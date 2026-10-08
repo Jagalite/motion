@@ -1,0 +1,33 @@
+{
+  "git_head": "12a24f4cab080794d2bf7cd9dc8a9d0591477372",
+  "dirty_snapshot_hashes": {
+    "web/app.js": "695835beffb471599fe12975b0fbfe5488d2c37c01f38303593858772eececfd",
+    "web/playback.js": "a83d27f7a3ae6f285fb8cf4117b8ca88e0317289cc8697120e02dbd5516f6e89",
+    "web/session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4",
+    "web/style.css": "6125711f79797ea7744f6329f7148b9c36524b4c1390278f0af122636a3c147b",
+    "src/viewing.rs": "b7dcf77593c0a3e7980e8a92e23d9d4652330ab6b0f20b9cbb0590bf59380d2e",
+    "web/vendor/demuxe/web/generated/unified-player.js": "873e03eb041f8db2d8302c0f57a48f57ba7256f70b56cba77aa58041024f8d4c",
+    "web/vendor/demuxe/web/generated/internal/native-player.js": "7847e4b6f0b19c933b6e7ff34337fba4c70595e99f69b71485a77d428b122ea0"
+  },
+  "served_hashes": {
+    "app.js": "695835beffb471599fe12975b0fbfe5488d2c37c01f38303593858772eececfd",
+    "playback.js": "a83d27f7a3ae6f285fb8cf4117b8ca88e0317289cc8697120e02dbd5516f6e89",
+    "session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4"
+  },
+  "server_binary_sha256": "0caca15b612377b49f51d995fa235697401039642a79a032cf172156c279ae66",
+  "probe_sha256": "53f14e162c115e8df63a639cd2f1cd9a52607a6db514a3fb5c937cde99209b48",
+  "runner_sha256": "d62898f7f088bf533d717b145280b9f4dda0471a8f3a47938c22d4da6d55aa81",
+  "served_matches_snapshot": true,
+  "recording": "private-recordings/after.mp4",
+  "recording_has_audio": false,
+  "recording_sha256": "831516c13c520fab079c7ae2c8bb3990c80eb6cdb1ab3e12bce4dc1715e051f5",
+  "recording_streams": [
+    {
+      "codec_name": "h264",
+      "codec_type": "video",
+      "width": 2804,
+      "height": 1752,
+      "avg_frame_rate": "31470000/1940579"
+    }
+  ]
+}

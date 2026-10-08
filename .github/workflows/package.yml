@@ -1,0 +1,44 @@
+name: Build Motion package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install build tools
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+          brew install pkg-config
+      - name: Test integration adapters
+        run: |
+          python3 scripts/check_publication.py
+          node --test scripts/test_demuxe_integration.mjs
+          python3 scripts/test_packaging.py
+          cargo test --locked -p playscale --lib config::tests
+      - name: Build self-contained package and source companion
+        run: python3 scripts/package_app.py --output artifacts/release
+      - name: Test extracted package without development tools
+        run: python3 scripts/test_package.py artifacts/release/Motion-macos-arm64.tar.gz --work artifacts/package-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Motion-macos-arm64
+          path: |
+            artifacts/release/Motion-macos-arm64.tar.gz
+            artifacts/release/Motion-sources.tar
+            artifacts/release/SHA256SUMS
+            artifacts/package-test/receipt.json
+          compression-level: 0

@@ -1,0 +1,24 @@
+/target/
+/data/
+/web/vendor/
+/artifacts/
+**/__pycache__/
+.DS_Store
+
+# Local configuration and generated credentials
+.env
+.env.*
+!.env.example
+/config.json
+/config.local.json
+*.local.json
+admin-token
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+/.npmrc
+/.netrc
+/.pypirc

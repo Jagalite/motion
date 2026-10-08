@@ -1,0 +1,615 @@
+{
+  "receipt": "research/playback-handoff/after.json.gz",
+  "samples": 2052,
+  "errors": [],
+  "transitions": [
+    {
+      "wall": 104034.425,
+      "from_element": 1,
+      "to_element": 2,
+      "old_frame": 338,
+      "new_frame": 337,
+      "frame_delta": -1,
+      "native_clock_delta": 0.008457999999999188,
+      "sample_interval_ms": 16.669999999998254,
+      "nearby": [
+        {
+          "wall": 103967.78,
+          "element": 1,
+          "frame": 337,
+          "valid": true,
+          "mediaTime": 11.210768,
+          "stateTime": 11.094481,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 103984.455,
+          "element": 1,
+          "frame": 337,
+          "valid": true,
+          "mediaTime": 11.227076,
+          "stateTime": 11.094481,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 104001.09,
+          "element": 1,
+          "frame": 338,
+          "valid": true,
+          "mediaTime": 11.242287,
+          "stateTime": 11.094481,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 104017.755,
+          "element": 1,
+          "frame": 338,
+          "valid": true,
+          "mediaTime": 11.257604,
+          "stateTime": 11.094481,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 104034.425,
+          "element": 2,
+          "frame": 337,
+          "valid": true,
+          "mediaTime": 11.266062,
+          "stateTime": 11.223422,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 104051.09,
+          "element": 2,
+          "frame": 338,
+          "valid": true,
+          "mediaTime": 11.281645,
+          "stateTime": 11.223422,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 104067.755,
+          "element": 2,
+          "frame": 338,
+          "valid": true,
+          "mediaTime": 11.295871,
+          "stateTime": 11.223422,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 104084.425,
+          "element": 2,
+          "frame": 339,
+          "valid": true,
+          "mediaTime": 11.311001,
+          "stateTime": 11.223422,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 104101.085,
+          "element": 2,
+          "frame": 339,
+          "valid": true,
+          "mediaTime": 11.327384,
+          "stateTime": 11.223422,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        }
+      ]
+    },
+    {
+      "wall": 111001.165,
+      "from_element": 2,
+      "to_element": 3,
+      "old_frame": 546,
+      "new_frame": 546,
+      "frame_delta": 0,
+      "native_clock_delta": -0.000257000000001284,
+      "sample_interval_ms": 16.669999999998254,
+      "nearby": [
+        {
+          "wall": 110934.495,
+          "element": 2,
+          "frame": 544,
+          "valid": true,
+          "mediaTime": 18.158625,
+          "stateTime": 18.059399,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 110949.165,
+          "element": 2,
+          "frame": 545,
+          "valid": true,
+          "mediaTime": 18.177243,
+          "stateTime": 18.059399,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 110967.83,
+          "element": 2,
+          "frame": 545,
+          "valid": true,
+          "mediaTime": 18.190148,
+          "stateTime": 18.059399,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 110984.495,
+          "element": 2,
+          "frame": 546,
+          "valid": true,
+          "mediaTime": 18.223272,
+          "stateTime": 18.059399,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 111001.165,
+          "element": 3,
+          "frame": 546,
+          "valid": true,
+          "mediaTime": 18.223015,
+          "stateTime": 18.183969,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 111017.83,
+          "element": 3,
+          "frame": 547,
+          "valid": true,
+          "mediaTime": 18.23828,
+          "stateTime": 18.183969,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 111034.495,
+          "element": 3,
+          "frame": 547,
+          "valid": true,
+          "mediaTime": 18.252602,
+          "stateTime": 18.183969,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 111049.33,
+          "element": 3,
+          "frame": 548,
+          "valid": true,
+          "mediaTime": 18.266009,
+          "stateTime": 18.183969,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 111067.83,
+          "element": 3,
+          "frame": 548,
+          "valid": true,
+          "mediaTime": 18.28423,
+          "stateTime": 18.183969,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        }
+      ]
+    },
+    {
+      "wall": 118001.21,
+      "from_element": 3,
+      "to_element": 4,
+      "old_frame": 756,
+      "new_frame": 755,
+      "frame_delta": -1,
+      "native_clock_delta": -0.028052999999999884,
+      "sample_interval_ms": 16.66500000000815,
+      "nearby": [
+        {
+          "wall": 117934.545,
+          "element": 3,
+          "frame": 754,
+          "valid": true,
+          "mediaTime": 25.147522,
+          "stateTime": 25.017032,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 117951.21,
+          "element": 3,
+          "frame": 755,
+          "valid": true,
+          "mediaTime": 25.172415,
+          "stateTime": 25.017032,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 117967.88,
+          "element": 3,
+          "frame": 755,
+          "valid": true,
+          "mediaTime": 25.188892,
+          "stateTime": 25.017032,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 117984.545,
+          "element": 3,
+          "frame": 756,
+          "valid": true,
+          "mediaTime": 25.203822,
+          "stateTime": 25.017032,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 118001.21,
+          "element": 4,
+          "frame": 755,
+          "valid": true,
+          "mediaTime": 25.175769,
+          "stateTime": 25.171042,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 118017.88,
+          "element": 4,
+          "frame": 756,
+          "valid": true,
+          "mediaTime": 25.222216,
+          "stateTime": 25.177077,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 118034.55,
+          "element": 4,
+          "frame": 757,
+          "valid": true,
+          "mediaTime": 25.238133,
+          "stateTime": 25.177077,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 118051.215,
+          "element": 4,
+          "frame": 757,
+          "valid": true,
+          "mediaTime": 25.252638,
+          "stateTime": 25.177077,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 118067.505,
+          "element": 4,
+          "frame": 758,
+          "valid": true,
+          "mediaTime": 25.269668,
+          "stateTime": 25.177077,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        }
+      ]
+    },
+    {
+      "wall": 125017.84,
+      "from_element": 4,
+      "to_element": 5,
+      "old_frame": 966,
+      "new_frame": 965,
+      "frame_delta": -1,
+      "native_clock_delta": -0.029757000000003586,
+      "sample_interval_ms": 16.58499999999185,
+      "nearby": [
+        {
+          "wall": 124951.25,
+          "element": 4,
+          "frame": 964,
+          "valid": true,
+          "mediaTime": 32.147117,
+          "stateTime": 32.035557,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 124967.915,
+          "element": 4,
+          "frame": 965,
+          "valid": true,
+          "mediaTime": 32.172784,
+          "stateTime": 32.035557,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 124984.585,
+          "element": 4,
+          "frame": 965,
+          "valid": true,
+          "mediaTime": 32.187302,
+          "stateTime": 32.035557,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 125001.255,
+          "element": 4,
+          "frame": 966,
+          "valid": true,
+          "mediaTime": 32.204132,
+          "stateTime": 32.035557,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 2
+        },
+        {
+          "wall": 125017.84,
+          "element": 5,
+          "frame": 965,
+          "valid": true,
+          "mediaTime": 32.174375,
+          "stateTime": 32.165523,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 125034.585,
+          "element": 5,
+          "frame": 966,
+          "valid": true,
+          "mediaTime": 32.220174,
+          "stateTime": 32.165523,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 125051.255,
+          "element": 5,
+          "frame": 967,
+          "valid": true,
+          "mediaTime": 32.234846,
+          "stateTime": 32.165523,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 125066.2,
+          "element": 5,
+          "frame": 967,
+          "valid": true,
+          "mediaTime": 32.249677,
+          "stateTime": 32.165523,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        },
+        {
+          "wall": 125084.585,
+          "element": 5,
+          "frame": 968,
+          "valid": true,
+          "mediaTime": 32.266467,
+          "stateTime": 32.165523,
+          "status": "playing",
+          "readyState": 4,
+          "muted": false,
+          "volume": 0.2,
+          "elements": 1
+        }
+      ]
+    }
+  ],
+  "windows": [
+    {
+      "label": "baseline-steady",
+      "samples": 301,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 35.28500000000349,
+      "max_sampling_interval_ms": 18.630000000004657
+    },
+    {
+      "label": "switch-convert-1",
+      "samples": 420,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [
+        {
+          "wall": 104034.425,
+          "from": 338,
+          "to": 337,
+          "delta": -1,
+          "elements": [
+            1,
+            2
+          ]
+        }
+      ],
+      "longest_frame_hold_ms": 35.320000000006985,
+      "max_sampling_interval_ms": 18.65000000000873
+    },
+    {
+      "label": "switch-original-2",
+      "samples": 420,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 35.3350000000064,
+      "max_sampling_interval_ms": 18.66500000000815
+    },
+    {
+      "label": "switch-convert-3",
+      "samples": 420,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [
+        {
+          "wall": 118001.21,
+          "from": 756,
+          "to": 755,
+          "delta": -1,
+          "elements": [
+            3,
+            4
+          ]
+        }
+      ],
+      "longest_frame_hold_ms": 35.32499999999709,
+      "max_sampling_interval_ms": 18.654999999998836
+    },
+    {
+      "label": "switch-original-4",
+      "samples": 420,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [
+        {
+          "wall": 125017.84,
+          "from": 966,
+          "to": 965,
+          "delta": -1,
+          "elements": [
+            4,
+            5
+          ]
+        }
+      ],
+      "longest_frame_hold_ms": 35.1649999999936,
+      "max_sampling_interval_ms": 18.61500000000524
+    },
+    {
+      "label": "end",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    }
+  ],
+  "coverage_sufficient": true,
+  "video_decoded_continuity": "FAIL",
+  "failed_windows": [
+    "switch-convert-1",
+    "switch-convert-3",
+    "switch-original-4"
+  ],
+  "audio_output": "NOT_MEASURED",
+  "frame_perfect_gapless_qualified": false
+}

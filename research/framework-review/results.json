@@ -1,0 +1,1621 @@
+{
+  "scope": "Loopback HTTP/1.1, synthetic 10-byte and empty files; no TLS, Tailscale, Demuxe, performance, or disconnect tests",
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "versions": {
+    "axum": "0.8.9",
+    "tower-http": "0.7.1",
+    "poem": "3.1.12",
+    "salvo": "1.0.1"
+  },
+  "results": {
+    "ten_bytes": {
+      "axum": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-length": "10"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-length": "10"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 7-9/10",
+            "content-length": "3"
+          },
+          "body_bytes": 3,
+          "body_sha256": "35a9e381b1a27567549b5f8a6f783c167ebf809f1c4d6a9e367240484d8ce281",
+          "body_text": "789"
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 4-9/10",
+            "content-length": "6"
+          },
+          "body_bytes": 6,
+          "body_sha256": "472bbe83616e93d3c09a79103ae47d8f71e3d35a966d6e8b22f743218d04171d",
+          "body_text": "456789"
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 0-9/10",
+            "content-length": "10"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 4-9/10",
+            "content-length": "6"
+          },
+          "body_bytes": 6,
+          "body_sha256": "472bbe83616e93d3c09a79103ae47d8f71e3d35a966d6e8b22f743218d04171d",
+          "body_text": "456789"
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */10",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */10",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */10",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-length": "37"
+          },
+          "body_bytes": 37,
+          "body_sha256": "bf44c08b22ff5a181c263b9dca1bc0160f98dcd17f5cbe4d16799c61c8cb5aea",
+          "body_text": "Cannot serve multipart range requests"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"6ac47584.083a8a32-a\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"6ac47584.083a8a32-a\""
+          },
+          "status": 304,
+          "headers": {
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"6ac47584.083a8a32-a\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {
+            "etag": "\"6ac47584.083a8a32-a\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ],
+      "poem": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "10",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "10",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "4",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 0-3/10"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "3",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 7-9/10"
+          },
+          "body_bytes": 3,
+          "body_sha256": "35a9e381b1a27567549b5f8a6f783c167ebf809f1c4d6a9e367240484d8ce281",
+          "body_text": "789"
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "6",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 4-9/10"
+          },
+          "body_bytes": 6,
+          "body_sha256": "472bbe83616e93d3c09a79103ae47d8f71e3d35a966d6e8b22f743218d04171d",
+          "body_text": "456789"
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "10",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */10",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */10",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "10",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "2",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 0-1/10"
+          },
+          "body_bytes": 2,
+          "body_sha256": "938db8c9f82c8cb58d3f3ef4fd250036a48d26a712753d2fde5abd03a85cabf4",
+          "body_text": "01"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "4",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 0-3/10"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "4",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 0-3/10"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"df1fcef:a:6ac47584:83a8a32\""
+          },
+          "status": 206,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "4",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "content-range": "bytes 0-3/10"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef:a:6ac47584:83a8a32\""
+          },
+          "status": 304,
+          "headers": {},
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef:a:6ac47584:83a8a32\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {},
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ],
+      "salvo": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-length": "10"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-length": "10"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 7-9/10",
+            "content-length": "3"
+          },
+          "body_bytes": 3,
+          "body_sha256": "35a9e381b1a27567549b5f8a6f783c167ebf809f1c4d6a9e367240484d8ce281",
+          "body_text": "789"
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 4-9/10",
+            "content-length": "6"
+          },
+          "body_bytes": 6,
+          "body_sha256": "472bbe83616e93d3c09a79103ae47d8f71e3d35a966d6e8b22f743218d04171d",
+          "body_text": "456789"
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 0-9/10",
+            "content-length": "10"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 4-9/10",
+            "content-length": "6"
+          },
+          "body_bytes": 6,
+          "body_sha256": "472bbe83616e93d3c09a79103ae47d8f71e3d35a966d6e8b22f743218d04171d",
+          "body_text": "456789"
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */10",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */10",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-length": "10"
+          },
+          "body_bytes": 10,
+          "body_sha256": "84d89877f0d4041efb6bf91a16f0248f2fd573e6af05c19f96bedb9f882f7882",
+          "body_text": "0123456789"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"df1fcef-a-6ac47584-83a8a32\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes 0-3/10",
+            "content-length": "4"
+          },
+          "body_bytes": 4,
+          "body_sha256": "1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a",
+          "body_text": "0123"
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef-a-6ac47584-83a8a32\""
+          },
+          "status": 304,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-a-6ac47584-83a8a32\"",
+            "accept-ranges": "bytes"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ]
+    },
+    "empty": {
+      "axum": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-range": "bytes 0-0/0",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-range": "bytes 0-0/0",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 416,
+          "headers": {
+            "content-range": "bytes */0",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-length": "37"
+          },
+          "body_bytes": 37,
+          "body_sha256": "bf44c08b22ff5a181c263b9dca1bc0160f98dcd17f5cbe4d16799c61c8cb5aea",
+          "body_text": "Cannot serve multipart range requests"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-range": "bytes 0-0/0",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-range": "bytes 0-0/0",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"6ac47584.2cde929c-0\""
+          },
+          "status": 206,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "accept-ranges": "bytes",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "content-range": "bytes 0-0/0",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"6ac47584.2cde929c-0\""
+          },
+          "status": 304,
+          "headers": {
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"6ac47584.2cde929c-0\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {
+            "etag": "\"6ac47584.2cde929c-0\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ],
+      "poem": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "0",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:0:6ac47584:2cde929c\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "0",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:0:6ac47584:2cde929c\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "0",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:0:6ac47584:2cde929c\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 200,
+          "headers": {
+            "accept-ranges": "bytes",
+            "content-length": "0",
+            "content-type": "application/octet-stream",
+            "etag": "\"df1fcef:0:6ac47584:2cde929c\"",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"df1fcef:0:6ac47584:2cde929c\""
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/plain; charset=utf-8",
+            "content-range": "bytes */0",
+            "content-length": "21"
+          },
+          "body_bytes": 21,
+          "body_sha256": "27d4b8fae8ae247714eb8661a90231693035d2971d6954974e20ecfbe0ad06aa",
+          "body_text": "range not satisfiable"
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef:0:6ac47584:2cde929c\""
+          },
+          "status": 304,
+          "headers": {},
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef:0:6ac47584:2cde929c\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {},
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ],
+      "salvo": [
+        {
+          "case": "full",
+          "request_method": "GET",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "head",
+          "request_method": "HEAD",
+          "request_headers": {},
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-length": "0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "prefix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "suffix",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "open_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "whole_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-9"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "beyond_end",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=4-99"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "unsatisfiable",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=99-100"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "malformed",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "not-a-range"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "multiple",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-1,4-5"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "stale_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"definitely-stale\""
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "head_with_range",
+          "request_method": "HEAD",
+          "request_headers": {
+            "Range": "bytes=0-3"
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "matching_if_range",
+          "request_method": "GET",
+          "request_headers": {
+            "Range": "bytes=0-3",
+            "If-Range": "\"df1fcef-0-6ac47584-2cde929c\""
+          },
+          "status": 416,
+          "headers": {
+            "content-type": "text/html",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes",
+            "content-range": "bytes */0",
+            "content-length": "954"
+          },
+          "body_bytes": 954,
+          "body_sha256": "7218b4977a68eef108e0f0be4920ff7ae3539e9f8e7c260137f031b48642eaa6",
+          "body_text": "<!DOCTYPE html>\n<html>\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width\">\n    <title>416: Range Not Satisfiable</title>\n    <style>\n    :root {\n        --bg-color: #fff;\n        --text-color: #222;\n    }\n    body {\n        background: var(--bg-color);\n        color: var(--text-color);\n        text-align: center;\n    }\n    pre { text-align: left; padding: 0 1rem; }\n    footer{text-align:center;}\n    @media (prefers-color-scheme: dark) {\n        :root {\n            --bg-color: #222;\n            --text-color: #ddd;\n        }\n        a:link { color: red; }\n        a:visited { color: #a8aeff; }\n        a:hover {color: #a8aeff;}\n        a:active {color: #a8aeff;}\n    }\n    </style>\n</head>\n<body>\n    <div><h1>416: Range Not Satisfiable</h1><h3>The portion of the requested file cannot be supplied by the server.</h3><hr><footer><a href=\"https://salvo.rs\" target=\"_blank\">salvo</a></footer></div>\n</body>\n</html>"
+        },
+        {
+          "case": "matching_if_none_match",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef-0-6ac47584-2cde929c\""
+          },
+          "status": 304,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        },
+        {
+          "case": "not_modified_before_range",
+          "request_method": "GET",
+          "request_headers": {
+            "If-None-Match": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "Range": "bytes=99-100"
+          },
+          "status": 304,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "last-modified": "Tue, 06 Oct 2026 04:13:56 GMT",
+            "etag": "\"df1fcef-0-6ac47584-2cde929c\"",
+            "accept-ranges": "bytes"
+          },
+          "body_bytes": 0,
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "body_text": ""
+        }
+      ]
+    }
+  }
+}

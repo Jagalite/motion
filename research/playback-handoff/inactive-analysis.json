@@ -1,0 +1,61 @@
+{
+  "receipt": "research/playback-handoff/inactive-preview.json",
+  "samples": 1,
+  "errors": [],
+  "transitions": [],
+  "windows": [
+    {
+      "label": "baseline-steady",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    },
+    {
+      "label": "switch-convert-1",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    },
+    {
+      "label": "switch-original-2",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    },
+    {
+      "label": "switch-convert-3",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    },
+    {
+      "label": "switch-original-4",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    },
+    {
+      "label": "end",
+      "samples": 0,
+      "invalid_samples": 0,
+      "nonconsecutive_frames": [],
+      "longest_frame_hold_ms": 0,
+      "max_sampling_interval_ms": 0
+    }
+  ],
+  "coverage_sufficient": false,
+  "video_decoded_continuity": "INCONCLUSIVE",
+  "failed_windows": [],
+  "audio_output": "NOT_MEASURED",
+  "frame_perfect_gapless_qualified": false
+}

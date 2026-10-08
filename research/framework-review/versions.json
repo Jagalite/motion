@@ -1,0 +1,66 @@
+[
+  {
+    "crate": "axum",
+    "version": "0.8.9",
+    "released": "2026-04-14T07:55:20.258398Z",
+    "rust_version": "1.80",
+    "license": "MIT",
+    "repository": "https://github.com/tokio-rs/axum"
+  },
+  {
+    "crate": "tower-http",
+    "version": "0.7.1",
+    "released": "2026-08-31T14:49:25.697237Z",
+    "rust_version": "1.65",
+    "license": "MIT",
+    "repository": "https://github.com/tower-rs/tower-http"
+  },
+  {
+    "crate": "utoipa-axum",
+    "version": "0.3.0",
+    "released": "2026-09-22T22:32:48.569734Z",
+    "rust_version": "1.88",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/juhaku/utoipa"
+  },
+  {
+    "crate": "poem",
+    "version": "3.1.12",
+    "released": "2025-07-28T04:39:14.775671Z",
+    "rust_version": "1.85",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/poem-web/poem"
+  },
+  {
+    "crate": "poem-openapi",
+    "version": "5.1.16",
+    "released": "2025-07-28T04:41:35.020009Z",
+    "rust_version": "1.85",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/poem-web/poem"
+  },
+  {
+    "crate": "salvo",
+    "version": "1.0.1",
+    "released": "2026-10-04T22:59:35.218410Z",
+    "rust_version": "1.94",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/salvo-rs/salvo"
+  },
+  {
+    "crate": "salvo_core",
+    "version": "1.0.1",
+    "released": "2026-10-04T22:56:10.382591Z",
+    "rust_version": "1.94",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/salvo-rs/salvo"
+  },
+  {
+    "crate": "salvo-oapi",
+    "version": "1.0.1",
+    "released": "2026-10-04T22:58:44.274906Z",
+    "rust_version": "1.94",
+    "license": "Apache-2.0",
+    "repository": "https://github.com/salvo-rs/salvo"
+  }
+]

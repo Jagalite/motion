@@ -1,0 +1,14 @@
+{
+  "poem_object": {
+    "duration_seconds": null,
+    "id": "item-1",
+    "tags": [],
+    "title": "Example"
+  },
+  "serde_axum_salvo": {
+    "duration_seconds": null,
+    "id": "item-1",
+    "tags": [],
+    "title": "Example"
+  }
+}

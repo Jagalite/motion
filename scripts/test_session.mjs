@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import {ViewingSession,preferredTrack} from '../web/session.js';
+const received=[];let lost=true;
+const api=async(path,options)=>{const event=JSON.parse(options.body);received.push(event);if(lost){lost=false;throw new TypeError('lost response');}await new Promise(r=>setTimeout(r,2));return {id:'session',...event};};
+const session=new ViewingSession(api,'default',{id:'session',sequence:0,status:'paused'});
+await Promise.all([session.update(10,'playing'),session.update(3,'paused'),session.update(4,'stopped')]);
+assert.deepEqual(received.map(v=>v.sequence),[1,1,2,3]);assert.deepEqual(received[0],received[1]);assert.equal(session.state.position_seconds,4);
+await session.update(5,'playing');assert.equal(received.length,4);
+let calls=0;const conflict=Object.assign(new Error('superseded'),{status:409});const stale=new ViewingSession(async()=>{calls++;throw conflict;},'default',{id:'old',sequence:0,status:'paused'});
+await assert.rejects(stale.update(1,'playing'));await assert.rejects(stale.update(2,'playing'));assert.equal(calls,1);
+assert.equal(preferredTrack([{id:'fr',language:'fr'},{id:'en',language:'en-US'}],['en']).id,'en');assert.equal(preferredTrack([{id:'en',language:null}],['en']),null);
+console.log('Session serialization, exact network retry, superseded-session stop, and language selection: PASS');
+const switches=[];let lostSwitch=true;
+const moving=new ViewingSession(async(_,options)=>{const event=JSON.parse(options.body);switches.push(event);if(event.file&&lostSwitch){lostSwitch=false;throw new TypeError('lost');}return {id:'same',...event};},'default',{id:'same',sequence:0,status:'playing'});
+await Promise.all([moving.update(20,'playing',{file_id:'converted',revision:'r2'}),moving.update(21,'paused')]);
+assert.deepEqual(switches[0],switches[1]);assert.deepEqual(switches.map(e=>e.sequence),[1,1,2]);assert.equal(moving.state.id,'same');
+let rejectFile=true;
+const recoverable=new ViewingSession(async(_,options)=>{const event=JSON.parse(options.body);if(event.file&&rejectFile){rejectFile=false;throw Object.assign(new Error('revision changed'),{status:409});}return {id:'same',...event};},'default',{id:'same',sequence:0,status:'playing'});
+await assert.rejects(recoverable.update(22,'playing',{file_id:'bad',revision:'old'}));
+await recoverable.update(23,'playing');assert.equal(recoverable.state.sequence,1);
+await recoverable.update(24,'ended');await assert.rejects(recoverable.update(24,'paused',{file_id:'new',revision:'r'}));
+console.log('Atomic file-switch retry, rejection recovery, terminal switch protection: PASS');
+// A rejected final position for a shorter replacement must permit switching back.
+const bounded=new ViewingSession(async(_,options)=>{const event=JSON.parse(options.body);if(event.file?.file_id==='short'&&event.position_seconds>30)throw Object.assign(new Error('invalid_position'),{status:400});return {id:'same',...event};},'default',{id:'same',sequence:0,status:'playing'});
+await bounded.update(10,'playing',{file_id:'short',revision:'r'});
+await assert.rejects(bounded.update(50,'paused',{file_id:'short',revision:'r'}));
+await bounded.update(50,'paused',{file_id:'original',revision:'r'});
+assert.equal(bounded.state.sequence,2);assert.equal(bounded.state.file.file_id,'original');
+// An uncertain server failure must never be treated as an acknowledged rejection.
+let uncertainCalls=0;
+const uncertain=new ViewingSession(async()=>{uncertainCalls++;throw Object.assign(new Error('server failure'),{status:500});},'default',{id:'same',sequence:0,status:'playing'});
+await assert.rejects(uncertain.update(10,'playing',{file_id:'target',revision:'r'}));
+await assert.rejects(uncertain.update(11,'paused'));assert.equal(uncertainCalls,1);
+console.log('Rejected final position rollback and uncertain server-error protection: PASS');

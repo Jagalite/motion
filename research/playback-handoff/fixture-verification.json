@@ -1,0 +1,20 @@
+[
+  {
+    "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/playscale-gapless-kvm8sch3/media/Frame-clock.mp4",
+    "sha256": "eb7a88b2d14e3c81c2719a422cc95ddf0dc34e2b026cc6978481e056a9277039",
+    "frames": 3600,
+    "wrong_count": 0,
+    "wrong_ids": [],
+    "max_pts_error_seconds": 3.333333467026023e-07,
+    "valid": true
+  },
+  {
+    "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/playscale-gapless-kvm8sch3/state/generated/5b0f2367-2aea-449e-88e5-1aa9b0c50c3f/1/output.mp4",
+    "sha256": "0fd6cb7adfa44bb49212d2e6df30bdfd6cbcdc75dab95b1004bfdb9268a26cf1",
+    "frames": 3600,
+    "wrong_count": 0,
+    "wrong_ids": [],
+    "max_pts_error_seconds": 3.333333467026023e-07,
+    "valid": true
+  }
+]

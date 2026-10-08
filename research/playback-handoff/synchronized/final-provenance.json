@@ -1,0 +1,23 @@
+{
+  "git_head": "12a24f4cab080794d2bf7cd9dc8a9d0591477372",
+  "dirty_snapshot_hashes": {
+    "web/app.js": "1a3bc1702fd2e464caa8ae7ee7de262c019e8dfe4c15a47236dadab131e3aff3",
+    "web/playback.js": "9cc50beac498f3e8092dbdce5b8458c6cd2f8657f00470ed27cdbdad47258ba7",
+    "web/session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4",
+    "web/style.css": "6125711f79797ea7744f6329f7148b9c36524b4c1390278f0af122636a3c147b",
+    "src/viewing.rs": "b7dcf77593c0a3e7980e8a92e23d9d4652330ab6b0f20b9cbb0590bf59380d2e",
+    "web/vendor/demuxe/web/generated/unified-player.js": "873e03eb041f8db2d8302c0f57a48f57ba7256f70b56cba77aa58041024f8d4c",
+    "web/vendor/demuxe/web/generated/internal/native-player.js": "7847e4b6f0b19c933b6e7ff34337fba4c70595e99f69b71485a77d428b122ea0"
+  },
+  "served_hashes": {
+    "app.js": "1a3bc1702fd2e464caa8ae7ee7de262c019e8dfe4c15a47236dadab131e3aff3",
+    "playback.js": "9cc50beac498f3e8092dbdce5b8458c6cd2f8657f00470ed27cdbdad47258ba7",
+    "session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4"
+  },
+  "served_matches_snapshot": true,
+  "server_binary_sha256": "e4521d2118cbd00635d0ae47e35452da7356bcec077fb03aa1896792a6541d06",
+  "recording": "private-recordings/synchronized.mp4",
+  "recording_sha256": "ab9a994372b52b83792ba25fa6b8bff8c61d4f82fa0f99f75b7f6feadc4829ac",
+  "recording_has_audio": false,
+  "scope": "macOS T3 Electron Chromium 152; native H264/AAC; 30fps deterministic fixture; four switches; decoded pixels only"
+}

@@ -1,0 +1,159 @@
+{
+  "source_sha256": "22bc50f1cd787e9fbbedcbae3bb051cb9a9a13cf3f0b4193d85999a33267aac6",
+  "binary_sha256": "028775d2a52d07ca6688554a1d32c4ab23a5209b40e945105288401255e25549",
+  "encodes": [
+    {
+      "profile": {
+        "version": 1,
+        "codec": "h264",
+        "max_width": 320,
+        "max_height": 180,
+        "video_bitrate": 500000,
+        "audio_bitrate": 96000,
+        "frame_rate": {
+          "numerator": 30,
+          "denominator": 1
+        }
+      },
+      "job_id": "f0948cd3-744d-42bc-98a1-a1bfeabd7dad",
+      "file_revision": "a34c91f833ba64a34b296d227293c7bc7d19cafcd804e95a859db21fe8a00d14",
+      "tracks": [
+        {
+          "index": 0,
+          "kind": "video",
+          "codec": "h264",
+          "language": "und",
+          "width": 320,
+          "height": 180,
+          "average_frame_rate": {
+            "numerator": 30,
+            "denominator": 1
+          },
+          "bitrate": 531377,
+          "pixel_format": "yuv420p",
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        },
+        {
+          "index": 1,
+          "kind": "audio",
+          "codec": "aac",
+          "language": "und",
+          "width": null,
+          "height": null,
+          "average_frame_rate": null,
+          "bitrate": 95867,
+          "pixel_format": null,
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        }
+      ],
+      "bytes": 324265,
+      "duration_seconds": 4.066667,
+      "average_bitrate": 637899
+    },
+    {
+      "profile": {
+        "version": 1,
+        "codec": "hevc",
+        "max_width": 320,
+        "max_height": 180,
+        "video_bitrate": 500000,
+        "audio_bitrate": 96000,
+        "frame_rate": null
+      },
+      "job_id": "4e63378b-d0ef-453e-bb86-56af44c02d52",
+      "file_revision": "cfb5f33540da5ce4b496d48cae59c72bbccb8428b5bf6d98956e037fe3bce527",
+      "tracks": [
+        {
+          "index": 0,
+          "kind": "video",
+          "codec": "hevc",
+          "language": "und",
+          "width": 320,
+          "height": 180,
+          "average_frame_rate": {
+            "numerator": 60,
+            "denominator": 1
+          },
+          "bitrate": 509792,
+          "pixel_format": "yuv420p",
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        },
+        {
+          "index": 1,
+          "kind": "audio",
+          "codec": "aac",
+          "language": "und",
+          "width": null,
+          "height": null,
+          "average_frame_rate": null,
+          "bitrate": 95867,
+          "pixel_format": null,
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        }
+      ],
+      "bytes": 313415,
+      "duration_seconds": 4.01,
+      "average_bitrate": 625267
+    },
+    {
+      "profile": {
+        "version": 1,
+        "codec": "h264",
+        "max_width": 640,
+        "max_height": 360,
+        "video_bitrate": 500000,
+        "audio_bitrate": 96000,
+        "frame_rate": {
+          "numerator": 30000,
+          "denominator": 1001
+        }
+      },
+      "job_id": "6c8511ef-f82c-41a0-a526-9ee2689f7f56",
+      "file_revision": "b8e5764114cc468b6c7b90dabe9c699bced775042c1563d336d1ff013ae35fcb",
+      "tracks": [
+        {
+          "index": 0,
+          "kind": "video",
+          "codec": "h264",
+          "language": "und",
+          "width": 640,
+          "height": 360,
+          "average_frame_rate": {
+            "numerator": 30000,
+            "denominator": 1001
+          },
+          "bitrate": 549724,
+          "pixel_format": "yuv420p",
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        },
+        {
+          "index": 1,
+          "kind": "audio",
+          "codec": "aac",
+          "language": "und",
+          "width": null,
+          "height": null,
+          "average_frame_rate": null,
+          "bitrate": 95867,
+          "pixel_format": null,
+          "color_transfer": null,
+          "start_time_seconds": 0.0
+        }
+      ],
+      "bytes": 331505,
+      "duration_seconds": 4.037367,
+      "average_bitrate": 656874
+    }
+  ],
+  "sse_replay": true,
+  "restart_preserves_profiles": true,
+  "range_delivery": true,
+  "fully_decoded": true,
+  "browser_switching_qualified": false,
+  "hardware_qualified": false
+}

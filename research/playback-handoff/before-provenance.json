@@ -1,0 +1,49 @@
+{
+  "git_head": "12a24f4cab080794d2bf7cd9dc8a9d0591477372",
+  "dirty_snapshot_hashes": {
+    "web/app.js": "ee618a2b0a9134ba299ece4059bf59682e94a7c76b26c1c27c8d0727220de60d",
+    "web/playback.js": "02f79c2f727877c1b8cb652729dbb13da603c577ad3e582d940ad7f6882a1cbf",
+    "web/session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4",
+    "web/style.css": "6125711f79797ea7744f6329f7148b9c36524b4c1390278f0af122636a3c147b",
+    "src/viewing.rs": "b7dcf77593c0a3e7980e8a92e23d9d4652330ab6b0f20b9cbb0590bf59380d2e",
+    "web/vendor/demuxe/web/generated/unified-player.js": "873e03eb041f8db2d8302c0f57a48f57ba7256f70b56cba77aa58041024f8d4c",
+    "web/vendor/demuxe/web/generated/internal/native-player.js": "7847e4b6f0b19c933b6e7ff34337fba4c70595e99f69b71485a77d428b122ea0"
+  },
+  "fixture": [
+    {
+      "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/playscale-gapless-kvm8sch3/media/Frame-clock.mp4",
+      "sha256": "eb7a88b2d14e3c81c2719a422cc95ddf0dc34e2b026cc6978481e056a9277039",
+      "frames": 3600,
+      "wrong_ids": [],
+      "wrong_count": 0
+    },
+    {
+      "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/playscale-gapless-kvm8sch3/state/generated/5b0f2367-2aea-449e-88e5-1aa9b0c50c3f/1/output.mp4",
+      "sha256": "0fd6cb7adfa44bb49212d2e6df30bdfd6cbcdc75dab95b1004bfdb9268a26cf1",
+      "frames": 3600,
+      "wrong_ids": [],
+      "wrong_count": 0
+    }
+  ],
+  "ffmpeg": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+  "recording": "private-recordings/before.mp4",
+  "recording_has_audio": false,
+  "served_hashes": {
+    "app.js": "ee618a2b0a9134ba299ece4059bf59682e94a7c76b26c1c27c8d0727220de60d",
+    "playback.js": "02f79c2f727877c1b8cb652729dbb13da603c577ad3e582d940ad7f6882a1cbf",
+    "session.js": "6dd3bc2f1fb180ab5eb0eb6e9af0a67ada61129eabb622fb44bc1f2120ba7fc4"
+  },
+  "server_binary_sha256": "b95715469c8664c19ad72d5a8ad07e70532e0549a921c54fbde390a6bf54232a",
+  "probe_sha256": "53f14e162c115e8df63a639cd2f1cd9a52607a6db514a3fb5c937cde99209b48",
+  "served_matches_snapshot": true,
+  "recording_sha256": "b0f727dfc39ae1df0d9d9f78cb28ecd1d83dbdf1dfc72f398fa21207bddf31b3",
+  "recording_streams": [
+    {
+      "codec_name": "h264",
+      "codec_type": "video",
+      "width": 2804,
+      "height": 1752,
+      "avg_frame_rate": "40845000/1447553"
+    }
+  ]
+}

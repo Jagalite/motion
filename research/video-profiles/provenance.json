@@ -1,0 +1,29 @@
+{
+  "base_commit": "c48833b68592115db7ff221fc9ab407a8cfb6095",
+  "tested_worktree": "Includes pre-existing uncommitted server-operations changes; isolated disposable runtime and target directory. No production server modified.",
+  "source_hashes": {
+    "Cargo.toml": "0581558558c2deef8fcfd22d778978fa7ec5d91b85ee701cc9a19cabfb447ca6",
+    "Cargo.lock": "4f5c7f458bba759655919d6db87e54dd961bb36919a50026224c7354a19c56e7",
+    "src/encoding.rs": "73189d5ab34e86148fa707ab19e48890a5fc6ce37938b22fe55397a446a37c7b",
+    "src/processing.rs": "417c878ca50888f14cf33cca53285206739bde31e9f10b2f2c1ef68a8cb28fca",
+    "src/scan.rs": "7cec1e779a0c2a0a9bb6e1962fde9006511d5061bee9af38d9a48c733ea1d0cb",
+    "src/db.rs": "56906e47500112af05e83c2c202a733bed9615ea56c340af28852b30fb83460e",
+    "src/lib.rs": "077fe5ef2684a1a9a2e452027e0158b9aa36c32598056b08362b8253b84da3f1",
+    "src/playback.rs": "f8421250b55c4f59ced70d4a370e798189424926c3d623bb6ef1604ed5c34088",
+    "src/renditions.rs": "acfdb5d81a2a6a3a1312ce4623803189d7b312afb4f420aa37e34f599700f5d1",
+    "migrations/0008_server_operations.sql": "1586d93730fcdc036cdf073e891f54696aa6fab3860625490930b0911a1aaf05",
+    "migrations/0009_video_profiles.sql": "ca3353c9aa6d3aeb67d0fd0d963f1a0f79ee5171bb493306b1ae6ebc8377e067",
+    "tests/support/video_profiles.rs": "f4e971d0a4fb69546461c89e3347a0f8ebe5a51273debe236f4187a40f80a0d0",
+    "scripts/video_profiles_smoke.py": "b26fad1e4c31735ed9ac6fd0082915946f155db61c9af09807a6d80a582872e7"
+  },
+  "tests": {
+    "rust": 64,
+    "clippy": "PASS -D warnings",
+    "live_software_encodes": 3
+  },
+  "limits": [
+    "No browser adaptation or gapless qualification",
+    "No hardware encoder qualification",
+    "External registration API tested; no Catabolic execution adapter"
+  ]
+}

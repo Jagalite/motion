@@ -1,0 +1,31 @@
+{
+  "base_commit": "c48833b68592115db7ff221fc9ab407a8cfb6095",
+  "scope": "Exact staged encoding changes over HEAD, excluding unrelated server-operations work",
+  "source_hashes": {
+    "Cargo.lock": "5d165b2fae2acd3e0c5b3a81f68e96caf9d4db26cae14d58c3dbbb20b23756a1",
+    "Cargo.toml": "bc15bc48083b286ce3e9751d3d521624c648dc3753646b0ab41ed096c5398f0c",
+    "ENCODING.md": "d3033543b903077f1f721a050737e8c0e2ec513d251b4c30cf795f366b70d284",
+    "migrations/0009_video_profiles.sql": "ca3353c9aa6d3aeb67d0fd0d963f1a0f79ee5171bb493306b1ae6ebc8377e067",
+    "scripts/video_profiles_smoke.py": "fc1e7b9048aed3c3a7622032c22c5be508461c907f4ad80af9eb440f08d0ac6a",
+    "src/db.rs": "d08ed5f0bb64b39327c5b89ed8174f37e725af868c99b7188a5a1987f707a803",
+    "src/encoding.rs": "bb122d2a67eb45ce5d2d2fb73fc4f4a83e15489b5c9c18102d0a5187102ae71b",
+    "src/lib.rs": "5bfef7e4c9d5174c542b35a4cb279815703d54d09dadc6675a81d1dfa6f0d536",
+    "src/playback.rs": "d7b635397535d4b8f902fa0028b6f8fb511c1f38a0109ef9993c2182fa44135a",
+    "src/processing.rs": "bdcac4f698abd98794f2bc26b1751a3dd746d711d323adb58da4aa32ca635f27",
+    "src/renditions.rs": "acfdb5d81a2a6a3a1312ce4623803189d7b312afb4f420aa37e34f599700f5d1",
+    "src/scan.rs": "b6ee6795be5edbbb8db3ed08d52336a10262efa8c9db40dd6dc73724ab517398",
+    "tests/server.rs": "26fba755a21646e5343582c15f409ca9a518daa26342e79e0b20b7859018f8d2",
+    "tests/support/video_profiles.rs": "eff2982d10141bc1f12698ae82a30dfca90bf34c322225db493c50794abfe44b"
+  },
+  "receipt_sha256": "2c57d41be94df15ee954a01384f1d4a855605280eae50ca575f55565aeb59f25",
+  "tests": {
+    "rust": 54,
+    "clippy": "PASS -D warnings",
+    "real_software_encodes": 5
+  },
+  "limits": [
+    "No browser switching or audio continuity qualification",
+    "No hardware encoder qualification",
+    "No Catabolic execution adapter"
+  ]
+}

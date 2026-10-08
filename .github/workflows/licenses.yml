@@ -1,0 +1,27 @@
+name: Dependency notices
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  notices:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install project Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+      - name: Check publication privacy
+        run: python3 scripts/check_publication.py
+      - name: Test notice collection
+        run: python3 scripts/test_third_party_notices.py
+      - name: Check locked dependency notices
+        run: python3 scripts/third_party_notices.py --target aarch64-apple-darwin --check
