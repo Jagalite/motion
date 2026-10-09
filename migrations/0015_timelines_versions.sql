@@ -39,8 +39,6 @@ CREATE TABLE version_files (
  UNIQUE(version_id,file_id)
 );
 CREATE INDEX version_files_file ON version_files(file_id);
--- Occurrence lookup: which files hold a given content revision.
-CREATE INDEX media_files_revision ON media_files(revision);
 
 -- Backfill: one version per (edition, content revision), represented by its
 -- smallest file ID; other files with that content are copies (occurrences).
