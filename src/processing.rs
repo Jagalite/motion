@@ -69,15 +69,24 @@ pub struct Runtime {
     pub io: Arc<Semaphore>,
     pub inspection: Arc<Semaphore>,
     pub maintenance: tokio::sync::Mutex<()>,
+    /// Shared encoder capacity; released only after confirmed worker termination.
+    pub execution: Arc<crate::execution::Coordinator>,
+    /// Executable that accepts `--internal-ffmpeg-supervisor`.
+    pub supervisor: PathBuf,
+    /// Live delivery sessions share the execution infrastructure.
+    pub deliveries: crate::delivery::Runtime,
 }
 impl Runtime {
     pub fn new(root: PathBuf, settings: Settings) -> Self {
         Self {
-            root,
             settings,
             io: Arc::new(Semaphore::new(1)),
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
+            execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
+            supervisor: std::env::current_exe().unwrap_or_default(),
+            deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
+            root,
         }
     }
 }
@@ -332,7 +341,32 @@ pub async fn control(
     .await?;
     Ok(Json(load(&app, &id).await?))
 }
+/// Witness files under `root` still held by executions of a previous process.
+pub fn held_witnesses(root: &FsPath) -> Vec<(PathBuf, crate::execution::Witness)> {
+    walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_file() && e.file_name() == ".owner")
+        .filter_map(|e| {
+            let witness = crate::execution::Witness::open(e.path()).ok()?;
+            (!witness.released()).then(|| (e.path().to_owned(), witness))
+        })
+        .collect()
+}
 pub async fn recover(app: &App) -> anyhow::Result<()> {
+    // Encoders of a previous process that are still alive keep their capacity until
+    // they are gone; their attempt directories are left alone until then.
+    let root = app.processing.root.clone();
+    for (path, witness) in tokio::task::spawn_blocking(move || held_witnesses(&root)).await? {
+        app.processing.execution.recovered(
+            format!("recovered:{}", path.display()),
+            playscale_core::work::Class::Preparation,
+            1,
+            witness,
+            || {},
+        );
+    }
     // A DB-only restore must not borrow another installation's disposable cache.
     sqlx::query("UPDATE media_files SET available=0 WHERE generated=1 AND library_id IN (SELECT id FROM libraries WHERE managed=1 AND root<>?)")
         .bind(app.processing.root.to_string_lossy().as_ref()).execute(&app.db).await?;
@@ -396,13 +430,15 @@ async fn command(
     app: &App,
     job: &ProcessingJob,
     stop: &CancellationToken,
+    lease: &crate::execution::Lease,
+    owner: &FsPath,
     cmd: &mut Command,
     progress: bool,
 ) -> anyhow::Result<()> {
     // A separate supervisor watches this pipe. Even SIGKILL of the server closes
     // it, so an encoder cannot outlive its owner and overlap a recovered attempt.
     let command = cmd.as_std();
-    let mut supervisor = Command::new(std::env::current_exe()?);
+    let mut supervisor = Command::new(&app.processing.supervisor);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(command.get_program())
@@ -410,7 +446,13 @@ async fn command(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
-    let mut child = supervisor.spawn()?;
+    // The encoder tree inherits the witness; capacity returns only once it is free.
+    let (witness, held) = crate::execution::Witness::create(owner)?;
+    #[cfg(unix)]
+    crate::execution::inherit(&mut supervisor, &[&held.0]);
+    let child = supervisor.spawn();
+    drop(held);
+    let mut child = child?;
     let heartbeat = child.stdin.take();
     let mut stderr = child.stderr.take().context("missing encoder stderr")?;
     let diagnostics = tokio::spawn(async move {
@@ -440,17 +482,29 @@ async fn command(
         loop {tokio::select!{
             _=&mut deadline=>anyhow::bail!("processing timeout"),
             _=stop.cancelled()=>anyhow::bail!("server stopping"),
+            _=lease.termination_requested().cancelled()=>anyhow::bail!("termination requested"),
             status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");break;},
             line=lines.next_line(),if output_open=>{if let Some(line)=line? {if let Some(v)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()).filter(|v|v.is_finite()&&*v>=0.0){pending_progress=v/1_000_000.0;}}else{output_open=false;}},
             _=poll.tick()=>{active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
         }} Ok(())
     }.await;
     drop(heartbeat);
-    if result.is_err() {
-        // EOF asks the supervisor to kill and reap its child. Dropping this future
-        // also closes the pipe; deliberately do not kill the supervisor first.
-        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-    }
+    // On failure, EOF asks the supervisor to terminate the encoder's process group;
+    // deliberately do not kill the supervisor first. Either way capacity is released
+    // only after the supervisor exits and the witness is free; otherwise the
+    // reservation is held as stuck.
+    let confirmed = crate::execution::confirm_exit(
+        lease,
+        result.is_err().then_some(child),
+        Some(witness),
+        crate::execution::TERMINATION_DEADLINE,
+        || {},
+    )
+    .await;
+    let result = result.and_then(|()| {
+        anyhow::ensure!(confirmed, "encoder descendants outlived the supervisor");
+        Ok(())
+    });
     if result.is_err()
         && let Ok(Ok(stderr)) = tokio::time::timeout(Duration::from_secs(1), diagnostics).await
     {
@@ -463,6 +517,7 @@ async fn convert(
     job: &ProcessingJob,
     stop: &CancellationToken,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    lease: &crate::execution::Lease,
 ) -> anyhow::Result<(scan::Found, String)> {
     active(app, job, stop).await?;
     let source: db::ItemRow =
@@ -618,7 +673,16 @@ async fn convert(
         .arg(app.processing.settings.max_output_bytes.to_string())
         .args(["-progress", "pipe:1", "-stats_period", "0.2", "-f", "mp4"])
         .arg(&output);
-    command(app, job, stop, &mut cmd, true).await?;
+    command(
+        app,
+        job,
+        stop,
+        lease,
+        &directory.join(".owner"),
+        &mut cmd,
+        true,
+    )
+    .await?;
     let found = scan::inspect(
         app.processing.root.clone(),
         job.relative().join("output.mp4"),
@@ -678,7 +742,16 @@ async fn convert(
             "null",
             "-",
         ]);
-    command(app, job, stop, &mut decode, false).await?;
+    command(
+        app,
+        job,
+        stop,
+        lease,
+        &directory.join(".owner"),
+        &mut decode,
+        false,
+    )
+    .await?;
     let (root, identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&source.library_id)
@@ -822,6 +895,21 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
         if stop.is_cancelled() {
             return Ok(());
         }
+        // Hold no capacity while idle: only reserve when work is queued.
+        let queued: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM processing_jobs WHERE phase='queued' LIMIT 1")
+                .fetch_optional(&app.db)
+                .await?;
+        if queued.is_none() {
+            tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(500))=>{}}
+            continue;
+        }
+        // Reserve encoder capacity before any I/O permit, so a stuck previous worker
+        // blocks replacement here without holding up maintenance.
+        let lease = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            lease = app.processing.execution.reserve(format!("processing:{}", new_id()), playscale_core::work::Class::Preparation, 1) => lease.map_err(|e| anyhow::anyhow!("encoder reservation rejected: {e:?}"))?,
+        };
         let permit = tokio::select! {_ = stop.cancelled()=>return Ok(()),p=app.processing.io.clone().acquire_owned()=>Arc::new(p?)};
         let job = {
             let _lock = app.jobs.lock().await;
@@ -846,7 +934,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
         if let Some(job) = job {
             // Do not detach a blocked snapshot and start another job. The permit and this
             // waiter both remain until it finishes; cancellation is checked before FFmpeg.
-            let result = convert(&app, &job, &stop, permit.clone()).await;
+            let result = convert(&app, &job, &stop, permit.clone(), &lease).await;
             if stop.is_cancelled() {
                 return Ok(());
             }
@@ -854,7 +942,8 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 tracing::warn!(job_id=%job.id,%error,"processing failed");
             }
             finish(&app, &job, result.ok()).await?;
-            if load(&app, &job.id).await?.phase != "completed" {
+            // A stuck attempt's directory holds its live witness: keep it for recovery.
+            if load(&app, &job.id).await?.phase != "completed" && !lease.is_stuck() {
                 let directory = app.processing.root.join(job.relative());
                 blocking(permit.clone(), move || {
                     if directory.exists() {
@@ -866,39 +955,195 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             }
         }
         drop(permit);
+        drop(lease);
         tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
 }
 
 /// Private child entry point. No HTTP caller can supply executable arguments.
 pub fn supervise_encoder(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<i32> {
-    use std::{
-        io::Read,
-        sync::atomic::{AtomicBool, Ordering},
-    };
     let mut args = args;
     let program = args.next().context("missing encoder")?;
+    supervise(program, args.collect(), std::io::stdin(), SUPERVISOR_GRACE)
+}
+
+/// Time between asking an encoder's process group to stop and killing it.
+pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `program` in its own process group and own that group until it is gone.
+/// EOF on `control` (the server closed the pipe or died) terminates the group:
+/// SIGTERM, then SIGKILL after `grace`. A natural exit also kills any remaining
+/// group members. The group is signalled only while the leader is an unreaped
+/// child, so its ID cannot have been reused by an unrelated process group.
+/// Descendants that create their own session or group escape this containment.
+pub fn supervise(
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+    control: impl std::io::Read + Send + 'static,
+    grace: Duration,
+) -> anyhow::Result<i32> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let alive = Arc::new(AtomicBool::new(true));
     let flag = alive.clone();
     std::thread::spawn(move || {
+        let mut control = control;
         let mut byte = [0u8; 1];
-        let _ = std::io::stdin().read(&mut byte);
+        // Any byte or EOF ends supervision; the server never writes.
+        let _ = control.read(&mut byte);
         flag.store(false, Ordering::SeqCst);
     });
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .spawn()?;
+    let mut command = std::process::Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if group::exited(&mut child)? {
+            group::signal(&mut child, group::Signal::Kill);
+            let status = child.wait()?;
+            group::wait_empty(&child);
             return Ok(status.code().unwrap_or(1));
         }
         if !alive.load(Ordering::SeqCst) {
-            let _ = child.kill();
+            group::signal(&mut child, group::Signal::Terminate);
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline && !group::exited(&mut child)? {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            group::signal(&mut child, group::Signal::Kill);
             let _ = child.wait();
+            group::wait_empty(&child);
             return Ok(1);
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+mod group {
+    pub enum Signal {
+        Terminate,
+        Kill,
+    }
+    /// Whether the child exited, without reaping it (its PID/PGID stay reserved).
+    #[cfg(unix)]
+    pub fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { info.si_pid() } != 0)
+    }
+    /// After the leader is reaped, wait (bounded) until no member of its group
+    /// remains. The group ID cannot be reused while any member exists, and only
+    /// the null signal is sent here, so a later reuse cannot be harmed. The
+    /// execution witness remains the server's authoritative evidence.
+    #[cfg(unix)]
+    pub fn wait_empty(child: &std::process::Child) {
+        let group = -(child.id() as libc::pid_t);
+        for _ in 0..400 {
+            if unsafe { libc::kill(group, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    #[cfg(not(unix))]
+    pub fn wait_empty(_: &std::process::Child) {}
+    #[cfg(unix)]
+    pub fn signal(child: &mut std::process::Child, signal: Signal) {
+        let signal = match signal {
+            Signal::Terminate => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+        };
+        // ESRCH (group already empty) is expected and ignored.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), signal);
+        }
+    }
+    // Without a Job Object adapter only the direct child is owned. It is killed
+    // through its handle, never by a possibly reused PID.
+    #[cfg(not(unix))]
+    pub fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+        Ok(child.try_wait()?.is_some())
+    }
+    #[cfg(not(unix))]
+    pub fn signal(child: &mut std::process::Child, _: Signal) {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod supervisor_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+    fn wait_gone(pid: i32) -> bool {
+        (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            !alive(pid)
+        })
+    }
+    fn grandchild(dir: &FsPath) -> i32 {
+        let path = dir.join("pid");
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("grandchild did not start");
+    }
+
+    #[test]
+    fn control_eof_kills_whole_group_including_term_ignoring_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "trap '' TERM; (trap '' TERM; exec sleep 300) & echo $! > {}/pid; wait",
+            dir.path().display()
+        );
+        let (server, supervisor) = UnixStream::pair().unwrap();
+        let task = std::thread::spawn(move || {
+            supervise(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                supervisor,
+                Duration::from_millis(200),
+            )
+        });
+        let pid = grandchild(dir.path());
+        assert!(alive(pid));
+        drop(server);
+        assert_eq!(task.join().unwrap().unwrap(), 1);
+        assert!(wait_gone(pid), "descendant survived supervisor");
+    }
+
+    #[test]
+    fn natural_exit_cleans_up_remaining_group_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!("sleep 300 & echo $! > {}/pid; exit 3", dir.path().display());
+        let (_server, supervisor) = UnixStream::pair().unwrap();
+        let code = supervise(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            supervisor,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+        assert!(wait_gone(grandchild(dir.path())));
     }
 }
 

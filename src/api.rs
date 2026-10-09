@@ -628,6 +628,11 @@ pub fn router_with(
         ))
         .routes(routes!(crate::viewing::continue_watching))
         .routes(routes!(crate::viewing::next_episode))
+        .routes(routes!(crate::delivery::create))
+        .routes(routes!(crate::delivery::get, crate::delivery::close))
+        .routes(routes!(crate::delivery::heartbeat))
+        .routes(routes!(crate::delivery::change))
+        .routes(routes!(crate::delivery::activate))
         .split_for_parts();
     spec.info.title = "Playscale core API".into();
     spec.info.version = "1".into();
@@ -709,6 +714,18 @@ pub fn router_with(
             get(|| async { Json(serde_json::json!({"status":"ok"})) }),
         )
         .route("/media/{id}", get(media::serve).head(media::serve))
+        .route(
+            "/api/v1/streams/{id}/{generation}/index.m3u8",
+            get(crate::delivery::playlist),
+        )
+        .route(
+            "/api/v1/streams/{id}/{generation}/init.mp4",
+            get(crate::delivery::init),
+        )
+        .route(
+            "/api/v1/streams/{id}/{generation}/segments/{segment}",
+            get(crate::delivery::segment),
+        )
         .route(
             "/app.js",
             get(|| async {
