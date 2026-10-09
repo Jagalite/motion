@@ -1,0 +1,21 @@
+{
+  "description": "Hand-authored filename parsing fixtures. Parser output is evidence for match proposals only; it never writes catalog identity.",
+  "cases": [
+    {"stem": "The.Matrix.1999.1080p.BluRay.x264", "expected": {"title": "The Matrix", "year": 1999, "season": null, "episodes": [], "edition": null}},
+    {"stem": "Blade Runner (1982) [Final Cut] 2160p", "expected": {"title": "Blade Runner", "year": 1982, "season": null, "episodes": [], "edition": "Final Cut"}},
+    {"stem": "[Group] Some Show - S01E02 - Pilot", "expected": {"title": "Some Show", "year": null, "season": 1, "episodes": [2], "edition": null}},
+    {"stem": "Show.Name.S02E03E04.720p.WEB-DL", "expected": {"title": "Show Name", "year": null, "season": 2, "episodes": [3, 4], "edition": null}},
+    {"stem": "Special.Show.S00E01", "expected": {"title": "Special Show", "year": null, "season": 0, "episodes": [1], "edition": null}},
+    {"stem": "1917 (2019)", "expected": {"title": "1917", "year": 2019, "season": null, "episodes": [], "edition": null}},
+    {"stem": "2001 A Space Odyssey 1968 Remastered", "expected": {"title": "2001 A Space Odyssey", "year": 1968, "season": null, "episodes": [], "edition": "Remastered"}},
+    {"stem": "Aliens.1986.Directors.Cut.REMUX", "expected": {"title": "Aliens", "year": 1986, "season": null, "episodes": [], "edition": "Director's Cut"}},
+    {"stem": "home_video_clip", "expected": {"title": "home video clip", "year": null, "season": null, "episodes": [], "edition": null}},
+    {"stem": "[only brackets]", "expected": {"title": "[only brackets]", "year": null, "season": null, "episodes": [], "edition": null}}
+  ],
+  "normalize": [
+    ["The Matrix", "the matrix"],
+    ["Director's  Cut!", "directors cut"],
+    ["  Amélie: Le Fabuleux  ", "amélie le fabuleux"],
+    ["WALL·E", "wall e"]
+  ]
+}

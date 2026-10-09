@@ -1,4 +1,5 @@
-//! Identity reconciliation for a complete, successfully inspected inventory.
+//! Identity reconciliation for one traversal attempt. Absence is inferred only
+//! inside directories whose complete listing the attempt proved.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,44 +15,165 @@ pub struct Observed {
     pub path: String,
     pub revision: String,
 }
+
+/// Directory enumeration evidence. Paths are source-relative with `/`
+/// separators; the root directory is `""`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Coverage {
+    /// Every directory was listed completely and every listed file inspected.
+    Complete,
+    /// `complete` directories were listed with every media file inspected.
+    /// `incomplete` directories were encountered but not proven: unreadable,
+    /// unvisited, capped, a mount boundary, or holding a failed inspection.
+    Listed {
+        complete: BTreeSet<String>,
+        incomplete: BTreeSet<String>,
+    },
+}
+impl Coverage {
+    /// A path's absence is proven by the nearest encountered ancestor: its own
+    /// directory listed completely, or a completely listed ancestor in which the
+    /// intermediate directory no longer appeared.
+    pub fn covers(&self, path: &str) -> bool {
+        let Self::Listed {
+            complete,
+            incomplete,
+        } = self
+        else {
+            return true;
+        };
+        let mut dir = parent(path);
+        loop {
+            if incomplete.contains(dir) {
+                return false;
+            }
+            if complete.contains(dir) {
+                return true;
+            }
+            if dir.is_empty() {
+                return false;
+            }
+            dir = parent(dir);
+        }
+    }
+}
+pub fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Assignment {
+    /// Same occurrence: unchanged path, or a proven unique move.
+    Existing { id: String, edition: String },
+    /// A new occurrence of verified content already held by exactly one
+    /// edition: a backup copy, not a new work or edition.
+    Copy { edition: String },
+    /// Unknown content, or content held by several editions (ambiguous).
+    New,
+    /// Content no edition held before, already observed earlier in this same
+    /// attempt at the given index: another occurrence of whatever that earlier
+    /// observation was assigned to.
+    CopyOf { observation: usize },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
+    /// Known occurrences proven absent by covered directory listings.
     pub unavailable: Vec<String>,
-    /// One entry per observation; None requests a new identity.
-    pub identities: Vec<Option<(String, String)>>,
+    /// One entry per observation.
+    pub assignments: Vec<Assignment>,
 }
+
 pub fn reconcile(old: &[Existing], found: &[Observed]) -> Plan {
+    reconcile_covered(old, found, &Coverage::Complete)
+}
+
+pub fn reconcile_covered(old: &[Existing], found: &[Observed], coverage: &Coverage) -> Plan {
     let observed: BTreeSet<_> = found.iter().map(|f| f.path.as_str()).collect();
     let by_path: BTreeMap<_, _> = old.iter().map(|f| (f.path.as_str(), f)).collect();
+    let absent = |f: &&Existing| !observed.contains(f.path.as_str());
+    // Previously known content not seen at its path, split by whether the
+    // attempt proved the absence. An unproven one may still exist, so it makes
+    // any move of the same content ambiguous.
     let mut missing: BTreeMap<&str, Vec<&Existing>> = BTreeMap::new();
-    for file in old.iter().filter(|f| !observed.contains(f.path.as_str())) {
-        missing.entry(&file.revision).or_default().push(file);
+    let mut unproven: BTreeSet<&str> = BTreeSet::new();
+    for file in old.iter().filter(absent) {
+        if coverage.covers(&file.path) {
+            missing.entry(&file.revision).or_default().push(file);
+        } else {
+            unproven.insert(&file.revision);
+        }
     }
     let mut counts = BTreeMap::new();
     for file in found {
         *counts.entry(file.revision.as_str()).or_insert(0usize) += 1;
     }
-    let identities = found
+    let mut editions: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for file in old {
+        editions
+            .entry(&file.revision)
+            .or_default()
+            .insert(&file.edition);
+    }
+    let mut first_seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let assignments = found
         .iter()
-        .map(|file| {
-            by_path
-                .get(file.path.as_str())
-                .copied()
-                .or_else(|| {
-                    let candidates = missing.get(file.revision.as_str())?;
-                    (candidates.len() == 1 && counts.get(file.revision.as_str()) == Some(&1))
-                        .then_some(candidates[0])
-                })
-                .map(|f| (f.id.clone(), f.edition.clone()))
+        .enumerate()
+        .map(|(index, file)| {
+            let earlier = *first_seen.entry(file.revision.as_str()).or_insert(index);
+            if let Some(f) = by_path.get(file.path.as_str()) {
+                return Assignment::Existing {
+                    id: f.id.clone(),
+                    edition: f.edition.clone(),
+                };
+            }
+            let revision = file.revision.as_str();
+            if let Some([only]) = missing.get(revision).map(Vec::as_slice)
+                && counts.get(revision) == Some(&1)
+                && !unproven.contains(revision)
+            {
+                return Assignment::Existing {
+                    id: only.id.clone(),
+                    edition: only.edition.clone(),
+                };
+            }
+            match editions.get(revision).map(|e| e.iter().collect::<Vec<_>>()) {
+                Some(one) if one.len() == 1 => Assignment::Copy {
+                    edition: one[0].to_string(),
+                },
+                // Known content in several editions is ambiguous: a new work.
+                Some(_) => Assignment::New,
+                None if earlier < index => Assignment::CopyOf {
+                    observation: earlier,
+                },
+                None => Assignment::New,
+            }
         })
         .collect();
     Plan {
         unavailable: old
             .iter()
-            .filter(|f| !observed.contains(f.path.as_str()))
+            .filter(absent)
+            .filter(|f| coverage.covers(&f.path))
             .map(|f| f.id.clone())
             .collect(),
-        identities,
+        assignments,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Complete,
+    Partial,
+}
+/// A traversal that could not list its root proves nothing and publishes
+/// nothing; one that listed the root publishes what it covered.
+pub fn outcome(root_listed: bool, incomplete_directories: usize) -> Option<Outcome> {
+    match (root_listed, incomplete_directories) {
+        (false, _) => None,
+        (true, 0) => Some(Outcome::Complete),
+        (true, _) => Some(Outcome::Partial),
     }
 }
 
