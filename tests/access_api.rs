@@ -1315,3 +1315,301 @@ fn deployments_are_restricted_unless_household_is_chosen() {
         AccessMode::Restricted
     );
 }
+
+impl Fixture {
+    /// Scan one file into the library and return (file_id, revision).
+    async fn scanned_file(&self, name: &str, bytes: &[u8]) -> (String, String) {
+        std::fs::write(self._dir.path().join("media").join(name), bytes).unwrap();
+        let job = db::enqueue_mode(&self.app, &self.library, false)
+            .await
+            .unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(playscale::scan::worker(self.app.clone(), stop.clone()));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let row = db::get_job(&self.app.db, &job.id).await.unwrap();
+                if !["queued", "running", "cancelling"].contains(&row.phase.as_str()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.cancel();
+        task.await.unwrap().unwrap();
+        sqlx::query_as("SELECT id,revision FROM media_files WHERE relative_path=?")
+            .bind(name)
+            .fetch_one(&self.app.db)
+            .await
+            .unwrap()
+    }
+
+    /// Give a paired device access to the fixture library.
+    async fn grant_library(&self, device_id: &str, permissions: &[&str]) {
+        let etag = self.device_etag(device_id).await;
+        let reply = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device_id}/policy"),
+                Some(json!({"library_ids":[self.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[],"permissions":permissions})),
+                &[("authorization", &bearer(OPERATOR)), ("if-match", &etag)],
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    }
+
+    async fn device_etag(&self, device_id: &str) -> String {
+        self.call(
+            "GET",
+            &format!("/api/v2/devices/{device_id}"),
+            None,
+            &[("authorization", &bearer(OPERATOR))],
+        )
+        .await
+        .headers["etag"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn bytes(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let response = self.raw(self.request("GET", path, None, headers)).await;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        (status, headers, body)
+    }
+}
+
+#[tokio::test]
+async fn media_bytes_require_scope_and_byte_permission() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (file, revision) = f.scanned_file("film.mp4", b"0123456789").await;
+    let path = format!("/api/v2/media/files/{file}/content?revision={revision}");
+    let (viewer_id, viewer) = f.pair(&["default"], &["catalog:read"]).await;
+    f.grant_library(&viewer_id, &["catalog:read", "playback:request"])
+        .await;
+    let (_, outsider) = f
+        .pair(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    let (reader_id, reader) = f.pair(&["default"], &["catalog:read"]).await;
+    f.grant_library(&reader_id, &["catalog:read"]).await;
+
+    let (status, headers, body) = f.bytes(&path, &[("authorization", &bearer(&viewer))]).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"0123456789"[..])
+    );
+    assert_eq!(headers["etag"], format!("\"{revision}\"").as_str());
+    let (status, headers, body) = f
+        .bytes(
+            &path,
+            &[("authorization", &bearer(&viewer)), ("range", "bytes=2-4")],
+        )
+        .await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::PARTIAL_CONTENT, &b"234"[..])
+    );
+    assert_eq!(headers["content-range"], "bytes 2-4/10");
+    // Unsatisfiable ranges keep their protocol headers.
+    let (status, headers, _) = f
+        .bytes(
+            &path,
+            &[
+                ("authorization", &bearer(&viewer)),
+                ("range", "bytes=50-60"),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(headers["content-range"], "bytes */10");
+    let head = f
+        .raw(f.request("HEAD", &path, None, &[("authorization", &bearer(&viewer))]))
+        .await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(
+        head.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+
+    // Outside the library: indistinguishable from missing. Metadata-only: denied.
+    let (status, _, _) = f
+        .bytes(&path, &[("authorization", &bearer(&outsider))])
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = f
+        .bytes(
+            "/api/v2/media/files/nope/content",
+            &[("authorization", &bearer(&outsider))],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = f.bytes(&path, &[("authorization", &bearer(&reader))]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = f.bytes(&path, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A stale revision is a conflict, not stale bytes.
+    let (status, _, _) = f
+        .bytes(
+            &format!("/api/v2/media/files/{file}/content?revision=old"),
+            &[("authorization", &bearer(&viewer))],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn content_tickets_are_narrow_revocable_and_replayable() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (file, revision) = f.scanned_file("film.mp4", b"0123456789").await;
+    let (other_file, _) = f.scanned_file("other.mp4", b"abc").await;
+    let (device_id, token) = f.pair(&["default"], &["catalog:read"]).await;
+    f.grant_library(&device_id, &["catalog:read", "playback:request"])
+        .await;
+    let auth = bearer(&token);
+    let request = |purpose: &str| {
+        json!({"purpose":purpose,"delivery_id":null,"generation":null,
+               "file":{"file_id":file,"file_revision":revision},"download_id":null,"ttl_seconds":600})
+    };
+    let create = |body: Value, key: &'static str| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            f.call(
+                "POST",
+                "/api/v2/content-access",
+                Some(body),
+                &[("authorization", &auth), ("idempotency-key", key)],
+            )
+            .await
+        }
+    };
+    let ticket = create(request("playback"), "ticket-key-000001").await;
+    assert_eq!(ticket.status, StatusCode::CREATED, "{:?}", ticket.body);
+    let url = ticket.body["url"].as_str().unwrap().to_owned();
+    assert!(url.starts_with(&format!("/api/v2/media/files/{file}/content?revision=")));
+    let replay = create(request("playback"), "ticket-key-000001").await;
+    assert_eq!(replay.body, ticket.body);
+    let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM content_tickets")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(tickets, 1);
+
+    // The ticket alone admits exactly that file and revision.
+    let (status, _, body) = f.bytes(&url, &[]).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"0123456789"[..])
+    );
+    let token_param = url.split("ticket=").nth(1).unwrap();
+    let (status, _, _) = f
+        .bytes(
+            &format!("/api/v2/media/files/{other_file}/content?ticket={token_param}"),
+            &[],
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Tickets do not authenticate JSON operations.
+    let me = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("authorization", &bearer(token_param))],
+        )
+        .await;
+    assert_eq!(me.status, StatusCode::UNAUTHORIZED);
+
+    // Purpose, family and revision rules.
+    problem(
+        &create(request("download"), "ticket-key-000002").await,
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    );
+    problem(
+        &create(request("cast"), "ticket-key-000003").await,
+        StatusCode::FORBIDDEN,
+        "cast_unavailable",
+    );
+    let mut stale = request("playback");
+    stale["file"]["file_revision"] = json!("old");
+    problem(
+        &create(stale, "ticket-key-000004").await,
+        StatusCode::CONFLICT,
+        "source_revision_changed",
+    );
+    let mut both = request("playback");
+    both["download_id"] = json!("d1");
+    problem(
+        &create(both, "ticket-key-000005").await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_resource_family",
+    );
+    let delivery = json!({"purpose":"playback","delivery_id":"d1","generation":"1","file":null,"download_id":null,"ttl_seconds":60});
+    problem(
+        &create(delivery, "ticket-key-000006").await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+
+    // Revocation by another principal is invisible; by the owner it applies.
+    let id = ticket.body["id"].as_str().unwrap();
+    let (_, stranger) = f.pair(&["default"], &["catalog:read"]).await;
+    let denied = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/content-access/{id}"),
+            None,
+            &[("authorization", &bearer(&stranger))],
+        )
+        .await;
+    problem(&denied, StatusCode::NOT_FOUND, "not_found");
+    let second = create(request("playback"), "ticket-key-000007").await;
+    let second_url = second.body["url"].as_str().unwrap().to_owned();
+    let revoked = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/content-access/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT);
+    let (status, _, _) = f.bytes(&url, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Narrowing the device's policy applies to tickets already issued.
+    f.grant_library(&device_id, &["catalog:read"]).await;
+    let (status, _, _) = f.bytes(&second_url, &[]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Revoking the device kills every ticket it issued.
+    let etag = f.device_etag(&device_id).await;
+    let revoke = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{device_id}"),
+            None,
+            &[("authorization", &bearer(OPERATOR)), ("if-match", &etag)],
+        )
+        .await;
+    assert_eq!(revoke.status, StatusCode::NO_CONTENT);
+    let (status, _, _) = f.bytes(&second_url, &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

@@ -60,6 +60,7 @@ pub enum Purpose {
     Access,
     Session,
     PairingCode,
+    Ticket,
 }
 
 impl Purpose {
@@ -69,6 +70,7 @@ impl Purpose {
             Self::Access => "mat",
             Self::Session => "mss",
             Self::PairingCode => "mdc",
+            Self::Ticket => "mtk",
         }
     }
 }
