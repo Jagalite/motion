@@ -37,7 +37,7 @@ def main():
         base=pathlib.Path(directory);media=base/'media';media.mkdir();state=base/'state';fixture=media/'Signal-Garden.mp4'
         subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc2=size=320x180:rate=24','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','3','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-movflags','+faststart',str(fixture)],check=True)
         payload=fixture.read_bytes();port=free_port();log=(base/'server.log').open('wb')
-        command=[str(BINARY),'--listen',f'127.0.0.1:{port}','--data-dir',str(state),'--library',str(media),'--demuxe-dir',str(ROOT/'web/vendor/demuxe')]
+        command=[str(BINARY),'--access-mode','trusted_household','--listen',f'127.0.0.1:{port}','--data-dir',str(state),'--library',str(media),'--demuxe-dir',str(ROOT/'web/vendor/demuxe')]
         process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
         try:
             wait_for(lambda:request(port,'GET','/health')[0]==200)
@@ -60,7 +60,7 @@ def main():
             process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT);wait_for(lambda:request(port,'GET','/health')[0]==200)
             assert json.loads(request(port,'GET',progress)[2])['position_seconds']==1.25;assert catalog()['title']=='Imported Signal';checks.append('restart_preserves_progress_and_curation')
             # A second owner must fail without touching the running catalog.
-            second=subprocess.run([str(BINARY),'--listen',f'127.0.0.1:{free_port()}','--data-dir',str(state)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+            second=subprocess.run([str(BINARY),'--access-mode','trusted_household','--listen',f'127.0.0.1:{free_port()}','--data-dir',str(state)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
             assert second.returncode!=0;checks.append('single_owner_lock')
         finally:
             stop(process);log.close()

@@ -927,6 +927,10 @@ mod publication_tests {
                 Default::default(),
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
         };
         let output = || {
             Some((

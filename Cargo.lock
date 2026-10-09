@@ -1366,6 +1366,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures-core",
+ "hmac",
  "http-body-util",
  "httpdate",
  "image",
