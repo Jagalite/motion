@@ -273,7 +273,7 @@ pub async fn decide(
         let candidate = identification.candidate;
         if let Some(target) = &candidate.item_id {
             let versions: i64 = sqlx::query_scalar(
-                "SELECT count(DISTINCT f.edition_id||':'||f.revision) FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?",
+                "SELECT count(*) FROM media_versions v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE e.item_id=?",
             )
             .bind(&item)
             .fetch_one(&mut *tx)

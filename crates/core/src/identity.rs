@@ -769,3 +769,87 @@ pub fn external_namespace(provider: &str, kind: &str) -> Option<String> {
     };
     valid(&provider).then(|| format!("{provider}:{kind}"))
 }
+
+// ---------------------------------------------------------------------------
+// Version availability and replacement
+
+/// An observed physical occurrence: a file record and its current content.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Occurrence {
+    pub file_id: Id,
+    pub revision: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    /// Every part's reviewed content has an available occurrence.
+    Available,
+    /// A bound file now holds different content and no other occurrence holds
+    /// the reviewed content: an operator must confirm before it is used.
+    Stale,
+    /// Some reviewed content is not currently reachable.
+    Unavailable,
+}
+
+/// Derived, never stored: copies anywhere are interchangeable occurrences of
+/// the same verified content.
+pub fn version_availability(bindings: &[Binding], occurrences: &[Occurrence]) -> Availability {
+    let mut stale = false;
+    for binding in bindings {
+        if occurrences
+            .iter()
+            .any(|o| o.available && o.revision == binding.revision)
+        {
+            continue;
+        }
+        if occurrences
+            .iter()
+            .any(|o| o.file_id == binding.file_id && o.revision != binding.revision)
+        {
+            stale = true;
+            continue;
+        }
+        return Availability::Unavailable;
+    }
+    if stale {
+        Availability::Stale
+    } else {
+        Availability::Available
+    }
+}
+
+/// Operator confirmation that replaced bytes still represent this version's
+/// timeline. Re-pins every replaced part to its file's current revision under
+/// the reviewed version revision; the equivalence becomes `Declared`.
+pub fn confirm_replacement(
+    version: &Version,
+    current_revision: u64,
+    expected_revision: u64,
+    occurrences: &[Occurrence],
+) -> Result<(Version, u64), IdentityError> {
+    if current_revision != expected_revision {
+        return Err(IdentityError::StaleRevision(version.id.clone()));
+    }
+    let next_revision = current_revision
+        .checked_add(1)
+        .ok_or_else(|| IdentityError::RevisionExhausted(version.id.clone()))?;
+    let mut next = version.clone();
+    let mut changed = false;
+    for binding in &mut next.bindings {
+        let current = occurrences
+            .iter()
+            .find(|o| o.file_id == binding.file_id)
+            .ok_or_else(|| invalid("bound file is not cataloged"))?;
+        if current.revision != binding.revision {
+            binding.revision = current.revision.clone();
+            changed = true;
+        }
+    }
+    if !changed {
+        return Err(invalid("no bound file was replaced"));
+    }
+    next.equivalence = Equivalence::Declared;
+    Ok((next, next_revision))
+}

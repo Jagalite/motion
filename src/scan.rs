@@ -549,6 +549,7 @@ async fn finish(
         let mut assigned: Vec<String> = Vec::with_capacity(files.len());
         for (file, assignment) in files.into_iter().zip(plan.assignments) {
             use playscale_core::scan::Assignment;
+            let mut first_version = false;
             let (id, edition) = match assignment {
                 Assignment::CopyOf { observation } => (
                     new_id(),
@@ -582,17 +583,28 @@ async fn finish(
                         .bind(&file.title)
                         .execute(&mut *tx)
                         .await?;
-                    sqlx::query("INSERT INTO editions (id,item_id,label) VALUES (?,?,'Original')")
-                        .bind(&edition)
-                        .bind(item)
-                        .execute(&mut *tx)
-                        .await?;
+                    crate::curation::create_edition(&mut tx, &edition, &item, "Original").await?;
+                    first_version = true;
                     (new_id(), edition)
                 }
             };
             assigned.push(edition.clone());
+            let file_id = id.clone();
+            let edition_timeline = edition.clone();
             sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
                 .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
+            if first_version {
+                // Unknown equivalence is permitted only in the new, empty timeline.
+                crate::curation::create_version(
+                    &mut tx,
+                    &edition_timeline,
+                    &file_id,
+                    playscale_core::identity::Origin::Original,
+                    playscale_core::identity::Equivalence::Unknown,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
         }
     }
     crate::matching::invalidate_changed(&mut tx).await?;
