@@ -45,7 +45,7 @@ async fn record(db: &SqlitePool, kind: &str, document: &serde_json::Value) -> an
 }
 
 /// Attribute work-keyed legacy progress to one timeline only when exactly one
-/// legacy timeline (edition) holds original media. Ambiguous and orphaned records
+/// timeline holds an original version. Ambiguous and orphaned records
 /// are preserved with their candidates for user correction; nothing is copied.
 async fn legacy_progress(db: &SqlitePool) -> anyhow::Result<()> {
     let mut tx = crate::db::begin_write(db).await?;
@@ -66,7 +66,7 @@ async fn legacy_progress(db: &SqlitePool) -> anyhow::Result<()> {
     let mut rows = Vec::new();
     for (profile, item) in keys {
         let timelines: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT e.id,(SELECT count(*) FROM media_files f WHERE f.edition_id=e.id AND f.generated=0) FROM editions e WHERE e.item_id=? ORDER BY e.id",
+            "SELECT t.id,(SELECT count(*) FROM media_versions v WHERE v.timeline_id=t.id AND v.origin='original') FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE e.item_id=? ORDER BY t.id",
         )
         .bind(&item)
         .fetch_all(&mut *tx)

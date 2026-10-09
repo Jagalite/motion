@@ -1,10 +1,12 @@
-//! Merge/split use cases over the legacy catalog tables. Decisions come from
+//! Catalog structure use cases: merge, split, file reassignment, version
+//! creation and replacement confirmation. Decisions come from
 //! `playscale_core::identity`; this adapter loads the affected aggregates inside
-//! the writer transaction and applies the returned moves literally.
+//! the writer transaction and applies the returned changes literally.
 //!
-//! Legacy storage mapping: an edition has exactly one timeline whose ID is the
-//! edition ID; a version is the set of an edition's files sharing one revision,
-//! identified by its smallest file ID (other files are copies/occurrences).
+//! Storage: `timelines` belong to editions, `media_versions` to timelines, and
+//! `version_files` bind each part to a file record pinned at the reviewed content
+//! revision. `media_files.edition_id` remains the file's edition; files sharing
+//! a pinned revision are occurrences (copies) of that content.
 use crate::{App, new_id, now};
 use playscale_core::identity::{
     self, Aggregate, Binding, Edition, Equivalence, Id, IdentityError, MergePlan, MergeRequest,
@@ -83,37 +85,37 @@ pub async fn load_aggregate(
             .await?;
     let mut out = Vec::new();
     for (id, label) in editions {
-        let versions: Vec<(String, String, bool)> = sqlx::query_as(
-            "SELECT min(id),revision,max(generated) FROM media_files WHERE edition_id=? GROUP BY revision ORDER BY min(id)",
-        )
-        .bind(&id)
-        .fetch_all(&mut *conn)
-        .await?;
+        let timeline_ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM timelines WHERE edition_id=? ORDER BY id")
+                .bind(&id)
+                .fetch_all(&mut *conn)
+                .await?;
+        let mut timelines = Vec::new();
+        for timeline in timeline_ids {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT id,origin,equivalence FROM media_versions WHERE timeline_id=? ORDER BY id",
+            )
+            .bind(&timeline)
+            .fetch_all(&mut *conn)
+            .await?;
+            let mut versions = Vec::new();
+            for (version, origin, equivalence) in rows {
+                versions.push(Version {
+                    bindings: bindings(conn, &version).await?,
+                    id: version,
+                    origin: enum_value(&origin)?,
+                    equivalence: enum_value(&equivalence)?,
+                });
+            }
+            timelines.push(Timeline {
+                id: timeline,
+                versions,
+            });
+        }
         out.push(Edition {
-            id: id.clone(),
+            id,
             label,
-            timelines: vec![Timeline {
-                id,
-                versions: versions
-                    .into_iter()
-                    .map(|(file, revision, generated)| Version {
-                        id: file.clone(),
-                        origin: if generated {
-                            Origin::Generated
-                        } else {
-                            Origin::Original
-                        },
-                        equivalence: Equivalence::Declared,
-                        bindings: vec![Binding {
-                            file_id: file,
-                            revision,
-                            part: 1,
-                            start_ms: None,
-                            end_ms: None,
-                        }],
-                    })
-                    .collect(),
-            }],
+            timelines,
         });
     }
     Ok(Some(Aggregate {
@@ -124,6 +126,39 @@ pub async fn load_aggregate(
         },
         editions: out,
     }))
+}
+
+fn enum_value<T: serde::de::DeserializeOwned>(name: &str) -> anyhow::Result<T> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        name.into(),
+    ))?)
+}
+fn enum_name<T: Serialize>(value: &T) -> anyhow::Result<String> {
+    Ok(serde_json::to_value(value)?
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
+}
+
+async fn bindings(conn: &mut SqliteConnection, version: &str) -> anyhow::Result<Vec<Binding>> {
+    type Row = (String, String, i64, Option<i64>, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT file_id,file_revision,part,start_ms,end_ms FROM version_files WHERE version_id=? ORDER BY part",
+    )
+    .bind(version)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter()
+        .map(|(file_id, revision, part, start, end)| {
+            Ok(Binding {
+                file_id,
+                revision,
+                part: u32::try_from(part)?,
+                start_ms: start.map(u64::try_from).transpose()?,
+                end_ms: end.map(u64::try_from).transpose()?,
+            })
+        })
+        .collect()
 }
 
 async fn participants(
@@ -314,27 +349,6 @@ async fn apply_merge(
     Ok(())
 }
 
-/// Legacy editions hold one timeline, so a fresh timeline is a fresh edition and
-/// shares its ID. Whole-timeline moves out of a multi-timeline edition cannot occur.
-fn legacy_split(mut plan: SplitPlan) -> Result<SplitPlan, CurationError> {
-    for step in &mut plan.moves {
-        match step {
-            SplitMove::Edition { .. } => {}
-            SplitMove::Versions {
-                new_edition,
-                new_timeline,
-                ..
-            } => *new_timeline = new_edition.clone(),
-            SplitMove::Timelines { .. } => {
-                return Err(CurationError::Storage(anyhow::anyhow!(
-                    "legacy editions hold exactly one timeline"
-                )));
-            }
-        }
-    }
-    Ok(plan)
-}
-
 pub async fn preview_split(
     db: &SqlitePool,
     request: &SplitRequest,
@@ -343,7 +357,7 @@ pub async fn preview_split(
     let current = load_aggregate(&mut conn, &request.item)
         .await?
         .ok_or_else(|| IdentityError::UnknownItem(request.item.clone()))?;
-    legacy_split(identity::plan_split(&current, request, &mut new_id)?)
+    Ok(identity::plan_split(&current, request, &mut new_id)?)
 }
 
 pub async fn commit_split(app: &App, reviewed: &SplitPlan) -> Result<Receipt, CurationError> {
@@ -355,7 +369,7 @@ pub async fn commit_split(app: &App, reviewed: &SplitPlan) -> Result<Receipt, Cu
         .fetch_one(&mut *tx)
         .await?
         > 0;
-    let fresh = legacy_split(identity::commit_split(reviewed, current.as_ref(), taken)?)?;
+    let fresh = identity::commit_split(reviewed, current.as_ref(), taken)?;
     let current = current.expect("commit_split requires the source");
     let receipt = receipt(&mut tx, "catalog:split", &fresh).await?;
     apply_split(&mut tx, &current, &fresh).await?;
@@ -395,53 +409,146 @@ async fn apply_split(
         .execute(&mut **tx)
         .await?;
     }
-    let revisions: BTreeMap<&str, &str> = current
-        .editions
-        .iter()
-        .flat_map(|e| &e.timelines)
-        .flat_map(|t| &t.versions)
-        .map(|v| (v.id.as_str(), v.bindings[0].revision.as_str()))
-        .collect();
+    // Where each timeline and version currently lives.
+    let mut edition_of_timeline = BTreeMap::new();
+    let mut versions_by_timeline: BTreeMap<&str, Vec<&Version>> = BTreeMap::new();
+    let mut labels = BTreeMap::new();
+    for edition in &current.editions {
+        labels.insert(edition.id.as_str(), edition.label.as_str());
+        for timeline in &edition.timelines {
+            edition_of_timeline.insert(timeline.id.as_str(), edition.id.as_str());
+            versions_by_timeline.insert(&timeline.id, timeline.versions.iter().collect());
+        }
+    }
+    let mut created = std::collections::BTreeSet::new();
+    // (from edition, new edition) -> versions moved between them.
+    let mut moved: BTreeMap<(&str, &str), Vec<&Version>> = BTreeMap::new();
     for step in &plan.moves {
-        match step {
+        let (from_edition, new_edition) = match step {
             SplitMove::Edition { edition } => {
-                let moved = sqlx::query("UPDATE editions SET item_id=? WHERE id=? AND item_id=?")
+                let changed = sqlx::query("UPDATE editions SET item_id=? WHERE id=? AND item_id=?")
                     .bind(&plan.new_item)
                     .bind(edition)
                     .bind(&plan.item)
                     .execute(&mut **tx)
                     .await?;
-                anyhow::ensure!(moved.rows_affected() == 1, "edition moved concurrently");
+                anyhow::ensure!(changed.rows_affected() == 1, "edition moved concurrently");
+                continue;
             }
+            SplitMove::Timelines {
+                from_edition,
+                new_edition,
+                ..
+            } => (from_edition.as_str(), new_edition.as_str()),
             SplitMove::Versions {
                 from_timeline,
                 new_edition,
+                ..
+            } => (
+                *edition_of_timeline
+                    .get(from_timeline.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("unknown timeline"))?,
+                new_edition.as_str(),
+            ),
+        };
+        if created.insert(new_edition) {
+            sqlx::query("INSERT INTO editions (id,item_id,label) VALUES (?,?,?)")
+                .bind(new_edition)
+                .bind(&plan.new_item)
+                .bind(labels.get(from_edition).copied().unwrap_or_default())
+                .execute(&mut **tx)
+                .await?;
+        }
+        let entry = moved.entry((from_edition, new_edition)).or_default();
+        match step {
+            SplitMove::Timelines { timelines, .. } => {
+                for timeline in timelines {
+                    sqlx::query("UPDATE timelines SET edition_id=? WHERE id=? AND edition_id=?")
+                        .bind(new_edition)
+                        .bind(timeline)
+                        .bind(from_edition)
+                        .execute(&mut **tx)
+                        .await?;
+                    entry.extend(
+                        versions_by_timeline
+                            .get(timeline.as_str())
+                            .into_iter()
+                            .flatten(),
+                    );
+                }
+            }
+            SplitMove::Versions {
+                from_timeline,
+                new_timeline,
                 versions,
                 ..
             } => {
-                sqlx::query("INSERT INTO editions (id,item_id,label) SELECT ?,?,label FROM editions WHERE id=?")
-                    .bind(new_edition).bind(&plan.new_item).bind(from_timeline).execute(&mut **tx).await?;
-                for version in versions {
-                    let revision = revisions
-                        .get(version.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("unknown version"))?;
-                    sqlx::query(
-                        "UPDATE media_files SET edition_id=? WHERE edition_id=? AND revision=?",
-                    )
+                sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+                    .bind(new_timeline)
                     .bind(new_edition)
+                    .execute(&mut **tx)
+                    .await?;
+                for version in versions {
+                    sqlx::query(
+                        "UPDATE media_versions SET timeline_id=? WHERE id=? AND timeline_id=?",
+                    )
+                    .bind(new_timeline)
+                    .bind(version)
                     .bind(from_timeline)
-                    .bind(revision)
                     .execute(&mut **tx)
                     .await?;
                 }
+                entry.extend(
+                    versions_by_timeline
+                        .get(from_timeline.as_str())
+                        .into_iter()
+                        .flatten()
+                        .filter(|v| versions.contains(&v.id)),
+                );
             }
-            SplitMove::Timelines { .. } => anyhow::bail!("legacy editions hold one timeline"),
+            SplitMove::Edition { .. } => {}
         }
     }
+    // Files follow the content they represent: each moved version's bound files,
+    // plus copies of its pinned content unless a version left behind in the old
+    // edition still pins that content.
+    for ((from_edition, new_edition), versions) in moved {
+        let moved_ids: std::collections::BTreeSet<&str> =
+            versions.iter().map(|v| v.id.as_str()).collect();
+        let remaining: std::collections::BTreeSet<&str> = current
+            .editions
+            .iter()
+            .filter(|e| e.id == from_edition)
+            .flat_map(|e| &e.timelines)
+            .flat_map(|t| &t.versions)
+            .filter(|v| !moved_ids.contains(v.id.as_str()))
+            .flat_map(|v| &v.bindings)
+            .map(|b| b.revision.as_str())
+            .collect();
+        for binding in versions.iter().flat_map(|v| &v.bindings) {
+            sqlx::query("UPDATE media_files SET edition_id=? WHERE id=? AND edition_id=?")
+                .bind(new_edition)
+                .bind(&binding.file_id)
+                .bind(from_edition)
+                .execute(&mut **tx)
+                .await?;
+            if !remaining.contains(binding.revision.as_str()) {
+                sqlx::query(
+                    "UPDATE media_files SET edition_id=? WHERE edition_id=? AND revision=?",
+                )
+                .bind(new_edition)
+                .bind(from_edition)
+                .bind(&binding.revision)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+    }
+    ensure_consistent(tx).await?;
     sqlx::query("UPDATE renditions SET item_id=? WHERE item_id=? AND file_id IN (SELECT f.id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?)")
         .bind(&plan.new_item).bind(&plan.item).bind(&plan.new_item).execute(&mut **tx).await?;
     sqlx::query("UPDATE items SET catalog_revision=? WHERE id=?")
-        .bind(i64::try_from(plan.expected_revision.saturating_add(1))?)
+        .bind(i64::try_from(plan.expected_revision + 1)?)
         .bind(&plan.item)
         .execute(&mut **tx)
         .await?;
@@ -450,6 +557,336 @@ async fn apply_split(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Bindings must stay within their file's edition; checked before commit.
+async fn ensure_consistent(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    let mismatched: i64 = sqlx::query_scalar("SELECT count(*) FROM version_edition_mismatch")
+        .fetch_one(&mut *conn)
+        .await?;
+    anyhow::ensure!(mismatched == 0, "version binding left its file's edition");
+    Ok(())
+}
+
+/// Create an edition with its default timeline (same ID).
+pub(crate) async fn create_edition(
+    conn: &mut SqliteConnection,
+    id: &str,
+    item: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("INSERT INTO editions (id,item_id,label) VALUES (?,?,?)")
+        .bind(id)
+        .bind(item)
+        .bind(label)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+        .bind(id)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// The edition's default timeline (same ID), created if the edition has none
+/// by that ID; otherwise its first timeline.
+pub(crate) async fn timeline_for(
+    conn: &mut SqliteConnection,
+    edition: &str,
+) -> anyhow::Result<String> {
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM timelines WHERE edition_id=? ORDER BY id<>edition_id,id LIMIT 1",
+    )
+    .bind(edition)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+        .bind(edition)
+        .bind(edition)
+        .execute(&mut *conn)
+        .await?;
+    Ok(edition.into())
+}
+
+/// Create a single-part version binding a file at its current revision in a
+/// timeline. `attach_version` decides whether the equivalence permits joining.
+pub(crate) async fn create_version(
+    conn: &mut SqliteConnection,
+    timeline: &str,
+    file: &str,
+    origin: Origin,
+    equivalence: Equivalence,
+) -> Result<String, CurationError> {
+    let occupied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM media_versions WHERE timeline_id=?")
+            .bind(timeline)
+            .fetch_one(&mut *conn)
+            .await?;
+    let existing = Timeline {
+        id: timeline.into(),
+        versions: (0..occupied)
+            .map(|i| Version {
+                id: i.to_string(),
+                origin,
+                equivalence,
+                bindings: vec![],
+            })
+            .collect(),
+    };
+    identity::attach_version(&existing, equivalence)?;
+    let revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(file)
+        .fetch_one(&mut *conn)
+        .await?;
+    let id = new_id();
+    sqlx::query("INSERT INTO media_versions (id,timeline_id,origin,equivalence) VALUES (?,?,?,?)")
+        .bind(&id)
+        .bind(timeline)
+        .bind(enum_name(&origin)?)
+        .bind(enum_name(&equivalence)?)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "INSERT INTO version_files (version_id,part,file_id,file_revision) VALUES (?,1,?,?)",
+    )
+    .bind(&id)
+    .bind(file)
+    .bind(revision)
+    .execute(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
+/// Operator reassignment of one file to another edition of the same work.
+/// Its content's version moves with it unless a copy can keep representing the
+/// version in the old edition, in which case the file gets its own declared
+/// version. Multipart versions are never torn apart.
+pub(crate) async fn reassign_file(
+    conn: &mut SqliteConnection,
+    file: &str,
+    target_edition: &str,
+) -> Result<(), CurationError> {
+    let (from_edition, revision): (String, String) =
+        sqlx::query_as("SELECT edition_id,revision FROM media_files WHERE id=?")
+            .bind(file)
+            .fetch_one(&mut *conn)
+            .await?;
+    if from_edition == target_edition {
+        return Ok(());
+    }
+    let bound: Option<(String, i64)> = sqlx::query_as(
+        "SELECT b.version_id,(SELECT count(*) FROM version_files p WHERE p.version_id=b.version_id) FROM version_files b WHERE b.file_id=?",
+    )
+    .bind(file)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let copy: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM media_files WHERE edition_id=? AND revision=? AND id<>? ORDER BY id LIMIT 1",
+    )
+    .bind(&from_edition)
+    .bind(&revision)
+    .bind(file)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let generated: bool = sqlx::query_scalar("SELECT generated FROM media_files WHERE id=?")
+        .bind(file)
+        .fetch_one(&mut *conn)
+        .await?;
+    let origin = if generated {
+        Origin::Generated
+    } else {
+        Origin::Original
+    };
+    sqlx::query("UPDATE media_files SET edition_id=? WHERE id=?")
+        .bind(target_edition)
+        .bind(file)
+        .execute(&mut *conn)
+        .await?;
+    match (bound, copy) {
+        (Some((version, _)), Some(copy)) => {
+            sqlx::query("UPDATE version_files SET file_id=? WHERE version_id=? AND file_id=?")
+                .bind(&copy)
+                .bind(&version)
+                .bind(file)
+                .execute(&mut *conn)
+                .await?;
+            let timeline = timeline_for(conn, target_edition).await?;
+            create_version(&mut *conn, &timeline, file, origin, Equivalence::Declared).await?;
+        }
+        // An operator declaration is explicit equivalence, so the version may
+        // join an occupied timeline (see `identity::attach_version`).
+        (Some((version, 1)), None) => {
+            let timeline = timeline_for(conn, target_edition).await?;
+            sqlx::query("UPDATE media_versions SET timeline_id=?,equivalence='declared',revision=revision+1 WHERE id=?")
+                .bind(&timeline)
+                .bind(&version)
+                .execute(&mut *conn)
+                .await?;
+        }
+        (Some(_), None) => {
+            return Err(IdentityError::InvalidBindings(
+                "a multipart version cannot be split by reassigning one file".into(),
+            )
+            .into());
+        }
+        (None, _) => {
+            let timeline = timeline_for(conn, target_edition).await?;
+            create_version(&mut *conn, &timeline, file, origin, Equivalence::Declared).await?;
+        }
+    }
+    ensure_consistent(conn).await?;
+    Ok(())
+}
+
+/// Confirm that replaced bytes still represent a version's timeline.
+pub async fn confirm_replacement(
+    app: &App,
+    version: &str,
+    expected_revision: u64,
+) -> Result<u64, CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let (revision, origin, equivalence): (i64, String, String) =
+        sqlx::query_as("SELECT revision,origin,equivalence FROM media_versions WHERE id=?")
+            .bind(version)
+            .fetch_one(&mut *tx)
+            .await?;
+    let current = Version {
+        id: version.into(),
+        origin: enum_value(&origin)?,
+        equivalence: enum_value(&equivalence)?,
+        bindings: bindings(&mut tx, version).await?,
+    };
+    let occurrences = occurrences(&mut tx, &current.bindings).await?;
+    let (next, next_revision) = identity::confirm_replacement(
+        &current,
+        u64::try_from(revision).map_err(anyhow::Error::from)?,
+        expected_revision,
+        &occurrences,
+    )?;
+    for binding in &next.bindings {
+        sqlx::query("UPDATE version_files SET file_revision=? WHERE version_id=? AND part=?")
+            .bind(&binding.revision)
+            .bind(version)
+            .bind(i64::from(binding.part))
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query("UPDATE media_versions SET revision=?,equivalence=? WHERE id=?")
+        .bind(i64::try_from(next_revision).map_err(anyhow::Error::from)?)
+        .bind(enum_name(&next.equivalence)?)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(next_revision)
+}
+
+/// Occurrences relevant to some bindings: the bound files themselves and every
+/// file holding a pinned revision.
+async fn occurrences(
+    conn: &mut SqliteConnection,
+    bindings: &[Binding],
+) -> anyhow::Result<Vec<identity::Occurrence>> {
+    let mut out = Vec::new();
+    for binding in bindings {
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT id,revision,available FROM media_files WHERE id=? OR revision=?",
+        )
+        .bind(&binding.file_id)
+        .bind(&binding.revision)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (file_id, revision, available) in rows {
+            out.push(identity::Occurrence {
+                file_id,
+                revision,
+                available,
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VersionView {
+    pub id: String,
+    pub origin: Origin,
+    pub equivalence: Equivalence,
+    pub availability: identity::Availability,
+    pub bindings: Vec<Binding>,
+}
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TimelineView {
+    pub id: String,
+    pub versions: Vec<VersionView>,
+}
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct EditionView {
+    pub id: String,
+    pub label: String,
+    pub timelines: Vec<TimelineView>,
+}
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StructureView {
+    pub item_id: String,
+    pub revision: u64,
+    pub editions: Vec<EditionView>,
+}
+
+/// Side-effect-free read of a work's structure with derived availability, for
+/// the API and the in-process UI query facade. Retired IDs resolve to the live
+/// work. One read snapshot; access policy is applied by the caller (A08).
+pub async fn read_structure(db: &SqlitePool, id: &str) -> anyhow::Result<Option<StructureView>> {
+    let mut tx = db.begin().await?;
+    let id =
+        match sqlx::query_scalar::<_, String>("SELECT item_id FROM item_aliases WHERE alias_id=?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            Some(target) => target,
+            None => id.to_string(),
+        };
+    let Some(aggregate) = load_aggregate(&mut tx, &id).await? else {
+        return Ok(None);
+    };
+    let mut editions = Vec::new();
+    for edition in aggregate.editions {
+        let mut timelines = Vec::new();
+        for timeline in edition.timelines {
+            let mut versions = Vec::new();
+            for version in timeline.versions {
+                let occurrences = occurrences(&mut tx, &version.bindings).await?;
+                versions.push(VersionView {
+                    availability: identity::version_availability(&version.bindings, &occurrences),
+                    id: version.id,
+                    origin: version.origin,
+                    equivalence: version.equivalence,
+                    bindings: version.bindings,
+                });
+            }
+            timelines.push(TimelineView {
+                id: timeline.id,
+                versions,
+            });
+        }
+        editions.push(EditionView {
+            id: edition.id,
+            label: edition.label,
+            timelines,
+        });
+    }
+    tx.commit().await?;
+    Ok(Some(StructureView {
+        item_id: aggregate.work.id,
+        revision: aggregate.work.revision,
+        editions,
+    }))
 }
 
 async fn receipt<T: Serialize>(
