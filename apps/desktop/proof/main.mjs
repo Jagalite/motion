@@ -10,7 +10,7 @@ const bootstrap = process.env.MOTION_PROOF_BOOTSTRAP;
 const output = process.env.MOTION_PROOF_OUT;
 const page = process.env.MOTION_PROOF_PAGE ?? '/play/tl2';
 
-const observations = {checks: {}, console: [], navigationBlocked: [], permissionRequests: []};
+const observations = {checks: {}, console: [], navigationBlocked: [], permissionRequests: [], permissionChecks: [], permissionsGranted: []};
 const note = (name, value) => { observations.checks[name] = value; };
 
 app.whenReady().then(async () => {
@@ -18,7 +18,16 @@ app.whenReady().then(async () => {
     const ses = session.fromPartition('motion-proof-server', {cache: false});
     ses.setPermissionRequestHandler((_contents, permission, callback) => {
       observations.permissionRequests.push(permission);
-      callback(permission === 'fullscreen');
+      const grant = permission === 'fullscreen';
+      if (grant) observations.permissionsGranted.push(permission);
+      callback(grant);
+    });
+    // Permission *checks* (e.g. permissions.query) are denied too, except fullscreen.
+    ses.setPermissionCheckHandler((_contents, permission) => {
+      observations.permissionChecks.push(permission);
+      const grant = permission === 'fullscreen';
+      if (grant) observations.permissionsGranted.push(permission);
+      return grant;
     });
     // Bootstrap: the code arrived on an inherited pipe, never argv/URL/HTML.
     const exchange = await ses.fetch(new URL('/api/v2/auth/session', origin).href, {
@@ -28,10 +37,13 @@ app.whenReady().then(async () => {
     note('sessionExchangeStatus', exchange.status);
     const cookies = await ses.cookies.get({url: origin});
     note('sessionCookie', cookies.map(c => ({name: c.name, httpOnly: c.httpOnly, sameSite: c.sameSite})));
-    const replay = await ses.fetch(new URL('/api/v2/auth/session', origin).href, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: 'credential', credential: bootstrap}),
+    // Replay from a fresh session with no cookie, so only credential validation can refuse it.
+    const fresh = session.fromPartition('motion-proof-replay', {cache: false});
+    const replay = await fresh.fetch(new URL('/api/v2/auth/session', origin).href, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, redirect: 'error',
+      body: JSON.stringify({kind: 'credential', credential: bootstrap}),
     });
-    note('bootstrapReplayStatus', replay.status);
+    note('bootstrapReplay', {status: replay.status, code: (await replay.json().catch(() => ({}))).code ?? null});
 
     const window = new BrowserWindow({
       show: false, width: 1100, height: 760,
@@ -42,9 +54,12 @@ app.whenReady().then(async () => {
     });
     const contents = window.webContents;
     contents.on('console-message', event => observations.console.push(`${event.level}: ${event.message}`.slice(0, 1500)));
-    contents.on('will-navigate', (event, url) => {
+    const guard = (event, url) => {
       if (new URL(url).origin !== origin) { event.preventDefault(); observations.navigationBlocked.push(url); }
-    });
+    };
+    contents.on('will-navigate', guard);
+    contents.on('will-redirect', guard);
+    contents.on('will-frame-navigate', event => guard(event, event.url));
     contents.setWindowOpenHandler(({url}) => { observations.navigationBlocked.push(url); return {action: 'deny'}; });
 
     const response = await new Promise(resolve => {
@@ -86,15 +101,24 @@ app.whenReady().then(async () => {
         await el.setMuted?.(true);
         await el.play();
         const played = await until(s => s.status === 'playing' && s.currentTime >= 2.5, 15000);
+        // A seek must land: from below 4 s, reach [6.8, 9] within 2 s of wall time.
+        const before = p.state.currentTime;
+        const t0 = performance.now();
         await el.seek(7);
-        const sought = await until(s => s.status === 'playing' && s.currentTime >= 7.5, 15000);
+        const landed = await until(s => s.currentTime >= 6.8 && s.currentTime <= 9, 2000);
+        const seekElapsedMs = Math.round(performance.now() - t0);
+        const afterSeek = p.state.currentTime;
+        const advancing = await until(s => s.status === 'playing' && s.currentTime >= afterSeek + 0.5, 5000);
         const stats = p.getStats?.();
-        return {played, sought, finalTime: p.state.currentTime, mode: p.state.activeMode, duration: p.state.duration,
+        return {played, before, afterSeek, seekElapsedMs, landed: landed && before < 4, advancing,
+          finalTime: p.state.currentTime, mode: p.state.activeMode, duration: p.state.duration,
           audioTracks: p.state.audioTracks.length, error: p.state.error, decodedFrames: stats?.decodedFrames ?? null};
       })()`);
       note('playback', playback);
     }
-    // Leave the page: the bridge must retire its delivery on pagehide.
+    // Leave the page: the bridge must retire its delivery on pagehide. A marker
+    // survives only if the document is restored from the back/forward cache.
+    await evaluate('window.__motionProofMarker = 1');
     await window.loadURL(`${origin}/`);
     await new Promise(r => setTimeout(r, 1500));
     note('homeTitle', await contents.executeJavaScript('document.querySelector("h1")?.textContent ?? null'));
@@ -107,11 +131,26 @@ app.whenReady().then(async () => {
         const host = document.getElementById('motion-player');
         const state = host?.dataset.state;
         if (state === 'ready' || state === 'failed' || performance.now() - started > 30000) {
-          resolve({state: state ?? null, players: document.querySelectorAll('#motion-player demuxe-player').length});
+          resolve({state: state ?? null, players: document.querySelectorAll('#motion-player demuxe-player').length,
+            restoredFromBfcache: window.__motionProofMarker === 1});
         } else setTimeout(tick, 200);
       };
       tick();
     })`));
+    note('afterBackPlayback', await evaluate(`(async () => {
+      const el = document.querySelector('#motion-player demuxe-player');
+      if (!el) return {advancing: false};
+      const p = el.player;
+      await el.setMuted?.(true);
+      await el.play();
+      const start = p.state.currentTime;
+      const t0 = performance.now();
+      while (performance.now() - t0 < 8000) {
+        if (p.state.status === 'playing' && p.state.currentTime >= start + 1) return {advancing: true, start, now: p.state.currentTime};
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return {advancing: false, start, now: p.state.currentTime};
+    })()`));
     await window.loadURL(`${origin}/`);
     await new Promise(r => setTimeout(r, 1500));
   } catch (error) {

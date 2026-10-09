@@ -33,7 +33,9 @@ use tower_http::services::ServeFile;
 
 #[derive(Default)]
 struct Sessions {
-    bootstrap: Option<String>,
+    /// One-use bootstrap capability and the instant it stops being valid.
+    bootstrap: Option<(String, std::time::Instant)>,
+    listening: String,
     sessions: HashMap<String, String>,
     deliveries: HashMap<String, bool>,
     idempotency: HashMap<String, Value>,
@@ -100,10 +102,21 @@ async fn log_requests(request: Request, next: Next) -> Response {
 }
 
 /// One-use bootstrap capability exchanged for an HttpOnly session cookie.
-async fn create_session(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn create_session(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let credential = body.get("credential").and_then(Value::as_str).unwrap_or_default().to_string();
     let mut sessions = state.sessions.lock().unwrap();
-    if body.get("kind").and_then(Value::as_str) != Some("credential") || sessions.bootstrap.as_deref() != Some(credential.as_str()) {
+    // Exact Host, and Origin when a browser sends one (plan 12.3).
+    let expected_host = sessions.listening.trim_start_matches("http://").to_string();
+    if headers.get(header::HOST).and_then(|v| v.to_str().ok()) != Some(expected_host.as_str()) {
+        return problem(StatusCode::FORBIDDEN, "host_not_allowed");
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+        && origin != sessions.listening
+    {
+        return problem(StatusCode::FORBIDDEN, "origin_not_allowed");
+    }
+    let valid = matches!(&sessions.bootstrap, Some((code, expires)) if *code == credential && std::time::Instant::now() < *expires);
+    if body.get("kind").and_then(Value::as_str) != Some("credential") || !valid {
         return problem(StatusCode::UNAUTHORIZED, "unauthenticated");
     }
     sessions.bootstrap = None;
@@ -142,6 +155,7 @@ async fn admit(State(state): State<AppState>, headers: HeaderMap, Json(body): Js
     // active on the next read (exercises the bridge's wait-for-ready path).
     let delivery = delivery_json(&id, start, false);
     sessions.idempotency.insert(key.to_string(), delivery.clone());
+    println!("{}", json!({"delivery_admitted": id}));
     mock(StatusCode::CREATED, delivery)
 }
 
@@ -169,6 +183,10 @@ async fn get_delivery(State(state): State<AppState>, Path(id): Path<String>) -> 
 async fn close_delivery(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.sessions.lock().unwrap().deliveries.get_mut(&id) {
         Some(open) => {
+            // Idempotent close; only the first one changes state.
+            if *open {
+                println!("{}", json!({"delivery_closed": id}));
+            }
             *open = false;
             StatusCode::NO_CONTENT.into_response()
         }
@@ -195,7 +213,8 @@ async fn main() {
     let demuxe = arg("--demuxe-dir").map(PathBuf::from);
 
     let bootstrap = random_token();
-    let state = AppState { sessions: Arc::new(Mutex::new(Sessions { bootstrap: Some(bootstrap.clone()), ..Default::default() })), media };
+    let expires = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let state = AppState { sessions: Arc::new(Mutex::new(Sessions { bootstrap: Some((bootstrap.clone(), expires)), ..Default::default() })), media };
     let api = Router::new()
         .route("/api/v2/auth/session", post(create_session))
         .route("/api/v2/playback/plans", post(plan))
@@ -209,6 +228,7 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
     let address = listener.local_addr().unwrap();
+    state.sessions.lock().unwrap().listening = format!("http://{address}");
     println!("{}", json!({"listening": format!("http://{address}"), "bootstrap": bootstrap}));
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }

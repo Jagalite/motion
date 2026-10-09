@@ -25,13 +25,14 @@ function status(message, kind = 'status') {
   if (!message) panel.remove();
 }
 
-async function api(method, path, body, idempotencyKey) {
+async function api(method, path, body, idempotencyKey, signal) {
   const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
     method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE',
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   if (!response.ok) {
     const problem = await response.json().catch(() => null);
@@ -99,11 +100,15 @@ async function firstGeneration(delivery, current) {
     const generation = latest.active ?? latest.pending;
     if (['failed', 'closed', 'interrupted'].includes(latest.status) || generation?.status === 'failed') return null;
     if (generation && (generation.status === 'ready' || generation.status === 'active')) return generation;
-    if (Date.now() > deadline) return null;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
     status('The server is preparing the stream…');
     await sleep(500);
     if (!current()) return null;
-    latest = await api('GET', `/api/v2/playback/delivery-sessions/${encodeURIComponent(latest.id)}`);
+    // Each poll is bounded too, so a stalled request cannot outlive the deadline.
+    latest = await api('GET', `/api/v2/playback/delivery-sessions/${encodeURIComponent(latest.id)}`, undefined, undefined,
+      AbortSignal.timeout(Math.max(1, Math.min(10_000, remaining))));
+    if (!current()) return null;
   }
 }
 
