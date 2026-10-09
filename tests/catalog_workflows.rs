@@ -578,3 +578,138 @@ async fn playlists_and_queues_keep_entry_identity_and_revisions() {
     assert_eq!(reloaded, edited, "u64 seed and state round-trip");
     assert!(orgs::get_queue(&f.app.db, "kid", &queue_id).await.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Review regressions
+
+fn admin_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "127.0.0.1:8787")
+        .header("authorization", "Bearer test-secret-token")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn merge(f: &Fixture, source: &str, target: &str) {
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in [source, target] {
+        let a = playscale::curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.to_string(), a.work.revision);
+    }
+    drop(conn);
+    let plan = playscale::curation::preview_merge(
+        &f.app.db,
+        &playscale_core::identity::MergeRequest {
+            sources: vec![source.into()],
+            target: target.into(),
+            expected,
+        },
+    )
+    .await
+    .unwrap();
+    playscale::curation::commit_merge(&f.app, &plan)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pinned_identity_cannot_be_withdrawn_and_moves_with_a_merge() {
+    let f = Fixture::new().await;
+    work(&f, "source", "Source", 2000).await;
+    work(&f, "target", "Target", 2000).await;
+    sqlx::query("INSERT INTO metadata_documents VALUES ('source','tmdb',1,'603',?,1)")
+        .bind(json!({"values":{"title":"Imported Title"},"tags":[],"excluded_tags":[]}).to_string())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE items SET match_state='manual' WHERE id='source'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let router = api::router(f.app.clone(), None);
+    let withdraw = router
+        .clone()
+        .oneshot(admin_request(
+            "PUT",
+            "/api/v1/items/source/metadata/tmdb",
+            json!({"expected_revision":1,"external_id":null,"values":{},"tags":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        withdraw.status(),
+        StatusCode::CONFLICT,
+        "removal is refused"
+    );
+
+    merge(&f, "source", "target").await;
+    let (state, title): (String, String) =
+        sqlx::query_as("SELECT match_state,title FROM items WHERE id='target'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(state, "manual", "pin moves with the identity");
+    assert_eq!(title, "Imported Title", "title projection recomputed");
+    let replace = router
+        .clone()
+        .oneshot(admin_request(
+            "PUT",
+            "/api/v1/items/target/metadata/tmdb",
+            json!({"expected_revision":1,"external_id":"604","values":{},"tags":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replace.status(), StatusCode::CONFLICT);
+    // The retired ID takes no new contributions.
+    let retired = router
+        .clone()
+        .oneshot(admin_request(
+            "PUT",
+            "/api/v1/items/source/metadata/local",
+            json!({"expected_revision":1,"values":{"title":"Late"},"tags":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retired.status(), StatusCode::NOT_FOUND);
+
+    // Retired IDs resolve to the live work for reads and edition creation.
+    let created = router
+        .clone()
+        .oneshot(admin_request(
+            "POST",
+            "/api/v1/items/source/editions",
+            json!({"label":"Extended"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let owner: String = sqlx::query_scalar("SELECT item_id FROM editions WHERE label='Extended'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, "target");
+}
+
+#[tokio::test]
+async fn reproposing_a_decided_file_keeps_the_decision() {
+    let f = Fixture::new().await;
+    f.write("Heat.1995.mkv", b"heat");
+    f.scan().await;
+    seed_target(&f, "heat", "Heat", 1995).await;
+    let (file, ..) = f.file("Heat.1995.mkv").await;
+    let proposal = matching::propose(&f.app, &file).await.unwrap();
+    matching::decide(&f.app, &proposal.id, proposal.revision, Decision::Reject)
+        .await
+        .unwrap();
+    let again = matching::propose(&f.app, &file).await.unwrap();
+    assert_eq!(again.id, proposal.id);
+    assert_eq!(again.status, Status::Rejected);
+    assert!(matching::inbox(&f.app.db, 50).await.unwrap().is_empty());
+}

@@ -3,7 +3,7 @@
 //! and applies an accepted identification in the same writer transaction.
 use crate::{App, curation, new_id, now};
 use playscale_core::matching::{
-    self, Attachment, Candidate, Decision, MatchError, MatchState, Proposal, Status,
+    self, Attachment, Candidate, Decision, MatchError, MatchState, Proposal, ProposalAction, Status,
 };
 use serde::Serialize;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
@@ -189,29 +189,41 @@ pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError
     .fetch_one(&mut *tx)
     .await?;
     let candidates = local_candidates(&mut tx, file_id, &path, &item).await?;
+    // An open proposal for an older file revision becomes stale first.
     let open: Option<Row> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} WHERE file_id=? AND status IN ('pending','review','deferred')"
     ))
     .bind(file_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let proposal = match open {
-        Some(row) => {
-            let current = decode(row)?;
-            let next = matching::refresh(&current, Some(&revision), candidates.clone())?;
+    if let Some(row) = open {
+        let current = decode(row)?;
+        if current.file_revision != revision {
+            let stale = matching::refresh(&current, Some(&revision), current.candidates.clone())?;
+            store(&mut tx, &stale, false).await?;
+        }
+    }
+    let latest: Option<Row> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} WHERE file_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1"
+    ))
+    .bind(file_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let latest = latest.map(decode).transpose()?;
+    let proposal = match (
+        matching::proposal_action(latest.as_ref(), &revision),
+        latest,
+    ) {
+        // A decision for this exact file revision stands until explicitly reopened.
+        (ProposalAction::Keep, Some(decided)) => decided,
+        (ProposalAction::Refresh, Some(current)) => {
+            let next = matching::refresh(&current, Some(&revision), candidates)?;
             if next != current {
                 store(&mut tx, &next, false).await?;
             }
-            if next.status == Status::Stale {
-                // The reviewed file changed; raise a fresh proposal for it.
-                let fresh = matching::propose(new_id(), file_id.into(), revision, candidates)?;
-                store(&mut tx, &fresh, true).await?;
-                fresh
-            } else {
-                next
-            }
+            next
         }
-        None => {
+        _ => {
             let fresh = matching::propose(new_id(), file_id.into(), revision, candidates)?;
             store(&mut tx, &fresh, true).await?;
             fresh
@@ -338,17 +350,14 @@ pub(crate) async fn invalidate_changed(conn: &mut SqliteConnection) -> anyhow::R
     Ok(())
 }
 
-/// A manual identification pins the work's provider identity: an automatic
-/// contribution asserting a different identity for that provider is refused.
+/// A manual identification pins the work's provider identity: a contribution
+/// asserting a different identity for that provider, or withdrawing it, is refused.
 pub(crate) async fn provider_identity_allowed(
     conn: &mut SqliteConnection,
     item: &str,
     source: &str,
     incoming: Option<&str>,
 ) -> anyhow::Result<bool> {
-    let Some(incoming) = incoming else {
-        return Ok(true);
-    };
     let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id=?")
         .bind(item)
         .fetch_one(&mut *conn)
@@ -362,9 +371,10 @@ pub(crate) async fn provider_identity_allowed(
     .fetch_optional(&mut *conn)
     .await?;
     let current = current.flatten().map(|v| (source.to_string(), v));
+    let incoming = incoming.map(|v| (source.to_string(), v.to_string()));
     Ok(matching::provider_identity_allowed(
         state,
         current.as_ref(),
-        &(source.to_string(), incoming.to_string()),
+        incoming.as_ref(),
     ))
 }

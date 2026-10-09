@@ -287,6 +287,23 @@ async fn apply_merge(
             .execute(&mut **tx)
             .await?;
     }
+    // The strongest match state (including a manual pin) moves with the
+    // identities the merge carried to the target.
+    let mut states = Vec::new();
+    for id in plan.retired.iter().chain([&plan.target]) {
+        let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id=?")
+            .bind(id)
+            .fetch_one(&mut **tx)
+            .await?;
+        states.push(serde_json::from_value(serde_json::Value::String(state))?);
+    }
+    let state = serde_json::to_value(playscale_core::matching::merged_state(&states))?;
+    sqlx::query("UPDATE items SET match_state=? WHERE id=?")
+        .bind(state.as_str())
+        .bind(&plan.target)
+        .execute(&mut **tx)
+        .await?;
+    crate::metadata::project_title(tx, &plan.target).await?;
     // Triggers advanced the revision once per row change inside this uncommitted
     // transaction; the committed structural revision is exactly the planned one.
     sqlx::query("UPDATE items SET catalog_revision=? WHERE id=?")

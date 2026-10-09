@@ -196,18 +196,58 @@ pub enum MatchState {
     Manual,
 }
 
-/// May an automatic provider contribution set a work's identity in a namespace?
-/// `current` is the work's identity in the incoming namespace. A manual
-/// identification pins that namespace: a disagreeing refresh is refused (and
-/// can be retained as a conflict), never applied. Other namespaces stay open.
+/// May an automatic provider contribution set (`Some`) or withdraw (`None`) a
+/// work's identity in a namespace? `current` is the work's identity in that
+/// namespace. A manual identification pins it: a disagreeing value or a removal
+/// is refused (and can be retained as a conflict), never applied. Namespaces
+/// without a pinned identity stay open.
 pub fn provider_identity_allowed(
     state: MatchState,
     current: Option<&(String, String)>,
-    incoming: &(String, String),
+    incoming: Option<&(String, String)>,
 ) -> bool {
     match (state, current) {
-        (MatchState::Manual, Some(current)) => current == incoming,
+        (MatchState::Manual, Some(current)) => incoming == Some(current),
         _ => true,
+    }
+}
+
+/// Match state of a merged work. Merge carries every source identity to the
+/// target (conflicting identities block the merge), so the strongest state,
+/// including a manual pin, moves with it.
+pub fn merged_state(states: &[MatchState]) -> MatchState {
+    let rank = |s: &MatchState| match s {
+        MatchState::Unmatched => 0,
+        MatchState::Ambiguous => 1,
+        MatchState::Matched => 2,
+        MatchState::Manual => 3,
+    };
+    states
+        .iter()
+        .copied()
+        .max_by_key(rank)
+        .unwrap_or(MatchState::Unmatched)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalAction {
+    /// The latest proposal already decided this exact file revision; keep it.
+    /// Reopening a decision is a separate explicit operation.
+    Keep,
+    /// Refresh the open proposal for this file revision.
+    Refresh,
+    /// Raise a new proposal (none yet, or the file revision changed).
+    Raise,
+}
+pub fn proposal_action(latest: Option<&Proposal>, file_revision: &str) -> ProposalAction {
+    match latest {
+        Some(p) if p.file_revision == file_revision => match p.status {
+            Status::Accepted | Status::Rejected => ProposalAction::Keep,
+            Status::Pending | Status::Review | Status::Deferred => ProposalAction::Refresh,
+            Status::Stale => ProposalAction::Raise,
+        },
+        _ => ProposalAction::Raise,
     }
 }
 

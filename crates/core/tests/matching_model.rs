@@ -1,8 +1,9 @@
 //! Stateless model of the identification workflow over the production
 //! `matching` decisions, plus independent filename fixtures.
 use playscale_core::matching::{
-    Candidate, Decision, MatchError, MatchState, Parsed, Proposal, Status, decide, normalize_title,
-    parse_name, propose, provider_identity_allowed, refresh,
+    Candidate, Decision, MatchError, MatchState, Parsed, Proposal, ProposalAction, Status, decide,
+    merged_state, normalize_title, parse_name, proposal_action, propose, provider_identity_allowed,
+    refresh,
 };
 use serde::{Deserialize, Serialize};
 use stateless::{
@@ -28,14 +29,14 @@ enum Input {
     },
     /// The file is replaced in place.
     ReplaceFile,
-    /// An automatic provider contribution asserts an identity.
+    /// An automatic provider contribution asserts an identity (`3` withdraws it).
     ProviderUpdate(u8),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Effect {
     Identified(Identity),
-    ProviderApplied(Identity),
-    ProviderConflict(Identity),
+    ProviderApplied(Option<Identity>),
+    ProviderConflict(Option<Identity>),
     Rejected(MatchError),
     Updated,
 }
@@ -126,11 +127,16 @@ impl Model for Matching {
                 Effect::Updated
             }
             Input::ProviderUpdate(n) => {
-                let incoming = identity(*n);
-                if provider_identity_allowed(s.match_state, s.identity.as_ref(), &incoming) {
-                    next.identity = Some(incoming.clone());
+                let incoming = (*n < 3).then(|| identity(*n));
+                if provider_identity_allowed(s.match_state, s.identity.as_ref(), incoming.as_ref())
+                {
+                    next.identity = incoming.clone();
                     if s.match_state != MatchState::Manual {
-                        next.match_state = MatchState::Matched;
+                        next.match_state = if incoming.is_some() {
+                            MatchState::Matched
+                        } else {
+                            MatchState::Unmatched
+                        };
                     }
                     Effect::ProviderApplied(incoming)
                 } else {
@@ -253,7 +259,7 @@ impl Enumerate for Matching {
         if s.file_revision.len() < 4 {
             inputs.push(Input::ReplaceFile);
         }
-        for n in 0..3 {
+        for n in 0..4 {
             inputs.push(Input::ProviderUpdate(n));
         }
         Ok(inputs)
@@ -317,6 +323,7 @@ fn fix_match_survives_provider_refresh() {
         },
         Input::Refresh(0),
         Input::ProviderUpdate(0),
+        Input::ProviderUpdate(3),
     ] {
         state = Matching.step(&state, &input).unwrap().state;
     }
@@ -348,4 +355,27 @@ fn filename_golden_fixtures() {
     for (input, expected) in f.normalize {
         assert_eq!(normalize_title(&input), expected, "{input}");
     }
+}
+
+#[test]
+fn decided_proposals_are_kept_and_pins_survive_merges() {
+    let open = propose("p".into(), "f".into(), "r".into(), candidates(0)).unwrap();
+    assert_eq!(proposal_action(None, "r"), ProposalAction::Raise);
+    assert_eq!(proposal_action(Some(&open), "r"), ProposalAction::Refresh);
+    assert_eq!(proposal_action(Some(&open), "r2"), ProposalAction::Raise);
+    let (rejected, _) = decide(&open, 1, Some("r"), Decision::Reject).unwrap();
+    assert_eq!(proposal_action(Some(&rejected), "r"), ProposalAction::Keep);
+    assert_eq!(
+        proposal_action(Some(&rejected), "r2"),
+        ProposalAction::Raise
+    );
+    assert_eq!(
+        merged_state(&[MatchState::Unmatched, MatchState::Manual]),
+        MatchState::Manual
+    );
+    assert_eq!(
+        merged_state(&[MatchState::Ambiguous]),
+        MatchState::Ambiguous
+    );
+    assert_eq!(merged_state(&[]), MatchState::Unmatched);
 }

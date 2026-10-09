@@ -505,9 +505,13 @@ async fn store_queue(conn: &mut SqliteConnection, id: &str, queue: &Queue) -> Re
     Ok(())
 }
 
+/// Header and entries come from one read snapshot so `current` is always a
+/// member of the returned entries.
 pub async fn get_queue(db: &SqlitePool, profile: &str, id: &str) -> Result<Queue, OrgError> {
-    let mut conn = db.acquire().await?;
-    load_queue(&mut conn, profile, id).await
+    let mut tx = db.begin().await?;
+    let queue = load_queue(&mut tx, profile, id).await?;
+    tx.commit().await?;
+    Ok(queue)
 }
 
 pub async fn create_queue(

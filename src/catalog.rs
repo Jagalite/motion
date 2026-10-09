@@ -243,7 +243,9 @@ pub async fn put(
         return Err(ApiError::bad("Invalid revision"));
     }
     let _guard = app.jobs.lock().await;
+    // Operate on the canonical work: a retired ID resolves to its live target.
     let current = load(&app, &id).await?;
+    let id = current.id.clone();
     if playscale_core::revision::advance(current.revision, body.expected_revision).is_err() {
         return Err(conflict());
     }
@@ -271,7 +273,7 @@ pub async fn editions(
     State(app): State<App>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<Edition>>, ApiError> {
-    load(&app, &id).await?;
+    let id = load(&app, &id).await?.id;
     Ok(Json(
         sqlx::query_as("SELECT * FROM editions WHERE item_id=? ORDER BY label,id")
             .bind(id)
@@ -293,6 +295,7 @@ pub async fn add_edition(
     }
     let _guard = app.jobs.lock().await;
     let item = load(&app, &id).await?;
+    let id = item.id.clone();
     if !playscale_core::catalog::can_own_editions(&item.media_type) {
         return Err(ApiError::bad("Container items cannot own editions"));
     }

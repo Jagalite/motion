@@ -155,10 +155,13 @@ pub async fn put(
     };
     let _guard = app.jobs.lock().await; // Metadata projection and scan publication share the writer boundary.
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let original: String = sqlx::query_scalar("SELECT title FROM item_origins WHERE item_id=?")
-        .bind(&id)
-        .fetch_one(&mut *tx)
-        .await?;
+    // Existence check; retired (merged) works take no new contributions.
+    let _origin: String = sqlx::query_scalar(
+        "SELECT title FROM item_origins WHERE item_id=? AND item_id NOT IN (SELECT alias_id FROM item_aliases)",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
     let existing: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM metadata_documents WHERE item_id=? AND source=?")
             .bind(&id)
@@ -197,17 +200,31 @@ pub async fn put(
         }
         return Err(error.into());
     }
+    project_title(&mut tx, &id)
+        .await
+        .map_err(ApiError::internal)?;
+    tx.commit().await?;
+    Ok(Json(load(&app.db, &id).await?))
+}
+
+/// Recompute the stored title projection from every contribution, falling
+/// back to the scanned origin title. Callers hold the writer transaction.
+pub(crate) async fn project_title(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> anyhow::Result<()> {
+    let original: String = sqlx::query_scalar("SELECT title FROM item_origins WHERE item_id=?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT source,document_json FROM metadata_documents WHERE item_id=?")
-            .bind(&id)
-            .fetch_all(&mut *tx)
+            .bind(id)
+            .fetch_all(&mut *conn)
             .await?;
     let mut docs = BTreeMap::new();
     for (source, text) in rows {
-        docs.insert(
-            source,
-            serde_json::from_str::<Contribution>(&text).map_err(ApiError::internal)?,
-        );
+        docs.insert(source, serde_json::from_str::<Contribution>(&text)?);
     }
     let resolved = resolve(&docs);
     let title = resolved
@@ -215,11 +232,11 @@ pub async fn put(
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or(&original);
-    sqlx::query("UPDATE items SET title=? WHERE id=?")
+    sqlx::query("UPDATE items SET title=? WHERE id=? AND title IS NOT ?")
         .bind(title)
-        .bind(&id)
-        .execute(&mut *tx)
+        .bind(id)
+        .bind(title)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
-    Ok(Json(load(&app.db, &id).await?))
+    Ok(())
 }
