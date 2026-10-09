@@ -243,7 +243,8 @@ fn availability_is_derived_from_reviewed_content() {
 #[test]
 fn splits_reassignments_and_renditions_respect_reviewed_content() {
     use playscale_core::identity::{
-        ReassignFacts, Reassignment, RenditionPlacement, Version, reassignment, rendition_placement,
+        PinnedSource, ReassignFacts, Reassignment, RenditionPlacement, Version, reassignment,
+        rendition_placement,
     };
     // Two episodes bind disjoint intervals of one file; splitting one away
     // would put the file in two works.
@@ -306,11 +307,22 @@ fn splits_reassignments_and_renditions_respect_reviewed_content() {
         })
     );
     assert!(reassignment(&facts(Some(("v", 2)), false)).is_err());
-    assert_eq!(rendition_placement(None), RenditionPlacement::OwnTimeline);
+    let pinned = |timeline: &str, parts, interval| PinnedSource {
+        timeline: timeline.into(),
+        parts,
+        interval,
+    };
+    assert_eq!(rendition_placement(&[]), RenditionPlacement::OwnTimeline);
     assert_eq!(
-        rendition_placement(Some(&"t".to_string())),
+        rendition_placement(&[pinned("t", 1, false)]),
         RenditionPlacement::Join {
             timeline: "t".into()
         }
+    );
+    // One part of a multipart version, or an episode interval of a shared
+    // file, does not represent the whole timeline.
+    assert_eq!(
+        rendition_placement(&[pinned("multi", 2, false), pinned("episode", 1, true)]),
+        RenditionPlacement::OwnTimeline
     );
 }

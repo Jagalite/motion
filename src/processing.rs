@@ -756,28 +756,37 @@ async fn finish(
         // versions pins exactly the source content this job read. Content, not
         // file identity: the source may be a byte-identical copy (occurrence)
         // of the bound file.
-        let pinned: Option<String> = sqlx::query_scalar(
-            "SELECT v.timeline_id FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id WHERE b.file_revision=? AND t.edition_id=? AND v.origin='original' ORDER BY v.timeline_id LIMIT 1",
+        let pinned: Vec<(String, i64, bool)> = sqlx::query_as(
+            "SELECT v.timeline_id,(SELECT count(*) FROM version_files p WHERE p.version_id=v.id),b.start_ms IS NOT NULL OR b.end_ms IS NOT NULL FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id WHERE b.file_revision=? AND t.edition_id=? AND v.origin='original'",
         )
         .bind(&job.source_revision)
         .bind(edition)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        let (timeline, equivalence) =
-            match playscale_core::identity::rendition_placement(pinned.as_ref()) {
-                playscale_core::identity::RenditionPlacement::Join { timeline } => {
-                    (timeline, playscale_core::identity::Equivalence::Declared)
-                }
-                playscale_core::identity::RenditionPlacement::OwnTimeline => {
-                    let timeline = new_id();
-                    sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
-                        .bind(&timeline)
-                        .bind(edition)
-                        .execute(&mut *tx)
-                        .await?;
-                    (timeline, playscale_core::identity::Equivalence::Unknown)
-                }
-            };
+        let pinned: Vec<playscale_core::identity::PinnedSource> = pinned
+            .into_iter()
+            .map(
+                |(timeline, parts, interval)| playscale_core::identity::PinnedSource {
+                    timeline,
+                    parts: usize::try_from(parts).unwrap_or(usize::MAX),
+                    interval,
+                },
+            )
+            .collect();
+        let (timeline, equivalence) = match playscale_core::identity::rendition_placement(&pinned) {
+            playscale_core::identity::RenditionPlacement::Join { timeline } => {
+                (timeline, playscale_core::identity::Equivalence::Declared)
+            }
+            playscale_core::identity::RenditionPlacement::OwnTimeline => {
+                let timeline = new_id();
+                sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+                    .bind(&timeline)
+                    .bind(edition)
+                    .execute(&mut *tx)
+                    .await?;
+                (timeline, playscale_core::identity::Equivalence::Unknown)
+            }
+        };
         crate::curation::create_version(
             &mut tx,
             &timeline,

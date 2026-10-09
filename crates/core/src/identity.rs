@@ -886,22 +886,36 @@ pub fn confirm_replacement(
     Ok((next, next_revision))
 }
 
-/// Where a generated output belongs. It joins the source's timeline as a
-/// declared version only when that timeline's version pins exactly the source
-/// content the job read; otherwise its equivalence is unknown and it gets a
-/// timeline of its own (never silently equated with stale reviewed content).
+/// A version in the source's edition that pins the content a job read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedSource {
+    pub timeline: Id,
+    /// Part count of that version.
+    pub parts: usize,
+    /// The matching binding covers a known interval rather than the whole file.
+    pub interval: bool,
+}
+
+/// Where a generated output belongs. A whole-file conversion is equivalent to
+/// a timeline only if some version represents that timeline with exactly this
+/// one whole file; then it joins as a declared version. A copy of one part of
+/// a multipart version, or of an interval-bound (multi-episode) file, is not a
+/// representation of the timeline: it gets its own timeline with unknown
+/// equivalence, as does output of stale or unreviewed content.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RenditionPlacement {
     Join { timeline: Id },
     OwnTimeline,
 }
-pub fn rendition_placement(timeline_pinning_source_revision: Option<&Id>) -> RenditionPlacement {
-    match timeline_pinning_source_revision {
-        Some(timeline) => RenditionPlacement::Join {
-            timeline: timeline.clone(),
-        },
-        None => RenditionPlacement::OwnTimeline,
-    }
+pub fn rendition_placement(pinned: &[PinnedSource]) -> RenditionPlacement {
+    pinned
+        .iter()
+        .filter(|p| p.parts == 1 && !p.interval)
+        .map(|p| p.timeline.clone())
+        .min()
+        .map_or(RenditionPlacement::OwnTimeline, |timeline| {
+            RenditionPlacement::Join { timeline }
+        })
 }
 
 /// Facts for reassigning one file to another edition of its work.
