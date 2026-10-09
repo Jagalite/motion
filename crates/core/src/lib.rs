@@ -2,6 +2,7 @@
 pub mod access;
 pub mod artwork;
 pub mod catalog;
+pub mod delivery;
 pub mod events;
 pub mod identity;
 pub mod jobs;
