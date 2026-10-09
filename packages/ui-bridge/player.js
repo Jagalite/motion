@@ -57,15 +57,62 @@ function observedCapability() {
   };
 }
 
+// Same pattern as the existing Motion web client: define the element and,
+// when the installed package supports it, lend it an application-owned
+// runtime with the archive's provider manifest loaded.
+let runtime;
 async function loadDemuxe(base) {
-  const module = await import(`${base}web/generated/player/index.js`);
-  module.definePlayerElement();
+  runtime ??= (async () => {
+    const [{DemuxeRuntime}, {definePlayerElement, DemuxePlayerElement}] = await Promise.all([
+      import(`${base}web/generated/index.js`),
+      import(`${base}web/generated/player/index.js`),
+    ]);
+    definePlayerElement();
+    if (typeof DemuxeRuntime !== 'function' || !('runtime' in DemuxePlayerElement.prototype)) return null;
+    const shared = new DemuxeRuntime({assetBase: base});
+    try {
+      await shared.providers.load('demuxe-providers.json');
+      return shared;
+    } catch (error) {
+      await shared.destroy();
+      throw error;
+    }
+  })().catch(error => { runtime = undefined; throw error; });
+  return runtime;
+}
+
+/** Ask the server to retire one delivery, exactly once, surviving page unload. */
+const retired = new Set();
+function retire(id) {
+  if (!id || retired.has(id)) return Promise.resolve();
+  retired.add(id);
+  return api('DELETE', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}`).catch(() => {});
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/** A delivery may be admitted while its first generation is still starting. */
+async function firstGeneration(delivery, current) {
+  const deadline = Date.now() + 60_000;
+  let latest = delivery;
+  for (;;) {
+    const generation = latest.active ?? latest.pending;
+    if (['failed', 'closed', 'interrupted'].includes(latest.status) || generation?.status === 'failed') return null;
+    if (generation && (generation.status === 'ready' || generation.status === 'active')) return generation;
+    if (Date.now() > deadline) return null;
+    status('The server is preparing the stream…');
+    await sleep(500);
+    if (!current()) return null;
+    latest = await api('GET', `/api/v2/playback/delivery-sessions/${encodeURIComponent(latest.id)}`);
+  }
 }
 
 async function start() {
   const epoch = ++state.epoch;
+  state.closing = null;
   const current = () => epoch === state.epoch;
   const data = host.dataset;
+  host.dataset.state = 'starting';
   try {
     status('Choosing how to play this on this device…');
     const plan = await api('POST', '/api/v2/playback/plans', {
@@ -77,29 +124,35 @@ async function start() {
     if (!current()) return;
     if (plan.status !== 'ready') {
       status(`This title cannot play here: ${plan.reason_codes.join(', ') || 'no compatible version'}.`, 'alert');
+      host.dataset.state = 'blocked';
       return;
     }
     status('Starting the stream…');
     const delivery = await api('POST', '/api/v2/playback/delivery-sessions', {plan_token: plan.plan_token, start_ms: Number(data.resumeMs) || 0}, key());
+    // Closed while admission was in flight: retire what the server created.
+    if (!current()) return retire(delivery.id);
     state.deliveryId = delivery.id;
-    if (!current()) return close();
-    const generation = delivery.active;
+    const generation = await firstGeneration(delivery, current);
+    if (!current()) return;
     if (!generation || generation.transport !== 'http_range' || !generation.media_url) {
-      status('The server offered a stream this page cannot open yet.', 'alert');
+      status('The server could not offer a stream this page can open.', 'alert');
+      host.dataset.state = 'failed';
       return close();
     }
-    await loadDemuxe(data.demuxeBase);
-    if (!current()) return close();
+    const shared = await loadDemuxe(data.demuxeBase);
+    if (!current()) return;
     const element = document.createElement('demuxe-player');
+    if (shared) element.runtime = shared;
     element.setAttribute('asset-base', data.demuxeBase);
     element.setAttribute('controls', '');
+    element.showSourceControls = false;
+    element.allowFileDrop = false;
     host.append(element);
     state.element = element;
     status('Opening media…');
     const start = Math.max(0, ((Number(data.resumeMs) || 0) - generation.media_time_origin_ms) / 1000);
-    await element.open({url: new URL(generation.media_url, location.origin).href, format: 'file', credentials: 'same-origin',
-      allowedOrigins: [location.origin], immutable: true}, {startTime: start});
-    if (!current()) return close();
+    await element.open(new URL(generation.media_url, location.origin).href, {startTime: start});
+    if (!current()) return;
     status('');
     host.dataset.state = 'ready';
   } catch (error) {
@@ -110,22 +163,28 @@ async function start() {
   }
 }
 
-/** Bounded teardown: dispose the player, then retire the delivery. */
+/**
+ * Teardown. The delivery is retired first, with a keepalive request, so that
+ * leaving the page releases server capacity even if player disposal stalls.
+ */
 function close() {
   state.closing ??= (async () => {
     state.epoch++;
-    const element = state.element;
-    state.element = null;
-    if (element) await Promise.race([element.destroy().catch(() => {}), new Promise(r => setTimeout(r, 2000))]);
-    element?.remove();
     const id = state.deliveryId;
     state.deliveryId = null;
-    if (id) await api('DELETE', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}`).catch(() => {});
+    const retiring = retire(id);
+    const element = state.element;
+    state.element = null;
+    if (element) await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
+    element?.remove();
+    await retiring;
   })();
   return state.closing;
 }
 
 addEventListener('pagehide', () => { void close(); });
+// Restored from the back/forward cache: the old player and delivery are gone.
+addEventListener('pageshow', event => { if (event.persisted && host) void start(); });
 if (host) void start();
 
 export {close};

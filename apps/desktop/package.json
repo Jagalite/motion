@@ -1,0 +1,14 @@
+{
+  "name": "motion-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Motion Electron host (A12). Wave 0: local-origin Topcoat/CSP/Demuxe proof.",
+  "scripts": {
+    "proof": "node proof/run.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.7.0"
+  }
+}

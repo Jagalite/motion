@@ -75,6 +75,9 @@ fn assert_presentation_headers(headers: &axum::http::HeaderMap) {
     assert_eq!(headers["content-security-policy"], CONTENT_SECURITY_POLICY);
     assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-eval'"));
     assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-inline'"));
+    assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-hashes'"));
+    // The only inline allowance is the pinned Demuxe stylesheet hash.
+    assert!(CONTENT_SECURITY_POLICY.contains(&format!("style-src 'self' '{}'", motion_ui::DEMUXE_STYLE_HASH)));
     assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
     assert_eq!(headers["cross-origin-embedder-policy"], "require-corp");
@@ -113,7 +116,7 @@ async fn home_renders_for_a_principal_and_labels_the_mock() {
 #[tokio::test]
 async fn api_paths_never_fall_through_to_html() {
     let app = app(Some(principal("everyone", VIEWER)), None);
-    for uri in ["/api/v2/unknown", "/api/v2", "/api/v2/catalog/items/x/nope"] {
+    for uri in ["/api/v2/unknown", "/api/v2", "/api/v2/", "/api/v2/catalog/items/x/nope"] {
         let (status, headers, body) = get_page(&app, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json", "{uri}");

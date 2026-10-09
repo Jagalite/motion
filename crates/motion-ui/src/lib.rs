@@ -35,7 +35,9 @@ pub const CONTENT_SECURITY_POLICY: &str = concat!(
     "default-src 'self'; ",
     "script-src 'self' 'wasm-unsafe-eval'; ",
     "worker-src 'self' blob:; ",
-    "style-src 'self'; ",
+    // The pinned Demuxe archive renders one static shadow-root <style>; allow
+    // exactly that text by hash (see DEMUXE_STYLE_HASH), not 'unsafe-inline'.
+    "style-src 'self' 'sha256-smNQpTGGdipSJJHMEztOmlzNusICCiQBd+JnOrZepKs='; ",
     "img-src 'self' data: blob:; ",
     "media-src 'self' blob:; ",
     "connect-src 'self'; ",
@@ -45,6 +47,11 @@ pub const CONTENT_SECURITY_POLICY: &str = concat!(
     "frame-ancestors 'none'; ",
     "form-action 'self'"
 );
+
+/// sha256 of the player stylesheet text rendered by the installed Demuxe
+/// archive (demuxe 1.1.0, archive sha256 ddb82eb5…f66f). Changing the Demuxe
+/// archive requires re-deriving it from the browser's CSP report.
+pub const DEMUXE_STYLE_HASH: &str = "sha256-smNQpTGGdipSJJHMEztOmlzNusICCiQBd+JnOrZepKs=";
 
 pub fn router(facade: Arc<dyn UiQueryFacade>) -> topcoat::router::Router {
     app::router(Facade(facade))
@@ -58,6 +65,7 @@ pub fn mount(api: AxumRouter, facade: Arc<dyn UiQueryFacade>, demuxe_dir: Option
         .merge(api)
         // Unknown API paths stay JSON Problem Details, never HTML.
         .route("/api/v2", any(api_not_found))
+        .route("/api/v2/", any(api_not_found))
         .route("/api/v2/{*rest}", any(api_not_found))
         .route("/ui/{file}", get(ui_asset));
     if let Some(dir) = demuxe_dir {
