@@ -54,6 +54,7 @@ pub struct Settings {
     pub processing: crate::processing::Settings,
     pub storage: crate::storage::Settings,
     pub access_mode: playscale_core::access::AccessMode,
+    pub api: crate::v2::ApiSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -68,6 +69,7 @@ impl Default for Settings {
             storage: Default::default(),
             // Household mode (anonymous legacy v1) is only an explicit choice.
             access_mode: playscale_core::access::AccessMode::Restricted,
+            api: Default::default(),
         }
     }
 }
@@ -186,6 +188,7 @@ impl Args {
         if let Some(origin) = &settings.public_origin {
             settings.public_origin = Some(canonical_origin(origin)?);
         }
+        settings.api.validate()?;
         settings.processing.validate()?;
         settings.storage.validate()?;
         Ok(settings)

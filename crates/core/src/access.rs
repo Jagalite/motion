@@ -526,10 +526,12 @@ pub fn replace_policy(
     }))
 }
 
-/// Unauthenticated legacy routes remain only in household mode. Restricted
-/// mode admits them for the operator alone, so v1 cannot bypass v2 policy.
-pub fn legacy_allowed(mode: AccessMode, operator: bool) -> bool {
-    operator || mode == AccessMode::TrustedHousehold
+/// Unauthenticated legacy routes remain only in household mode. v1 responses
+/// are not library-scoped, so restricted mode admits them only for an
+/// administrator (whose v2 scope is the whole catalog): v1 can never return
+/// more than v2 would.
+pub fn legacy_allowed(mode: AccessMode, admin: bool) -> bool {
+    admin || mode == AccessMode::TrustedHousehold
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
