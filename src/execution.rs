@@ -280,11 +280,17 @@ impl Drop for Lease {
                 });
                 let coordinator = self.coordinator.clone();
                 let ticket = self.ticket;
+                // Without a runtime (e.g. during shutdown) a plain thread waits, so
+                // the reservation is still released once the execution is gone.
+                // An inconclusive (non-Unix) witness keeps it reserved for good.
+                let reap = move || {
+                    witness.wait_blocking();
+                    coordinator.input(Input::Exited { ticket });
+                };
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        witness.wait().await;
-                        coordinator.input(Input::Exited { ticket });
-                    });
+                    runtime.spawn_blocking(reap);
+                } else {
+                    std::thread::spawn(reap);
                 }
             }
         }
@@ -348,18 +354,25 @@ impl Witness {
         #[cfg(not(unix))]
         true
     }
+    /// Whether releasing this witness is evidence of termination. Without `flock`
+    /// it is not, and only a successful reap of the process counts.
+    pub fn conclusive(&self) -> bool {
+        cfg!(unix)
+    }
+    /// Block until every holder is gone. Never returns for an inconclusive witness.
+    pub fn wait_blocking(self) {
+        #[cfg(unix)]
+        while !flock(&self.probe, libc::LOCK_EX) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        #[cfg(not(unix))]
+        loop {
+            std::thread::park();
+        }
+    }
     /// Resolve once every holder is gone. A blocking-pool thread waits on the lock.
     pub async fn wait(self) {
-        #[cfg(unix)]
-        {
-            let probe = self.probe;
-            let _ = tokio::task::spawn_blocking(move || {
-                while !flock(&probe, libc::LOCK_EX) {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            })
-            .await;
-        }
+        let _ = tokio::task::spawn_blocking(move || self.wait_blocking()).await;
     }
 }
 
@@ -423,6 +436,8 @@ pub async fn confirm_exit(
         tokio::time::sleep(Duration::from_millis(50)).await;
         released = witness.as_ref().is_none_or(Witness::released);
     }
+    // An inconclusive witness only adds weight to a successful reap; after a natural
+    // exit (no handle) on such a platform there is no evidence beyond the exit itself.
     if reaped && released {
         lease.settled();
         exited();
@@ -436,14 +451,16 @@ pub async fn confirm_exit(
     lease.stuck(async move {
         if let Some(mut child) = remaining {
             // Retry failed waits; only a successful reap is evidence.
+            // Retry failed waits; only a successful reap is evidence, unless a
+            // conclusive witness will provide it.
             while child.wait().await.is_err() {
-                if witness.is_some() {
+                if witness.as_ref().is_some_and(Witness::conclusive) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
-        if let Some(witness) = witness {
+        if let Some(witness) = witness.filter(Witness::conclusive) {
             witness.wait().await;
         }
         exited();
