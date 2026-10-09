@@ -16,6 +16,25 @@ pub const DRAIN_MS: u64 = 10_000;
 pub const WINDOW: usize = 6;
 /// Generations one delivery may create; further seeks require a new delivery.
 pub const MAX_GENERATIONS: u64 = 1_000;
+/// Delivery pacing and window policy, fixed at admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Policy {
+    /// Advertised playlist duration kept before eviction (at least 3 targets).
+    pub min_window_ms: u64,
+    /// Pause a generation's worker when its output is this far ahead of the
+    /// position it must serve next (client playhead for the active generation,
+    /// requested start for a candidate).
+    pub ahead_pause_ms: u64,
+    /// Resume once the lead falls below this.
+    pub ahead_resume_ms: u64,
+}
+/// Production policy: a minute of playlist, encode at most 45 s ahead.
+pub const POLICY: Policy = Policy {
+    min_window_ms: 60_000,
+    ahead_pause_ms: 45_000,
+    ahead_resume_ms: 30_000,
+};
+
 /// Accepted HLS target durations, in whole seconds.
 pub const TARGET_SECONDS: std::ops::RangeInclusive<u64> = 1..=20;
 
@@ -114,6 +133,10 @@ pub struct Generation {
     pub available_end_ms: u64,
     /// Every segment through the final one was published; the playlist may end.
     pub complete: bool,
+    /// Longest playlist ever advertised; bounds retention after eviction.
+    pub longest_playlist_ms: u64,
+    /// The live worker is paused because its output is far enough ahead.
+    pub paused: bool,
     pub worker: Worker,
     pub drain_until_ms: Option<u64>,
 }
@@ -150,6 +173,9 @@ pub enum Replacement {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Delivery {
     pub revision: u64,
+    pub policy: Policy,
+    /// Last logical playhead reported by the client.
+    pub client_position_ms: Option<u64>,
     pub timeline: String,
     pub duration_ms: Option<u64>,
     pub status: Status,
@@ -210,6 +236,8 @@ pub enum Input {
     },
     Heartbeat {
         active_generation: u64,
+        /// Logical timeline playhead, when the client reports it.
+        position_ms: Option<u64>,
         now_ms: u64,
     },
     Tick {
@@ -227,6 +255,11 @@ pub enum Effect {
     },
     Stop {
         generation: u64,
+    },
+    /// Pause or resume the generation's live worker (encode-ahead bound).
+    Pace {
+        generation: u64,
+        paused: bool,
     },
     /// Delete published segments below `below_index`; none is advertised or fetchable.
     Discard {
@@ -283,6 +316,8 @@ fn new_generation(pin: Pin, start_ms: u64, duration_ms: Option<u64>) -> Generati
         },
         // A stored representation is complete and needs no worker.
         complete: !segmented,
+        longest_playlist_ms: 0,
+        paused: false,
         worker: if segmented {
             Worker::Deferred
         } else {
@@ -293,8 +328,19 @@ fn new_generation(pin: Pin, start_ms: u64, duration_ms: Option<u64>) -> Generati
 }
 
 impl Delivery {
-    /// Admit a delivery and its first generation.
+    /// Admit a delivery and its first generation under the production policy.
     pub fn admit(
+        timeline: String,
+        pin: Pin,
+        start_ms: u64,
+        duration_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<Effect>), Error> {
+        Self::admit_with_policy(POLICY, timeline, pin, start_ms, duration_ms, now_ms)
+    }
+
+    pub fn admit_with_policy(
+        policy: Policy,
         timeline: String,
         pin: Pin,
         start_ms: u64,
@@ -306,6 +352,8 @@ impl Delivery {
         }
         let mut d = Self {
             revision: 1,
+            policy,
+            client_position_ms: None,
             timeline,
             duration_ms,
             status: Status::Starting,
@@ -475,10 +523,11 @@ impl Delivery {
     /// 8216 minimum. Evicted segments stay fetchable until their deadline.
     fn evict(&mut self, number: u64, now_ms: u64) {
         let g = self.generations.get_mut(&number).unwrap();
-        let minimum = g.target_duration_s * 3_000;
-        // No playlist containing these segments was longer than the current one.
-        let longest: u64 = g.segments.iter().map(|s| s.duration_ms).sum();
-        let mut total = longest;
+        let minimum = (g.target_duration_s * 3_000).max(self.policy.min_window_ms);
+        let mut total: u64 = g.segments.iter().map(|s| s.duration_ms).sum();
+        // A conservative bound on any playlist that contained an evicted segment.
+        g.longest_playlist_ms = g.longest_playlist_ms.max(total);
+        let longest = g.longest_playlist_ms;
         loop {
             let head = g.segments[0].duration_ms;
             if g.segments.len() <= WINDOW || total - head < minimum {
@@ -491,6 +540,35 @@ impl Delivery {
                 index: evicted.index,
                 until_ms: now_ms.saturating_add(head).saturating_add(longest),
             });
+        }
+    }
+
+    /// Pause workers whose output is far enough ahead of what must be served
+    /// next; resume them once the lead shrinks (hysteresis between thresholds).
+    fn pace(&mut self, effects: &mut Vec<Effect>) {
+        let policy = self.policy;
+        for (number, g) in self.generations.iter_mut() {
+            if g.worker != Worker::Live || !g.status.current() || g.complete {
+                continue;
+            }
+            let reference = if Some(*number) == self.active {
+                self.client_position_ms.unwrap_or(g.requested_start_ms)
+            } else {
+                g.requested_start_ms
+            };
+            let ahead = g.available_end_ms.saturating_sub(reference);
+            let paused = if g.paused {
+                ahead >= policy.ahead_resume_ms
+            } else {
+                ahead >= policy.ahead_pause_ms
+            };
+            if paused != g.paused {
+                g.paused = paused;
+                effects.push(Effect::Pace {
+                    generation: *number,
+                    paused,
+                });
+            }
         }
     }
 
@@ -556,6 +634,7 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
                     g.next_segment = 1;
                     g.available_start_ms = origin;
                     g.available_end_ms = end;
+                    g.longest_playlist_ms = *first_segment_ms;
                     if d.active.is_none() {
                         // Nothing to hand off from: the first generation activates.
                         d.promote(n);
@@ -729,6 +808,7 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
         }
         Input::Heartbeat {
             active_generation,
+            position_ms,
             now_ms,
         } => {
             if !d.lease_valid(*now_ms) {
@@ -737,7 +817,13 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
             if ![d.active, d.pending].contains(&Some(*active_generation)) {
                 return Err(Error::GenerationConflict);
             }
+            if position_ms.is_some_and(|p| !within(d.duration_ms, p)) {
+                return Err(Error::InvalidPosition);
+            }
             d.lease_expires_ms = now_ms.saturating_add(LEASE_MS).max(d.lease_expires_ms);
+            if position_ms.is_some() {
+                d.client_position_ms = *position_ms;
+            }
         }
         Input::Tick { now_ms } => {
             if !d.status.fenced() && *now_ms >= d.lease_expires_ms {
@@ -765,6 +851,9 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
                 d.shut(Status::Interrupted, &mut effects);
             }
         }
+    }
+    if !d.status.fenced() {
+        d.pace(&mut effects);
     }
     if d != *before {
         d.revision += 1;
@@ -971,6 +1060,7 @@ mod tests {
         step(&mut d, ready(1, 0)).unwrap();
         let heartbeat = |generation, now| Input::Heartbeat {
             active_generation: generation,
+            position_ms: None,
             now_ms: now,
         };
         assert_eq!(
@@ -1026,8 +1116,20 @@ mod tests {
     #[test]
     fn playlist_is_rolling_retained_and_ends_only_after_final_segment() {
         // Admitted late enough that the lease covers the clock values used below.
-        let (mut d, _) =
-            Delivery::admit("t".into(), pin(&["a1"]), 0, Some(200_000), 60_000).unwrap();
+        let rfc_minimum = Policy {
+            min_window_ms: 0,
+            ahead_pause_ms: u64::MAX,
+            ahead_resume_ms: u64::MAX,
+        };
+        let (mut d, _) = Delivery::admit_with_policy(
+            rfc_minimum,
+            "t".into(),
+            pin(&["a1"]),
+            0,
+            Some(200_000),
+            60_000,
+        )
+        .unwrap();
         let segment = |index, duration_ms| Input::Segment {
             generation: 1,
             index,
@@ -1079,5 +1181,50 @@ mod tests {
         step(&mut e, ready(1, 0)).unwrap();
         step(&mut e, segment(1, 6_500)).unwrap();
         assert_eq!(e.status, Status::Failed);
+    }
+
+    #[test]
+    fn workers_pause_far_ahead_of_the_playhead_and_resume_behind_it() {
+        let (mut d, _) = Delivery::admit("t".into(), pin(&["a1"]), 0, None, 0).unwrap();
+        step(&mut d, ready(1, 0)).unwrap();
+        let mut paced = Vec::new();
+        for index in 1..12 {
+            paced.extend(
+                step(
+                    &mut d,
+                    Input::Segment {
+                        generation: 1,
+                        index,
+                        duration_ms: 4000,
+                        now_ms: 1,
+                    },
+                )
+                .unwrap()
+                .into_iter()
+                .filter(|e| matches!(e, Effect::Pace { .. })),
+            );
+        }
+        // 48 s produced while the client is at 0: paused once at 48 s >= 45 s.
+        assert_eq!(
+            paced,
+            [Effect::Pace {
+                generation: 1,
+                paused: true
+            }]
+        );
+        let beat = |position| Input::Heartbeat {
+            active_generation: 1,
+            position_ms: Some(position),
+            now_ms: 2,
+        };
+        // Within the hysteresis band nothing changes; behind it the worker resumes.
+        assert_eq!(step(&mut d, beat(10_000)).unwrap(), []);
+        assert_eq!(
+            step(&mut d, beat(20_000)).unwrap(),
+            [Effect::Pace {
+                generation: 1,
+                paused: false
+            }]
+        );
     }
 }
