@@ -1,9 +1,10 @@
 {
-  "kind": "topcoat-electron-local-origin-proof",
+  "kind": "topcoat-electron-local-origin-smoke-proof",
+  "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
   "passed": true,
-  "recorded_at": "2026-10-09T22:51:14.004Z",
-  "motion_commit": "52302fe2dd81b47c91cbe38a34ba56cbf3e03ca3",
+  "recorded_at": "2026-10-09T23:03:38.961Z",
+  "motion_commit": "786a837950d9496d26e68ae1a8adf1e44e86af27",
   "worktree_dirty": false,
   "environment": {
     "electron": "44.7.0",
@@ -12,13 +13,22 @@
     "os": "darwin 25.5.0",
     "arch": "arm64"
   },
-  "topcoat": "tokio-rs/topcoat 341f3ff2fe16a73af5469685cf597693af5acb25, features router+view+tower+discover (no runtime)",
+  "topcoat": {
+    "version": "0.10.0",
+    "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
+    "features": "router, view, tower, discover (no runtime)"
+  },
+  "proof_server_sha256": "59994c15b37c17a49a3d72e0a0a58713e97dab557a0a4e3a7064ac51277ca812",
+  "rust_toolchain": "1.98.0",
   "origin": "single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media",
   "demuxe": {
     "name": "demuxe",
     "version": "1.1.0",
-    "archive_sha256": "ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f"
+    "archive_sha256": "ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f",
+    "files_verified": 266,
+    "mismatched_files": []
   },
+  "bfcache_restored": false,
   "media": {
     "generator": "ffmpeg lavfi testsrc2+sine, H.264 High/AAC-LC, 640x360@24, 12 s, faststart",
     "sha256": "bf542c8af5cac2ca726dfdc033fb434a3511ff71b468de975850f9388adfcecf"
@@ -32,11 +42,13 @@
     "inline_script_blocked": true,
     "player_ready": true,
     "played_past_2_5s": true,
-    "seek_to_7s_played": true,
+    "seek_landed_and_continued": true,
     "range_requests": true,
-    "delivery_closed_on_leave": true,
+    "every_delivery_retired": true,
     "waited_for_starting_generation": true,
-    "replays_after_back_navigation": true
+    "plays_after_back_navigation": true,
+    "demuxe_bytes_match_install_receipt": true,
+    "no_permission_granted_beyond_fullscreen": true
   },
   "observations": {
     "sessionExchangeStatus": 200,
@@ -47,7 +59,10 @@
         "sameSite": "strict"
       }
     ],
-    "bootstrapReplayStatus": 403,
+    "bootstrapReplay": {
+      "status": 401,
+      "code": "unauthenticated"
+    },
     "pageCsp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'sha256-smNQpTGGdipSJJHMEztOmlzNusICCiQBd+JnOrZepKs='; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     "nodeAvailable": false,
     "crossOriginIsolated": true,
@@ -59,8 +74,12 @@
     },
     "playback": {
       "played": true,
-      "sought": true,
-      "finalTime": 7.756852,
+      "before": 2.612595,
+      "afterSeek": 7.001428,
+      "seekElapsedMs": 42,
+      "landed": true,
+      "advancing": true,
+      "finalTime": 7.743678,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -70,23 +89,40 @@
     "homeTitle": "Home",
     "afterBack": {
       "state": "ready",
-      "players": 1
+      "players": 1,
+      "restoredFromBfcache": false
+    },
+    "afterBackPlayback": {
+      "advancing": true,
+      "start": 0.004337,
+      "now": 1.010846
     }
   },
   "csp_console": [
     "error: Executing inline script violates the following Content Security Policy directive 'script-src 'self' 'wasm-unsafe-eval''. Either the 'unsafe-inline' keyword, a hash ('sha256-3ESihh3MurRVVlneQHpXxx54JMAaWXY5YvlFn21oZjw='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked."
   ],
   "permission_requests": [],
+  "permission_checks": [
+    "background-sync"
+  ],
+  "navigation_blocked": [],
   "http": {
     "requests": 159,
-    "deliveries_created": 2,
-    "deliveries_closed": 2
+    "deliveries_admitted": [
+      "del1",
+      "del2"
+    ],
+    "deliveries_closed": [
+      "del1",
+      "del2"
+    ]
   },
   "limitations": [
     "Proof server uses a mock UiQueryFacade, mock session exchange and mock playback routes; it is not the Motion server.",
     "Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.",
     "Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.",
     "Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.",
-    "Wave 0 player bridge: no viewing authority, progress events, generation switching or lease renewal."
+    "Wave 0 player bridge: no viewing authority, progress events, generation switching or lease renewal.",
+    "Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron."
   ]
 }
