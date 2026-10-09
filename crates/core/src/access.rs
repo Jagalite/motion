@@ -159,6 +159,7 @@ pub enum AccessError {
     PairingDecided,
     UserCodeMismatch,
     UnknownProfile,
+    UnknownLibrary,
     InvalidTtl,
     StaleRevision,
     DeviceRevoked,
@@ -182,6 +183,7 @@ impl AccessError {
             Self::PairingDecided => "pairing_already_decided",
             Self::UserCodeMismatch => "user_code_mismatch",
             Self::UnknownProfile => "unknown_profile",
+            Self::UnknownLibrary => "unknown_library",
             Self::InvalidTtl => "invalid_ttl",
             Self::StaleRevision => "precondition_failed",
             Self::DeviceRevoked => "device_revoked",
@@ -224,6 +226,37 @@ pub fn normalize_user_code(code: &str) -> String {
 
 pub fn admit_pairing(pending: usize) -> bool {
     pending < MAX_PENDING_PAIRINGS
+}
+
+/// At most one claim per poll interval per pairing. `Err` carries the
+/// seconds to wait before the next claim.
+pub fn claim_poll(last_claim_at: Option<i64>, now: i64) -> Result<(), i64> {
+    match last_claim_at.map(|last| PAIRING_POLL_SECONDS - (now - last)) {
+        Some(wait) if wait > 0 => Err(wait),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Revised {
+    Unchanged,
+    Next(u64),
+}
+
+/// A conditional replacement of a simple revisioned resource (profiles): the
+/// strong precondition must name the current revision; an identical value is
+/// not a new revision.
+pub fn revise(current: u64, expected: u64, changed: bool) -> Result<Revised, AccessError> {
+    if current != expected {
+        return Err(AccessError::StaleRevision);
+    }
+    if !changed {
+        return Ok(Revised::Unchanged);
+    }
+    current
+        .checked_add(1)
+        .map(Revised::Next)
+        .ok_or(AccessError::StaleRevision)
 }
 
 /// Approval creates the device with an explicit grant. The device has no
@@ -462,17 +495,22 @@ pub fn revoke(device: &Device, expected_revision: u64) -> Result<Option<Device>,
 }
 
 /// `None` means the policy is unchanged; no revision or event is produced.
+/// `known_libraries` are the existing libraries among those the policy names.
 pub fn replace_policy(
     device: &Device,
     expected_revision: u64,
     permissions: BTreeSet<Permission>,
     policy: Policy,
+    known_libraries: &BTreeSet<String>,
 ) -> Result<Option<Device>, AccessError> {
     if device.revision != expected_revision {
         return Err(AccessError::StaleRevision);
     }
     if device.revoked {
         return Err(AccessError::DeviceRevoked);
+    }
+    if !policy.library_ids.is_subset(known_libraries) {
+        return Err(AccessError::UnknownLibrary);
     }
     if device.grant.permissions == permissions && device.policy == policy {
         return Ok(None);
@@ -578,6 +616,8 @@ pub enum ResetReason {
     PrincipalChanged,
     PolicyChanged,
     CursorExpired,
+    /// A hint whose authorization facts are gone (e.g. a deleted item).
+    ScopeUnknown,
 }
 
 impl ResetReason {
@@ -588,6 +628,7 @@ impl ResetReason {
             Self::PrincipalChanged => "principal_changed",
             Self::PolicyChanged => "policy_changed",
             Self::CursorExpired => "cursor_expired",
+            Self::ScopeUnknown => "scope_unknown",
         }
     }
 }
@@ -657,9 +698,11 @@ pub fn recheck(subscribed: u64, current: &Result<Principal, AccessError>) -> Rec
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Resource {
     Library(String),
-    /// Catalog-derived resources carry the libraries that contain them.
+    /// Catalog-derived resources carry the libraries that contain them now
+    /// and, for file mutations, the library the mutated file was in.
     Item {
         libraries: BTreeSet<String>,
+        prior: BTreeSet<String>,
     },
     Profile(String),
     Device(String),
@@ -678,7 +721,7 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
     match resource {
         Resource::Library(id) => catalog && principal.policy.library_ids.contains(id),
         // Rating/label evidence is not yet attached to hints; fail closed.
-        Resource::Item { libraries } => {
+        Resource::Item { libraries, .. } => {
             catalog
                 && !principal.policy.rating_restricted()
                 && libraries
@@ -688,6 +731,41 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
         Resource::Profile(id) => principal.may_use_profile(id),
         Resource::Device(id) => principal.device_id.as_deref() == Some(id),
         Resource::Administrative => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Disclosure {
+    Deliver,
+    Withhold,
+    /// The hint may concern a resource the principal could see, but the facts
+    /// to decide are gone; the client must discard and rebuild its views.
+    Reset,
+}
+
+/// How to treat one hint for a principal. A catalog hint the principal can
+/// no longer see, but which left a library it can see (its file moved or was
+/// removed), or which has no membership left at all (deleted item), cannot
+/// be named; the principal gets a reset that names nothing, so its cached
+/// views of that library are rebuilt.
+pub fn disclose(principal: &Principal, resource: &Resource) -> Disclosure {
+    if visible(principal, resource) {
+        return Disclosure::Deliver;
+    }
+    let catalog = principal.allows(Permission::EventsRead)
+        && principal.allows(Permission::CatalogRead)
+        && !principal.policy.rating_restricted();
+    match resource {
+        Resource::Item { libraries, prior }
+            if catalog
+                && (prior
+                    .iter()
+                    .any(|l| principal.policy.library_ids.contains(l))
+                    || (libraries.is_empty() && !principal.policy.library_ids.is_empty())) =>
+        {
+            Disclosure::Reset
+        }
+        _ => Disclosure::Withhold,
     }
 }
 
@@ -911,6 +989,7 @@ mod tests {
         .unwrap();
         let item = |l: &str| Resource::Item {
             libraries: [l.to_string()].into(),
+            prior: BTreeSet::new(),
         };
         assert!(!visible(&p, &Resource::Library("l1".into())));
         p.policy.library_ids.insert("l1".into());
@@ -920,7 +999,8 @@ mod tests {
         assert!(!visible(
             &p,
             &Resource::Item {
-                libraries: BTreeSet::new()
+                libraries: BTreeSet::new(),
+                prior: BTreeSet::new(),
             }
         ));
         p.policy.allow_unrated = false;
@@ -948,6 +1028,126 @@ mod tests {
             Err(AccessError::IdempotencyMismatch)
         );
         assert_eq!(idempotency(Some(&r), "b", 10), Ok(Idempotent::Execute));
+    }
+
+    /// Exhaustive over a small domain, against an independent statement of
+    /// the rule: deliver iff visible now; otherwise reset iff the hint may
+    /// have left the principal's view; never name a resource it cannot see.
+    #[test]
+    fn disclosure_matches_specification_exhaustively() {
+        let libs = ["a", "b"];
+        let subsets: Vec<BTreeSet<String>> = (0..4)
+            .map(|mask| {
+                libs.iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, l)| l.to_string())
+                    .collect()
+            })
+            .collect();
+        let mut cases = 0;
+        for allowed in &subsets {
+            for now in &subsets {
+                for prior in &subsets {
+                    for (catalog, events, unrated) in [
+                        (true, true, true),
+                        (false, true, true),
+                        (true, false, true),
+                        (true, true, false),
+                    ] {
+                        let mut p = authenticate(
+                            &cred(CredentialKind::Device, 1_000),
+                            None,
+                            Some(&device()),
+                            0,
+                        )
+                        .unwrap();
+                        p.grant.permissions.clear();
+                        if catalog {
+                            p.grant.permissions.insert(Permission::CatalogRead);
+                        }
+                        if events {
+                            p.grant.permissions.insert(Permission::EventsRead);
+                        }
+                        p.policy.library_ids = allowed.clone();
+                        p.policy.allow_unrated = unrated;
+                        let r = Resource::Item {
+                            libraries: now.clone(),
+                            prior: prior.clone(),
+                        };
+                        let can = catalog && events && unrated;
+                        let sees_now = can && now.iter().any(|l| allowed.contains(l));
+                        let left_view = can
+                            && (prior.iter().any(|l| allowed.contains(l))
+                                || (now.is_empty() && !allowed.is_empty()));
+                        let expected = if sees_now {
+                            Disclosure::Deliver
+                        } else if left_view {
+                            Disclosure::Reset
+                        } else {
+                            Disclosure::Withhold
+                        };
+                        assert_eq!(
+                            disclose(&p, &r),
+                            expected,
+                            "{allowed:?} {now:?} {prior:?} {catalog} {events} {unrated}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 256);
+        let orphan = Resource::Item {
+            libraries: BTreeSet::new(),
+            prior: BTreeSet::new(),
+        };
+        assert_eq!(
+            disclose(&Principal::operator(), &orphan),
+            Disclosure::Deliver
+        );
+    }
+
+    #[test]
+    fn claim_polls_and_conditional_revisions() {
+        assert_eq!(claim_poll(None, 100), Ok(()));
+        assert_eq!(claim_poll(Some(98), 100), Err(3));
+        assert_eq!(claim_poll(Some(95), 100), Ok(()));
+        assert_eq!(revise(2, 1, true), Err(AccessError::StaleRevision));
+        assert_eq!(revise(2, 2, false), Ok(Revised::Unchanged));
+        assert_eq!(revise(2, 2, true), Ok(Revised::Next(3)));
+        assert_eq!(
+            revise(u64::MAX, u64::MAX, true),
+            Err(AccessError::StaleRevision)
+        );
+        let d = device();
+        let lib =
+            |ids: &[&str]| -> BTreeSet<String> { ids.iter().map(|s| s.to_string()).collect() };
+        let policy = Policy {
+            library_ids: lib(&["l1", "l2"]),
+            ..Policy::default()
+        };
+        assert_eq!(
+            replace_policy(
+                &d,
+                1,
+                d.grant.permissions.clone(),
+                policy.clone(),
+                &lib(&["l1"])
+            ),
+            Err(AccessError::UnknownLibrary)
+        );
+        assert!(
+            replace_policy(
+                &d,
+                1,
+                d.grant.permissions.clone(),
+                policy,
+                &lib(&["l1", "l2"])
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]

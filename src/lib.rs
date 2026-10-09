@@ -19,6 +19,7 @@ pub mod renditions;
 pub mod scan;
 pub mod storage;
 pub mod upgrade;
+pub mod v2;
 pub mod viewing;
 
 use std::{path::PathBuf, sync::Arc};
@@ -38,6 +39,7 @@ pub struct App {
     pub event_streams: Arc<Semaphore>,
     pub processing: Arc<processing::Runtime>,
     pub storage: Arc<storage::Runtime>,
+    pub access: Arc<v2::Runtime>,
 }
 
 pub fn now() -> i64 {

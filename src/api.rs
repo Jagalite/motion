@@ -362,13 +362,20 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok());
+    let v2 = request.uri().path() == "/api/v2" || request.uri().path().starts_with("/api/v2/");
+    let reject = |status, code: &'static str, message: &str| {
+        if v2 {
+            crate::v2::boundary_problem(status, Some(code), message)
+        } else {
+            ApiError::new(status, code, message).into_response()
+        }
+    };
     if host != Some(app.authority.as_str()) {
-        return ApiError::new(
+        return reject(
             StatusCode::FORBIDDEN,
             "invalid_host",
             "Unexpected Host header",
-        )
-        .into_response();
+        );
     }
     if !matches!(
         *request.method(),
@@ -383,22 +390,47 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             .get("sec-fetch-site")
             .is_some_and(|v| v == "cross-site");
         if cross_site || origin.is_some_and(|v| v != app.origin.as_str()) {
-            return ApiError::new(
+            return reject(
                 StatusCode::FORBIDDEN,
                 "invalid_origin",
                 "Cross-origin mutations are not allowed",
-            )
-            .into_response();
+            );
         }
     }
-    let is_api = request.uri().path().starts_with("/api/");
+    let path = request.uri().path();
+    if (path.starts_with("/api/v1/") || path.starts_with("/media/"))
+        && !playscale_core::access::legacy_allowed(
+            app.access.mode,
+            crate::v2::auth::bearer(request.headers())
+                .ok()
+                .flatten()
+                .is_some_and(|t| crate::v2::auth::is_operator(&app, t)),
+        )
+    {
+        // Restricted mode: the legacy surface cannot bypass v2 grants.
+        return ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "restricted_mode",
+            "This server requires the v2 API with paired credentials",
+        )
+        .into_response();
+    }
+    let is_api = path.starts_with("/api/");
     let mut response = next.run(request).await;
-    if is_api
-        && (response.status().is_client_error() || response.status().is_server_error())
+    let failed = response.status().is_client_error() || response.status().is_server_error();
+    if v2 && failed && !crate::v2::is_problem_response(&response) {
+        // Router-level fallbacks (e.g. 405) run outside the v2 layer.
+        response = crate::v2::boundary_problem(
+            response.status(),
+            None,
+            "The request could not be accepted",
+        );
+    } else if is_api
+        && failed
         && response
             .headers()
             .get(header::CONTENT_TYPE)
-            .is_none_or(|v| v != "application/json")
+            .is_none_or(|v| v != "application/json" && v != "application/problem+json")
     {
         response = ApiError::new(
             response.status(),
@@ -561,6 +593,7 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
         response["headers"] = serde_json::json!({"ETag":{"schema":{"type":"string"}},"Content-Range":{"schema":{"type":"string"}},"Content-Length":{"schema":{"type":"integer","format":"int64"}},"Accept-Ranges":{"schema":{"type":"string"}}});
     }
     let mut router = router
+        .nest("/api/v2", crate::v2::router())
         .route(
             "/api/v1/openapi.json",
             get(move || async move { Json(spec) }),

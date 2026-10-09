@@ -368,11 +368,13 @@ impl Model for Access {
                 } else if !policy.library_ids.remove("l1") {
                     policy.library_ids.insert("l1".into());
                 }
+                let known = policy.library_ids.clone();
                 match replace_policy(
                     device,
                     device.revision - u64::from(*stale),
                     permissions,
                     policy,
+                    &known,
                 ) {
                     Ok(Some(d)) => {
                         let revision = d.revision;
