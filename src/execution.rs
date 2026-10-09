@@ -139,6 +139,7 @@ impl Coordinator {
             ticket,
             terminate: token,
             stuck: AtomicBool::new(false),
+            running: Mutex::new(None),
         })
     }
 
@@ -209,10 +210,22 @@ pub struct Lease {
     ticket: u64,
     terminate: CancellationToken,
     stuck: AtomicBool,
+    /// Witness of a started execution whose end is not yet confirmed. If the lease
+    /// is dropped while this is set (e.g. its future was cancelled), the capacity
+    /// stays reserved until the witness is released.
+    running: Mutex<Option<Witness>>,
 }
 impl Lease {
     pub fn ticket(&self) -> u64 {
         self.ticket
+    }
+    /// Record that an execution owning the witness at `path` has started.
+    pub fn started(&self, path: &std::path::Path) -> std::io::Result<()> {
+        *self.running.lock().unwrap() = Some(Witness::open(path)?);
+        Ok(())
+    }
+    fn settled(&self) {
+        self.running.lock().unwrap().take();
     }
     /// Whether termination was not confirmed; a reaper now owns the release.
     pub fn is_stuck(&self) -> bool {
@@ -247,10 +260,33 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if !self.stuck.load(Ordering::SeqCst) {
-            self.coordinator.input(Input::Exited {
-                ticket: self.ticket,
-            });
+        if self.stuck.load(Ordering::SeqCst) {
+            return;
+        }
+        let running = self.running.lock().unwrap().take();
+        match running {
+            None => {
+                self.coordinator.input(Input::Exited {
+                    ticket: self.ticket,
+                });
+            }
+            Some(witness) => {
+                // Dropped mid-execution: the supervisor sees its control pipe close
+                // and terminates; release only once every holder is gone.
+                tracing::warn!(ticket = self.ticket, "lease dropped during execution");
+                self.terminating();
+                self.coordinator.input(Input::Stuck {
+                    ticket: self.ticket,
+                });
+                let coordinator = self.coordinator.clone();
+                let ticket = self.ticket;
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        witness.wait().await;
+                        coordinator.input(Input::Exited { ticket });
+                    });
+                }
+            }
         }
     }
 }
@@ -375,8 +411,9 @@ pub async fn confirm_exit(
         Some(mut child) => match tokio::time::timeout(deadline, child.wait()).await {
             Ok(Ok(_)) => (true, None),
             Ok(Err(error)) => {
+                // Not evidence of exit; keep the handle for the reaper to retry.
                 tracing::error!(%error, "could not wait for worker");
-                (false, None)
+                (false, Some(child))
             }
             Err(_) => (false, Some(child)),
         },
@@ -387,23 +424,27 @@ pub async fn confirm_exit(
         released = witness.as_ref().is_none_or(Witness::released);
     }
     if reaped && released {
+        lease.settled();
         exited();
         return true;
     }
+    lease.settled();
     tracing::error!(
         ticket = lease.ticket(),
         "worker termination not confirmed; capacity remains reserved"
     );
-    let unknowable = !reaped && remaining.is_none() && witness.is_none();
     lease.stuck(async move {
         if let Some(mut child) = remaining {
-            let _ = child.wait().await;
+            // Retry failed waits; only a successful reap is evidence.
+            while child.wait().await.is_err() {
+                if witness.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
-        match witness {
-            Some(witness) => witness.wait().await,
-            // Neither a process handle nor a witness can ever confirm it.
-            None if unknowable => std::future::pending::<()>().await,
-            None => {}
+        if let Some(witness) = witness {
+            witness.wait().await;
         }
         exited();
     });
@@ -412,8 +453,8 @@ pub async fn confirm_exit(
 
 impl Coordinator {
     /// Account for an execution left by a previous server process whose witness is
-    /// still held: its capacity is reserved as stuck until the witness is released,
-    /// then `released` runs.
+    /// still held. It is adopted as stuck capacity even beyond the budget, so no new
+    /// work runs beside it; `released` runs after the witness is free.
     pub fn recovered(
         self: &Arc<Self>,
         owner: String,
@@ -422,34 +463,18 @@ impl Coordinator {
         witness: Witness,
         released: impl FnOnce() + Send + 'static,
     ) {
-        let ticket = {
-            let mut inner = self.inner.lock().unwrap();
-            let effects = Self::apply(
-                &mut inner,
-                Input::Request {
-                    owner: owner.clone(),
-                    class,
-                    units,
-                },
-            );
-            let started = effects.iter().find_map(|e| match e {
-                Effect::Start { ticket } => Some(*ticket),
-                _ => None,
-            });
-            let Some(ticket) = started else {
-                // Over budget even when idle: nothing can be admitted beside it anyway.
-                tracing::error!(%owner, "recovered execution could not be accounted");
-                if let Some(Effect::Accepted { ticket, .. }) = effects
-                    .iter()
-                    .find(|e| matches!(e, Effect::Accepted { .. }))
-                {
-                    Self::apply(&mut inner, Input::Cancel { ticket: *ticket });
-                }
-                return;
-            };
-            Self::apply(&mut inner, Input::Cancel { ticket });
-            Self::apply(&mut inner, Input::Stuck { ticket });
-            ticket
+        let effects = self.input(Input::Adopt {
+            owner: owner.clone(),
+            class,
+            units,
+        });
+        let Some(ticket) = effects.iter().find_map(|e| match e {
+            Effect::Accepted { ticket, .. } => Some(*ticket),
+            _ => None,
+        }) else {
+            // Owner names embed unique paths; a conflict means it is already adopted.
+            tracing::error!(%owner, "recovered execution could not be adopted");
+            return;
         };
         tracing::warn!(%owner, "execution from a previous process is still alive; capacity reserved");
         let coordinator = self.clone();

@@ -57,7 +57,13 @@ struct Source {
 struct Inner {
     delivery: Delivery,
     /// Cancellation for each generation worker that may still be running.
-    workers: HashMap<u64, CancellationToken>,
+    workers: HashMap<u64, WorkerControl>,
+}
+
+/// Control of one generation worker: cancellation and pacing (true = paused).
+struct WorkerControl {
+    stop: CancellationToken,
+    pace: tokio::sync::mpsc::UnboundedSender<bool>,
 }
 
 struct Session {
@@ -117,18 +123,31 @@ fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<E
     for effect in effects {
         match effect {
             Effect::Start { generation } => {
-                let token = CancellationToken::new();
-                inner.workers.insert(generation, token.clone());
+                let stop = CancellationToken::new();
+                let (pace, paced) = tokio::sync::mpsc::unbounded_channel();
+                inner.workers.insert(
+                    generation,
+                    WorkerControl {
+                        stop: stop.clone(),
+                        pace,
+                    },
+                );
                 tokio::spawn(run_generation(
                     app.clone(),
                     session.clone(),
                     generation,
-                    token,
+                    stop,
+                    paced,
                 ));
             }
             Effect::Stop { generation } => {
-                if let Some(token) = inner.workers.get(&generation) {
-                    token.cancel();
+                if let Some(worker) = inner.workers.get(&generation) {
+                    worker.stop.cancel();
+                }
+            }
+            Effect::Pace { generation, paused } => {
+                if let Some(worker) = inner.workers.get(&generation) {
+                    let _ = worker.pace.send(paused);
                 }
             }
             Effect::Discard {
@@ -190,23 +209,21 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
                 .and_then(|v| v.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .map(|v| (v * 1000.0).round() as u64);
-        } else if !line.starts_with('#') && !line.is_empty()
+        } else if !line.starts_with('#')
+            && !line.is_empty()
             && let (Some(duration_ms), Some(index)) = (
                 duration.take(),
                 line.strip_prefix("seg")
                     .and_then(|n| n.strip_suffix(".m4s"))
                     .and_then(|n| n.parse().ok()),
-            ) {
-                out.push(Published { index, duration_ms });
-            }
+            )
+        {
+            out.push(Published { index, duration_ms });
+        }
     }
     (out, text.lines().any(|l| l == "#EXT-X-ENDLIST"))
 }
 
-/// Encode at most twice real time after an initial burst, so a paused or slow
-/// client does not let the encoder race toward the end and evict what it needs.
-const READ_RATE: &str = "2";
-const INITIAL_BURST_SECONDS: &str = "30";
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
@@ -225,10 +242,6 @@ fn arguments(start_ms: u64, audio: Option<u32>, directory: &FsPath) -> Vec<Strin
     args.push(format!("{}.{:03}", start_ms / 1000, start_ms % 1000));
     args.extend(
         [
-            "-readrate",
-            READ_RATE,
-            "-readrate_initial_burst",
-            INITIAL_BURST_SECONDS,
             // The validated source descriptor inherited as fd 3.
             "-i",
             "/dev/fd/3",
@@ -367,7 +380,13 @@ fn source_valid(source: &Source) -> anyhow::Result<std::fs::File> {
 /// cancellation or termination accounting.
 const OBSERVE_DEADLINE: Duration = Duration::from_secs(5);
 
-async fn run_generation(app: App, session: Arc<Session>, generation: u64, stop: CancellationToken) {
+async fn run_generation(
+    app: App,
+    session: Arc<Session>,
+    generation: u64,
+    stop: CancellationToken,
+    mut paced: tokio::sync::mpsc::UnboundedReceiver<bool>,
+) {
     let stopped = move |app: &App, session: &Arc<Session>| {
         let _ = apply(app, session, Input::Stopped { generation });
     };
@@ -398,16 +417,22 @@ async fn run_generation(app: App, session: Arc<Session>, generation: u64, stop: 
         .tracks
         .iter()
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()));
+    // A stalled source volume must not block cancellation. Nothing runs yet, so
+    // abandoning the blocking preparation leaves no execution to account for; its
+    // descriptors close when it finishes.
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
-        tokio::task::spawn_blocking(move || {
+        let preparation = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
             let input = source_valid(&source)?;
             let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
             anyhow::Ok((input, witness, held))
-        })
-        .await
+        });
+        tokio::select! {
+            _ = stop.cancelled() => return stopped(&app, &session),
+            prepared = preparation => prepared,
+        }
     };
     let (input, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,
@@ -428,6 +453,9 @@ async fn run_generation(app: App, session: Arc<Session>, generation: u64, stop: 
     // fd 3: the validated source; fd 4: the execution witness.
     #[cfg(unix)]
     execution::inherit(&mut supervisor, &[&input, &held.0]);
+    if stop.is_cancelled() {
+        return stopped(&app, &session);
+    }
     let child = supervisor.spawn();
     drop((input, held));
     let mut child = match child {
@@ -438,7 +466,10 @@ async fn run_generation(app: App, session: Arc<Session>, generation: u64, stop: 
             return fail(&app, &session);
         }
     };
-    let heartbeat = child.stdin.take();
+    if let Err(error) = lease.started(&directory.join(".owner")) {
+        tracing::warn!(%error, "delivery witness unreadable");
+    }
+    let mut heartbeat = child.stdin.take();
     if let Some(mut stderr) = child.stderr.take() {
         // Drain continuously; retain a bounded tail for diagnostics.
         let id = session.id.clone();
@@ -466,6 +497,15 @@ async fn run_generation(app: App, session: Arc<Session>, generation: u64, stop: 
             _ = stop.cancelled() => break None,
             _ = lease.termination_requested().cancelled() => break None,
             status = child.wait() => break Some(status),
+            Some(paused) = paced.recv() => {
+                use tokio::io::AsyncWriteExt;
+                if let Some(control) = heartbeat.as_mut() {
+                    let byte: &[u8] = if paused { b"p" } else { b"r" };
+                    if control.write_all(byte).await.is_err() {
+                        break None;
+                    }
+                }
+            }
             _ = poll.tick() => {
                 let observed = tokio::select! {
                     _ = stop.cancelled() => break None,
@@ -585,8 +625,16 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                     .lock()
                     .unwrap()
                     .remove(&session.id);
+                // Generation cleanups may still be running; retry until it is gone.
                 let directory = app.processing.deliveries.root.join(&session.id);
-                let _ = tokio::fs::remove_dir_all(directory).await;
+                for _ in 0..50 {
+                    match tokio::fs::remove_dir_all(&directory).await {
+                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        _ => break,
+                    }
+                }
             }
         }
     }
@@ -602,18 +650,24 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
     };
     let mut keep = Vec::new();
     for (path, witness) in held {
-        // live/<delivery>/<generation>/.owner
-        let Some(directory) = path.parent().and_then(FsPath::parent).map(FsPath::to_owned) else {
+        // live/<delivery>/<generation>/.owner: keep the delivery directory while
+        // any of its generations survives; remove only the released generation,
+        // then the delivery directory once it is empty.
+        let (Some(generation), Some(delivery)) = (
+            path.parent().map(FsPath::to_owned),
+            path.parent().and_then(FsPath::parent).map(FsPath::to_owned),
+        ) else {
             continue;
         };
-        keep.push(directory.clone());
+        keep.push(delivery.clone());
         app.processing.execution.recovered(
             format!("recovered:{}", path.display()),
             Class::Interactive,
             1,
             witness,
             move || {
-                let _ = std::fs::remove_dir_all(directory);
+                let _ = std::fs::remove_dir_all(generation);
+                let _ = std::fs::remove_dir(delivery);
             },
         );
     }
@@ -674,6 +728,9 @@ pub struct ActivateRequest {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatRequest {
     pub active_generation: String,
+    /// Logical playhead; bounds how far the encoder may run ahead.
+    #[serde(default)]
+    pub position_ms: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -689,6 +746,8 @@ pub struct GenerationView {
     pub transport: String,
     pub operation: String,
     pub complete: bool,
+    /// The encoder is paused because its output is far enough ahead of the playhead.
+    pub paused: bool,
     pub audio_track: Option<u32>,
 }
 
@@ -732,6 +791,7 @@ fn view(app: &App, session: &Session, d: &Delivery) -> DeliveryView {
                 transport: "hls".into(),
                 operation: name(g.pin.operation),
                 complete: g.complete,
+                paused: g.paused,
                 audio_track: g
                     .pin
                     .tracks
@@ -870,6 +930,14 @@ pub async fn create(
             .bind(&file.library_id)
             .fetch_one(&app.db)
             .await?;
+    if !cfg!(unix) {
+        // Encoder input is the inherited validated descriptor (Unix only).
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "platform_unsupported",
+            "Live conversion is not available on this platform",
+        ));
+    }
     let runtime = &app.processing.deliveries;
     let (delivery, effects) = Delivery::admit(
         // The current catalog binds one timeline per edition.
@@ -949,6 +1017,7 @@ pub async fn heartbeat(
         &session,
         Input::Heartbeat {
             active_generation: generation_number(&r.active_generation)?,
+            position_ms: r.position_ms,
             now_ms: app.processing.deliveries.now_ms(),
         },
     )
@@ -1036,11 +1105,27 @@ fn stream_headers(content_type: &'static str) -> [(header::HeaderName, &'static 
     ]
 }
 
+/// Request admission re-reads the catalog: a detached library, unavailable file
+/// or new revision fences the delivery immediately, and an unreadable catalog
+/// fails closed.
+async fn admit_stream(app: &App, id: &str) -> Result<Arc<Session>, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let current: Option<String> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+        .bind(&session.file_id)
+        .fetch_optional(&app.db)
+        .await?;
+    if current.as_deref() != Some(session.revision.as_str()) {
+        revalidate(app, &session).await;
+        return Err(ApiError::not_found());
+    }
+    Ok(session)
+}
+
 pub async fn playlist(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = app.processing.deliveries.session(&id)?;
+    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
     let text = {
         let inner = session.inner.lock().unwrap();
@@ -1090,7 +1175,7 @@ pub async fn init(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = app.processing.deliveries.session(&id)?;
+    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
     {
         let inner = session.inner.lock().unwrap();
@@ -1108,7 +1193,7 @@ pub async fn segment(
     State(app): State<App>,
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = app.processing.deliveries.session(&id)?;
+    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
     let index: u32 = segment
         .strip_suffix(".m4s")

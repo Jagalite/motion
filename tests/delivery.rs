@@ -284,6 +284,42 @@ async fn hls_plays_before_completion_switches_generations_and_releases_workers()
     assert_eq!(audio.len(), 1);
     assert_eq!(audio[0]["sample_rate"], "22050", "selected audio track");
 
+    // Encode-ahead is bounded by the playhead: with the client at 0 the encoder
+    // pauses about 45 s ahead and stays there; an advancing playhead resumes it.
+    f.until(&id, |d| d["active"]["paused"] == true).await;
+    // Segments finished between the pause decision and the stop signal may still
+    // be published; after that the output is stable.
+    let heartbeat = format!("/api/v1/deliveries/{id}/heartbeat");
+    let beat = |position: u64| {
+        f.json(
+            "POST",
+            &heartbeat,
+            Some(json!({"active_generation":"1","position_ms":position})),
+        )
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let end = beat(0).await.1["active"]["available_end_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        (45_000..120_000).contains(&end),
+        "encode-ahead not bounded: {end}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (_, still) = beat(0).await;
+    assert_eq!(still["active"]["paused"], true);
+    assert_eq!(
+        still["active"]["available_end_ms"], end,
+        "encoder kept running"
+    );
+    let (status, resumed) = beat(end - 20_000).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["active"]["paused"], false, "{resumed}");
+    f.until(&id, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > end
+    })
+    .await;
+
     // Seek far ahead with an overlapping generation; the old one keeps serving.
     let (status, changed) = f
         .json(
@@ -386,7 +422,8 @@ async fn hls_plays_before_completion_switches_generations_and_releases_workers()
                 .0
                 == StatusCode::NOT_FOUND;
             let snapshot = f.app.processing.execution.snapshot();
-            if gone && snapshot.used == 0 && snapshot.stuck.is_empty() {
+            let removed = !f.app.processing.deliveries.root.join(&id).exists();
+            if gone && removed && snapshot.used == 0 && snapshot.stuck.is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -394,6 +431,5 @@ async fn hls_plays_before_completion_switches_generations_and_releases_workers()
     })
     .await
     .expect("delivery workers were not released");
-    assert!(!f.app.processing.deliveries.root.join(&id).exists());
     f.stop.cancel();
 }
