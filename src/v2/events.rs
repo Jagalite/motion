@@ -109,6 +109,9 @@ fn resource_type(topic: &str) -> &str {
         "viewing" => "profile_viewing",
         "devices" => "device",
         "schedules" => "scan_schedule",
+        "organization" => "organization",
+        "queues" => "profile_queue",
+        "matches" => "match",
         other => other,
     }
 }
@@ -141,7 +144,17 @@ async fn classify(
             libraries: Default::default(),
             prior,
         },
-        "profiles" | "viewing" => Resource::Profile(id.clone()),
+        "profiles" | "viewing" | "queues" => Resource::Profile(id.clone()),
+        // Collections, saved filters and playlists belong to a profile.
+        "organization" => {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT profile_id FROM collections WHERE id=?1 UNION ALL SELECT profile_id FROM saved_filters WHERE id=?1 UNION ALL SELECT profile_id FROM playlists WHERE id=?1 LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(conn)
+            .await?;
+            owner.map_or(Resource::Administrative, Resource::Profile)
+        }
         "devices" => Resource::Device(id.clone()),
         _ => Resource::Administrative,
     })

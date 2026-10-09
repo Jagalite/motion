@@ -22,7 +22,7 @@
     }
   ],
   "x-contract-status": "finalized-design-not-implemented",
-  "x-design-version": "1.0.0",
+  "x-design-version": "1.1.0",
   "tags": [
     {
       "name": "administration"

@@ -28,6 +28,10 @@ fn app(dir: &Path, db: SqlitePool) -> App {
             dir.join("cache"),
             Default::default(),
         )),
+        access: Arc::new(playscale::v2::Runtime::new(
+            playscale_core::access::AccessMode::TrustedHousehold,
+            playscale::v2::auth::random_key(),
+        )),
     }
 }
 
