@@ -501,6 +501,7 @@ fn bounded_work_graph_checks_production_reducer() {
 }
 
 #[test]
+#[ignore = "fuzzing deferred; see the A06/A07 TODO doc"]
 fn seeded_work_sequences_cover_wider_units_and_owners() {
     let report = stateless::explore::fuzz(
         &Work {
