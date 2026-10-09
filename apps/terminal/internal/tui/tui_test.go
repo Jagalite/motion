@@ -212,16 +212,18 @@ func TestDropAfterPublishedResyncSchedulesAnother(t *testing.T) {
 	ch := make(chan tea.Msg, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	emit := make(chan struct{})
+	emit, handled := make(chan struct{}), make(chan struct{})
 	go Pump(ctx, func(ctx context.Context, h func(api.Event) error, _ func(error, time.Duration)) error {
 		for range emit {
 			_ = h(api.Event{Kind: "changed", ResourceType: "profile"})
+			handled <- struct{}{}
 		}
 		<-ctx.Done()
 		return ctx.Err()
 	}, ch)
-	emit <- struct{}{} // fills the buffer
-	emit <- struct{}{} // dropped: resync scheduled
+	send := func() { emit <- struct{}{}; <-handled }
+	send() // fills the buffer
+	send() // dropped: resync scheduled
 	if _, ok := (<-ch).(eventMsg); !ok {
 		t.Fatal("expected the buffered event")
 	}
@@ -229,8 +231,8 @@ func TestDropAfterPublishedResyncSchedulesAnother(t *testing.T) {
 		t.Fatal("expected a resync")
 	}
 	// The interface has processed the resync. Fill the buffer, then drop.
-	emit <- struct{}{}
-	emit <- struct{}{}
+	send()
+	send()
 	close(emit)
 	if _, ok := (<-ch).(eventMsg); !ok {
 		t.Fatal("expected the buffered event")
