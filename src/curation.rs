@@ -569,7 +569,7 @@ async fn ensure_consistent(conn: &mut SqliteConnection) -> anyhow::Result<()> {
 }
 
 /// Create an edition with its default timeline (same ID).
-pub(crate) async fn create_edition(
+pub async fn create_edition(
     conn: &mut SqliteConnection,
     id: &str,
     item: &str,
@@ -665,7 +665,7 @@ pub(crate) async fn create_version(
 /// Its content's version moves with it unless a copy can keep representing the
 /// version in the old edition, in which case the file gets its own declared
 /// version. Multipart versions are never torn apart.
-pub(crate) async fn reassign_file(
+pub async fn reassign_file(
     conn: &mut SqliteConnection,
     file: &str,
     target_edition: &str,
@@ -678,20 +678,34 @@ pub(crate) async fn reassign_file(
     if from_edition == target_edition {
         return Ok(());
     }
-    let bound: Option<(String, i64)> = sqlx::query_as(
-        "SELECT b.version_id,(SELECT count(*) FROM version_files p WHERE p.version_id=b.version_id) FROM version_files b WHERE b.file_id=?",
+    let bound: Option<(String, i64, String)> = sqlx::query_as(
+        "SELECT b.version_id,(SELECT count(*) FROM version_files p WHERE p.version_id=b.version_id),b.file_revision FROM version_files b WHERE b.file_id=?",
     )
     .bind(file)
     .fetch_optional(&mut *conn)
     .await?;
-    let copy: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM media_files WHERE edition_id=? AND revision=? AND id<>? ORDER BY id LIMIT 1",
-    )
-    .bind(&from_edition)
-    .bind(&revision)
-    .bind(file)
-    .fetch_optional(&mut *conn)
-    .await?;
+    // A copy must hold the binding's pinned (reviewed) content, not whatever
+    // the moved file holds now.
+    let copy: Option<String> = match &bound {
+        Some((_, _, pinned)) => {
+            sqlx::query_scalar(
+                "SELECT id FROM media_files WHERE edition_id=? AND revision=? AND id<>? ORDER BY id LIMIT 1",
+            )
+            .bind(&from_edition)
+            .bind(pinned)
+            .bind(file)
+            .fetch_optional(&mut *conn)
+            .await?
+        }
+        None => None,
+    };
+    let _ = revision;
+    let decision = identity::reassignment(&identity::ReassignFacts {
+        bound: bound
+            .as_ref()
+            .map(|(v, parts, _)| (v.clone(), usize::try_from(*parts).unwrap_or(usize::MAX))),
+        pinned_copy_remains: copy.is_some(),
+    })?;
     let generated: bool = sqlx::query_scalar("SELECT generated FROM media_files WHERE id=?")
         .bind(file)
         .fetch_one(&mut *conn)
@@ -706,35 +720,27 @@ pub(crate) async fn reassign_file(
         .bind(file)
         .execute(&mut *conn)
         .await?;
-    match (bound, copy) {
-        (Some((version, _)), Some(copy)) => {
+    let timeline = timeline_for(conn, target_edition).await?;
+    match decision {
+        identity::Reassignment::RebindToCopyAndDeclareNew { version } => {
             sqlx::query("UPDATE version_files SET file_id=? WHERE version_id=? AND file_id=?")
-                .bind(&copy)
+                .bind(copy.as_deref())
                 .bind(&version)
                 .bind(file)
                 .execute(&mut *conn)
                 .await?;
-            let timeline = timeline_for(conn, target_edition).await?;
             create_version(&mut *conn, &timeline, file, origin, Equivalence::Declared).await?;
         }
         // An operator declaration is explicit equivalence, so the version may
         // join an occupied timeline (see `identity::attach_version`).
-        (Some((version, 1)), None) => {
-            let timeline = timeline_for(conn, target_edition).await?;
+        identity::Reassignment::MoveVersion { version } => {
             sqlx::query("UPDATE media_versions SET timeline_id=?,equivalence='declared',revision=revision+1 WHERE id=?")
                 .bind(&timeline)
                 .bind(&version)
                 .execute(&mut *conn)
                 .await?;
         }
-        (Some(_), None) => {
-            return Err(IdentityError::InvalidBindings(
-                "a multipart version cannot be split by reassigning one file".into(),
-            )
-            .into());
-        }
-        (None, _) => {
-            let timeline = timeline_for(conn, target_edition).await?;
+        identity::Reassignment::DeclareNew => {
             create_version(&mut *conn, &timeline, file, origin, Equivalence::Declared).await?;
         }
     }
@@ -743,10 +749,12 @@ pub(crate) async fn reassign_file(
 }
 
 /// Confirm that replaced bytes still represent a version's timeline.
+/// `reviewed` maps each part to the content revision the operator inspected.
 pub async fn confirm_replacement(
     app: &App,
     version: &str,
     expected_revision: u64,
+    reviewed: &BTreeMap<u32, String>,
 ) -> Result<u64, CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
@@ -766,6 +774,7 @@ pub async fn confirm_replacement(
         &current,
         u64::try_from(revision).map_err(anyhow::Error::from)?,
         expected_revision,
+        reviewed,
         &occurrences,
     )?;
     for binding in &next.bindings {

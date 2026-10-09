@@ -815,13 +815,40 @@ async fn scanned_works_get_versions_copies_do_not_and_replacement_needs_confirma
         .await
         .unwrap();
     assert_eq!(state(view), playscale_core::identity::Availability::Stale);
+    let replaced: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&bound)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let reviewed = std::collections::BTreeMap::from([(1u32, replaced.clone())]);
     assert!(
-        playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64 + 1)
-            .await
-            .is_err(),
+        playscale::curation::confirm_replacement(
+            &f.app,
+            &version.id,
+            revision as u64 + 1,
+            &reviewed
+        )
+        .await
+        .is_err(),
         "stale review rejected"
     );
-    playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64)
+    // Reviewed one replacement, but the file changed again before confirming.
+    f.write(&bound_path, b"replaced again");
+    f.scan().await;
+    assert!(matches!(
+        playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64, &reviewed)
+            .await,
+        Err(playscale::curation::CurationError::Rejected(
+            playscale_core::identity::IdentityError::ReviewedContentChanged(_)
+        ))
+    ));
+    let current: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&bound)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let reviewed = std::collections::BTreeMap::from([(1u32, current)]);
+    playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64, &reviewed)
         .await
         .unwrap();
     let view = playscale::curation::read_structure(&f.app.db, &item)
@@ -885,4 +912,53 @@ async fn reassigning_a_file_moves_its_version_within_the_work() {
         .await
         .unwrap();
     assert_eq!(mismatched, 0);
+}
+
+#[tokio::test]
+async fn reassignment_keeps_reviewed_content_with_its_copy() {
+    let f = Fixture::new().await;
+    f.write("a.mp4", b"reviewed A");
+    f.write("b.mp4", b"reviewed A");
+    f.scan().await;
+    let (first, item, _, edition) = f.file("a.mp4").await;
+    let version: (String, String) = sqlx::query_as(
+        "SELECT version_id,file_id FROM version_files b JOIN media_files f ON f.id=b.file_id WHERE f.edition_id=?",
+    )
+    .bind(&edition)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    // Replace the bound file's bytes (now B) while a copy keeps reviewed A.
+    let bound_path: String = sqlx::query_scalar("SELECT relative_path FROM media_files WHERE id=?")
+        .bind(&version.1)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    f.write(&bound_path, b"different B");
+    f.scan().await;
+    let mut tx = playscale::db::begin_write(&f.app.db).await.unwrap();
+    playscale::curation::create_edition(&mut tx, "other", &item, "Other")
+        .await
+        .unwrap();
+    playscale::curation::reassign_file(&mut tx, &version.1, "other")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    // The original version stays in the old edition, re-bound to the A copy.
+    let (timeline, file, pinned): (String, String, String) = sqlx::query_as(
+        "SELECT v.timeline_id,b.file_id,b.file_revision FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE v.id=?",
+    )
+    .bind(&version.0)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(timeline, edition);
+    assert_ne!(file, version.1);
+    let copy_revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&file)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(copy_revision, pinned);
+    let _ = first;
 }
