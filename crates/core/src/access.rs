@@ -734,6 +734,47 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
     }
 }
 
+/// The catalog a principal may read. Every catalog, file, artwork, media and
+/// search adapter constrains its query with this before counting, filtering
+/// or paginating, so restricted rows are never disclosed indirectly.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CatalogScope {
+    All,
+    Libraries(BTreeSet<String>),
+    Nothing,
+}
+
+impl CatalogScope {
+    /// Whether a resource contained in `libraries` is readable.
+    pub fn admits<'a>(&self, mut libraries: impl Iterator<Item = &'a String>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Libraries(allowed) => libraries.any(|l| allowed.contains(l)),
+            Self::Nothing => false,
+        }
+    }
+    pub fn library(&self, library: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Libraries(allowed) => allowed.contains(library),
+            Self::Nothing => false,
+        }
+    }
+}
+
+/// Ratings and labels are not yet recorded as catalog evidence, so a
+/// rating- or label-restricted principal reads nothing until they are
+/// (missing evidence is unknown, and unknown is denied).
+pub fn catalog_scope(principal: &Principal) -> CatalogScope {
+    if principal.is_admin() {
+        CatalogScope::All
+    } else if !principal.allows(Permission::CatalogRead) || principal.policy.rating_restricted() {
+        CatalogScope::Nothing
+    } else {
+        CatalogScope::Libraries(principal.policy.library_ids.clone())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Disclosure {
     Deliver,
@@ -1148,6 +1189,29 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    #[test]
+    fn catalog_scope_fails_closed() {
+        let mut p = authenticate(
+            &cred(CredentialKind::Device, 1_000),
+            None,
+            Some(&device()),
+            0,
+        )
+        .unwrap();
+        let libs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(catalog_scope(&p), CatalogScope::Libraries(BTreeSet::new()));
+        assert!(!catalog_scope(&p).admits(libs(&["l1"]).iter()));
+        p.policy.library_ids.insert("l1".into());
+        assert!(catalog_scope(&p).admits(libs(&["l2", "l1"]).iter()));
+        assert!(!catalog_scope(&p).admits(libs(&[]).iter()));
+        p.policy.blocked_labels.insert("horror".into());
+        assert_eq!(catalog_scope(&p), CatalogScope::Nothing);
+        p.policy.blocked_labels.clear();
+        p.grant.permissions.remove(&Permission::CatalogRead);
+        assert_eq!(catalog_scope(&p), CatalogScope::Nothing);
+        assert_eq!(catalog_scope(&Principal::operator()), CatalogScope::All);
     }
 
     #[test]

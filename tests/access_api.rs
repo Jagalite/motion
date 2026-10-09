@@ -1254,7 +1254,7 @@ async fn problems_contract_and_capabilities() {
     assert_eq!(caps.status, StatusCode::OK, "{:?}", caps.body);
     assert_eq!(caps.body["server_id"], health.body["server_id"]);
     assert_eq!(caps.body["server_epoch"], health.body["server_epoch"]);
-    assert_eq!(caps.body["schema_version"], "11");
+    assert_eq!(caps.body["schema_version"], "14");
     assert_eq!(
         caps.body["contract_digest"],
         playscale::v2::system::contract_digest()

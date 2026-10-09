@@ -47,6 +47,10 @@ impl Fixture {
                 dir.path().join("cache"),
                 Default::default(),
             )),
+            access: Arc::new(playscale::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale::v2::auth::random_key(),
+            )),
         };
         Self {
             _dir: dir,

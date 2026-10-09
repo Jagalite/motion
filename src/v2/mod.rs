@@ -532,6 +532,26 @@ pub async fn page<T>(
     })
 }
 
+/// A SQL condition admitting rows whose library column is readable under
+/// `scope`. Bind the two returned values in order. Use it inside the read
+/// query, before counting, filtering or paginating.
+pub fn scope_clause(
+    scope: &playscale_core::access::CatalogScope,
+    column: &str,
+) -> (String, bool, String) {
+    use playscale_core::access::CatalogScope::*;
+    let (all, ids) = match scope {
+        All => (true, "[]".to_string()),
+        Libraries(ids) => (false, serde_json::to_string(ids).expect("ids serialize")),
+        Nothing => (false, "[]".to_string()),
+    };
+    (
+        format!("(? OR {column} IN (SELECT value FROM json_each(?)))"),
+        all,
+        ids,
+    )
+}
+
 /// UTC RFC 3339 from Unix seconds.
 pub fn timestamp(unix: i64) -> String {
     let days = unix.div_euclid(86_400);
