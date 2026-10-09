@@ -204,7 +204,9 @@ pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError
         }
     }
     let latest: Option<Row> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} WHERE file_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1"
+        // The open proposal wins; otherwise insertion order. Proposals are never
+        // deleted, so rowid is monotonic; wall-clock timestamps are not.
+        "SELECT {COLUMNS} WHERE file_id=? ORDER BY status IN ('pending','review','deferred') DESC,rowid DESC LIMIT 1"
     ))
     .bind(file_id)
     .fetch_optional(&mut *tx)

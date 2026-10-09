@@ -713,3 +713,31 @@ async fn reproposing_a_decided_file_keeps_the_decision() {
     assert_eq!(again.status, Status::Rejected);
     assert!(matching::inbox(&f.app.db, 50).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn proposal_history_ignores_wall_clock_order() {
+    let f = Fixture::new().await;
+    f.write("Ran.1985.mkv", b"v1");
+    f.scan().await;
+    seed_target(&f, "ran", "Ran", 1985).await;
+    let (file, ..) = f.file("Ran.1985.mkv").await;
+    let first = matching::propose(&f.app, &file).await.unwrap();
+    matching::decide(&f.app, &first.id, first.revision, Decision::Reject)
+        .await
+        .unwrap();
+    // The clock later moves backward relative to the decided proposal.
+    sqlx::query("UPDATE match_proposals SET created_at=99999999999 WHERE id=?")
+        .bind(&first.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    f.write("Ran.1985.mkv", b"v2");
+    f.scan().await;
+    let second = matching::propose(&f.app, &file).await.unwrap();
+    assert_ne!(second.id, first.id);
+    let again = matching::propose(&f.app, &file).await.unwrap();
+    assert_eq!(
+        again.id, second.id,
+        "open proposal refreshed, not re-raised"
+    );
+}
