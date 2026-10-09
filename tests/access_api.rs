@@ -1139,6 +1139,18 @@ async fn restricted_mode_closes_the_legacy_surface() {
         )
         .await;
     assert_eq!(paired.status, StatusCode::UNAUTHORIZED);
+    // A paired administrator's v2 scope is the whole catalog, so v1 reads
+    // (which are not library-scoped) are admitted for it.
+    let (_, admin) = f.pair(&[], &["system:admin"]).await;
+    let admin_read = f
+        .call(
+            "GET",
+            "/api/v1/libraries",
+            None,
+            &[("authorization", &bearer(&admin))],
+        )
+        .await;
+    assert_eq!(admin_read.status, StatusCode::OK);
     let operator = f
         .call(
             "GET",
@@ -1612,4 +1624,103 @@ async fn content_tickets_are_narrow_revocable_and_replayable() {
     assert_eq!(revoke.status, StatusCode::NO_CONTENT);
     let (status, _, _) = f.bytes(&second_url, &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn approved_origins_get_bearer_only_cors_and_principals_are_rate_limited() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    let settings = playscale::v2::ApiSettings {
+        approved_origins: vec!["https://app.example".into()],
+        requests_per_minute: 3,
+    };
+    f.app.access = Arc::new(
+        playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
+            .with_settings(settings),
+    );
+    let preflight = f
+        .call(
+            "OPTIONS",
+            "/api/v2/profiles",
+            None,
+            &[
+                ("origin", "https://app.example"),
+                ("access-control-request-method", "POST"),
+            ],
+        )
+        .await;
+    assert_eq!(preflight.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight.headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert!(
+        !preflight
+            .headers
+            .contains_key("access-control-allow-credentials")
+    );
+    let other = f
+        .call(
+            "OPTIONS",
+            "/api/v2/profiles",
+            None,
+            &[
+                ("origin", "https://evil.example"),
+                ("access-control-request-method", "POST"),
+            ],
+        )
+        .await;
+    assert!(!other.headers.contains_key("access-control-allow-origin"));
+
+    let operator = bearer(OPERATOR);
+    let cross = f
+        .call(
+            "POST",
+            "/api/v2/profiles",
+            Some(json!({"name":"Remote"})),
+            &[
+                ("authorization", &operator),
+                ("origin", "https://app.example"),
+                ("idempotency-key", "cors-create-key-01"),
+            ],
+        )
+        .await;
+    assert_eq!(cross.status, StatusCode::CREATED, "{:?}", cross.body);
+    assert_eq!(
+        cross.headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    assert!(
+        cross.headers["access-control-expose-headers"]
+            .to_str()
+            .unwrap()
+            .contains("etag")
+    );
+    // An ambient cookie never rides a cross-origin request.
+    let cookie = f
+        .call(
+            "POST",
+            "/api/v2/profiles",
+            Some(json!({"name":"Remote"})),
+            &[
+                ("authorization", &operator),
+                ("cookie", "motion_session=x"),
+                ("origin", "https://app.example"),
+                ("idempotency-key", "cors-create-key-02"),
+            ],
+        )
+        .await;
+    problem(&cookie, StatusCode::FORBIDDEN, "invalid_origin");
+
+    // The operator has used 1 of 3; the bucket refills at 3/minute.
+    for _ in 0..2 {
+        let ok = f
+            .call("GET", "/api/v2/me", None, &[("authorization", &operator)])
+            .await;
+        assert_eq!(ok.status, StatusCode::OK);
+    }
+    let limited = f
+        .call("GET", "/api/v2/me", None, &[("authorization", &operator)])
+        .await;
+    problem(&limited, StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    assert!(limited.headers.contains_key("retry-after"));
 }

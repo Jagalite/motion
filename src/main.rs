@@ -126,10 +126,13 @@ async fn run() -> anyhow::Result<()> {
                 .join("generated"),
             args.processing,
         )),
-        access: Arc::new(playscale::v2::Runtime::new(
-            args.access_mode,
-            playscale::v2::auth::load_or_create_key(&args.data_dir.join("credential-key"))?,
-        )),
+        access: Arc::new(
+            playscale::v2::Runtime::new(
+                args.access_mode,
+                playscale::v2::auth::load_or_create_key(&args.data_dir.join("credential-key"))?,
+            )
+            .with_settings(args.api.clone()),
+        ),
     };
     playscale::processing::recover(&app).await?;
     if assets.is_none() {

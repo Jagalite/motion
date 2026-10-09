@@ -4,6 +4,7 @@
 //! the decided effects inside one SQLite transaction.
 pub mod auth;
 pub mod content;
+pub mod cors;
 pub mod events;
 pub mod identity;
 pub mod system;
@@ -23,7 +24,11 @@ use playscale_core::access::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::{collections::VecDeque, sync::Mutex, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Mutex,
+    time::Instant,
+};
 
 pub const BODY_LIMIT: usize = 256 * 1024;
 pub const PAGE_DEFAULT: u32 = 50;
@@ -31,8 +36,39 @@ pub const PAGE_MAX: u32 = 200;
 /// Pairing creation is unauthenticated: bound it globally per minute.
 const PAIRINGS_PER_MINUTE: usize = 30;
 
+/// Deployment settings of the v2 adapter.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApiSettings {
+    /// Exact origins (scheme://host[:port]) allowed to call the API with
+    /// bearer tokens from a browser. Empty: third-party CORS disabled.
+    pub approved_origins: Vec<String>,
+    /// Requests per minute per authenticated principal; 0 disables.
+    pub requests_per_minute: u32,
+}
+
+impl Default for ApiSettings {
+    fn default() -> Self {
+        Self {
+            approved_origins: vec![],
+            requests_per_minute: 1_200,
+        }
+    }
+}
+
+impl ApiSettings {
+    pub fn validate(&mut self) -> anyhow::Result<()> {
+        for origin in &mut self.approved_origins {
+            *origin = crate::config::canonical_origin(origin)?;
+        }
+        Ok(())
+    }
+}
+
 /// Process-lifetime state of the v2 adapter.
 pub struct Runtime {
+    pub settings: ApiSettings,
+    buckets: Mutex<HashMap<String, (f64, Instant)>>,
     pub mode: AccessMode,
     /// Changes on every process start; distinct from the database restore epoch.
     pub server_epoch: String,
@@ -46,6 +82,8 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(mode: AccessMode, key: [u8; 32]) -> Self {
         Self {
+            settings: ApiSettings::default(),
+            buckets: Mutex::new(HashMap::new()),
             key,
             mode,
             server_epoch: crate::new_id(),
@@ -54,6 +92,34 @@ impl Runtime {
             server_hash: tokio::sync::OnceCell::new(),
         }
     }
+    pub fn with_settings(mut self, settings: ApiSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Token bucket per principal: capacity and refill per minute.
+    pub(crate) fn admit_request(&self, principal: &str) -> Result<(), Problem> {
+        let rate = f64::from(self.settings.requests_per_minute);
+        if rate == 0.0 {
+            return Ok(());
+        }
+        let mut buckets = self.buckets.lock().unwrap();
+        let now = Instant::now();
+        if buckets.len() > 10_000 {
+            // Bound memory: forget principals idle for a full refill period.
+            buckets.retain(|_, (_, at)| now.duration_since(*at).as_secs() < 60);
+        }
+        let (tokens, at) = buckets.entry(principal.to_owned()).or_insert((rate, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * rate / 60.0).min(rate);
+        *at = now;
+        if *tokens < 1.0 {
+            let wait = ((1.0 - *tokens) * 60.0 / rate).ceil() as u64;
+            return Err(Problem::rate_limited(wait));
+        }
+        *tokens -= 1.0;
+        Ok(())
+    }
+
     fn admit_pairing_request(&self) -> Result<(), Problem> {
         let mut window = self.pairing_window.lock().unwrap();
         let now = Instant::now();

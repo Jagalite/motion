@@ -381,6 +381,17 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             "Unexpected Host header",
         );
     }
+    let cors_origin = v2
+        .then(|| {
+            crate::v2::cors::approved(&app.access.settings.approved_origins, request.headers())
+                .map(str::to_owned)
+        })
+        .flatten();
+    if let Some(origin) = &cors_origin
+        && crate::v2::cors::is_preflight(request.method(), request.headers())
+    {
+        return crate::v2::cors::preflight(origin);
+    }
     if !matches!(
         *request.method(),
         axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -393,7 +404,12 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             .headers()
             .get("sec-fetch-site")
             .is_some_and(|v| v == "cross-site");
-        if cross_site || origin.is_some_and(|v| v != app.origin.as_str()) {
+        // Approved third-party origins may mutate only with a bearer token.
+        let approved = v2
+            && crate::v2::cors::approved(&app.access.settings.approved_origins, request.headers())
+                .is_some()
+            && crate::v2::cors::bearer_only(request.headers());
+        if !approved && (cross_site || origin.is_some_and(|v| v != app.origin.as_str())) {
             return reject(
                 StatusCode::FORBIDDEN,
                 "invalid_origin",
@@ -401,16 +417,20 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             );
         }
     }
+    let legacy = {
+        let path = request.uri().path();
+        path.starts_with("/api/v1/") || path.starts_with("/media/")
+    };
+    // v1 responses are not library-scoped, so in restricted mode only a
+    // principal whose v2 scope is the whole catalog (an administrator) may
+    // read them; v1 mutations still require the operator token.
+    let admin = legacy
+        && app.access.mode == playscale_core::access::AccessMode::Restricted
+        && crate::v2::auth::resolve(&app, request.method(), request.headers())
+            .await
+            .is_ok_and(|caller| caller.principal.is_admin());
     let path = request.uri().path();
-    if (path.starts_with("/api/v1/") || path.starts_with("/media/"))
-        && !playscale_core::access::legacy_allowed(
-            app.access.mode,
-            crate::v2::auth::bearer(request.headers())
-                .ok()
-                .flatten()
-                .is_some_and(|t| crate::v2::auth::is_operator(&app, t)),
-        )
-    {
+    if legacy && !playscale_core::access::legacy_allowed(app.access.mode, admin) {
         // Restricted mode: the legacy surface cannot bypass v2 grants.
         return ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -449,6 +469,9 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             "Request could not be accepted",
         )
         .into_response();
+    }
+    if let Some(origin) = &cors_origin {
+        crate::v2::cors::decorate(&mut response, origin);
     }
     if is_api {
         response.headers_mut().insert(

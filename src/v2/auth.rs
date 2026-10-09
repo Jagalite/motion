@@ -419,6 +419,8 @@ pub async fn resolve(app: &App, method: &Method, headers: &HeaderMap) -> Result<
 impl FromRequestParts<App> for Caller {
     type Rejection = Problem;
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Problem> {
-        resolve(app, &parts.method, &parts.headers).await
+        let caller = resolve(app, &parts.method, &parts.headers).await?;
+        app.access.admit_request(&caller.principal.id)?;
+        Ok(caller)
     }
 }
