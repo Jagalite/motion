@@ -272,7 +272,7 @@ impl Model for Work {
         });
         let accepted_recorded = match input {
             Input::Request {
-                owner,
+                owner: _,
                 class,
                 units,
             } => accepted.iter().all(|(o, t)| {
