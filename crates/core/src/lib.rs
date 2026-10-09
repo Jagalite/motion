@@ -12,3 +12,4 @@ pub mod renditions;
 pub mod revision;
 pub mod scan;
 pub mod viewing;
+pub mod work;
