@@ -85,6 +85,8 @@ pub enum IdentityError {
     InvalidBindings(String),
     SharedFileNeedsKnownIntervals(Id),
     RevisionExhausted(Id),
+    IncompatibleKinds(Id),
+    SourceHasChildren(Id),
 }
 
 pub const MAX_SELECTION: usize = 100;
@@ -212,6 +214,23 @@ pub fn plan_merge(
             .ok_or(IdentityError::RevisionExhausted(request.target.clone()))?,
         warnings,
     })
+}
+
+/// Hierarchy guard for merges: only works of one kind merge, and a retired work
+/// must not own children that would be stranded behind its alias.
+pub fn merge_structure(
+    target_kind: &str,
+    sources: &[(Id, String, usize)],
+) -> Result<(), IdentityError> {
+    for (id, kind, children) in sources {
+        if kind != target_kind {
+            return Err(IdentityError::IncompatibleKinds(id.clone()));
+        }
+        if *children > 0 {
+            return Err(IdentityError::SourceHasChildren(id.clone()));
+        }
+    }
+    Ok(())
 }
 
 /// Commit applies only the exact reviewed plan; any changed participant is a conflict.
@@ -343,6 +362,9 @@ pub fn plan_split(
     if current.work.revision != request.expected_revision {
         return Err(IdentityError::StaleRevision(request.item.clone()));
     }
+    if request.expected_revision.checked_add(1).is_none() {
+        return Err(IdentityError::RevisionExhausted(request.item.clone()));
+    }
     if request.versions.is_empty() {
         return Err(IdentityError::EmptySelection);
     }
@@ -437,6 +459,87 @@ pub fn plan_split(
     })
 }
 
+/// IDs in the order [`plan_split`] allocates them, so a reviewed plan can be
+/// recomputed exactly at commit.
+fn issued_ids(plan: &SplitPlan) -> Vec<Id> {
+    let mut ids = vec![plan.new_item.clone()];
+    let mut editions = BTreeSet::new();
+    for step in &plan.moves {
+        match step {
+            SplitMove::Edition { .. } => {}
+            SplitMove::Timelines { new_edition, .. } => {
+                if editions.insert(new_edition) {
+                    ids.push(new_edition.clone());
+                }
+            }
+            SplitMove::Versions {
+                new_edition,
+                new_timeline,
+                ..
+            } => {
+                if editions.insert(new_edition) {
+                    ids.push(new_edition.clone());
+                }
+                ids.push(new_timeline.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// Commit applies only the exact reviewed split against the current aggregate.
+/// A stale, replayed or structurally different plan is a conflict, and the new
+/// work ID must still be unused.
+pub fn commit_split(
+    reviewed: &SplitPlan,
+    current: Option<&Aggregate>,
+    new_item_taken: bool,
+) -> Result<SplitPlan, IdentityError> {
+    let current = current.ok_or_else(|| IdentityError::UnknownItem(reviewed.item.clone()))?;
+    if new_item_taken {
+        return Err(IdentityError::StaleRevision(reviewed.item.clone()));
+    }
+    let selected: Vec<Id> = reviewed
+        .moves
+        .iter()
+        .flat_map(|step| match step {
+            SplitMove::Edition { edition } => current
+                .editions
+                .iter()
+                .filter(|e| &e.id == edition)
+                .flat_map(|e| &e.timelines)
+                .flat_map(|t| &t.versions)
+                .map(|v| v.id.clone())
+                .collect(),
+            SplitMove::Timelines { timelines, .. } => current
+                .editions
+                .iter()
+                .flat_map(|e| &e.timelines)
+                .filter(|t| timelines.contains(&t.id))
+                .flat_map(|t| &t.versions)
+                .map(|v| v.id.clone())
+                .collect(),
+            SplitMove::Versions { versions, .. } => versions.clone(),
+        })
+        .collect();
+    let mut issued = issued_ids(reviewed).into_iter();
+    let mut ids = || issued.next().unwrap_or_default();
+    let fresh = plan_split(
+        current,
+        &SplitRequest {
+            item: reviewed.item.clone(),
+            versions: selected,
+            new_title: reviewed.new_title.clone(),
+            expected_revision: reviewed.expected_revision,
+        },
+        &mut ids,
+    )?;
+    if &fresh != reviewed {
+        return Err(IdentityError::StaleRevision(reviewed.item.clone()));
+    }
+    Ok(fresh)
+}
+
 /// Reference application of a merge to loaded aggregates. Adapters apply the same
 /// moves in SQL; integration tests compare both results.
 pub fn apply_merge(catalog: &mut BTreeMap<Id, Aggregate>, plan: &MergePlan) {
@@ -526,7 +629,8 @@ pub fn apply_split(catalog: &mut BTreeMap<Id, Aggregate>, plan: &SplitPlan) {
             }
         }
     }
-    source.work.revision = source.work.revision.saturating_add(1);
+    // plan_split rejected exhaustion; the source revision always advances.
+    source.work.revision = plan.expected_revision + 1;
     catalog.insert(
         plan.new_item.clone(),
         Aggregate {

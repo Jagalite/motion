@@ -1,7 +1,7 @@
 use playscale_core::identity::{
     Aggregate, Binding, Edition, Equivalence, Id, IdentityError, MergePlan, MergeRequest, Origin,
-    Resolved, SplitRequest, Timeline, Version, Work, apply_merge, apply_split, commit_merge,
-    merged_aliases, plan_merge, plan_split, resolve,
+    Resolved, SplitPlan, SplitRequest, Timeline, Version, Work, apply_merge, apply_split,
+    commit_merge, commit_split, merged_aliases, plan_merge, plan_split, resolve,
 };
 use serde::{Deserialize, Serialize};
 use stateless::{
@@ -14,6 +14,7 @@ struct State {
     works: BTreeMap<Id, Aggregate>,
     aliases: BTreeMap<Id, Id>,
     pending: Option<MergePlan>,
+    pending_split: Option<SplitPlan>,
     next: u32,
 }
 
@@ -31,6 +32,12 @@ enum Input {
         target: Id,
     },
     CommitPending,
+    /// Preview a split; `CommitSplit` may then run, possibly more than once.
+    PreviewSplit {
+        item: Id,
+        version: Id,
+    },
+    CommitSplit,
     Split {
         item: Id,
         versions: Vec<Id>,
@@ -142,6 +149,7 @@ impl Model for Identity {
             ]),
             aliases: BTreeMap::new(),
             pending: None,
+            pending_split: None,
             next: 0,
         })
     }
@@ -178,19 +186,58 @@ impl Model for Identity {
             }
             Input::CommitPending => match &s.pending {
                 None => Effect::Rejected(IdentityError::EmptySelection),
-                Some(plan) => {
-                    next.pending = None;
-                    match commit_merge(plan, &s.works, &s.aliases) {
+                // The plan stays pending so a replayed commit is exercised.
+                Some(plan) => match commit_merge(plan, &s.works, &s.aliases) {
+                    Ok(plan) => {
+                        merge(&mut next, &plan);
+                        Effect::Merged {
+                            target: plan.target,
+                            retired: plan.retired,
+                        }
+                    }
+                    Err(e) => Effect::Rejected(e),
+                },
+            },
+            Input::PreviewSplit { item, version } => match s.works.get(item) {
+                None => Effect::Rejected(IdentityError::UnknownItem(item.clone())),
+                Some(aggregate) => {
+                    let mut counter = s.next;
+                    let mut ids = || {
+                        counter += 1;
+                        format!("n{counter}")
+                    };
+                    let request = SplitRequest {
+                        item: item.clone(),
+                        versions: vec![version.clone()],
+                        new_title: "Split".into(),
+                        expected_revision: aggregate.work.revision,
+                    };
+                    match plan_split(aggregate, &request, &mut ids) {
                         Ok(plan) => {
-                            merge(&mut next, &plan);
-                            Effect::Merged {
-                                target: plan.target,
-                                retired: plan.retired,
-                            }
+                            next.next = counter;
+                            next.pending_split = Some(plan);
+                            Effect::Previewed
                         }
                         Err(e) => Effect::Rejected(e),
                     }
                 }
+            },
+            Input::CommitSplit => match &s.pending_split {
+                None => Effect::Rejected(IdentityError::EmptySelection),
+                Some(plan) => match commit_split(
+                    plan,
+                    s.works.get(&plan.item),
+                    s.works.contains_key(&plan.new_item) || s.aliases.contains_key(&plan.new_item),
+                ) {
+                    Ok(plan) => {
+                        apply_split(&mut next.works, &plan);
+                        Effect::Split {
+                            from: plan.item,
+                            new_item: plan.new_item,
+                        }
+                    }
+                    Err(e) => Effect::Rejected(e),
+                },
             },
             Input::Split {
                 item,
@@ -278,15 +325,19 @@ impl Model for Identity {
                     && after.works[&target].work.revision == before.works[&target].work.revision + 1
             }
             [Effect::Split { from, new_item }] => {
-                matches!(input, Input::Split { item, .. } if item == from)
+                (matches!(input, Input::Split { item, .. } if item == from)
+                    || matches!((input, &before.pending_split), (Input::CommitSplit, Some(p)) if &p.item == from))
                     && !before.works.contains_key(new_item)
                     && after.works.contains_key(new_item)
                     && after.works[from].work.revision == before.works[from].work.revision + 1
             }
             [Effect::Previewed] => {
-                matches!(input, Input::Preview { .. })
-                    && unchanged_catalog
-                    && after.pending.is_some()
+                unchanged_catalog
+                    && match input {
+                        Input::Preview { .. } => after.pending.is_some(),
+                        Input::PreviewSplit { .. } => after.pending_split.is_some(),
+                        _ => false,
+                    }
             }
             [Effect::Rejected(_)] => unchanged_catalog,
             _ => false,
@@ -394,8 +445,12 @@ impl Enumerate for Identity {
                 }
             }
         }
+        if s.pending_split.is_some() {
+            inputs.push(Input::CommitSplit);
+        }
         // One split per path keeps the graph finite while covering split-before-
-        // merge, split-between-preview-and-commit, and split-after-merge orders.
+        // merge, split-between-preview-and-commit, split-after-merge orders and
+        // replayed split commits.
         if s.next == 0 {
             for (id, work) in &s.works {
                 let versions: Vec<Id> = work
@@ -406,6 +461,10 @@ impl Enumerate for Identity {
                     .map(|v| v.id.clone())
                     .collect();
                 for v in &versions {
+                    inputs.push(Input::PreviewSplit {
+                        item: id.clone(),
+                        version: v.clone(),
+                    });
                     for stale in [false, true] {
                         inputs.push(Input::Split {
                             item: id.clone(),
@@ -467,7 +526,7 @@ fn bounded_identity_graph_checks_production_decisions() {
     );
     assert!(report.transitions > 1000, "{}", report.transitions);
     println!(
-        "Stateless: {} states, {} edges; 3 works, <=1 split, one pending preview, stale/retired/self merges",
+        "Stateless: {} states, {} edges; 3 works, <=1 split plan, replayed merge/split commits, stale/retired/self merges",
         report.states, report.transitions
     );
 }
@@ -503,6 +562,46 @@ fn preview_then_intervening_split_rejects_commit_without_partial_apply() {
     );
     assert!(state.works.contains_key("w2"));
     assert!(state.aliases.is_empty());
+}
+
+#[test]
+fn replayed_split_commit_is_rejected_without_losing_associations() {
+    let mut state = Identity.initial_state().unwrap();
+    let mut outputs = Vec::new();
+    for input in [
+        Input::PreviewSplit {
+            item: "w1".into(),
+            version: "v3".into(),
+        },
+        Input::CommitSplit,
+        Input::CommitSplit,
+    ] {
+        let transition = Identity.step(&state, &input).unwrap();
+        state = transition.state;
+        outputs.extend(transition.outputs);
+    }
+    assert_eq!(
+        outputs[2],
+        Effect::Rejected(IdentityError::StaleRevision("w1".into()))
+    );
+    assert_eq!(state.works["n1"].editions[0].id, "directors");
+}
+
+#[test]
+fn split_rejects_revision_exhaustion() {
+    let mut state = Identity.initial_state().unwrap();
+    state.works.get_mut("w1").unwrap().work.revision = u64::MAX;
+    let mut ids = || "x".to_string();
+    let request = SplitRequest {
+        item: "w1".into(),
+        versions: vec!["v3".into()],
+        new_title: "t".into(),
+        expected_revision: u64::MAX,
+    };
+    assert_eq!(
+        plan_split(&state.works["w1"], &request, &mut ids),
+        Err(IdentityError::RevisionExhausted("w1".into()))
+    );
 }
 
 #[test]
