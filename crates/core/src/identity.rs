@@ -87,6 +87,10 @@ pub enum IdentityError {
     RevisionExhausted(Id),
     IncompatibleKinds(Id),
     SourceHasChildren(Id),
+    /// A selected version binds a file that a retained version also binds.
+    SharedFileSplit(Id),
+    /// The content observed now differs from the content the operator reviewed.
+    ReviewedContentChanged(Id),
 }
 
 pub const MAX_SELECTION: usize = 100;
@@ -389,6 +393,26 @@ pub fn plan_split(
     }
     if selected.len() == owned.len() {
         return Err(IdentityError::SplitWouldEmptySource);
+    }
+    // A file bound by both a moving and a retained version (e.g. a
+    // multi-episode file) cannot belong to two works' editions at once.
+    let all_versions = current
+        .editions
+        .iter()
+        .flat_map(|e| &e.timelines)
+        .flat_map(|t| &t.versions);
+    let retained_files: BTreeSet<&str> = all_versions
+        .clone()
+        .filter(|v| !selected.contains(v.id.as_str()))
+        .flat_map(|v| &v.bindings)
+        .map(|b| b.file_id.as_str())
+        .collect();
+    if let Some(shared) = all_versions
+        .filter(|v| selected.contains(v.id.as_str()))
+        .flat_map(|v| &v.bindings)
+        .find(|b| retained_files.contains(b.file_id.as_str()))
+    {
+        return Err(IdentityError::SharedFileSplit(shared.file_id.clone()));
     }
     let new_item = new_id();
     let mut moves = Vec::new();
@@ -821,12 +845,15 @@ pub fn version_availability(bindings: &[Binding], occurrences: &[Occurrence]) ->
 }
 
 /// Operator confirmation that replaced bytes still represent this version's
-/// timeline. Re-pins every replaced part to its file's current revision under
-/// the reviewed version revision; the equivalence becomes `Declared`.
+/// timeline. `reviewed` is the content revision the operator inspected for
+/// each part; every replaced part must still hold exactly that content. Parts
+/// are re-pinned under the reviewed version revision and the equivalence
+/// becomes `Declared`.
 pub fn confirm_replacement(
     version: &Version,
     current_revision: u64,
     expected_revision: u64,
+    reviewed: &BTreeMap<u32, String>,
     occurrences: &[Occurrence],
 ) -> Result<(Version, u64), IdentityError> {
     if current_revision != expected_revision {
@@ -843,6 +870,11 @@ pub fn confirm_replacement(
             .find(|o| o.file_id == binding.file_id)
             .ok_or_else(|| invalid("bound file is not cataloged"))?;
         if current.revision != binding.revision {
+            if reviewed.get(&binding.part) != Some(&current.revision) {
+                return Err(IdentityError::ReviewedContentChanged(
+                    binding.file_id.clone(),
+                ));
+            }
             binding.revision = current.revision.clone();
             changed = true;
         }
@@ -852,4 +884,55 @@ pub fn confirm_replacement(
     }
     next.equivalence = Equivalence::Declared;
     Ok((next, next_revision))
+}
+
+/// Where a generated output belongs. It joins the source's timeline as a
+/// declared version only when that timeline's version pins exactly the source
+/// content the job read; otherwise its equivalence is unknown and it gets a
+/// timeline of its own (never silently equated with stale reviewed content).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenditionPlacement {
+    Join { timeline: Id },
+    OwnTimeline,
+}
+pub fn rendition_placement(timeline_pinning_source_revision: Option<&Id>) -> RenditionPlacement {
+    match timeline_pinning_source_revision {
+        Some(timeline) => RenditionPlacement::Join {
+            timeline: timeline.clone(),
+        },
+        None => RenditionPlacement::OwnTimeline,
+    }
+}
+
+/// Facts for reassigning one file to another edition of its work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReassignFacts {
+    /// The version binding this file and its part count, if any.
+    pub bound: Option<(Id, usize)>,
+    /// A file left in the old edition holds the binding's pinned content.
+    pub pinned_copy_remains: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reassignment {
+    /// The copy keeps representing the version; the moved file gets its own
+    /// declared version in the target.
+    RebindToCopyAndDeclareNew { version: Id },
+    /// The single-part version moves with its only reviewed occurrence.
+    MoveVersion { version: Id },
+    /// An unbound file gets a declared version in the target.
+    DeclareNew,
+}
+pub fn reassignment(facts: &ReassignFacts) -> Result<Reassignment, IdentityError> {
+    match (&facts.bound, facts.pinned_copy_remains) {
+        (None, _) => Ok(Reassignment::DeclareNew),
+        (Some((version, _)), true) => Ok(Reassignment::RebindToCopyAndDeclareNew {
+            version: version.clone(),
+        }),
+        (Some((version, 1)), false) => Ok(Reassignment::MoveVersion {
+            version: version.clone(),
+        }),
+        (Some(_), false) => Err(invalid(
+            "a multipart version cannot be split by reassigning one file",
+        )),
+    }
 }
