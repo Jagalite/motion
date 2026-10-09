@@ -341,24 +341,29 @@ pub async fn control(
     .await?;
     Ok(Json(load(&app, &id).await?))
 }
-/// Witness files under `root` still held by executions of a previous process.
-pub fn held_witnesses(root: &FsPath) -> Vec<(PathBuf, crate::execution::Witness)> {
-    walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-        .filter(|e| e.file_type().is_file() && e.file_name() == ".owner")
-        .filter_map(|e| {
-            let witness = crate::execution::Witness::open(e.path()).ok()?;
-            (!witness.released()).then(|| (e.path().to_owned(), witness))
-        })
-        .collect()
+/// Witness files under `root` still held by live executions. Fails rather than
+/// under-reporting: an unreadable directory or witness means ownership is unknown.
+pub fn held_witnesses(root: &FsPath) -> anyhow::Result<Vec<(PathBuf, crate::execution::Witness)>> {
+    if !root.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut held = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() == ".owner" {
+            let witness = crate::execution::Witness::open(entry.path())?;
+            if !witness.released() {
+                held.push((entry.path().to_owned(), witness));
+            }
+        }
+    }
+    Ok(held)
 }
 pub async fn recover(app: &App) -> anyhow::Result<()> {
     // Encoders of a previous process that are still alive keep their capacity until
     // they are gone; their attempt directories are left alone until then.
     let root = app.processing.root.clone();
-    for (path, witness) in tokio::task::spawn_blocking(move || held_witnesses(&root)).await? {
+    for (path, witness) in tokio::task::spawn_blocking(move || held_witnesses(&root)).await?? {
         app.processing.execution.recovered(
             format!("recovered:{}", path.display()),
             playscale_core::work::Class::Preparation,

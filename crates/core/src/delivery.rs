@@ -174,8 +174,9 @@ pub enum Replacement {
 pub struct Delivery {
     pub revision: u64,
     pub policy: Policy,
-    /// Last logical playhead reported by the client.
-    pub client_position_ms: Option<u64>,
+    /// Last logical playhead reported by the client, with the generation it was
+    /// playing. A playhead never paces another generation.
+    pub playhead: Option<(u64, u64)>,
     pub timeline: String,
     pub duration_ms: Option<u64>,
     pub status: Status,
@@ -353,7 +354,7 @@ impl Delivery {
         let mut d = Self {
             revision: 1,
             policy,
-            client_position_ms: None,
+            playhead: None,
             timeline,
             duration_ms,
             status: Status::Starting,
@@ -551,10 +552,11 @@ impl Delivery {
             if g.worker != Worker::Live || !g.status.current() || g.complete {
                 continue;
             }
-            let reference = if Some(*number) == self.active {
-                self.client_position_ms.unwrap_or(g.requested_start_ms)
-            } else {
-                g.requested_start_ms
+            // Until the client reports playing this generation, it is consumed
+            // from its requested start.
+            let reference = match self.playhead {
+                Some((generation, position)) if generation == *number => position,
+                _ => g.requested_start_ms,
             };
             let ahead = g.available_end_ms.saturating_sub(reference);
             let paused = if g.paused {
@@ -821,8 +823,8 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
                 return Err(Error::InvalidPosition);
             }
             d.lease_expires_ms = now_ms.saturating_add(LEASE_MS).max(d.lease_expires_ms);
-            if position_ms.is_some() {
-                d.client_position_ms = *position_ms;
+            if let Some(position) = position_ms {
+                d.playhead = Some((*active_generation, *position));
             }
         }
         Input::Tick { now_ms } => {

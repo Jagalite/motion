@@ -320,6 +320,13 @@ async fn observe(
         return;
     };
     let (published, ended) = parse_playlist(&text);
+    // FFmpeg's bounded playlist dropped segments that were never reported: the
+    // generation's output (and its pacing) can no longer be accounted for.
+    if published.first().is_some_and(|s| s.index > *reported) {
+        tracing::warn!(delivery=%session.id, generation, "segment publication gap");
+        let _ = apply(app, session, Input::Failed { generation });
+        return;
+    }
     let from = *reported;
     for segment in published.iter().filter(|s| s.index >= from) {
         if segment.index != *reported
@@ -646,7 +653,7 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
     let root = app.processing.deliveries.root.clone();
     let held = {
         let root = root.clone();
-        tokio::task::spawn_blocking(move || crate::processing::held_witnesses(&root)).await?
+        tokio::task::spawn_blocking(move || crate::processing::held_witnesses(&root)).await??
     };
     let mut keep = Vec::new();
     for (path, witness) in held {
@@ -1105,11 +1112,29 @@ fn stream_headers(content_type: &'static str) -> [(header::HeaderName, &'static 
     ]
 }
 
-/// Request admission re-reads the catalog: a detached library, unavailable file
-/// or new revision fences the delivery immediately, and an unreadable catalog
-/// fails closed.
-async fn admit_stream(app: &App, id: &str) -> Result<Arc<Session>, ApiError> {
+/// Admit a stream request. Cheap local checks come first; a stream permit then
+/// bounds concurrent catalog queries and transfers; finally the catalog is
+/// re-read, so a detached library, unavailable file or new revision fences the
+/// delivery immediately and an unreadable catalog fails closed.
+async fn admit_stream(
+    app: &App,
+    id: &str,
+    local: impl Fn(&Delivery, u64) -> bool,
+) -> Result<(Arc<Session>, tokio::sync::OwnedSemaphorePermit), ApiError> {
     let session = app.processing.deliveries.session(id)?;
+    if !local(
+        &session.inner.lock().unwrap().delivery,
+        app.processing.deliveries.now_ms(),
+    ) {
+        return Err(ApiError::not_found());
+    }
+    let permit = app.streams.clone().try_acquire_owned().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stream_limit",
+            "Too many open streams",
+        )
+    })?;
     let current: Option<String> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(&session.file_id)
         .fetch_optional(&app.db)
@@ -1118,21 +1143,23 @@ async fn admit_stream(app: &App, id: &str) -> Result<Arc<Session>, ApiError> {
         revalidate(app, &session).await;
         return Err(ApiError::not_found());
     }
-    Ok(session)
+    Ok((session, permit))
 }
 
 pub async fn playlist(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
+    let serves = |d: &Delivery, now| {
+        d.serves(generation, now) && d.generations[&generation].pin.operation.segmented()
+    };
+    let (session, _permit) = admit_stream(&app, &id, serves).await?;
     let text = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
-        if !d.serves(generation, app.processing.deliveries.now_ms())
-            || !d.generations[&generation].pin.operation.segmented()
-        {
+        // State may have changed while the catalog was read.
+        if !serves(d, app.processing.deliveries.now_ms()) {
             return Err(ApiError::not_found());
         }
         core::media_playlist(
@@ -1144,16 +1171,12 @@ pub async fn playlist(
     Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
 }
 
-/// Stream an owned output file under the shared stream admission limit; the
-/// permit is held until the response body completes or is dropped.
-async fn file(app: &App, path: PathBuf) -> Result<Response, ApiError> {
-    let permit = app.streams.clone().try_acquire_owned().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "stream_limit",
-            "Too many open streams",
-        )
-    })?;
+/// Stream an owned output file; the admission permit is held until the response
+/// body completes or is dropped.
+async fn file(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    path: PathBuf,
+) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|_| ApiError::not_found())?;
@@ -1175,39 +1198,27 @@ pub async fn init(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
-    {
-        let inner = session.inner.lock().unwrap();
-        let d = &inner.delivery;
-        if !d.serves(generation, app.processing.deliveries.now_ms())
-            || d.generations[&generation].next_segment == 0
-        {
-            return Err(ApiError::not_found());
-        }
-    }
-    file(&app, session.directory(&app, generation).join("init.mp4")).await
+    let (session, permit) = admit_stream(&app, &id, |d, now| {
+        d.serves(generation, now) && d.generations[&generation].next_segment > 0
+    })
+    .await?;
+    file(permit, session.directory(&app, generation).join("init.mp4")).await
 }
 
 pub async fn segment(
     State(app): State<App>,
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
-    let session = admit_stream(&app, &id).await?;
     let generation = generation_number(&generation)?;
     let index: u32 = segment
         .strip_suffix(".m4s")
         .and_then(|n| n.parse().ok())
         .ok_or_else(ApiError::not_found)?;
-    if !session.inner.lock().unwrap().delivery.fetchable(
-        generation,
-        index,
-        app.processing.deliveries.now_ms(),
-    ) {
-        return Err(ApiError::not_found());
-    }
+    let (session, permit) =
+        admit_stream(&app, &id, |d, now| d.fetchable(generation, index, now)).await?;
     file(
-        &app,
+        permit,
         session
             .directory(&app, generation)
             .join(format!("seg{index}.m4s")),
