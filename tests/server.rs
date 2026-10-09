@@ -1898,7 +1898,7 @@ async fn events_are_transactional_replayable_and_bounded_by_subscriber_capacity(
         .await
         .unwrap();
     let mut tx = f.app.db.begin().await.unwrap();
-    sqlx::query("INSERT INTO items VALUES ('rolled-back','No event','video')")
+    sqlx::query("INSERT INTO items (id,title,kind) VALUES ('rolled-back','No event','video')")
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -1908,7 +1908,7 @@ async fn events_are_transactional_replayable_and_bounded_by_subscriber_capacity(
         .await
         .unwrap();
     assert_eq!(before, after);
-    sqlx::query("INSERT INTO items VALUES ('committed','Published','video')")
+    sqlx::query("INSERT INTO items (id,title,kind) VALUES ('committed','Published','video')")
         .execute(&f.app.db)
         .await
         .unwrap();
@@ -2276,7 +2276,7 @@ async fn snapshots_are_validated_retained_and_disk_pressure_is_reported() {
         assert_eq!(manifest["format"], 1);
         assert_eq!(
             manifest["schema_versions"].as_array().unwrap().last(),
-            Some(&json!(9))
+            Some(&json!(14))
         );
     }
     let snapshots: Vec<_> = std::fs::read_dir(&root)

@@ -21,7 +21,16 @@ pub struct CatalogItem {
     pub revision: i64,
 }
 const SELECT: &str = "SELECT i.id,i.title,coalesce(s.media_type,'unclassified') AS media_type,s.parent_id,s.number,coalesce(s.revision,0) AS revision FROM items i LEFT JOIN item_structure s ON s.item_id=i.id";
+/// Retired (merged) IDs resolve to their live work so old links stay explainable.
 async fn load(app: &App, id: &str) -> Result<CatalogItem, ApiError> {
+    let id = match crate::curation::resolve(&app.db, id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        Some(playscale_core::identity::Resolved::Live(id))
+        | Some(playscale_core::identity::Resolved::Alias { to: id, .. }) => id,
+        None => return Err(ApiError::not_found()),
+    };
     Ok(sqlx::query_as(&format!("{SELECT} WHERE i.id=?"))
         .bind(id)
         .fetch_one(&app.db)
@@ -65,7 +74,7 @@ pub async fn browse(
     {
         return Err(ApiError::bad("Invalid catalog filter or page bounds"));
     }
-    let filter = " WHERE (? IS NULL OR s.parent_id=?) AND (? IS NULL OR coalesce(s.media_type,'unclassified')=?) AND (? IS NULL OR EXISTS (SELECT 1 FROM metadata_documents m WHERE m.item_id=i.id AND m.source=? AND m.external_id=?))";
+    let filter = " WHERE i.id NOT IN (SELECT alias_id FROM item_aliases) AND (? IS NULL OR s.parent_id=?) AND (? IS NULL OR coalesce(s.media_type,'unclassified')=?) AND (? IS NULL OR EXISTS (SELECT 1 FROM metadata_documents m WHERE m.item_id=i.id AND m.source=? AND m.external_id=?))";
     let mut tx = app.db.begin().await?;
     let total = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM items i LEFT JOIN item_structure s ON s.item_id=i.id {filter}"
@@ -197,7 +206,7 @@ pub async fn create(
     let mut tx = crate::db::begin_write(&app.db).await?;
     let id = new_id();
     validate(&mut tx, &id, &body.media_type, &body.parent_id, body.number).await?;
-    sqlx::query("INSERT INTO items VALUES (?,?,'video')")
+    sqlx::query("INSERT INTO items (id,title,kind) VALUES (?,?,'video')")
         .bind(&id)
         .bind(body.title.trim())
         .execute(&mut *tx)
@@ -293,7 +302,7 @@ pub async fn add_edition(
         label: body.label.trim().into(),
         revision: 1,
     };
-    sqlx::query("INSERT INTO editions VALUES (?,?,?,?)")
+    sqlx::query("INSERT INTO editions (id,item_id,label,revision) VALUES (?,?,?,?)")
         .bind(&edition.id)
         .bind(&edition.item_id)
         .bind(&edition.label)

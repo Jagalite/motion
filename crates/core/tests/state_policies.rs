@@ -1,7 +1,9 @@
 use playscale_core::{
     jobs::{Effect, Input, Job, Phase, transition},
     maintenance::{CacheEntry, due, enough_space},
-    scan::{Existing, Observed, reconcile},
+    scan::{
+        Assignment, Coverage, Existing, Observed, Outcome, outcome, reconcile, reconcile_covered,
+    },
     viewing::{FileIdentity, Session, State, check_file, check_switch, event},
 };
 #[test]
@@ -55,22 +57,29 @@ fn scan_moves_require_unique_missing_and_observed_revisions() {
     };
     let old = vec![file("one", "old")];
     let moved = reconcile(&old, &[observed("new")]);
-    assert_eq!(
-        moved.identities,
-        vec![Some(("one".into(), "edition-one".into()))]
-    );
+    let one = Assignment::Existing {
+        id: "one".into(),
+        edition: "edition-one".into(),
+    };
+    assert_eq!(moved.assignments, vec![one.clone()]);
     assert_eq!(moved.unavailable, vec!["one"]);
+    // Two identical observations cannot both be the moved occurrence; they are
+    // copies of the one edition holding that verified content.
+    let copy = Assignment::Copy {
+        edition: "edition-one".into(),
+    };
     assert_eq!(
-        reconcile(&old, &[observed("new"), observed("copy")]).identities,
-        vec![None, None]
+        reconcile(&old, &[observed("new"), observed("copy")]).assignments,
+        vec![copy.clone(), copy]
     );
+    // Content held by two editions is ambiguous: a new work, never a guess.
     assert_eq!(
         reconcile(
             &[file("one", "old"), file("two", "copy")],
             &[observed("new")]
         )
-        .identities,
-        vec![None]
+        .assignments,
+        vec![Assignment::New]
     );
     let replaced = reconcile(
         &old,
@@ -79,8 +88,52 @@ fn scan_moves_require_unique_missing_and_observed_revisions() {
             revision: "replacement".into(),
         }],
     );
-    assert_eq!(replaced.identities[0], moved.identities[0]);
+    assert_eq!(replaced.assignments[0], one);
     assert!(replaced.unavailable.is_empty());
+}
+#[test]
+fn absence_requires_a_covered_directory_listing() {
+    let file = |id: &str, path: &str, revision: &str| Existing {
+        id: id.into(),
+        edition: format!("edition-{id}"),
+        path: path.into(),
+        revision: revision.into(),
+    };
+    let old = vec![
+        file("root", "a.mkv", "ra"),
+        file("listed", "ok/b.mkv", "rb"),
+        file("unread", "locked/c.mkv", "rc"),
+        file("deep", "ok/unvisited/d.mkv", "rd"),
+        file("gone", "removed/sub/e.mkv", "re"),
+    ];
+    let coverage = Coverage::Listed {
+        complete: ["".into(), "ok".into()].into(),
+        incomplete: ["locked".into(), "ok/unvisited".into()].into(),
+    };
+    let plan = reconcile_covered(&old, &[], &coverage);
+    // "removed" did not appear in the complete root listing, so its whole
+    // subtree is proven absent; unread and unvisited directories are not.
+    assert_eq!(plan.unavailable, vec!["root", "listed", "gone"]);
+    // A file seen at a new path whose content is still unproven elsewhere is a
+    // copy, not a move: the unread original may still exist.
+    let plan = reconcile_covered(
+        &old,
+        &[Observed {
+            path: "ok/c-renamed.mkv".into(),
+            revision: "rc".into(),
+        }],
+        &coverage,
+    );
+    assert_eq!(
+        plan.assignments,
+        vec![Assignment::Copy {
+            edition: "edition-unread".into()
+        }]
+    );
+    assert!(!plan.unavailable.contains(&"unread".to_string()));
+    assert_eq!(outcome(false, 0), None);
+    assert_eq!(outcome(true, 0), Some(Outcome::Complete));
+    assert_eq!(outcome(true, 3), Some(Outcome::Partial));
 }
 #[test]
 fn retention_respects_active_work_playback_and_attempt_races() {

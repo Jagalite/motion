@@ -165,6 +165,20 @@ pub async fn put(
             .bind(&source)
             .fetch_optional(&mut *tx)
             .await?;
+    if !crate::matching::provider_identity_allowed(
+        &mut tx,
+        &id,
+        &source,
+        body.external_id.as_deref(),
+    )
+    .await
+    .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::conflict(
+            "manual_identity_pinned",
+            "A manual identification pins this source's external identity",
+        ));
+    }
     if playscale_core::revision::advance(existing.unwrap_or(0), body.expected_revision).is_err() {
         return Err(ApiError::conflict(
             "metadata_revision_conflict",
