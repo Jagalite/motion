@@ -102,6 +102,21 @@ curl http://127.0.0.1:8787/api/v1/items
 python3 scripts/client.py http://127.0.0.1:8787
 ```
 
+## Next architecture and API v2
+
+The [Motion architecture and implementation plan](Motion_Final_Architecture_and_Implementation_Plan.md)
+and [API v2 contract](contracts/Motion_Server_API_v2.yaml) describe the next
+implementation target. See the [implementation readiness review](MOTION_IMPLEMENTATION_READINESS.md)
+for checks performed, missing handoff artifacts, and the recommended first work.
+The supplied documents are preserved unchanged. Their referenced companion bundle
+was not included in this import.
+
+For the new implementation, use these documents for target architecture decisions;
+`DESIGN.md`, `IMPLEMENTATION_PLAN.md`, and `ROADMAP.md` retain earlier decisions and
+history, including proposals superseded by the new plan. `API.md` and the running
+`/api/v1/openapi.json` describe the existing API. Importing the v2 contract does not
+enable v2 endpoints or change application behavior.
+
 ## Verification
 
 ```sh
