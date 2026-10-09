@@ -3,6 +3,7 @@
 //! `playscale_core::access`; this module supplies stored facts and executes
 //! the decided effects inside one SQLite transaction.
 pub mod auth;
+pub mod content;
 pub mod events;
 pub mod identity;
 pub mod system;
@@ -290,11 +291,22 @@ pub fn is_problem_response(response: &Response) -> bool {
 /// Assigns the request ID and converts framework rejections into problems.
 async fn request_scope(request: Request, next: Next) -> Response {
     let id = crate::new_id();
+    // Byte routes answer 304/412/416 with protocol headers (Content-Range,
+    // ETag) and no body; those responses pass through unchanged.
+    let bytes = request.uri().path().starts_with("/api/v2/media/")
+        || request.uri().path().starts_with("/media/");
     REQUEST_ID
         .scope(id.clone(), async move {
             let mut response = next.run(request).await;
             let status = response.status();
-            if (status.is_client_error() || status.is_server_error()) && !is_problem(&response) {
+            if (status.is_client_error() || status.is_server_error())
+                && !is_problem(&response)
+                && !(bytes
+                    && matches!(
+                        status,
+                        StatusCode::PRECONDITION_FAILED | StatusCode::RANGE_NOT_SATISFIABLE
+                    ))
+            {
                 response = Problem::new(
                     status,
                     generic_code(status),
@@ -616,6 +628,15 @@ pub fn router() -> Router<App> {
                 .delete(identity::delete_profile),
         )
         .route("/events", get(events::subscribe))
+        .route("/content-access", post(content::create))
+        .route(
+            "/content-access/{access_id}",
+            axum::routing::delete(content::revoke),
+        )
+        .route(
+            "/media/files/{file_id}/content",
+            get(content::file_content).head(content::file_content),
+        )
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

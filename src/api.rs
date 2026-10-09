@@ -28,6 +28,10 @@ pub struct ApiError {
     body: ErrorBody,
 }
 impl ApiError {
+    /// Status and stable code, for adapters that re-express legacy errors.
+    pub fn parts(&self) -> (StatusCode, &str, &str) {
+        (self.status, &self.body.code, &self.body.message)
+    }
     pub fn new(status: StatusCode, code: &str, message: &str) -> Self {
         Self {
             status,
@@ -416,9 +420,15 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         .into_response();
     }
     let is_api = path.starts_with("/api/");
+    // Byte routes answer 412/416 with protocol headers and no problem body.
+    let bytes = path.starts_with("/api/v2/media/");
     let mut response = next.run(request).await;
     let failed = response.status().is_client_error() || response.status().is_server_error();
-    if v2 && failed && !crate::v2::is_problem_response(&response) {
+    let protocol = matches!(
+        response.status(),
+        StatusCode::PRECONDITION_FAILED | StatusCode::RANGE_NOT_SATISFIABLE
+    ) && bytes;
+    if v2 && failed && !protocol && !crate::v2::is_problem_response(&response) {
         // Router-level fallbacks (e.g. 405) run outside the v2 layer.
         response = crate::v2::boundary_problem(
             response.status(),
@@ -427,6 +437,7 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         );
     } else if is_api
         && failed
+        && !protocol
         && response
             .headers()
             .get(header::CONTENT_TYPE)

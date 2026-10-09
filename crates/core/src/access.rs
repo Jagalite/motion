@@ -810,6 +810,132 @@ pub fn disclose(principal: &Principal, resource: &Resource) -> Disclosure {
     }
 }
 
+/// Purpose of a content ticket; each purpose needs its own permission and a
+/// metadata grant is never a byte grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketPurpose {
+    Playback,
+    Download,
+    Cast,
+}
+
+/// Current facts about a file, observed by the adapter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileFacts {
+    pub library_id: String,
+    pub revision: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TicketError {
+    /// The principal lacks the purpose's permission.
+    Forbidden(Permission),
+    /// Missing, invisible, or a resource family this server cannot serve.
+    NotFound,
+    /// The file revision differs from the one requested or pinned.
+    SourceChanged,
+    /// Casting needs a separately approved receiver policy.
+    CastUnavailable,
+    InvalidTtl,
+    /// Expired, revoked, issued for another resource, or its principal is
+    /// no longer valid.
+    TicketInvalid,
+}
+
+fn purpose_permission(purpose: TicketPurpose) -> Result<Permission, TicketError> {
+    match purpose {
+        TicketPurpose::Playback => Ok(Permission::PlaybackRequest),
+        TicketPurpose::Download => Ok(Permission::DownloadsManage),
+        TicketPurpose::Cast => Err(TicketError::CastUnavailable),
+    }
+}
+
+/// Grant a ticket for one exact file revision. `facts` is `None` when the
+/// file does not exist (or the resource family has no service). The ticket
+/// never outlives the credential that requested it.
+pub fn grant_file_ticket(
+    principal: &Principal,
+    purpose: TicketPurpose,
+    requested_revision: &str,
+    facts: Option<&FileFacts>,
+    ttl_seconds: i64,
+    parent_expires_at: Option<i64>,
+    now: i64,
+) -> Result<i64, TicketError> {
+    if !(1..=3_600).contains(&ttl_seconds) {
+        return Err(TicketError::InvalidTtl);
+    }
+    let permission = purpose_permission(purpose)?;
+    if !principal.allows(permission) {
+        return Err(TicketError::Forbidden(permission));
+    }
+    let facts = facts
+        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .ok_or(TicketError::NotFound)?;
+    if facts.revision != requested_revision {
+        return Err(TicketError::SourceChanged);
+    }
+    let expires = now.saturating_add(ttl_seconds);
+    Ok(parent_expires_at.map_or(expires, |p| expires.min(p)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileTicket {
+    pub file_id: String,
+    pub revision: String,
+    pub purpose: TicketPurpose,
+    pub expires_at: i64,
+    pub revoked: bool,
+}
+
+/// Admit a media request presenting a ticket. The issuing principal is
+/// re-derived for every request (`principal` is its current authentication
+/// result), so revocation, policy narrowing and permission loss apply
+/// immediately; the ticket only ever narrows that principal's access.
+pub fn admit_file_ticket(
+    ticket: &FileTicket,
+    file_id: &str,
+    requested_revision: Option<&str>,
+    principal: &Result<Principal, AccessError>,
+    facts: Option<&FileFacts>,
+    now: i64,
+) -> Result<(), TicketError> {
+    if ticket.revoked || now >= ticket.expires_at || ticket.file_id != file_id {
+        return Err(TicketError::TicketInvalid);
+    }
+    let principal = principal.as_ref().map_err(|_| TicketError::TicketInvalid)?;
+    let permission = purpose_permission(ticket.purpose)?;
+    if !principal.allows(permission) {
+        return Err(TicketError::Forbidden(permission));
+    }
+    let facts = facts
+        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .ok_or(TicketError::NotFound)?;
+    if facts.revision != ticket.revision || requested_revision.is_some_and(|r| r != ticket.revision)
+    {
+        return Err(TicketError::SourceChanged);
+    }
+    Ok(())
+}
+
+/// Byte access without a ticket: a bearer or cookie principal needs a byte
+/// permission (playback or download) and the file inside its catalog scope.
+pub fn admit_file_bytes(
+    principal: &Principal,
+    facts: Option<&FileFacts>,
+) -> Result<(), TicketError> {
+    if !principal.allows(Permission::PlaybackRequest)
+        && !principal.allows(Permission::DownloadsManage)
+    {
+        return Err(TicketError::Forbidden(Permission::PlaybackRequest));
+    }
+    facts
+        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .map(|_| ())
+        .ok_or(TicketError::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1338,140 @@ mod tests {
         p.grant.permissions.remove(&Permission::CatalogRead);
         assert_eq!(catalog_scope(&p), CatalogScope::Nothing);
         assert_eq!(catalog_scope(&Principal::operator()), CatalogScope::All);
+    }
+
+    #[test]
+    fn file_tickets_pin_revision_purpose_and_principal() {
+        let mut p = authenticate(
+            &cred(CredentialKind::Device, 1_000),
+            None,
+            Some(&device()),
+            0,
+        )
+        .unwrap();
+        p.grant.permissions.insert(Permission::PlaybackRequest);
+        p.policy.library_ids.insert("l1".into());
+        let facts = FileFacts {
+            library_id: "l1".into(),
+            revision: "r1".into(),
+        };
+        let hidden = FileFacts {
+            library_id: "l2".into(),
+            ..facts.clone()
+        };
+        let grant = |p: &Principal, purpose, rev: &str, f: Option<&FileFacts>, ttl| {
+            grant_file_ticket(p, purpose, rev, f, ttl, Some(1_000), 900)
+        };
+        assert_eq!(
+            grant(&p, TicketPurpose::Playback, "r1", Some(&facts), 3_600),
+            Ok(1_000)
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Playback, "r1", Some(&facts), 60),
+            Ok(960)
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Download, "r1", Some(&facts), 60),
+            Err(TicketError::Forbidden(Permission::DownloadsManage))
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Cast, "r1", Some(&facts), 60),
+            Err(TicketError::CastUnavailable)
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Playback, "r1", Some(&hidden), 60),
+            Err(TicketError::NotFound)
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Playback, "r1", None, 60),
+            Err(TicketError::NotFound)
+        );
+        assert_eq!(
+            grant(&p, TicketPurpose::Playback, "r0", Some(&facts), 60),
+            Err(TicketError::SourceChanged)
+        );
+        for ttl in [0, 3_601] {
+            assert_eq!(
+                grant(&p, TicketPurpose::Playback, "r1", Some(&facts), ttl),
+                Err(TicketError::InvalidTtl)
+            );
+        }
+
+        let ticket = FileTicket {
+            file_id: "f1".into(),
+            revision: "r1".into(),
+            purpose: TicketPurpose::Playback,
+            expires_at: 1_000,
+            revoked: false,
+        };
+        let ok = Ok(p.clone());
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", Some("r1"), &ok, Some(&facts), 999),
+            Ok(())
+        );
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", None, &ok, Some(&facts), 1_000),
+            Err(TicketError::TicketInvalid)
+        );
+        assert_eq!(
+            admit_file_ticket(&ticket, "f2", None, &ok, Some(&facts), 0),
+            Err(TicketError::TicketInvalid)
+        );
+        assert_eq!(
+            admit_file_ticket(
+                &ticket,
+                "f1",
+                None,
+                &Err(AccessError::CredentialRevoked),
+                Some(&facts),
+                0
+            ),
+            Err(TicketError::TicketInvalid)
+        );
+        let changed = FileFacts {
+            revision: "r2".into(),
+            ..facts.clone()
+        };
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", None, &ok, Some(&changed), 0),
+            Err(TicketError::SourceChanged)
+        );
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", Some("r2"), &ok, Some(&facts), 0),
+            Err(TicketError::SourceChanged)
+        );
+        // The issuing principal lost the library or the permission since.
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", None, &ok, Some(&hidden), 0),
+            Err(TicketError::NotFound)
+        );
+        let mut narrowed = p.clone();
+        narrowed
+            .grant
+            .permissions
+            .remove(&Permission::PlaybackRequest);
+        assert_eq!(
+            admit_file_ticket(&ticket, "f1", None, &Ok(narrowed.clone()), Some(&facts), 0),
+            Err(TicketError::Forbidden(Permission::PlaybackRequest))
+        );
+        let revoked = FileTicket {
+            revoked: true,
+            ..ticket
+        };
+        assert_eq!(
+            admit_file_ticket(&revoked, "f1", None, &ok, Some(&facts), 0),
+            Err(TicketError::TicketInvalid)
+        );
+
+        assert_eq!(admit_file_bytes(&p, Some(&facts)), Ok(()));
+        assert_eq!(
+            admit_file_bytes(&p, Some(&hidden)),
+            Err(TicketError::NotFound)
+        );
+        assert_eq!(
+            admit_file_bytes(&narrowed, Some(&facts)),
+            Err(TicketError::Forbidden(Permission::PlaybackRequest))
+        );
     }
 
     #[test]

@@ -96,3 +96,18 @@ END;
 CREATE TRIGGER event_media_files_delete AFTER DELETE ON media_files BEGIN INSERT INTO change_events(topic,resource_id,scope_library) SELECT 'catalog',item_id,OLD.library_id FROM editions WHERE id=OLD.edition_id; END;
 DROP TRIGGER event_items_delete;
 CREATE TRIGGER event_items_delete AFTER DELETE ON items BEGIN INSERT INTO change_events(topic,resource_id,kind) VALUES ('catalog',OLD.id,'deleted'); END;
+
+-- Content tickets pin one file revision and purpose. They die with the
+-- credential that issued them (operator tickets have none and expire).
+CREATE TABLE content_tickets (
+ id TEXT PRIMARY KEY,
+ token_hash TEXT NOT NULL UNIQUE,
+ principal_id TEXT NOT NULL,
+ credential_hash TEXT REFERENCES credentials(token_hash) ON DELETE CASCADE,
+ file_id TEXT NOT NULL,
+ file_revision TEXT NOT NULL,
+ purpose TEXT NOT NULL CHECK(purpose IN ('playback','download')),
+ expires_at INTEGER NOT NULL,
+ revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1))
+);
+CREATE INDEX content_tickets_expiry ON content_tickets(expires_at);
