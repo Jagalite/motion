@@ -142,6 +142,7 @@ async fn run() -> anyhow::Result<()> {
         app.access.set_bootstrap(&read_bootstrap(fd)?)?;
     }
     playscale::processing::recover(&app).await?;
+    playscale::delivery::recover(&app).await?;
     if assets.is_none() {
         tracing::warn!(
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
@@ -158,6 +159,7 @@ async fn run() -> anyhow::Result<()> {
         let result = tokio::try_join!(
             scan::worker(worker_app.clone(), worker_stop.clone()),
             playscale::processing::worker(worker_app.clone(), worker_stop.clone()),
+            playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
             playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
             playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
             playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
