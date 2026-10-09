@@ -175,3 +175,60 @@ fn external_namespaces_separate_movies_and_television() {
     assert_eq!(external_namespace("tmdb", "unclassified"), None);
     assert_eq!(external_namespace("", "movie"), None);
 }
+
+#[test]
+fn availability_is_derived_from_reviewed_content() {
+    use playscale_core::identity::{
+        Availability, Occurrence, Origin, Version, confirm_replacement, version_availability,
+    };
+    let bound = Binding {
+        file_id: "f".into(),
+        revision: "a".into(),
+        part: 1,
+        start_ms: None,
+        end_ms: None,
+    };
+    let occ = |file: &str, revision: &str, available| Occurrence {
+        file_id: file.into(),
+        revision: revision.into(),
+        available,
+    };
+    let b = std::slice::from_ref(&bound);
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", true)]),
+        Availability::Available
+    );
+    // The bound file is gone but a verified copy remains.
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", false), occ("copy", "a", true)]),
+        Availability::Available
+    );
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", false)]),
+        Availability::Unavailable
+    );
+    // Replaced in place: stale until confirmed, never silently re-pinned.
+    let replaced = [occ("f", "b", true)];
+    assert_eq!(version_availability(b, &replaced), Availability::Stale);
+    let version = Version {
+        id: "v".into(),
+        origin: Origin::Original,
+        equivalence: Equivalence::Unknown,
+        bindings: vec![bound.clone()],
+    };
+    assert_eq!(
+        confirm_replacement(&version, 3, 2, &replaced),
+        Err(IdentityError::StaleRevision("v".into()))
+    );
+    let (confirmed, revision) = confirm_replacement(&version, 3, 3, &replaced).unwrap();
+    assert_eq!(
+        (confirmed.bindings[0].revision.as_str(), revision),
+        ("b", 4)
+    );
+    assert_eq!(confirmed.equivalence, Equivalence::Declared);
+    assert_eq!(
+        version_availability(&confirmed.bindings, &replaced),
+        Availability::Available
+    );
+    assert!(confirm_replacement(&version, 3, 3, &[occ("f", "a", true)]).is_err());
+}

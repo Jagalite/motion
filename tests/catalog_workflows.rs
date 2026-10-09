@@ -337,6 +337,12 @@ async fn work(f: &Fixture, id: &str, title: &str, year: i64) {
         .execute(&f.app.db)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+        .bind(format!("{id}-ed"))
+        .bind(format!("{id}-ed"))
+        .execute(&f.app.db)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -740,4 +746,143 @@ async fn proposal_history_ignores_wall_clock_order() {
         again.id, second.id,
         "open proposal refreshed, not re-raised"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Timelines and versions
+
+#[tokio::test]
+async fn scanned_works_get_versions_copies_do_not_and_replacement_needs_confirmation() {
+    let f = Fixture::new().await;
+    f.write("film.mp4", b"original bytes");
+    f.write("backup/film.mp4", b"original bytes");
+    f.scan().await;
+    let (file, item, ..) = f.file("film.mp4").await;
+    let view = playscale::curation::read_structure(&f.app.db, &item)
+        .await
+        .unwrap()
+        .unwrap();
+    let versions: Vec<_> = view
+        .editions
+        .iter()
+        .flat_map(|e| &e.timelines)
+        .flat_map(|t| &t.versions)
+        .collect();
+    assert_eq!(versions.len(), 1, "a copy is an occurrence, not a version");
+    let version = versions[0].clone();
+    assert_eq!(
+        version.availability,
+        playscale_core::identity::Availability::Available
+    );
+
+    // Replace whichever file the version is bound to; the copy still holds the
+    // reviewed bytes, so the version stays available.
+    let bound = version.bindings[0].file_id.clone();
+    let bound_path: String = sqlx::query_scalar("SELECT relative_path FROM media_files WHERE id=?")
+        .bind(&bound)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    f.write(&bound_path, b"replaced bytes");
+    f.scan().await;
+    let state = |view: playscale::curation::StructureView| {
+        view.editions[0].timelines[0].versions[0].availability
+    };
+    let view = playscale::curation::read_structure(&f.app.db, &item)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state(view),
+        playscale_core::identity::Availability::Available
+    );
+    // Remove the copy as well: now the only reviewed content is gone and the
+    // bound file holds other bytes, so the version is stale.
+    let other = if bound_path == "film.mp4" {
+        "backup/film.mp4"
+    } else {
+        "film.mp4"
+    };
+    std::fs::remove_file(f.root.join(other)).unwrap();
+    f.scan().await;
+    let view = playscale::curation::read_structure(&f.app.db, &item)
+        .await
+        .unwrap()
+        .unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM media_versions WHERE id=?")
+        .bind(&version.id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(state(view), playscale_core::identity::Availability::Stale);
+    assert!(
+        playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64 + 1)
+            .await
+            .is_err(),
+        "stale review rejected"
+    );
+    playscale::curation::confirm_replacement(&f.app, &version.id, revision as u64)
+        .await
+        .unwrap();
+    let view = playscale::curation::read_structure(&f.app.db, &item)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state(view.clone()),
+        playscale_core::identity::Availability::Available
+    );
+    assert_eq!(
+        view.editions[0].timelines[0].versions[0].equivalence,
+        playscale_core::identity::Equivalence::Declared
+    );
+    let _ = file;
+}
+
+#[tokio::test]
+async fn reassigning_a_file_moves_its_version_within_the_work() {
+    let f = Fixture::new().await;
+    f.write("cut.mp4", b"directors cut");
+    f.scan().await;
+    let (file, item, _, edition) = f.file("cut.mp4").await;
+    let router = api::router(f.app.clone(), None);
+    let created = router
+        .clone()
+        .oneshot(admin_request(
+            "POST",
+            &format!("/api/v1/items/{item}/editions"),
+            json!({"label":"Director's Cut"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let target: String =
+        sqlx::query_scalar("SELECT id FROM editions WHERE label='Director''s Cut'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let moved = router
+        .oneshot(admin_request(
+            "PUT",
+            &format!("/api/v1/files/{file}/edition"),
+            json!({"expected_edition_id":edition,"edition_id":target}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), StatusCode::OK);
+    let view = playscale::curation::read_structure(&f.app.db, &item)
+        .await
+        .unwrap()
+        .unwrap();
+    let holder = view
+        .editions
+        .iter()
+        .find(|e| e.timelines.iter().any(|t| !t.versions.is_empty()))
+        .unwrap();
+    assert_eq!(holder.id, target);
+    let mismatched: i64 = sqlx::query_scalar("SELECT count(*) FROM version_edition_mismatch")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(mismatched, 0);
 }
