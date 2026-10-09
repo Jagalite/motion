@@ -1,4 +1,6 @@
-use playscale_core::work::{Budget, Class, Effect, Hold, Input, Ledger, transition};
+use playscale_core::work::{
+    Budget, Class, Effect, Hold, Input, Ledger, Reservation, Waiter, transition,
+};
 use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
 };
@@ -69,6 +71,27 @@ fn fits_beside_stuck(l: &Ledger, class: Class, units: u32) -> bool {
             || background <= u64::from(l.budget.units - l.budget.interactive_reserve))
 }
 
+/// Specification of admission precedence: interactive first, then background
+/// classes rotating after `last_background`, then arrival (ticket) order.
+fn rank(l: &Ledger, w: &Waiter) -> (usize, u64) {
+    const ROTATION: [Class; 3] = [Class::Preparation, Class::Inventory, Class::Maintenance];
+    let start = l
+        .last_background
+        .and_then(|c| ROTATION.iter().position(|r| *r == c))
+        .map_or(0, |i| i + 1);
+    let class = match ROTATION.iter().position(|r| *r == w.class) {
+        None => 0,
+        Some(i) => 1 + (i + ROTATION.len() - start) % ROTATION.len(),
+    };
+    (class, w.ticket)
+}
+
+/// Waiters that may justify withholding later work: they do not fit now but can
+/// be served once live (non-stuck) holders exit.
+fn legitimately_blocked(l: &Ledger, w: &Waiter) -> bool {
+    !l.fits(w.class, w.units) && fits_beside_stuck(l, w.class, w.units)
+}
+
 impl Model for Work {
     type State = Ledger;
     type Input = Input;
@@ -122,17 +145,16 @@ impl Model for Work {
                 "waiting_in_arrival_order",
                 s.waiting.windows(2).all(|w| w[0].ticket < w[1].ticket),
             ),
-            // A fitting waiter may only wait behind a head that can still be served
-            // by live capacity; never behind nothing, or behind stuck capacity only.
+            // A fitting waiter may only wait behind an earlier-ranked waiter that
+            // can still be served by live capacity; never behind nothing, behind
+            // lower-priority work, or behind stuck capacity only.
             check(
                 "admission_progress",
                 s.waiting.iter().all(|w| {
                     !s.fits(w.class, w.units)
-                        || s.waiting.iter().any(|b| {
-                            b.ticket != w.ticket
-                                && !s.fits(b.class, b.units)
-                                && fits_beside_stuck(s, b.class, b.units)
-                        })
+                        || s.waiting
+                            .iter()
+                            .any(|b| rank(s, b) < rank(s, w) && legitimately_blocked(s, b))
                 }),
             ),
         ])
@@ -248,6 +270,67 @@ impl Model for Work {
                     w.class != class || w.ticket > *t || !fits_beside_stuck(after, w.class, w.units)
                 })
         });
+        let accepted_recorded = match input {
+            Input::Request {
+                owner,
+                class,
+                units,
+            } => accepted.iter().all(|(o, t)| {
+                let waiting = after
+                    .waiting
+                    .iter()
+                    .filter(|w| w.ticket == *t)
+                    .all(|w| &w.owner == o && w.class == *class && w.units == *units)
+                    && after.waiting.iter().filter(|w| w.ticket == *t).count() <= 1;
+                let held = after
+                    .holds(*t)
+                    .is_none_or(|r| &r.owner == o && r.class == *class && r.units == *units);
+                waiting && held && (after.is_waiting(*t) != after.holds(*t).is_some())
+            }),
+            _ => true,
+        };
+        // Replay the starts one at a time from the state immediately before the
+        // first of them, checking precedence obligations before each start.
+        let mut stepwise = after.clone();
+        stepwise.last_background = before.last_background;
+        for t in &started {
+            if let Some(r) = stepwise.held.remove(t) {
+                stepwise.waiting.push(Waiter {
+                    ticket: *t,
+                    owner: r.owner,
+                    class: r.class,
+                    units: r.units,
+                });
+            }
+        }
+        stepwise.waiting.sort_by_key(|w| w.ticket);
+        let mut ordered_starts = true;
+        for t in &started {
+            let Some(index) = stepwise.waiting.iter().position(|w| w.ticket == *t) else {
+                ordered_starts = false;
+                break;
+            };
+            let chosen = stepwise.waiting[index].clone();
+            // Nothing that ranks earlier may still be admissible or legitimately blocking.
+            ordered_starts &= stepwise.fits(chosen.class, chosen.units)
+                && stepwise.waiting.iter().all(|w| {
+                    rank(&stepwise, w) >= rank(&stepwise, &chosen)
+                        || !fits_beside_stuck(&stepwise, w.class, w.units)
+                });
+            stepwise.waiting.remove(index);
+            if !chosen.class.interactive() {
+                stepwise.last_background = Some(chosen.class);
+            }
+            stepwise.held.insert(
+                chosen.ticket,
+                Reservation {
+                    owner: chosen.owner,
+                    class: chosen.class,
+                    units: chosen.units,
+                    hold: Hold::Running,
+                },
+            );
+        }
         let background_started: Vec<Class> = started
             .iter()
             .filter_map(|t| after.holds(*t).map(|r| r.class))
@@ -268,7 +351,8 @@ impl Model for Work {
             _ => true,
         };
         Ok(vec![
-            check("request_disposition", disposition),
+            check("request_disposition", disposition && accepted_recorded),
+            check("starts_follow_precedence", ordered_starts),
             check(
                 "release_exactly_on_owner_exit",
                 released == expected_release,
