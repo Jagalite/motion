@@ -1,0 +1,92 @@
+{
+  "kind": "topcoat-electron-local-origin-proof",
+  "wave": 0,
+  "passed": true,
+  "recorded_at": "2026-10-09T22:51:14.004Z",
+  "motion_commit": "52302fe2dd81b47c91cbe38a34ba56cbf3e03ca3",
+  "worktree_dirty": false,
+  "environment": {
+    "electron": "44.7.0",
+    "chromium": "152.0.7977.130",
+    "node": "24.21.0",
+    "os": "darwin 25.5.0",
+    "arch": "arm64"
+  },
+  "topcoat": "tokio-rs/topcoat 341f3ff2fe16a73af5469685cf597693af5acb25, features router+view+tower+discover (no runtime)",
+  "origin": "single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media",
+  "demuxe": {
+    "name": "demuxe",
+    "version": "1.1.0",
+    "archive_sha256": "ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f"
+  },
+  "media": {
+    "generator": "ffmpeg lavfi testsrc2+sine, H.264 High/AAC-LC, 640x360@24, 12 s, faststart",
+    "sha256": "bf542c8af5cac2ca726dfdc033fb434a3511ff71b468de975850f9388adfcecf"
+  },
+  "results": {
+    "session_cookie_http_only": true,
+    "bootstrap_one_use": true,
+    "strict_csp_served": true,
+    "no_node_in_page": true,
+    "eval_blocked_by_csp": true,
+    "inline_script_blocked": true,
+    "player_ready": true,
+    "played_past_2_5s": true,
+    "seek_to_7s_played": true,
+    "range_requests": true,
+    "delivery_closed_on_leave": true,
+    "waited_for_starting_generation": true,
+    "replays_after_back_navigation": true
+  },
+  "observations": {
+    "sessionExchangeStatus": 200,
+    "sessionCookie": [
+      {
+        "name": "motion_session",
+        "httpOnly": true,
+        "sameSite": "strict"
+      }
+    ],
+    "bootstrapReplayStatus": 403,
+    "pageCsp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'sha256-smNQpTGGdipSJJHMEztOmlzNusICCiQBd+JnOrZepKs='; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "nodeAvailable": false,
+    "crossOriginIsolated": true,
+    "evalBlocked": "EvalError",
+    "inlineScriptBlocked": true,
+    "playerHost": {
+      "state": "ready",
+      "text": ""
+    },
+    "playback": {
+      "played": true,
+      "sought": true,
+      "finalTime": 7.756852,
+      "mode": "native",
+      "duration": 12,
+      "audioTracks": 0,
+      "error": null,
+      "decodedFrames": null
+    },
+    "homeTitle": "Home",
+    "afterBack": {
+      "state": "ready",
+      "players": 1
+    }
+  },
+  "csp_console": [
+    "error: Executing inline script violates the following Content Security Policy directive 'script-src 'self' 'wasm-unsafe-eval''. Either the 'unsafe-inline' keyword, a hash ('sha256-3ESihh3MurRVVlneQHpXxx54JMAaWXY5YvlFn21oZjw='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked."
+  ],
+  "permission_requests": [],
+  "http": {
+    "requests": 159,
+    "deliveries_created": 2,
+    "deliveries_closed": 2
+  },
+  "limitations": [
+    "Proof server uses a mock UiQueryFacade, mock session exchange and mock playback routes; it is not the Motion server.",
+    "Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.",
+    "Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.",
+    "Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.",
+    "Wave 0 player bridge: no viewing authority, progress events, generation switching or lease renewal."
+  ]
+}
