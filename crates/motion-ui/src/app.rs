@@ -7,8 +7,12 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     router::{
-        Router, Slot, StatusCode, href, layout, page, path_param, query_params,
-        error::{ForbiddenError, NotFoundError, ServiceUnavailableError, UnauthorizedError, forbidden, not_found, service_unavailable, unauthorized},
+        Router, Slot, StatusCode,
+        error::{
+            ForbiddenError, NotFoundError, ServiceUnavailableError, UnauthorizedError, forbidden,
+            not_found, service_unavailable, unauthorized,
+        },
+        href, layout, page, path_param, query_params,
         request::extensions,
     },
     view::{View, component, error_boundary, view},
@@ -42,7 +46,9 @@ pub fn router(facade: Facade) -> Router {
 
 /// The authenticated principal placed in request extensions by the host.
 fn principal(cx: &Cx) -> Result<&UiPrincipal> {
-    extensions(cx).get::<UiPrincipal>().ok_or_else(|| unauthorized().into())
+    extensions(cx)
+        .get::<UiPrincipal>()
+        .ok_or_else(|| unauthorized().into())
 }
 
 fn facade(cx: &Cx) -> &Facade {
@@ -60,7 +66,11 @@ fn ui_error(error: UiError) -> topcoat::Error {
 fn clock(ms: u64) -> String {
     let total = ms / 1000;
     let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn availability_text(value: Availability) -> &'static str {
@@ -297,7 +307,11 @@ async fn search(cx: &Cx) -> Result<impl View> {
         return Err(topcoat::router::error::bad_request("search text is too long").into());
     }
     let view_model = facade(cx).0.search(who, q).await.map_err(ui_error)?;
-    let heading = if view_model.query.is_empty() { "Search".to_string() } else { format!("Results for “{}”", view_model.query) };
+    let heading = if view_model.query.is_empty() {
+        "Search".to_string()
+    } else {
+        format!("Results for “{}”", view_model.query)
+    };
     Ok(view! {
         <h1>(heading.as_str())</h1>
         if view_model.query.is_empty() {
@@ -333,4 +347,3 @@ async fn play(cx: &Cx) -> Result<impl View> {
         <p><a href=(href!(item, ItemId(view_model.item_id.as_str())))>"Back to title"</a></p>
     })
 }
-

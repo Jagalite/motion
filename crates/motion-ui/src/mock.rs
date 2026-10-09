@@ -21,17 +21,88 @@ struct Title {
 }
 
 const TITLES: &[Title] = &[
-    Title { id: "item1", title: "Arrival of the Night Train", kind: "movie", library: "lib1", parent: None, timeline: Some("tl1"), duration_ms: 5_400_000, restricted: false, needs_review: false },
-    Title { id: "item2", title: "Harbour Lights", kind: "movie", library: "lib1", parent: None, timeline: Some("tl2"), duration_ms: 6_300_000, restricted: false, needs_review: true },
-    Title { id: "item3", title: "Midnight Ledger", kind: "movie", library: "lib1", parent: None, timeline: Some("tl3"), duration_ms: 7_200_000, restricted: true, needs_review: false },
-    Title { id: "item4", title: "The Lighthouse Keepers", kind: "series", library: "lib2", parent: None, timeline: None, duration_ms: 0, restricted: false, needs_review: false },
-    Title { id: "item5", title: "Season 1", kind: "season", library: "lib2", parent: Some("item4"), timeline: None, duration_ms: 0, restricted: false, needs_review: false },
-    Title { id: "item6", title: "Pilot", kind: "episode", library: "lib2", parent: Some("item5"), timeline: Some("tl6"), duration_ms: 2_700_000, restricted: false, needs_review: false },
-    Title { id: "item7", title: "The Second Lamp", kind: "episode", library: "lib2", parent: Some("item5"), timeline: Some("tl7"), duration_ms: 2_640_000, restricted: false, needs_review: false },
+    Title {
+        id: "item1",
+        title: "Arrival of the Night Train",
+        kind: "movie",
+        library: "lib1",
+        parent: None,
+        timeline: Some("tl1"),
+        duration_ms: 5_400_000,
+        restricted: false,
+        needs_review: false,
+    },
+    Title {
+        id: "item2",
+        title: "Harbour Lights",
+        kind: "movie",
+        library: "lib1",
+        parent: None,
+        timeline: Some("tl2"),
+        duration_ms: 6_300_000,
+        restricted: false,
+        needs_review: true,
+    },
+    Title {
+        id: "item3",
+        title: "Midnight Ledger",
+        kind: "movie",
+        library: "lib1",
+        parent: None,
+        timeline: Some("tl3"),
+        duration_ms: 7_200_000,
+        restricted: true,
+        needs_review: false,
+    },
+    Title {
+        id: "item4",
+        title: "The Lighthouse Keepers",
+        kind: "series",
+        library: "lib2",
+        parent: None,
+        timeline: None,
+        duration_ms: 0,
+        restricted: false,
+        needs_review: false,
+    },
+    Title {
+        id: "item5",
+        title: "Season 1",
+        kind: "season",
+        library: "lib2",
+        parent: Some("item4"),
+        timeline: None,
+        duration_ms: 0,
+        restricted: false,
+        needs_review: false,
+    },
+    Title {
+        id: "item6",
+        title: "Pilot",
+        kind: "episode",
+        library: "lib2",
+        parent: Some("item5"),
+        timeline: Some("tl6"),
+        duration_ms: 2_700_000,
+        restricted: false,
+        needs_review: false,
+    },
+    Title {
+        id: "item7",
+        title: "The Second Lamp",
+        kind: "episode",
+        library: "lib2",
+        parent: Some("item5"),
+        timeline: Some("tl7"),
+        duration_ms: 2_640_000,
+        restricted: false,
+        needs_review: false,
+    },
 ];
 
 /// Per-profile resume positions for the mock.
-const PROGRESS: &[(&str, &str, u64)] = &[("everyone", "tl1", 1_830_000), ("everyone", "tl6", 600_000)];
+const PROGRESS: &[(&str, &str, u64)] =
+    &[("everyone", "tl1", 1_830_000), ("everyone", "tl6", 600_000)];
 
 pub struct MockUiQueryFacade;
 
@@ -51,17 +122,34 @@ fn card(title: &Title) -> ItemCard {
 
 fn libraries() -> Vec<LibraryCard> {
     vec![
-        LibraryCard { id: "lib1".into(), name: "Films".into(), kind: "movies".into(), availability: Availability::Available },
-        LibraryCard { id: "lib2".into(), name: "Television".into(), kind: "television".into(), availability: Availability::Degraded },
+        LibraryCard {
+            id: "lib1".into(),
+            name: "Films".into(),
+            kind: "movies".into(),
+            availability: Availability::Available,
+        },
+        LibraryCard {
+            id: "lib2".into(),
+            name: "Television".into(),
+            kind: "television".into(),
+            availability: Availability::Degraded,
+        },
     ]
 }
 
 fn progress(who: &UiPrincipal, timeline: &str) -> u64 {
-    PROGRESS.iter().find(|(p, t, _)| *p == who.profile_id && *t == timeline).map(|(_, _, ms)| *ms).unwrap_or(0)
+    PROGRESS
+        .iter()
+        .find(|(p, t, _)| *p == who.profile_id && *t == timeline)
+        .map(|(_, _, ms)| *ms)
+        .unwrap_or(0)
 }
 
 fn find<'t>(who: &UiPrincipal, id: &str) -> UiResult<&'t Title> {
-    TITLES.iter().find(|t| t.id == id && visible(who, t)).ok_or(UiError::NotFound)
+    TITLES
+        .iter()
+        .find(|t| t.id == id && visible(who, t))
+        .ok_or(UiError::NotFound)
 }
 
 impl UiQueryFacade for MockUiQueryFacade {
@@ -88,17 +176,31 @@ impl UiQueryFacade for MockUiQueryFacade {
                     })
                 })
                 .collect();
-            Ok(HomeView { continue_watching, libraries: libraries() })
+            Ok(HomeView {
+                continue_watching,
+                libraries: libraries(),
+            })
         })
     }
 
-    fn library<'a>(&'a self, who: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<LibraryView>> {
+    fn library<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        id: &'a str,
+    ) -> BoxFuture<'a, UiResult<LibraryView>> {
         Box::pin(async move {
             if !who.can("catalog:read") {
                 return Err(UiError::Denied);
             }
-            let library = libraries().into_iter().find(|l| l.id == id).ok_or(UiError::NotFound)?;
-            let items = TITLES.iter().filter(|t| t.library == id && t.parent.is_none() && visible(who, t)).map(card).collect();
+            let library = libraries()
+                .into_iter()
+                .find(|l| l.id == id)
+                .ok_or(UiError::NotFound)?;
+            let items = TITLES
+                .iter()
+                .filter(|t| t.library == id && t.parent.is_none() && visible(who, t))
+                .map(card)
+                .collect();
             Ok(LibraryView { library, items })
         })
     }
@@ -106,7 +208,11 @@ impl UiQueryFacade for MockUiQueryFacade {
     fn item<'a>(&'a self, who: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<ItemView>> {
         Box::pin(async move {
             let title = find(who, id)?;
-            let children = TITLES.iter().filter(|t| t.parent == Some(title.id) && visible(who, t)).map(card).collect();
+            let children = TITLES
+                .iter()
+                .filter(|t| t.parent == Some(title.id) && visible(who, t))
+                .map(card)
+                .collect();
             let timelines = title
                 .timeline
                 .map(|timeline| {
@@ -126,11 +232,19 @@ impl UiQueryFacade for MockUiQueryFacade {
                     }]
                 })
                 .unwrap_or_default();
-            Ok(ItemView { item: card(title), children, timelines })
+            Ok(ItemView {
+                item: card(title),
+                children,
+                timelines,
+            })
         })
     }
 
-    fn search<'a>(&'a self, who: &'a UiPrincipal, query: &'a str) -> BoxFuture<'a, UiResult<SearchView>> {
+    fn search<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        query: &'a str,
+    ) -> BoxFuture<'a, UiResult<SearchView>> {
         Box::pin(async move {
             if !who.can("catalog:read") {
                 return Err(UiError::Denied);
@@ -139,13 +253,24 @@ impl UiQueryFacade for MockUiQueryFacade {
             let items = if needle.is_empty() {
                 Vec::new()
             } else {
-                TITLES.iter().filter(|t| visible(who, t) && t.title.to_lowercase().contains(&needle)).map(card).collect()
+                TITLES
+                    .iter()
+                    .filter(|t| visible(who, t) && t.title.to_lowercase().contains(&needle))
+                    .map(card)
+                    .collect()
             };
-            Ok(SearchView { query: query.trim().into(), items })
+            Ok(SearchView {
+                query: query.trim().into(),
+                items,
+            })
         })
     }
 
-    fn player<'a>(&'a self, who: &'a UiPrincipal, timeline_id: &'a str) -> BoxFuture<'a, UiResult<PlayerView>> {
+    fn player<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        timeline_id: &'a str,
+    ) -> BoxFuture<'a, UiResult<PlayerView>> {
         Box::pin(async move {
             if !who.can("playback:request") {
                 return Err(UiError::Denied);

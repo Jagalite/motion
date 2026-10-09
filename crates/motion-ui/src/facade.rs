@@ -144,10 +144,22 @@ pub trait UiQueryFacade: Send + Sync + 'static {
     /// True for development/test doubles; pages then label themselves.
     fn is_mock(&self) -> bool;
     fn home<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<HomeView>>;
-    fn library<'a>(&'a self, who: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<LibraryView>>;
+    fn library<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        id: &'a str,
+    ) -> BoxFuture<'a, UiResult<LibraryView>>;
     fn item<'a>(&'a self, who: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<ItemView>>;
-    fn search<'a>(&'a self, who: &'a UiPrincipal, query: &'a str) -> BoxFuture<'a, UiResult<SearchView>>;
-    fn player<'a>(&'a self, who: &'a UiPrincipal, timeline_id: &'a str) -> BoxFuture<'a, UiResult<PlayerView>>;
+    fn search<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        query: &'a str,
+    ) -> BoxFuture<'a, UiResult<SearchView>>;
+    fn player<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        timeline_id: &'a str,
+    ) -> BoxFuture<'a, UiResult<PlayerView>>;
 }
 
 /// The facade as stored in Topcoat's app context.

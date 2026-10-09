@@ -7,8 +7,8 @@
 //! media/API responses are untouched by presentation headers, and Topcoat
 //! receives the full original URI and the genuine peer address.
 
-pub mod assets;
 mod app;
+pub mod assets;
 pub mod facade;
 pub mod mock;
 
@@ -59,7 +59,11 @@ pub fn router(facade: Arc<dyn UiQueryFacade>) -> topcoat::router::Router {
 
 /// Compose the presentation with an API router whose routes use full paths
 /// under `/api/v2`. `demuxe_dir` is the verified Demuxe package directory.
-pub fn mount(api: AxumRouter, facade: Arc<dyn UiQueryFacade>, demuxe_dir: Option<PathBuf>) -> AxumRouter {
+pub fn mount(
+    api: AxumRouter,
+    facade: Arc<dyn UiQueryFacade>,
+    demuxe_dir: Option<PathBuf>,
+) -> AxumRouter {
     let presentation = TowerService::new(router(facade));
     let mut app = AxumRouter::new()
         .merge(api)
@@ -69,7 +73,10 @@ pub fn mount(api: AxumRouter, facade: Arc<dyn UiQueryFacade>, demuxe_dir: Option
         .route("/api/v2/{*rest}", any(api_not_found))
         .route("/ui/{file}", get(ui_asset));
     if let Some(dir) = demuxe_dir {
-        app = app.nest_service("/assets/demuxe", tower_http::services::ServeDir::new(dir).append_index_html_on_directories(false));
+        app = app.nest_service(
+            "/assets/demuxe",
+            tower_http::services::ServeDir::new(dir).append_index_html_on_directories(false),
+        );
     }
     app.fallback_service(
         AxumRouter::new()
@@ -89,7 +96,12 @@ async fn api_not_found(request: Request) -> Response {
         "request_id": "ui-composition",
         "retryable": false,
     });
-    (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "application/problem+json")], body.to_string()).into_response()
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/problem+json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 async fn ui_asset(Path(file): Path<String>) -> Response {
@@ -99,7 +111,10 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
                 (header::CONTENT_TYPE, asset.content_type),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
                 (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                (header::HeaderName::from_static("cross-origin-resource-policy"), "same-origin"),
+                (
+                    header::HeaderName::from_static("cross-origin-resource-policy"),
+                    "same-origin",
+                ),
             ],
             asset.bytes,
         )
@@ -127,7 +142,10 @@ async fn presentation_headers(request: Request, next: Next) -> Response {
     }
     let headers = response.headers_mut();
     let set = |headers: &mut axum::http::HeaderMap, name: &'static str, value: &'static str| {
-        headers.insert(header::HeaderName::from_static(name), HeaderValue::from_static(value));
+        headers.insert(
+            header::HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
     };
     set(headers, "content-security-policy", CONTENT_SECURITY_POLICY);
     set(headers, "cross-origin-opener-policy", "same-origin");

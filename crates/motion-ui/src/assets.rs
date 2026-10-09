@@ -18,8 +18,18 @@ pub struct Asset {
 }
 
 impl Asset {
-    const fn new(stem: &'static str, extension: &'static str, content_type: &'static str, bytes: &'static [u8]) -> Self {
-        Self { stem, extension, content_type, bytes }
+    const fn new(
+        stem: &'static str,
+        extension: &'static str,
+        content_type: &'static str,
+        bytes: &'static [u8],
+    ) -> Self {
+        Self {
+            stem,
+            extension,
+            content_type,
+            bytes,
+        }
     }
 
     /// `/ui/<stem>.<12 hex of sha256>.<ext>`; changes whenever the bytes do.
@@ -34,13 +44,31 @@ impl Asset {
     }
 
     pub fn sha256(&self) -> String {
-        Sha256::digest(self.bytes).iter().map(|b| format!("{b:02x}")).collect()
+        Sha256::digest(self.bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
-pub static STYLESHEET: Asset = Asset::new("motion", "css", "text/css; charset=utf-8", include_bytes!("../../../ui-assets/motion.css"));
-pub static BRIDGE: Asset = Asset::new("bridge", "js", "text/javascript; charset=utf-8", include_bytes!("../../../packages/ui-bridge/bridge.js"));
-pub static PLAYER: Asset = Asset::new("player", "js", "text/javascript; charset=utf-8", include_bytes!("../../../packages/ui-bridge/player.js"));
+pub static STYLESHEET: Asset = Asset::new(
+    "motion",
+    "css",
+    "text/css; charset=utf-8",
+    include_bytes!("../../../ui-assets/motion.css"),
+);
+pub static BRIDGE: Asset = Asset::new(
+    "bridge",
+    "js",
+    "text/javascript; charset=utf-8",
+    include_bytes!("../../../packages/ui-bridge/bridge.js"),
+);
+pub static PLAYER: Asset = Asset::new(
+    "player",
+    "js",
+    "text/javascript; charset=utf-8",
+    include_bytes!("../../../packages/ui-bridge/player.js"),
+);
 
 /// Every embedded asset, for routing and the release inventory.
 pub fn all() -> [&'static Asset; 3] {
@@ -49,5 +77,7 @@ pub fn all() -> [&'static Asset; 3] {
 
 /// Resolve a request under `/ui/` to an embedded asset by exact hashed name.
 pub fn lookup(file_name: &str) -> Option<&'static Asset> {
-    all().into_iter().find(|asset| asset.file_name() == file_name)
+    all()
+        .into_iter()
+        .find(|asset| asset.file_name() == file_name)
 }

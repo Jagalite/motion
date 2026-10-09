@@ -14,7 +14,9 @@ use axum::{
     routing::get,
 };
 use http_body_util::BodyExt;
-use motion_ui::{CONTENT_SECURITY_POLICY, UiPrincipal, assets, facade::ProfileOption, mock::MockUiQueryFacade};
+use motion_ui::{
+    CONTENT_SECURITY_POLICY, UiPrincipal, assets, facade::ProfileOption, mock::MockUiQueryFacade,
+};
 use tower::ServiceExt;
 
 fn principal(profile: &str, permissions: &[&str]) -> UiPrincipal {
@@ -22,7 +24,10 @@ fn principal(profile: &str, permissions: &[&str]) -> UiPrincipal {
         principal_id: "p1".into(),
         profile_id: profile.into(),
         profile_name: profile.into(),
-        profiles: vec![ProfileOption { id: profile.into(), name: profile.into() }],
+        profiles: vec![ProfileOption {
+            id: profile.into(),
+            name: profile.into(),
+        }],
         permissions: permissions.iter().map(|p| p.to_string()).collect(),
         server_epoch: "epoch1".into(),
         csrf_token: "csrf-abc".into(),
@@ -33,24 +38,48 @@ const VIEWER: &[&str] = &["catalog:read", "playback:request", "viewing:write"];
 
 /// Stand-in for the host's authentication layer: it alone inserts the principal.
 fn app(who: Option<UiPrincipal>, demuxe: Option<std::path::PathBuf>) -> Router {
-    let api = Router::new().route("/api/v2/system/health", get(|| async { ([(header::CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#) }));
-    motion_ui::mount(api, Arc::new(MockUiQueryFacade), demuxe).layer(middleware::from_fn(move |mut request: Request, next: Next| {
-        let who = who.clone();
-        async move {
-            if let Some(who) = who {
-                request.extensions_mut().insert(who);
+    let api = Router::new().route(
+        "/api/v2/system/health",
+        get(|| async {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"status":"ok"}"#,
+            )
+        }),
+    );
+    motion_ui::mount(api, Arc::new(MockUiQueryFacade), demuxe).layer(middleware::from_fn(
+        move |mut request: Request, next: Next| {
+            let who = who.clone();
+            async move {
+                if let Some(who) = who {
+                    request.extensions_mut().insert(who);
+                }
+                next.run(request).await
             }
-            next.run(request).await
-        }
-    }))
+        },
+    ))
 }
 
 async fn get_page(app: &Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
     send(app, Method::GET, uri).await
 }
 
-async fn send(app: &Router, method: Method, uri: &str) -> (StatusCode, axum::http::HeaderMap, String) {
-    let response: Response = app.clone().oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+async fn send(
+    app: &Router,
+    method: Method,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let response: Response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -64,9 +93,20 @@ fn assert_strict_markup(html: &str) {
         let tag_end = lower[index..].find('>').unwrap() + index;
         let tag = &lower[index..tag_end];
         assert!(tag.contains(" src="), "inline script: {tag}");
-        assert!(lower[tag_end + 1..].starts_with("</script>"), "script element has inline content");
+        assert!(
+            lower[tag_end + 1..].starts_with("</script>"),
+            "script element has inline content"
+        );
     }
-    for needle in [" onclick=", " onload=", " onerror=", " oninput=", "javascript:", "new function", "eval("] {
+    for needle in [
+        " onclick=",
+        " onload=",
+        " onerror=",
+        " oninput=",
+        "javascript:",
+        "new function",
+        "eval(",
+    ] {
         assert!(!lower.contains(needle), "markup contains {needle}");
     }
 }
@@ -77,7 +117,10 @@ fn assert_presentation_headers(headers: &axum::http::HeaderMap) {
     assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-inline'"));
     assert!(!CONTENT_SECURITY_POLICY.contains("'unsafe-hashes'"));
     // The only inline allowance is the pinned Demuxe stylesheet hash.
-    assert!(CONTENT_SECURITY_POLICY.contains(&format!("style-src 'self' '{}'", motion_ui::DEMUXE_STYLE_HASH)));
+    assert!(CONTENT_SECURITY_POLICY.contains(&format!(
+        "style-src 'self' '{}'",
+        motion_ui::DEMUXE_STYLE_HASH
+    )));
     assert_eq!(headers["cache-control"], "private, no-store");
     assert_eq!(headers["cross-origin-opener-policy"], "same-origin");
     assert_eq!(headers["cross-origin-embedder-policy"], "require-corp");
@@ -91,7 +134,10 @@ async fn unauthenticated_pages_render_sign_in_with_401() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_presentation_headers(&headers);
     assert!(html.contains("Sign in to Motion"));
-    assert!(!html.contains("Films"), "no library data without a principal");
+    assert!(
+        !html.contains("Films"),
+        "no library data without a principal"
+    );
     assert_strict_markup(&html);
     let (status, _, html) = get_page(&app, "/item/item1").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -116,12 +162,24 @@ async fn home_renders_for_a_principal_and_labels_the_mock() {
 #[tokio::test]
 async fn api_paths_never_fall_through_to_html() {
     let app = app(Some(principal("everyone", VIEWER)), None);
-    for uri in ["/api/v2/unknown", "/api/v2", "/api/v2/", "/api/v2/catalog/items/x/nope"] {
+    for uri in [
+        "/api/v2/unknown",
+        "/api/v2",
+        "/api/v2/",
+        "/api/v2/catalog/items/x/nope",
+    ] {
         let (status, headers, body) = get_page(&app, uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
-        assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json", "{uri}");
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            "application/problem+json",
+            "{uri}"
+        );
         assert!(body.contains(r#""code":"not_found""#));
-        assert!(!headers.contains_key("content-security-policy"), "presentation headers leaked onto API");
+        assert!(
+            !headers.contains_key("content-security-policy"),
+            "presentation headers leaked onto API"
+        );
     }
     let (status, headers, body) = get_page(&app, "/api/v2/system/health").await;
     assert_eq!(status, StatusCode::OK);
@@ -156,7 +214,10 @@ async fn permissions_gate_pages_and_actions() {
     let browse_only = app(Some(principal("everyone", &["catalog:read"])), None);
     let (status, _, html) = get_page(&browse_only, "/item/item1").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!html.contains("/play/tl1"), "no play action without playback:request");
+    assert!(
+        !html.contains("/play/tl1"),
+        "no play action without playback:request"
+    );
     let (status, _, _) = get_page(&browse_only, "/play/tl1").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let nothing = app(Some(principal("everyone", &[])), None);
@@ -209,7 +270,10 @@ async fn ui_assets_are_content_hashed_and_immutable() {
         let (status, headers, body) = get_page(&app, &asset.url()).await;
         assert_eq!(status, StatusCode::OK, "{}", asset.url());
         assert_eq!(headers[header::CONTENT_TYPE], asset.content_type);
-        assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+        assert_eq!(
+            headers[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
         assert_eq!(body.as_bytes(), asset.bytes);
     }
     let (status, _, _) = get_page(&app, "/ui/bridge.000000000000.js").await;
@@ -222,12 +286,22 @@ async fn ui_assets_are_content_hashed_and_immutable() {
 async fn demuxe_is_served_as_its_own_unrenamed_tree() {
     let dir = std::env::temp_dir().join(format!("motion-ui-demuxe-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("web/generated/player")).unwrap();
-    std::fs::write(dir.join("web/generated/player/index.js"), "export const x = 1;").unwrap();
+    std::fs::write(
+        dir.join("web/generated/player/index.js"),
+        "export const x = 1;",
+    )
+    .unwrap();
     std::fs::write(dir.join("core.wasm"), [0, 97, 115, 109]).unwrap();
     let app = app(None, Some(dir.clone()));
-    let (status, headers, body) = get_page(&app, "/assets/demuxe/web/generated/player/index.js").await;
+    let (status, headers, body) =
+        get_page(&app, "/assets/demuxe/web/generated/player/index.js").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers[header::CONTENT_TYPE].to_str().unwrap().contains("javascript"));
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("javascript")
+    );
     assert_eq!(body, "export const x = 1;");
     let (status, headers, _) = get_page(&app, "/assets/demuxe/core.wasm").await;
     assert_eq!(status, StatusCode::OK);

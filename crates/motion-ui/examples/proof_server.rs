@@ -49,23 +49,38 @@ struct AppState {
 
 fn random_token() -> String {
     let mut bytes = [0u8; 24];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).expect("urandom");
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .expect("urandom");
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn mock(status: StatusCode, body: Value) -> Response {
-    (status, [(header::HeaderName::from_static("x-motion-mock"), "1")], Json(body)).into_response()
+    (
+        status,
+        [(header::HeaderName::from_static("x-motion-mock"), "1")],
+        Json(body),
+    )
+        .into_response()
 }
 
 fn problem(status: StatusCode, code: &str) -> Response {
-    mock(status, json!({"type": "about:blank", "title": code, "status": status.as_u16(), "code": code, "request_id": "proof", "retryable": false}))
+    mock(
+        status,
+        json!({"type": "about:blank", "title": code, "status": status.as_u16(), "code": code, "request_id": "proof", "retryable": false}),
+    )
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(';')).find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        (name == "motion_session").then(|| value.to_string())
-    })
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == "motion_session").then(|| value.to_string())
+        })
 }
 
 /// The proof's stand-in for the host authentication layer.
@@ -74,19 +89,35 @@ async fn authenticate(State(state): State<AppState>, mut request: Request, next:
     let csrf = token.and_then(|t| state.sessions.lock().unwrap().sessions.get(&t).cloned());
     if let Some(csrf) = csrf {
         let unsafe_method = !matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS");
-        if unsafe_method && request.uri().path().starts_with("/api/") && request.headers().get("x-csrf-token").and_then(|v| v.to_str().ok()) != Some(&csrf) {
+        if unsafe_method
+            && request.uri().path().starts_with("/api/")
+            && request
+                .headers()
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                != Some(&csrf)
+        {
             return problem(StatusCode::FORBIDDEN, "csrf_required");
         }
         request.extensions_mut().insert(UiPrincipal {
             principal_id: "proof-principal".into(),
             profile_id: "everyone".into(),
             profile_name: "Everyone".into(),
-            profiles: vec![ProfileOption { id: "everyone".into(), name: "Everyone".into() }],
-            permissions: vec!["catalog:read".into(), "playback:request".into(), "viewing:write".into()],
+            profiles: vec![ProfileOption {
+                id: "everyone".into(),
+                name: "Everyone".into(),
+            }],
+            permissions: vec![
+                "catalog:read".into(),
+                "playback:request".into(),
+                "viewing:write".into(),
+            ],
             server_epoch: "proof-epoch".into(),
             csrf_token: csrf,
         });
-    } else if request.uri().path().starts_with("/api/v2/") && request.uri().path() != "/api/v2/auth/session" {
+    } else if request.uri().path().starts_with("/api/v2/")
+        && request.uri().path() != "/api/v2/auth/session"
+    {
         return problem(StatusCode::UNAUTHORIZED, "unauthenticated");
     }
     next.run(request).await
@@ -95,15 +126,30 @@ async fn authenticate(State(state): State<AppState>, mut request: Request, next:
 async fn log_requests(request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
-    let range = request.headers().get(header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let response = next.run(request).await;
-    println!("{}", json!({"request": {"method": method, "path": path, "range": range, "status": response.status().as_u16()}}));
+    println!(
+        "{}",
+        json!({"request": {"method": method, "path": path, "range": range, "status": response.status().as_u16()}})
+    );
     response
 }
 
 /// One-use bootstrap capability exchanged for an HttpOnly session cookie.
-async fn create_session(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    let credential = body.get("credential").and_then(Value::as_str).unwrap_or_default().to_string();
+async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let credential = body
+        .get("credential")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let mut sessions = state.sessions.lock().unwrap();
     // Exact Host, and Origin when a browser sends one (plan 12.3).
     let expected_host = sessions.listening.trim_start_matches("http://").to_string();
@@ -123,24 +169,39 @@ async fn create_session(State(state): State<AppState>, headers: HeaderMap, Json(
     let token = random_token();
     let csrf = random_token();
     sessions.sessions.insert(token.clone(), csrf.clone());
-    let mut response = mock(StatusCode::OK, json!({"principal": {"id": "proof-principal"}, "csrf_token": csrf, "expires_at": "2099-01-01T00:00:00Z"}));
+    let mut response = mock(
+        StatusCode::OK,
+        json!({"principal": {"id": "proof-principal"}, "csrf_token": csrf, "expires_at": "2099-01-01T00:00:00Z"}),
+    );
     let cookie = format!("motion_session={token}; Path=/; HttpOnly; SameSite=Strict");
-    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     response
 }
 
 async fn plan(Json(body): Json<Value>) -> Response {
-    let timeline = body.get("timeline_id").and_then(Value::as_str).unwrap_or_default();
-    mock(StatusCode::OK, json!({
-        "status": "ready", "plan_token": format!("proof-plan-{timeline}-0000000000"), "expires_at": "2099-01-01T00:00:00Z",
-        "candidate_id": "proof-original", "profile_id": "everyone", "timeline_id": timeline, "version_id": "proof-version",
-        "source": {"file_id": "proof", "file_revision": "r1"}, "transport": "http_range", "operation": "original",
-        "reason_codes": [], "warnings": ["proof server: no media was evaluated"],
-        "tracks": body.get("tracks").cloned().unwrap_or(Value::Null),
-    }))
+    let timeline = body
+        .get("timeline_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    mock(
+        StatusCode::OK,
+        json!({
+            "status": "ready", "plan_token": format!("proof-plan-{timeline}-0000000000"), "expires_at": "2099-01-01T00:00:00Z",
+            "candidate_id": "proof-original", "profile_id": "everyone", "timeline_id": timeline, "version_id": "proof-version",
+            "source": {"file_id": "proof", "file_revision": "r1"}, "transport": "http_range", "operation": "original",
+            "reason_codes": [], "warnings": ["proof server: no media was evaluated"],
+            "tracks": body.get("tracks").cloned().unwrap_or(Value::Null),
+        }),
+    )
 }
 
-async fn admit(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn admit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) else {
         return problem(StatusCode::BAD_REQUEST, "idempotency_key_required");
     };
@@ -154,7 +215,9 @@ async fn admit(State(state): State<AppState>, headers: HeaderMap, Json(body): Js
     // Admitted while the first generation is still starting; it becomes
     // active on the next read (exercises the bridge's wait-for-ready path).
     let delivery = delivery_json(&id, start, false);
-    sessions.idempotency.insert(key.to_string(), delivery.clone());
+    sessions
+        .idempotency
+        .insert(key.to_string(), delivery.clone());
     println!("{}", json!({"delivery_admitted": id}));
     mock(StatusCode::CREATED, delivery)
 }
@@ -196,30 +259,62 @@ async fn close_delivery(State(state): State<AppState>, Path(id): Path<String>) -
 
 /// Revision-pinned original bytes: single range, conditional requests, same origin.
 async fn serve_media(State(state): State<AppState>, request: Request) -> Response {
-    let mut response = ServeFile::new(&state.media).oneshot(request).await.unwrap().map(Body::new);
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-transform"));
-    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
-    response.headers_mut().insert(header::HeaderName::from_static("cross-origin-resource-policy"), HeaderValue::from_static("same-origin"));
+    let mut response = ServeFile::new(&state.media)
+        .oneshot(request)
+        .await
+        .unwrap()
+        .map(Body::new);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-transform"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+    response.headers_mut().insert(
+        header::HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
     response
 }
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let listen: SocketAddr = arg("--listen").unwrap_or_else(|| "127.0.0.1:0".into()).parse().expect("--listen");
-    assert!(listen.ip().is_loopback(), "the proof server binds to loopback only");
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let listen: SocketAddr = arg("--listen")
+        .unwrap_or_else(|| "127.0.0.1:0".into())
+        .parse()
+        .expect("--listen");
+    assert!(
+        listen.ip().is_loopback(),
+        "the proof server binds to loopback only"
+    );
     let media = PathBuf::from(arg("--media").expect("--media <mp4>"));
     let demuxe = arg("--demuxe-dir").map(PathBuf::from);
 
     let bootstrap = random_token();
     let expires = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let state = AppState { sessions: Arc::new(Mutex::new(Sessions { bootstrap: Some((bootstrap.clone(), expires)), ..Default::default() })), media };
+    let state = AppState {
+        sessions: Arc::new(Mutex::new(Sessions {
+            bootstrap: Some((bootstrap.clone(), expires)),
+            ..Default::default()
+        })),
+        media,
+    };
     let api = Router::new()
         .route("/api/v2/auth/session", post(create_session))
         .route("/api/v2/playback/plans", post(plan))
         .route("/api/v2/playback/delivery-sessions", post(admit))
-        .route("/api/v2/playback/delivery-sessions/{id}", delete(close_delivery).get(get_delivery))
+        .route(
+            "/api/v2/playback/delivery-sessions/{id}",
+            delete(close_delivery).get(get_delivery),
+        )
         .route("/api/v2/media/files/proof/content", get(serve_media))
         .with_state(state.clone());
     let app = motion_ui::mount(api, Arc::new(MockUiQueryFacade), demuxe)
@@ -229,6 +324,14 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");
     let address = listener.local_addr().unwrap();
     state.sessions.lock().unwrap().listening = format!("http://{address}");
-    println!("{}", json!({"listening": format!("http://{address}"), "bootstrap": bootstrap}));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+    println!(
+        "{}",
+        json!({"listening": format!("http://{address}"), "bootstrap": bootstrap})
+    );
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
