@@ -1,6 +1,6 @@
 use playscale_core::delivery::{
-    DRAIN_MS, Delivery, Effect, Error, GenerationStatus as G, Input, LEASE_MS, Operation, Pin,
-    Replacement, Status, WINDOW, Worker, fits_target, transition,
+    DRAIN_MS, Delivery, Effect, Error, GenerationStatus as G, Input, LEASE_MS, Operation, POLICY,
+    Pin, Policy, Replacement, Status, WINDOW, Worker, fits_target, transition,
 };
 use stateless::{
     Check, Disposition, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition,
@@ -38,6 +38,8 @@ fn pin(tracks: &[&str], operation: Operation) -> Pin {
 /// Bounded input domain. `segment_indices`/`durations` drive rolling-window
 /// behavior; `changes` allows generation replacement.
 struct Deliveries {
+    policy: Policy,
+    heartbeat_positions: &'static [Option<u64>],
     duration: Option<u64>,
     first: Pin,
     max_generations: u64,
@@ -66,10 +68,14 @@ impl Enumerate for Deliveries {
         }
         // Current, stale and never-issued generations.
         for g in 1..=d.last_generation + 1 {
-            inputs.push(Step::Delivery(Input::Heartbeat {
-                active_generation: g,
-                now_ms: now,
-            }));
+            for position in self.heartbeat_positions {
+                let position = *position;
+                inputs.push(Step::Delivery(Input::Heartbeat {
+                    active_generation: g,
+                    position_ms: position,
+                    now_ms: now,
+                }));
+            }
             for origin in self.origins {
                 inputs.push(Step::Delivery(Input::Ready {
                     generation: g,
@@ -171,9 +177,15 @@ impl Model for Deliveries {
         }
     }
     fn initial_state(&self) -> Result<World, ModelError> {
-        let (delivery, _) =
-            Delivery::admit(TIMELINE.into(), self.first.clone(), 0, self.duration, 0)
-                .map_err(|e| ModelError::new(error_name(e)))?;
+        let (delivery, _) = Delivery::admit_with_policy(
+            self.policy,
+            TIMELINE.into(),
+            self.first.clone(),
+            0,
+            self.duration,
+            0,
+        )
+        .map_err(|e| ModelError::new(error_name(e)))?;
         Ok(World { delivery, now: 0 })
     }
     fn step(&self, w: &World, step: &Step) -> Result<Transition<World, Effect>, ModelError> {
@@ -290,6 +302,31 @@ impl Model for Deliveries {
                 }),
             ),
             check(
+                "longest_playlist_bounds_current_window",
+                d.generations.values().all(|g| {
+                    g.longest_playlist_ms >= g.segments.iter().map(|s| s.duration_ms).sum::<u64>()
+                }),
+            ),
+            // Hysteresis: a live, unfinished generation is paused at or beyond the
+            // pause lead and running below the resume lead.
+            check(
+                "pace_follows_lead",
+                d.status.fenced()
+                    || d.generations.iter().all(|(n, g)| {
+                        if g.worker != Worker::Live || !g.status.current() || g.complete {
+                            return true;
+                        }
+                        let reference = if Some(*n) == d.active {
+                            d.client_position_ms.unwrap_or(g.requested_start_ms)
+                        } else {
+                            g.requested_start_ms
+                        };
+                        let ahead = g.available_end_ms.saturating_sub(reference);
+                        (ahead < d.policy.ahead_pause_ms || g.paused)
+                            && (ahead >= d.policy.ahead_resume_ms || !g.paused)
+                    }),
+            ),
+            check(
                 "segment_zero_covers_requested_start",
                 d.generations.values().all(|g| {
                     !g.pin.operation.segmented()
@@ -335,8 +372,10 @@ impl Model for Deliveries {
         let mut stops = Vec::new();
         let mut cleanups = Vec::new();
         let mut discards = Vec::new();
+        let mut paces = Vec::new();
         for e in next.outputs {
             match e {
+                Effect::Pace { generation, paused } => paces.push((*generation, *paused)),
                 Effect::Start { generation } => starts.push(*generation),
                 Effect::Stop { generation } => stops.push(*generation),
                 Effect::Cleanup { generation } => cleanups.push(*generation),
@@ -417,14 +456,23 @@ impl Model for Deliveries {
                         || g.retained.iter().any(|r| {
                             r.index == s.index
                                 && input_now.is_some_and(|t| {
-                                    r.until_ms
-                                        >= t + s.duration_ms
-                                            + old.segments.iter().map(|x| x.duration_ms).sum::<u64>()
+                                    r.until_ms >= t + s.duration_ms + old.longest_playlist_ms
                                 })
                         })
                 })
                 // Expired entries are not kept.
                 && input_now.is_none_or(|t| g.retained.iter().all(|r| t < r.until_ms))
+        });
+        let expected_paces: Vec<(u64, bool)> = a
+            .generations
+            .iter()
+            .filter(|(n, g)| g.paused != b.generations.get(n).is_some_and(|o| o.paused))
+            .map(|(n, g)| (*n, g.paused))
+            .collect();
+        let longest_monotonic = a.generations.iter().all(|(n, g)| {
+            b.generations
+                .get(n)
+                .is_none_or(|o| g.longest_playlist_ms >= o.longest_playlist_ms)
         });
         let changed = {
             let mut a2 = a.clone();
@@ -503,6 +551,10 @@ impl Model for Deliveries {
             } if ![b.active, b.pending].contains(&Some(*active_generation)) => {
                 Some(Error::GenerationConflict)
             }
+            Input::Heartbeat {
+                position_ms: Some(p),
+                ..
+            } if self.duration.is_some_and(|d| *p > d + 1_000) => Some(Error::InvalidPosition),
             Input::Activate {
                 generation,
                 expected_active,
@@ -626,6 +678,12 @@ impl Model for Deliveries {
                     .all(|n| b.generations.contains_key(n) || created.contains(n)),
             ),
             check("track_choice_preserved", pins_kept && new_pin_ok),
+            check("pace_exactly_on_flip", {
+                let mut p = paces.clone();
+                p.sort();
+                p == expected_paces
+            }),
+            check("longest_playlist_monotonic", longest_monotonic),
             check(
                 "generation_fenced_output",
                 output_from_producer && created_fresh,
@@ -699,10 +757,19 @@ impl ModelCodec for Deliveries {
     }
 }
 
+/// Scaled-down policy so pacing and eviction occur within model bounds.
+const MODEL_POLICY: Policy = Policy {
+    min_window_ms: 0,
+    ahead_pause_ms: 30_000,
+    ahead_resume_ms: 18_000,
+};
+
 /// Replacement lifecycle: up to three generations, byte and HLS routes, clock
 /// boundaries at drain and lease deadlines (and one millisecond before them).
 fn lifecycle() -> Deliveries {
     Deliveries {
+        policy: MODEL_POLICY,
+        heartbeat_positions: &[None, Some(6_000), Some(18_000)],
         duration: Some(12_000),
         first: pin(&["audio-1", "subtitle-off"], Operation::VideoTranscode),
         max_generations: 3,
@@ -719,16 +786,18 @@ fn lifecycle() -> Deliveries {
 /// Rolling window: one generation of unknown duration, variable segment lengths.
 fn window() -> Deliveries {
     Deliveries {
+        policy: MODEL_POLICY,
+        heartbeat_positions: &[None, Some(12_000)],
         duration: None,
         first: pin(&["audio-1"], Operation::VideoTranscode),
         max_generations: 1,
         changes: false,
         positions: &[],
         origins: &[0],
-        segment_indices: 9,
+        segment_indices: 8,
         durations: &[1_000, 6_000],
-        clock_steps: &[6_000],
-        max_now: 18_000,
+        clock_steps: &[24_000],
+        max_now: 48_000,
     }
 }
 
@@ -766,7 +835,7 @@ fn bounded_delivery_lifecycle_checks_production_reducer() {
 fn bounded_delivery_window_checks_production_reducer() {
     exhaust(
         &window(),
-        "window (segments 0..9, 1s/6s, clock 0..18s, unknown duration)",
+        "window (segments 0..8, 1s/6s, clock 0..48s in 24s steps, pacing 30/18s, unknown duration)",
     );
 }
 
@@ -774,6 +843,8 @@ fn bounded_delivery_window_checks_production_reducer() {
 fn seeded_delivery_sequences_with_more_generations() {
     let report = stateless::explore::fuzz(
         &Deliveries {
+            policy: POLICY,
+            heartbeat_positions: &[None, Some(0), Some(30_000), Some(61_001)],
             duration: Some(60_000),
             first: pin(&["audio-1"], Operation::Original),
             max_generations: 8,

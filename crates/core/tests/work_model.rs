@@ -43,6 +43,12 @@ impl Enumerate for Work {
                         });
                     }
                 }
+                // Recovery adopts survivors; the largest unit size exceeds limits.
+                inputs.push(Input::Adopt {
+                    owner: (*owner).into(),
+                    class: Class::Preparation,
+                    units: *self.units.last().unwrap(),
+                });
             }
         }
         // Every issued ticket (current and stale) plus one never issued.
@@ -127,11 +133,18 @@ impl Model for Work {
         tickets.sort();
         tickets.dedup();
         Ok(vec![
+            // Only adopted survivors may exceed the budget; admitted work never does
+            // (checked per start by starts_follow_precedence).
             check(
-                "capacity_within_budget",
-                s.used() <= u64::from(s.budget.units)
-                    && s.background_used()
-                        <= u64::from(s.budget.units - s.budget.interactive_reserve),
+                "capacity_within_budget_except_adopted",
+                s.held.values().any(|r| r.adopted)
+                    || (s.used() <= u64::from(s.budget.units)
+                        && s.background_used()
+                            <= u64::from(s.budget.units - s.budget.interactive_reserve)),
+            ),
+            check(
+                "adopted_survivors_are_stuck",
+                s.held.values().all(|r| !r.adopted || r.hold == Hold::Stuck),
             ),
             check(
                 "owner_has_one_reservation_or_request",
@@ -184,7 +197,7 @@ impl Model for Work {
             Input::Cancel { ticket } | Input::Exited { ticket } | Input::Stuck { ticket } => {
                 Some(*ticket)
             }
-            Input::Request { .. } => None,
+            Input::Request { .. } | Input::Adopt { .. } => None,
         };
         let known = ticket.is_some_and(|t| before.holds(t).is_some() || before.is_waiting(t));
         let expected_release: Vec<(u64, u32)> = match input {
@@ -234,6 +247,24 @@ impl Model for Work {
                     } else {
                         accepted.is_empty() && rejected == 1 && after == before
                     }
+                }
+            },
+            Input::Adopt {
+                owner,
+                class,
+                units,
+            } => match before.ticket(owner) {
+                Some(_) => accepted.is_empty() && rejected == 1 && after == before,
+                None => {
+                    let t = before.last_ticket + 1;
+                    accepted == [(owner.clone(), t)]
+                        && after.holds(t).is_some_and(|r| {
+                            r.adopted
+                                && r.hold == Hold::Stuck
+                                && r.class == *class
+                                && r.units == *units
+                        })
+                        && started.is_empty()
                 }
             },
             _ => accepted.is_empty() && rejected == 0 && after.last_ticket == before.last_ticket,
@@ -328,6 +359,7 @@ impl Model for Work {
                     class: chosen.class,
                     units: chosen.units,
                     hold: Hold::Running,
+                    adopted: false,
                 },
             );
         }
@@ -363,7 +395,13 @@ impl Model for Work {
             ),
             check(
                 "capacity_tracks_live_owner",
-                started_units.is_some_and(|s| after.used() + released_units == before.used() + s),
+                started_units.is_some_and(|s| {
+                    let adopted = match input {
+                        Input::Adopt { units, .. } if accepted.len() == 1 => u64::from(*units),
+                        _ => 0,
+                    };
+                    after.used() + released_units == before.used() + s + adopted
+                }),
             ),
             check(
                 "start_only_from_request",

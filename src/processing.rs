@@ -453,6 +453,7 @@ async fn command(
     let child = supervisor.spawn();
     drop(held);
     let mut child = child?;
+    lease.started(owner)?;
     let heartbeat = child.stdin.take();
     let mut stderr = child.stderr.take().context("missing encoder stderr")?;
     let diagnostics = tokio::spawn(async move {
@@ -982,16 +983,30 @@ pub fn supervise(
     control: impl std::io::Read + Send + 'static,
     grace: Duration,
 ) -> anyhow::Result<i32> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let alive = Arc::new(AtomicBool::new(true));
-    let flag = alive.clone();
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // Control protocol: b'p' pauses the group, b'r' resumes it; EOF, an error or
+    // any other byte terminates it.
+    const RUN: u8 = 0;
+    const PAUSE: u8 = 1;
+    const STOP: u8 = 2;
+    let wanted = Arc::new(AtomicU8::new(RUN));
+    let flag = wanted.clone();
     std::thread::spawn(move || {
         let mut control = control;
         let mut byte = [0u8; 1];
-        // Any byte or EOF ends supervision; the server never writes.
-        let _ = control.read(&mut byte);
-        flag.store(false, Ordering::SeqCst);
+        loop {
+            let next = match control.read(&mut byte) {
+                Ok(1) if byte[0] == b'p' => PAUSE,
+                Ok(1) if byte[0] == b'r' => RUN,
+                _ => STOP,
+            };
+            flag.store(next, Ordering::SeqCst);
+            if next == STOP {
+                return;
+            }
+        }
     });
+    let mut paused = false;
     let mut command = std::process::Command::new(program);
     command.args(args).stdin(Stdio::null());
     #[cfg(unix)]
@@ -1004,7 +1019,21 @@ pub fn supervise(
             group::wait_empty(&child);
             return Ok(status.code().unwrap_or(1));
         }
-        if !alive.load(Ordering::SeqCst) {
+        let wanted = wanted.load(Ordering::SeqCst);
+        if wanted != STOP && (wanted == PAUSE) != paused {
+            paused = wanted == PAUSE;
+            group::signal(
+                &mut child,
+                if paused {
+                    group::Signal::Pause
+                } else {
+                    group::Signal::Resume
+                },
+            );
+        }
+        if wanted == STOP {
+            // A stopped process acts on SIGTERM only after it is continued.
+            group::signal(&mut child, group::Signal::Resume);
             group::signal(&mut child, group::Signal::Terminate);
             let deadline = std::time::Instant::now() + grace;
             while std::time::Instant::now() < deadline && !group::exited(&mut child)? {
@@ -1023,6 +1052,8 @@ mod group {
     pub enum Signal {
         Terminate,
         Kill,
+        Pause,
+        Resume,
     }
     /// Whether the child exited, without reaping it (its PID/PGID stay reserved).
     #[cfg(unix)]
@@ -1039,7 +1070,13 @@ mod group {
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(unsafe { info.si_pid() } != 0)
+        // macOS can report a stopped child here despite WEXITED alone; only an
+        // actual exit counts.
+        Ok(unsafe { info.si_pid() } != 0
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
     }
     /// After the leader is reaped, wait (bounded) until no member of its group
     /// remains. The group ID cannot be reused while any member exists, and only
@@ -1062,6 +1099,8 @@ mod group {
         let signal = match signal {
             Signal::Terminate => libc::SIGTERM,
             Signal::Kill => libc::SIGKILL,
+            Signal::Pause => libc::SIGSTOP,
+            Signal::Resume => libc::SIGCONT,
         };
         // ESRCH (group already empty) is expected and ignored.
         unsafe {
@@ -1075,8 +1114,11 @@ mod group {
         Ok(child.try_wait()?.is_some())
     }
     #[cfg(not(unix))]
-    pub fn signal(child: &mut std::process::Child, _: Signal) {
-        let _ = child.kill();
+    pub fn signal(child: &mut std::process::Child, signal: Signal) {
+        // No pausing without a Job Object adapter; only termination is supported.
+        if matches!(signal, Signal::Terminate | Signal::Kill) {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -1128,6 +1170,43 @@ mod supervisor_tests {
         drop(server);
         assert_eq!(task.join().unwrap().unwrap(), 1);
         assert!(wait_gone(pid), "descendant survived supervisor");
+    }
+
+    #[test]
+    fn pause_and_resume_the_group_then_terminate_while_paused() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = dir.path().join("ticks");
+        let script = format!(
+            "echo $$ > {}/pid; while :; do echo x >> {}; sleep 0.05; done",
+            dir.path().display(),
+            ticks.display()
+        );
+        let (mut server, supervisor) = UnixStream::pair().unwrap();
+        let task = std::thread::spawn(move || {
+            supervise(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                supervisor,
+                Duration::from_millis(500),
+            )
+        });
+        let pid = grandchild(dir.path());
+        let size = || std::fs::metadata(&ticks).map_or(0, |m| m.len());
+        std::thread::sleep(Duration::from_millis(300));
+        server.write_all(b"p").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let paused = size();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(size(), paused, "group kept running while paused");
+        server.write_all(b"r").unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(size() > paused, "group did not resume");
+        server.write_all(b"p").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(server);
+        assert_eq!(task.join().unwrap().unwrap(), 1);
+        assert!(wait_gone(pid));
     }
 
     #[test]

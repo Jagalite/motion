@@ -62,6 +62,9 @@ pub struct Reservation {
     pub class: Class,
     pub units: u32,
     pub hold: Hold,
+    /// Recorded from a previous process at recovery, regardless of budget.
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,6 +91,14 @@ pub struct Ledger {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Input {
     Request {
+        owner: String,
+        class: Class,
+        units: u32,
+    },
+    /// Record an execution that survived a previous process (its witness is
+    /// still held). It is held as stuck even if that exceeds the budget, so no
+    /// new work is admitted beside it until it exits.
+    Adopt {
         owner: String,
         class: Class,
         units: u32,
@@ -236,6 +247,7 @@ impl Ledger {
                             class: w.class,
                             units: w.units,
                             hold: Hold::Running,
+                            adopted: false,
                         },
                     );
                     continue 'admit;
@@ -302,6 +314,40 @@ pub fn transition(before: &Ledger, input: &Input) -> (Ledger, Vec<Effect>) {
                     });
                     next.admit(&mut effects);
                 }
+            }
+        }
+        Input::Adopt {
+            owner,
+            class,
+            units,
+        } => {
+            if next.ticket(owner).is_some() {
+                effects.push(Effect::Rejected {
+                    owner: owner.clone(),
+                    reason: Rejection::OwnerConflict,
+                });
+            } else if next.last_ticket == u64::MAX {
+                effects.push(Effect::Rejected {
+                    owner: owner.clone(),
+                    reason: Rejection::TicketsExhausted,
+                });
+            } else {
+                next.last_ticket += 1;
+                let ticket = next.last_ticket;
+                next.held.insert(
+                    ticket,
+                    Reservation {
+                        owner: owner.clone(),
+                        class: *class,
+                        units: *units,
+                        hold: Hold::Stuck,
+                        adopted: true,
+                    },
+                );
+                effects.push(Effect::Accepted {
+                    owner: owner.clone(),
+                    ticket,
+                });
             }
         }
         Input::Cancel { ticket } => {
@@ -522,5 +568,27 @@ mod tests {
         );
         assert_eq!(act(&mut l, request("b", Class::Interactive, 1)), []);
         assert_eq!(l.used(), u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn adopted_survivors_hold_capacity_even_beyond_budget() {
+        let mut l = Ledger::new(Budget {
+            units: 2,
+            interactive_reserve: 1,
+        });
+        let adopt = |owner: &str| Input::Adopt {
+            owner: owner.into(),
+            class: Class::Preparation,
+            units: 2,
+        };
+        run(&mut l, adopt("old-1"));
+        run(&mut l, adopt("old-2"));
+        assert_eq!(l.used(), 4);
+        assert_eq!(act(&mut l, request("v", Class::Interactive, 1)), []);
+        assert_eq!(act(&mut l, Input::Exited { ticket: 1 }), [released(1, 2)]);
+        assert_eq!(
+            act(&mut l, Input::Exited { ticket: 2 }),
+            [released(2, 2), start(3)]
+        );
     }
 }
