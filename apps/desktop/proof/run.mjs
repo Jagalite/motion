@@ -84,7 +84,7 @@ const receipt = {
   passed,
   recorded_at: new Date().toISOString(),
   motion_commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim(),
-  worktree_dirty: execFileSync('git', ['status', '--porcelain'], {cwd: root}).toString().trim().length > 0,
+  worktree_dirty: execFileSync('git', ['status', '--porcelain', '--', '.', ':!qualification/desktop'], {cwd: root}).toString().trim().length > 0,
   environment: {electron: observed.electron, chromium: observed.chromium, node: observed.node, os: `${process.platform} ${release()}`, arch: observed.arch},
   topcoat: 'tokio-rs/topcoat 341f3ff2fe16a73af5469685cf597693af5acb25, features router+view+tower+discover (no runtime)',
   origin: 'single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media',
