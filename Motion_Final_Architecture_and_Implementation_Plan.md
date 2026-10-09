@@ -1,14 +1,15 @@
 # Motion: Final Architecture and Implementation Plan
-## Motion-owned Rust catalog · one server API · parallel implementation workstreams
+## Motion-owned Rust catalog · Topcoat presentation · one server API · parallel workstreams
 
-**Design version:** 1.0.0  
+**Design version:** 1.1.0  
 **Date:** October 9, 2026  
 **Status:** Finalized implementation baseline; the proposed changes are not yet implemented or release-qualified.  
 **Primary repository:** `Jagalite/motion`  
 **Public API contract:** [Motion Server API v2](contracts/Motion_Server_API_v2.yaml)  
-**Audience:** Maintainer, implementation agents, reviewers, client developers, and release engineers.
+**Audience:** Maintainer, implementation agents, reviewers, client developers, and release engineers.  
+**Revision:** Topcoat frontend adoption; this revision replaces the React/Vite application decision, not the Motion-owned catalog or native desktop host. See [change record](CHANGELOG_TOPCOAT.md) and [Topcoat research](research/TOPCOAT_RESEARCH.md).
 
-> **Binding decision:** Motion owns its catalog, storage schema, scanning, metadata, processing, viewing, and delivery logic in Rust. Catabolic supplies selected reference behavior and regression scenarios—not a runtime, crate dependency, service, database, or required standalone rewrite. All ordinary clients use the same Motion API.
+> **Binding decision:** Motion owns its catalog, storage schema, scanning, metadata, processing, viewing, and delivery logic in Rust. Catabolic supplies selected reference behavior and regression scenarios—not a runtime, crate dependency, service, database, or required standalone rewrite. All client business operations remain available through the same Motion API. Topcoat server-rendered views may call the same authorized read use cases in-process; they may not create a second domain implementation.
 
 This document supersedes the architecture decisions in `Motion_Unified_Application_Architecture.md`, `Motion_Rust_Catabolic_Architecture_and_Implementation_Plan.md`, and their API draft. It retains the personal-media objectives and gaps from `Motion_Plex_Parity_and_Architecture_Review.md`. The previous full Catabolic rewrite/PyPI plan is **not** a prerequisite or a workstream in this implementation.
 
@@ -27,7 +28,7 @@ This document supersedes the architecture decisions in `Motion_Unified_Applicati
 11. [Public server API](#11-public-server-api)
 12. [Identity, authorization, and private networking](#12-identity-authorization-and-private-networking)
 13. [Go CLI and Charm TUI](#13-go-cli-and-charm-tui)
-14. [TypeScript frontend and Demuxe](#14-typescript-frontend-and-demuxe)
+14. [Topcoat frontend and Demuxe](#14-topcoat-frontend-and-demuxe)
 15. [Desktop shell and one-app lifecycle](#15-desktop-shell-and-one-app-lifecycle)
 16. [Offline, TV, music, photos, and further parity](#16-offline-tv-music-photos-and-further-parity)
 17. [Statelessness and the correctness corpus](#17-statelessness-and-the-correctness-corpus)
@@ -48,14 +49,16 @@ This document supersedes the architecture decisions in `Motion_Unified_Applicati
 | D02 | Implement a Motion-owned, Catabolic-inspired catalog in the Motion workspace. | No Python worker, PyO3, maturin, Catabolic HTTP listener, or internal Catabolic RPC protocol in the product. |
 | D03 | Use one authoritative local SQLite database, owned by Motion. | One migration authority and one transaction protocol; module ownership does not require separate databases. |
 | D04 | Keep a modular monolith with bounded native execution workers. | Ordinary domain operations are in-process Rust calls; FFmpeg/FFprobe remain supervised subprocesses. |
-| D05 | One documented public API serves all clients. | Web, desktop, CLI, TUI, automation, and future clients cannot depend on private business endpoints or direct database access. |
-| D06 | TypeScript is the shared web/desktop frontend; Demuxe is the browser playback implementation. | Do not rewrite Demuxe or its codecs as part of Motion. |
-| D07 | Ship Electron as the initial desktop shell. | A thin host interface preserves a later Tauri option; do not build two production shells simultaneously. This is a design selection, not a claim of playback qualification. |
+| D05 | One documented public API exposes every application use case. | Browser mutations, playback and Go clients use it. Topcoat SSR reads reuse the same authorized application services without self-HTTP or direct database access. UI rendering transports are not alternate business APIs. |
+| D06 | Topcoat Rust views/components implement shared web and desktop screens. Demuxe and small external TypeScript/JavaScript modules implement browser playback and immediate interactions. | React/Vite is no longer the application framework. Rust-authored UI still produces HTML/JavaScript; this is neither a native widget toolkit nor a browser-Wasm rewrite. |
+| D07 | Retain Electron as the initial native desktop host for Topcoat-rendered content. | Topcoat supplies the web presentation, not native windows, an installer or updater. Keep native privileges outside remote content. A later Tauri change remains a separate qualified decision. |
 | D08 | Use Statelessness against production reducers and composed workflows. | Verification checks the real transition logic, not a separately maintained simulation. |
 | D09 | Keep original media read-only. | Deleting or detaching a catalog object never authorizes deleting original files. |
 | D10 | Separate viewing authority, active delivery, and durable preparation. | Session cancellation and background optimization have independent lifetimes, sharing resource admission and execution primitives. |
 | D11 | Adopt `/api/v2` for logical catalog semantics; preserve v1 through compatibility adapters during migration. | Do not keep two authoritative catalog writers to support two API versions. |
 | D12 | “One app” means one coherent installation and lifecycle, not one executable or OS process. | One installer, coordinated component versions, automatic local startup, explicit remote mode, and one data directory. |
+| D13 | Mount Topcoat presentation inside the existing Rust/Axum host through the documented Tower adapter. | One normal listener/origin and one service composition; retain Axum/Utoipa API/media ownership and Motion's SQLite/migrator/auth system. No Toasty migration or second auth authority. |
+| D14 | Adopt strict-CSP SSR first; enable Topcoat's experimental reactive runtime only through its explicit qualification gate. | The inspected runtime uses `new Function`. Do not silently add `unsafe-eval`, global `unsafe-inline`, or disable browser security. The selected baseline is Topcoat SSR plus prebuilt external modules. |
 
 Changes to these decisions require a recorded architecture decision and corresponding contract/migration review. Implementation agents must not silently reopen them.
 
@@ -80,11 +83,12 @@ Development-only tooling may use Python to extract reference fixtures or validat
 | Motion | `52491bf3e6ef323a33dd546687129bdb3b51d4d1` | Existing Rust application, API, schemas, delivery, viewing, packaging, and tests. |
 | Catabolic | `8389e66b01a102b2107ee8ae9f0c00161d17d267` | Selected catalog, observation, components, recovery, and processing reference behavior. |
 | Statelessness | `b97423d2bc01b61eee25b50a44e4b6416851b6b6` | Verification API/reference for the migration branch. |
-| Demuxe | `f32afd60db1787600229823d13c668a812da4dca` | Latest checked source head for this document; runtime archives still need explicit selection and qualification. |
+| Demuxe | `f32afd60db1787600229823d13c668a812da4dca` | Retained media reference from design 1.0.0; not requalified by a UI framework change. |
+| Topcoat | `341f3ff2fe16a73af5469685cf597693af5acb25` | Head retrieved for this revision; October 8, 2026 commit. Workspace declares 0.10.0, edition 2024, Rust 1.98 minimum. [T1] [T2] |
 
-The Motion and Catabolic heads were rechecked for this document. Demuxe's source head is newer than the earlier review. A source commit is not equivalent to a published npm archive or an installed runtime. Existing Motion packaging pins a separate Demuxe distribution; do not inherit source-candidate capabilities by changing a version label. [M1] [D1]
+The Motion, Catabolic, Statelessness and Demuxe references above are retained from design 1.0.0; this frontend revision does not assert they are still the latest heads. Topcoat was inspected for this revision. A source commit is not equivalent to a published npm archive or an installed runtime. Existing Motion packaging pins a separate Demuxe distribution; do not inherit source-candidate capabilities by changing a version label. [M1] [D1]
 
-No Motion application build, repository change, media benchmark, or new runtime qualification was performed to produce this plan. The accompanying validation report describes **document and schema checks only**.
+No Motion or Topcoat application build, repository write, media benchmark, or runtime qualification was performed for this revision. Research inspected upstream documentation and selected implementation files. The workspace manifest is source evidence, not a dependency-resolution or compiler pass. Accompanying reports describe **document/schema checks only**, and every new Topcoat acceptance case is explicitly unexecuted.
 
 ### 2.2 Preserve existing behavior
 
@@ -101,59 +105,65 @@ The initial selections are identity/association separation, guarded observations
 ## 3. Runtime topology and ownership
 
 ```text
-                        ONE MOTION PRODUCT
+                            ONE MOTION PRODUCT
 
-   Go CLI / Charm TUI     Web browser       Electron desktop
-            |                 |              TypeScript + Demuxe
-            +-----------------+---------------------+
-                              |
-                    Motion public HTTP API
-                              |
-                  motion-server (Rust/Axum)
-                              |
-            +-----------------+-------------------------+
-            |                 |                         |
-      Motion catalog    Viewing / delivery        Auth / operations
-      scan / metadata   planning / sessions       events / settings
-            |                 |                         |
-            +--------- shared transaction services -----+
-                              |
-                  motion.sqlite + managed assets
-                              |
-                 Rust work/resource coordinator
-                              |
-                supervised FFprobe / FFmpeg workers
-                              |
-                 original roots / temporary segments
+  Go CLI / Charm TUI           Browser                 Electron desktop
+          |                      |                      sandboxed HTML
+          | public JSON/media    | Topcoat HTML + JS         |
+          +----------------------+---------------------------+
+                                 |
+                    motion-server: one Axum listener
+                         /                 \
+          /api/v1, /api/v2, media       Topcoat TowerService
+           Axum + reviewed OpenAPI      UI pages/assets only
+                         |              /          \
+                         |       authorized reads   browser API commands
+                         +--------------+-------------------+
+                                        |
+                         shared Motion application services
+                     catalog / scans / viewing / delivery / policy
+                                        |
+                        motion.sqlite + managed asset storage
+                                        |
+                         Rust work/resource coordinator
+                                        |
+                            supervised FFprobe / FFmpeg
 
- Media data: safely opened original or prepared bytes -> Rust HTTP -> client.
- Decode/display: browser native / WebCodecs / Demuxe Wasm at the client.
- Server conversion: FFmpeg decodes, filters and re-encodes only when required.
- Catabolic: reference repository and development corpus; absent at runtime.
+  Normal rendering: Rust Topcoat -> HTML -> browser/Electron renderer.
+  Playback: small TS coordinator + Demuxe -> native/WebCodecs/Wasm as qualified.
+  Native desktop windows, credentials and updates: Electron host, not Topcoat.
+  Catabolic: reference only; no Python service or secondary catalog.
 ```
 
-The Rust server normally does not render video into a display. It may decode through native FFmpeg while transcoding; the client presents the output. Direct play bypasses server decoding. Server-side adaptation and client-local fallback are coordinated choices, not mutually exclusive product architectures.
+Topcoat adds a **presentation adapter inside the server**, not another authoritative application. Keep Axum as the outer routing/security composition and mount Topcoat through `topcoat::router::tower::TowerService`; that embedding path is documented upstream. The concrete Motion integration still requires a compile and HTTP proof. [T3]
+
+Server-rendered pages read through a narrow `UiQueryFacade` backed by the same authorized use cases as the public API. Browser writes, scans, media planning, delivery, progress, and administration keep using `/api/v2`. A page render, hover-prefetch, reconnect, or shard rerun must never itself start durable work or claim viewing authority.
+
+The server normally does not render decoded video into a display. It may decode through native FFmpeg while transcoding; Demuxe presents media on the client. Using Rust to author HTML does not move client decoding into Topcoat.
 
 ### 3.1 Component ownership
 
 | Component | Sole responsibility | Forbidden ownership |
 |---|---|---|
-| Catalog services | Logical identity, locations, observed files, associations, metadata, effective search views | Viewer identity, UI state, uncontrolled process creation |
-| Viewing services | Profile/timeline progress, manual overrides, session sequence authority | Segment generation or file discovery |
-| Delivery services | Source selection, tracks, streaming generations, transport leases, timeline mapping | Inventing catalog identities or rewriting originals |
-| Work coordinator | Durable demands, attempts, effect dispatch, recovery, shared budgets | A second catalog or an arbitrary shell-command service |
-| Execution adapter | Qualified FFmpeg/FFprobe recipes, subprocess containment and evidence | User authorization decisions |
-| API/identity layer | Request identity, policy enforcement, wire contract, scoped events | UI-specific alternate domain rules |
-| Go and TypeScript clients | Presentation, user intent, transport retries, local caches | Direct SQLite writes, independent scans, server policy duplication |
-| Desktop host | Native windows/tray, secure credential storage, dialogs, installed-server lifecycle, offline local assets | A second server implementation or unrestricted renderer IPC |
+| Catalog services | Logical identity, sources, observed files, associations, metadata and effective search | Viewer credentials, DOM state, uncontrolled process creation |
+| Viewing services | Profile/timeline progress, manual epochs and session sequence authority | Segment generation or filesystem discovery |
+| Delivery services | Source/track selection, streaming generations, leases and timeline mapping | Inventing catalog identities or rewriting originals |
+| Work/execution services | Durable work, admission, FFmpeg supervision, validation and recovery | UI-specific authorization or unbounded native commands |
+| Axum API/identity | Public JSON/media/SSE contracts and authoritative request policy | Depending on generated Topcoat procedure paths for business operations |
+| Topcoat presentation | Rust HTML views, page/layout composition, authorized read projections and optional gated reactive fragments | SQL access from components, Toasty schema ownership, independent auth, hidden business operations |
+| TS browser modules + Demuxe | Immediate controls, playback lifecycle, public API commands and browser effects | Catalog authority or round-tripping each frame through Rust views |
+| Go clients | Terminal presentation, API commands, retries and local caches | Database access, private Topcoat endpoints or their own scans |
+| Electron host | Windows/tray, approved native dialogs, credentials, lifecycle, updates and device cache access | Treating a selected remote server's HTML as privileged packaged code |
 
 ### 3.2 Deployment modes
 
-**Local desktop:** installer includes the Rust server, Go terminal binary, web assets, Demuxe assets, FFmpeg/FFprobe, and Electron. Opening Motion attaches to the selected local server or explicitly starts it. Closing the window follows the configured background-service policy; it is not implicitly equivalent to shutting down the server.
+**Local desktop:** the installed Rust server renders Topcoat HTML, API and player assets from one verified loopback origin; Electron displays it after protected bootstrap. The package contains no React SPA. Closing the window follows explicit server ownership policy.
 
-**Headless:** the Rust server runs under the host service manager and serves the same web application/API. No Electron or Python installation is needed. A server-only package may omit the Go client, but the full desktop package includes it.
+**Headless:** the same Rust host serves Topcoat pages, API and version-matched assets. No Electron or Python is needed. A GUI-less server package still includes the HTML-rendering code and browser assets when web access is enabled.
 
-**Remote client:** desktop or terminal client connects to a selected existing server. Connection failure never silently starts a blank local library. All caches, credentials, and IDs are namespaced by `server_id`.
+**Remote client:** Electron opens the chosen Motion server's HTTPS Topcoat UI in an unprivileged isolated view. Native connection controls remain in trusted local chrome. It does not need a second local catalog or a self-proxy to render remote pages. Failure leaves an explicit disconnected screen, not a newly initialized local library.
+
+**Offline downloads, M5:** a narrowly scoped, separately supervised local Rust presentation host renders the same Topcoat download/player views from verified cached manifests. It owns no server catalog, migrations, scanning or encoding. It is activated explicitly for offline/download mode and serves only cache-scoped reads and local unsynchronized device events. This planned helper is not needed for ordinary online rendering; Section 16 defines its constraints.
 
 ## 4. Repository and dependency structure
 
@@ -172,17 +182,19 @@ motion/
     motion-execution/         # native tools, process supervision, output validation
     motion-playback/          # planner, viewing, delivery, HLS/time-map services
     motion-application/       # composition of cross-domain operations and policy
-    motion-server/            # Axum routes, auth ingress, events, asset/media routes
+    motion-server/            # Axum API/media/auth and Topcoat TowerService mount
+    motion-ui/                # Topcoat Rust pages/layouts/components + UiQueryFacade
+    motion-ui-host/           # M5 presentation-only offline host, no server DB access
     motion-verification/      # Statelessness adapters, scenarios, oracle harness
   apps/
     terminal/                 # one Go module; motion CLI + motion tui
-    web/                      # React + TypeScript + Vite application
-    desktop/                  # Electron main/preload and packaged frontend host
+    desktop/                  # Electron host, trusted chrome, sandboxed Topcoat content
   packages/
     api-ts/                   # generated models + typed fetch client
     playback/                 # Motion player coordinator + Demuxe adapter
     host/                     # narrow platform capability interface
-    ui/                       # reusable accessible presentation components
+    ui-bridge/                # small prebuilt browser modules; no React app
+  ui-assets/                  # local CSS/icons/fonts + reproducible Topcoat asset inputs
   contracts/
     Motion_Server_API_v2.yaml
     fixtures/                 # public request/response and negative examples
@@ -194,7 +206,7 @@ motion/
   packaging/ scripts/ docs/
 ```
 
-Dependencies point inward: domain has no Axum, SQLx, Tokio runtime, Electron, or Demuxe types. Ports use domain types. Concrete adapters implement ports. Application services coordinate transactions and effects. The server is the composition root. `motion-catalog` does not depend on a `catabolic-*` crate.
+Dependencies point inward: domain has no Axum, SQLx, Tokio runtime, Topcoat, Electron, or Demuxe types. Ports use domain types. Concrete adapters implement ports. Application services coordinate transactions and effects. The server is the composition root. `motion-catalog` does not depend on a `catabolic-*` crate. `motion-ui` depends on authorized application/query interfaces, never concrete SQL repositories. Topcoat is modular: opt into a reviewed feature set, not `full` or a scaffold that creates another Toasty/SQLite migrator. A14 pins compatible Topcoat crates/CLI and Rust >=1.98; do not assume the old Rust 1.95 packaging configuration can build the inspected source. [T2] [T4]
 
 Avoid a new giant shared `App` object exposing the entire database, admin secret, tool paths, mutable locks, and every service to every handler. Inject narrow service handles. One shared writer coordinator is acceptable for correctness initially; do not hold it across slow filesystem/network/encoder activity.
 
@@ -212,6 +224,8 @@ These are operation contracts, not wire DTOs or mandatory trait syntax:
 | `PlaybackService` | plan, admit delivery, stage change, activate generation, close, renew lease | Plans have no execution effects; admission revalidates everything. |
 | `ViewingService` | read, start authority, record ordered event, override, reconcile offline | Profile/timeline transaction protects manual epochs and sequence ordering. |
 | `AccessPolicy` | authorize action/resource, build scoped query constraints, revoke | Evaluated before disclosure; cache tied to principal and policy revision. |
+| `UiQueryFacade` | load bounded page/view models under request principal, profile and server epoch | Same read use cases and visibility as API; no persistent render-side effects or raw SQL. |
+| `OfflinePresentationReader` | read verified download manifests/local pending event summaries | Device cache only, explicitly selected server namespace; no API impersonation or live catalog mutation. |
 
 A persistence command may span catalog, viewing-reference, job, audit, and event tables in **one** SQLite transaction. Only the designated use case may make that combined change; direct cross-module table writes from unrelated code remain prohibited.
 
@@ -553,7 +567,15 @@ File/asset routes return an appropriate content type after validation. Mutable H
 
 `Last-Event-ID` takes precedence over `after`. A policy change or restored database invalidates old cursor scope even if numeric event positions overlap. Emit a reset, clear stale client rows, and rebuild authorized views using the overlap protocol in Section 6.4. The server rechecks authorization while streaming and ends revoked sessions. The event loop must not poll SQLite independently per client without a bounded shared notification strategy.
 
-### 11.7 Concrete fixture coverage
+### 11.7 Topcoat embedding and API preservation
+
+Retain **all 97 paths, 146 operations and 148 schemas** in API v2.0.0. This revision changes the design annotation only, not request/response/security definitions. Do not replace OpenAPI/Utoipa or SDKs with Topcoat-generated procedure/shard identifiers. Upstream currently lists OpenAPI endpoints as roadmap work; Motion already has its independent contract. [T1]
+
+A08 mounts Topcoat using the documented `TowerService` at the Axum composition root. Forward the original full URI. Keep explicit API subrouters with JSON not-found/method/error handling so `/api/v2/unknown` cannot fall through to HTML. Keep original/media, HLS, SSE and health routes outside Topcoat rendering/compression/body-buffering rules. Apply request identity, host/origin and limits before dispatch. Forward genuine connection address metadata as documented; in-process embedding adds no trusted-proxy hop. [T3]
+
+Topcoat page, asset and optional fragment/runtime routes are presentation transport, inventoried separately in [the presentation contract](contracts/TOPCOAT_PRESENTATION_CONTRACT.md). Every protected render or independently callable shard checks the principal and requested resource. SSR read shortcuts must return the same permitted records as the API. Browser business mutations call existing `/api/v2` methods with the same preconditions, idempotency keys and CSRF protection. No mutation-only `#[procedure]` is authorized by this revision.
+
+### 11.8 Concrete fixture coverage
 
 The contract package includes machine-checked example objects for a playback request, scan result, viewing event, content ticket request, and offline synchronization. These are authored conformance fixtures, not results obtained from the current server. Implementers must add end-to-end request/response tests for each operation and negative tests for 401/403/404, 409/412/428, source mutation, expired tickets, event resets, and conditional media behavior.
 
@@ -587,6 +609,14 @@ Initial third-party browser CORS is disabled. Explicitly approved origins may us
 
 Revocation denies new API/media admissions and signals active deliveries to stop. Some bytes already admitted to an OS/network transfer may finish before cancellation takes effect. Define and test that interval; do not promise retroactive deletion of already transferred data. Unencrypted offline copies cannot be erased by server revocation alone. Explicitly disclose that limitation in sharing/download UX.
 
+### 12.5 SSR, generated endpoints and CSP
+
+Authorization must cover HTML and all optional Topcoat transports, not merely JSON routes. A shard is independently callable without its page/layout guards. Restored signals, captured arguments and component records from a browser are untrusted; revalidate sizes, scopes and revisions. Never serialize service handles, credentials, administrator tokens, raw source paths or hidden metadata into browser-visible captures. Do not install Topcoat's session storage as a second identity system: adapt the existing Motion browser session/principal once. [T5] [T6]
+
+Default production presentation uses strict-CSP Topcoat SSR with external prebuilt modules. The inspected reactive expression compiler invokes `new Function`; ordinary nonces or `wasm-unsafe-eval` do not permit that JavaScript compilation under a no-eval policy. Thus the unmodified inspected reactive runtime is **not admitted to the strict baseline**. Enable it only after a separately reviewed no-eval implementation is qualified, or a maintainer-approved scoped security exception explicitly changes this decision. A test pass alone cannot remove the known CSP incompatibility. Never silently allow broad `unsafe-eval`/`unsafe-inline` or disable Electron `webSecurity`. Demuxe's WebAssembly permissions are separately qualified. [T7] [T8]
+
+Authenticated HTML is private and not public-cacheable. Clear rendered/cached content on logout, principal/profile change or server epoch change. A long-lived UI stream must recheck revocation and stop/refetch when policy changes; it cannot retain request-scoped authorization indefinitely. Future runtime POST-to-GET internal rewrites do not exempt the original incoming request from origin, body-limit and authentication checks. [T5]
+
 ## 13. Go CLI and Charm TUI
 
 Use one Go module and a shared generated/typed Motion client. The terminal binary is `motion`; `motion tui` starts the Charm Bubble Tea/Lip Gloss interface. Command parsing can use Cobra. These are selected implementation tools, with exact versions committed by the release integrator.
@@ -615,67 +645,104 @@ The TUI provides libraries, logical catalog, search, profiles, scans/jobs, diagn
 
 TUI reconnect uses event reset plus fresh queries. Slow screens cannot block event draining. Terminal resize, Unicode, keyboard focus, cancellation, server-unavailable state, and credential redaction are acceptance requirements. Agent-owned tests must prove no direct SQLite, scan, provider, or FFmpeg dependencies exist in the Go client.
 
-## 14. TypeScript frontend and Demuxe
+## 14. Topcoat frontend and Demuxe
 
-### 14.1 Shared application
+### 14.1 Framework decision and actual platform model
 
-Select React + TypeScript + Vite for the new application. Share API models/client, domain-neutral UI components, route screens, and the playback coordinator between browser and desktop. Keep a small host-capability interface rather than conditionals scattered throughout features.
+**Use Topcoat for Motion's web and desktop-facing application screens.** Author page/layout/component code in Rust in `motion-ui`, with local CSS and vendored, reviewed Topcoat UI components as useful. The same server-rendered HTML is consumed by browsers and Electron. React is not a dependency of the new application; a Vite SPA is no longer the baseline build artifact.
 
-Initial screens: onboarding, home/continue watching, libraries, movie/show/season/episode detail, versions/editions, search, matches/corrections, profiles/preferences, processing, sources/scans, and diagnostics. Later add collections/playlists/queues, offline, markers, music/photos, and qualified living-room controls. Loading, empty, partial, denied, verifying, unavailable, retry, and conflict states are real UI states—not one generic spinner/error.
+Topcoat is an experimental server-rendered web framework, not a native widget system or a desktop packager. Its optional expression system translates a limited Rust vocabulary to JavaScript rather than compiling the application to browser Wasm. The reviewed source declares 0.10.0 and Rust 1.98; APIs and platform behavior must be pinned and tested, not inferred from the Tokio organization name. [T1] [T2] [T5]
 
-All business operations go through the public API. A host-only file picker returns an explicit user selection; adding a server source is still an authorized server operation. A folder selected on a remote client's machine is not automatically a server-local media source.
+Retain TypeScript where it belongs: `packages/playback` around Demuxe, `packages/api-ts` for typed API commands, and `packages/ui-bridge` for immediate DOM/host interactions. Do not translate Demuxe's internals, AudioWorklets, WebCodecs calls or every playback event into Topcoat expressions. This reduces the full SPA surface without promising zero JavaScript, zero frontend build tooling, or lower measured CPU/memory.
 
-### 14.2 Playback coordinator versus player implementation
+### 14.2 Shared views and authorized data flow
 
-`packages/playback` owns Motion workflow: read preferences/history, plan, admit, obtain media access, open candidate, create viewing authority, renew lease, submit ordered events, stage/activate replacement, and tear down. Demuxe owns local player state, browser route execution, tracks, subtitles, and decoder lifecycle. Do not fork its reducers or wrap it in a contradictory second decoder state machine.
+Initial screens remain onboarding, home/continue watching, libraries, movie/show/season/episode, editions/versions, search, corrections, profiles/preferences, processing, sources/scans and diagnostics. Later add collections/playlists, markers, downloads, music/photos and qualified living-room presentation. Preserve loading, empty, denied, verifying, partial, offline, retry and conflict states and accessible focus behavior.
 
-Use a playback adapter with open/close, play/pause, absolute seek through the Motion timeline mapper, track/quality selection, state/error subscription, and bounded disposal. Serialize critical source changes and use generation ownership to ignore stale callbacks. Each asynchronous operation is cancelled on navigation or ownership replacement; late completion cannot change a new page/player.
+Pages receive a bounded view model from `UiQueryFacade`. It takes an authenticated principal/profile, uses Motion's current policy and query services, and returns presentation-safe data. A component never opens SQLite, migrates tables or fetches providers directly. Request-scoped memoization may deduplicate reads; a cross-user cache key must include authorization scope, policy revision and server epoch or avoid caching. No render holds a writer transaction across network/HTML streaming.
 
-### 14.3 Assets and exact-build qualification
+Domain mutations stay in the existing public API. A small external module submits form/button commands, preserves idempotency/revision/CSRF data, displays typed errors and refreshes authorized presentation. Rust views may call the same read use cases directly; there is no requirement to make loopback HTTP requests to the same process. The public API remains sufficient for independent clients, and parity tests compare API-visible data with SSR-visible data.
 
-Package JavaScript and runtime assets from the same verified Demuxe archive. Store a manifest with source/build identity, file hashes, enabled providers, licensing materials, and browser qualification. Do not dynamically download unpinned codecs into a signed production app. Native browser, WebCodecs, Wasm and HLS paths remain separate capability records. [D1]
+### 14.3 State ownership and reactive-runtime gate
 
-Qualify localhost/HTTPS and Electron's chosen custom/packaged origin for workers, fetch/ranges, CSP, WASM MIME, audio, and isolation. Cross-origin isolation is an observed runtime fact, not a configuration assumption. Non-isolated JSPI/Asyncify support is restricted to the selected assets and tested cases; it does not establish Safari, HDR, surround, or unlimited-format support. [D1]
+| State | Owner | Rule |
+|---|---|---|
+| Catalog, access, scans, jobs and viewing authority | Motion application services | Never copied into a second Topcoat state machine. |
+| Render/query context | `motion-ui` request/view model | Read-only, bounded and principal-scoped; rerunning is safe. |
+| Temporary menus, selected tab, unsaved form input | Browser UI bridge; optional qualified Topcoat signals | User input only; not authorization or canonical catalog state. |
+| Decoder, current media time, buffering and audio output | Demuxe | No server round-trip per frame/timeupdate. |
+| Plan/admit/switch/progress/lease orchestration | Motion TypeScript playback coordinator | Same public API and timeline/generation protocol as before. |
+| Native capabilities and persistent credentials | Electron main/trusted chrome | No arbitrary native bridge to a remote page. |
 
-Do not route entire movie payloads through a small custom-source staging API or Electron JSON IPC. Use normal revision-bound HTTP sources or a separately qualified lazy native byte adapter. The earlier Demuxe extension documentation has a bounded custom playback staging path; do not assume it is a general large-file native bridge. [D2]
+The **M0/M2 baseline is SSR plus external prebuilt modules**. Do not include the experimental runtime script merely because it is enabled in upstream's default features. Use an explicit minimum feature set and qualify the emitted production HTML under CSP.
 
-### 14.4 Client cost and accessibility
+An optional reactive enhancement track may use `$(...)`, `#[shard]`, navigation links or connected live rendering after the CSP blocker in Section 12.5 is resolved or explicitly accepted through an ADR. Each generated/registered route is inventoried and independently authorized; browser signal state is validated. Auto-discovery must not accidentally expose unrelated linked handlers. Keep the Topcoat UI protocol version tied to the deployed bundle, never expose its generated paths as public SDK contracts. [T4] [T5] [T6]
 
-Measure client CPU, memory, dropped frames, audible output and stalls as well as server cost. The player can request a server fallback when local execution is inappropriate, but only the server admits it. Route labels and progressing timestamps are not proof of hardware decode or correct sound/color.
+If reactive navigation is enabled, use `PrefetchMode::Never` on playback/session, administrative and expensive pages initially. Upstream intent-prefetch can render an unvisited destination; render functions therefore cannot start scans, create deliveries, update watched state or submit jobs. Register layers in the documented order before runtime installation and verify both original and rewritten requests. [T5] [T9]
 
-Responsive and keyboard/screen-reader behavior is a release requirement. Use explicit focus management, accessible track/quality controls, readable conflict messages, and reduced-motion handling. Native PiP/fullscreen/background behavior requires testing on the actual host, not inference from a web API existing.
+### 14.4 Demuxe integration and DOM lifetime
+
+Topcoat renders an ordinary stable player host and control markup. An external ES module creates and owns Demuxe. This is a **Motion-owned integration boundary**, not a claim that Topcoat's roadmap islands feature exists. Preserve the selected archive's worker/engine APIs and its own decoder lifecycle. [T1] [D1]
+
+The coordinator retains preferences/history -> plan -> delivery admission -> candidate open -> viewing authority -> progress/lease -> replacement/disposal. It maps transport time to logical timeline milliseconds and preserves generation/source/track identity. Topcoat signals or a rendered slider value never become the authoritative playback clock.
+
+Keep the player subtree outside re-rendered search/detail/job regions. The initial playback page does not allow a framework HTML swap to own Demuxe-created DOM. Use explicit enter/leave handling, a page/player ownership epoch and cancellation. Before intentionally leaving the player, flush or durably queue the last viewing event, retire the delivery and await bounded teardown. A source switch may preserve the old candidate as specified in Section 10. A stale callback cannot update a newly rendered profile/server/player.
+
+Topcoat documents element matching and shared signal preservation, not a guarantee that an externally managed video/canvas/worker instance survives every navigation. Stable IDs are necessary for reorderable lists but insufficient evidence of player lifetime. A later persistent mini-player/music shell requires actual identity/worker/audio continuity tests or a separately isolated media document. Do not claim uninterrupted audio from an HTML-navigation feature alone. [T6] [T9]
+
+Progress, play/pause/seek, audio-track operations and frame notifications remain client-local or ordinary API commands; UI polling/streaming cannot rerender the entire page every time the player clock advances. During a render-service outage, already admitted media may continue subject to delivery lease/auth policy; show stale controls rather than corrupting saved state.
+
+### 14.5 Two asset pipelines, one release identity
+
+Topcoat's bundler handles static UI CSS, icons/fonts and prebuilt bridge modules. The binary and asset bundle must match and survive package relocation. Use local, checksum-pinned inputs; do not rely on live Iconify/font/CDN downloads at runtime. Commit customized component sources and reviewed upstream versions. `topcoat dev` is development tooling, not a shipped server. [T1] [T10]
+
+Keep Demuxe as a **separate immutable versioned asset tree** from one verified JS/runtime archive. Its worker imports, relative provider paths, Wasm files and installed-file receipts must remain consistent. Do not independently hash/rename every Demuxe file through `asset!` and break its relative references. Mount both asset classes under reserved non-API paths with correct MIME, CSP, caching, range/CORS and isolation behavior. Do not route original media through the Topcoat asset collector. [D1] [D2]
+
+A14 pins the Topcoat source/release, matching CLI, Rust toolchain, Tailwind/compiler inputs, UI bridge digest, Demuxe archive, Electron/Chromium, FFmpeg and contract digest in the release manifest. Topcoat's pure examples can avoid a Node build step; Motion's retained TS/Demuxe/Electron packaging still has build-time JavaScript tooling. Users need neither a Node development server nor a Rust compiler.
+
+### 14.6 UI qualification and cost
+
+Qualify browser and packaged desktop separately for HTML behavior, real media output, navigation/back-forward, resize, focus, screen-reader semantics, reduced motion, errors and teardown. Rust-authored HTML does not automatically establish accessibility or TV focus navigation. Image optimization/localization shown on an upstream roadmap remain Motion work until available and integrated. [T1]
+
+Track SSR query/render latency, HTML size, cache behavior, concurrent render load, client memory/CPU and playback stalls separately. Bound page queries, rendering concurrency and optional connected streams so a poster-grid refresh cannot starve playback admission/media serving. The existing performance budgets remain targets, not Topcoat benchmark results. The [Topcoat acceptance matrix](qualification/TOPCOAT_ACCEPTANCE.md) is a release gate, not evidence of completed tests.
 
 ## 15. Desktop shell and one-app lifecycle
 
-### 15.1 Shell decision
+### 15.1 Topcoat presentation, Electron native host
 
-Electron is the initial production shell because it allows the release to control a bundled Chromium version. That is an engineering choice for qualifying a complex browser media stack, not a claim that Electron makes every codec work. Tauri uses platform webviews and remains an option after its actual target engines pass the required corpus. [W8] [W9] [D1]
+Topcoat replaces the **React application layer**, not Electron's native windows, process/credential integration, signing or updater. Retain the previously selected Electron host and its pinned Chromium engine for initial media qualification. Tauri remains a separate future platform decision; switching HTML authoring frameworks does not qualify its platform webviews. [T1] [W8] [W9]
 
-Keep Node integration disabled in the renderer, context isolation and renderer sandbox enabled, navigation/popups restricted, and IPC sender/origin validated. Expose task-specific host capabilities, never `exec`, arbitrary filesystem read/write, a raw Electron IPC object, or reusable privileged credentials. An Electron renderer compromise must not imply unrestricted host command execution. [W9]
+Keep Node integration disabled for rendered content, context isolation and renderer sandbox enabled, permission grants explicit, and navigation/popups restricted. Native IPC is task-specific and sender/frame/origin validated; it is never a raw Electron API, filesystem or shell interface. In particular, remote Topcoat HTML is still remote executable web content, regardless of being generated from Rust. [W9]
 
-### 15.2 Origins and connections
+### 15.2 Local and remote rendering origins
 
-Load the bundled TypeScript UI from a registered secure application origin with an explicit protocol handler and immutable local assets. Browser deployment serves the same build from the Rust origin. Desktop domain requests use the same public HTTP API through the selected server connection and a scoped in-memory token; approved CORS is explicit. Media elements receive narrow tickets where headers are unavailable. Disable cross-origin token forwarding and reject unapproved redirects.
+**Local attached server:** protected bootstrap verifies server ID, runtime epoch, endpoint and compatibility before Electron displays the server's Topcoat URL. The page, API and media share the loopback origin; use the existing browser-session exchange and CSRF contract. Do not inject long-lived credentials into page HTML, captured signals, URLs, argv or logs. Loopback is not sufficient principal proof. Browser workers/audio/Wasm/isolation still need qualification at the actual origin.
 
-The host retains the persistent device credential and obtains short-lived API access for the selected server. The bridge only supplies connection/auth bootstrap and native capabilities; it does not implement alternative catalog or playback use cases. Switching servers clears server-scoped player state, caches and credentials. Remote content is never loaded into a privileged preload context.
+**Remote selected server:** use its validated HTTPS origin in an unprivileged `WebContentsView` or equivalent isolated web-content surface, with no privileged preload. Keep connection selection, native source dialogs, update controls and offline-mode entry in trusted packaged chrome/native menus. Retain persistent credentials in the host and establish a scoped browser session through the reviewed auth exchange before navigation; use a server-scoped Electron session partition. Reject cross-origin redirects, certificate bypasses and credential forwarding. The direct remote page uses same-origin API calls, not arbitrary localhost CORS. [W9]
 
-The custom origin must pass actual worker, media, isolation, audio and source-network tests. A failing media-origin proof blocks the shell release; do not disable browser security flags to make tests pass. A local HTTP asset-host alternative is an ADR with the same API/auth requirements, not a second domain backend.
+The trusted chrome can remain a tiny packaged connection/error surface; it is not a second React application. A server-driven request for a native operation is an untrusted intent, not permission. Initial native operations are initiated in trusted chrome and call the same public API after explicit user confirmation. A remote client's local folder picker must not be mistaken for a path on the remote server.
+
+**Offline downloads:** render locally from the explicitly started presentation-only host described in Section 16. It uses a separate loopback origin and cache scope, never proxies arbitrary remote URLs or claims that a remote server is online.
+
+Changing server/profile/auth context cancels the previous render/player ownership, drains or queues valid events, and clears sensitive DOM/client caches. A principal cannot inherit another server's cookies, prefetch results or open media. Native chrome and content share no unrestricted cross-origin object bridge.
+
+The old requirement to load the entire application as a bundled static TypeScript SPA is superseded. Ordinary SSR deployment needs a live render host; there is no assumption that Topcoat can export the application into an offline `index.html`. [T1]
 
 ### 15.3 Single-instance and server ownership
 
 Use an OS-level exclusive data-directory lock for the authoritative server. A private descriptor records server ID, runtime epoch, endpoint, binary version and startup ownership. It is not itself sufficient authentication. A second desktop/CLI process verifies and attaches to the live instance; a stale descriptor never authorizes PID killing or database writes.
 
-Support explicit `desktop_owned`, `service_owned`, and `remote` attachment modes. Only the actor that owns a local process may terminate it through local lifecycle controls. Closing a desktop window does not stop a service-owned or remote server. “Quit Motion” clearly distinguishes closing the UI from stopping the local server and its active viewers.
+Support explicit `desktop_owned`, `service_owned`, and `remote` attachment modes. Only the owner may terminate a local server through local lifecycle controls. Closing a window does not stop a service-owned or remote server. “Quit Motion” distinguishes closing UI, stopping the optional presentation-only helper, and stopping the authoritative local server and active viewers.
 
-Server startup sequence: acquire ownership; validate paths/config; verify binaries/assets; complete migration/recovery; initialize services; publish readiness; accept viewers. Shutdown: stop admission; fence deliveries; flush accepted state/effects; terminate/reap owned executions; close resources; retire descriptor/ownership. Deadlines never justify reporting live workers as dead.
+Server startup: acquire ownership; validate paths/config; verify native tools and both UI/player asset trees; finish migration/recovery; initialize application services and Topcoat routing; publish readiness; accept viewers. Shutdown stops admission, fences deliveries, flushes accepted state/effects, terminates/reaps executions, and retires ownership. Render failure does not authorize initializing another database or restarting healthy encoders. A framework/bundle mismatch returns a diagnostic error before rendering partial incompatible UI.
 
-### 15.4 Packaging and updates
+### 15.4 Packaging and coordinated updates
 
-One full installer includes native server/terminal tools, Electron, frontend, matching Demuxe providers, FFmpeg/FFprobe, notices, and a release manifest. No Python, pip, cargo, Node development server, or manually managed Catabolic process is required to run it. Headless packages exclude the GUI components.
+The full installer includes the Rust server with Topcoat render code, Go terminal tool, matching UI/bridge/Demuxe assets, FFmpeg/FFprobe, Electron, notices and release manifest. The M5 offline feature additionally includes the small Rust presentation-only executable. No Python/Catabolic runtime, Rust compiler, package-manager setup or frontend development server is required. Headless packages omit Electron and the offline presentation helper, not the ordinary browser renderer.
 
-Sign/notarize installers where applicable; verify update signatures and exact artifacts before execution. Coordinate server, frontend, protocol, tool and schema compatibility. Do not auto-update one embedded component independently unless the declared manifest compatibility range and qualification allow it. Retain a rollback package and verified database/asset backup; restoring a backup is not a general schema downgrade.
+Sign/notarize where applicable and verify update signatures and complete manifest before execution. Coordinate server, Topcoat binary/bundle, browser bridge, public contract, native tools and schema compatibility. Browser reload/reconnect after a UI update must retire old UI protocol state while preserving canonical viewing state. Do not independently update Topcoat's client runtime or substitute a newer npm Demuxe archive under old qualification receipts.
 
-Launch targets are macOS arm64 local desktop/server and Linux x86_64 headless server, each gated by tests. Windows and additional architectures are separate build/qualification milestones. This target list is not a claim the new packages already exist.
+Retain a compatible rollback package and verified database/asset backup. A source code UI change alone should not migrate the catalog schema. Launch targets remain macOS arm64 local desktop/server and Linux x86_64 headless; Windows and other architectures require their own adapter/build/media evidence. Rust 1.98 is the inspected Topcoat source's minimum, not evidence that any new Motion package has been built. [T2]
 
 ## 16. Offline, TV, music, photos, and further parity
 
@@ -683,7 +750,11 @@ Launch targets are macOS arm64 local desktop/server and Linux x86_64 headless se
 
 A download is a device-owned demand for exact media plus selected subtitles, artwork and metadata. The manifest pins timeline/source revisions, file sizes and checksums. The client owns local transfer staging, resume, quotas, verified completion and deletion; the server owns authorization and optional durable preparation. Do not call a downloaded source URL a complete offline feature.
 
-The first offline client is desktop, using a private managed asset store; browser offline follows only after storage quota/eviction and lifecycle testing. Offline local data is a cache plus unsynchronized events, not a second authoritative media catalog. It may have its own local storage engine without violating the single server database decision.
+The first offline client is desktop, using a private managed asset store. A remote server-rendered page cannot supply new HTML while its server is unreachable, and upstream static export is still roadmap work. Therefore M5 includes an explicit `motion-ui-host`: a small local Rust/Topcoat presentation executable sharing download/player view components, backed only by `OfflinePresentationReader`, verified download manifests and local event storage. Cold-start it in airplane mode; do not count an already-open remote page as offline support. [T1]
+
+The helper is a **client cache adapter**, not a second authoritative server. It has no access to `motion.sqlite`, source roots, provider matching, migrations, FFmpeg execution, or live catalog mutation. It exposes a bounded client-local presentation/cache transport under its own protected origin, not a fake `/api/v2` server. Host bootstrap and exact managed-file tickets limit access; no arbitrary filesystem URL is accepted. Start it only after explicit Downloads/offline selection, never automatically create a new library when remote access fails. A12 owns process/origin lifecycle, A13 cache/events and A11 reusable Topcoat views.
+
+Browser offline remains separately gated on storage eviction, caching and lifecycle. Local desktop online-mode pages can work without internet when the local authoritative server is running; that is not equivalent to remote-server-disconnected cold-start playback. Offline data may use a local cache database but remains a cache plus unsynchronized events, not another canonical media catalog.
 
 Each offline event carries device sequence, event ID, timeline revision, base viewing revision and base manual epoch. Exact duplicates are idempotent. Per-device order is required; clocks are recorded but not used as global authority. Apply progress to current state only when it is causally compatible and no newer manual action/session has precedence. Otherwise retain history and return `history_only` with the current state. A long offline rewatch may validly move backward in its own sequence; do not reduce all progress to a maximum timestamp or maximum position.
 
@@ -697,7 +768,7 @@ Client/receiver sessions need capabilities, pairing, controller permissions, que
 
 ### 16.3 Music
 
-A15 builds artist/album/album-artist/disc/track relationships, compilations, embedded tags, album art, favorites/ratings, persistent queues, shuffle/repeat, loudness policy, and listening history. Background/offline listening, gapless transitions and output fidelity need audio-specific qualification. Do not treat playing an MP3 in the movie player as music parity.
+A15 builds artist/album/album-artist/disc/track relationships, compilations, embedded tags, album art, favorites/ratings, persistent queues, shuffle/repeat, loudness policy, and listening history, using shared Topcoat view components and the browser playback bridge. Background/offline listening, gapless transitions and output fidelity need audio-specific qualification. Do not treat playing an MP3 in the movie player as music parity.
 
 Generic catalog, assets, queues and viewing primitives are reused; dedicated queries and listening semantics receive explicit contract additions. Preserve potentially different recording, release, track and physical-file identities. Music-specific analysis is low-priority work under the global coordinator.
 
@@ -748,7 +819,11 @@ Run the frozen Python reference during development where practical and separatel
 
 Statelessness `WithOracle` can compare an independent event ledger/reference implementation with observed production transitions. Do not derive the oracle from the very reducer it is checking. If observing a transition already executed at runtime, do not execute it again just to record it. [S1]
 
-### 17.4 Verification ownership
+### 17.4 Presentation and playback ownership checks
+
+Add bounded client-controller properties such as `ui.stale_render_cannot_replace_player`, `ui.prefetch_has_no_domain_effect`, `ui.server_switch_retires_old_owner` and `ui.offline_cache_cannot_mutate_catalog`. These are Motion controller policies, not a rewrite of Topcoat's DOM runtime or Demuxe's decoder reducers. Model outputs and ownership epochs where useful; **only actual browser tests** establish DOM retention, CSP behavior, focus, audible continuity and worker disposal. Keep framework test evidence distinct from Motion integration receipts.
+
+### 17.5 Verification ownership
 
 A05 owns shared corpus formats, model scaffolding, oracle helpers and cross-system campaigns. Every implementation team owns its own production invariants and tests. The verification team must not become a separate owner of a second set of business rules.
 
@@ -790,7 +865,13 @@ Old numeric metadata revisions remain mapped; file revision strings and old rang
 
 Security is not frozen at an unsafe boundary: once restricted mode is enabled, v1 routes apply the same effective authorization as v2. Existing unauthenticated clients may need pairing under that mode; document the intentional change rather than preserving a bypass.
 
-### 18.5 Failure and rollback
+### 18.5 Frontend cutover without a catalog rewrite
+
+Implement `motion-ui` and its authorized query facade against the existing application ports first. Serve the new Topcoat routes behind an explicit rollout gate while retained UI fixtures provide a behavior baseline. A disposable test deployment may compare both presentation implementations; there is still one domain writer. Switch ordinary web/desktop entry URLs to Topcoat only after auth, asset/CSP, media ownership and cross-surface tests pass. Retire React/Vite application dependencies after affected screens and native lifecycle behavior are covered, not before.
+
+Do not replace Motion's database layer with Toasty, change public wire schemas, or rewrite Demuxe to make Topcoat adoption appear complete. Preserve old compatible API clients. A rollback must restore a matching binary, Topcoat bundle, browser bridge and host manifest; a UI rollback does not authorize reversing a schema migration.
+
+### 18.6 Failure and rollback
 
 A failed upgrade restores the verified pre-upgrade database and compatible assets/binary. Do not assume old code can open a newer schema. Preserve both backup and migration receipt. Restore generates a fresh runtime/cursor epoch and revokes ephemeral deliveries/tickets; outstanding durable work reconciles before retry. No migration cleanup deletes original files.
 
@@ -810,12 +891,12 @@ The package contains [individual agent briefs](agents/README.md). Each agent rec
 | A05 | Statelessness/corpus; `motion-verification`, qualification models | Production transition contracts | Independent oracles, minimized replay traces, cross-workflow fault cases. |
 | A06 | Jobs/admission/process execution; `motion-work`, `motion-execution` | A00/A02 contracts | Native tree cleanup, stuck-worker accounting, durable publication and fairness. |
 | A07 | Viewing/delivery; `motion-playback`, relevant domain modules | A00/A01/A06 | Timeline state, generation changes, HLS before-complete, exact tracks, cleanup. |
-| A08 | HTTP/auth/events; `motion-server`, policy application modules | A00 ports | Real contract conformance, profile isolation, no v1/ticket/event bypass. |
+| A08 | HTTP/auth/events and Topcoat Tower mount; `motion-server`, policy modules | A00 ports, A11 render interface | API remains JSON; authorized HTML/fragments; no v1/ticket/event/SSR bypass or stream regression. |
 | A09 | Search/collections/queries/interchange; organization modules | A00/A01/A02 | Scoped counts, queues, saved filters, preview/apply import receipts. |
 | A10 | Go client; `apps/terminal` | A00 mock server/SDK shapes | CLI/TUI workflows, retry identity, cancellation, reconnect; no DB dependency. |
-| A11 | Shared TS app and Demuxe; `apps/web`, `packages/ui`, `packages/playback` | A00 mocks, A07 adapter contract | Real open/seek/switch/resume with exact assets; accessible complete screens. |
-| A12 | Desktop host; `apps/desktop`, `packages/host` | A00 connection/auth contract | One-app lifecycle, sandbox, credentials, native dialogs, packaged media proof. |
-| A13 | Offline and qualified external clients; offline modules/client cache | A00/A07/A08 | Verified offline media, causal history merge, early physical receiver proof. |
+| A11 | Topcoat Rust presentation + TS/Demuxe bridge; `motion-ui`, `packages/ui-bridge`, `packages/playback` | A00 presentation contract, A08 service bridge, A07 player contract | Authorized SSR, strict CSP, explicit DOM ownership, exact-asset playback and accessible screens. |
+| A12 | Electron/native host; `apps/desktop`, `packages/host`, M5 `motion-ui-host` process | A00 connection/auth contract, A11 views, A13 cache port | Same-origin local SSR; unprivileged remote HTML; native lifecycle and offline-host containment. |
+| A13 | Offline cache reader/events and qualified external clients | A00/A07/A08, A12 offline host | Offline cold-start Topcoat/download player, causal history merge, early physical receiver proof. |
 | A14 | Operations/release integration; packaging, CI, release manifests | All artifact owners | One-install, headless, signing, recovery, upgrade, inventory and qualification. |
 | A15 | Music/photos/personal media; dedicated feature modules | A01/A04/A09/A11 | Media-type-specific metadata, audio/visual lifecycle/privacy acceptance. |
 
@@ -823,9 +904,9 @@ A08 owns the HTTP adapter, not every service body. A01/A07/A06 own distinct subd
 
 ### 19.2 Parallelism and integration order
 
-**Wave 0:** A00, A01, A02 and A05 establish identities, ports, schema change protocol, and fixtures. A11/A12 run the exact Demuxe/shell proof; A13 investigates receiver reachability; A14 establishes clean package baselines.
+**Wave 0:** A00, A01, A02 and A05 establish identities, ports, schema change protocol, and fixtures. A08/A11/A12 run the exact Topcoat/Axum/CSP/Demuxe/shell proof; A13 investigates receiver reachability; A14 establishes clean package baselines.
 
-**Wave 1:** Once interface baseline 1 is committed, A03/A04/A06/A07/A08/A09 implement independently against ports; A10/A11/A12 build against schema-valid mocks. Mocks must identify themselves and cannot be counted as backend completion.
+**Wave 1:** Once interface baseline 1 is committed, A03/A04/A06/A07/A08/A09 implement independently against ports; A10/A11/A12 build against schema-valid API mocks and an authorized mock `UiQueryFacade`. Mocks must identify themselves and cannot be counted as backend completion.
 
 **Wave 2:** Integrate source -> scan -> logical browse -> direct play -> viewing state across real clients. Advance durable preparation and generation-based streaming with real FFmpeg.
 
@@ -847,19 +928,19 @@ The acceptance commands in briefs are **target commands to add** where the repos
 
 | Gate | Required outcome | Release-blocking checks |
 |---|---|---|
-| M0 — Contracts and proof | Final contract/version in repo, source fixtures, one schema owner, selected Demuxe/Electron media proof | No unresolved canonical ownership; no duplicate runtime catalog; source/asset mismatch fails clearly. |
+| M0 — Contracts and proof | Public/presentation contracts, Topcoat source/CLI/toolchain pin, Axum bridge and strict-CSP SSR/Demuxe/Electron proof | Known `new Function` runtime path excluded or separately reviewed; no JSON-to-HTML fallback, render side effects, auth bypass or asset mismatch. |
 | M1 — Rust catalog foundation | Motion-owned single DB, source/library split, identity/timelines, guarded scans, basic auth/v2, migration adapters | Incomplete scan cannot erase unseen media; migration/restore preserve IDs/history; restricted raw URLs fail. |
-| M2 — One-app vertical slice | Installer opens desktop; Go/TUI/browser see same catalog; original playback and ordered resume | No Python/Catabolic service; one server instance; clean machine install; cross-surface restart/resume. |
+| M2 — One-app vertical slice | Topcoat HTML works in browser/Electron; Go/TUI use unchanged API; original playback and ordered resume | One server instance; no React/Python/Catabolic product dependency; real strict-CSP local/remote rendering, ownership/disposal and clean install. |
 | M3 — Complete library and preparation | Matching/fix-match/NFO/artwork, search/organization, durable renditions and schedules | Curation survives scans; wrong match corrected; selected tracks retained; stale attempt rejected; no duplicate browse rows. |
 | M4 — Playback service | Uncached streaming conversion, generation seeks/switches, shared resource budget, selected subtitle/HDR policy | Playback begins before full encode; far seek works; cancel/source change/restart do not expose stale segments or leak capacity. |
-| M5 — Convenience/offline/client breadth | Markers/previews, managed offline, desktop polish, selected TV/cast workflows and advanced playback | Actual offline output and conflict merge; physical receiver route; exact audio/subtitle/display qualification. |
+| M5 — Convenience/offline/client breadth | Markers/previews, explicit cache-only Topcoat offline host, desktop polish, TV/cast and advanced playback | Cold-start offline without remote render service; no server DB/scanner access; conflict merge, physical receiver route and exact media output. |
 | M6 — Broader personal media/operations | Dedicated music/photos, scoped integrations/imports, supported platform expansion, parity ledger completion | Media-specific fidelity/privacy, signed upgrades/restore, documented exceptions; no broad parity claim with missing rows. |
 
 Milestones describe dependency and acceptance order, not delivery dates. A feature can be developed ahead against a contract, but cannot bypass prerequisite safety gates. Optional external/commercial/social work remains separately approved; “all M6 complete” does not imply those products exist.
 
 ### First integration demonstration
 
-For M2, install Motion on a clean target. Launch desktop, open the web client, and attach the TUI. Add a source/library through one surface, scan, inspect a discovered logical item, and see it elsewhere. Play a qualified original, change its supported tracks, stop, resume on another client, restart the server, and recover the same authoritative state. M3 extends this demonstration with automatic matching, correction and background conversion visible on all surfaces. No manual Python process, package-manager setup, second authoritative database, or private UI endpoint is allowed.
+For M2, install Motion on a clean target. Launch desktop, open the web client, and attach the TUI. Add a source/library through one surface, scan, inspect a discovered logical item, and see it elsewhere. Play a qualified original, change its supported tracks, stop, resume on another client, restart the server, and recover the same authoritative state. M3 extends this demonstration with automatic matching, correction and background conversion visible on all surfaces. No manual Python process, package-manager setup, second authoritative database, or private business endpoint is allowed. Topcoat HTML/presentation transports may exist, but the same domain outcomes must remain callable through the reviewed public API.
 
 ## 21. Qualification, operations, and release
 
@@ -867,7 +948,7 @@ For M2, install Motion on a clean target. Launch desktop, open the web client, a
 
 Use separate receipts for: pure unit tests; Statelessness models; persistence/filesystem/process integration; public HTTP contract; generated SDK builds; browser/player behavior; installed package; physical device/audio/HDR; and performance. A pass in one layer is not automatically transferred to another.
 
-Every receipt records Motion commit, schema level, contract digest, Statelessness/model versions where applicable, native tool hashes, Demuxe archive and enabled providers, browser/shell/OS/hardware, fixture IDs, network topology, commands, observed outcomes and limitations. A changed media provider or player archive invalidates affected previous qualification.
+Every receipt records Motion commit, schema level, contract digest, Statelessness/model versions where applicable, native tool hashes, Topcoat commit/CLI/toolchain and asset-bundle digest, selected presentation mode/CSP, Demuxe archive and enabled providers, browser/shell/OS/hardware, fixture IDs, network topology, commands, observed outcomes and limitations. A changed media provider or player archive invalidates affected previous qualification.
 
 ### 21.2 Required fault and behavior matrix
 
@@ -879,8 +960,9 @@ Every receipt records Motion commit, schema level, contract digest, Statelessnes
 | Process | Parent/child crash; orphan attempt; PID reuse; stdout/stderr flood; full disk; hung encoder; outdated completion; hard/soft budget evidence. |
 | Media | Original/range/conditions; remux; audio/video conversion; long/far seeks; track switching; subtitle render/burn; explicit HDR behavior. |
 | Access | Restricted profile guessing; list/facet/count leak; media HEAD; sidecar/artwork; HLS child URLs; expired ticket; stale v1 path; CSRF and origin. |
-| Client | CLI JSON/exit codes; TUI cancellation/reconnect; web focus/accessibility; desktop sandbox/lifecycle; real media open/fallback/dispose. |
-| Offline | Partial download; checksum mismatch; quota; device restart; disconnected playback; reconnect after manual override; revoked credentials. |
+| Client | CLI JSON/exit codes; TUI reconnect; Topcoat HTML focus/accessibility; sandboxed local/remote desktop; real media ownership/fallback/disposal. |
+| Topcoat | Axum streaming/404 isolation; strict CSP and excluded eval runtime; no render/prefetch mutations; anonymous fragment requests; input restoration; matching bundle; retired player callbacks; SSR query parity. |
+| Offline | Partial transfer/checksum/quota; offline cold-start local Topcoat renderer; blocked server DB/arbitrary paths; cache namespace; reconnect after manual override and revoke. |
 | Operations | Clean install; relocated package; service attach; incompatible component; signed update rejection; supported rollback/restore. |
 | Personal media | Music album/disc/compilation ordering; gapless/background audio; photo orientation/time/GPS policy; personal video without matching. |
 
@@ -898,7 +980,13 @@ A backup includes database snapshot, schema/contract/build versions, configurati
 
 Restore into a new destination, validate integrity/references/assets, establish a fresh epoch, and only then switch the active installation. Test actual restore before claiming backup support. Restoring a snapshot does not make missing NAS files reappear.
 
-### 21.5 Observability and privacy
+### 21.5 Topcoat build and integration gates
+
+Before advertising the new frontend, compile the actual locked Topcoat/Axum composition on launch targets and validate runtime asset collection. Upstream's inspected minimum is Rust 1.98; record the exact chosen compiler, CLI and crate revisions instead of a floating `latest` install. Package from a clean, versioned UI source and retain license attribution for edited vendored components. [T2] [T4]
+
+Run [TC01–TC20](qualification/TOPCOAT_ACCEPTANCE.md) as applicable to the milestone. They include HTTP/media body preservation, scoped HTML auth, CSP, optional runtime endpoint gating, prefetch purity, lifecycle, remote sandboxing, offline cold start, reproducible assets and load isolation. A known CSP-incompatible enhancement is `blocked`, not `passed` because basic SSR works. DOM/video/audio and physical platform tests require a browser/host; static schema checks cannot satisfy these gates.
+
+### 21.6 Observability and privacy
 
 Expose active deliveries, actual selected routes, reasons, selected components, measured transfer/stall counters, attempts, reservations, queue age, source health and disk pressure. Unknown CPU/hardware/throughput observations stay unknown. Logs are bounded and redacted; diagnostic bundles require explicit export. Paths, title history, credentials and metadata may be sensitive.
 
@@ -908,7 +996,7 @@ The server health endpoint means process liveness; readiness and per-feature cap
 
 | Risk | Mitigation and stop condition |
 |---|---|
-| Repeated architectural reversals | D01-D12 are binding for this version. New Catabolic integration/rewrite/PyPI work requires a separate proposal, not an agent side quest. |
+| Repeated architectural reversals | D01-D14 are binding for this revision. Topcoat replaces frontend authoring only; catalog, API and native-host decisions do not silently change. |
 | Porting only happy paths | Reference register, negative fixtures, partial coverage, journals and actual crash tests. No deletion of old writer before migration proof. |
 | Timeline corruption | Explicit cuts/order domains, recoverable legacy history, no inferred position equivalence. |
 | Duplicate rule implementations | Shared production reducers; one catalog and one job/FFmpeg execution infrastructure; API clients own no business policy. |
@@ -918,10 +1006,15 @@ The server health endpoint means process liveness; readiness and per-feature cap
 | Event/security race | Transactional events, scoped cursor epochs, reset/overlap resync, revocation before cached response disclosure. |
 | Product scope disappearing during rewrite | All original G01-G45 items mapped to owners/gates or explicit exclusions in the parity ledger. |
 | Catabolic/Motion divergence | Pin selected reference scenarios and record intended differences; do not imply ongoing automatic parity with all upstream behavior. |
+| Experimental Topcoat APIs/toolchain | Pin source/CLI/asset bundle and Rust >=1.98; scope framework types to presentation; compile/qualification before upgrades. |
+| CSP conflict from runtime eval | Ship strict-CSP SSR/external modules; reactive runtime remains blocked until a reviewed compatible implementation or explicit security ADR. |
+| HTML morph destroys active player | Keep player DOM outside mutable regions; ownership/disposal protocol and real identity/worker/audio tests. No inferred island support. |
+| SSR obscures API/authorization | Same authorized query use cases, public mutations, independently protected fragments; no direct SQL in components or private business-only RPC. |
+| Remote/offline desktop regression | Unprivileged remote content, same-origin sessions, explicit offline presentation-only host; cold-start tests instead of cached-page claims. |
 
 A module is complete only when its owned behavior, public/internal contract, persistence/recovery, authorization, user surface where applicable, and negative tests are present. A release capability is qualified only on its named delivered matrix. A finalized design document does not certify an implementation.
 
-**Final acceptance statement:** Motion is one installed product with a Motion-owned Rust catalog and media server, one authoritative SQLite database, one public API, supervised native media workers, shared TypeScript/Demuxe presentation, Go terminal clients, and a thin Electron host. Catabolic remains a separate reference project. Statelessness exercises actual production transitions. The full personal-media goal remains visible and testable throughout the migration.
+**Final acceptance statement:** Motion is one installed product with a Motion-owned Rust catalog/media server, one authoritative SQLite database, one public application API, supervised native media workers, shared Rust-authored Topcoat HTML, a small TypeScript/Demuxe browser bridge, Go terminal clients and a thin Electron host. Topcoat does not replace the native host or codec engine. Catabolic remains a reference only; Statelessness exercises production transitions. Offline rendering and optional framework reactivity have explicit gates rather than implied support. The full personal-media goal remains visible and testable.
 
 ## 23. Sources and accompanying artifacts
 
@@ -939,6 +1032,11 @@ A module is complete only when its owned behavior, public/internal contract, per
 | `qualification/DOCUMENT_VALIDATION.json` | Checks actually run on this deliverable and their limitations. |
 | `validate_design.py`, `validation_requirements.txt` | Reproducible static contract/package checks and pinned validator dependencies; not a Motion runtime test. |
 | `SHA256SUMS` | Integrity inventory for the delivered bundle. |
+| `research/TOPCOAT_RESEARCH.md` | Source-pinned framework findings, suitability, limitations and implementation disposition. |
+| `contracts/TOPCOAT_PRESENTATION_CONTRACT.md` | Internal presentation/query/browser ownership and origin contracts; not another public domain API. |
+| `qualification/TOPCOAT_ACCEPTANCE.md` / `.json` | TC01–TC20 target cases, owners and current unexecuted status. |
+| `qualification/TOPCOAT_REVISION_VALIDATION.json` | Actual static revision/API-preservation/package checks. |
+| `CHANGELOG_TOPCOAT.md`, `validate_topcoat_revision.py` | Change scope and reproducible revision-specific document checks. |
 
 ### 23.2 Source notes
 
@@ -966,3 +1064,14 @@ Repository facts are pinned below. Prior comparisons are used as a requirements 
 [W9]: https://www.electronjs.org/docs/latest/tutorial/security
 [W10]: https://www.sqlite.org/backup.html
 [R1]: qualification/PARITY_LEDGER.md
+
+[T1]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/README.md
+[T2]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/Cargo.toml
+[T3]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/crates/topcoat-router/docs/tower.md
+[T4]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/crates/topcoat/Cargo.toml
+[T5]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/docs/runtime.md
+[T6]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/docs/runtime/shard.md
+[T7]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/crates/topcoat-runtime/browser/src/expression/compile.ts
+[T8]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/script-src
+[T9]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/docs/runtime/link.md
+[T10]: https://github.com/tokio-rs/topcoat/blob/341f3ff2fe16a73af5469685cf597693af5acb25/llms.txt

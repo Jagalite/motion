@@ -148,3 +148,33 @@ events, failure interleavings, and exact effect identities/counts. Real integrat
 tests must separately prove transaction atomicity, durable effect ordering,
 filesystem recovery, and process ownership. This import changes no behavior and
 therefore adds no new reducer or model claim.
+
+## Design 1.1.0: Topcoat presentation (adopted October 9, 2026)
+
+The supplied Topcoat revision is now the official design, replacing the
+React/Vite application decision:
+
+- [Architecture and implementation plan](Motion_Final_Architecture_and_Implementation_Plan.md),
+  revision "Topcoat frontend adoption" (sha256 `4b6e4d87…5d0e`).
+- [OpenAPI v2 contract](contracts/Motion_Server_API_v2.yaml) (sha256
+  `cd4100be…cfa0`). The only change from 1.0.0 is the non-wire annotation
+  `x-design-version: 1.1.0`; paths, operations and schemas are unchanged.
+- [Topcoat research](research/TOPCOAT_RESEARCH.md) (sha256 `00bce317…5be7`).
+
+Bytes are imported as supplied. The sections of this review above describe
+the 1.0.0 import and remain valid except where they name React/Vite.
+
+The plan links to companion artifacts that were not supplied and are absent:
+`CHANGELOG_TOPCOAT.md`, `contracts/TOPCOAT_PRESENTATION_CONTRACT.md`,
+`qualification/TOPCOAT_ACCEPTANCE.md` (TC01–TC20) and
+`qualification/TOPCOAT_REVISION_VALIDATION.json`. As with the earlier
+missing companions, obtain them or author explicitly labelled replacements;
+do not infer TC01–TC20 from the plan text alone.
+
+The React/TypeScript A11/A12 work started against design 1.0.0 is
+discarded from the active line. It is preserved, unmerged, on branch
+`archive/a11-a12-react-typescript` for reference only. Note that design
+1.1.0 still assigns A11 a small external TypeScript bridge and the playback
+coordinator (`packages/ui-bridge`, `packages/playback`) and A12 the Electron
+host; those must be rebuilt against the Topcoat presentation contract
+rather than revived wholesale.
