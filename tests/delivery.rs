@@ -30,6 +30,9 @@ fn tools_available() -> bool {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_storage(Default::default()).await
+    }
+    async fn with_storage(storage: playscale::storage::Settings) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter("playscale=debug")
@@ -65,7 +68,7 @@ impl Fixture {
             jobs: Arc::new(Mutex::new(())),
             streams: Arc::new(Semaphore::new(4)),
             event_streams: Arc::new(Semaphore::new(2)),
-            storage: Arc::new(playscale::storage::Runtime::new(state, Default::default())),
+            storage: Arc::new(playscale::storage::Runtime::new(state, storage)),
             processing: Arc::new(processing),
         };
         playscale::delivery::recover(&app).await.unwrap();
@@ -431,5 +434,83 @@ async fn hls_plays_before_completion_switches_generations_and_releases_workers()
     })
     .await
     .expect("delivery workers were not released");
+    f.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generation_without_disk_headroom_fails_and_releases_capacity() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    // A floor no volume can satisfy: preparation refuses to start the encoder.
+    let f = Fixture::with_storage(playscale::storage::Settings {
+        min_free_bytes: i64::MAX as u64,
+        ..Default::default()
+    })
+    .await;
+    let source = f.dir.path().join("media/clip.mkv");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=12",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let (status, created) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(
+                json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":null}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    // Failed, then forgotten once nothing remains: either observation is final.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) = f
+                .json("GET", &format!("/api/v1/deliveries/{id}"), None)
+                .await;
+            if status == StatusCode::NOT_FOUND {
+                break;
+            }
+            if body["status"] == "failed" {
+                assert_eq!(body["active"], Value::Null, "{body}");
+                break;
+            }
+            assert_ne!(body["status"], "ready", "{body}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("delivery did not fail");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("capacity was not released");
     f.stop.cancel();
 }
