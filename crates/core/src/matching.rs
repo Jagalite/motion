@@ -414,3 +414,40 @@ pub fn attachment(file_item: &str, target_item: &str, versions_in_file_item: usi
         Attachment::SplitRequired
     }
 }
+
+/// Fix-match: reopen a decided proposal for a new decision. Only the exact
+/// reviewed revision of an accepted or rejected proposal for the file's
+/// current revision may reopen; the prior decision is kept in history by the
+/// caller's audit trail, not replayed.
+pub fn reopen(
+    proposal: &Proposal,
+    expected_revision: u64,
+    current_file_revision: Option<&str>,
+) -> Result<Proposal, MatchError> {
+    if !decided(proposal.status) {
+        return Err(MatchError::StaleProposal);
+    }
+    if expected_revision != proposal.revision {
+        return Err(MatchError::StaleProposal);
+    }
+    if current_file_revision != Some(proposal.file_revision.as_str()) {
+        return Err(MatchError::FileChanged);
+    }
+    let mut next = proposal.clone();
+    next.revision = proposal
+        .revision
+        .checked_add(1)
+        .ok_or(MatchError::RevisionExhausted)?;
+    next.status = initial_status(&proposal.candidates);
+    next.decision = None;
+    Ok(next)
+}
+
+/// Unmatch releases a manual pin; contributions stay as evidence and the
+/// work becomes eligible for automatic identity again.
+pub fn unmatch(state: MatchState) -> MatchState {
+    match state {
+        MatchState::Manual | MatchState::Matched | MatchState::Ambiguous => MatchState::Unmatched,
+        MatchState::Unmatched => MatchState::Unmatched,
+    }
+}

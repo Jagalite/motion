@@ -10,6 +10,7 @@ pub mod encoding;
 pub mod events;
 pub mod libraries;
 pub mod maintenance;
+pub mod markers;
 pub mod matching;
 pub mod media;
 pub mod metadata;

@@ -7,6 +7,7 @@ pub mod events;
 pub mod identity;
 pub mod jobs;
 pub mod maintenance;
+pub mod markers;
 pub mod matching;
 pub mod metadata;
 pub mod nfo;

@@ -148,6 +148,7 @@ fn inventory(
     let mut out = Inventory::default();
     let mut pending = vec![PathBuf::new()];
     let mut first = true;
+    let mut subtitle_count = 0usize;
     while let Some(relative) = pending.pop() {
         anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
         let Some(name) = key(&relative) else {
@@ -197,14 +198,18 @@ fn inventory(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if kind.is_file() && SUBTITLES.contains(&extension.as_str()) {
-                if let (Some(file), Ok(meta)) =
-                    (child.file_name().and_then(|n| n.to_str()), entry.metadata())
-                    && out.subtitles.values().map(Vec::len).sum::<usize>() < FILE_LIMIT
-                {
-                    out.subtitles
-                        .entry(name.clone())
-                        .or_default()
-                        .push((file.to_string(), fingerprint(&meta)));
+                // An unobservable sidecar leaves its directory unproven, so
+                // previously recorded sidecars there are retained.
+                match (child.file_name().and_then(|n| n.to_str()), entry.metadata()) {
+                    _ if subtitle_count >= FILE_LIMIT => reason = Some("file_limit"),
+                    (Some(file), Ok(meta)) => {
+                        subtitle_count += 1;
+                        out.subtitles
+                            .entry(name.clone())
+                            .or_default()
+                            .push((file.to_string(), fingerprint(&meta)));
+                    }
+                    _ => reason = Some("unreadable_entry"),
                 }
                 continue;
             }
@@ -693,6 +698,7 @@ async fn finish(
                 &file_id,
                 &file_relative,
                 &inventory.subtitles,
+                &inventory.complete,
             )
             .await?;
         }

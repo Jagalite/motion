@@ -11,21 +11,26 @@ pub(crate) async fn publish_sidecars(
     file: &str,
     relative: &str,
     subtitles: &BTreeMap<String, Vec<(String, String)>>,
+    complete: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<()> {
     let dir = playscale_core::scan::parent(relative);
     let stem = std::path::Path::new(relative)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    sqlx::query("DELETE FROM sidecar_subtitles WHERE file_id=?")
-        .bind(file)
-        .execute(&mut *conn)
-        .await?;
+    // The previous set is replaced only when the directory was listed
+    // completely; otherwise unproven sidecars are retained.
+    if complete.contains(dir) {
+        sqlx::query("DELETE FROM sidecar_subtitles WHERE file_id=?")
+            .bind(file)
+            .execute(&mut *conn)
+            .await?;
+    }
     for (name, fingerprint) in subtitles.get(dir).into_iter().flatten() {
         let Some(sidecar) = core::sidecar_subtitle(stem, name) else {
             continue;
         };
-        sqlx::query("INSERT INTO sidecar_subtitles VALUES (?,?,?,?,?,?,?)")
+        sqlx::query("INSERT OR REPLACE INTO sidecar_subtitles VALUES (?,?,?,?,?,?,?)")
             .bind(file)
             .bind(name)
             .bind(fingerprint)
@@ -48,7 +53,9 @@ pub async fn timeline_components(
 ) -> anyhow::Result<Vec<Component>> {
     let mut tx = db.begin().await?;
     let bound: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT v.id,b.file_id,b.file_revision,f.tracks_json FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? ORDER BY v.id,b.part",
+        // Evidence only from an occurrence holding the pinned (reviewed)
+        // revision: the bound file if unchanged, else a copy with that content.
+        "SELECT v.id,o.id,b.file_revision,o.tracks_json FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN media_files o ON o.id=coalesce((SELECT f.id FROM media_files f WHERE f.id=b.file_id AND f.revision=b.file_revision),(SELECT f.id FROM media_files f WHERE f.revision=b.file_revision ORDER BY f.available DESC,f.id LIMIT 1)) WHERE v.timeline_id=? ORDER BY v.id,b.part",
     )
     .bind(timeline)
     .fetch_all(&mut *tx)

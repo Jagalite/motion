@@ -25,6 +25,7 @@ applying any pending migration to an existing database.
 | 0023 | `0023_structure.sql` | A01 | order groups, item relationships, multi-episode bindings |
 | 0024 | `0024_sidecar_subtitles.sql` | A04 | sidecar subtitle observations |
 | 0025 | `0025_structure_events.sql` | A01/A09 | relationship update revisions; organization delete events |
+| 0026 | `0026_markers.sql` | A04 | timeline markers |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

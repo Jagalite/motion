@@ -1413,3 +1413,196 @@ async fn split_hands_the_nfo_identity_to_the_files_new_work() {
         [(split.new_item.clone(), Some("tmdb:77".to_string()))]
     );
 }
+
+#[tokio::test]
+async fn fix_match_unmatch_and_manual_identification() {
+    let f = Fixture::new().await;
+    f.write("Heat.1995.mkv", b"heat");
+    f.scan().await;
+    sqlx::query(
+        "INSERT INTO item_structure (item_id,media_type) SELECT item_id,'movie' FROM catalog_files",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    seed_target(&f, "heat", "Heat", 1995).await;
+    let (file, ..) = f.file("Heat.1995.mkv").await;
+    let proposal = matching::propose(&f.app, &file).await.unwrap();
+    let rejected = matching::decide(&f.app, &proposal.id, proposal.revision, Decision::Reject)
+        .await
+        .unwrap()
+        .proposal;
+    // Stale reopen is refused; the reviewed revision reopens for a new decision.
+    assert!(
+        matching::reopen(&f.app, &proposal.id, proposal.revision)
+            .await
+            .is_err()
+    );
+    let reopened = matching::reopen(&f.app, &proposal.id, rejected.revision)
+        .await
+        .unwrap();
+    assert_eq!(reopened.status, Status::Pending);
+    let candidate = reopened.candidates[0].id.clone();
+    let decided = matching::decide(
+        &f.app,
+        &proposal.id,
+        reopened.revision,
+        Decision::Accept {
+            candidate_id: candidate,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(decided.item_id, "heat");
+    // Manual identity: a different pinned identity requires unmatch first.
+    matching::identify_manually(&f.app, "heat", "tmdb:movie", "949")
+        .await
+        .unwrap();
+    assert!(matches!(
+        matching::identify_manually(&f.app, "heat", "tmdb:movie", "1").await,
+        Err(matching::MatchingError::IdentityTaken)
+    ));
+    matching::unmatch(&f.app, "heat").await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id='heat'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(state, "unmatched");
+    matching::identify_manually(&f.app, "heat", "tmdb:movie", "1")
+        .await
+        .unwrap();
+    let external: Option<String> = sqlx::query_scalar(
+        "SELECT external_id FROM metadata_documents WHERE item_id='heat' AND source='tmdb'",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(external.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn markers_are_fenced_on_the_timeline_and_resolved_by_provenance() {
+    use playscale_core::markers::{Kind, Provenance};
+    let f = Fixture::new().await;
+    work(&f, "film", "Film", 2000).await;
+    sqlx::query("UPDATE timelines SET duration_ms=6000000 WHERE id='film-ed'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let detected = playscale::markers::create(
+        &f.app,
+        "film-ed",
+        1,
+        playscale::markers::NewMarker {
+            kind: Kind::Intro,
+            start_ms: 5_000,
+            end_ms: Some(60_000),
+            label: None,
+            provenance: Provenance::Detected,
+        },
+    )
+    .await
+    .unwrap();
+    let manual = playscale::markers::create(
+        &f.app,
+        "film-ed",
+        1,
+        playscale::markers::NewMarker {
+            kind: Kind::Intro,
+            start_ms: 4_000,
+            end_ms: Some(61_000),
+            label: Some("Intro"),
+            provenance: Provenance::Manual,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        playscale::markers::create(
+            &f.app,
+            "film-ed",
+            0,
+            playscale::markers::NewMarker {
+                kind: Kind::Credits,
+                start_ms: 1,
+                end_ms: Some(2),
+                label: None,
+                provenance: Provenance::Manual
+            }
+        )
+        .await
+        .is_err(),
+        "stale timeline revision"
+    );
+    assert!(
+        playscale::markers::create(
+            &f.app,
+            "film-ed",
+            1,
+            playscale::markers::NewMarker {
+                kind: Kind::Credits,
+                start_ms: 5_900_000,
+                end_ms: Some(7_000_000),
+                label: None,
+                provenance: Provenance::Manual
+            }
+        )
+        .await
+        .is_err(),
+        "outside the timeline"
+    );
+    let effective = playscale::markers::list(&f.app.db, "film-ed", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        effective.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        std::slice::from_ref(&manual)
+    );
+    assert_eq!(
+        playscale::markers::list(&f.app.db, "film-ed", false)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    playscale::markers::delete(&f.app, &manual, 1)
+        .await
+        .unwrap();
+    let effective = playscale::markers::list(&f.app.db, "film-ed", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        effective[0].id, detected,
+        "the detected marker becomes effective"
+    );
+}
+
+#[tokio::test]
+async fn replaced_files_do_not_supply_component_evidence() {
+    let f = Fixture::new().await;
+    f.write("show.mkv", b"reviewed bytes");
+    f.write("show.de.srt", b"untertitel");
+    f.scan().await;
+    let (file, _, _, edition) = f.file("show.mkv").await;
+    assert_eq!(
+        playscale::components::timeline_components(&f.app.db, &edition)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // Replace the bound file: the version still pins the reviewed revision,
+    // which no occurrence holds any more.
+    f.write("show.mkv", b"replacement bytes");
+    f.scan().await;
+    sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+        .bind(json!([{"index":1,"kind":"audio","codec":"aac","language":"fra"}]).to_string())
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let components = playscale::components::timeline_components(&f.app.db, &edition)
+        .await
+        .unwrap();
+    assert!(components.is_empty(), "{components:?}");
+}

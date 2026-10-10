@@ -89,10 +89,16 @@ fn key(o: &Observed) -> (Kind, Option<String>, Roles, Option<String>) {
 /// one version, the n-th track with a key is component ordinal n; the same
 /// ordinal in another version is another occurrence of that component.
 pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component> {
-    let mut components: BTreeMap<(Kind, Option<String>, Roles, Option<String>, u32), Component> =
-        BTreeMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut components: BTreeMap<
+        (Kind, Option<String>, Roles, Option<String>, u32),
+        Component,
+    > = BTreeMap::new();
     for (version, tracks) in versions {
-        let mut seen: BTreeMap<(Kind, Option<String>, Roles, Option<String>), u32> =
+        // Ordinals count same-key tracks within one file, so each part of a
+        // multipart version continues the same components.
+        #[allow(clippy::type_complexity)]
+        let mut seen: BTreeMap<(Id, Kind, Option<String>, Roles, Option<String>), u32> =
             BTreeMap::new();
         let mut ordered: Vec<&Observed> = tracks.iter().collect();
         ordered.sort_by(|a, b| {
@@ -106,7 +112,15 @@ pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component
         for track in ordered {
             let k = key(track);
             let ordinal = {
-                let n = seen.entry(k.clone()).or_insert(0);
+                let n = seen
+                    .entry((
+                        track.file_id.clone(),
+                        k.0,
+                        k.1.clone(),
+                        k.2.clone(),
+                        k.3.clone(),
+                    ))
+                    .or_insert(0);
                 *n += 1;
                 *n
             };
@@ -178,10 +192,9 @@ pub fn sidecar_subtitle(media_stem: &str, file_name: &str) -> Option<SidecarSubt
         match token.to_ascii_lowercase().as_str() {
             "forced" => out.roles.forced = true,
             "sdh" | "cc" | "hi" => out.roles.hearing_impaired = true,
-            other if out.language.is_none() => match normalize_language(Some(other)) {
-                Some(lang) if lang.len() <= 8 => out.language = Some(lang),
-                _ => return None,
-            },
+            other if out.language.is_none() => {
+                out.language = Some(normalize_language(Some(other))?)
+            }
             _ => return None,
         }
     }
@@ -221,6 +234,26 @@ mod tests {
         ];
         let c = derive("t", &[("v1".into(), v1), ("v2".into(), v2)]);
         assert_eq!(c.len(), 3, "main, second main (ordinal 2), commentary");
+        // A two-part version with one English track per part is one component.
+        let parts = derive(
+            "t",
+            &[(
+                "multi".into(),
+                vec![
+                    track("p1", 1, Kind::Audio, "en", Roles::default()),
+                    track("p2", 1, Kind::Audio, "en", Roles::default()),
+                ],
+            )],
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].occurrences.len(), 2);
+        assert_eq!(
+            sidecar_subtitle("Movie", "Movie.zh-Hant-TW.srt")
+                .unwrap()
+                .language
+                .as_deref(),
+            Some("zh-hant-tw")
+        );
         let main = c
             .iter()
             .find(|c| !c.roles.commentary && c.ordinal == 1)
