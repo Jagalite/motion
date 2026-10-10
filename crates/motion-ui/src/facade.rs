@@ -202,6 +202,8 @@ pub struct ScanRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourcesView {
+    /// A missing scan API must not appear as an empty scan history.
+    pub scans_available: bool,
     pub sources: Vec<SourceRow>,
     pub libraries: Vec<LibraryCard>,
     pub scans: Vec<ScanRow>,

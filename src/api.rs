@@ -771,6 +771,9 @@ pub fn router_with(
                 )
             }),
         );
+    if presentation.is_some() {
+        router = router.merge(motion_ui::asset_router());
+    }
     if presentation.is_none() {
         router = router.route(
             "/",

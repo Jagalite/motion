@@ -316,6 +316,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 return Err(UiError::Denied);
             }
             Ok(SourcesView {
+                scans_available: true,
                 sources: vec![SourceRow {
                     id: "src1".into(),
                     name: "Movies disk".into(),

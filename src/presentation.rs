@@ -335,8 +335,33 @@ impl UiQueryFacade for Queries {
     fn profiles<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<ProfilesView>> {
         Box::pin(async { Err(UiError::Unavailable) })
     }
-    fn sources<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<SourcesView>> {
-        Box::pin(async { Err(UiError::Unavailable) })
+    fn sources<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<SourcesView>> {
+        Box::pin(async move {
+            if !who.can("sources:manage") {
+                return Err(UiError::Denied);
+            }
+            Ok(SourcesView {
+                sources: self
+                    .complete_list("/sources?limit=200")
+                    .await?
+                    .iter()
+                    .map(|v| SourceRow {
+                        id: text(v, "id"),
+                        name: text(v, "name"),
+                        root_path: text(v, "root_path"),
+                        availability: availability(v),
+                    })
+                    .collect(),
+                libraries: self
+                    .complete_list("/libraries?limit=200")
+                    .await?
+                    .iter()
+                    .map(library)
+                    .collect(),
+                scans_available: false,
+                scans: vec![],
+            })
+        })
     }
     fn matches<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<MatchRow>>> {
         Box::pin(async move {

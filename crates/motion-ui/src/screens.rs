@@ -197,15 +197,17 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                 for library in model.libraries {
                     <li>
                         <strong>(library.name.as_str())</strong> " · " (availability_text(library.availability))
-                        command_form(command: format!("POST /api/v2/libraries/{}/scans", library.id), label: "Scan now", idempotent: true, class: Some("command inline"),
-                            <label>"Mode "
-                                <select name="mode" data-type=(kind(Field::Text))>
-                                    <option value="incremental">"Changes only"</option>
-                                    <option value="verify">"Verify file contents"</option>
-                                </select>
-                            </label>
-                            <input type="hidden" name="require_complete" data-type=(kind(Field::Json)) value="false">
-                        )
+                        if model.scans_available {
+                            command_form(command: format!("POST /api/v2/libraries/{}/scans", library.id), label: "Scan now", idempotent: true, class: Some("command inline"),
+                                <label>"Mode "
+                                    <select name="mode" data-type=(kind(Field::Text))>
+                                        <option value="incremental">"Changes only"</option>
+                                        <option value="verify">"Verify file contents"</option>
+                                    </select>
+                                </label>
+                                <input type="hidden" name="require_complete" data-type=(kind(Field::Json)) value="false">
+                            )
+                        }
                     </li>
                 }
             </ul>
@@ -232,7 +234,9 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         </section>
         <section aria-labelledby="scans-heading">
             <h2 id="scans-heading">"Recent scans"</h2>
-            if model.scans.is_empty() {
+            if !model.scans_available {
+                empty(message: "Scanning is unavailable on this server.")
+            } else if model.scans.is_empty() {
                 empty(message: "No scans yet.")
             } else {
                 <ul class="rows">
