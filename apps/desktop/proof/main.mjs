@@ -94,6 +94,9 @@ app.whenReady().then(async () => {
     })`);
     note('playerHost', ready);
     if (ready.state === 'ready') {
+      // The mock advertises a five-second lease heartbeat interval. Stay on
+      // this player long enough to exercise renewal before navigation teardown.
+      await new Promise(r => setTimeout(r, 5500));
       const playback = await evaluate(`(async () => {
         const el = document.querySelector('#motion-player demuxe-player');
         const p = el.player;

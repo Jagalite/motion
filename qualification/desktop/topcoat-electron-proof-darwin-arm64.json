@@ -3,8 +3,8 @@
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
   "passed": true,
-  "recorded_at": "2026-10-10T01:00:17.797Z",
-  "motion_commit": "7072d6e9bde637eaf1a460e043494c0bc2356143",
+  "recorded_at": "2026-10-10T01:19:52.411Z",
+  "motion_commit": "d605e0929b3e4ca3e51f90021419c75e97b972c2",
   "worktree_dirty": true,
   "environment": {
     "electron": "44.7.0",
@@ -18,10 +18,10 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "e2fe385eaf0f0d58bd57e340c8f96c67311197f64c1811b91264df86413b72bd",
+  "proof_server_sha256": "495f8ec02b0c2b3e44eb060b3f9204aa4bc36eb9d734cea85f6e9d8d2fcdfad7",
   "proof_server_launch": {
     "location": "host-temporary-directory",
-    "sha256": "e2fe385eaf0f0d58bd57e340c8f96c67311197f64c1811b91264df86413b72bd",
+    "sha256": "495f8ec02b0c2b3e44eb060b3f9204aa4bc36eb9d734cea85f6e9d8d2fcdfad7",
     "matches_build": true
   },
   "rust_toolchain": "1.98.0",
@@ -51,6 +51,7 @@
     "range_requests": true,
     "every_delivery_retired": true,
     "waited_for_starting_generation": true,
+    "active_delivery_lease_renewed": true,
     "plays_after_back_navigation": true,
     "command_form_creates_scan": true,
     "if_match_conflict_surfaced": true,
@@ -81,12 +82,12 @@
     },
     "playback": {
       "played": true,
-      "before": 2.614616,
-      "afterSeek": 7.001384,
-      "seekElapsedMs": 40,
+      "before": 2.648701,
+      "afterSeek": 7.001274,
+      "seekElapsedMs": 100,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.754786,
+      "finalTime": 7.747315,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -101,8 +102,8 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.00385,
-      "now": 1.022536
+      "start": 0.003104,
+      "now": 1.021879
     },
     "afterScanTitle": "Sources and scans",
     "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again."
@@ -118,10 +119,24 @@
   "commands": [
     {
       "body": {
+        "active_generation": "1"
+      },
+      "delivery": "del1",
+      "operation": "heartbeatDelivery"
+    },
+    {
+      "body": {
+        "active_generation": "1"
+      },
+      "delivery": "del1",
+      "operation": "heartbeatDelivery"
+    },
+    {
+      "body": {
         "mode": "incremental",
         "require_complete": false
       },
-      "key": "f1124591e9074089b0c42474ebb35c91",
+      "key": "ca859c436dd04f0d91c9910c02705b29",
       "library": "lib1",
       "operation": "createScan",
       "replay": false
@@ -146,7 +161,7 @@
     }
   ],
   "http": {
-    "requests": 166,
+    "requests": 168,
     "deliveries_admitted": [
       "del1",
       "del2"
@@ -161,7 +176,7 @@
     "Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.",
     "Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.",
     "Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.",
-    "Wave 0 player bridge: no viewing authority, progress events, generation switching or lease renewal.",
+    "Player bridge renews its active delivery lease; viewing authority, progress events and generation switching remain unimplemented.",
     "Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron."
   ]
 }

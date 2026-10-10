@@ -5,13 +5,13 @@
 // Scope: plan -> admit delivery -> open the generation in Demuxe -> close the
 // delivery and dispose on leave, through the same-origin public API with
 // CSRF and idempotency keys. Viewing authority, ordered progress events,
-// generation switching and lease renewal belong to the full playback
+// generation switching belong to the full playback
 // coordinator and are NOT implemented here.
 
 const host = document.getElementById('motion-player');
 const csrf = document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 
-const state = {epoch: 0, deliveryId: null, element: null, closing: null};
+const state = {epoch: 0, deliveryId: null, element: null, closing: null, stopLease: null};
 
 function status(message, kind = 'status') {
   let panel = host.querySelector('.status-panel');
@@ -92,6 +92,71 @@ function retire(id) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+/** Client scheduling only: the server decides whether the lease is renewable.
+ * Every callback belongs to one delivery/generation and one player epoch.
+ */
+function maintainLease(delivery, generation, {send, current, failed,
+  now = Date.now, schedule = setTimeout, cancel = clearTimeout} = {}) {
+  let stopped = false;
+  let timer;
+  let controller;
+  let expires = Date.parse(delivery.lease_expires_at);
+  let interval = delivery.heartbeat_interval_seconds * 1000;
+  const live = () => !stopped && current();
+  const stop = () => {
+    stopped = true;
+    cancel(timer);
+    controller?.abort();
+  };
+  const fail = error => {
+    if (!live()) return;
+    stop();
+    failed(error);
+  };
+  const queue = delay => {
+    if (!live()) return;
+    if (!Number.isFinite(expires) || !Number.isFinite(interval) || interval < 5000 || interval > 60000) {
+      fail(new Error('The server returned an invalid delivery lease.'));
+      return;
+    }
+    const remaining = expires - now();
+    if (remaining <= 0) {
+      fail(new Error('The delivery lease expired.'));
+      return;
+    }
+    timer = schedule(beat, Math.min(delay, remaining));
+  };
+  const beat = async () => {
+    if (!live()) return;
+    const remaining = expires - now();
+    if (remaining <= 0) { fail(new Error('The delivery lease expired.')); return; }
+    controller = new AbortController();
+    const timeout = schedule(() => controller.abort(), Math.min(10000, remaining));
+    try {
+      const renewed = await send(delivery.id, generation, controller.signal);
+      if (!live()) return;
+      if (now() >= expires) throw new Error('The delivery lease expired before renewal was confirmed.');
+      if (renewed.id !== delivery.id || !['ready', 'transitioning'].includes(renewed.status)
+        || renewed.active?.generation !== generation) {
+        fail(new Error('The active delivery changed or ended.'));
+        return;
+      }
+      expires = Date.parse(renewed.lease_expires_at);
+      interval = renewed.heartbeat_interval_seconds * 1000;
+      queue(interval);
+    } catch (error) {
+      if (!live()) return;
+      if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) fail(error);
+      else queue(1000); // Retry uncertain transport failures only within the confirmed lease.
+    } finally {
+      cancel(timeout);
+    }
+  };
+  queue(interval);
+  return stop;
+}
+
+
 /** A delivery may be admitted while its first generation is still starting. */
 async function firstGeneration(delivery, current) {
   const deadline = Date.now() + 60_000;
@@ -99,7 +164,7 @@ async function firstGeneration(delivery, current) {
   for (;;) {
     const generation = latest.active ?? latest.pending;
     if (['failed', 'closed', 'interrupted'].includes(latest.status) || generation?.status === 'failed') return null;
-    if (generation && (generation.status === 'ready' || generation.status === 'active')) return generation;
+    if (generation && (generation.status === 'ready' || generation.status === 'active')) return latest;
     const remaining = deadline - Date.now();
     if (remaining <= 0) return null;
     status('The server is preparing the stream…');
@@ -137,13 +202,25 @@ async function start() {
     // Closed while admission was in flight: retire what the server created.
     if (!current()) return retire(delivery.id);
     state.deliveryId = delivery.id;
-    const generation = await firstGeneration(delivery, current);
+    const readyDelivery = await firstGeneration(delivery, current);
+    const generation = readyDelivery?.active ?? readyDelivery?.pending;
     if (!current()) return;
     if (!generation || generation.transport !== 'http_range' || !generation.media_url) {
       status('The server could not offer a stream this page can open.', 'alert');
       host.dataset.state = 'failed';
       return close();
     }
+    state.stopLease = maintainLease(readyDelivery, generation.generation, {
+      current,
+      send: (id, active_generation, signal) => api('POST',
+        `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal),
+      failed: error => {
+        status(`Playback stopped: ${error.message}`, 'alert');
+        host.dataset.state = 'failed';
+        void close();
+      },
+    });
+    if (!current()) return;
     const shared = await loadDemuxe(data.demuxeBase);
     if (!current()) return;
     const element = document.createElement('demuxe-player');
@@ -175,6 +252,8 @@ async function start() {
 function close() {
   state.closing ??= (async () => {
     state.epoch++;
+    state.stopLease?.();
+    state.stopLease = null;
     const id = state.deliveryId;
     state.deliveryId = null;
     const retiring = retire(id);
@@ -192,4 +271,4 @@ addEventListener('pagehide', () => { void close(); });
 addEventListener('pageshow', event => { if (event.persisted && host) void start(); });
 if (host) void start();
 
-export {close};
+export {close, maintainLease};

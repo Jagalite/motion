@@ -123,6 +123,8 @@ const results = {
   every_delivery_retired: admitted.length > 0 && admitted.length === new Set(admitted).size
     && closed.length === admitted.length && admitted.every(id => closed.includes(id)),
   waited_for_starting_generation: requests.some(r => r.method === 'GET' && /^\/api\/v2\/playback\/delivery-sessions\/[^/]+$/.test(r.path) && r.status === 200),
+  active_delivery_lease_renewed: commands.some(cmd => cmd.operation === 'heartbeatDelivery'
+    && cmd.delivery === admitted[0] && cmd.body?.active_generation === '1'),
   plays_after_back_navigation: c.afterBack?.state === 'ready' && c.afterBack?.players === 1 && c.afterBackPlayback?.advancing === true && deliveriesCreated === 2,
   // A command form reached the public API with a 32-hex idempotency key and the typed body.
   command_form_creates_scan: commands.some(cmd => cmd.operation === 'createScan' && cmd.library === 'lib1'
@@ -170,7 +172,7 @@ const receipt = {
     'Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.',
     'Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.',
     'Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.',
-    'Wave 0 player bridge: no viewing authority, progress events, generation switching or lease renewal.',
+    'Player bridge renews its active delivery lease; viewing authority, progress events and generation switching remain unimplemented.',
     'Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron.',
   ],
 };

@@ -34,3 +34,36 @@ recorded in the receipt. Server readiness is bounded to 30 seconds and the
 Electron run to 120 seconds; child processes are stopped on success or failure.
 Temporary diagnostic artifacts are retained. These launcher mechanics belong
 to the qualification adapter and do not change application/core transitions.
+
+## Player delivery leases
+
+`player.js` renews the currently owned delivery with its exact active generation,
+using the server's heartbeat interval. Only one renewal is in flight. Uncertain
+transport failures retry within the last confirmed expiry; revocation, changed
+delivery/generation, invalid lease data or expiry stop playback and retire the
+delivery. Leaving the page aborts renewal, and the player epoch fences late
+responses. Run `node --test packages/ui-bridge/*.test.mjs` for both bridge suites.
+
+Lease eligibility, authorization and durable expiry remain server/core rules.
+The browser owns transport scheduling, cancellation and conservative local
+teardown; it does not grant itself a renewed lease. Controlled-clock tests run
+the production scheduler through success, retries, expiry, revocation, identity
+mismatch and stale callbacks. They do not establish server conformance or replace
+Stateless checks of the server's lease policy. The Electron proof separately
+requires an actual heartbeat command with the expected delivery/generation.
+
+## Remaining A11/A12 scope
+
+The branch has authorized mock-backed Topcoat screens and a local-origin Electron
+smoke harness. The next playback work is viewing-session admission with an
+explicit viewing revision, ordered progress with exact retries, generation
+activation/replacement, and navigation flush. The current bridge does not save
+viewing progress. Full typed playback coordination is still outstanding.
+
+Real `UiQueryFacade` integration and API/SSR parity need the backend owners'
+production interfaces. The desktop directory remains a proof harness: packaged
+trusted connection chrome, verified local attachment, server-scoped remote
+sessions, ownership-aware shutdown, and offline-host lifecycle are not implemented
+by it. Packaging, update/signing and offline cache integration require their
+respective owners and separate qualification. Passing the smoke receipt does not
+complete these plan sections.

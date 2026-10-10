@@ -301,13 +301,34 @@ fn delivery_json(id: &str, start: u64, ready: bool) -> Value {
         "id": id, "revision": if ready { "2" } else { "1" }, "replacement_mode": "none", "profile_id": "everyone", "timeline_id": "proof",
         "source": {"file_id": "proof", "file_revision": "r1"}, "status": if ready { "ready" } else { "starting" },
         "active": if ready { generation.clone() } else { Value::Null }, "pending": if ready { Value::Null } else { generation },
-        "lease_expires_at": "2099-01-01T00:00:00Z", "heartbeat_interval_seconds": 15, "logical_duration_ms": 12000,
+        "lease_expires_at": "2099-01-01T00:00:00Z", "heartbeat_interval_seconds": 5, "logical_duration_ms": 12000,
     })
 }
 
 async fn get_delivery(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.sessions.lock().unwrap().deliveries.get(&id) {
         Some(true) => mock(StatusCode::OK, delivery_json(&id, 0, true)),
+        Some(false) => problem(StatusCode::GONE, "delivery_closed"),
+        None => problem(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
+async fn heartbeat_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    if body != json!({"active_generation": "1"}) {
+        return problem(StatusCode::CONFLICT, "generation_conflict");
+    }
+    match state.sessions.lock().unwrap().deliveries.get(&id) {
+        Some(true) => {
+            println!(
+                "{}",
+                json!({"command": {"operation": "heartbeatDelivery", "delivery": id, "body": body}})
+            );
+            mock(StatusCode::OK, delivery_json(&id, 0, true))
+        }
         Some(false) => problem(StatusCode::GONE, "delivery_closed"),
         None => problem(StatusCode::NOT_FOUND, "not_found"),
     }
@@ -389,6 +410,10 @@ async fn main() {
         .route(
             "/api/v2/playback/delivery-sessions/{id}",
             delete(close_delivery).get(get_delivery),
+        )
+        .route(
+            "/api/v2/playback/delivery-sessions/{id}/heartbeat",
+            post(heartbeat_delivery),
         )
         .route("/api/v2/media/files/proof/content", get(serve_media))
         .with_state(state.clone());
