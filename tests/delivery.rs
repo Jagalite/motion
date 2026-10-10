@@ -1195,6 +1195,12 @@ async fn videotoolbox_live_transcode_uses_the_hardware_encoder() {
         return;
     }
     let f = Fixture::new().await;
+    // Hosted CI runners are VMs without a hardware encoder session; the server
+    // then answers backend_unavailable for every VideoToolbox request.
+    if !playscale::processing::videotoolbox_available(&f.app).await {
+        eprintln!("SKIPPED: no VideoToolbox encoder session on this host");
+        return;
+    }
     let status = Command::new("ffmpeg")
         .args([
             "-v",
