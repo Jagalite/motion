@@ -1110,3 +1110,140 @@ async fn sidecar_fifo_pins_and_merges_are_handled() {
     .unwrap();
     assert_eq!(left, 0);
 }
+
+#[tokio::test]
+async fn organization_reads_and_deletes_are_profile_scoped_and_revisioned() {
+    let f = Fixture::new().await;
+    work(&f, "a", "A", 2000).await;
+    let filter = orgs::save_filter(
+        &f.app,
+        "default",
+        None,
+        "Year",
+        vec![Term {
+            field: Field::Year,
+            operator: Operator::Gte,
+            value: Value::Integer(1990),
+        }],
+    )
+    .await
+    .unwrap();
+    let smart = orgs::save_collection(
+        &f.app,
+        "default",
+        None,
+        "Smart",
+        CollectionKind::Smart,
+        vec![],
+        Some(filter.id.clone()),
+    )
+    .await
+    .unwrap();
+    let playlist = orgs::save_playlist(
+        &f.app,
+        "default",
+        None,
+        "P",
+        vec![Entry {
+            entry_id: "1".into(),
+            timeline_id: "a-ed".into(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        orgs::list_filters(&f.app.db, "default")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        orgs::list_collections(&f.app.db, "default").await.unwrap()[0],
+        smart
+    );
+    assert_eq!(
+        orgs::get_playlist(&f.app.db, "default", &playlist.id)
+            .await
+            .unwrap(),
+        playlist
+    );
+    assert!(
+        orgs::list_playlists(&f.app.db, "kid")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // A filter used by a smart collection cannot be deleted.
+    assert!(matches!(
+        orgs::delete_filter(&f.app, "default", &filter.id, filter.revision).await,
+        Err(orgs::OrgError::InvalidReference(_))
+    ));
+    assert!(matches!(
+        orgs::delete_collection(&f.app, "default", &smart.id, 0).await,
+        Err(orgs::OrgError::Rejected(OrganizationError::StaleRevision))
+    ));
+    orgs::delete_collection(&f.app, "default", &smart.id, smart.revision)
+        .await
+        .unwrap();
+    orgs::delete_filter(&f.app, "default", &filter.id, filter.revision)
+        .await
+        .unwrap();
+    orgs::delete_playlist(&f.app, "default", &playlist.id, playlist.revision)
+        .await
+        .unwrap();
+    assert!(
+        orgs::list_collections(&f.app.db, "default")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn nfo_ownership_follows_contributions_through_merges_and_splits() {
+    let f = Fixture::new().await;
+    // Target has an API-supplied nfo contribution; source has a sidecar.
+    f.write("source.mkv", b"source");
+    f.write("source.nfo", b"<movie><title>Sidecar</title></movie>");
+    f.write("target.mkv", b"target");
+    f.scan().await;
+    let (_, source, ..) = f.file("source.mkv").await;
+    let (_, target, ..) = f.file("target.mkv").await;
+    sqlx::query("INSERT INTO metadata_documents VALUES (?,'nfo',1,NULL,'{\"values\":{\"title\":\"API\"},\"tags\":[],\"excluded_tags\":[]}',1)")
+        .bind(&target)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in [&source, &target] {
+        let a = playscale::curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.clone(), a.work.revision);
+    }
+    drop(conn);
+    let plan = playscale::curation::preview_merge(
+        &f.app.db,
+        &playscale_core::identity::MergeRequest {
+            sources: vec![source.clone()],
+            target: target.clone(),
+            expected,
+        },
+    )
+    .await
+    .unwrap();
+    playscale::curation::commit_merge(&f.app, &plan)
+        .await
+        .unwrap();
+    std::fs::remove_file(f.root.join("source.nfo")).unwrap();
+    f.scan().await;
+    let api: String = sqlx::query_scalar("SELECT json_extract(document_json,'$.values.title') FROM metadata_documents WHERE item_id=? AND source='nfo'")
+        .bind(&target)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(api, "API", "the target's own contribution is untouched");
+}

@@ -228,7 +228,9 @@ pub async fn preview_merge(
 ) -> Result<MergePlan, CurationError> {
     let mut conn = db.acquire().await?;
     let (found, aliases) = merge_decision(&mut conn, request).await?;
-    Ok(identity::plan_merge(&found, &aliases, request)?)
+    let plan = identity::plan_merge(&found, &aliases, request)?;
+    identity::remap_relationships(&edges(&mut conn).await?, &plan.retired, &plan.target)?;
+    Ok(plan)
 }
 
 pub async fn commit_merge(app: &App, reviewed: &MergePlan) -> Result<Receipt, CurationError> {
@@ -251,7 +253,22 @@ pub(crate) async fn merge_in_transaction(
     };
     let (found, aliases) = merge_decision(tx, &request).await?;
     let plan = identity::commit_merge(reviewed, &found, &aliases)?;
+    let remap = identity::remap_relationships(&edges(tx).await?, &plan.retired, &plan.target)?;
     let receipt = receipt(tx, "catalog:merge", &plan).await?;
+    for id in &remap.deletes {
+        sqlx::query("DELETE FROM item_relationships WHERE id=?")
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    for (id, source, target) in &remap.updates {
+        sqlx::query("UPDATE item_relationships SET source_item_id=?,target_item_id=?,revision=revision+1 WHERE id=?")
+            .bind(source)
+            .bind(target)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+    }
     apply_merge(tx, &plan, &receipt.id).await?;
     crate::search::refresh(tx, 100).await?;
     Ok(receipt)
@@ -298,12 +315,23 @@ async fn apply_merge(
         // otherwise the target's stays authoritative and the retired one remains
         // attached to the retired ID for explanation. Equal-source conflicts with
         // differing identities were rejected by the decision.
+        let target_had_nfo: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM metadata_documents WHERE item_id=? AND source='nfo')",
+        )
+        .bind(&plan.target)
+        .fetch_one(&mut **tx)
+        .await?;
         sqlx::query("UPDATE metadata_documents SET item_id=? WHERE item_id=? AND source NOT IN (SELECT source FROM metadata_documents WHERE item_id=?)")
             .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
-        // The NFO origin moves with its contribution (it moved only if the
-        // target had no NFO contribution, hence no origin of its own).
-        sqlx::query("UPDATE nfo_origins SET item_id=? WHERE item_id=? AND NOT EXISTS (SELECT 1 FROM nfo_origins WHERE item_id=?)")
-            .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
+        // The NFO origin moves only when its contribution did (the target had
+        // no NFO contribution of its own, from a sidecar or the API).
+        if !target_had_nfo {
+            sqlx::query("UPDATE nfo_origins SET item_id=? WHERE item_id=?")
+                .bind(&plan.target)
+                .bind(retired)
+                .execute(&mut **tx)
+                .await?;
+        }
         sqlx::query("UPDATE artwork_contributions SET item_id=? WHERE item_id=? AND (role,source) NOT IN (SELECT role,source FROM artwork_contributions WHERE item_id=?)")
             .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
         sqlx::query("UPDATE renditions SET item_id=? WHERE item_id=?")
@@ -343,6 +371,9 @@ async fn apply_merge(
         .bind(&plan.target)
         .execute(&mut **tx)
         .await?;
+    let moved: Vec<Id> = plan.moved_editions.iter().map(|(e, _)| e.clone()).collect();
+    let moved = timelines_of_editions(tx, &moved).await?;
+    revalidate_order(tx, &moved).await?;
     crate::metadata::project_title(tx, &plan.target).await?;
     // Triggers advanced the revision once per row change inside this uncommitted
     // transaction; the committed structural revision is exactly the planned one.
@@ -551,6 +582,12 @@ async fn apply_split(
         }
     }
     ensure_consistent(tx).await?;
+    let new_editions: Vec<Id> = sqlx::query_scalar("SELECT id FROM editions WHERE item_id=?")
+        .bind(&plan.new_item)
+        .fetch_all(&mut **tx)
+        .await?;
+    let moved = timelines_of_editions(tx, &new_editions).await?;
+    revalidate_order(tx, &moved).await?;
     sqlx::query("UPDATE renditions SET item_id=? WHERE item_id=? AND file_id IN (SELECT f.id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?)")
         .bind(&plan.new_item).bind(&plan.item).bind(&plan.new_item).execute(&mut **tx).await?;
     sqlx::query("UPDATE items SET catalog_revision=? WHERE id=?")
@@ -1154,29 +1191,13 @@ pub async fn place_timeline(
     if u64::try_from(revision).map_err(anyhow::Error::from)? != expected_group_revision {
         return Err(IdentityError::StaleRevision(group.into()).into());
     }
-    let item: String = sqlx::query_scalar(
-        "SELECT e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    let (item, previous): (String, Option<String>) = sqlx::query_as(
+        "SELECT e.item_id,t.order_group_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
     )
     .bind(timeline)
     .fetch_one(&mut *tx)
     .await?;
-    // The work itself and up to two hierarchy ancestors (season, series).
-    let mut ancestors = vec![item.clone()];
-    let mut current = item;
-    for _ in 0..2 {
-        let parent: Option<Option<String>> =
-            sqlx::query_scalar("SELECT parent_id FROM item_structure WHERE item_id=?")
-                .bind(&current)
-                .fetch_optional(&mut *tx)
-                .await?;
-        match parent.flatten() {
-            Some(p) => {
-                ancestors.push(p.clone());
-                current = p;
-            }
-            None => break,
-        }
-    }
+    let ancestors = ancestors(&mut tx, &item).await?;
     let occupied: BTreeMap<u32, String> = sqlx::query_as::<_, (i64, String)>(
         "SELECT order_position,id FROM timelines WHERE order_group_id=? AND order_position IS NOT NULL",
     )
@@ -1195,6 +1216,13 @@ pub async fn place_timeline(
     .bind(timeline)
     .execute(&mut *tx)
     .await?;
+    // Leaving another group changes that group's ordering too.
+    if let Some(previous) = previous.filter(|p| p != group) {
+        sqlx::query("UPDATE order_groups SET revision=revision+1 WHERE id=?")
+            .bind(&previous)
+            .execute(&mut *tx)
+            .await?;
+    }
     let next = expected_group_revision + 1;
     sqlx::query("UPDATE order_groups SET revision=? WHERE id=?")
         .bind(i64::try_from(next).map_err(anyhow::Error::from)?)
@@ -1334,4 +1362,93 @@ pub async fn item_files(db: &SqlitePool, item: &str) -> anyhow::Result<Vec<FileV
         bytes,
     })
     .collect())
+}
+
+/// The work itself and up to two hierarchy ancestors (season, series).
+async fn ancestors(conn: &mut SqliteConnection, item: &str) -> anyhow::Result<Vec<Id>> {
+    let mut out = vec![item.to_string()];
+    let mut current = item.to_string();
+    for _ in 0..2 {
+        let parent: Option<Option<String>> =
+            sqlx::query_scalar("SELECT parent_id FROM item_structure WHERE item_id=?")
+                .bind(&current)
+                .fetch_optional(&mut *conn)
+                .await?;
+        match parent.flatten() {
+            Some(p) => {
+                out.push(p.clone());
+                current = p;
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// After timelines change works (merge or split), drop order-group
+/// memberships that `identity::order_membership_valid` no longer allows and
+/// advance those groups' revisions.
+async fn revalidate_order(conn: &mut SqliteConnection, timelines: &[Id]) -> anyhow::Result<()> {
+    for timeline in timelines {
+        let row: Option<(Option<String>, String)> = sqlx::query_as(
+            "SELECT t.order_group_id,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+        )
+        .bind(timeline)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((Some(group), item)) = row else {
+            continue;
+        };
+        let owner: String = sqlx::query_scalar(
+            "SELECT e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
+        )
+        .bind(&group)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !identity::order_membership_valid(&ancestors(conn, &item).await?, &owner) {
+            sqlx::query("UPDATE timelines SET order_group_id=NULL,order_position=NULL,revision=revision+1 WHERE id=?")
+                .bind(timeline)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("UPDATE order_groups SET revision=revision+1 WHERE id=?")
+                .bind(&group)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn edges(conn: &mut SqliteConnection) -> anyhow::Result<Vec<identity::Edge>> {
+    sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT id,source_item_id,target_item_id,kind FROM item_relationships",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(|(id, source, target, kind)| {
+        Ok(identity::Edge {
+            id,
+            source,
+            target,
+            kind: enum_value(&kind)?,
+        })
+    })
+    .collect()
+}
+
+async fn timelines_of_editions(
+    conn: &mut SqliteConnection,
+    editions: &[Id],
+) -> anyhow::Result<Vec<Id>> {
+    let mut out = Vec::new();
+    for edition in editions {
+        out.extend(
+            sqlx::query_scalar::<_, String>("SELECT id FROM timelines WHERE edition_id=?")
+                .bind(edition)
+                .fetch_all(&mut *conn)
+                .await?,
+        );
+    }
+    Ok(out)
 }

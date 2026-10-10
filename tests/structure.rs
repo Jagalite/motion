@@ -243,3 +243,151 @@ async fn relationships_reject_cycles_and_duplicates() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].id, "double");
 }
+
+async fn group_revision(app: &App, group: &str) -> u64 {
+    let r: i64 = sqlx::query_scalar("SELECT revision FROM order_groups WHERE id=?")
+        .bind(group)
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    r as u64
+}
+
+#[tokio::test]
+async fn order_and_relationships_follow_moves_merges_and_splits() {
+    let (_dir, app) = fixture().await;
+    let aired = curation::create_order_group(&app, "show-ed", "Aired", curation::OrderKind::Aired)
+        .await
+        .unwrap();
+    let dvd = curation::create_order_group(&app, "show-ed", "DVD", curation::OrderKind::Dvd)
+        .await
+        .unwrap();
+    curation::place_timeline(&app, "e1-ed", &aired, 1, 1)
+        .await
+        .unwrap();
+    let aired_seen = group_revision(&app, &aired).await;
+    // Moving e1 to the DVD order changes the aired order too.
+    curation::place_timeline(&app, "e1-ed", &dvd, 1, 1)
+        .await
+        .unwrap();
+    assert!(
+        curation::place_timeline(&app, "e2-ed", &aired, 1, aired_seen)
+            .await
+            .is_err()
+    );
+
+    // Merging e1 into e2 remaps its relationship onto e2.
+    curation::create_relationship(&app, "e1", "show", RelationshipKind::ExtraOf, None)
+        .await
+        .unwrap();
+    let mut conn = app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in ["e1", "e2"] {
+        let a = curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.to_string(), a.work.revision);
+    }
+    drop(conn);
+    let request = playscale_core::identity::MergeRequest {
+        sources: vec!["e1".into()],
+        target: "e2".into(),
+        expected,
+    };
+    let plan = curation::preview_merge(&app.db, &request).await.unwrap();
+    curation::commit_merge(&app, &plan).await.unwrap();
+    let edges = curation::relationships(&app.db, "show").await.unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].source_item_id, "e2");
+
+    // Splitting e2's ordered timeline into a new work clears the membership.
+    curation::place_timeline(&app, "e2-ed", &aired, 2, group_revision(&app, &aired).await)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json) VALUES ('e2-file','e2-ed','lib','e2.mkv','r2','s',1,'[]')")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_versions (id,timeline_id,origin,equivalence) VALUES ('e2-v','e2-ed','original','declared')")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO version_files (version_id,part,file_id,file_revision) VALUES ('e2-v',1,'e2-file','r2')")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    // e1's merged edition keeps a version, so the split leaves e2 non-empty.
+    for sql in [
+        "INSERT INTO media_versions (id,timeline_id,origin,equivalence) VALUES ('dv','e1-ed','original','declared')",
+        "INSERT INTO version_files (version_id,part,file_id,file_revision) VALUES ('dv',1,'double','r')",
+    ] {
+        sqlx::query(sql).execute(&app.db).await.unwrap();
+    }
+    let before = group_revision(&app, &aired).await;
+    let split = curation::preview_split(
+        &app.db,
+        &playscale_core::identity::SplitRequest {
+            item: "e2".into(),
+            versions: vec!["e2-v".into()],
+            new_title: "Mis-filed".into(),
+            expected_revision: {
+                let mut conn = app.db.acquire().await.unwrap();
+                curation::load_aggregate(&mut conn, "e2")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .work
+                    .revision
+            },
+        },
+    )
+    .await
+    .unwrap();
+    curation::commit_split(&app, &split).await.unwrap();
+    let membership: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT t.order_group_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE e.item_id=?",
+    )
+    .bind(&split.new_item)
+    .fetch_all(&app.db)
+    .await
+    .unwrap();
+    assert!(membership.iter().all(Option::is_none), "{membership:?}");
+    assert!(group_revision(&app, &aired).await > before);
+}
+
+#[tokio::test]
+async fn merges_that_would_create_relationship_cycles_are_rejected() {
+    let (_dir, app) = fixture().await;
+    sqlx::query("INSERT INTO items (id,title,kind) VALUES ('x','X','video'),('y','Y','video'),('dup','Dup','video')")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    curation::create_relationship(&app, "x", "y", RelationshipKind::PartOf, None)
+        .await
+        .unwrap();
+    curation::create_relationship(&app, "y", "dup", RelationshipKind::PartOf, None)
+        .await
+        .unwrap();
+    let mut conn = app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in ["dup", "x"] {
+        let a = curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.to_string(), a.work.revision);
+    }
+    drop(conn);
+    let request = playscale_core::identity::MergeRequest {
+        sources: vec!["dup".into()],
+        target: "x".into(),
+        expected,
+    };
+    assert!(matches!(
+        curation::preview_merge(&app.db, &request).await,
+        Err(curation::CurationError::Rejected(
+            IdentityError::InvalidBindings(_)
+        ))
+    ));
+}

@@ -5,7 +5,7 @@ use crate::{App, administration::VerifiedRoot, new_id};
 use playscale_core::sources::{self as core, Availability, LibraryKind, SourceError};
 use serde::Serialize;
 use sqlx::{SqliteConnection, SqlitePool};
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 #[derive(Debug)]
 pub enum LibraryError {
@@ -357,4 +357,310 @@ pub async fn libraries_of_item(db: &SqlitePool, item: &str) -> anyhow::Result<Ve
     .bind(item)
     .fetch_all(db)
     .await?)
+}
+
+/// Delete a logical library (never its sources or files). Refused while any of
+/// its scan requests still has pending demands; finished scan history goes
+/// with it.
+pub async fn delete_library(
+    app: &App,
+    id: &str,
+    expected_revision: u64,
+) -> Result<(), LibraryError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let current: i64 = sqlx::query_scalar("SELECT revision FROM catalog_libraries WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    core::advance(revision(current)?, expected_revision)?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM scan_demands d JOIN scan_requests r ON r.id=d.request_id WHERE r.library_id=? AND d.status='pending'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending > 0 {
+        return Err(LibraryError::Busy);
+    }
+    sqlx::query("DELETE FROM scan_requests WHERE library_id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM catalog_libraries WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRemoval {
+    /// No cataloged files referenced it: the registration was deleted.
+    Deleted,
+    /// Cataloged files still reference it: it was disabled instead and its
+    /// files marked unavailable; originals and history are retained.
+    Disabled,
+}
+
+/// Remove a storage source that no library references and no scan is using.
+/// Original files are never touched.
+pub async fn delete_source(
+    app: &App,
+    id: &str,
+    expected_revision: u64,
+) -> Result<SourceRemoval, LibraryError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let current: i64 = sqlx::query_scalar("SELECT revision FROM sources WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let next = core::advance(revision(current)?, expected_revision)?;
+    let (members, active, files, demands): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM library_sources WHERE source_id=?1),\
+                (SELECT count(*) FROM jobs WHERE library_id=?1 AND phase IN ('queued','running','cancelling')),\
+                (SELECT count(*) FROM media_files WHERE library_id=?1),\
+                (SELECT count(*) FROM scan_demands WHERE source_id=?1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if members > 0 || active > 0 {
+        return Err(LibraryError::Busy);
+    }
+    let outcome = if files == 0 && demands == 0 {
+        sqlx::query("DELETE FROM scan_schedules WHERE library_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM jobs WHERE library_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM libraries WHERE id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        SourceRemoval::Deleted
+    } else {
+        sqlx::query("UPDATE libraries SET enabled=0,revision=? WHERE id=?")
+            .bind(i64::try_from(next).map_err(|e| LibraryError::Storage(e.into()))?)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM scan_schedules WHERE library_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE media_files SET available=0 WHERE library_id=? AND available=1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        SourceRemoval::Disabled
+    };
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+#[derive(Debug)]
+pub enum RelocationError {
+    Library(LibraryError),
+    /// The candidate root does not hold the cataloged content unchanged.
+    CandidateMismatch(String),
+    Conflict(core::RelocationConflict),
+}
+impl From<LibraryError> for RelocationError {
+    fn from(e: LibraryError) -> Self {
+        Self::Library(e)
+    }
+}
+impl From<sqlx::Error> for RelocationError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Library(e.into())
+    }
+}
+impl From<anyhow::Error> for RelocationError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Library(e.into())
+    }
+}
+
+/// Preview a rebind of a source to a new root: verify by hashing that every
+/// in-scope cataloged file (all of them for a disabled source; available ones
+/// for an enabled source) exists unchanged at the new root. Nothing is written.
+pub async fn preview_relocation(
+    app: &App,
+    source: &str,
+    candidate: VerifiedRoot,
+) -> Result<core::RelocationPlan, RelocationError> {
+    let (rev, binding, enabled, scope): (i64, i64, bool, String) = sqlx::query_as(
+        "SELECT revision,binding_revision,enabled,exclusions_json FROM sources WHERE id=?",
+    )
+    .bind(source)
+    .fetch_one(&app.db)
+    .await?;
+    let scope: Vec<String> = serde_json::from_str(&scope).map_err(anyhow::Error::from)?;
+    let files: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT id,relative_path,revision,available FROM media_files WHERE library_id=? ORDER BY id",
+    )
+    .bind(source)
+    .fetch_all(&app.db)
+    .await?;
+    let (in_scope, out_of_scope): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|(_, path, _, _)| !core::excluded(path, &scope));
+    let required: Vec<(String, String, String)> = in_scope
+        .into_iter()
+        .filter(|(_, _, _, available)| !enabled || *available)
+        .map(|(id, path, revision, _)| (id, path, revision))
+        .collect();
+    let root = candidate.root.clone();
+    let identity = candidate.identity.clone();
+    let hashing_root = root.clone();
+    let expected_identity = identity.clone();
+    let verified = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        // Holding the candidate keeps the library inspection permit.
+        let _hold = candidate;
+        let mut out = Vec::new();
+        for (id, path, revision) in required {
+            let check = || -> anyhow::Result<String> {
+                let mut file = crate::scan::open_file(Path::new(&hashing_root), Path::new(&path))?;
+                let before = crate::scan::fingerprint(&file.metadata()?);
+                let mut hash = Sha256::new();
+                let mut buffer = vec![0u8; 128 * 1024];
+                loop {
+                    let n = file.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..n]);
+                }
+                anyhow::ensure!(
+                    format!("{:x}", hash.finalize()) == revision,
+                    "content differs"
+                );
+                anyhow::ensure!(
+                    before == crate::scan::fingerprint(&file.metadata()?),
+                    "changed while hashing"
+                );
+                Ok(before)
+            };
+            match check() {
+                Ok(stamp) => out.push((id, stamp)),
+                Err(_) => return Err(id),
+            }
+        }
+        // The root must still be the same volume after verification.
+        match std::fs::metadata(&hashing_root) {
+            Ok(meta) if crate::db::root_identity(&meta) == expected_identity => Ok(out),
+            _ => Err("root".into()),
+        }
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+    .map_err(RelocationError::CandidateMismatch)?;
+    Ok(core::RelocationPlan {
+        source: source.into(),
+        expected_revision: revision(rev)?,
+        binding_revision: revision(binding)?,
+        root,
+        root_identity: identity,
+        verified,
+        out_of_scope: out_of_scope.into_iter().map(|(id, ..)| id).collect(),
+    })
+}
+
+/// Commit a reviewed relocation. Stat facts are gathered under the domain
+/// lock but outside the writer transaction; the decision rechecks the source
+/// revision and binding, the root volume, every verified file's fingerprint
+/// and overlap. Excluded files are not offered at the new root.
+pub async fn commit_relocation(
+    app: &App,
+    plan: &core::RelocationPlan,
+) -> Result<SourceView, RelocationError> {
+    let _guard = app.jobs.lock().await;
+    let paths: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,relative_path FROM media_files WHERE library_id=?")
+            .bind(&plan.source)
+            .fetch_all(&app.db)
+            .await?;
+    let paths: std::collections::BTreeMap<String, String> = paths.into_iter().collect();
+    let root = plan.root.clone();
+    let verified: Vec<(String, Option<String>)> = plan
+        .verified
+        .iter()
+        .map(|(id, _)| (id.clone(), paths.get(id).cloned()))
+        .collect();
+    let (root_identity, fingerprints) = tokio::task::spawn_blocking(move || {
+        let identity = std::fs::metadata(&root)
+            .ok()
+            .map(|m| crate::db::root_identity(&m));
+        let fingerprints = verified
+            .into_iter()
+            .map(|(id, path)| {
+                let stamp = path.and_then(|p| {
+                    crate::scan::open_file(Path::new(&root), Path::new(&p))
+                        .and_then(|f| Ok(crate::scan::fingerprint(&f.metadata()?)))
+                        .ok()
+                });
+                (id, stamp)
+            })
+            .collect();
+        (identity, fingerprints)
+    })
+    .await
+    .map_err(anyhow::Error::from)?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let (rev, binding): (i64, i64) =
+        sqlx::query_as("SELECT revision,binding_revision FROM sources WHERE id=?")
+            .bind(&plan.source)
+            .fetch_one(&mut *tx)
+            .await?;
+    let others: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries WHERE id<>?")
+        .bind(&plan.source)
+        .fetch_all(&mut *tx)
+        .await?;
+    let refs: Vec<&str> = others.iter().map(String::as_str).collect();
+    let overlapping_root = refs
+        .iter()
+        .find(|r| **r == plan.root)
+        .map(|r| r.to_string())
+        .or_else(|| core::overlapping(&plan.root, &refs).map(str::to_owned));
+    core::relocation_commit(
+        plan,
+        &core::RelocationFacts {
+            revision: revision(rev)?,
+            binding_revision: revision(binding)?,
+            root_identity,
+            fingerprints,
+            overlapping_root,
+        },
+    )
+    .map_err(RelocationError::Conflict)?;
+    sqlx::query("UPDATE libraries SET root=?,root_identity=?,enabled=1,revision=revision+1,binding_revision=binding_revision+1 WHERE id=?")
+        .bind(&plan.root)
+        .bind(&plan.root_identity)
+        .bind(&plan.source)
+        .execute(&mut *tx)
+        .await?;
+    for (file, stamp) in &plan.verified {
+        sqlx::query("UPDATE media_files SET fingerprint=?,available=1 WHERE id=?")
+            .bind(stamp)
+            .bind(file)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for file in &plan.out_of_scope {
+        sqlx::query("UPDATE media_files SET available=0 WHERE id=? AND available=1")
+            .bind(file)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(get_source(&app.db, &plan.source).await?)
 }

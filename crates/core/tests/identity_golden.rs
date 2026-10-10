@@ -443,3 +443,41 @@ fn explicit_versions_order_groups_and_relationships() {
     );
     assert!(validate_relationship("a", "a", RelationshipKind::CreatedBy, &edges).is_err());
 }
+
+#[test]
+fn merges_remap_relationships_and_order_memberships_follow_ancestry() {
+    use playscale_core::identity::{
+        Edge, RelationshipKind::*, order_membership_valid, remap_relationships,
+    };
+    let edge = |id: &str, s: &str, t: &str, k| Edge {
+        id: id.into(),
+        source: s.into(),
+        target: t.into(),
+        kind: k,
+    };
+    let edges = vec![
+        edge("1", "dup", "show", ExtraOf),
+        edge("2", "film", "show", ExtraOf),
+        edge("3", "dup", "film", CreatedBy),
+        edge("4", "film", "dup", PerformedBy),
+    ];
+    let remap = remap_relationships(&edges, &["dup".into()], "film").unwrap();
+    // dup->show becomes a duplicate of film->show; dup<->film become self edges.
+    assert_eq!(remap.deletes, ["1", "3", "4"]);
+    assert!(remap.updates.is_empty());
+    let chain = vec![edge("a", "x", "y", PartOf), edge("b", "y", "dup", PartOf)];
+    assert!(
+        remap_relationships(&chain, &["dup".into()], "x").is_err(),
+        "x part_of y part_of x"
+    );
+    let ok = remap_relationships(&chain, &["dup".into()], "z").unwrap();
+    assert_eq!(
+        ok.updates,
+        [("b".to_string(), "y".to_string(), "z".to_string())]
+    );
+    assert!(order_membership_valid(
+        &["e1".into(), "s1".into(), "show".into()],
+        "show"
+    ));
+    assert!(!order_membership_valid(&["split-off".into()], "show"));
+}

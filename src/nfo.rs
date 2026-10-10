@@ -97,30 +97,9 @@ pub(crate) async fn publish(
     match sidecar {
         Sidecar::Unusable => Ok(()),
         Sidecar::Absent => {
-            // Only the file that supplied a contribution can withdraw it, and
-            // only if a manual identification does not pin its identity.
-            let origin: Option<String> =
-                sqlx::query_scalar("SELECT item_id FROM nfo_origins WHERE file_id=?")
-                    .bind(file)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-            let Some(owner) = origin else {
-                return Ok(());
-            };
-            if !crate::matching::provider_identity_allowed(conn, &owner, SOURCE, None).await? {
-                return Ok(());
-            }
-            sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
-                .bind(&owner)
-                .bind(SOURCE)
-                .execute(&mut *conn)
-                .await?;
-            sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
-                .bind(&owner)
-                .execute(&mut *conn)
-                .await?;
-            crate::metadata::project_title(conn, &owner).await?;
-            Ok(())
+            // Every work this file's sidecar supplied loses that contribution,
+            // each subject to its own manual pin.
+            withdraw(conn, file, None).await
         }
         Sidecar::Parsed(parsed) => {
             let document = serde_json::to_string(&parsed.contribution)?;
@@ -156,6 +135,9 @@ pub(crate) async fn publish(
                     other?;
                 }
             }
+            // A file supplies one work: contributions it left on works it no
+            // longer belongs to (after a split) are withdrawn.
+            withdraw(conn, file, Some(&item)).await?;
             sqlx::query("INSERT INTO nfo_origins VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET file_id=excluded.file_id")
                 .bind(&item)
                 .bind(file)
@@ -165,4 +147,33 @@ pub(crate) async fn publish(
             Ok(())
         }
     }
+}
+
+/// Withdraw the `nfo` contribution from every work whose origin is `file`,
+/// except `keep`, unless a manual identification pins that work's identity.
+async fn withdraw(
+    conn: &mut SqliteConnection,
+    file: &str,
+    keep: Option<&str>,
+) -> anyhow::Result<()> {
+    let owners: Vec<String> = sqlx::query_scalar("SELECT item_id FROM nfo_origins WHERE file_id=?")
+        .bind(file)
+        .fetch_all(&mut *conn)
+        .await?;
+    for owner in owners.into_iter().filter(|o| Some(o.as_str()) != keep) {
+        if !crate::matching::provider_identity_allowed(conn, &owner, SOURCE, None).await? {
+            continue;
+        }
+        sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
+            .bind(&owner)
+            .bind(SOURCE)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
+            .bind(&owner)
+            .execute(&mut *conn)
+            .await?;
+        crate::metadata::project_title(conn, &owner).await?;
+    }
+    Ok(())
 }

@@ -1088,3 +1088,77 @@ pub fn validate_relationship(
     }
     Ok(())
 }
+
+/// An order-group membership stays valid only while the timeline's work
+/// descends from the group's work (the rule `place_in_order` enforces).
+/// Merges and splits re-check it for every timeline they move.
+pub fn order_membership_valid(ancestors: &[Id], group_owner: &str) -> bool {
+    ancestors.iter().any(|a| a == group_owner)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edge {
+    pub id: Id,
+    pub source: Id,
+    pub target: Id,
+    pub kind: RelationshipKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRemap {
+    /// `(edge id, new source, new target)` for edges touching retired works.
+    pub updates: Vec<(Id, Id, Id)>,
+    /// Edges that would become self edges or duplicates after remapping.
+    pub deletes: Vec<Id>,
+}
+
+/// Remap relationships of works retired by a merge onto the target. Self
+/// edges and duplicates are dropped; a remap that would close a cycle in a
+/// containment kind rejects the merge.
+pub fn remap_relationships(
+    edges: &[Edge],
+    retired: &[Id],
+    target: &str,
+) -> Result<EdgeRemap, IdentityError> {
+    let map = |id: &Id| {
+        if retired.contains(id) {
+            target.to_string()
+        } else {
+            id.clone()
+        }
+    };
+    let mut remap = EdgeRemap::default();
+    let mut kept: Vec<(Id, Id, RelationshipKind)> = Vec::new();
+    // Untouched edges first so a remapped duplicate is the one dropped.
+    let (touched, untouched): (Vec<&Edge>, Vec<&Edge>) = edges
+        .iter()
+        .partition(|e| retired.contains(&e.source) || retired.contains(&e.target));
+    for edge in untouched {
+        kept.push((edge.source.clone(), edge.target.clone(), edge.kind));
+    }
+    for edge in touched {
+        let (source, target) = (map(&edge.source), map(&edge.target));
+        let duplicate = kept
+            .iter()
+            .any(|(s, t, k)| *s == source && *t == target && *k == edge.kind);
+        if source == target || duplicate {
+            remap.deletes.push(edge.id.clone());
+        } else {
+            kept.push((source.clone(), target.clone(), edge.kind));
+            remap.updates.push((edge.id.clone(), source, target));
+        }
+    }
+    // The resulting graph must stay acyclic for containment kinds.
+    for (i, (source, target, kind)) in kept.iter().enumerate() {
+        let others: Vec<(Id, Id, RelationshipKind)> = kept
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, e)| e.clone())
+            .collect();
+        if validate_relationship(source, target, *kind, &others).is_err() {
+            return Err(invalid("merge would create a relationship cycle"));
+        }
+    }
+    Ok(remap)
+}

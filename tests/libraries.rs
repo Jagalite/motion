@@ -308,3 +308,117 @@ async fn v1_registration_pairs_a_source_only_root_once() {
     let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
     assert_eq!(library.source_ids, std::slice::from_ref(&source.id));
 }
+
+#[tokio::test]
+async fn deleting_libraries_and_sources_never_touches_originals() {
+    let f = Fixture::new().await;
+    let used = f.source("used", &[]).await;
+    let empty = f.source("empty", &[]).await;
+    std::fs::write(f.root("used").join("film.mp4"), b"film").unwrap();
+    let library = libraries::save_library(
+        &f.app,
+        None,
+        "L",
+        LibraryKind::Mixed,
+        "",
+        std::slice::from_ref(&used.id),
+    )
+    .await
+    .unwrap();
+    // A source referenced by a library cannot be removed.
+    let used_view = libraries::get_source(&f.app.db, &used.id).await.unwrap();
+    assert!(matches!(
+        libraries::delete_source(&f.app, &used.id, used_view.revision).await,
+        Err(libraries::LibraryError::Busy)
+    ));
+    f.scan(&used.id).await;
+    assert!(matches!(
+        libraries::delete_library(&f.app, &library.id, 0).await,
+        Err(libraries::LibraryError::Rejected(
+            SourceError::StaleRevision
+        ))
+    ));
+    libraries::delete_library(&f.app, &library.id, library.revision)
+        .await
+        .unwrap();
+    assert!(
+        libraries::get_library(&f.app.db, &library.id)
+            .await
+            .is_err()
+    );
+    // With cataloged files the source is disabled, not deleted.
+    let used_view = libraries::get_source(&f.app.db, &used.id).await.unwrap();
+    assert_eq!(
+        libraries::delete_source(&f.app, &used.id, used_view.revision)
+            .await
+            .unwrap(),
+        libraries::SourceRemoval::Disabled
+    );
+    assert!(
+        f.root("used").join("film.mp4").exists(),
+        "originals untouched"
+    );
+    let available: bool = sqlx::query_scalar("SELECT available FROM media_files")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(!available);
+    // An unused source with no catalog is deleted outright.
+    assert_eq!(
+        libraries::delete_source(&f.app, &empty.id, empty.revision)
+            .await
+            .unwrap(),
+        libraries::SourceRemoval::Deleted
+    );
+    assert!(libraries::get_source(&f.app.db, &empty.id).await.is_err());
+}
+
+#[tokio::test]
+async fn relocation_is_previewed_then_committed_against_unchanged_facts() {
+    let f = Fixture::new().await;
+    let source = f.source("old", &[]).await;
+    std::fs::write(f.root("old").join("a.mp4"), b"alpha").unwrap();
+    f.scan(&source.id).await;
+    let moved = f.dir.path().join("new");
+    std::fs::rename(f.root("old"), &moved).unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
+    assert_eq!(plan.verified.len(), 1);
+    // The file changes after preview: commit is refused.
+    std::fs::write(moved.join("a.mp4"), b"alpha!").unwrap();
+    assert!(matches!(
+        libraries::commit_relocation(&f.app, &plan).await,
+        Err(libraries::RelocationError::Conflict(
+            playscale_core::sources::RelocationConflict::FileChanged(_)
+        ))
+    ));
+    std::fs::write(moved.join("a.mp4"), b"alpha").unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
+    let view = libraries::commit_relocation(&f.app, &plan).await.unwrap();
+    assert_eq!(view.binding_revision, source.binding_revision + 1);
+    assert!(
+        matches!(
+            libraries::commit_relocation(&f.app, &plan).await,
+            Err(libraries::RelocationError::Conflict(
+                playscale_core::sources::RelocationConflict::SourceChanged
+            ))
+        ),
+        "a committed plan cannot be replayed"
+    );
+    // A candidate missing content is rejected at preview.
+    let empty = f.root("empty");
+    let candidate = administration::candidate_root(&f.app, empty).await.unwrap();
+    assert!(matches!(
+        libraries::preview_relocation(&f.app, &source.id, candidate).await,
+        Err(libraries::RelocationError::CandidateMismatch(_))
+    ));
+}

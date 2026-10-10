@@ -386,3 +386,23 @@ pub async fn get(db: &sqlx::SqlitePool, id: &str) -> Result<ScanView, ScanError>
         sources,
     })
 }
+
+/// Recent scan requests, newest first, optionally for one library.
+pub async fn list(
+    db: &sqlx::SqlitePool,
+    library: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ScanView>, ScanError> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM scan_requests WHERE (?1 IS NULL OR library_id=?1) ORDER BY created_at DESC,rowid DESC LIMIT ?2",
+    )
+    .bind(library)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(db)
+    .await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(get(db, &id).await?);
+    }
+    Ok(out)
+}
