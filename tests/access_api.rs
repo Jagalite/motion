@@ -612,15 +612,14 @@ async fn browser_sessions_require_origin_cookie_flags_and_csrf() {
         .await;
     assert_eq!(session.status, StatusCode::OK, "{:?}", session.body);
     let cookie = session.headers["set-cookie"].to_str().unwrap().to_owned();
-    for flag in [
-        "HttpOnly",
-        "SameSite=Strict",
-        "Path=/api/v2",
-        "Max-Age=43200",
-    ] {
+    for flag in ["HttpOnly", "SameSite=Strict", "Path=/;", "Max-Age=43200"] {
         assert!(cookie.contains(flag), "{cookie}");
     }
     assert!(!cookie.contains("Secure"), "plain-http origin");
+    assert!(session.headers.get_all("set-cookie").iter().any(|v| {
+        let value = v.to_str().unwrap();
+        value.contains("Path=/api/v2;") && value.contains("Max-Age=0")
+    }));
     let pair = cookie.split(';').next().unwrap().to_owned();
     let csrf = session.body["csrf_token"].as_str().unwrap().to_owned();
     let read = f
@@ -1266,7 +1265,7 @@ async fn problems_contract_and_capabilities() {
     assert_eq!(caps.status, StatusCode::OK, "{:?}", caps.body);
     assert_eq!(caps.body["server_id"], health.body["server_id"]);
     assert_eq!(caps.body["server_epoch"], health.body["server_epoch"]);
-    assert_eq!(caps.body["schema_version"], "14");
+    assert_eq!(caps.body["schema_version"], "19");
     assert_eq!(
         caps.body["contract_digest"],
         playscale::v2::system::contract_digest()
@@ -2184,4 +2183,375 @@ async fn ingress_capability_separates_implementation_configuration_and_qualifica
         assert_eq!(feature["qualification"], "unqualified");
         assert_eq!(feature["receipt_ids"], json!([]));
     }
+}
+
+#[tokio::test]
+async fn logical_libraries_are_scoped_before_paging_and_authorize_source_files() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (file, revision) = f.scanned_file("scope.mp4", b"0123456789").await;
+    let operator = bearer(OPERATOR);
+    let input =
+        json!({"name":"Logical movies","kind":"movies","language":"en","source_ids":[f.library]});
+    let headers = [
+        ("authorization", operator.as_str()),
+        ("idempotency-key", "logical-library-create-1"),
+    ];
+    let created = f
+        .call("POST", "/api/v2/libraries", Some(input.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let logical = created.body["id"].as_str().unwrap();
+    assert_ne!(logical, f.library);
+    assert_eq!(created.body["revision"], "1");
+    let replay = f
+        .call("POST", "/api/v2/libraries", Some(input), &headers)
+        .await;
+    assert_eq!(replay.body, created.body);
+    let conflict = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(json!({"name":"Different","kind":"movies","language":"en","source_ids":[]})),
+            &headers,
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let (device, token) = f
+        .pair(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    let etag = f.device_etag(&device).await;
+    let policy = f.call("PUT", &format!("/api/v2/devices/{device}/policy"), Some(json!({"library_ids":[logical],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[],"permissions":["catalog:read","playback:request"]})), &[("authorization", &operator),("if-match", &etag)]).await;
+    assert_eq!(policy.status, StatusCode::OK, "{}", policy.body);
+    let auth = bearer(&token);
+    let listed = f
+        .call(
+            "GET",
+            "/api/v2/libraries?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(listed.body["items"][0]["id"], logical);
+    assert!(listed.body["next_cursor"].is_null());
+    let hidden = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{}", f.library),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    let (status, _, bytes) = f
+        .bytes(
+            &format!("/api/v2/media/files/{file}/content?revision={revision}"),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"0123456789");
+    let catalog = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(catalog.status, StatusCode::OK, "{}", catalog.body);
+    assert_eq!(catalog.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog.body["items"][0]["library_ids"], json!([logical]));
+}
+
+#[tokio::test]
+async fn source_library_crud_requires_authority_preconditions_and_preserves_media() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let root = f._dir.path().join("new-source");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+    let input = json!({"name":"New source","root_path":root,"exclusions":[]});
+    let auth = bearer(OPERATOR);
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "source-create-crud-1"),
+    ];
+    assert_eq!(
+        f.call("POST", "/api/v2/sources", Some(input.clone()), &[])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    let created = f
+        .call("POST", "/api/v2/sources", Some(input.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert!(created.body["binding_revision"].is_string());
+    let replay = f
+        .call("POST", "/api/v2/sources", Some(input), &headers)
+        .await;
+    assert_eq!(replay.body, created.body);
+    let source = created.body["id"].as_str().unwrap();
+    let library_input =
+        json!({"name":"Library","kind":"mixed","language":"","source_ids":[source]});
+    let library = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(library_input.clone()),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "library-create-crud-1"),
+            ],
+        )
+        .await;
+    assert_eq!(library.status, StatusCode::CREATED, "{}", library.body);
+    let library_path = format!("/api/v2/libraries/{}", library.body["id"].as_str().unwrap());
+    assert_eq!(
+        f.call(
+            "PUT",
+            &library_path,
+            Some(library_input.clone()),
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    assert_eq!(
+        f.call(
+            "PUT",
+            &library_path,
+            Some(library_input),
+            &[("authorization", &auth), ("if-match", "\"r-0\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let source_path = format!("/api/v2/sources/{source}");
+    let source_etag = created.headers["etag"].to_str().unwrap();
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &source_path,
+            None,
+            &[("authorization", &auth), ("if-match", source_etag)]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &library_path,
+            None,
+            &[
+                ("authorization", &auth),
+                ("if-match", library.headers["etag"].to_str().unwrap())
+            ]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &source_path,
+            None,
+            &[("authorization", &auth), ("if-match", source_etag)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(
+        f.call("GET", &source_path, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn topcoat_uses_real_authorized_library_reads_and_keeps_api_json() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let response = app
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'")
+    );
+    let operator = bearer(OPERATOR);
+    let response = app
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[("authorization", &operator)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Movies"), "{html}");
+    assert!(!html.contains("Development mock"));
+    assert!(!html.contains(OPERATOR));
+    let response = app
+        .clone()
+        .oneshot(f.request(
+            "GET",
+            "/api/v2/not-real",
+            None,
+            &[("authorization", &operator)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    let response = app
+        .oneshot(f.request("HEAD", "/", None, &[("authorization", &operator)]))
+        .await
+        .unwrap();
+    assert!(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn diagnostics_are_admin_only_and_do_not_expose_worker_output() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let denied = f.call("GET", "/api/v2/admin/diagnostics", None, &[]).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at,error) VALUES ('failed-job',?,'failed',0,'secret /private/media/path')").bind(&f.library).execute(&f.app.db).await.unwrap();
+    let d = f
+        .call(
+            "GET",
+            "/api/v2/admin/diagnostics",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(d.status, StatusCode::OK, "{:?}", d.body);
+    assert_eq!(d.body["worker_errors"], json!(["scan:failed-job:failed"]));
+    assert!(!d.body.to_string().contains("private"));
+    assert!(
+        d.body["uptime_seconds"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let (device, token) = f.pair(&["default"], &["processing:request"]).await;
+    let auth = bearer(&token);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at,requester_id) VALUES ('owned',?,'queued',0,?)").bind(&f.library).bind(&device).execute(&f.app.db).await.unwrap();
+    let page = f
+        .call(
+            "GET",
+            "/api/v2/jobs?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert_eq!(page.body["items"][0]["id"], "owned");
+    let cancel = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/cancel",
+            None,
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "cancel-owned-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK, "{:?}", cancel.body);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/cancel",
+            None,
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "cancel-owned-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.body, replay.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at) VALUES ('legacy',?,'queued',0)")
+        .bind(&f.library)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let hidden = f
+        .call(
+            "GET",
+            "/api/v2/jobs/legacy",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    let page = f
+        .call(
+            "GET",
+            "/api/v2/jobs?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(page.body["items"].as_array().unwrap().len(), 1);
+    assert!(page.body["next_cursor"].is_null());
+    let busy = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/retry",
+            None,
+            &[
+                ("authorization", &operator),
+                ("idempotency-key", "retry-busy-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(busy.status, StatusCode::CONFLICT, "{:?}", busy.body);
 }

@@ -3,10 +3,14 @@
 //! `playscale_core::access`; this module supplies stored facts and executes
 //! the decided effects inside one SQLite transaction.
 pub mod auth;
+pub mod catalog;
 pub mod content;
 pub mod cors;
 pub mod events;
 pub mod identity;
+pub mod jobs;
+pub mod libraries;
+pub mod metadata;
 pub mod organization;
 pub mod system;
 
@@ -100,6 +104,7 @@ impl ApiSettings {
 
 /// Process-lifetime state of the v2 adapter.
 pub struct Runtime {
+    pub(crate) renders: std::sync::Arc<tokio::sync::Semaphore>,
     pub settings: ApiSettings,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
     /// Hash and deadline of the one-use desktop bootstrap secret.
@@ -117,6 +122,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(mode: AccessMode, key: [u8; 32]) -> Self {
         Self {
+            renders: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
             settings: ApiSettings::default(),
             buckets: Mutex::new(HashMap::new()),
             bootstrap: Mutex::new(None),
@@ -274,14 +280,17 @@ impl From<sqlx::Error> for Problem {
     fn from(e: sqlx::Error) -> Self {
         match &e {
             sqlx::Error::RowNotFound => Self::not_found(),
-            sqlx::Error::Database(d) if d.message().contains("database is locked") => Self {
-                retry_after: Some(1),
-                ..Self::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "database_busy",
-                    "The database is busy; retry the request",
-                )
-            },
+            sqlx::Error::Database(d) if d.message().contains("database is locked") => {
+                system::DB_BUSY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Self {
+                    retry_after: Some(1),
+                    ..Self::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "database_busy",
+                        "The database is busy; retry the request",
+                    )
+                }
+            }
             _ => Self::internal(e),
         }
     }
@@ -702,7 +711,9 @@ pub fn scope_clause(
         Nothing => (false, "[]".to_string()),
     };
     (
-        format!("(? OR {column} IN (SELECT value FROM json_each(?)))"),
+        format!(
+            "(? OR {column} IN (SELECT source_id FROM library_sources WHERE library_id IN (SELECT value FROM json_each(?))))"
+        ),
         all,
         ids,
     )
@@ -734,6 +745,7 @@ pub fn router() -> Router<App> {
     Router::new()
         .route("/openapi.json", get(system::openapi))
         .route("/system/health", get(system::health))
+        .route("/admin/diagnostics", get(system::diagnostics))
         .route("/system/capabilities", get(system::capabilities))
         .route("/me", get(identity::me))
         .route("/auth/pairings", post(identity::create_pairing))
@@ -782,6 +794,10 @@ pub fn router() -> Router<App> {
             get(content::file_content).head(content::file_content),
         )
         .merge(organization::routes())
+        .merge(catalog::routes())
+        .merge(libraries::routes())
+        .merge(jobs::routes())
+        .merge(metadata::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

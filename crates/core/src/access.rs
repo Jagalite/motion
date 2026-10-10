@@ -720,6 +720,7 @@ pub fn recheck(subscribed: u64, current: &Result<Principal, AccessError>) -> Rec
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Resource {
     Library(String),
+    Source,
     /// Catalog-derived resources carry the libraries that contain them now
     /// and, for file mutations, the library the mutated file was in.
     Item {
@@ -728,6 +729,9 @@ pub enum Resource {
     },
     Profile(String),
     Device(String),
+    Job {
+        requester: String,
+    },
     /// Administrative or unclassified: visible to administrators only.
     Administrative,
 }
@@ -742,6 +746,7 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
     let catalog = principal.allows(Permission::CatalogRead);
     match resource {
         Resource::Library(id) => catalog && principal.policy.library_ids.contains(id),
+        Resource::Source => principal.allows(Permission::SourcesManage),
         // Rating/label evidence is not yet attached to hints; fail closed.
         Resource::Item { libraries, .. } => {
             catalog
@@ -752,6 +757,7 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
         }
         Resource::Profile(id) => principal.may_use_profile(id),
         Resource::Device(id) => principal.device_id.as_deref() == Some(id),
+        Resource::Job { requester } => owns_job(principal, requester),
         Resource::Administrative => false,
     }
 }
@@ -795,6 +801,30 @@ pub fn catalog_scope(principal: &Principal) -> CatalogScope {
     } else {
         CatalogScope::Libraries(principal.policy.library_ids.clone())
     }
+}
+
+/// Whether a principal may change a catalog item contained in `libraries`.
+/// Reading needs one readable library; curation (attribute replacement,
+/// edition creation, merge, split) needs every library the item belongs to,
+/// so a restricted writer never moves or reshapes rows it cannot read. An
+/// item with no library membership belongs to no restricted scope.
+pub fn may_curate(scope: &CatalogScope, libraries: &BTreeSet<String>) -> bool {
+    match scope {
+        CatalogScope::All => true,
+        CatalogScope::Libraries(allowed) => {
+            !libraries.is_empty() && libraries.iter().all(|l| allowed.contains(l))
+        }
+        CatalogScope::Nothing => false,
+    }
+}
+
+/// Lifetime of a reviewed catalog change plan token. The token only names the
+/// reviewed plan; commit rechecks authorization and every recorded revision.
+pub const PLAN_TOKEN_TTL_SECONDS: i64 = 15 * 60;
+
+/// A plan token is accepted strictly before its expiry instant.
+pub fn plan_token_current(expires_at: i64, now: i64) -> bool {
+    now < expires_at
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -845,7 +875,7 @@ pub enum TicketPurpose {
 /// Current facts about a file, observed by the adapter.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileFacts {
-    pub library_id: String,
+    pub library_ids: BTreeSet<String>,
     pub revision: String,
 }
 
@@ -893,7 +923,7 @@ pub fn grant_file_ticket(
         return Err(TicketError::Forbidden(permission));
     }
     let facts = facts
-        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .filter(|f| catalog_scope(principal).admits(f.library_ids.iter()))
         .ok_or(TicketError::NotFound)?;
     if facts.revision != requested_revision {
         return Err(TicketError::SourceChanged);
@@ -932,7 +962,7 @@ pub fn admit_file_ticket(
         return Err(TicketError::Forbidden(permission));
     }
     let facts = facts
-        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .filter(|f| catalog_scope(principal).admits(f.library_ids.iter()))
         .ok_or(TicketError::NotFound)?;
     if facts.revision != ticket.revision || requested_revision.is_some_and(|r| r != ticket.revision)
     {
@@ -953,7 +983,7 @@ pub fn admit_file_bytes(
         return Err(TicketError::Forbidden(Permission::PlaybackRequest));
     }
     facts
-        .filter(|f| catalog_scope(principal).library(&f.library_id))
+        .filter(|f| catalog_scope(principal).admits(f.library_ids.iter()))
         .map(|_| ())
         .ok_or(TicketError::NotFound)
 }
@@ -981,6 +1011,28 @@ mod tests {
             generation: 1,
             expires_at,
         }
+    }
+
+    #[test]
+    fn curation_requires_every_library_readable() {
+        let a: BTreeSet<String> = ["a".to_string()].into();
+        let ab: BTreeSet<String> = ["a".to_string(), "b".to_string()].into();
+        let none = BTreeSet::new();
+        let scope = CatalogScope::Libraries(a.clone());
+        assert!(may_curate(&scope, &a));
+        assert!(scope.admits(ab.iter()));
+        assert!(!may_curate(&scope, &ab));
+        assert!(!may_curate(&scope, &none));
+        assert!(may_curate(&CatalogScope::All, &none));
+        assert!(may_curate(&CatalogScope::All, &ab));
+        assert!(!may_curate(&CatalogScope::Nothing, &a));
+    }
+
+    #[test]
+    fn plan_tokens_expire_at_their_instant() {
+        assert!(plan_token_current(100, 99));
+        assert!(!plan_token_current(100, 100));
+        assert!(!plan_token_current(100, 101));
     }
 
     #[test]
@@ -1374,13 +1426,30 @@ mod tests {
         p.grant.permissions.insert(Permission::PlaybackRequest);
         p.policy.library_ids.insert("l1".into());
         let facts = FileFacts {
-            library_id: "l1".into(),
+            library_ids: ["l1".into()].into(),
             revision: "r1".into(),
         };
         let hidden = FileFacts {
-            library_id: "l2".into(),
+            library_ids: ["l2".into()].into(),
             ..facts.clone()
         };
+        // A physical source can serve several logical libraries. A byte grant
+        // requires at least one current membership, and removal applies to
+        // existing tickets just as it does to direct requests.
+        let mut shared = facts.clone();
+        shared.library_ids.insert("l2".into());
+        assert_eq!(admit_file_bytes(&p, Some(&shared)), Ok(()));
+        shared.library_ids.remove("l1");
+        assert_eq!(
+            admit_file_bytes(&p, Some(&shared)),
+            Err(TicketError::NotFound)
+        );
+        shared.library_ids.clear();
+        assert_eq!(
+            admit_file_bytes(&p, Some(&shared)),
+            Err(TicketError::NotFound)
+        );
+
         let grant = |p: &Principal, purpose, rev: &str, f: Option<&FileFacts>, ttl| {
             grant_file_ticket(p, purpose, rev, f, ttl, Some(1_000), 900)
         };
@@ -1519,5 +1588,93 @@ mod tests {
         assert!(legacy_allowed(AccessMode::TrustedHousehold, false));
         assert!(!legacy_allowed(AccessMode::Restricted, false));
         assert!(legacy_allowed(AccessMode::Restricted, true));
+    }
+}
+
+/// Durable-job ownership survives HTTP retries and credential rotation. Legacy
+/// rows have no known requester and are administrative, never claimed on read.
+pub fn owns_job(principal: &Principal, requester: &str) -> bool {
+    principal.is_admin() || (requester != "legacy" && requester == principal.id)
+}
+
+#[cfg(test)]
+mod logical_scope_properties {
+    use super::*;
+    fn subset(mask: u8) -> BTreeSet<String> {
+        (0..3)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .map(|bit| format!("library-{bit}"))
+            .collect()
+    }
+    #[test]
+    fn file_and_ticket_reads_use_current_logical_memberships() {
+        // Exhaust all policies and source memberships over three logical
+        // libraries, current/replaced content and before/at ticket expiry.
+        for allowed in 0..8 {
+            for memberships in 0..8 {
+                for changed in [false, true] {
+                    for now in [59, 60] {
+                        let mut principal = Principal::operator();
+                        principal.id = "device".into();
+                        principal.grant.permissions =
+                            [Permission::CatalogRead, Permission::PlaybackRequest].into();
+                        principal.policy.library_ids = subset(allowed);
+                        let facts = FileFacts {
+                            library_ids: subset(memberships),
+                            revision: if changed { "r2" } else { "r1" }.into(),
+                        };
+                        let visible = allowed & memberships != 0;
+                        assert_eq!(admit_file_bytes(&principal, Some(&facts)).is_ok(), visible);
+                        let ticket = FileTicket {
+                            file_id: "file".into(),
+                            revision: "r1".into(),
+                            purpose: TicketPurpose::Playback,
+                            expires_at: 60,
+                            revoked: false,
+                        };
+                        let result = admit_file_ticket(
+                            &ticket,
+                            "file",
+                            None,
+                            &Ok(principal),
+                            Some(&facts),
+                            now,
+                        );
+                        assert_eq!(
+                            result.is_ok(),
+                            visible && !changed && now < 60,
+                            "allowed={allowed} memberships={memberships} changed={changed} now={now}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn job_ownership_and_events_never_claim_legacy_work() {
+        let mut principal = Principal::operator();
+        principal.id = "device".into();
+        principal.grant.permissions =
+            [Permission::ProcessingRequest, Permission::EventsRead].into();
+        for owner in ["device", "other", "legacy"] {
+            assert_eq!(owns_job(&principal, owner), owner == "device");
+            assert_eq!(
+                visible(
+                    &principal,
+                    &Resource::Job {
+                        requester: owner.into()
+                    }
+                ),
+                owner == "device"
+            );
+        }
+        principal.grant.permissions.remove(&Permission::EventsRead);
+        assert!(!visible(
+            &principal,
+            &Resource::Job {
+                requester: "device".into()
+            }
+        ));
+        assert!(owns_job(&Principal::operator(), "legacy"));
     }
 }

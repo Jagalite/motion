@@ -148,7 +148,8 @@ async fn run() -> anyhow::Result<()> {
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
         );
     }
-    let router = api::router(app.clone(), assets);
+    let presentation = playscale::presentation::router(app.clone());
+    let router = api::router_with(app.clone(), assets, Some(presentation));
     let shutdown = CancellationToken::new();
     app.health
         .worker_running

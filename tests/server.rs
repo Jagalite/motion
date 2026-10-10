@@ -2775,12 +2775,3 @@ async fn exhausted_jobs_do_not_stop_workers_or_block_following_work() {
         StatusCode::CONFLICT
     );
 }
-
-/// Highest migration version shipped in `migrations/`.
-fn latest_migration() -> i64 {
-    std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .unwrap()
-        .filter_map(|e| e.unwrap().file_name().to_str()?.get(..4)?.parse().ok())
-        .max()
-        .unwrap()
-}

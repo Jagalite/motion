@@ -122,7 +122,22 @@ const MEDIA: [&str; 14] = [
 /// proven) incomplete rather than aborting or implying absence. Symlinks are not
 /// followed and nested mounts are boundaries: an unmounted volume's empty mount
 /// point must never prove that its files disappeared.
-fn inventory(root: &Path, stop: &CancellationToken) -> anyhow::Result<Inventory> {
+/// Load a source's normalized exclusions.
+async fn exclusions(db: &sqlx::SqlitePool, source: &str) -> anyhow::Result<Vec<String>> {
+    let text: String = sqlx::query_scalar("SELECT exclusions_json FROM libraries WHERE id=?")
+        .bind(source)
+        .fetch_one(db)
+        .await?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+fn inventory(
+    root: &Path,
+    exclusions: &[String],
+    stop: &CancellationToken,
+) -> anyhow::Result<Inventory> {
+    let out_of_scope =
+        |path: &Path| key(path).is_some_and(|k| playscale_core::sources::excluded(&k, exclusions));
     let root_device = device(&std::fs::symlink_metadata(root)?);
     let mut out = Inventory::default();
     let mut pending = vec![PathBuf::new()];
@@ -149,6 +164,11 @@ fn inventory(root: &Path, stop: &CancellationToken) -> anyhow::Result<Inventory>
         let mut reason = None;
         for entry in entries {
             let child = relative.join(entry.file_name());
+            // Excluded paths are outside the source's scope: neither listed,
+            // inspected, nor counted as unproven.
+            if out_of_scope(&child) {
+                continue;
+            }
             let Ok(kind) = entry.file_type() else {
                 reason = Some("unreadable_entry");
                 continue;
@@ -338,6 +358,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
             .bind(&job.library_id)
             .fetch_one(&app.db)
             .await?;
+    let inventory_scope = exclusions(&app.db, &job.library_id).await?;
     let path = PathBuf::from(root);
     let metadata_path = path.clone();
     let hold = permit.clone();
@@ -353,7 +374,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
     let hold = permit.clone();
     let mut traversal = tokio::task::spawn_blocking(move || {
         let _hold = hold;
-        inventory(&inventory_path, &inventory_stop)
+        inventory(&inventory_path, &inventory_scope, &inventory_stop)
     });
     let mut inventory = loop {
         tokio::select! {
@@ -471,11 +492,16 @@ async fn finish(
 ) -> anyhow::Result<()> {
     let _guard = app.jobs.lock().await;
     let current = db::get_job(&app.db, &job.id).await?;
-    let (root, enabled): (String, bool) =
-        sqlx::query_as("SELECT root_identity,enabled FROM libraries WHERE id=?")
-            .bind(&job.library_id)
-            .fetch_one(&app.db)
-            .await?;
+    let (root, enabled, binding_now, scope): (String, bool, i64, String) = sqlx::query_as(
+        "SELECT root_identity,enabled,binding_revision,exclusions_json FROM libraries WHERE id=?",
+    )
+    .bind(&job.library_id)
+    .fetch_one(&app.db)
+    .await?;
+    let scope: Vec<String> = serde_json::from_str(&scope)?;
+    // Jobs started before migration 0017 carry no binding; they are fenced by
+    // the root identity check alone.
+    let binding_at_start = current.binding_revision.unwrap_or(binding_now);
     let previous = current.state()?;
     let (next, effects) = playscale_core::scan::finish(
         &previous,
@@ -484,6 +510,8 @@ async fn finish(
             complete_inventory_roots: found.as_ref().and(complete_root),
             current_root: root,
             library_enabled: enabled,
+            binding_at_start: u64::try_from(binding_at_start)?,
+            binding_now: u64::try_from(binding_now)?,
         },
     );
     if next == previous && effects.is_empty() {
@@ -500,7 +528,7 @@ async fn finish(
         .bind(&job.library_id)
         .fetch_all(&mut *tx)
         .await?;
-        let plan = playscale_core::scan::reconcile_covered(
+        let (plan, excluded) = playscale_core::scan::reconcile_scoped(
             &old.iter()
                 .map(|r| playscale_core::scan::Existing {
                     id: r.0.clone(),
@@ -517,8 +545,11 @@ async fn finish(
                 })
                 .collect::<Vec<_>>(),
             &coverage,
+            &scope,
         );
-        for id in &plan.unavailable {
+        // Proven absences and newly excluded files both leave the browsable
+        // catalog; only the former is recorded as observed absence.
+        for id in plan.unavailable.iter().chain(&excluded) {
             sqlx::query("UPDATE media_files SET available=0 WHERE id=? AND available=1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -551,6 +582,10 @@ async fn finish(
             use playscale_core::scan::Assignment;
             let mut first_version = false;
             let (id, edition) = match assignment {
+                Assignment::OutOfScope => {
+                    assigned.push(String::new());
+                    continue;
+                }
                 Assignment::CopyOf { observation } => (
                     new_id(),
                     assigned
@@ -637,7 +672,9 @@ pub async fn worker(app: App, shutdown: CancellationToken) -> anyhow::Result<()>
             if let Some(row) = row {
                 let (next, effects) = transition(&row.state()?, Input::Start);
                 let runs = matches!(effects.as_slice(), [Effect::Run { .. }]);
-                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=? WHERE id=?")
+                // The attempt records the source binding it observes; a rebind
+                // before publication fences it.
+                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=?,binding_revision=(SELECT binding_revision FROM libraries WHERE id=jobs.library_id) WHERE id=?")
                     .bind(db::phase_name(next.phase))
                     .bind(next.attempt)
                     .bind((!runs).then_some("job attempt limit reached"))
