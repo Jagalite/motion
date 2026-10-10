@@ -298,8 +298,9 @@ fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
     anyhow::bail!("bootstrap descriptors are supported on Unix only")
 }
 
-/// Register for SIGINT and SIGTERM now; the returned future completes on
-/// either. Registration happens in this call, not on first poll.
+/// Register for SIGINT and SIGTERM (Ctrl+C on Windows) now; the returned
+/// future completes on either. Registration happens in this call, not on
+/// first poll.
 fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
     #[cfg(unix)]
     {
@@ -311,7 +312,15 @@ fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = anyhow:
             Ok(())
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+            Ok(())
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     Ok(async { Ok(tokio::signal::ctrl_c().await?) })
 }
 
@@ -346,7 +355,10 @@ mod tests {
             .build()
             .unwrap();
         for signal in [libc::SIGINT, libc::SIGTERM] {
-            let requested = runtime.block_on(async { super::shutdown_signal().unwrap() });
+            let requested = {
+                let _context = runtime.enter(); // signal() needs the runtime's driver
+                super::shutdown_signal().unwrap()
+            };
             // SAFETY: raise only queues a signal for this process.
             assert_eq!(unsafe { libc::raise(signal) }, 0);
             runtime
