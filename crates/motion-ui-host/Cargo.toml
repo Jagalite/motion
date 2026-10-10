@@ -13,7 +13,6 @@ playscale-core = { path = "../core" }
 anyhow = "1"
 axum = "=0.8.9"
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "=0.7.1", features = ["fs"] }
 topcoat = { git = "https://github.com/tokio-rs/topcoat", rev = "341f3ff2fe16a73af5469685cf597693af5acb25", default-features = false, features = ["router", "view", "tower", "discover"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +21,7 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 cap-std = "3"
 fs2 = "0.4"
+futures-util = "0.3"
 tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 mime_guess = "2"

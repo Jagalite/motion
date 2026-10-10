@@ -339,6 +339,14 @@ async fn failed_publication_cannot_acknowledge_or_consume_a_sequence() {
         .0,
         StatusCode::CONFLICT
     );
+    assert!(
+        !std::fs::read_dir(dir.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")),
+        "failed publication must remove its temporary log"
+    );
     std::fs::remove_dir(dir.path().join("events.json")).unwrap();
     let (a, b) = tokio::join!(
         request(
