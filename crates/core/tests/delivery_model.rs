@@ -491,8 +491,10 @@ impl Model for Deliveries {
                 position_ms,
                 ..
             } if rejected.is_none() => match position_ms {
-                Some(p) => a.playhead == Some((*active_generation, *p)),
-                None => a.playhead == b.playhead,
+                Some(p) if b.active == Some(*active_generation) => {
+                    a.playhead == Some((*active_generation, *p))
+                }
+                _ => a.playhead == b.playhead,
             },
             Input::Heartbeat { .. } => a.playhead == b.playhead,
             _ => true,
@@ -886,31 +888,11 @@ fn bounded_delivery_lifecycle_checks_production_reducer() {
     );
 }
 
-/// Playhead reports alternating between the active and pending generation
-/// change state (and its revision) indefinitely, so this graph is infinite: it
-/// is searched completely up to a fixed depth instead.
 #[test]
 fn bounded_delivery_playhead_checks_production_reducer() {
-    const DEPTH: usize = 24;
-    let report = stateless::explore::enumerate(
+    exhaust(
         &playhead(),
-        stateless::explore::SearchConfig {
-            max_states: 3_000_000,
-            max_transitions: 300_000_000,
-            max_depth: DEPTH,
-        },
-    )
-    .unwrap();
-    assert!(report.failure.is_none(), "{:?}", report.failure);
-    assert_eq!(report.skipped_checks, 0);
-    assert!(matches!(
-        report.termination,
-        stateless::explore::SearchTermination::GraphExhausted
-            | stateless::explore::SearchTermination::DepthBound
-    ));
-    println!(
-        "Stateless delivery playhead (2 generations, playhead 6s on either, pause 8s / resume 4s): {} states, {} edges, all paths to depth {DEPTH} ({:?})",
-        report.states, report.transitions, report.termination
+        "playhead (2 generations, playhead 6s, heartbeats for active and pending, pause 8s / resume 4s)",
     );
 }
 
