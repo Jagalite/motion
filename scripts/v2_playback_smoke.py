@@ -45,11 +45,20 @@ def main():
             def ready():
                 assert p.poll() is None, ('server exited', p.returncode)
                 return request(port, 'GET', '/ready')[0] == 200
-            wait_for(ready, seconds=60)
+            try:
+                wait_for(ready, seconds=60)
+            except BaseException:
+                # Never leave an untracked server behind a failed readiness wait.
+                if p.poll() is None:
+                    p.terminate()
+                    try: p.wait(timeout=10)
+                    except subprocess.TimeoutExpired: p.kill(); p.wait()
+                raise
             return p
 
-        process = boot()
+        process = None
         try:
+            process = boot()
             operator = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
 
             def api(method, path, body=None, auth=None, expected=None, extra=None):
@@ -229,8 +238,15 @@ def main():
             ok('live_audio_switch_by_replan_and_activation')
 
             # ---- crash: SIGKILL, restart, recovery
-            process.send_signal(signal.SIGKILL); process.wait()
+            process.send_signal(signal.SIGKILL); process.wait(); process = None
             process = boot()
+            # Durable progress first, before any write could restore it.
+            acknowledged = ack['viewing']
+            _, _, viewing = api('GET', f'/profiles/default/timelines/{timeline}/viewing', auth=auth, expected=200)
+            assert (viewing['position_ms'], viewing['revision'], viewing['session_id']) == \
+                (27000, acknowledged['revision'], sid), (viewing, acknowledged)
+            _, _, persisted = api('GET', f'/playback/viewing-sessions/{sid}', auth=auth, expected=200)
+            assert persisted['sequence'] == ack['session']['sequence'] and persisted['position_ms'] == 27000
             assert delivery(hls['id'])['status'] == 'interrupted'
             api('POST', f"/playback/delivery-sessions/{hls['id']}/heartbeat", {'active_generation': pending}, auth, 409)
             api('DELETE', f"/playback/delivery-sessions/{hls['id']}", auth=auth, expected=204)
@@ -254,7 +270,9 @@ def main():
             assert old['status'] == 'superseded'
             ok('resume_supersedes_the_previous_session')
         finally:
-            stop(process); log.close()
+            if process is not None:
+                stop(process)
+            log.close()
     print(json.dumps({'checks': checks, 'passed': len(checks),
                       'binary_sha256': hashlib.sha256(BINARY.read_bytes()).hexdigest(),
                       'fixture_sha256': hashlib.sha256(payload).hexdigest()}, indent=2))

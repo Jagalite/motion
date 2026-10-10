@@ -2,9 +2,10 @@
 crates/core/src/timeline_viewing.rs must make the Stateless model fail.
 
 Run from the repository root: python3 scripts/check_timeline_viewing_mutations.py
+Set KYOTO=/path/to/kyoto.py to submit each cargo run through that build queue.
 The source file is restored after every mutation.
 """
-import pathlib, subprocess, sys
+import json, os, pathlib, subprocess, sys, types
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'crates/core/src/timeline_viewing.rs'
@@ -22,9 +23,17 @@ MUTATIONS = [
 
 
 def model():
-    return subprocess.run(['cargo', 'test', '-p', 'playscale-core', '--release', '--test',
-                           'timeline_viewing_model', '--', '--nocapture'],
-                          cwd=ROOT, capture_output=True, text=True)
+    command = ['cargo', 'test', '-p', 'playscale-core', '--release', '--test',
+               'timeline_viewing_model', '--', '--nocapture']
+    kyoto = os.environ.get('KYOTO')
+    if not kyoto:
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    job = json.loads(subprocess.run([kyoto, 'submit', '--cwd', str(ROOT), '--', *command],
+                                    check=True, capture_output=True, text=True).stdout)
+    done = json.loads(subprocess.run([kyoto, 'wait', job['id']], check=True,
+                                     capture_output=True, text=True).stdout)
+    log = pathlib.Path(done['log']).read_text(errors='replace')
+    return types.SimpleNamespace(returncode=done['exit_code'], stdout=log, stderr=log)
 
 
 def main():
