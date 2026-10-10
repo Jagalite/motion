@@ -773,6 +773,16 @@ pub async fn record_viewing(
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
+            // The acknowledged logical playhead paces the bound delivery's
+            // encoder (an observation; a stale generation is ignored).
+            if matches!(event.status, Status::Playing | Status::Paused) {
+                delivery::report_playhead(
+                    &app,
+                    &next.session.delivery,
+                    event.generation,
+                    event.position_ms,
+                );
+            }
             Ok(tagged(StatusCode::OK, ack, next.session.revision))
         }
     }

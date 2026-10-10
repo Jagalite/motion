@@ -50,9 +50,18 @@ Adapters supply the facts and commit the decided records:
   with the delivery's first record and its admission receipt
   (`migrations/0033`). After a restart the owner reads the delivery as
   `interrupted`; commands are `409 delivery_closed`; close is idempotent.
-- Change (seek/replan) acknowledgements are recorded under the delivery's
-  lock together with the transition they acknowledge. They are as durable as
-  the staged generation itself; a restart interrupts both.
+- Change (seek/replan) and activation acknowledgements are recorded under the
+  delivery's lock together with the transition they acknowledge (core
+  `delivery_admission::decide`), and also in `idempotency_records` within the
+  command's write transaction, so an exact retry replays after a restart too.
+- An exact retry of an acknowledged admission is reauthorized without plan
+  expiry (`playback_session::reauthorize`); only a new admission needs a
+  fresh token (`fresh`).
+- Planning uses only whole, single-part version bindings whose reviewed file
+  revision is still current; timeline reads check the work and the edition,
+  like catalog timeline reads.
+- Accepted viewing events report the logical playhead to the bound delivery,
+  which paces its encoder.
 - Admission refusals keep their v2 problem code (for example `plan_expired`)
   instead of being re-mapped through the v1 error type.
 
@@ -100,6 +109,14 @@ routes is qualified separately (A11/A12).
 - Live conversion uses the software recipe only; hardware encoding and copy
   routes are not offered by the v2 planner. A conversion is refused when the
   client sets any bitrate limit, because the CRF recipe has no bitrate cap.
+- Multipart versions and interval (multi-episode) bindings are not planned:
+  they are reported as unavailable until a part-aware delivery exists.
+- Encoder pacing follows viewing events. A principal that plays a live
+  conversion without `viewing:write` sends no playhead, so its encoder pauses
+  45 s ahead of the requested start. The v2 heartbeat carries no position.
+- HDR sources are refused for byte delivery under `require_sdr` or to a
+  client reporting `hdr: unsupported`; no tone-mapped route exists.
+- Revision-local track pins (`a{n}`) require an exact `source` pin.
 - Next-in-order uses `timelines.order_group_id`/`order_position` only. Main has
   no placement writer until PR #4 merges, so tests place timelines by SQL.
 - v1 item-keyed progress and v2 timeline progress are separate authorities

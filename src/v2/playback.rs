@@ -7,7 +7,7 @@
 //! tokens, and executes the effects through `crate::delivery` and
 //! `crate::viewing`, which v1 shares.
 use super::{
-    Body, Problem,
+    Body, Problem, Scope,
     auth::Caller,
     catalog::{self, TimelineRow},
     content::file_facts,
@@ -209,7 +209,10 @@ pub(crate) async fn readable_timeline(
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(Problem::not_found)?;
-    catalog::load_item(conn, &access::catalog_scope(principal), &row.item_id, false).await?;
+    // The same visibility as catalog timeline reads: the work and the edition.
+    let scope = access::catalog_scope(principal);
+    catalog::load_item(conn, &scope, &row.item_id, false).await?;
+    catalog::require_edition(conn, &scope, &row.edition_id).await?;
     Ok(row)
 }
 
@@ -401,7 +404,6 @@ pub struct ClientCapability {
     audio_codecs: Vec<String>,
     #[allow(dead_code)]
     subtitle_modes: Vec<String>,
-    #[allow(dead_code)]
     hdr: String,
     max_height: Option<u32>,
     #[allow(dead_code)]
@@ -446,6 +448,7 @@ async fn original_of(
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 AND f.available=1 \
          AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
+         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
          AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) ORDER BY v.id,b.file_id LIMIT 100",
     )
     .bind(timeline)
@@ -481,7 +484,8 @@ async fn originals_of(
         "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 \
-         AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) ORDER BY v.id,b.file_id",
+         AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
+         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id,b.file_id",
     )
     .bind(timeline)
     .bind(version)
@@ -565,6 +569,7 @@ async fn prepared_of(
          JOIN media_files f ON f.id=b.file_id JOIN renditions r ON r.file_id=f.id \
          JOIN media_files s ON s.id=r.source_file_id \
          WHERE v.timeline_id=? AND v.origin='generated' AND f.generated=1 AND r.source_file_id=? \
+         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
          AND (? IS NULL OR v.id=?) AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) \
          ORDER BY r.updated_at DESC,v.id",
     )
@@ -651,11 +656,25 @@ fn never_browser(video: &str, audio: Option<&str>) -> bool {
 }
 
 /// What the client reports about decoding this file's video and default audio.
-fn client_support(file: &db::ItemRow, client: &ClientCapability, audio: Option<u32>) -> Support {
+fn client_support(
+    file: &db::ItemRow,
+    client: &ClientCapability,
+    audio: Option<u32>,
+    require_sdr: bool,
+) -> Support {
     let streams: Vec<db::Track> = serde_json::from_str(&file.tracks_json).unwrap_or_default();
     let Some(video) = streams.iter().find(|t| t.kind == "video") else {
         return Support::Unknown;
     };
+    // PQ/HLG bytes are delivered unchanged: never to a client that reports no
+    // HDR support, nor when the request requires SDR.
+    let hdr = matches!(
+        video.color_transfer.as_deref(),
+        Some("smpte2084" | "arib-std-b67")
+    );
+    if hdr && (require_sdr || client.hdr == "unsupported") {
+        return Support::Unsupported;
+    }
     let audio = audio.and_then(|i| {
         streams
             .iter()
@@ -800,6 +819,16 @@ pub async fn plan(
             ));
         }
     };
+    // Revision-local track pins must accompany an exact source file pin.
+    let tracks_pinned =
+        input.tracks.audio_track_id.is_some() || input.tracks.subtitle_track_id.is_some();
+    if tracks_pinned && input.source.is_none() {
+        return Err(Problem::invalid(
+            "invalid_plan_input",
+            "audio_track_id and subtitle_track_id require an exact source file pin",
+        ));
+    }
+    let require_sdr = input.quality.hdr_policy == "require_sdr";
     let principal = &caller.principal;
     let mut conn = app.db.acquire().await?;
     usable_profile(&mut conn, principal, &input.profile_id).await?;
@@ -895,17 +924,27 @@ pub async fn plan(
         .into_iter()
         .flatten()
         .min();
+    // Every original's readable revision-valid renditions reach the core
+    // decision, not only those of the original chosen for direct delivery.
     let mut prepared = match found {
         Some(renditions) => renditions,
         None => {
-            readable_prepared(
-                &mut conn,
-                principal,
-                &input.timeline_id,
-                &bound.file.id,
-                rendition_pin,
-            )
-            .await?
+            let mut renditions = Vec::new();
+            for original in
+                originals_of(&mut conn, &input.timeline_id, version_pin, original_pin).await?
+            {
+                renditions.extend(
+                    readable_prepared(
+                        &mut conn,
+                        principal,
+                        &input.timeline_id,
+                        &original.file.id,
+                        rendition_pin,
+                    )
+                    .await?,
+                );
+            }
+            renditions
         }
     };
     if let Some(pin) = input.source.as_ref().filter(|_| pinned_prepared) {
@@ -923,13 +962,18 @@ pub async fn plan(
     }
     let source = core::SourceFacts {
         available: original_available && bound.file.available,
-        client_support: client_support(&bound.file, &input.client, audio),
+        client_support: client_support(&bound.file, &input.client, audio, require_sdr),
         within_budget: fits_budget(&bound.file, limit, max_bitrate),
         prepared: prepared
             .iter()
             .map(|p| core::PreparedFacts {
                 file: p.file.id.clone(),
-                client_support: client_support(&p.file, &input.client, first_audio(&p.file)),
+                client_support: client_support(
+                    &p.file,
+                    &input.client,
+                    first_audio(&p.file),
+                    require_sdr,
+                ),
                 within_budget: fits_budget(&p.file, limit, max_bitrate),
             })
             .collect(),
@@ -950,6 +994,7 @@ pub async fn plan(
         hls: input.client.transports.iter().any(|t| t == "hls"),
         explicit_streams: audio != default_audio,
         pinned_prepared,
+        tracks_pinned,
         failed: input.failed_candidate_ids.clone(),
     };
     // A prepared plan pins the chosen rendition and plays its default streams.
@@ -1036,7 +1081,7 @@ impl delivery::AdmissionAuthority for PlanAuthority {
             let bound = still_bound(db, &self.claims)
                 .await
                 .map_err(|p| self.refuse(p))?;
-            core::admit(
+            core::reauthorize(
                 &self.claims,
                 &core::Observed {
                     principal: &principal,
@@ -1048,6 +1093,9 @@ impl delivery::AdmissionAuthority for PlanAuthority {
             .map_err(|e| self.refuse(plan_problem(e)))?;
             Ok(principal.id)
         })
+    }
+    fn fresh(&self) -> Result<(), ApiError> {
+        core::fresh(&self.claims, now()).map_err(|e| self.refuse(plan_problem(e)))
     }
 }
 
@@ -1304,6 +1352,29 @@ pub enum DeliveryChange {
     },
 }
 
+/// A durable acknowledgement of an earlier delivery command by this
+/// principal (`idempotency_records`), replayed after the delivery is no longer
+/// live, for example after a restart. While it is live the in-memory receipt,
+/// recorded atomically with the transition, is authoritative.
+async fn durable_replay(
+    tx: &mut sqlx::SqliteConnection,
+    scope: &Scope<'_>,
+    digest: &str,
+) -> Result<Option<Response>, Problem> {
+    let stored = scope.load(tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), digest, now())?
+        != access::Idempotent::Replay
+    {
+        return Ok(None);
+    }
+    let stored = stored.expect("replay has a record");
+    let mut response = (stored.status, Json(stored.body.unwrap_or_default())).into_response();
+    response
+        .headers_mut()
+        .insert("idempotent-replayed", HeaderValue::from_static("true"));
+    Ok(Some(response))
+}
+
 /// Stage a seek or replan. Its acknowledgement is recorded with the staged
 /// generation, under the delivery's lock (`delivery::change_live`), so an exact
 /// retry of a lost response replays it instead of staging another generation.
@@ -1316,11 +1387,22 @@ pub async fn change_delivery(
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
     let (mut tx, principal, owner) = command(&app, &caller, &id).await?;
-    require_live(&app, &id)?;
+    let durable = Scope {
+        principal: &principal.id,
+        operation: "changeDelivery",
+        target: &id,
+        key: &key,
+    };
+    if !app.processing.deliveries.is_live(&id) {
+        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+            return Ok(replay);
+        }
+        require_live(&app, &id)?;
+    }
     let receipt = delivery::ChangeReceipt {
         principal: principal.id.clone(),
-        key,
-        digest: body.digest,
+        key: key.clone(),
+        digest: body.digest.clone(),
     };
     // An acknowledged change replays even if its plan token expired since.
     if let Some(view) = delivery::change_replay(&app, &id, &receipt).map_err(problem)? {
@@ -1377,8 +1459,20 @@ pub async fn change_delivery(
         delivery::change_live(&app, &id, &expected, position, selection, &receipt, &mut tx)
             .await
             .map_err(problem)?;
+    let ack = delivery_json(&view, &owner);
+    if !replayed {
+        durable
+            .save(
+                &mut tx,
+                &body.digest,
+                StatusCode::ACCEPTED,
+                Some(&ack),
+                None,
+            )
+            .await?;
+    }
     tx.commit().await?;
-    let mut response = (StatusCode::ACCEPTED, Json(delivery_json(&view, &owner))).into_response();
+    let mut response = (StatusCode::ACCEPTED, Json(ack)).into_response();
     if replayed {
         response
             .headers_mut()
@@ -1393,8 +1487,9 @@ pub struct ActivateGeneration {
     expected_active_generation: String,
 }
 
-/// Activation is idempotent in the core reducer (re-activating the active
-/// generation is an acknowledged no-op), so retries need no stored receipt.
+/// Activation keeps an acknowledgement per Idempotency-Key, scoped to the
+/// delivery and generation: an exact retry replays it (also after a later
+/// activation or a restart) and the same key with another body conflicts.
 pub async fn activate(
     State(app): State<App>,
     caller: Caller,
@@ -1402,18 +1497,49 @@ pub async fn activate(
     Path((id, generation)): Path<(String, String)>,
     body: Body<ActivateGeneration>,
 ) -> Result<Response, Problem> {
-    idempotency_key(&headers)?;
-    let (tx, _, owner) = command(&app, &caller, &id).await?;
-    require_live(&app, &id)?;
-    let view = delivery::activate_live(
+    let key = idempotency_key(&headers)?;
+    let (mut tx, principal, owner) = command(&app, &caller, &id).await?;
+    let target = format!("{id}/{generation}");
+    let durable = Scope {
+        principal: &principal.id,
+        operation: "activateGeneration",
+        target: &target,
+        key: &key,
+    };
+    if !app.processing.deliveries.is_live(&id) {
+        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+            return Ok(replay);
+        }
+        require_live(&app, &id)?;
+    }
+    let receipt = delivery::ChangeReceipt {
+        principal: principal.id.clone(),
+        // Activation keys are distinct from change keys on the same delivery.
+        key: format!("activate:{generation}:{key}"),
+        digest: body.digest.clone(),
+    };
+    let (view, replayed) = delivery::activate_live(
         &app,
         &id,
         &generation,
         Some(&body.value.expected_active_generation),
+        &receipt,
     )
     .map_err(problem)?;
+    let ack = delivery_json(&view, &owner);
+    if !replayed {
+        durable
+            .save(&mut tx, &body.digest, StatusCode::OK, Some(&ack), None)
+            .await?;
+    }
     tx.commit().await?;
-    Ok(Json(delivery_json(&view, &owner)).into_response())
+    let mut response = (StatusCode::OK, Json(ack)).into_response();
+    if replayed {
+        response
+            .headers_mut()
+            .insert("idempotent-replayed", HeaderValue::from_static("true"));
+    }
+    Ok(response)
 }
 
 // ------------------------------------------------------------------ streams

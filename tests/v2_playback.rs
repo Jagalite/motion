@@ -271,6 +271,17 @@ impl Fixture {
         self.call("POST", path, Some(body), &headers).await
     }
 
+    /// The exact source pin (file and revision) of the first original.
+    async fn source(&self) -> Value {
+        let (file_id, file_revision): (String, String) = sqlx::query_as(
+            "SELECT id,revision FROM media_files WHERE generated=0 ORDER BY relative_path LIMIT 1",
+        )
+        .fetch_one(&self.server.app.db)
+        .await
+        .unwrap();
+        json!({"file_id": file_id, "file_revision": file_revision})
+    }
+
     async fn timeline(&self) -> (String, String) {
         sqlx::query_as("SELECT t.id,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id ORDER BY t.id LIMIT 1")
             .fetch_one(&self.server.app.db)
@@ -332,6 +343,20 @@ fn plan_input(
         "quality":{"mode":mode,"max_bitrate_bps":null,"max_height":null,"allow_client_software":true,
             "hdr_policy":"preserve_if_supported"},
         "client":client(transports),"failed_candidate_ids":[]})
+}
+
+/// `plan_input` with revision-local track pins and their exact source pin.
+fn pinned_plan_input(
+    profile: &str,
+    timeline: &str,
+    mode: &str,
+    audio: &str,
+    transports: &[&str],
+    source: &Value,
+) -> Value {
+    let mut input = plan_input(profile, timeline, mode, Some(audio), transports);
+    input["source"] = source.clone();
+    input
 }
 
 fn problem(reply: &Reply, status: StatusCode, code: &str) {
@@ -665,6 +690,29 @@ async fn original_playback_seek_resume_and_ordered_viewing() {
         StatusCode::OK,
         "duplicate activation is acknowledged"
     );
+    // An activation key names one request: another body under it conflicts;
+    // the exact retry replays its acknowledgement.
+    problem(
+        &f.post(
+            &format!("{path}/generations/2/activate"),
+            &auth,
+            Some("activate-two-0001"),
+            json!({"expected_active_generation":"2"}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
+    let replayed = f
+        .post(
+            &format!("{path}/generations/2/activate"),
+            &auth,
+            Some("activate-two-0001"),
+            json!({"expected_active_generation":"1"}),
+        )
+        .await;
+    assert_eq!(replayed.status, StatusCode::OK, "{:?}", replayed.body);
+    assert_eq!(replayed.headers["idempotent-replayed"], "true");
     problem(
         &f.post(
             &format!("{path}/heartbeat"),
@@ -803,12 +851,13 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
             "/api/v2/playback/plans",
             &auth,
             None,
-            plan_input(
+            pinned_plan_input(
                 "default",
                 &timeline,
                 "original",
-                Some("a1"),
+                "a1",
                 &["http_range", "hls"],
+                &f.source().await,
             ),
         )
         .await;
@@ -821,16 +870,35 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
             "/api/v2/playback/plans",
             &auth,
             None,
-            plan_input(
+            pinned_plan_input(
                 "default",
                 &timeline,
                 "auto",
-                Some("a9"),
+                "a9",
                 &["http_range", "hls"],
+                &f.source().await,
             ),
         )
         .await;
     problem(&unknown, StatusCode::UNPROCESSABLE_ENTITY, "unknown_track");
+    // Revision-local track pins need the exact source they index.
+    problem(
+        &f.post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input(
+                "default",
+                &timeline,
+                "auto",
+                Some("a1"),
+                &["http_range", "hls"],
+            ),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_plan_input",
+    );
 
     // Start on the original, then switch to the second audio track: the
     // planner moves to a live conversion inside the same delivery.
@@ -860,12 +928,13 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
             "/api/v2/playback/plans",
             &auth,
             None,
-            plan_input(
+            pinned_plan_input(
                 "default",
                 &timeline,
                 "auto",
-                Some("a1"),
+                "a1",
                 &["http_range", "hls"],
+                &f.source().await,
             ),
         )
         .await;
@@ -1208,6 +1277,21 @@ async fn revocation_and_source_changes_end_control_immediately() {
         )
         .await;
     problem(&stale, StatusCode::CONFLICT, "source_revision_changed");
+    // A fresh plan never uses content the version binding did not review.
+    let unreviewed = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["http_range"]),
+        )
+        .await;
+    assert_eq!(unreviewed.status, StatusCode::OK, "{:?}", unreviewed.body);
+    assert_eq!(unreviewed.body["status"], "blocked");
+    assert_eq!(
+        unreviewed.body["reason_codes"],
+        json!(["source_unavailable"])
+    );
 
     // Losing playback:request ends control even with the library granted.
     f.policy(

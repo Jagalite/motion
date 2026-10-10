@@ -114,6 +114,9 @@ pub struct Request {
     /// The client pinned the prepared rendition's version: nothing else may
     /// serve the plan.
     pub pinned_prepared: bool,
+    /// The client pinned revision-local source tracks. A rendition has its own
+    /// streams, so it cannot honor them.
+    pub tracks_pinned: bool,
     pub failed: Vec<String>,
 }
 
@@ -150,7 +153,7 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     }];
     candidates.extend(source.prepared.iter().map(|p| Candidate {
         original: false,
-        available: byte && !failed(Route::Prepared, &p.file),
+        available: byte && !request.tracks_pinned && !failed(Route::Prepared, &p.file),
         support: p.client_support,
         matches_recipe: true,
         within_budget: p.within_budget,
@@ -228,9 +231,24 @@ pub fn readable(principal: &Principal, file: Option<&FileFacts>) -> bool {
 /// fact is rechecked: a token never outlives a permission, profile grant,
 /// catalog scope, version binding or source revision it was issued under.
 pub fn admit(claims: &Claims, observed: &Observed<'_>) -> Result<(), PlanError> {
-    if observed.now >= claims.expires_at {
-        return Err(PlanError::Expired);
+    fresh(claims, observed.now)?;
+    reauthorize(claims, observed)
+}
+
+/// A plan token may start something new only before it expires.
+pub fn fresh(claims: &Claims, now: i64) -> Result<(), PlanError> {
+    if now >= claims.expires_at {
+        Err(PlanError::Expired)
+    } else {
+        Ok(())
     }
+}
+
+/// Every pinned fact except expiry. An exact retry of an already admitted
+/// request is reauthorized with this, so a lost acknowledgement can be
+/// replayed after the token expired, but never past a revoked permission,
+/// grant, scope, binding or source revision.
+pub fn reauthorize(claims: &Claims, observed: &Observed<'_>) -> Result<(), PlanError> {
     if observed.principal.id != claims.principal {
         return Err(PlanError::WrongPrincipal);
     }
@@ -354,6 +372,7 @@ mod tests {
             hls: true,
             explicit_streams: false,
             pinned_prepared: false,
+            tracks_pinned: false,
             failed: vec![],
         }
     }
@@ -482,6 +501,15 @@ mod tests {
         assert_eq!(
             admit(&claims(), &observed(&ok, Some(&r1), true, 100)),
             Err(PlanError::Expired)
+        );
+        // An admitted request is reauthorized without expiry, never past a revocation.
+        assert_eq!(
+            reauthorize(&claims(), &observed(&ok, Some(&r1), true, 100)),
+            Ok(())
+        );
+        assert_eq!(
+            reauthorize(&claims(), &observed(&ok, Some(&r1), false, 100)),
+            Err(PlanError::NotFound)
         );
         let other = principal("b", &[Permission::PlaybackRequest], &["p"]);
         assert_eq!(
@@ -690,6 +718,15 @@ mod tests {
             ..source(Support::Unsupported)
         };
         assert_eq!(plan("f", &two, &request(Mode::Convert)), Plan::Prepared(1));
+        // Pinned source tracks are never served by a rendition's own streams.
+        let pinned_tracks = Request {
+            tracks_pinned: true,
+            ..request(Mode::Convert)
+        };
+        assert_eq!(
+            plan("f", &ready, &pinned_tracks),
+            Plan::Ready(Route::Transcode)
+        );
     }
 
     #[test]

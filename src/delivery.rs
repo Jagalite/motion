@@ -1988,6 +1988,12 @@ pub trait AdmissionAuthority: Send + Sync + 'static {
         db: &'a mut sqlx::SqliteConnection,
         request: &'a CreateRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ApiError>> + Send + 'a>>;
+    /// Conditions only a new admission must meet (for example an unexpired
+    /// plan). Checked after the receipt lookup, so an exact retry of an
+    /// acknowledged admission replays after reauthorization alone.
+    fn fresh(&self) -> Result<(), ApiError> {
+        Ok(())
+    }
 }
 struct LegacyAdmin;
 impl AdmissionAuthority for LegacyAdmin {
@@ -2079,24 +2085,51 @@ pub(crate) fn heartbeat_live(
     Ok(view(app, &session, &d))
 }
 
+/// Activate a generation; its acknowledgement is recorded under the delivery
+/// lock with the transition, like a change receipt, so an exact retry replays
+/// it and the same key with another request conflicts.
 pub(crate) fn activate_live(
     app: &App,
     id: &str,
     generation: &str,
     expected_active: Option<&str>,
-) -> Result<DeliveryView, ApiError> {
+    receipt: &ChangeReceipt,
+) -> Result<(DeliveryView, bool), ApiError> {
     let session = app.processing.deliveries.session(id)?;
-    let d = apply(
+    let input = Input::Activate {
+        generation: generation_number(generation)?,
+        expected_active: expected_active.map(generation_number).transpose()?,
+        now_ms: app.processing.deliveries.now_ms(),
+    };
+    let mut inner = session.inner.lock().unwrap();
+    if let Some(view) = replayed_change(&inner, receipt)? {
+        return Ok((view, true));
+    }
+    let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
+    let acknowledged = view(app, &session, &d);
+    inner.changes.push((
+        receipt.identity(),
+        serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
+    ));
+    Ok((acknowledged, false))
+}
+
+/// Report the client's logical playhead for the active generation, which
+/// bounds how far its encoder may run ahead (pacing). Observation only: a
+/// stale generation or a fenced delivery is ignored.
+pub(crate) fn report_playhead(app: &App, id: &str, generation: u64, position_ms: u64) {
+    let Ok(session) = app.processing.deliveries.session(id) else {
+        return;
+    };
+    let _ = apply(
         app,
         &session,
-        Input::Activate {
-            generation: generation_number(generation)?,
-            expected_active: expected_active.map(generation_number).transpose()?,
+        Input::Heartbeat {
+            active_generation: generation,
+            position_ms: Some(position_ms),
             now_ms: app.processing.deliveries.now_ms(),
         },
-    )
-    .map_err(error)?;
-    Ok(view(app, &session, &d))
+    );
 }
 
 /// Close a live delivery and record the fenced state through `conn` (the
@@ -2438,6 +2471,7 @@ async fn admit_owned(
             }
         }
     }
+    authority.fresh()?;
     if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,

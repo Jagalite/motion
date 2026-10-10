@@ -40,13 +40,17 @@ def main():
         command = [str(BINARY), '--access-mode', 'restricted', '--listen', f'127.0.0.1:{port}',
                    '--data-dir', str(state), '--library', str(media)]
 
+        # The first launch of a freshly linked binary can be slow (macOS
+        # assessment); warm it untimed so readiness measures the server.
+        subprocess.run([str(BINARY), '--help'], stdout=subprocess.DEVNULL, check=True)
+
         def boot():
             p = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             def ready():
                 assert p.poll() is None, ('server exited', p.returncode)
                 return request(port, 'GET', '/ready')[0] == 200
             try:
-                wait_for(ready, seconds=60)
+                wait_for(ready, seconds=120)
             except BaseException:
                 # Never leave an untracked server behind a failed readiness wait.
                 if p.poll() is None:
@@ -93,8 +97,11 @@ def main():
             timeline = timelines['items'][0]['id']
             ok('paired_restricted_device_reads_scanned_catalog')
 
+            pins = {}
             def plan(mode, transports, audio=None):
-                body = {'profile_id': 'default', 'timeline_id': timeline, 'version_id': None, 'source': None,
+                # Revision-local track pins travel with the exact source pin.
+                body = {'profile_id': 'default', 'timeline_id': timeline, 'version_id': None,
+                        'source': pins['source'] if audio else None,
                         'tracks': {'audio_component_id': None, 'subtitle_component_id': None, 'subtitle_policy': 'auto',
                                    'audio_track_id': audio, 'subtitle_track_id': None},
                         'quality': {'mode': mode, 'max_bitrate_bps': None, 'max_height': None,
@@ -119,6 +126,7 @@ def main():
             # ---- original playback over byte ranges
             p = plan('auto', ['http_range', 'hls'])
             assert (p['transport'], p['operation']) == ('http_range', 'original'), p
+            pins['source'] = p['source']
             original = admit(p, 0, 'admit-original')
             media_url = original['active']['media_url']
             status, _, body = request(port, 'GET', media_url, headers=dict(auth, Range='bytes=0-65535'))
@@ -166,7 +174,8 @@ def main():
             def finished():
                 row = json.loads(request(port, 'GET', f"/api/v1/processing-jobs/{job['id']}", headers=operator)[2])
                 return row if row['phase'] not in ('queued', 'running', 'cancelling') else None
-            assert wait_for(finished, seconds=120)['phase'] == 'completed'
+            row = wait_for(finished, seconds=300)
+            assert row['phase'] == 'completed', row
             converted = plan('convert', ['http_range', 'hls'])
             assert (converted['transport'], converted['operation']) == ('http_range', 'prepared'), converted
             assert converted['source']['file_id'] != p['source']['file_id']
@@ -269,6 +278,10 @@ def main():
             _, _, old = api('GET', f'/playback/viewing-sessions/{sid}', auth=auth, expected=200)
             assert old['status'] == 'superseded'
             ok('resume_supersedes_the_previous_session')
+        except BaseException:
+            log.flush()
+            print((root / 'server.log').read_text(errors='replace')[-6000:], file=sys.stderr)
+            raise
         finally:
             if process is not None:
                 stop(process)

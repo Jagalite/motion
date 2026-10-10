@@ -1585,7 +1585,7 @@ pub(crate) struct TimelineRow {
     pub(crate) id: String,
     revision: i64,
     pub(crate) item_id: String,
-    edition_id: String,
+    pub(crate) edition_id: String,
     duration_ms: Option<i64>,
     order_group_id: Option<String>,
     order_position: Option<i64>,
@@ -1754,7 +1754,7 @@ pub async fn list_versions(
     Ok(Json(value).into_response())
 }
 
-async fn require_edition(
+pub(crate) async fn require_edition(
     conn: &mut sqlx::SqliteConnection,
     scope: &CatalogScope,
     id: &str,
