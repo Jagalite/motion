@@ -369,6 +369,12 @@ pub(crate) async fn enqueue_transaction(
     playscale_core::scan::admit(existing.as_ref().map(|j| j.full_scan), full)
         .map_err(anyhow::Error::msg)?;
     if let Some(row) = existing {
+        // The direct requester now relies on this attempt: no demand
+        // cancellation may stop it.
+        sqlx::query("UPDATE jobs SET direct_request=1 WHERE id=?")
+            .bind(&row.id)
+            .execute(&mut **tx)
+            .await?;
         return Ok(row.id);
     }
     let id = new_id();
@@ -402,15 +408,24 @@ pub fn phase_name(phase: Phase) -> &'static str {
 }
 pub async fn cancel(app: &App, id: &str) -> anyhow::Result<JobRow> {
     let _guard = app.jobs.lock().await;
-    let row = get_job(&app.db, id).await?;
+    let mut tx = begin_write(&app.db).await?;
+    let row: JobRow = sqlx::query_as("SELECT * FROM jobs WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     let (next, _) = transition(&row.state()?, Input::Cancel);
     sqlx::query("UPDATE jobs SET phase=? WHERE id=?")
         .bind(phase_name(next.phase))
         .bind(id)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    // A directly cancelled attempt no longer serves pending demands; they get
+    // a follow-up in the same transaction.
+    crate::scans::after_attempt(&mut tx, id).await?;
+    tx.commit().await?;
     get_job(&app.db, id).await
 }
+
 pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
     let rows: Vec<JobRow> = sqlx::query_as(
         "SELECT * FROM jobs WHERE phase IN ('running','cancelling') ORDER BY created_at,id",

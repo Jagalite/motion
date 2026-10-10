@@ -15,6 +15,8 @@ pub enum ScanError {
     NotFound,
     /// A requested source is not part of the library.
     UnknownSource(String),
+    /// The library has no sources, or an empty subset was requested.
+    NoSources,
     Storage(anyhow::Error),
 }
 impl From<sqlx::Error> for ScanError {
@@ -50,14 +52,14 @@ async fn attempts(
     conn: &mut SqliteConnection,
     source: &str,
 ) -> anyhow::Result<Vec<(Attempt, Job)>> {
-    let rows: Vec<(String, String, i64, bool, Option<i64>)> = sqlx::query_as(
-        "SELECT id,phase,attempt,full_scan,started_barrier FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY created_at,id",
+    let rows: Vec<(String, String, i64, bool, Option<i64>, bool)> = sqlx::query_as(
+        "SELECT id,phase,attempt,full_scan,started_barrier,direct_request FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY created_at,id",
     )
     .bind(source)
     .fetch_all(&mut *conn)
     .await?;
     rows.into_iter()
-        .map(|(id, phase, attempt, verify, started)| {
+        .map(|(id, phase, attempt, verify, started, direct)| {
             let phase: Phase = serde_json::from_value(serde_json::Value::String(phase))?;
             Ok((
                 Attempt {
@@ -65,6 +67,7 @@ async fn attempts(
                     phase,
                     verify,
                     started_barrier: started.map(u64::try_from).transpose()?,
+                    direct,
                 },
                 Job {
                     phase,
@@ -97,7 +100,7 @@ async fn demands(conn: &mut SqliteConnection, source: &str) -> anyhow::Result<Ve
 
 async fn enqueue(conn: &mut SqliteConnection, source: &str, verify: bool) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO jobs (id,library_id,phase,created_at,full_scan) VALUES (?,?,'queued',?,?)",
+        "INSERT INTO jobs (id,library_id,phase,created_at,full_scan,direct_request) VALUES (?,?,'queued',?,?,0)",
     )
     .bind(new_id())
     .bind(source)
@@ -190,6 +193,9 @@ pub async fn request(
             out
         }
     };
+    if selected.is_empty() {
+        return Err(ScanError::NoSources);
+    }
     let id = new_id();
     sqlx::query("INSERT INTO scan_requests VALUES (?,?,?,?)")
         .bind(&id)
@@ -313,11 +319,15 @@ pub(crate) async fn after_attempt(conn: &mut SqliteConnection, job: &str) -> any
             phase: Phase::Running,
             verify,
             started_barrier: started.map(u64::try_from).transpose()?,
+            direct: false,
         };
         let pending = demands(conn, &source).await?;
         for (id, status) in core::resolve(&attempt, result, &pending) {
-            sqlx::query("UPDATE scan_demands SET status=?,job_id=? WHERE id=?")
+            // The coverage summary is copied so it survives job history pruning.
+            sqlx::query("UPDATE scan_demands SET status=?,job_id=?,complete_directories=(SELECT complete_directories FROM jobs WHERE id=?),incomplete_directories=(SELECT incomplete_directories FROM jobs WHERE id=?) WHERE id=?")
                 .bind(status_name(status))
+                .bind(job)
+                .bind(job)
                 .bind(job)
                 .bind(id)
                 .execute(&mut *conn)
@@ -347,16 +357,9 @@ pub async fn get(db: &sqlx::SqlitePool, id: &str) -> Result<ScanView, ScanError>
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
-    type Row = (
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    );
+    type Row = (String, String, Option<String>, Option<String>, i64, i64);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT d.source_id,d.status,d.job_id,d.error,j.complete_directories,j.incomplete_directories FROM scan_demands d LEFT JOIN jobs j ON j.id=d.job_id WHERE d.request_id=? ORDER BY d.source_id",
+        "SELECT source_id,status,job_id,error,complete_directories,incomplete_directories FROM scan_demands WHERE request_id=? ORDER BY source_id",
     )
     .bind(id)
     .fetch_all(&mut *tx)
@@ -368,8 +371,8 @@ pub async fn get(db: &sqlx::SqlitePool, id: &str) -> Result<ScanView, ScanError>
             source_id,
             status: status_value(&status)?,
             job_id,
-            complete_directories: complete.unwrap_or(0),
-            incomplete_directories: incomplete.unwrap_or(0),
+            complete_directories: complete,
+            incomplete_directories: incomplete,
             error,
         });
     }

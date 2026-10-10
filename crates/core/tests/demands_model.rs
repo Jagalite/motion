@@ -19,12 +19,16 @@ struct State {
     attempts: Vec<(Attempt, Job)>,
     next_job: u32,
     restarts: u8,
+    directs: u8,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Input {
     Request {
         verify: bool,
     },
+    /// A direct (v1/scheduled) request: joins any active attempt, otherwise
+    /// enqueues one that no demand cancellation may stop.
+    Direct,
     /// A filesystem change hint advances the barrier.
     MarkDirty,
     Start,
@@ -63,6 +67,7 @@ fn enqueue(s: &mut State, verify: bool) {
             phase: Phase::Queued,
             verify,
             started_barrier: None,
+            direct: false,
         },
         Job::default(),
     ));
@@ -102,6 +107,7 @@ impl Model for Demands {
             attempts: vec![],
             next_job: 0,
             restarts: 0,
+            directs: 0,
         })
     }
     fn step(&self, s: &State, input: &Input) -> Result<Transition<State, Effect>, ModelError> {
@@ -125,6 +131,23 @@ impl Model for Demands {
                 }
                 next.demands.push(demand);
                 outputs.push(Effect::Admitted(admission));
+            }
+            Input::Direct => {
+                next.directs += 1;
+                let any_active = next.attempts.iter().any(|(a, _)| {
+                    matches!(a.phase, Phase::Queued | Phase::Running | Phase::Cancelling)
+                });
+                if any_active {
+                    // The direct requester joins the first active attempt.
+                    if let Some((a, _)) = next.attempts.iter_mut().find(|(a, _)| {
+                        matches!(a.phase, Phase::Queued | Phase::Running | Phase::Cancelling)
+                    }) {
+                        a.direct = true;
+                    }
+                } else {
+                    enqueue(&mut next, false);
+                    next.attempts.last_mut().unwrap().0.direct = true;
+                }
             }
             Input::MarkDirty => next.barrier += 1,
             Input::Start => {
@@ -277,9 +300,10 @@ impl Model for Demands {
         let isolated = match (input, next.outputs) {
             (Input::CancelDemand(i), [Effect::Stopped(stop)]) => stop.iter().all(|job| {
                 let attempt = before.attempts.iter().find(|(a, _)| &a.job == job).unwrap();
-                !before.demands.iter().enumerate().any(|(k, d)| {
-                    k != *i && d.status == DemandStatus::Pending && can_satisfy(&attempt.0, d)
-                })
+                !attempt.0.direct
+                    && !before.demands.iter().enumerate().any(|(k, d)| {
+                        k != *i && d.status == DemandStatus::Pending && can_satisfy(&attempt.0, d)
+                    })
             }),
             (Input::CancelDemand(_), []) => true,
             (Input::CancelDemand(_), _) => false,
@@ -326,6 +350,9 @@ impl Enumerate for Demands {
                 inputs.push(Input::Request { verify: false });
                 inputs.push(Input::Request { verify: true });
             }
+            if s.directs < 1 {
+                inputs.push(Input::Direct);
+            }
         }
         Ok(inputs)
     }
@@ -362,7 +389,15 @@ fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T, ModelError> {
 
 #[test]
 fn bounded_demand_graph_checks_production_decisions() {
-    let report = stateless::explore::enumerate(&Demands, Default::default()).unwrap();
+    let report = stateless::explore::enumerate(
+        &Demands,
+        stateless::explore::SearchConfig {
+            max_states: 400_000,
+            max_transitions: 4_000_000,
+            max_depth: 100,
+        },
+    )
+    .unwrap();
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
     assert_eq!(
@@ -370,7 +405,7 @@ fn bounded_demand_graph_checks_production_decisions() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Stateless: {} states, {} edges; <=3 demands, barrier <=4, <=4 attempts, <=1 restart; start/finish/cancel interleavings",
+        "Stateless: {} states, {} edges; <=3 demands, barrier <=4, <=4 attempts, <=1 restart, <=1 direct request; start/finish/cancel interleavings",
         report.states, report.transitions
     );
 }

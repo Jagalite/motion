@@ -133,7 +133,10 @@ async fn concurrent_requests_share_one_attempt_per_source() {
     assert!(first.complete);
     assert_eq!(second.status, DemandStatus::Complete);
     let first_a = first.sources.iter().find(|s| s.source_id == a).unwrap();
-    assert_eq!(first_a.job_id, second.sources[0].job_id, "one attempt served both");
+    assert_eq!(
+        first_a.job_id, second.sources[0].job_id,
+        "one attempt served both"
+    );
 }
 
 #[tokio::test]
@@ -263,4 +266,58 @@ async fn recovery_merges_an_interrupted_attempt_into_its_queued_follow_up() {
     assert_eq!(f.settle(&late.id).await.status, DemandStatus::Complete);
     stop.cancel();
     worker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn direct_requests_are_respected_and_empty_requests_rejected() {
+    let f = Fixture::new().await;
+    let a = f.source("a").await;
+    let library = f.library(std::slice::from_ref(&a)).await;
+    // A v1/scheduled request owns the queued attempt; a demand joins it.
+    let direct = db::enqueue(&f.app, &a).await.unwrap();
+    let demand = scans::request(&f.app, &library, None, false, false)
+        .await
+        .unwrap();
+    scans::cancel(&f.app, &demand.id).await.unwrap();
+    assert_eq!(
+        db::get_job(&f.app.db, &direct.id).await.unwrap().phase,
+        "queued"
+    );
+    // Cancelling the direct job itself re-queues work for a pending demand.
+    let other = scans::request(&f.app, &library, None, false, false)
+        .await
+        .unwrap();
+    db::cancel(&f.app, &direct.id).await.unwrap();
+    let jobs = f.jobs(&a).await;
+    assert_eq!(
+        jobs.iter().filter(|(_, p)| p == "queued").count(),
+        1,
+        "follow-up queued"
+    );
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(scan::worker(f.app.clone(), stop.clone()));
+    let other = f.settle(&other.id).await;
+    stop.cancel();
+    worker.await.unwrap().unwrap();
+    assert_eq!(other.status, DemandStatus::Complete);
+    // Coverage survives pruning of the answering job.
+    let counts = other.sources[0].complete_directories;
+    assert!(counts >= 1);
+    sqlx::query("DELETE FROM jobs WHERE id=?")
+        .bind(other.sources[0].job_id.as_deref().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let retained = scans::get(&f.app.db, &other.id).await.unwrap();
+    assert_eq!(retained.sources[0].complete_directories, counts);
+    // No sources: rejected rather than pending forever.
+    let empty = f.library(&[]).await;
+    assert!(matches!(
+        scans::request(&f.app, &empty, None, false, false).await,
+        Err(scans::ScanError::NoSources)
+    ));
+    assert!(matches!(
+        scans::request(&f.app, &library, Some(&[]), false, false).await,
+        Err(scans::ScanError::NoSources)
+    ));
 }

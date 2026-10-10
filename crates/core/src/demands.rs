@@ -40,6 +40,9 @@ pub struct Attempt {
     pub verify: bool,
     /// Barrier observed when traversal started; `None` while queued.
     pub started_barrier: Option<u64>,
+    /// Admitted by a requester outside the demand ledger (v1 API, schedule,
+    /// configured root). No demand cancellation may stop it.
+    pub direct: bool,
 }
 
 fn active(a: &Attempt) -> bool {
@@ -135,7 +138,7 @@ pub fn cancel(demand: &Demand, others: &[Demand], attempts: &[Attempt]) -> (Dema
     };
     let stop = attempts
         .iter()
-        .filter(|a| active(a) && a.phase != Phase::Cancelling)
+        .filter(|a| active(a) && a.phase != Phase::Cancelling && !a.direct)
         .filter(|a| can_satisfy(a, demand) && !still_needed(a))
         .map(|a| a.job.clone())
         .collect();
