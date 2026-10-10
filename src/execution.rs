@@ -20,6 +20,12 @@ pub const BUDGET: Budget = Budget {
     units: 2,
     interactive_reserve: 1,
 };
+/// Concurrent hardware (VideoToolbox) encoder sessions, separate from CPU
+/// capacity: live delivery may use both, background encoding one.
+pub const HARDWARE_BUDGET: Budget = Budget {
+    units: 2,
+    interactive_reserve: 1,
+};
 /// How long the server waits for a supervisor to confirm termination before the
 /// reservation is classified as stuck. The supervisor's own SIGTERM grace is shorter.
 pub const TERMINATION_DEADLINE: Duration = Duration::from_secs(10);
@@ -171,6 +177,34 @@ impl Coordinator {
     }
 }
 
+/// Cancellation fences blocking preparation without pretending its filesystem
+/// operation stopped. Its reservation follows the blocking closure, and a late
+/// completion is observed before the domain may clean up its generation.
+pub(crate) async fn prepare<T: Send + 'static>(
+    lease: Arc<Lease>,
+    stop: &CancellationToken,
+    deadline: Duration,
+    operation: impl FnOnce() -> T + Send + 'static,
+    late_exit: impl FnOnce() + Send + 'static,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let ownership = lease.clone();
+    let mut work = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        operation()
+    });
+    tokio::select! {
+        result = &mut work => Some(result),
+        _ = async { tokio::select! { _ = stop.cancelled() => {}, _ = tokio::time::sleep(deadline) => {} } } => {
+            lease.stuck(async move {
+                // Drop returned descriptors before reporting stopped/allowing GC.
+                drop(work.await);
+                late_exit();
+            });
+            None
+        }
+    }
+}
+
 struct Withdraw {
     coordinator: Arc<Coordinator>,
     ticket: u64,
@@ -224,7 +258,8 @@ impl Lease {
         *self.running.lock().unwrap() = Some(Witness::open(path)?);
         Ok(())
     }
-    fn settled(&self) {
+    /// The execution this lease covered has ended (confirmed by the caller).
+    pub fn settled(&self) {
         self.running.lock().unwrap().take();
     }
     /// Whether termination was not confirmed; a reaper now owns the release.
@@ -506,6 +541,104 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_or_timed_out_preparation_holds_capacity_until_actual_exit() {
+        for cancel in [true, false] {
+            let coordinator = Coordinator::new(Budget {
+                units: 1,
+                interactive_reserve: 0,
+            });
+            let lease = Arc::new(
+                coordinator
+                    .reserve("filesystem".into(), Class::Interactive, 1)
+                    .await
+                    .unwrap(),
+            );
+            let stop = CancellationToken::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, blocked) = std::sync::mpsc::channel();
+            let task = {
+                let lease = lease.clone();
+                let stop = stop.clone();
+                let entered = entered.clone();
+                let completed = completed.clone();
+                tokio::spawn(async move {
+                    prepare(
+                        lease,
+                        &stop,
+                        if cancel {
+                            Duration::from_secs(30)
+                        } else {
+                            Duration::from_millis(20)
+                        },
+                        move || {
+                            entered.notify_one();
+                            blocked.recv().unwrap();
+                        },
+                        move || {
+                            completed.fetch_add(1, Ordering::SeqCst);
+                        },
+                    )
+                    .await
+                })
+            };
+            entered.notified().await;
+            if cancel {
+                stop.cancel();
+            }
+            assert!(task.await.unwrap().is_none());
+            drop(lease);
+            assert_eq!(coordinator.snapshot().used, 1);
+            assert_eq!(coordinator.snapshot().stuck, ["filesystem"]);
+            assert_eq!(completed.load(Ordering::SeqCst), 0);
+            assert!(!coordinator.fits_now(Class::Interactive, 1));
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while coordinator.snapshot().used != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert!(coordinator.fits_now(Class::Interactive, 1));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registered_ownership_survives_path_loss_and_releases_after_failed_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner");
+        let coordinator = Coordinator::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        let lease = coordinator
+            .reserve("owner".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        let (_witness, held) = Witness::create(&path).unwrap();
+        lease.started(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // The registered open description, not a later path lookup, fences release.
+        drop(lease);
+        assert_eq!(coordinator.snapshot().used, 1);
+        assert_eq!(coordinator.snapshot().stuck, ["owner"]);
+        // A failed spawn leaves no inheritor; dropping the parent's descriptor is
+        // sufficient evidence. The same rule waits for real children otherwise.
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.snapshot().used != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(coordinator.snapshot().stuck.is_empty());
+    }
 
     #[tokio::test]
     async fn stuck_child_keeps_capacity_until_reaped() {

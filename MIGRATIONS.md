@@ -19,6 +19,7 @@ applying any pending migration to an existing database.
 | 0017 | `0017_library_sources.sql` | A02/A03 | logical libraries over storage sources, exclusions, scan binding revision |
 | 0018 | `0018_delivery_sessions.sql` | A07 integration | delivery restart fencing; resolves the provisional 0015 collision before applying it in this integration |
 | 0019 | `0019_job_api_identity.sql` | A08 integration | persisted job requester and revisions; legacy requester stays unknown |
+| 0028 | `0028_delivery_admissions.sql` | A06/A07 | requested: idempotent delivery admission receipts (0020–0026 are claimed by open PR #4) |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

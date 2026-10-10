@@ -32,6 +32,14 @@ pub struct Settings {
     pub max_output_bytes: u64,
     pub retention_seconds: u64,
     pub timeout_seconds: u64,
+    /// Optional liveness limits; omitted preserves the total-timeout-only policy.
+    pub startup_timeout_seconds: Option<u64>,
+    pub no_progress_timeout_seconds: Option<u64>,
+    pub expected_duration: Option<playscale_core::execution_deadline::ExpectedDurationPolicy>,
+    /// Admit live stream-copy routes (remux, audio conversion). Implemented but
+    /// not qualified: source timestamp mapping and browser playback of copied
+    /// streams are unverified, so they stay off unless explicitly enabled.
+    pub experimental_copy_routes: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +49,10 @@ impl Default for Settings {
             max_output_bytes: 2 * 1024 * 1024 * 1024,
             retention_seconds: 30 * 86400,
             timeout_seconds: 7200,
+            startup_timeout_seconds: None,
+            no_progress_timeout_seconds: None,
+            expected_duration: None,
+            experimental_copy_routes: false,
         }
     }
 }
@@ -57,6 +69,22 @@ impl Settings {
                 && (1..=86400).contains(&self.timeout_seconds),
             "invalid processing retention/timeout"
         );
+        anyhow::ensure!(
+            self.expected_duration.is_none_or(|policy| policy.valid()),
+            "invalid expected-duration policy"
+        );
+        for value in [
+            self.startup_timeout_seconds,
+            self.no_progress_timeout_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            anyhow::ensure!(
+                (1..=86400).contains(&value),
+                "invalid processing liveness timeout"
+            );
+        }
         Ok(())
     }
 }
@@ -69,6 +97,10 @@ pub struct Runtime {
     pub maintenance: tokio::sync::Mutex<()>,
     /// Shared encoder capacity; released only after confirmed worker termination.
     pub execution: Arc<crate::execution::Coordinator>,
+    /// Hardware encoder sessions, accounted like CPU capacity.
+    pub hardware: Arc<crate::execution::Coordinator>,
+    /// Whether this machine can open a VideoToolbox encoder session (probed once).
+    pub videotoolbox: tokio::sync::OnceCell<bool>,
     /// Executable that accepts `--internal-ffmpeg-supervisor`.
     pub supervisor: PathBuf,
     /// Live delivery sessions share the execution infrastructure.
@@ -82,6 +114,8 @@ impl Runtime {
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
             execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
+            hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
+            videotoolbox: tokio::sync::OnceCell::new(),
             supervisor: std::env::current_exe().unwrap_or_default(),
             deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
             root,
@@ -437,6 +471,7 @@ async fn command(
     owner: &FsPath,
     cmd: &mut Command,
     progress: bool,
+    media_ms: u64,
 ) -> anyhow::Result<()> {
     // A separate supervisor watches this pipe. Even SIGKILL of the server closes
     // it, so an encoder cannot outlive its owner and overlap a recovered attempt.
@@ -453,10 +488,12 @@ async fn command(
     let (witness, held) = crate::execution::Witness::create(owner)?;
     #[cfg(unix)]
     crate::execution::inherit(&mut supervisor, &[&held.0]);
+    // Register ownership before spawning: a failed witness open must never
+    // leave a live child whose lease can be released without termination proof.
+    lease.started(owner)?;
     let child = supervisor.spawn();
     drop(held);
     let mut child = child?;
-    lease.started(owner)?;
     let heartbeat = child.stdin.take();
     let mut stderr = child.stderr.take().context("missing encoder stderr")?;
     let diagnostics = tokio::spawn(async move {
@@ -481,6 +518,25 @@ async fn command(
     let mut decoder = progress::Decoder::default();
     let deadline = tokio::time::sleep(Duration::from_secs(app.processing.settings.timeout_seconds));
     tokio::pin!(deadline);
+    let started = tokio::time::Instant::now();
+    let mut liveness = playscale_core::execution_deadline::Deadline::new(
+        app.processing.settings.timeout_seconds * 1000,
+        app.processing
+            .settings
+            .startup_timeout_seconds
+            .map(|v| v * 1000),
+        app.processing
+            .settings
+            .no_progress_timeout_seconds
+            .map(|v| v * 1000),
+    )
+    .with_expected_duration(
+        app.processing
+            .settings
+            .expected_duration
+            .map(|p| p.budget_ms(media_ms)),
+    );
+    let elapsed = || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut output_open = true;
     let mut pending_progress = 0.0f64;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
@@ -489,7 +545,7 @@ async fn command(
             _=&mut deadline=>anyhow::bail!("processing timeout"),
             _=stop.cancelled()=>anyhow::bail!("server stopping"),
             _=lease.termination_requested().cancelled()=>anyhow::bail!("termination requested"),
-            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");break;},
+            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } break;},
             read=stdout.read(&mut output_buffer),if output_open=>{
                 let count = read?;
                 let observed = if count == 0 {
@@ -499,10 +555,11 @@ async fn command(
                     decoder.push(&output_buffer[..count])
                 };
                 if let Some(seconds) = observed {
-                    pending_progress = seconds;
+                    liveness.observe(elapsed(), (seconds * 1000.0) as u64);
+                    pending_progress = pending_progress.max(seconds);
                 }
             },
-            _=poll.tick()=>{active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
+            _=poll.tick()=>{if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
         }} Ok(())
     }.await;
     drop(heartbeat);
@@ -551,6 +608,11 @@ async fn convert(
             .bind(&source.library_id)
             .fetch_one(&app.db)
             .await?;
+    let duration = source
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("source duration unknown")?;
+    let media_ms = (duration * 1000.0).ceil() as u64;
     let directory = app.processing.root.join(job.relative());
     let stage = directory.clone();
     let cache = app.processing.root.clone();
@@ -698,6 +760,7 @@ async fn convert(
         &directory.join(".owner"),
         &mut cmd,
         true,
+        media_ms,
     )
     .await?;
     let found = scan::inspect(
@@ -708,7 +771,6 @@ async fn convert(
         permit.clone(),
     )
     .await?;
-    let duration = source.duration_seconds.context("source duration unknown")?;
     let source_tracks: Vec<db::Track> = serde_json::from_str(&source.tracks_json)?;
     let observations = |tracks: &[db::Track]| {
         tracks
@@ -767,6 +829,7 @@ async fn convert(
         &directory.join(".owner"),
         &mut decode,
         false,
+        media_ms,
     )
     .await?;
     let (root, identity): (String, String) =
@@ -907,19 +970,75 @@ async fn finish(
     tx.commit().await?;
     Ok(())
 }
+/// Whether VideoToolbox can encode here: one tiny hardware-only encode, cached.
+/// macOS alone is not enough (virtual machines and some hosts lack sessions).
+pub async fn videotoolbox_available(app: &App) -> bool {
+    *app.processing
+        .videotoolbox
+        .get_or_init(|| async {
+            if !cfg!(target_os = "macos") {
+                return false;
+            }
+            let probe = Command::new(&app.processing.settings.ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:d=0.2",
+                    "-c:v",
+                    "h264_videotoolbox",
+                    "-allow_sw",
+                    "0",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status();
+            matches!(
+                tokio::time::timeout(Duration::from_secs(20), probe).await,
+                Ok(Ok(status)) if status.success()
+            )
+        })
+        .await
+}
+
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     loop {
         if stop.is_cancelled() {
             return Ok(());
         }
         // Hold no capacity while idle: only reserve when work is queued.
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM processing_jobs WHERE phase='queued' LIMIT 1")
-                .fetch_optional(&app.db)
-                .await?;
-        if queued.is_none() {
+        let queued: Option<String> = sqlx::query_scalar(
+            "SELECT backend FROM processing_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
+        )
+        .fetch_optional(&app.db)
+        .await?;
+        let Some(next_backend) = queued else {
             tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(500))=>{}}
             continue;
+        };
+        // A hardware session is reserved before the I/O permit too, so waiting for
+        // one never blocks maintenance.
+        let reserve_hardware = || {
+            app.processing.hardware.reserve(
+                format!("processing-hw:{}", new_id()),
+                playscale_core::work::Class::Preparation,
+                1,
+            )
+        };
+        let mut hardware = None;
+        if next_backend == "videotoolbox" {
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
         }
         // Reserve encoder capacity before any I/O permit, so a stuck previous worker
         // blocks replacement here without holding up maintenance.
@@ -948,6 +1067,16 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 None
             }
         };
+        if let Some(job) = job.as_ref().filter(|j| j.backend == "videotoolbox")
+            && hardware.is_none()
+        {
+            // The queue head changed since the peek; reserve now.
+            tracing::debug!(job_id=%job.id, "reserving hardware after selection");
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
+        }
         if let Some(job) = job {
             // Do not detach a blocked snapshot and start another job. The permit and this
             // waiter both remain until it finishes; cancellation is checked before FFmpeg.
@@ -959,6 +1088,16 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 tracing::warn!(job_id=%job.id,%error,"processing failed");
             }
             finish(&app, &job, result.ok()).await?;
+            // A stuck encoder keeps its hardware session too, until its witness frees.
+            if lease.is_stuck()
+                && let Some(hardware) = &hardware
+            {
+                let owner = app.processing.root.join(job.relative()).join(".owner");
+                match crate::execution::Witness::open(&owner) {
+                    Ok(witness) => hardware.stuck(witness.wait()),
+                    Err(_) => hardware.stuck(std::future::pending()),
+                }
+            }
             // A stuck attempt's directory holds its live witness: keep it for recovery.
             if load(&app, &job.id).await?.phase != "completed" && !lease.is_stuck() {
                 let directory = app.processing.root.join(job.relative());
@@ -972,6 +1111,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             }
         }
         drop(permit);
+        drop(hardware);
         drop(lease);
         tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
@@ -1376,5 +1516,34 @@ mod publication_tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    #[test]
+    fn liveness_limits_are_opt_in_and_bounded() {
+        let default: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.startup_timeout_seconds, None);
+        assert_eq!(default.no_progress_timeout_seconds, None);
+        assert_eq!(default.expected_duration, None);
+        for (allowance, multiplier, valid) in [
+            (1, 1, true),
+            (86400, 100, true),
+            (0, 1, false),
+            (86401, 1, false),
+            (1, 0, false),
+            (1, 101, false),
+        ] {
+            let settings: super::Settings = serde_json::from_value(serde_json::json!({"expected_duration":{"allowance_seconds":allowance,"media_duration_multiplier":multiplier}})).unwrap();
+            assert_eq!(settings.validate().is_ok(), valid);
+        }
+        for field in ["startup_timeout_seconds", "no_progress_timeout_seconds"] {
+            for (value, valid) in [(0, false), (1, true), (86400, true), (86401, false)] {
+                let settings: super::Settings =
+                    serde_json::from_value(serde_json::json!({field: value})).unwrap();
+                assert_eq!(settings.validate().is_ok(), valid, "{field}={value}");
+            }
+        }
     }
 }

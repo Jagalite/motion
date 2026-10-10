@@ -129,3 +129,22 @@ FFmpeg jobs: H.264 320×180/30, HEVC 320×180/preserved 60, and H.264
 complete within the existing 0.5-second duration tolerance. It verifies decoded files, hashes, ranges, planner matching,
 SSE replay and persistence across restart. It does not qualify client ABR,
 seamless switching, physical audio output, Catabolic execution or hardware encoding.
+
+### Duration-derived execution deadline
+
+Processing can optionally set `expected_duration` alongside the existing absolute,
+startup and no-progress timeouts:
+
+```json
+{"processing":{"expected_duration":{"allowance_seconds":30,"media_duration_multiplier":4}}}
+```
+
+Each conversion and validation-decode command gets an elapsed-time budget of
+`allowance_seconds + source_duration_seconds * media_duration_multiplier`. The
+absolute `timeout_seconds` remains an upper bound. The allowance must be 1–86400
+seconds and the integer multiplier 1–100. Omission or null disables this optional
+policy. Source duration comes from the revalidated catalog revision and rounds
+up to milliseconds. Progress never extends this budget; expiration requests tree
+termination and capacity remains reserved until termination is confirmed. Output
+duration/track validation is still required before publication. This setting
+applies to durable processing, not intentionally paced live delivery.

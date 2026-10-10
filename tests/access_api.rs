@@ -1265,7 +1265,13 @@ async fn problems_contract_and_capabilities() {
     assert_eq!(caps.status, StatusCode::OK, "{:?}", caps.body);
     assert_eq!(caps.body["server_id"], health.body["server_id"]);
     assert_eq!(caps.body["server_epoch"], health.body["server_epoch"]);
-    assert_eq!(caps.body["schema_version"], "19");
+    // The newest migration on disk, so a new or renumbered migration needs no edit here.
+    let latest: i64 = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().to_str()?.get(..4)?.parse().ok())
+        .max()
+        .unwrap();
+    assert_eq!(caps.body["schema_version"], latest.to_string());
     assert_eq!(
         caps.body["contract_digest"],
         playscale::v2::system::contract_digest()

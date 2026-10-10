@@ -47,6 +47,101 @@ pub enum Operation {
     AudioConvert,
     VideoTranscode,
 }
+/// Codecs of the exact source streams a live route would read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStreams<'a> {
+    pub video: Option<&'a str>,
+    /// The selected audio stream; None when audio is omitted.
+    pub audio: Option<&'a str>,
+    /// PQ or HLG transfer: no live route has a qualified tone-mapping path.
+    pub hdr: bool,
+    /// Every source stream (hence the container) starts at media time zero.
+    /// Stream copy keeps source timestamps, which equal timeline time only then.
+    pub starts_at_zero: bool,
+    /// The video is 8-bit 4:2:0, the only layout the browser pipeline decodes.
+    pub eight_bit_420: bool,
+    /// Bitstream details observed from the source itself; None = not observed,
+    /// which makes stream copy ineligible.
+    pub details: Option<VideoDetails<'a>>,
+}
+
+/// H.264 bitstream properties that decide whether a copied stream is playable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoDetails<'a> {
+    pub profile: &'a str,
+    /// level_idc, e.g. 31 for 3.1.
+    pub level: i64,
+    pub progressive: bool,
+    /// A display rotation is present (copied streams would play unrotated).
+    pub rotated: bool,
+}
+
+/// Profiles every supported browser decodes, and the highest level (5.1).
+const COPY_PROFILES: [&str; 4] = ["Constrained Baseline", "Baseline", "Main", "High"];
+const COPY_MAX_LEVEL: i64 = 51;
+
+/// Where a stream copy for `requested_ms` begins: the last source keyframe at or
+/// before it. The HLS muxer cuts at the first keyframe at least `hls_time_s`
+/// after the current segment's start; every segment so produced up to `end_ms`
+/// (the end of the observed keyframes, or of the media) must fit `target_s`.
+/// None when no keyframe precedes the request or some segment would not fit.
+pub fn copy_start(
+    keyframes_ms: &[u64],
+    requested_ms: u64,
+    hls_time_s: u64,
+    target_s: u64,
+    end_ms: u64,
+) -> Option<u64> {
+    let start = keyframes_ms
+        .iter()
+        .copied()
+        .filter(|k| *k <= requested_ms)
+        .max()?;
+    let mut segment = start;
+    for keyframe in keyframes_ms.iter().copied().filter(|k| *k > start) {
+        if keyframe - segment >= hls_time_s * 1000 {
+            if !fits_target(keyframe - segment, target_s) {
+                return None;
+            }
+            segment = keyframe;
+        }
+    }
+    // The open segment runs at least to the end of what was observed.
+    (end_ms <= segment || fits_target(end_ms - segment, target_s)).then_some(start)
+}
+
+/// Text subtitle codecs that can be delivered as a WebVTT sidecar in timeline
+/// time, on any route, without losing meaning. ASS/SSA are excluded: WebVTT
+/// drops their positioning, fonts and effects, which can merge signs with
+/// dialogue. Bitmap subtitles (PGS, DVD, DVB) need burn-in, not yet offered.
+pub fn sidecar_subtitle(codec: &str) -> bool {
+    matches!(codec, "subrip" | "srt" | "mov_text" | "webvtt" | "text")
+}
+
+/// Whether a live segmented route can serve these streams. Stream copy is only
+/// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
+/// conversion copies H.264 and converts any other audio to AAC.
+pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool {
+    if s.hdr || s.video.is_none() {
+        return false;
+    }
+    let copy = s.video == Some("h264")
+        && s.starts_at_zero
+        && s.eight_bit_420
+        && s.details.is_some_and(|d| {
+            COPY_PROFILES.contains(&d.profile)
+                && (1..=COPY_MAX_LEVEL).contains(&d.level)
+                && d.progressive
+                && !d.rotated
+        });
+    match operation {
+        Operation::VideoTranscode => true,
+        Operation::Remux => copy && s.audio.is_none_or(|a| a == "aac"),
+        Operation::AudioConvert => copy && s.audio.is_some_and(|a| a != "aac"),
+        Operation::Original | Operation::Prepared => false,
+    }
+}
+
 impl Operation {
     /// Byte routes serve a stored representation; the others are generated HLS.
     pub fn segmented(self) -> bool {
@@ -123,6 +218,10 @@ pub struct Generation {
     pub media_time_origin_ms: u64,
     /// Pinned when the first segment is published; constant for the generation.
     pub target_duration_s: u64,
+    /// Logical time where segment 0 begins (the requested start, or the
+    /// preceding keyframe for stream copy).
+    #[serde(default)]
+    pub segment_zero_start_ms: u64,
     /// Segments advertised in the media playlist (a rolling window).
     pub segments: Vec<Segment>,
     /// Evicted but still fetchable segments, in index order.
@@ -199,6 +298,9 @@ pub enum Input {
     Ready {
         generation: u64,
         media_time_origin_ms: u64,
+        /// Media time at which segment 0 begins: zero when the encoder starts
+        /// output at the requested time, the preceding keyframe for stream copy.
+        first_segment_start_ms: u64,
         first_segment_ms: u64,
         target_duration_s: u64,
     },
@@ -307,6 +409,7 @@ fn new_generation(pin: Pin, start_ms: u64, duration_ms: Option<u64>) -> Generati
         requested_start_ms: start_ms,
         media_time_origin_ms: if segmented { start_ms } else { 0 },
         target_duration_s: 0,
+        segment_zero_start_ms: if segmented { start_ms } else { 0 },
         segments: Vec::new(),
         retained: Vec::new(),
         next_segment: 0,
@@ -613,15 +716,18 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
         Input::Ready {
             generation,
             media_time_origin_ms,
+            first_segment_start_ms,
             first_segment_ms,
             target_duration_s,
         } => {
             let n = *generation;
             let origin = *media_time_origin_ms;
-            let end = origin.saturating_add(*first_segment_ms);
+            let begin = origin.saturating_add(*first_segment_start_ms);
+            let end = begin.saturating_add(*first_segment_ms);
             if producing(&d, n) && d.generations[&n].status == G::Starting {
                 let start = d.generations[&n].requested_start_ms;
-                if origin <= start
+                // Segment 0 must cover the requested start in logical time.
+                if begin <= start
                     && start < end
                     && within(d.duration_ms, end)
                     && TARGET_SECONDS.contains(target_duration_s)
@@ -635,7 +741,8 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
                         duration_ms: *first_segment_ms,
                     }];
                     g.next_segment = 1;
-                    g.available_start_ms = origin;
+                    g.segment_zero_start_ms = begin;
+                    g.available_start_ms = begin;
                     g.available_end_ms = end;
                     g.longest_playlist_ms = *first_segment_ms;
                     if d.active.is_none() {
@@ -916,6 +1023,7 @@ mod tests {
         Input::Ready {
             generation,
             media_time_origin_ms: origin,
+            first_segment_start_ms: 0,
             first_segment_ms: 4000,
             target_duration_s: 6,
         }
@@ -1048,6 +1156,7 @@ mod tests {
         let bad = Input::Ready {
             generation: 2,
             media_time_origin_ms: 4_000,
+            first_segment_start_ms: 0,
             first_segment_ms: 4000,
             target_duration_s: 6,
         };
@@ -1257,5 +1366,149 @@ mod tests {
                 paused: false
             }]
         );
+    }
+
+    #[test]
+    fn copy_routes_start_at_the_preceding_keyframe() {
+        let mut copy = pin(&["a1"]);
+        copy.operation = Operation::Remux;
+        let (mut d, _) = Delivery::admit("t".into(), copy, 30_000, Some(120_000), 0).unwrap();
+        // Copied output keeps source timestamps: media time is logical time and
+        // segment 0 starts at the keyframe at 28 s, before the requested 30 s.
+        let ready = |start, length| Input::Ready {
+            generation: 1,
+            media_time_origin_ms: 0,
+            first_segment_start_ms: start,
+            first_segment_ms: length,
+            target_duration_s: 12,
+        };
+        assert_eq!(
+            transition(&d, &ready(31_000, 4000)).unwrap().0.status,
+            Status::Failed,
+            "a segment starting after the request does not cover it"
+        );
+        assert_eq!(
+            transition(&d, &ready(20_000, 4000)).unwrap().0.status,
+            Status::Failed,
+            "a segment ending before the request does not cover it"
+        );
+        step(&mut d, ready(28_000, 10_000)).unwrap();
+        let g = &d.generations[&1];
+        assert_eq!((d.status, g.segment_zero_start_ms), (Status::Ready, 28_000));
+        assert_eq!((g.available_start_ms, g.available_end_ms), (28_000, 38_000));
+    }
+
+    #[test]
+    fn live_routes_follow_source_codecs() {
+        let streams = |video, audio, hdr| SourceStreams {
+            video,
+            audio,
+            hdr,
+            starts_at_zero: true,
+            eight_bit_420: true,
+            details: Some(VideoDetails {
+                profile: "High",
+                level: 40,
+                progressive: true,
+                rotated: false,
+            }),
+        };
+        let h264_aac = streams(Some("h264"), Some("aac"), false);
+        let h264_ac3 = streams(Some("h264"), Some("ac3"), false);
+        let hevc = streams(Some("hevc"), Some("aac"), false);
+        assert!(live_route_supported(Operation::Remux, &h264_aac));
+        assert!(!live_route_supported(Operation::AudioConvert, &h264_aac));
+        assert!(live_route_supported(Operation::AudioConvert, &h264_ac3));
+        assert!(!live_route_supported(Operation::Remux, &h264_ac3));
+        assert!(live_route_supported(
+            Operation::Remux,
+            &streams(Some("h264"), None, false)
+        ));
+        assert!(!live_route_supported(Operation::Remux, &hevc));
+        assert!(live_route_supported(Operation::VideoTranscode, &hevc));
+        assert!(!live_route_supported(
+            Operation::VideoTranscode,
+            &streams(Some("hevc"), None, true)
+        ));
+        assert!(!live_route_supported(Operation::Original, &h264_aac));
+        let offset = SourceStreams {
+            starts_at_zero: false,
+            ..h264_aac
+        };
+        assert!(!live_route_supported(Operation::Remux, &offset));
+        assert!(live_route_supported(Operation::VideoTranscode, &offset));
+        let ten_bit = SourceStreams {
+            eight_bit_420: false,
+            ..h264_aac
+        };
+        assert!(!live_route_supported(Operation::Remux, &ten_bit));
+        assert!(live_route_supported(Operation::VideoTranscode, &ten_bit));
+        let detail = |profile, level, progressive, rotated| SourceStreams {
+            details: Some(VideoDetails {
+                profile,
+                level,
+                progressive,
+                rotated,
+            }),
+            ..h264_aac
+        };
+        for ineligible in [
+            detail("High 10", 40, true, false),
+            detail("High 4:2:2", 40, true, false),
+            detail("High", 52, true, false),
+            detail("High", 40, false, false),
+            detail("High", 40, true, true),
+            SourceStreams {
+                details: None,
+                ..h264_aac
+            },
+        ] {
+            assert!(!live_route_supported(Operation::Remux, &ineligible));
+            assert!(live_route_supported(Operation::VideoTranscode, &ineligible));
+        }
+        assert!(live_route_supported(
+            Operation::Remux,
+            &detail("Constrained Baseline", 31, true, false)
+        ));
+    }
+
+    #[test]
+    fn copy_starts_at_the_preceding_keyframe_within_target_spacing() {
+        let keyframes = [28_000, 30_000, 32_000, 36_000, 40_000];
+        let start = |k: &[u64], requested, end| copy_start(k, requested, 4, 12, end);
+        assert_eq!(start(&keyframes, 31_000, 44_000), Some(30_000));
+        assert_eq!(start(&keyframes, 30_000, 44_000), Some(30_000));
+        assert_eq!(
+            start(&keyframes, 27_000, 44_000),
+            None,
+            "no keyframe at or before"
+        );
+        // A 13 s gap cannot fit a 12 s target.
+        assert_eq!(start(&[0, 4_000, 17_000], 1_000, 17_000), None);
+        assert_eq!(start(&[0, 4_000, 16_000], 1_000, 16_000), Some(0));
+        assert_eq!(start(&[], 0, 0), None);
+        // The muxer skips a keyframe before hls_time: 0, 5, 15 with hls_time 6
+        // cuts at 15, a 15 s segment, although no single gap exceeds 10 s.
+        assert_eq!(copy_start(&[0, 5_000, 15_000], 0, 6, 12, 15_000), None);
+        assert_eq!(copy_start(&[0, 5_000, 15_000], 0, 4, 12, 15_000), Some(0));
+        // Keyframes stop 32 s before the observed end: the open segment is too long.
+        assert_eq!(start(&[30_000, 34_000, 58_000], 31_000, 90_000), None);
+    }
+
+    #[test]
+    fn only_text_subtitles_become_sidecars() {
+        for codec in ["subrip", "mov_text", "webvtt"] {
+            assert!(sidecar_subtitle(codec), "{codec}");
+        }
+        for codec in [
+            "ass",
+            "ssa",
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvb_subtitle",
+            "",
+        ] {
+            assert!(!sidecar_subtitle(codec), "{codec}");
+        }
     }
 }

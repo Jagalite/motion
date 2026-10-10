@@ -9,6 +9,7 @@ pub mod delivery;
 pub mod encoding;
 pub mod events;
 pub mod execution;
+pub mod fmp4;
 pub mod libraries;
 pub mod maintenance;
 pub mod matching;

@@ -14,7 +14,7 @@ const bytes = readFileSync(source);
 const executable = join(work, 'motion-server');
 writeFileSync(executable, bytes, {mode: 0o700, flag: 'wx'});
 const contractDigest = `sha256:${hash(readFileSync(new URL('contracts/Motion_Server_API_v2.yaml', root)))}`;
-const options = {executable, dataDir: join(work, 'data'), demuxeDir: resolve(process.env.MOTION_DEMUXE_DIR ?? '/Volumes/seed2/Projects/playscale/web/vendor/demuxe'), contractDigest};
+const options = {executable, dataDir: join(work, 'data'), demuxeDir: resolve(process.env.MOTION_DEMUXE_DIR ?? fileURLToPath(new URL('web/vendor/demuxe', root))), contractDigest};
 const first = createOwnedServer(options);
 const second = createOwnedServer(options);
 const checks = {};

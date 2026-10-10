@@ -46,6 +46,9 @@ struct Deliveries {
     changes: bool,
     positions: &'static [u64],
     origins: &'static [u64],
+    /// Media time of segment 0's start (0 = encoder starts at the request;
+    /// otherwise a stream-copy keyframe).
+    first_starts: &'static [u64],
     segment_indices: u32,
     durations: &'static [u64],
     clock_steps: &'static [u64],
@@ -77,12 +80,15 @@ impl Enumerate for Deliveries {
                 }));
             }
             for origin in self.origins {
-                inputs.push(Step::Delivery(Input::Ready {
-                    generation: g,
-                    media_time_origin_ms: *origin,
-                    first_segment_ms: 4_000,
-                    target_duration_s: TARGET,
-                }));
+                for first_start in self.first_starts {
+                    inputs.push(Step::Delivery(Input::Ready {
+                        generation: g,
+                        media_time_origin_ms: *origin,
+                        first_segment_start_ms: *first_start,
+                        first_segment_ms: 4_000,
+                        target_duration_s: TARGET,
+                    }));
+                }
             }
             // The next index (plus one early index) with each duration.
             let next = d.generations.get(&g).map_or(1, |x| x.next_segment.max(1));
@@ -330,8 +336,11 @@ impl Model for Deliveries {
                 d.generations.values().all(|g| {
                     !g.pin.operation.segmented()
                         || g.next_segment == 0
-                        || (g.media_time_origin_ms <= g.requested_start_ms
-                            && g.requested_start_ms < g.media_time_origin_ms + 4_000)
+                        || (g.segment_zero_start_ms <= g.requested_start_ms
+                            && g.requested_start_ms < g.segment_zero_start_ms + 4_000
+                            // Until eviction, the window starts at segment 0.
+                            && (g.segments.first().is_none_or(|s| s.index != 0)
+                                || g.available_start_ms == g.segment_zero_start_ms))
                 }),
             ),
             check(
@@ -544,6 +553,40 @@ impl Model for Deliveries {
                 _ => false,
             }
         });
+        // A Ready that satisfies the request makes the generation playable with
+        // exactly the reported interval; otherwise the generation fails.
+        let ready_effective = match input {
+            Input::Ready {
+                generation,
+                media_time_origin_ms,
+                first_segment_start_ms,
+                first_segment_ms,
+                target_duration_s,
+            } if b.generations.get(generation).is_some_and(|g| {
+                g.status == G::Starting && g.worker == Worker::Live && !b.status.fenced()
+            }) =>
+            {
+                let g = &b.generations[generation];
+                let begin = media_time_origin_ms + first_segment_start_ms;
+                let end = begin + first_segment_ms;
+                let valid = begin <= g.requested_start_ms
+                    && g.requested_start_ms < end
+                    && self.duration.is_none_or(|limit| end <= limit + 1_000)
+                    && (1..=20).contains(target_duration_s)
+                    && fits_target(*first_segment_ms, *target_duration_s);
+                match a.generations.get(generation) {
+                    Some(x) if valid => {
+                        matches!(x.status, G::Ready | G::Active)
+                            && x.segment_zero_start_ms == begin
+                            && x.available_start_ms == begin
+                            && x.available_end_ms == end
+                    }
+                    Some(x) => x.status == G::Failed,
+                    None => !valid,
+                }
+            }
+            _ => true,
+        };
         let created_fresh = created.iter().all(|n| {
             let g = &a.generations[n];
             g.segments.is_empty() && g.next_segment == 0
@@ -721,6 +764,7 @@ impl Model for Deliveries {
                 output_from_producer && created_fresh,
             ),
             check("valid_command_takes_effect", command_effective),
+            check("ready_takes_effect_with_exact_interval", ready_effective),
             check(
                 "activation_requires_expected_active",
                 !matches!(input, Input::Activate { .. })
@@ -809,6 +853,7 @@ fn lifecycle() -> Deliveries {
         changes: true,
         positions: &[6_000, 12_000],
         origins: &[0, 6_000],
+        first_starts: &[0, 4_000],
         segment_indices: 1,
         durations: &[4_000],
         clock_steps: &[DRAIN_MS],
@@ -827,6 +872,7 @@ fn window() -> Deliveries {
         changes: false,
         positions: &[],
         origins: &[0],
+        first_starts: &[0],
         segment_indices: 8,
         durations: &[1_000, 6_000],
         clock_steps: &[24_000],
@@ -851,6 +897,7 @@ fn playhead() -> Deliveries {
         changes: true,
         positions: &[6_000],
         origins: &[0, 6_000],
+        first_starts: &[0],
         segment_indices: 2,
         durations: &[4_000],
         clock_steps: &[],
@@ -916,6 +963,7 @@ fn seeded_delivery_sequences_with_more_generations() {
             changes: true,
             positions: &[0, 6_000, 30_000, 59_999, 60_000],
             origins: &[0, 6_000, 28_000, 30_000],
+            first_starts: &[0],
             segment_indices: 20,
             durations: &[1_000, 4_000, 6_000, 6_600],
             clock_steps: &[1, DRAIN_MS - 1, LEASE_MS],
@@ -961,6 +1009,7 @@ fn heartbeat_boundaries_renew_only_valid_generation_leases() {
         &Input::Ready {
             generation: 1,
             media_time_origin_ms: 0,
+            first_segment_start_ms: 0,
             first_segment_ms: 4_000,
             target_duration_s: TARGET,
         },
@@ -1049,6 +1098,7 @@ fn seek_switch_and_stale_segment_replay_exactly() {
         Step::Delivery(Input::Ready {
             generation: 1,
             media_time_origin_ms: 0,
+            first_segment_start_ms: 0,
             first_segment_ms: 4_000,
             target_duration_s: TARGET,
         }),
@@ -1062,6 +1112,7 @@ fn seek_switch_and_stale_segment_replay_exactly() {
         Step::Delivery(Input::Ready {
             generation: 2,
             media_time_origin_ms: 6_000,
+            first_segment_start_ms: 0,
             first_segment_ms: 4_000,
             target_duration_s: TARGET,
         }),

@@ -727,6 +727,10 @@ pub fn router_with(
             get(crate::delivery::segment),
         )
         .route(
+            "/api/v1/streams/{id}/{generation}/subtitles.vtt",
+            get(crate::delivery::subtitles),
+        )
+        .route(
             "/app.js",
             get(|| async {
                 (

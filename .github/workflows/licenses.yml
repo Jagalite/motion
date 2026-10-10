@@ -12,6 +12,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Pull requests check their own head, not GitHub's synthetic merge commit,
+          # whose identity is GitHub's and not the contributors'.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
