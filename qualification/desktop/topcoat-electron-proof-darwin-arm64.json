@@ -3,8 +3,8 @@
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
   "passed": true,
-  "recorded_at": "2026-10-10T04:19:03.906Z",
-  "motion_commit": "a9ea89558e81344b0c7f8a023d2e7fe0d6402025",
+  "recorded_at": "2026-10-10T04:28:51.299Z",
+  "motion_commit": "de331b3d4bfef1fa047f6c161f441b1300c1af6a",
   "worktree_dirty": true,
   "environment": {
     "electron": "44.7.0",
@@ -18,11 +18,11 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "ca293b62fa7dba52baf6cce804e3bc857e5a908617ebb9d7a1bdfa520c3de1ed",
-  "proof_driver_sha256": "c51c7886feaa4fe1befe424119d96be8a61b5036263c6e2d8e8829349661a0bb",
+  "proof_server_sha256": "3c5d8a678252f2cab7e09c344919d1c66e21c22f253129b72ff8fe82f84f3254",
+  "proof_driver_sha256": "7700301380967c53b8743a9a615c5260040e14d41343302dfe3e981825aa2da1",
   "proof_server_launch": {
     "location": "host-temporary-directory",
-    "sha256": "ca293b62fa7dba52baf6cce804e3bc857e5a908617ebb9d7a1bdfa520c3de1ed",
+    "sha256": "3c5d8a678252f2cab7e09c344919d1c66e21c22f253129b72ff8fe82f84f3254",
     "matches_build": true
   },
   "rust_toolchain": "1.98.0",
@@ -101,12 +101,12 @@
     },
     "playback": {
       "played": true,
-      "before": 2.599956,
-      "afterSeek": 7.000929,
-      "seekElapsedMs": 39,
+      "before": 2.600014,
+      "afterSeek": 7.001456,
+      "seekElapsedMs": 49,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.750695,
+      "finalTime": 7.747019,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -115,7 +115,7 @@
     },
     "generationSwitch": {
       "replaced": true,
-      "logicalTime": 5.002727,
+      "logicalTime": 5.005876,
       "muted": true,
       "players": 1
     },
@@ -127,9 +127,76 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.003523,
-      "now": 1.008882
+      "start": 0.004373,
+      "now": 1.010747
     },
+    "playbackProcessSnapshot": [
+      {
+        "pid": 17540,
+        "type": "Browser",
+        "cpu": {
+          "cumulativeCPUUsage": 0.856149,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 154832,
+          "peakWorkingSetSize": 160256
+        }
+      },
+      {
+        "pid": 17555,
+        "type": "GPU",
+        "cpu": {
+          "cumulativeCPUUsage": 0.900933,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 93552,
+          "peakWorkingSetSize": 94464
+        }
+      },
+      {
+        "pid": 17556,
+        "type": "Utility",
+        "cpu": {
+          "cumulativeCPUUsage": 0.236714,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 48880,
+          "peakWorkingSetSize": 56576
+        }
+      },
+      {
+        "pid": 17560,
+        "type": "Tab",
+        "cpu": {
+          "cumulativeCPUUsage": 0.866941,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 160304,
+          "peakWorkingSetSize": 160304
+        }
+      },
+      {
+        "pid": 17561,
+        "type": "Utility",
+        "cpu": {
+          "cumulativeCPUUsage": 0.172076,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 40496,
+          "peakWorkingSetSize": 46000
+        }
+      }
+    ],
     "afterScanTitle": "Sources and scans",
     "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again.",
     "screenMatrix": [
@@ -191,6 +258,10 @@
         "headings": 1,
         "labelled": true,
         "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.sources-320.png",
+          "sha256": "65f00330f71eda3207088815ac6b44ecb0adcb10090ac8283b46c772278076b7"
+        },
         "accessibleControlNames": true
       },
       {
@@ -211,6 +282,10 @@
         "headings": 1,
         "labelled": true,
         "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.processing-320.png",
+          "sha256": "28c77a29c7f0c7dc03acd082e119f054954552091c115d2bbd686e809c907952"
+        },
         "accessibleControlNames": true
       },
       {
@@ -281,6 +356,10 @@
         "headings": 1,
         "labelled": true,
         "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.sources-1280.png",
+          "sha256": "7f144d6ece051ede47c54a8b115aee61b269e385d7166512ad2db9804b935b03"
+        },
         "accessibleControlNames": true
       },
       {
@@ -301,6 +380,10 @@
         "headings": 1,
         "labelled": true,
         "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.processing-1280.png",
+          "sha256": "5c7f1983e68b0af601d25b6f63d9339505312b7ec2a4d6f076862ecf787e4f54"
+        },
         "accessibleControlNames": true
       },
       {
@@ -316,11 +399,13 @@
     ],
     "renderLoad": {
       "requests": 24,
+      "htmlBytesMin": 1763,
+      "htmlBytesMax": 2934,
       "simultaneousRangeRead": true,
       "allSucceeded": true,
-      "elapsedMs": 14,
-      "p50Ms": 8,
-      "p95Ms": 12
+      "elapsedMs": 26,
+      "p50Ms": 16,
+      "p95Ms": 24
     }
   },
   "csp_console": [
@@ -353,7 +438,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "f33f12355aa14015816141865643a1c2",
+        "event_id": "f58a4d3baf6f4da288c5e0981e80fcd0",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -371,7 +456,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "89db9360e92141e9bea6982e3f9eb940",
+        "event_id": "c30924d733cf4fa18804880728065218",
         "position_ms": 0,
         "sequence": "2",
         "status": "paused"
@@ -382,7 +467,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "d9e3954b47bc4b1990c39d11dcc1217b",
+        "event_id": "b91a7776d4d24e3dbc524a19ddd6ed52",
         "position_ms": 5,
         "sequence": "3",
         "status": "playing"
@@ -400,8 +485,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "7757f31ba40d442fb313274460a6ecaa",
-        "position_ms": 7751,
+        "event_id": "daae3aa3edf646a48bda8dfa42838ecc",
+        "position_ms": 7747,
         "sequence": "4",
         "status": "playing"
       },
@@ -420,8 +505,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "1be1533a2bec461f9643e80c93222c06",
-        "position_ms": 7835,
+        "event_id": "c98642bbbd414a1089f91f1533790f0e",
+        "position_ms": 7861,
         "sequence": "5",
         "status": "paused"
       },
@@ -439,7 +524,7 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "2901d24b10294ac9b8269483e708f243",
+        "event_id": "792a4752621741aba632e1367e25dd41",
         "position_ms": 5000,
         "sequence": "6",
         "status": "paused"
@@ -450,8 +535,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "4a46ffd4672a421bb1ec2f318376425a",
-        "position_ms": 5001,
+        "event_id": "76e291659f884c81b2d8935b7c4a648e",
+        "position_ms": 5002,
         "sequence": "7",
         "status": "playing"
       },
@@ -461,8 +546,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "9f0516b9f0e3425b8b51e71551b70af3",
-        "position_ms": 5003,
+        "event_id": "78bf0a5103e04803a883c81fb4dc3f04",
+        "position_ms": 5006,
         "sequence": "8",
         "status": "stopped"
       },
@@ -490,7 +575,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "0ca96cfe6e5f4695b9a1a7c355b6b9ed",
+        "event_id": "be869c8c75444fa88636150b0ee8885b",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -501,7 +586,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "f7cb22568f134dec9c9a7129ce352b9c",
+        "event_id": "60b8e76addee45b68dec34555c14df49",
         "position_ms": 2,
         "sequence": "2",
         "status": "playing"
@@ -512,8 +597,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "e3bd4a9b3e20415382f1ca549e7f7679",
-        "position_ms": 1009,
+        "event_id": "70da2cc57fb3439c96ff080ac3e352b5",
+        "position_ms": 1011,
         "sequence": "3",
         "status": "stopped"
       },
@@ -525,7 +610,7 @@
         "mode": "incremental",
         "require_complete": false
       },
-      "key": "4572ef6672a74ac588810950ea2f02e0",
+      "key": "a44ed4c78aa34f5b8a1c884aabaebed9",
       "library": "lib1",
       "operation": "createScan",
       "replay": false
@@ -568,5 +653,12 @@
     "Viewing authority and event replies use static mock fixtures; production authority conflicts and persistence require real-backend qualification.",
     "Generation replacement is exercised against mock range media; real FFmpeg/HLS transport remains unqualified.",
     "Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron."
-  ]
+  ],
+  "visual_review": {
+    "screens": [
+      "sources at 320 and 1280 CSS pixels",
+      "processing at 320 CSS pixels"
+    ],
+    "result": "Readable wrapping, labelled fields and contained horizontal table scrolling; reviewed captured images. Physical assistive technology is not covered."
+  }
 }

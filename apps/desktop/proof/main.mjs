@@ -3,6 +3,7 @@
 // session in a dedicated partition, then shows the server's Topcoat page in a
 // sandboxed window with no preload and no Node, and records observed facts.
 import {writeFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {app, BrowserWindow, session} from 'electron';
 
 const origin = process.env.MOTION_PROOF_ORIGIN;
@@ -211,7 +212,14 @@ app.whenReady().then(async () => {
           reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches && [...document.querySelectorAll('.card a')].every(e => getComputedStyle(e).transitionDuration === '0s')})`);
         const tree = await contents.debugger.sendCommand('Accessibility.getFullAXTree');
         const controls = tree.nodes.filter(node => !node.ignored && ['button', 'textbox', 'combobox', 'checkbox', 'radio', 'link'].includes(node.role?.value));
-        screens.push({path, ...dom, accessibleControlNames: controls.every(node => Boolean(node.name?.value))});
+        let screenshot;
+        if (path === '/processing' || path === '/sources') {
+          const png = (await contents.capturePage()).toPNG();
+          const file = `${output}.${path.slice(1)}-${width}.png`;
+          writeFileSync(file, png);
+          screenshot = {file, sha256: createHash('sha256').update(png).digest('hex')};
+        }
+        screens.push({path, ...dom, screenshot, accessibleControlNames: controls.every(node => Boolean(node.name?.value))});
       }
     }
     contents.debugger.detach();
