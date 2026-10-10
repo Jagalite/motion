@@ -7,6 +7,7 @@ pub mod content;
 pub mod cors;
 pub mod events;
 pub mod identity;
+pub mod organization;
 pub mod system;
 
 use crate::App;
@@ -780,6 +781,7 @@ pub fn router() -> Router<App> {
             "/media/files/{file_id}/content",
             get(content::file_content).head(content::file_content),
         )
+        .merge(organization::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))
