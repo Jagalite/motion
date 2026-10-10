@@ -32,6 +32,9 @@ pub struct Settings {
     pub max_output_bytes: u64,
     pub retention_seconds: u64,
     pub timeout_seconds: u64,
+    /// Optional liveness limits; omitted preserves the total-timeout-only policy.
+    pub startup_timeout_seconds: Option<u64>,
+    pub no_progress_timeout_seconds: Option<u64>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -41,6 +44,8 @@ impl Default for Settings {
             max_output_bytes: 2 * 1024 * 1024 * 1024,
             retention_seconds: 30 * 86400,
             timeout_seconds: 7200,
+            startup_timeout_seconds: None,
+            no_progress_timeout_seconds: None,
         }
     }
 }
@@ -57,6 +62,18 @@ impl Settings {
                 && (1..=86400).contains(&self.timeout_seconds),
             "invalid processing retention/timeout"
         );
+        for value in [
+            self.startup_timeout_seconds,
+            self.no_progress_timeout_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            anyhow::ensure!(
+                (1..=86400).contains(&value),
+                "invalid processing liveness timeout"
+            );
+        }
         Ok(())
     }
 }
@@ -453,10 +470,12 @@ async fn command(
     let (witness, held) = crate::execution::Witness::create(owner)?;
     #[cfg(unix)]
     crate::execution::inherit(&mut supervisor, &[&held.0]);
+    // Register ownership before spawning: a failed witness open must never
+    // leave a live child whose lease can be released without termination proof.
+    lease.started(owner)?;
     let child = supervisor.spawn();
     drop(held);
     let mut child = child?;
-    lease.started(owner)?;
     let heartbeat = child.stdin.take();
     let mut stderr = child.stderr.take().context("missing encoder stderr")?;
     let diagnostics = tokio::spawn(async move {
@@ -481,6 +500,19 @@ async fn command(
     let mut decoder = progress::Decoder::default();
     let deadline = tokio::time::sleep(Duration::from_secs(app.processing.settings.timeout_seconds));
     tokio::pin!(deadline);
+    let started = tokio::time::Instant::now();
+    let mut liveness = playscale_core::execution_deadline::Deadline::new(
+        app.processing.settings.timeout_seconds * 1000,
+        app.processing
+            .settings
+            .startup_timeout_seconds
+            .map(|v| v * 1000),
+        app.processing
+            .settings
+            .no_progress_timeout_seconds
+            .map(|v| v * 1000),
+    );
+    let elapsed = || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut output_open = true;
     let mut pending_progress = 0.0f64;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
@@ -489,7 +521,7 @@ async fn command(
             _=&mut deadline=>anyhow::bail!("processing timeout"),
             _=stop.cancelled()=>anyhow::bail!("server stopping"),
             _=lease.termination_requested().cancelled()=>anyhow::bail!("termination requested"),
-            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");break;},
+            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } break;},
             read=stdout.read(&mut output_buffer),if output_open=>{
                 let count = read?;
                 let observed = if count == 0 {
@@ -499,10 +531,11 @@ async fn command(
                     decoder.push(&output_buffer[..count])
                 };
                 if let Some(seconds) = observed {
-                    pending_progress = seconds;
+                    liveness.observe(elapsed(), (seconds * 1000.0) as u64);
+                    pending_progress = pending_progress.max(seconds);
                 }
             },
-            _=poll.tick()=>{active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
+            _=poll.tick()=>{if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
         }} Ok(())
     }.await;
     drop(heartbeat);
@@ -1328,5 +1361,22 @@ mod publication_tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    #[test]
+    fn liveness_limits_are_opt_in_and_bounded() {
+        let default: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.startup_timeout_seconds, None);
+        assert_eq!(default.no_progress_timeout_seconds, None);
+        for field in ["startup_timeout_seconds", "no_progress_timeout_seconds"] {
+            for (value, valid) in [(0, false), (1, true), (86400, true), (86401, false)] {
+                let settings: super::Settings =
+                    serde_json::from_value(serde_json::json!({field: value})).unwrap();
+                assert_eq!(settings.validate().is_ok(), valid, "{field}={value}");
+            }
+        }
     }
 }

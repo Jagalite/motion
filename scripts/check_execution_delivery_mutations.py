@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check four execution/delivery regressions in a disposable core-only workspace.
+"""Check seven execution/delivery regressions in a disposable core-only workspace.
 
 Requires cached Cargo dependencies. Never edits the checkout or shares its target
 directory. A compile error, timeout, or missing test is not a detected mutation.
@@ -17,6 +17,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 HEARTBEAT = "heartbeat_boundaries_renew_only_valid_generation_leases"
 STUCK = "work::tests::stuck_owner_keeps_capacity_until_exit"
+LIVENESS = "liveness_graph_covers_stalls_duplicates_regressions_and_expiry"
 
 
 def check(workspace, target, test, should_fail=False):
@@ -53,18 +54,28 @@ def main():
             f"[workspace.dependencies]\nstateless = {{ {inline} }}\n"
         )
         delivery_target = ["--test", "delivery_model"]
-        print("Checking unmodified delivery and work baselines", flush=True)
+        liveness_target = ["--test", "execution_deadline_model"]
+        print("Checking unmodified delivery, work and deadline baselines", flush=True)
         check(workspace, delivery_target, HEARTBEAT)
         check(workspace, ["--lib"], STUCK)
+        check(workspace, liveness_target, LIVENESS)
         delivery = workspace / "crates/core/src/delivery.rs"
         work = workspace / "crates/core/src/work.rs"
-        original_delivery, original_work = delivery.read_text(), work.read_text()
+        deadline = workspace / "crates/core/src/execution_deadline.rs"
+        originals = {path: path.read_text() for path in [delivery, work, deadline]}
+        original_delivery = originals[delivery]
         # Restrict heartbeat edits to the production transition arm, not the
         # input enum or other commands that have their own lease checks.
         start = original_delivery.index("        Input::Heartbeat {", original_delivery.index("pub fn transition"))
         end = original_delivery.index("        Input::Tick {", start)
         heartbeat = original_delivery[start:end]
         mutants = [
+            ("duplicate progress renews stall deadline", deadline,
+             "position_ms > self.position_ms", "position_ms >= self.position_ms", liveness_target, LIVENESS),
+            ("late progress revives an expired execution", deadline,
+             "self.expired(elapsed_ms).is_none() &&", "true &&", liveness_target, LIVENESS),
+            ("progress can outlive total deadline", deadline,
+             "elapsed_ms >= self.total_ms", "false", liveness_target, LIVENESS),
             ("pending heartbeat replaces active playhead", delivery,
              "&& d.active == Some(*active_generation)", "&& true", delivery_target, HEARTBEAT),
             ("out-of-range heartbeat renews lease", delivery,
@@ -77,16 +88,16 @@ def main():
              ["--lib"], STUCK),
         ]
         for label, path, old, new, target, test in mutants:
-            delivery.write_text(original_delivery)
-            work.write_text(original_work)
+            for original_path, original in originals.items():
+                original_path.write_text(original)
             if path == delivery:
                 mutated = original_delivery[:start] + replace_once(heartbeat, old, new) + original_delivery[end:]
             else:
-                mutated = replace_once(original_work, old, new)
+                mutated = replace_once(originals[path], old, new)
             path.write_text(mutated)
             check(workspace, target, test, should_fail=True)
             print(f"Detected: {label}", flush=True)
-        print("PASS: 2 baselines; 4 compiled mutations detected by test failures", flush=True)
+        print("PASS: 3 baselines; 7 compiled mutations detected by test failures", flush=True)
 
 
 if __name__ == "__main__":

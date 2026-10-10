@@ -22,13 +22,14 @@ impl Default for Decoder {
 }
 
 impl Decoder {
-    /// Consume one bounded read and return its last valid progress value.
+    /// Consume one bounded read and return its highest valid progress value.
+    /// A later regressing field in the same read cannot hide an advancement.
     pub(super) fn push(&mut self, bytes: &[u8]) -> Option<f64> {
-        let mut latest = None;
+        let mut latest: Option<f64> = None;
         for &byte in bytes {
             if byte == b'\n' {
                 if let Some(seconds) = self.finish() {
-                    latest = Some(seconds);
+                    latest = Some(latest.map_or(seconds, |previous| previous.max(seconds)));
                 }
             } else if !self.oversized {
                 if self.len == MAX_LINE_BYTES {
@@ -73,6 +74,21 @@ mod tests {
             }
             assert_eq!(latest, Some(2.5), "chunk size {chunk_size}");
             assert_eq!(decoder.finish(), None);
+        }
+    }
+
+    #[test]
+    fn regressing_fields_cannot_hide_advancement_in_a_coalesced_read() {
+        let input = b"out_time_us=1000000\nout_time_us=0\nout_time_us=500000\n";
+        for size in 1..=input.len() {
+            let mut decoder = Decoder::default();
+            let mut highest = 0.0f64;
+            for chunk in input.chunks(size) {
+                if let Some(value) = decoder.push(chunk) {
+                    highest = highest.max(value);
+                }
+            }
+            assert_eq!(highest, 1.0, "chunk size {size}");
         }
     }
 

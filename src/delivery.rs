@@ -567,6 +567,10 @@ async fn run_generation(
     if stop.is_cancelled() {
         return stopped(&app, &session);
     }
+    if let Err(error) = lease.started(&directory.join(".owner")) {
+        tracing::warn!(%error, "delivery witness unreadable; refusing to spawn");
+        return fail(&app, &session);
+    }
     let child = supervisor.spawn();
     drop((input, held));
     let mut child = match child {
@@ -577,9 +581,6 @@ async fn run_generation(
             return fail(&app, &session);
         }
     };
-    if let Err(error) = lease.started(&directory.join(".owner")) {
-        tracing::warn!(%error, "delivery witness unreadable");
-    }
     let mut heartbeat = child.stdin.take();
     if let Some(mut stderr) = child.stderr.take() {
         // Drain continuously; retain a bounded tail for diagnostics.

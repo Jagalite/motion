@@ -803,3 +803,76 @@ three real recipes, cancellation/retry, restart and SIGKILL recovery, source
 replacement, cache pressure, corrupt output rejection, restore, and preservation
 of original bytes. VideoToolbox completed and its output was probed/decoded on
 this Mac; this is not qualification of other hardware or live delivery pipelines.
+
+## A06/A07 execution liveness and ownership ordering (2026-10-09)
+
+Processing now accepts optional `startup_timeout_seconds` and
+`no_progress_timeout_seconds`, each 1–86400 seconds. Omitted/null settings retain
+existing behavior. The production core's `execution_deadline::Deadline` owns
+expiry decisions; adapters provide monotonic elapsed milliseconds and decoded
+media progress. Positive advancement ends startup, duplicate/regressing positions
+cannot renew the stall budget, and expiry cannot be revived by later progress.
+The absolute total limit remains independent. These clocks apply separately to
+encoding and FFmpeg decode validation, not copying, FFprobe, live-delivery pacing
+or an expected-media-duration resource policy.
+
+The bounded progress decoder now reports the highest valid observation in each
+read: a regressing field coalesced into the same pipe read cannot hide genuine
+advancement. Test coverage varies every read chunk size. Validation/publication
+still requires the existing core completion decision and atomic adapter commit;
+progress does not establish output validity.
+
+Both processing and live delivery register the ownership witness before spawn.
+Previously a failed post-spawn witness open could leave a live process without
+its lease's drop guard. Registration failure now prevents spawn. The adapter
+regression verifies that deleting a registered witness path cannot free capacity
+while its open description remains held, and that closing the last holder releases
+the reservation. Core reservation/termination decisions are unchanged.
+
+`cargo test -p playscale --lib -- --nocapture` passed all 25 tests on final
+production source, including configuration bounds, five parser tests, Unix
+supervisor cleanup, witness retention, atomic publication and restart fencing.
+`cargo test -p playscale-core --test execution_deadline_model -- --nocapture`
+exhausted 241 states and 1,030 transitions with zero skipped checks. Its finite
+domain has elapsed times 0–9, positions 0/1/2/3/u64::MAX, total limit 8, startup
+limit 3 and stall limit 2. Properties check irreversible expiry, the absolute
+cap, zero progress, duplicate/regressing observations, exact renewed stall windows
+and single expiry reasons. This does not prove native timer scheduling or OS
+termination.
+
+`python3 scripts/check_execution_delivery_mutations.py` passed three baselines
+and detected seven compiled regressions through the expected named test failures.
+The three new regressions accept duplicate progress, revive expired execution
+and remove the total deadline; the four existing delivery/capacity mutations
+remain covered. Compilation errors, absent tests and timeouts remain failures
+of the harness, not evidence that a mutation was detected.
+
+Native validation encountered startup delays before Rust test code: sampling a
+waiting test executable showed `_dyld_start` and a 112 KiB footprint. The smoke
+runner is executed after building and warming the final server executable; no
+application timeout was enlarged to hide this delay. An initial smoke assertion
+also read the wrong log file; it now checks the server's bounded diagnostic log.
+The restart integration fixture was made deterministic with real-time FFmpeg
+input: an ultrafast encoder could previously finish before the test asserted
+that recovery still retained its reservation. The exact reservation assertion
+is preserved.
+
+The remaining full-plan scope and integration dependencies are listed in
+`A06_A07_HANDOFF.md`. In particular, these changes do not implement authenticated
+v2 plan admission, delivery-create idempotency, Windows Job Objects or additional
+live pipelines, and do not finalize A02's migration numbering.
+
+Final native results on macOS 26.5.2 arm64, Rust 1.99.0 and FFmpeg 8.1.2:
+`cargo test -p playscale --test delivery -- --nocapture` passed all three tests
+with real tools and no skips. `cargo build -p playscale --bin playscale` passed.
+Once the build/test queue finished and the final executable was warmed with
+`--help`, `python3 scripts/processing_smoke.py` passed all 18 checks. The added
+startup and no-progress cases verify distinct diagnostic reasons, no published
+output, actual encoder reaping and successful subsequent work. The existing
+recipes, VideoToolbox probe/decode, pipe floods, cancel/retry, restart/SIGKILL,
+source replacement, cache/output rejection, scheduling, DB-only restore and
+original integrity checks also passed. Earlier runs timed out at recipe or
+server startup, including restored-root startup; they are not counted as passes.
+Failed-boot cleanup now reaps the attempted server and reports the relevant data
+root's log. No readiness or application deadline was enlarged. Formatting and
+diff checks passed.

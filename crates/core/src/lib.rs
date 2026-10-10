@@ -3,6 +3,7 @@ pub mod artwork;
 pub mod catalog;
 pub mod delivery;
 pub mod events;
+pub mod execution_deadline;
 pub mod jobs;
 pub mod maintenance;
 pub mod metadata;

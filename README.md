@@ -163,6 +163,13 @@ See [VALIDATION.md](VALIDATION.md) for evidence and qualification limits.
   processing supports explicit MP4 remux, AAC audio conversion, and H.264 720p
   recipes, with software or macOS VideoToolbox encoding. Delegated Catabolic jobs,
   callback delivery, adaptive HLS, HDR tone mapping, and subtitle burn-in remain future work.
+- Processing configuration accepts optional `startup_timeout_seconds` and
+  `no_progress_timeout_seconds` (1–86400 seconds each). Startup requires advancing
+  media time; repeated or regressing progress and log output do not renew either
+  deadline. The no-progress clock begins at the first advancement. Omitted/null
+  values disable these additional limits and preserve the existing
+  `timeout_seconds` total limit. Each encoder and FFmpeg decode-validation
+  invocation has its own clocks; timed-out attempts cannot publish and retain capacity until reaped.
 - A blocked filesystem syscall cannot be forcibly interrupted. NAS performance,
   large-library scale, Windows filesystem identity, relayed Tailscale paths, and broad codec/
   browser coverage require further qualification.

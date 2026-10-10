@@ -21,8 +21,22 @@ def main():
         log=(root/'log').open('wb'); process=None
         def boot(data=None):
             p=subprocess.Popen([str(BINARY),'--config',str(config)]+(['--data-dir',str(data)] if data else []),stdout=log,stderr=log)
-            wait_for(lambda:request(port,'GET','/ready')[0]==200)
-            return p
+            def ready():
+                assert p.poll() is None, ('server exited before readiness', p.returncode)
+                return request(port,'GET','/ready')[0]==200
+            try:
+                wait_for(ready)
+                return p
+            except BaseException:
+                # A failed boot must not leave an untracked server behind, and
+                # restore failures need diagnostics from the restored root.
+                if p.poll() is None:
+                    p.terminate()
+                    try: p.wait(timeout=5)
+                    except subprocess.TimeoutExpired: p.kill();p.wait()
+                diagnostic=(data or state)/'logs/server.log'
+                if diagnostic.exists(): print(diagnostic.read_text()[-4000:],file=sys.stderr)
+                raise
         try:
             process=boot();auth={'Authorization':'Bearer '+(state/'admin-token').read_text().strip()}
             def api(method,path,body=None,expected=200,protected=True):
@@ -73,6 +87,34 @@ def main():
             finally:
                 gate.unlink(missing_ok=True)
                 wrapper.write_text(normal_wrapper)
+            # Explicit liveness settings distinguish never-started and stalled
+            # tools. Repeated valid progress and stderr noise must not renew them.
+            stop(process)
+            settings=json.loads(config.read_text())
+            settings['processing'].update(startup_timeout_seconds=5,no_progress_timeout_seconds=5)
+            config.write_text(json.dumps(settings));process=boot()
+            try:
+                for initial,reason in [('', 'Startup'),('os.write(1,b"out_time_us=1000000\\n")\n', 'NoProgress')]:
+                    reported='1000000' if initial else '0'
+                    wrapper.write_text('#!'+sys.executable+'\nimport os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\n'+initial+'while True:\n os.write(1,b"out_time_us='+reported+'\\n"); os.write(2,b"still alive\\n"); time.sleep(.05)\n')
+                    pidfile.unlink(missing_ok=True)
+                    server_log=state/'logs/server.log'
+                    log_offset=server_log.stat().st_size
+                    job=submit();wait_for(pidfile.exists);encoder_pid=int(pidfile.read_text())
+                    row=terminal(job)
+                    assert row['phase']=='failed' and row['output_file_id'] is None,row
+                    wait_for(lambda: ('processing '+reason+' timeout').encode() in server_log.read_bytes()[log_offset:],seconds=5)
+                    try: os.kill(encoder_pid,0)
+                    except ProcessLookupError: pass
+                    else: raise AssertionError('timed out encoder was not reaped')
+                    checks.append(reason.lower()+'_deadline_reaps_noisy_encoder_without_publication')
+                wrapper.write_text(normal_wrapper)
+                assert terminal(submit())['phase']=='completed'
+                checks.append('liveness_timeout_releases_capacity_after_reaping')
+            finally:
+                wrapper.write_text(normal_wrapper);stop(process)
+                settings['processing'].pop('startup_timeout_seconds');settings['processing'].pop('no_progress_timeout_seconds')
+                config.write_text(json.dumps(settings));process=boot()
             hardware={'attempted':sys.platform=='darwin'}
             if sys.platform=='darwin':
                 row=terminal(submit(backend='videotoolbox'));hardware.update(phase=row['phase'],error=row['error']);
@@ -145,7 +187,10 @@ def main():
             spec=api('GET','/openapi.json');assert '/api/v1/events' in spec['paths'] and '/api/v1/processing-jobs' in spec['paths']
             print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware},indent=2))
         except BaseException:
-            log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr);raise
+            log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr)
+            server_log=state/'logs/server.log'
+            if server_log.exists(): print(server_log.read_text()[-8000:],file=sys.stderr)
+            raise
         finally:
             if process is not None and process.poll() is None:stop(process)
             log.close()

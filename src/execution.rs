@@ -507,6 +507,39 @@ impl Coordinator {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registered_ownership_survives_path_loss_and_releases_after_failed_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner");
+        let coordinator = Coordinator::new(Budget {
+            units: 1,
+            interactive_reserve: 0,
+        });
+        let lease = coordinator
+            .reserve("owner".into(), Class::Preparation, 1)
+            .await
+            .unwrap();
+        let (_witness, held) = Witness::create(&path).unwrap();
+        lease.started(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // The registered open description, not a later path lookup, fences release.
+        drop(lease);
+        assert_eq!(coordinator.snapshot().used, 1);
+        assert_eq!(coordinator.snapshot().stuck, ["owner"]);
+        // A failed spawn leaves no inheritor; dropping the parent's descriptor is
+        // sufficient evidence. The same rule waits for real children otherwise.
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while coordinator.snapshot().used != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(coordinator.snapshot().stuck.is_empty());
+    }
+
     #[tokio::test]
     async fn stuck_child_keeps_capacity_until_reaped() {
         let coordinator = Coordinator::new(Budget {

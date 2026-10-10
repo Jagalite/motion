@@ -33,6 +33,9 @@ impl Fixture {
         Self::with_storage(Default::default()).await
     }
     async fn with_storage(storage: playscale::storage::Settings) -> Self {
+        Self::with_realtime(storage, false).await
+    }
+    async fn with_realtime(storage: playscale::storage::Settings, realtime: bool) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter("playscale=debug")
@@ -58,6 +61,18 @@ impl Fixture {
         let mut processing =
             playscale::processing::Runtime::new(dir.path().join("cache"), Default::default());
         processing.supervisor = PathBuf::from(env!("CARGO_BIN_EXE_playscale"));
+        if realtime {
+            // A survivor test must own an encoder that cannot finish the entire
+            // fixture before the restart assertions reach it.
+            let wrapper = dir.path().join("realtime-ffmpeg");
+            std::fs::write(&wrapper, "#!/bin/sh\nexec ffmpeg -re \"$@\"\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            processing.settings.ffmpeg = wrapper;
+        }
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
             db,
@@ -530,7 +545,7 @@ async fn restart_reports_recorded_deliveries_as_interrupted() {
         eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
         return;
     }
-    let f = Fixture::new().await;
+    let f = Fixture::with_realtime(Default::default(), true).await;
     let source = f.dir.path().join("media/clip.mkv");
     let status = Command::new("ffmpeg")
         .args([
