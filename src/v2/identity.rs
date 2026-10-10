@@ -488,6 +488,7 @@ fn session_cookie(app: &App, token: &str, max_age: i64) -> HeaderValue {
 
 pub async fn create_session(
     State(app): State<App>,
+    ingress: Option<axum::Extension<auth::TrustedIngress>>,
     headers: HeaderMap,
     body: Body<SessionExchange>,
 ) -> Result<Response, Problem> {
@@ -501,11 +502,28 @@ pub async fn create_session(
     }
     let credential = match body.value {
         SessionExchange::TrustedPrivate {} => {
-            return Err(Problem::new(
-                StatusCode::FORBIDDEN,
-                "trusted_private_unavailable",
-                "Verified private ingress is not configured on this server",
-            ));
+            // Identity stays ambient on the ingress listener; the response
+            // carries the principal and the CSRF token unsafe requests need.
+            // It never creates an administrator.
+            let Some(axum::Extension(marker)) = ingress else {
+                return Err(Problem::new(
+                    StatusCode::FORBIDDEN,
+                    "trusted_private_unavailable",
+                    "Verified private ingress is not available on this connection",
+                ));
+            };
+            let caller =
+                auth::resolve_with(&app, &axum::http::Method::GET, &headers, Some(marker)).await?;
+            if caller.ingress.is_none() {
+                return Err(AccessError::Unauthenticated.into());
+            }
+            let mut conn = app.db.acquire().await?;
+            return Ok(Json(SessionBody {
+                principal: principal_body(&mut conn, &caller.principal).await?,
+                csrf_token: caller.csrf.unwrap_or_default(),
+                expires_at: timestamp(now() + SESSION_TTL_SECONDS),
+            })
+            .into_response());
         }
         SessionExchange::Credential { credential } => credential,
     };
@@ -514,6 +532,11 @@ pub async fn create_session(
     }
     let now = now();
     let mut tx = begin_write(&app.db).await?;
+    let credential = if app.access.take_bootstrap(&credential) {
+        bootstrap_device(&app, &mut tx, now).await?
+    } else {
+        credential
+    };
     let parent_hash = auth::token_hash(&credential);
     let stored = auth::load_credential(&mut tx, &parent_hash)
         .await?
@@ -550,6 +573,67 @@ pub async fn create_session(
         session_cookie(&app, &token, child.expires_at - now),
     );
     Ok(response)
+}
+
+/// The desktop that launched this server proved it with the one-use
+/// bootstrap secret. It acts as the local desktop device (created on first
+/// use with every permission, as the server's owner); each bootstrap issues a
+/// new device credential generation, superseding the previous desktop run.
+/// An administrator who revokes that device disables bootstrap until it is
+/// deleted, and the result is never a credential the caller sees.
+async fn bootstrap_device(
+    app: &App,
+    tx: &mut sqlx::SqliteConnection,
+    now: i64,
+) -> Result<String, Problem> {
+    let existing = auth::load_device(tx, super::DESKTOP_DEVICE).await?;
+    let device = match existing {
+        Some(row) => row,
+        None => {
+            let row = DeviceRow {
+                device: Device::approved(
+                    super::DESKTOP_DEVICE.into(),
+                    Grant {
+                        profile_ids: BTreeSet::new(),
+                        permissions: Permission::ALL.into_iter().collect(),
+                    },
+                ),
+                name: "Desktop".into(),
+                client_name: "motion-desktop".into(),
+            };
+            auth::insert_device(tx, &row).await?;
+            row
+        }
+    };
+    if device.device.revoked {
+        return Err(AccessError::DeviceRevoked.into());
+    }
+    let issue = core::Issue {
+        device_id: device.device.id.clone(),
+        generation: device.device.generation + 1,
+        expires_at: now + core::DEVICE_CREDENTIAL_TTL_SECONDS,
+    };
+    let next = core::apply_issue(&device.device, &issue)?;
+    sqlx::query("DELETE FROM credentials WHERE device_id=?")
+        .bind(&issue.device_id)
+        .execute(&mut *tx)
+        .await?;
+    auth::update_device(tx, &device.device, &next).await?;
+    let token = auth::derive_secret(&app.access.key, Purpose::Device, &auth::nonce());
+    auth::insert_credential(
+        tx,
+        &auth::token_hash(&token),
+        &core::Credential {
+            device_id: issue.device_id,
+            kind: CredentialKind::Device,
+            generation: issue.generation,
+            expires_at: issue.expires_at,
+        },
+        None,
+        None,
+    )
+    .await?;
+    Ok(token)
 }
 
 fn cookie_session(caller: &Caller) -> Result<(&str, &core::Credential, &str), Problem> {
