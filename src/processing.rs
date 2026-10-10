@@ -983,6 +983,7 @@ mod publication_tests {
                     duration: Some(1.0),
                     tracks: vec![],
                     reused: false,
+                    nfo: crate::nfo::Sidecar::Absent,
                 },
                 library.id.clone(),
             ))

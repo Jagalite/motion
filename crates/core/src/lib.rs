@@ -8,6 +8,7 @@ pub mod jobs;
 pub mod maintenance;
 pub mod matching;
 pub mod metadata;
+pub mod nfo;
 pub mod organization;
 pub mod playback;
 pub mod processing;

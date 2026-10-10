@@ -962,3 +962,70 @@ async fn reassignment_keeps_reviewed_content_with_its_copy() {
     assert_eq!(copy_revision, pinned);
     let _ = first;
 }
+
+// ---------------------------------------------------------------------------
+// Sidecar NFO
+
+#[tokio::test]
+async fn sidecar_nfo_contributes_and_is_withdrawn_only_by_its_origin() {
+    let f = Fixture::new().await;
+    f.write("heat.mkv", b"heat bytes");
+    f.write(
+        "heat.nfo",
+        br#"<movie><title>Heat</title><year>1995</year><uniqueid type="tmdb" default="true">949</uniqueid><actor><name>Al Pacino</name></actor></movie>"#,
+    );
+    f.scan().await;
+    let (_, item, ..) = f.file("heat.mkv").await;
+    let (title, external): (String, Option<String>) = sqlx::query_as(
+        "SELECT i.title,m.external_id FROM items i JOIN metadata_documents m ON m.item_id=i.id AND m.source='nfo' WHERE i.id=?",
+    )
+    .bind(&item)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(title, "Heat");
+    assert_eq!(external.as_deref(), Some("tmdb:949"));
+    playscale::maintenance::refresh_search(&f.app)
+        .await
+        .unwrap();
+    let hits = playscale::search::search(&f.app.db, "pacino", None, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(hits.items[0].item_id, item);
+
+    // A byte-identical copy without a sidecar does not withdraw it.
+    f.write("backup/heat.mkv", b"heat bytes");
+    f.scan().await;
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM metadata_documents WHERE item_id=? AND source='nfo'",
+    )
+    .bind(&item)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(kept, 1);
+    // A hostile replacement is ignored, keeping the published contribution.
+    f.write("heat.nfo", br#"<!DOCTYPE movie [<!ENTITY x SYSTEM "file:///etc/passwd">]><movie><title>&x;</title></movie>"#);
+    f.scan().await;
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id=?")
+        .bind(&item)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(title, "Heat");
+    // Removing the supplying sidecar withdraws the contribution.
+    std::fs::remove_file(f.root.join("heat.nfo")).unwrap();
+    f.scan().await;
+    let (title, left): (String, i64) = sqlx::query_as(
+        "SELECT title,(SELECT count(*) FROM metadata_documents WHERE item_id=items.id AND source='nfo') FROM items WHERE id=?",
+    )
+    .bind(&item)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (title.as_str(), left),
+        ("heat", 0),
+        "back to the scanned title"
+    );
+}

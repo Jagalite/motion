@@ -24,6 +24,8 @@ pub struct Found {
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
     pub reused: bool,
+    /// Sidecar NFO observed beside the file (read outside the writer).
+    pub nfo: crate::nfo::Sidecar,
 }
 
 pub fn fingerprint(meta: &std::fs::Metadata) -> String {
@@ -348,6 +350,7 @@ pub(crate) async fn inspect(
         duration,
         tracks,
         reused: false,
+        nfo: crate::nfo::Sidecar::Absent,
     })
 }
 
@@ -426,6 +429,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         duration: row.duration_seconds,
                         tracks: serde_json::from_str(&row.tracks_json)?,
                         reused: true,
+                        nfo: crate::nfo::Sidecar::Absent,
                     }))
                 })
                 .await?
@@ -474,6 +478,20 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         }
     }
     anyhow::ensure!(!shutdown.is_cancelled(), "server stopping");
+    // Sidecar NFOs are small bounded reads, done before the writer transaction.
+    let sidecar_root = path.clone();
+    let hold = permit.clone();
+    found = tokio::task::spawn_blocking(move || {
+        let _hold = hold;
+        found
+            .into_iter()
+            .map(|mut f| {
+                f.nfo = crate::nfo::read(&sidecar_root, &f.relative);
+                f
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
     let hold = permit.clone();
     let final_identity = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let _hold = hold;
@@ -578,7 +596,8 @@ async fn finish(
                 .await?;
         }
         let mut assigned: Vec<String> = Vec::with_capacity(files.len());
-        for (file, assignment) in files.into_iter().zip(plan.assignments) {
+        for (mut file, assignment) in files.into_iter().zip(plan.assignments) {
+            let sidecar = std::mem::replace(&mut file.nfo, crate::nfo::Sidecar::Absent);
             use playscale_core::scan::Assignment;
             let mut first_version = false;
             let (id, edition) = match assignment {
@@ -640,6 +659,7 @@ async fn finish(
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            crate::nfo::publish(&mut tx, &file_id, &sidecar).await?;
         }
     }
     crate::matching::invalidate_changed(&mut tx).await?;
