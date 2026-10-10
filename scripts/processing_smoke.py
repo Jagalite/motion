@@ -51,6 +51,28 @@ def main():
             assert len(api('GET','/items')['items'])==1
             assert len(api('GET','/libraries'))==1
             checks.append('three_real_recipes_decode_idempotency_and_original_isolation')
+            # Both pipes can flood without a newline. Parsing/storage must stay
+            # bounded, and a partial progress line must not prevent cancellation.
+            flooded=root/'flood-drained'
+            flood_code=('chunk=b"x"*4096\n'
+                        'for _ in range(4096): os.write(1,chunk); os.write(2,chunk)\n'
+                        'if not pathlib.Path('+repr(str(gate))+').exists(): os.write(1,b"\\nout_time_us=1000000\\n")\n'
+                        'pathlib.Path('+repr(str(flooded))+').touch()\n')
+            wrapper.write_text(normal_wrapper.replace('while pathlib.Path(',flood_code+'while pathlib.Path(',1))
+            try:
+                job=submit();row=terminal(job)
+                assert flooded.exists() and row['phase']=='completed' and row['output_file_id'],row
+                checks.append('stdout_stderr_flood_recovers_into_real_encode')
+                flooded.unlink();gate.touch();job=submit()
+                wait_for(flooded.exists)
+                assert request(port,'GET','/ready')[0]==200
+                api('POST',f"/processing-jobs/{job['id']}/control",{'action':'cancel'})
+                row=terminal(job)
+                assert row['phase']=='cancelled' and row['output_file_id'] is None,row
+                checks.append('unterminated_stdout_flood_remains_cancellable')
+            finally:
+                gate.unlink(missing_ok=True)
+                wrapper.write_text(normal_wrapper)
             hardware={'attempted':sys.platform=='darwin'}
             if sys.platform=='darwin':
                 row=terminal(submit(backend='videotoolbox'));hardware.update(phase=row['phase'],error=row['error']);

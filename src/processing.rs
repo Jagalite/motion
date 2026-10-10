@@ -18,13 +18,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    process::Command,
-    sync::Semaphore,
-};
+use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
+
+mod progress;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -475,10 +473,12 @@ async fn command(
         }
         String::from_utf8_lossy(&tail).into_owned()
     });
-    let stdout = child.stdout.take();
-    let mut lines =
-        BufReader::new(stdout.unwrap_or_else(|| unreachable!("command requires progress pipe")))
-            .lines();
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("missing encoder progress pipe")?;
+    let mut output_buffer = [0u8; 4096];
+    let mut decoder = progress::Decoder::default();
     let deadline = tokio::time::sleep(Duration::from_secs(app.processing.settings.timeout_seconds));
     tokio::pin!(deadline);
     let mut output_open = true;
@@ -490,7 +490,18 @@ async fn command(
             _=stop.cancelled()=>anyhow::bail!("server stopping"),
             _=lease.termination_requested().cancelled()=>anyhow::bail!("termination requested"),
             status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");break;},
-            line=lines.next_line(),if output_open=>{if let Some(line)=line? {if let Some(v)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()).filter(|v|v.is_finite()&&*v>=0.0){pending_progress=v/1_000_000.0;}}else{output_open=false;}},
+            read=stdout.read(&mut output_buffer),if output_open=>{
+                let count = read?;
+                let observed = if count == 0 {
+                    output_open = false;
+                    decoder.finish()
+                } else {
+                    decoder.push(&output_buffer[..count])
+                };
+                if let Some(seconds) = observed {
+                    pending_progress = seconds;
+                }
+            },
             _=poll.tick()=>{active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
         }} Ok(())
     }.await;
