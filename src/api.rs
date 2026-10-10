@@ -495,6 +495,78 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
 }
 
 pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
+    router_with(app, assets, None)
+}
+
+/// The request identity offered to presentation (Topcoat) renders: the
+/// verified session, bearer or trusted-ingress caller, or `None` for anonymous
+/// requests and invalid credentials. Protected views must authorize this caller.
+#[derive(Clone)]
+pub struct PresentationIdentity(pub Option<crate::v2::auth::Caller>);
+
+async fn presentation_identity(
+    axum::extract::State(app): axum::extract::State<App>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let ingress = request
+        .extensions()
+        .get::<crate::v2::auth::TrustedIngress>()
+        .copied();
+    let caller =
+        match crate::v2::auth::resolve_with(&app, request.method(), request.headers(), ingress)
+            .await
+        {
+            Ok(caller) => {
+                if let Err(error) = app.access.admit_request(&caller.principal.id) {
+                    return error.into_response();
+                }
+                Some(caller)
+            }
+            Err(error) if error.status == StatusCode::UNAUTHORIZED => None,
+            // CSRF rejection and storage failures must not become anonymous renders.
+            Err(error) => return error.into_response(),
+        };
+    request
+        .extensions_mut()
+        .insert(PresentationIdentity(caller));
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    // Even anonymous output varies with current credential/revocation state.
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        axum::http::HeaderValue::from_static("cookie, authorization"),
+    );
+    response
+}
+
+/// Unknown API and media paths are JSON errors, never presentation HTML.
+async fn api_paths_stay_json(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if path == "/api"
+        || path.starts_with("/api/")
+        || path == "/media"
+        || path.starts_with("/media/")
+    {
+        return ApiError::not_found().into_response();
+    }
+    next.run(request).await
+}
+
+/// Compose the API with an optional presentation router (plan §11.7). The
+/// host/origin boundary and default extractor body limit wrap everything, presentation
+/// included. API, media and SSE paths keep their JSON errors and are never
+/// answered by presentation; only otherwise-unrouted paths reach it, with
+/// the request's verified identity in `PresentationIdentity`.
+pub fn router_with(
+    app: App,
+    assets: Option<std::path::PathBuf>,
+    presentation: Option<Router>,
+) -> Router {
     let (router, mut spec) = OpenApiRouter::<App>::new()
         .routes(routes!(libraries, add_library))
         .routes(routes!(crate::operations::ready))
@@ -638,10 +710,6 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
         )
         .route("/media/{id}", get(media::serve).head(media::serve))
         .route(
-            "/",
-            get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
-        )
-        .route(
             "/app.js",
             get(|| async {
                 (
@@ -686,14 +754,30 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
                 )
             }),
         );
+    if presentation.is_none() {
+        router = router.route(
+            "/",
+            get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
+        );
+    }
     if let Some(assets) = assets {
         router = router.nest_service(
             "/assets/demuxe",
             tower_http::services::ServeDir::new(assets),
         );
     }
+    let router = match presentation {
+        None => router.fallback(|| async { ApiError::not_found() }),
+        Some(presentation) => router.fallback_service(
+            presentation
+                .layer(middleware::from_fn_with_state(
+                    app.clone(),
+                    presentation_identity,
+                ))
+                .layer(middleware::from_fn(api_paths_stay_json)),
+        ),
+    };
     router
-        .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
