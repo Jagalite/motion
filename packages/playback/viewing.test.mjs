@@ -113,3 +113,27 @@ test('persistence failure prevents an unrecorded request; stopped seals observat
   assert.equal(h.calls.length, 1);
   assert.equal(h.calls[0].event.status, 'stopped');
 });
+
+test('every retry persists the pending identity before sending', async () => {
+  let unavailable = false;
+  const h = harness(undefined, {persist() { if (unavailable) throw new Error('quota'); }});
+  h.writer.record(snapshot(10));
+  unavailable = true;
+  await assert.rejects(h.writer.flush(), /quota/);
+  await assert.rejects(h.writer.flush(), /quota/);
+  assert.equal(h.calls.length, 0);
+  unavailable = false;
+  assert.equal(await h.writer.flush(), true);
+  assert.equal(h.calls[0].event.event_id, 'e1');
+  assert.equal(h.calls[0].event.sequence, '1');
+});
+
+test('u64 limits reject invalid observations and exhausted sequences', async () => {
+  const h = harness();
+  assert.throws(() => h.writer.record({...snapshot(1), delivery_generation: '18446744073709551616'}), /Invalid/);
+  const options = {send() { assert.fail('exhausted sequence sent'); }, persist() {}, uuid: () => 'e1', wait: async () => {}};
+  assert.throws(() => createViewingWriter({...session, sequence: '18446744073709551616'}, options), /Invalid/);
+  const writer = createViewingWriter({...session, sequence: '18446744073709551615'}, options);
+  writer.record(snapshot(1));
+  await assert.rejects(writer.flush(), /exhausted/);
+});

@@ -438,12 +438,18 @@ async fn bootstrap(State(host): State<Host>, Json(input): Json<Bootstrap>) -> Re
         .into_response()
 }
 async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
-    let Ok(_single) = host.opening.try_lock() else {
+    let Ok(_single) = host.opening.clone().try_lock_owned() else {
         return StatusCode::CONFLICT.into_response();
     };
     let cache = host.cache.clone();
     let download = id.clone();
-    let snapshot = tokio::task::spawn_blocking(move || cache.snapshot(&download)).await;
+    let snapshot = tokio::task::spawn_blocking(move || {
+        // Cancellation of the HTTP handler cannot admit another copy while this
+        // blocking worker still consumes the snapshot disk budget.
+        let _single = _single;
+        cache.snapshot(&download)
+    })
+    .await;
     let Ok(Ok((item, file))) = snapshot else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };

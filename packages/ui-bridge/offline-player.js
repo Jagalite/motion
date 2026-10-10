@@ -53,6 +53,7 @@ async function close() {
 async function start() {
   const base = host.dataset.demuxeBase;
   const {definePlayerElement} = await import(`${base}web/generated/player/index.js`);
+  if (retired) return;
   definePlayerElement();
   context = await request(`/cache/open/${encodeURIComponent(host.dataset.downloadId)}`, {});
   if (retired) return;
@@ -78,4 +79,5 @@ document.addEventListener('click', event => {
   void close().then(() => location.assign(link.href)).catch(() => {});
 });
 addEventListener('pagehide', () => { retired = true; unsubscribe?.(); void element?.destroy(); });
+addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 if (host) void start().catch(error => { host.dataset.state = 'failed'; fail(error); });
