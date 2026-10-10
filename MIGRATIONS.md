@@ -14,6 +14,8 @@ applying any pending migration to an existing database.
 | 0012 | `0012_scan_coverage.sql` | A03 | per-attempt directory coverage |
 | 0013 | `0013_matching.sql` | A04 | match proposals, item match state |
 | 0014 | `0014_organization.sql` | A09 | saved filters, collections, playlists, queues |
+| 0027 | `0027_delivery_sessions.sql` | A07 | requested: delivery restart fences and diagnostics (0015–0026 are claimed by open PRs #2/#4; PR #3 carries this file as 0018) |
+| 0028 | `0028_delivery_admissions.sql` | A06/A07 | requested: idempotent delivery admission receipts |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.
