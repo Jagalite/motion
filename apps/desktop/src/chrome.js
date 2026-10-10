@@ -16,8 +16,12 @@ form.addEventListener('submit', async event => {
   } catch (error) { show(error.message, true); }
   finally { button.disabled = false; }
 });
-document.getElementById('disconnect').addEventListener('click', async () => {
-  await window.motionHost.disconnect(); show('Disconnected. The server is still running.');
+document.getElementById('disconnect').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try { await window.motionHost.disconnect(); show('Disconnected. The server is still running.'); }
+  catch (error) { show(error.message, true); }
+  finally { button.disabled = false; }
 });
 
 window.motionHost.onStatus(message => show(message, true));
