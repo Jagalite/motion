@@ -34,6 +34,23 @@ try {
   assert.ok(body.principal.id && body.csrf_token);
   assert.equal((await exchange()).status, 401);
   checks.real_bootstrap_is_one_use = true;
+  const cookie = session.headers.get('set-cookie').split(';')[0];
+  const home = await fetch(`${ready.origin}/`, {headers: {cookie}});
+  assert.equal(home.status, 200);
+  assert.match(home.headers.get('content-security-policy'), /script-src 'self'/);
+  const html = await home.text();
+  assert.match(html, /<h1>Home<\/h1>/);
+  assert.doesNotMatch(html, /Development mock/);
+  const assetPath = html.match(/(?:src|href)="(\/ui\/[^" ]+\.css)"/)?.[1];
+  assert.ok(assetPath, 'content-hashed presentation stylesheet');
+  const asset = await fetch(`${ready.origin}${assetPath}`, {headers: {cookie}});
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get('cache-control'), /immutable/);
+  const missingApi = await fetch(`${ready.origin}/api/v2/not-real`, {headers: {cookie}});
+  assert.equal(missingApi.status, 404);
+  assert.match(missingApi.headers.get('content-type'), /application\/problem\+json/);
+  checks.real_topcoat_and_hashed_assets_preserve_api_boundary = true;
+
   await assert.rejects(second.start(), /exited before readiness|readiness pipe closed/);
   assert.equal((await fetch(`${ready.origin}/api/v2/system/health`)).status, 200);
   checks.exclusive_lock_preserves_existing_server = true;

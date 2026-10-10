@@ -59,6 +59,12 @@ pub fn router(facade: Arc<dyn UiQueryFacade>) -> topcoat::router::Router {
     app::router(Facade(facade))
 }
 
+/// Public, content-hashed static assets contain no request identity. Mount
+/// outside identity-dependent HTML middleware so immutable caching is retained.
+pub fn asset_router<S: Clone + Send + Sync + 'static>() -> AxumRouter<S> {
+    AxumRouter::new().route("/ui/{file}", get(ui_asset))
+}
+
 /// Compose the presentation with an API router whose routes use full paths
 /// under `/api/v2`. `demuxe_dir` is the verified Demuxe package directory.
 pub fn mount(
@@ -73,7 +79,7 @@ pub fn mount(
         .route("/api/v2", any(api_not_found))
         .route("/api/v2/", any(api_not_found))
         .route("/api/v2/{*rest}", any(api_not_found))
-        .route("/ui/{file}", get(ui_asset));
+        .merge(asset_router());
     if let Some(dir) = demuxe_dir {
         app = app.nest_service(
             "/assets/demuxe",

@@ -485,7 +485,8 @@ async fn record_viewing(
         .parse::<u64>()
         .unwrap()
         + 1;
-    if body["sequence"] != expected.to_string() || body["delivery_generation"] != active_generation
+    if body["sequence"].as_str() != Some(expected.to_string().as_str())
+        || body["delivery_generation"] != active_generation
     {
         return problem(StatusCode::CONFLICT, "event_sequence_conflict");
     }

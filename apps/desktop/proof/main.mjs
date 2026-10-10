@@ -180,6 +180,7 @@ app.whenReady().then(async () => {
       }
       return {advancing: false, start, now: p.state.currentTime};
     })()`));
+    note('playbackProcessSnapshot', app.getAppMetrics().map(({pid, type, cpu, memory}) => ({pid, type, cpu, memory})));
     await window.loadURL(`${origin}/`);
     await new Promise(r => setTimeout(r, 1500));
     // Command forms: one generic external module turns them into API calls.
@@ -217,15 +218,17 @@ app.whenReady().then(async () => {
     note('screenMatrix', screens);
     note('renderLoad', await evaluate(`(async () => {
       const durations = [];
+      const htmlBytes = [];
       const start = performance.now();
       const results = await Promise.all(Array.from({length: 24}, async (_, index) => {
         const begin = performance.now();
         const response = await fetch(index % 2 ? '/library/lib1' : '/profiles', {cache: 'no-store'});
         const body = await response.text(); durations.push(performance.now() - begin);
+        htmlBytes.push(new TextEncoder().encode(body).byteLength);
         return response.ok && body.includes('<main');
       }).concat([fetch('/api/v2/media/files/proof/content', {headers: {Range: 'bytes=0-63'}}).then(async response => response.status === 206 && (await response.arrayBuffer()).byteLength === 64)]));
       durations.sort((a,b) => a-b);
-      return {requests: 24, simultaneousRangeRead: true, allSucceeded: results.every(Boolean), elapsedMs: Math.round(performance.now()-start), p50Ms: Math.round(durations[11]), p95Ms: Math.round(durations[22])};
+      return {requests: 24, htmlBytesMin: Math.min(...htmlBytes), htmlBytesMax: Math.max(...htmlBytes), simultaneousRangeRead: true, allSucceeded: results.every(Boolean), elapsedMs: Math.round(performance.now()-start), p50Ms: Math.round(durations[11]), p95Ms: Math.round(durations[22])};
     })()`));
   } catch (error) {
     note('exception', String(error?.stack ?? error));

@@ -2740,3 +2740,78 @@ async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn topcoat_sources_use_authorized_reads_and_report_missing_scan_service() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let (_, token) = f.pair(&["default"], &["catalog:read"]).await;
+    for (credential, expected) in [
+        (bearer(OPERATOR), StatusCode::OK),
+        (bearer(&token), StatusCode::FORBIDDEN),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(f.request("GET", "/sources", None, &[("authorization", &credential)]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!html.contains("Development mock"));
+        if expected == StatusCode::OK {
+            assert!(html.contains("Movies"), "{html}");
+            assert!(html.contains("Scanning is unavailable on this server."));
+            assert!(html.contains("POST /api/v2/sources"));
+            assert!(!html.contains("Scan now"));
+            assert!(!html.contains("No recent scans"));
+        } else {
+            assert!(!html.contains(f._dir.path().to_str().unwrap()));
+            assert!(!html.contains("POST /api/v2/sources"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let asset = &motion_ui::assets::STYLESHEET;
+    for auth in [None, Some("Bearer invalid")] {
+        let headers = auth.map(|v| vec![("authorization", v)]).unwrap_or_default();
+        let response = app
+            .clone()
+            .oneshot(f.request("GET", &asset.url(), None, &headers))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert!(!response.headers().contains_key("set-cookie"));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), asset.bytes);
+    }
+    let response = app
+        .oneshot(f.request("GET", "/ui/motion.invalid.css", None, &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
