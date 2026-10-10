@@ -5,7 +5,7 @@
 //! The adapter supplies observations (current principal, file revision, catalog
 //! scope, client capability, source streams) and executes effects; it never
 //! decides these rules itself.
-use crate::access::{Permission, Principal};
+use crate::access::{FileFacts, Permission, Principal, catalog_scope};
 use crate::delivery::Operation;
 use crate::playback::{self, Candidate, Mode, Support};
 use serde::{Deserialize, Serialize};
@@ -37,10 +37,21 @@ impl Route {
     }
     /// Candidate identities are stable for one file and route, so a client
     /// can report a failed candidate and never be offered it again.
+    /// IDs fit the contract's 128-character identifier: a file ID too long to
+    /// embed is replaced by a stable 64-bit digest of it.
     pub fn candidate_id(self, file_id: &str) -> String {
-        match self {
-            Route::Original => format!("original-{file_id}"),
-            Route::Transcode => format!("transcode-{file_id}"),
+        let prefix = match self {
+            Route::Original => "o",
+            Route::Transcode => "t",
+        };
+        if file_id.len() <= 126 {
+            format!("{prefix}-{file_id}")
+        } else {
+            // FNV-1a: deterministic across builds and platforms.
+            let digest = file_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+            format!("{prefix}_{digest:016x}")
         }
     }
 }
@@ -134,9 +145,9 @@ pub struct Claims {
 pub struct Observed<'a> {
     /// The caller re-derived from current credential state.
     pub principal: &'a Principal,
-    /// The current revision of the pinned file, if it is still available and
-    /// inside the principal's catalog scope.
-    pub file_revision: Option<&'a str>,
+    /// The pinned file's current revision and library membership; None when it
+    /// is missing or unavailable.
+    pub file: Option<&'a FileFacts>,
     /// The pinned version still binds the pinned file to the pinned timeline.
     pub bound: bool,
     pub now: i64,
@@ -151,6 +162,12 @@ pub enum PlanError {
     ProfileForbidden,
     NotFound,
     SourceChanged,
+}
+
+/// Whether `principal` may read a file with these facts: the same catalog
+/// scope (library grants, CatalogRead, rating policy) as every catalog read.
+pub fn readable(principal: &Principal, file: Option<&FileFacts>) -> bool {
+    file.is_some_and(|f| catalog_scope(principal).admits(f.library_ids.iter()))
 }
 
 /// Whether a plan token may admit (or replan) a delivery now. Every pinned
@@ -169,11 +186,13 @@ pub fn admit(claims: &Claims, observed: &Observed<'_>) -> Result<(), PlanError> 
     if !observed.principal.may_use_profile(&claims.profile) {
         return Err(PlanError::ProfileForbidden);
     }
-    let revision = observed.file_revision.ok_or(PlanError::NotFound)?;
-    if !observed.bound {
+    if !observed.bound || !readable(observed.principal, observed.file) {
         return Err(PlanError::NotFound);
     }
-    if revision != claims.file_revision {
+    if observed
+        .file
+        .is_some_and(|f| f.revision != claims.file_revision)
+    {
         return Err(PlanError::SourceChanged);
     }
     Ok(())
@@ -190,12 +209,15 @@ pub struct Owner {
 }
 
 /// Observe or control a delivery: only its admitting principal, while that
-/// principal may still request playback for the delivery's profile. Any other
-/// caller learns nothing (the adapter reports not found).
-pub fn may_control(owner: &Owner, principal: &Principal) -> bool {
+/// principal may still request playback for the delivery's profile and still
+/// read the delivered file. Any other caller learns nothing (the adapter
+/// reports not found). Source revision changes are fenced by stream admission;
+/// the owner may still read and close such a delivery.
+pub fn may_control(owner: &Owner, principal: &Principal, file: Option<&FileFacts>) -> bool {
     owner.principal == principal.id
         && principal.allows(Permission::PlaybackRequest)
         && principal.may_use_profile(&owner.profile)
+        && readable(principal, file)
 }
 
 /// A replan may change route and streams but never the delivery's timeline,
@@ -209,8 +231,8 @@ pub fn replan_compatible(owner: &Owner, claims: &Claims) -> bool {
 }
 
 /// Viewing sessions write durable progress for the delivery's profile.
-pub fn may_view(owner: &Owner, principal: &Principal) -> bool {
-    may_control(owner, principal) && principal.allows(Permission::ViewingWrite)
+pub fn may_view(owner: &Owner, principal: &Principal, file: Option<&FileFacts>) -> bool {
+    may_control(owner, principal, file) && principal.allows(Permission::ViewingWrite)
 }
 
 /// A viewing session's identity embeds the delivery it was created for, so the
@@ -236,16 +258,27 @@ mod tests {
     use crate::access::{Grant, Mode as AccessMode, Policy};
 
     fn principal(id: &str, permissions: &[Permission], profiles: &[&str]) -> Principal {
+        let mut permissions: std::collections::BTreeSet<_> = permissions.iter().copied().collect();
+        permissions.insert(Permission::CatalogRead);
         Principal {
             id: id.into(),
             device_id: None,
             mode: AccessMode::Paired,
             grant: Grant {
                 profile_ids: profiles.iter().map(|p| p.to_string()).collect(),
-                permissions: permissions.iter().copied().collect(),
+                permissions,
             },
-            policy: Policy::default(),
+            policy: Policy {
+                library_ids: ["lib".to_string()].into(),
+                ..Policy::default()
+            },
             policy_revision: 0,
+        }
+    }
+    fn facts(revision: &str, library: &str) -> FileFacts {
+        FileFacts {
+            library_ids: [library.to_string()].into(),
+            revision: revision.into(),
         }
     }
     fn source(support: Support) -> SourceFacts {
@@ -299,6 +332,14 @@ mod tests {
         assert_eq!(
             plan("f", &source(Support::Supported), &both),
             Plan::Blocked("all_candidates_failed")
+        );
+        let no_range = Request {
+            range: false,
+            ..auto.clone()
+        };
+        assert_eq!(
+            plan("f", &source(Support::Supported), &no_range),
+            Plan::Ready(Route::Transcode)
         );
         let explicit = Request {
             explicit_streams: true,
@@ -368,33 +409,34 @@ mod tests {
     #[test]
     fn plan_admission_rechecks_every_pinned_fact() {
         let ok = principal("a", &[Permission::PlaybackRequest], &["p"]);
-        let observed = |p, revision, bound, now| Observed {
+        let r1 = facts("r1", "lib");
+        let observed = |p, file, bound, now| Observed {
             principal: p,
-            file_revision: revision,
+            file,
             bound,
             now,
         };
         assert_eq!(
-            admit(&claims(), &observed(&ok, Some("r1"), true, 99)),
+            admit(&claims(), &observed(&ok, Some(&r1), true, 99)),
             Ok(())
         );
         assert_eq!(
-            admit(&claims(), &observed(&ok, Some("r1"), true, 100)),
+            admit(&claims(), &observed(&ok, Some(&r1), true, 100)),
             Err(PlanError::Expired)
         );
         let other = principal("b", &[Permission::PlaybackRequest], &["p"]);
         assert_eq!(
-            admit(&claims(), &observed(&other, Some("r1"), true, 1)),
+            admit(&claims(), &observed(&other, Some(&r1), true, 1)),
             Err(PlanError::WrongPrincipal)
         );
-        let revoked = principal("a", &[Permission::CatalogRead], &["p"]);
+        let revoked = principal("a", &[], &["p"]);
         assert_eq!(
-            admit(&claims(), &observed(&revoked, Some("r1"), true, 1)),
+            admit(&claims(), &observed(&revoked, Some(&r1), true, 1)),
             Err(PlanError::Forbidden(Permission::PlaybackRequest))
         );
         let narrowed = principal("a", &[Permission::PlaybackRequest], &["q"]);
         assert_eq!(
-            admit(&claims(), &observed(&narrowed, Some("r1"), true, 1)),
+            admit(&claims(), &observed(&narrowed, Some(&r1), true, 1)),
             Err(PlanError::ProfileForbidden)
         );
         assert_eq!(
@@ -402,11 +444,24 @@ mod tests {
             Err(PlanError::NotFound)
         );
         assert_eq!(
-            admit(&claims(), &observed(&ok, Some("r1"), false, 1)),
+            admit(&claims(), &observed(&ok, Some(&r1), false, 1)),
+            Err(PlanError::NotFound)
+        );
+        // Moved to a library outside the grant, or policy narrowed to nothing.
+        let moved = facts("r1", "other");
+        let changed = facts("r2", "lib");
+        assert_eq!(
+            admit(&claims(), &observed(&ok, Some(&moved), true, 1)),
+            Err(PlanError::NotFound)
+        );
+        let mut rated = ok.clone();
+        rated.policy.allow_unrated = false;
+        assert_eq!(
+            admit(&claims(), &observed(&rated, Some(&r1), true, 1)),
             Err(PlanError::NotFound)
         );
         assert_eq!(
-            admit(&claims(), &observed(&ok, Some("r2"), true, 1)),
+            admit(&claims(), &observed(&ok, Some(&changed), true, 1)),
             Err(PlanError::SourceChanged)
         );
     }
@@ -425,17 +480,24 @@ mod tests {
             &[Permission::PlaybackRequest, Permission::ViewingWrite],
             &["p"],
         );
-        assert!(may_control(&owner, &viewer) && may_view(&owner, &viewer));
+        let file = facts("r1", "lib");
+        let f = Some(&file);
+        assert!(may_control(&owner, &viewer, f) && may_view(&owner, &viewer, f));
         let player = principal("a", &[Permission::PlaybackRequest], &["p"]);
-        assert!(may_control(&owner, &player) && !may_view(&owner, &player));
+        assert!(may_control(&owner, &player, f) && !may_view(&owner, &player, f));
         assert!(!may_control(
             &owner,
-            &principal("b", &[Permission::PlaybackRequest], &["p"])
+            &principal("b", &[Permission::PlaybackRequest], &["p"]),
+            f
         ));
         assert!(!may_control(
             &owner,
-            &principal("a", &[Permission::PlaybackRequest], &["q"])
+            &principal("a", &[Permission::PlaybackRequest], &["q"]),
+            f
         ));
+        // Losing the library (or the file) ends control and viewing.
+        assert!(!may_control(&owner, &viewer, Some(&facts("r1", "other"))));
+        assert!(!may_view(&owner, &viewer, None));
         let mut c = claims();
         assert!(replan_compatible(&owner, &c));
         c.route = Route::Transcode;
@@ -452,6 +514,23 @@ mod tests {
             change(&mut changed);
             assert!(!replan_compatible(&owner, &changed));
         }
+    }
+
+    #[test]
+    fn candidate_ids_are_stable_distinct_and_bounded() {
+        let long = "x".repeat(128);
+        for route in [Route::Original, Route::Transcode] {
+            assert_eq!(route.candidate_id(&long), route.candidate_id(&long));
+            assert!(route.candidate_id(&long).len() <= 128);
+        }
+        assert_ne!(
+            Route::Original.candidate_id("f"),
+            Route::Transcode.candidate_id("f")
+        );
+        assert_ne!(
+            Route::Original.candidate_id(&long),
+            Route::Original.candidate_id(&"y".repeat(128))
+        );
     }
 
     #[test]
