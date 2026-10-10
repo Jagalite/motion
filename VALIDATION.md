@@ -63,6 +63,16 @@ encoders terminated afterwards and leaked processes counted as failures.
 integration suite does not run it, but `scripts/package_app.py` runs it against
 the staged bundle in the package job.
 
+Product fix found by these checks: `src/main.rs` installed its SIGINT/SIGTERM
+handlers only when the final `select!` first polled them, after the listener and
+workers had started, so a signal in that window killed a serving process (exit
+status -2) without graceful shutdown. Handlers are now registered synchronously
+before anything serves (Windows Ctrl+C likewise); a unit test raises each
+signal before first poll, and making registration lazy again kills the test
+process with SIGINT. Under load the checks also met two documented slow/busy
+answers, which they now tolerate within hard bounds: 503 `storage_busy` from
+`/admin/storage`, and upgrade starts taking over 50 s (startup bound 180 s).
+
 Local evidence (Apple silicon, macOS 26; shared and heavily loaded host; Rust
 via the kyoto queue with rustup's pinned toolchains, because Homebrew's cargo
 1.99 earlier on PATH ignores `rust-toolchain.toml`): see the PR description
