@@ -51,3 +51,11 @@ test('late prepared player is disposed before its delivery is retired', async ()
   }), null);
   assert.deepEqual(effects, ['dispose', 'retire:d1']);
 });
+test('a plan blocked after failed trials reports the last open failure', async () => {
+  let plans = 0;
+  await assert.rejects(openCandidates(input, {current: () => true,
+    plan: async () => (++plans === 1 ? {profile_id: 'p1', timeline_id: 't1', status: 'ready', candidate_id: 'c1'}
+      : {profile_id: 'p1', timeline_id: 't1', status: 'blocked', reason_codes: ['all_candidates_failed']}),
+    admit: async () => ({id: 'd1'}), prepare: async () => { throw new Error('Native manifest has no finite VOD duration'); }, retire: async () => {},
+  }), /Native manifest has no finite VOD duration \(Playback is blocked: all_candidates_failed\)/);
+});

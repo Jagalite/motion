@@ -39,11 +39,15 @@ test('audio, version and quality choices replan only the same timeline input', (
   assert.equal(next.timeline_id, 't');
   assert.deepEqual([...next.failed_candidate_ids], [], 'a new choice is planned afresh');
   assert.equal(input.tracks.audio_track_id, null, 'the current input is not mutated');
-  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: ''});
+  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: '', audioVersion: 'v2'});
   assert.equal(back.tracks.audio_track_id, null);
   assert.equal(back.version_id, 'v2');
   assert.equal(back.quality.mode, 'convert');
   assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x'}), /Invalid audio/);
+  const sameVersion = replanInput(input, {version: 'v1', quality: 'auto', audio: 'a1', audioVersion: 'v1'});
+  assert.equal(sameVersion.tracks.audio_track_id, 'a1');
+  const otherVersion = replanInput(input, {version: 'v2', quality: 'auto', audio: 'a1', audioVersion: 'v1'});
+  assert.equal(otherVersion.tracks.audio_track_id, null, 'ordinals of another version are not reused');
 });
 
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {

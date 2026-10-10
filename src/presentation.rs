@@ -124,17 +124,38 @@ impl Queries {
             .ok_or(UiError::Unavailable)
     }
 
-    /// Audio streams of the timeline's first original, labelled for the
-    /// player's selector. The v2 contract has no track read yet, so this is a
-    /// narrow catalog read made only after the timeline itself was authorized
-    /// through the v2 adapter above; IDs match the planner's `a{n}`.
-    async fn audio_tracks(&self, timeline: &str) -> Vec<TrackOption> {
+    /// Audio streams of the timeline's first available original version that
+    /// the principal may read. The version and its file binding come from the
+    /// scope-filtered v2 versions read; only that bound file's stored stream
+    /// list is then read (the v2 contract has no track read yet). IDs match
+    /// the planner's `a{n}` ordinals for that version.
+    async fn audio_tracks(&self, timeline: &str) -> (Option<String>, Vec<TrackOption>) {
+        let Ok(versions) = self
+            .complete_list(&format!(
+                "/catalog/timelines/{}/versions?limit=200",
+                segment(timeline)
+            ))
+            .await
+        else {
+            return (None, vec![]);
+        };
+        let Some((version, file, revision)) = versions.iter().find_map(|v| {
+            let first = v["files"].as_array()?.iter().find(|b| b["part"] == 1)?;
+            (v["origin"] == "original" && v["availability"] == "available").then(|| {
+                (
+                    text(v, "id"),
+                    text(&first["file"], "file_id"),
+                    text(&first["file"], "file_revision"),
+                )
+            })
+        }) else {
+            return (None, vec![]);
+        };
         let tracks: Option<String> = sqlx::query_scalar(
-            "SELECT f.tracks_json FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
-             JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND v.origin='original' AND f.available=1 \
-             ORDER BY v.id,b.file_id LIMIT 1",
+            "SELECT tracks_json FROM media_files WHERE id=? AND revision=? AND available=1 AND generated=0",
         )
-        .bind(timeline)
+        .bind(&file)
+        .bind(&revision)
         .fetch_optional(&self.app.db)
         .await
         .ok()
@@ -142,7 +163,7 @@ impl Queries {
         let streams: Vec<crate::db::Track> = tracks
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        streams
+        let options = streams
             .iter()
             .filter(|t| t.kind == "audio")
             .enumerate()
@@ -158,7 +179,8 @@ impl Queries {
                     t.codec
                 ),
             })
-            .collect()
+            .collect();
+        (Some(version), options)
     }
 
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
@@ -441,6 +463,7 @@ impl UiQueryFacade for Queries {
                 .await
                 .ok_or(UiError::Unavailable)?;
             let position = viewing["position_ms"].as_u64().unwrap_or(0);
+            let (audio_version, audio_tracks) = self.audio_tracks(timeline_id).await;
             // A watched title, or one stopped in its final second, starts over.
             let finished = viewing["watched"].as_bool().unwrap_or(false)
                 || duration_ms.is_some_and(|d| position.saturating_add(1000) >= d);
@@ -451,7 +474,9 @@ impl UiQueryFacade for Queries {
                 duration_ms,
                 resume_ms: if finished { 0 } else { position },
                 viewing_revision: text(&viewing, "revision"),
-                audio_tracks: self.audio_tracks(timeline_id).await,
+                viewing_manual_epoch: text(&viewing, "manual_epoch"),
+                audio_tracks,
+                audio_version,
             })
         })
     }

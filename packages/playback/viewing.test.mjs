@@ -138,13 +138,17 @@ test('u64 limits reject invalid observations and exhausted sequences', async () 
   await assert.rejects(writer.flush(), /exhausted/);
 });
 
-test('a newer viewing revision is adopted only when it cannot change the offered resume', () => {
-  const state = (over = {}) => ({revision: '7', watched: false, manual_watched: null, position_ms: 52720, ...over});
-  assert.equal(adoptableRevision(state(), 52720), '7');
-  assert.equal(adoptableRevision(state({position_ms: 54000}), 52720), '7');
-  assert.equal(adoptableRevision(state({position_ms: 60000}), 52720), null, 'progress moved elsewhere');
-  assert.equal(adoptableRevision(state({watched: true}), 52720), null, 'watched since render');
-  assert.equal(adoptableRevision(state({manual_watched: false}), 52720), null, 'manual override');
-  assert.equal(adoptableRevision(state({revision: 'x'}), 52720), null);
-  assert.equal(adoptableRevision(null, 0), null);
+test('a newer viewing revision is adopted only from our own session with nothing else changed', () => {
+  const state = (over = {}) => ({revision: '7', watched: false, manual_watched: null, manual_epoch: '0', session_id: 's-own', position_ms: 52720, ...over});
+  const rendered = {ownSession: 's-own', manualEpoch: '0', resumeMs: 52720};
+  assert.equal(adoptableRevision(state(), rendered), '7');
+  assert.equal(adoptableRevision(state({position_ms: 54000}), rendered), '7');
+  assert.equal(adoptableRevision(state({session_id: 's-other-device'}), rendered), null, 'another device started');
+  assert.equal(adoptableRevision(state(), {...rendered, ownSession: null}), null, 'no session of ours is known');
+  assert.equal(adoptableRevision(state({manual_epoch: '1'}), rendered), null, 'a manual change, even if cleared');
+  assert.equal(adoptableRevision(state({position_ms: 60000}), rendered), null, 'progress moved elsewhere');
+  assert.equal(adoptableRevision(state({watched: true}), rendered), null);
+  assert.equal(adoptableRevision(state({manual_watched: false}), rendered), null);
+  assert.equal(adoptableRevision(state({revision: 'x'}), rendered), null);
+  assert.equal(adoptableRevision(null, rendered), null);
 });

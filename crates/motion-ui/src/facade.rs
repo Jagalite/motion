@@ -145,9 +145,12 @@ pub struct PlayerView {
     pub duration_ms: Option<u64>,
     pub resume_ms: u64,
     pub viewing_revision: String,
-    /// Audio streams of the planned original, by planning track ID (`a{n}`).
-    /// Choosing one other than the first asks the planner for a conversion.
+    /// Manual watched epoch at render; a session start never adopts a newer one.
+    pub viewing_manual_epoch: String,
+    /// Audio streams of `audio_version`'s original file, by planning track ID
+    /// (`a{n}`). Choosing one other than the first asks for a conversion.
     pub audio_tracks: Vec<TrackOption>,
+    pub audio_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

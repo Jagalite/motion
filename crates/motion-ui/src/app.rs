@@ -394,6 +394,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-server-epoch=(who.server_epoch.as_str())
             data-can-save-viewing=(if who.can("viewing:write") { "true" } else { "false" })
             data-viewing-revision=(view_model.viewing_revision.as_str())
+            data-viewing-manual-epoch=(view_model.viewing_manual_epoch.as_str())
             data-quality-mode=(preferences.quality_mode.as_str())
             data-autoplay=(if preferences.autoplay { "true" } else { "false" })
             data-subtitle-policy=(preferences.subtitle_mode.as_str())
@@ -415,7 +416,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
                     <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
                 }
             </select></label>
-            <label>"Audio "<select name="audio"><option value="">"Default"</option>
+            <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))><option value="">"Default"</option>
                 for track in view_model.audio_tracks.iter() {
                     <option value=(track.id.as_str())>(track.label.as_str())</option>
                 }
