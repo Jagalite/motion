@@ -386,6 +386,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-can-save-viewing=(if who.can("viewing:write") { "true" } else { "false" })
             data-viewing-revision=(view_model.viewing_revision.as_str())
             data-quality-mode=(preferences.quality_mode.as_str())
+            data-autoplay=(if preferences.autoplay { "true" } else { "false" })
             data-subtitle-policy=(preferences.subtitle_mode.as_str())
             data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
             data-resume-ms=(view_model.resume_ms)
@@ -397,6 +398,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             <button type="button" data-player-action="play">"Play"</button>
             <button type="button" data-player-action="pause">"Pause"</button>
             <button type="button" data-player-action="mute">"Mute / unmute"</button>
+            <button type="button" data-player-action="next">"Next title"</button>
             <label>"Position in seconds "<input name="position" type="number" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
             <button type="submit">"Seek"</button>
             <label>"Version "<select name="version"><option value="">"Automatic"</option>
