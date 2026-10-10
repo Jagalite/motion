@@ -38,20 +38,23 @@ pub struct Pending {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Hint {
     /// A path (relative to the source root, `/`-separated) was created,
-    /// modified, renamed or removed.
-    Path(String),
+    /// modified, renamed or removed. `container` is the adapter's observation
+    /// that it is (or may be) a directory: it is a directory now, the event
+    /// named a folder, or it was renamed or removed with an unknown kind. A
+    /// directory rename can arrive without events for its unchanged children.
+    Path { path: String, container: bool },
     /// Events may have been lost; the whole source is suspect.
     Lost,
 }
 
 /// Whether a hint can affect the catalog. Excluded paths are outside the
-/// source's scope. Only media, subtitle sidecars, NFO files and directories
-/// (no extension, or a directory rename) are relevant; hidden files such as
-/// `.DS_Store` and editor/partial-download temporaries are not.
+/// source's scope. Directories (whatever their name) and media, subtitle
+/// sidecar and NFO files are relevant; hidden entries such as `.DS_Store` and
+/// editor/partial-download temporaries are not.
 pub fn relevant(hint: &Hint, exclusions: &[String]) -> bool {
-    let path = match hint {
+    let (path, container) = match hint {
         Hint::Lost => return true,
-        Hint::Path(path) => path,
+        Hint::Path { path, container } => (path, *container),
     };
     if path.is_empty() || crate::sources::excluded(path, exclusions) {
         return false;
@@ -59,6 +62,9 @@ pub fn relevant(hint: &Hint, exclusions: &[String]) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     if name.starts_with('.') {
         return false;
+    }
+    if container {
+        return true;
     }
     match name.rsplit_once('.') {
         // No extension: most likely a directory (or an extensionless file,
@@ -104,6 +110,17 @@ pub fn take_due(pending: &mut BTreeMap<Id, Pending>, now_ms: u64, policy: Deboun
     due
 }
 
+/// Whether a watched root must be watched again: its identity (volume and
+/// inode) changed or it could not be observed. A watch on a deleted and
+/// recreated root (inotify) or a remounted volume no longer reports changes
+/// even though the registered path is unchanged. `None` means unobservable.
+pub fn rewatch(watched_identity: Option<&str>, current_identity: Option<&str>) -> bool {
+    match (watched_identity, current_identity) {
+        (Some(watched), Some(current)) => watched != current,
+        _ => true,
+    }
+}
+
 /// Drop pending hints for sources no longer watched (removed, disabled or
 /// relocated); their next scan comes from whoever re-enables them.
 pub fn retain_watched(pending: &mut BTreeMap<Id, Pending>, watched: &[Id]) {
@@ -117,7 +134,20 @@ mod tests {
     #[test]
     fn relevance_follows_scope_and_catalog_file_kinds() {
         let exclusions = vec!["Extras".to_string()];
-        let path = |p: &str| Hint::Path(p.into());
+        let path = |p: &str| Hint::Path {
+            path: p.into(),
+            container: false,
+        };
+        let dir = |p: &str| Hint::Path {
+            path: p.into(),
+            container: true,
+        };
+        assert!(
+            relevant(&dir("Movies/Movie.2025"), &exclusions),
+            "dotted directory"
+        );
+        assert!(!relevant(&dir("Extras/Movie.2025"), &exclusions));
+        assert!(!relevant(&dir("Movies/.Trash"), &exclusions));
         assert!(relevant(&path("Movies/Film.MKV"), &exclusions));
         assert!(relevant(&path("Movies/Film.en.srt"), &exclusions));
         assert!(relevant(&path("Movies/movie.nfo"), &exclusions));
@@ -128,6 +158,14 @@ mod tests {
         assert!(!relevant(&path("Movies/Film.mkv.part"), &exclusions));
         assert!(!relevant(&path("Movies/cover.jpg"), &exclusions));
         assert!(!relevant(&path(""), &exclusions));
+    }
+
+    #[test]
+    fn roots_are_rewatched_when_their_identity_changes_or_is_unknown() {
+        assert!(!rewatch(Some("1:2"), Some("1:2")));
+        assert!(rewatch(Some("1:2"), Some("1:3")), "recreated root");
+        assert!(rewatch(Some("1:2"), None), "root missing");
+        assert!(rewatch(None, Some("1:2")), "never observed");
     }
 
     #[test]

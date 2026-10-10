@@ -9,7 +9,10 @@
 //! network filesystems, permission errors) are logged and left to scheduled
 //! and requested scans. Lost events count as a hint for the whole source.
 use crate::App;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
+};
 use playscale_core::watch::{self as core, Debounce, Hint};
 use std::{
     collections::BTreeMap,
@@ -31,6 +34,8 @@ struct Watched {
     /// FSEvents reports `/private/var/...` for `/var/...`).
     canonical: PathBuf,
     exclusions: Vec<String>,
+    /// Root identity (volume:inode) when the watch was established.
+    identity: Option<String>,
 }
 impl Watched {
     fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
@@ -41,8 +46,25 @@ impl Watched {
 }
 
 enum Observed {
-    Paths(Vec<PathBuf>),
+    /// Paths with whether the event itself named a directory or a rename or
+    /// removal of unknown kind (a removed path can no longer be inspected).
+    Paths(Vec<PathBuf>, bool),
     Lost(Option<PathBuf>),
+}
+
+fn names_container(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Folder)
+            | EventKind::Remove(RemoveKind::Folder | RemoveKind::Any | RemoveKind::Other)
+            | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
+fn identity(root: &Path) -> Option<String> {
+    std::fs::metadata(root)
+        .ok()
+        .map(|m| crate::db::root_identity(&m))
 }
 
 /// Run until `shutdown`. `policy` is injectable for tests.
@@ -53,7 +75,10 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
             let observed = match result {
                 Ok(event) if event.need_rescan() => Observed::Lost(event.paths.into_iter().next()),
                 Ok(event) if matches!(event.kind, EventKind::Access(_)) => return,
-                Ok(event) => Observed::Paths(event.paths),
+                Ok(event) => {
+                    let container = names_container(&event.kind);
+                    Observed::Paths(event.paths, container)
+                }
                 Err(error) => Observed::Lost(error.paths.into_iter().next()),
             };
             let _ = tx.send(observed);
@@ -76,8 +101,14 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = resync.tick() => {
-                if let Err(error) = sync(&app, &mut watcher, &mut watched).await {
-                    tracing::warn!(%error, "could not refresh watched sources");
+                match sync(&app, &mut watcher, &mut watched).await {
+                    // Changes made while a root was unwatched were not seen.
+                    Ok(rewatched) => {
+                        for source in rewatched {
+                            core::record(&mut pending, &source, now_ms());
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "could not refresh watched sources"),
                 }
                 let ids: Vec<String> = watched.keys().cloned().collect();
                 core::retain_watched(&mut pending, &ids);
@@ -92,7 +123,10 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
             _ = tick.tick() => {
                 for source in core::take_due(&mut pending, now_ms(), policy) {
                     if let Err(error) = demand(&app, &source).await {
-                        tracing::warn!(%error, source, "could not request a scan after a change");
+                        // Keep the hint until a scan is admitted; it is due
+                        // again after the quiet period.
+                        tracing::warn!(%error, source, "could not request a scan after a change; will retry");
+                        core::record(&mut pending, &source, now_ms());
                     }
                 }
             }
@@ -116,7 +150,7 @@ fn attribute(watched: &BTreeMap<String, Watched>, observed: Observed) -> Vec<(St
             .map(|(id, ..)| (id, Hint::Lost))
             .into_iter()
             .collect(),
-        Observed::Paths(paths) => paths
+        Observed::Paths(paths, named_container) => paths
             .iter()
             .filter_map(|path| {
                 let (id, _, relative) = owner(path)?;
@@ -126,19 +160,28 @@ fn attribute(watched: &BTreeMap<String, Watched>, observed: Observed) -> Vec<(St
                     .collect();
                 // A non-UTF-8 path is not catalogable, but its directory may
                 // be: treat it as a hint for the source.
-                Some((id, parts.map_or(Hint::Lost, |p| Hint::Path(p.join("/")))))
+                let container = named_container || path.is_dir();
+                Some((
+                    id,
+                    parts.map_or(Hint::Lost, |p| Hint::Path {
+                        path: p.join("/"),
+                        container,
+                    }),
+                ))
             })
             .collect(),
     }
 }
 
 /// Watch every enabled, non-managed source root; unwatch removed, disabled or
-/// relocated ones.
+/// relocated ones; re-establish watches whose root identity changed (deleted
+/// and recreated, or remounted). Returns sources (re)watched after having
+/// been watched before, whose changes in between were not observed.
 async fn sync(
     app: &App,
     watcher: &mut RecommendedWatcher,
     watched: &mut BTreeMap<String, Watched>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id,root_path,exclusions_json FROM sources WHERE enabled=1 ORDER BY id",
     )
@@ -152,6 +195,7 @@ async fn sync(
         wanted.insert(
             id,
             Watched {
+                identity: identity(&root),
                 root,
                 canonical,
                 exclusions,
@@ -168,20 +212,28 @@ async fn sync(
             let _ = watcher.unwatch(&old.root);
         }
     }
+    let mut rewatched = Vec::new();
     for (id, want) in wanted {
-        match watched.get_mut(&id) {
-            Some(current) => current.exclusions = want.exclusions,
-            None => match watcher.watch(&want.root, RecursiveMode::Recursive) {
-                Ok(()) => {
-                    watched.insert(id, want);
-                }
-                Err(error) => {
-                    tracing::warn!(%error, source = id, "source root cannot be watched");
-                }
-            },
+        if let Some(current) = watched.get_mut(&id) {
+            if !core::rewatch(current.identity.as_deref(), want.identity.as_deref()) {
+                current.exclusions = want.exclusions;
+                continue;
+            }
+            let _ = watcher.unwatch(&current.root);
+            watched.remove(&id);
+            rewatched.push(id.clone());
+        }
+        match watcher.watch(&want.root, RecursiveMode::Recursive) {
+            Ok(()) => {
+                watched.insert(id, want);
+            }
+            Err(error) => {
+                // Not recorded as watched, so the next sync tries again.
+                tracing::warn!(%error, source = id, "source root cannot be watched");
+            }
         }
     }
-    Ok(())
+    Ok(rewatched)
 }
 
 /// Mark the source dirty and request a scan of it through the demand rules,

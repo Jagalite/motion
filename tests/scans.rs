@@ -388,6 +388,35 @@ async fn a_filesystem_change_requests_a_scan_that_publishes_it() {
     })
     .await
     .expect("the change was scanned and published");
+    // A renamed directory whose name has a dot may be reported only as a
+    // directory rename; it must still trigger a rescan.
+    std::fs::create_dir(root.join("Show.2025")).unwrap();
+    std::fs::write(root.join("Show.2025/ep.mkv"), b"episode").unwrap();
+    let published = |path: &'static str| {
+        let db = f.app.db.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let n: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM media_files WHERE relative_path=? AND available=1",
+                    )
+                    .bind(path)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    if n == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{path} was not published"));
+        }
+    };
+    published("Show.2025/ep.mkv").await;
+    std::fs::rename(root.join("Show.2025"), root.join("Show.2026")).unwrap();
+    published("Show.2026/ep.mkv").await;
     let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests")
         .fetch_one(&f.app.db)
         .await
