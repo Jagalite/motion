@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -207,5 +208,36 @@ func TestPagesDecodeContractShape(t *testing.T) {
 	}
 	if !strings.Contains(page.Items[0].Permissions[0], "catalog") {
 		t.Fatal("permissions")
+	}
+}
+
+func TestOpaqueResourceIDsAreEscapedExactlyOnce(t *testing.T) {
+	for _, id := range []string{"plain", "with space", "a/b", "literal%2F", "日本語", "a?b#c"} {
+		t.Run(id, func(t *testing.T) {
+			c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				segment := strings.TrimPrefix(r.URL.EscapedPath(), "/api/v2/profiles/")
+				got, err := url.PathUnescape(segment)
+				if err != nil || got != id || strings.Contains(segment, "/") || r.URL.RawQuery != "" {
+					t.Errorf("resource ID changed: path=%q decoded=%q err=%v", r.URL.EscapedPath(), got, err)
+				}
+				json.NewEncoder(w).Encode(Profile{ID: id, Name: "test", Revision: "1"})
+			}))
+			if _, err := c.GetProfile(context.Background(), id); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBackoffRemainsBoundedDuringProlongedOutage(t *testing.T) {
+	for attempt := 0; attempt < 10000; attempt++ {
+		got := backoff(attempt)
+		want := 5 * time.Second
+		if attempt < 5 {
+			want = 250 * time.Millisecond << attempt
+		}
+		if got != want {
+			t.Fatalf("attempt %d: got %s, want %s", attempt, got, want)
+		}
 	}
 }
