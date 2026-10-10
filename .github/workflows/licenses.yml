@@ -16,6 +16,8 @@ jobs:
           # Pull requests check their own head, not GitHub's synthetic merge commit,
           # whose identity is GitHub's and not the contributors'.
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The identity check reads every commit reachable from HEAD.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -23,6 +25,8 @@ jobs:
         run: |
           rustup toolchain install 1.98.0 --profile minimal
           rustup override set 1.98.0
+      - name: Test publication privacy check
+        run: python3 scripts/test_check_publication.py
       - name: Check publication privacy
         run: python3 scripts/check_publication.py
       - name: Test notice collection
