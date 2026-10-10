@@ -768,3 +768,38 @@ positions, renewing an expired lease, and releasing capacity on cancellation
 before worker exit. The script uses a temporary core-only workspace and isolated
 Cargo target; it rejects compile failures, missing tests, and timeouts as mutation
 evidence. This is a four-mutation sensitivity check, not a general mutation score.
+
+## A06/A07 follow-up audit and bounded progress decoding (2026-10-09)
+
+The execution audit found `BufReader::lines()` retaining unbounded encoder stdout
+until a newline. Processing now reads at most 4 KiB per select iteration and
+keeps a fixed 128-byte line prefix. Oversized lines are discarded through their
+newline; subsequent valid progress, CRLF, fragmented fields and final EOF fields
+are supported. Malformed/non-finite/negative advisory progress is ignored.
+Cancellation and the existing total processing deadline remain selectable while
+a line is incomplete. No core publication/admission decision changes: this
+parser reports advisory progress only, and media validation still gates output
+acceptance. Memory/parse-work bounds belong in this I/O adapter rather than a
+new domain lifecycle model.
+
+The plan audit does **not** establish complete A06/A07 delivery. Remaining items
+include separate startup/no-progress deadlines (processing currently has a total
+deadline), Windows Job Object containment/qualification, v2 authenticated plan
+and ticket integration with A08, delivery-creation idempotency, and A02 migration
+number coordination. The current live adapter is the experimental v1 H.264/AAC
+SDR path; browser/player, remote/NAS and additional live pipelines still need
+qualification. The four source mutations above cover selected rules, not every
+fault or property in the plan.
+
+Validation on the final parser source: `cargo test -p playscale --lib processing::
+-- --nocapture` passed all eight tests (four decoder, three supervisor and one
+atomic-publication regression). `cargo build -p playscale --bin playscale` passed.
+After warming the fresh executable with `--help`,
+`python3 scripts/processing_smoke.py` passed all 15 checks in disposable roots.
+The added fixtures write 16 MiB without newlines to each pipe: one proceeds to
+real encoding/validation, and another holds an incomplete stdout line while
+readiness and cancellation remain responsive. Existing checks also passed for
+three real recipes, cancellation/retry, restart and SIGKILL recovery, source
+replacement, cache pressure, corrupt output rejection, restore, and preservation
+of original bytes. VideoToolbox completed and its output was probed/decoded on
+this Mac; this is not qualification of other hardware or live delivery pipelines.
