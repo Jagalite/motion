@@ -56,6 +56,7 @@ writeFileSync(launchMain, readFileSync(new URL('./main.mjs', import.meta.url)), 
 let child;
 let electronChild;
 let lines;
+let failure;
 async function stop(proc) {
   if (!proc?.pid || proc.exitCode !== null || proc.signalCode !== null) return;
   await new Promise(resolve => {
@@ -93,7 +94,7 @@ try {
       // Private child environment for this proof; packaged host will use a pipe.
       env: {...electronEnv, MOTION_PROOF_ORIGIN: announced.listening, MOTION_PROOF_BOOTSTRAP: announced.bootstrap, MOTION_PROOF_OUT: output},
     });
-    const timer = setTimeout(() => reject(new Error('Electron proof exceeded 180 seconds')), 120000);
+    const timer = setTimeout(() => reject(new Error('Electron proof exceeded 180 seconds')), 180000);
     electronChild.once('error', error => { clearTimeout(timer); reject(error); });
     electronChild.once('exit', code => {
       clearTimeout(timer);
@@ -101,13 +102,16 @@ try {
     });
   });
   await new Promise(r => setTimeout(r, 300));
+} catch (error) {
+  failure = String(error.stack ?? error);
 } finally {
   await stop(electronChild);
   await stop(child);
   lines?.close();
 }
 
-const observed = JSON.parse(readFileSync(output, 'utf8'));
+const observed = existsSync(output) ? JSON.parse(readFileSync(output, 'utf8')) : {checks: {}, console: [], permissionRequests: [], permissionChecks: [], navigationBlocked: []};
+observed.arch ??= process.arch;
 const c = observed.checks;
 const deliveriesCreated = admitted.length;
 const deliveriesClosed = closed.length;
@@ -119,6 +123,8 @@ const results = {
   eval_blocked_by_csp: c.evalBlocked === 'EvalError',
   inline_script_blocked: c.inlineScriptBlocked === true,
   player_ready: c.playerHost?.state === 'ready',
+  keyboard_skip_link_preserves_player: c.skipLink?.focused === true && c.skipLink.retained === true && c.skipLink.players === 1,
+  narrow_player_layout_and_labels: c.narrowLayout?.width === 390 && c.narrowLayout.scrollWidth <= 391 && c.narrowLayout.labelled === true,
   played_past_2_5s: c.playback?.played === true,
   seek_landed_and_continued: c.playback?.landed === true && c.playback?.advancing === true,
   range_requests: requests.filter(r => r.range && r.path.startsWith('/api/v2/media/')).length > 0,
@@ -150,7 +156,7 @@ const results = {
   demuxe_bytes_match_install_receipt: demuxeMismatches.length === 0,
   no_permission_granted_beyond_fullscreen: observed.permissionsGranted.every(p => p === 'fullscreen'),
 };
-const passed = Object.values(results).every(Boolean) && !c.exception;
+const passed = Object.values(results).every(Boolean) && !c.exception && !failure;
 const demuxePkg = JSON.parse(readFileSync(join(demuxe, 'package.json'), 'utf8'));
 const demuxeInstall = existsSync(join(demuxe, 'playscale-package.json')) ? JSON.parse(readFileSync(join(demuxe, 'playscale-package.json'), 'utf8')) : {};
 const receipt = {
@@ -158,6 +164,7 @@ const receipt = {
   scope: 'Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.',
   wave: 0,
   passed,
+  failure,
   recorded_at: new Date().toISOString(),
   motion_commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim(),
   worktree_dirty: execFileSync('git', ['status', '--porcelain', '--', '.', ':!qualification/desktop'], {cwd: root}).toString().trim().length > 0,

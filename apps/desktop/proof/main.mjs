@@ -94,6 +94,16 @@ app.whenReady().then(async () => {
     })`);
     note('playerHost', ready);
     if (ready.state === 'ready') {
+      await evaluate(`window.__motionPlayerBeforeSkip = document.querySelector('demuxe-player'); document.querySelector('.skip-link').focus()`);
+      contents.sendInputEvent({type: 'keyDown', keyCode: 'Enter'});
+      contents.sendInputEvent({type: 'keyUp', keyCode: 'Enter'});
+      await new Promise(r => setTimeout(r, 150));
+      note('skipLink', await evaluate(`({focused: document.activeElement.id === 'main', retained: document.querySelector('demuxe-player') === window.__motionPlayerBeforeSkip, players: document.querySelectorAll('demuxe-player').length})`));
+      window.setContentSize(390, 844);
+      await new Promise(r => setTimeout(r, 150));
+      note('narrowLayout', await evaluate(`({width: innerWidth, scrollWidth: document.documentElement.scrollWidth, labelled: [...document.querySelectorAll('input:not([type=hidden]),select')].every(e => e.labels?.length || e.getAttribute('aria-label'))})`));
+      window.setContentSize(1100, 760);
+
       // The mock advertises a five-second lease heartbeat interval. Stay on
       // this player long enough to exercise renewal before navigation teardown.
       await new Promise(r => setTimeout(r, 5500));

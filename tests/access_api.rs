@@ -1266,7 +1266,7 @@ async fn problems_contract_and_capabilities() {
     assert_eq!(caps.status, StatusCode::OK, "{:?}", caps.body);
     assert_eq!(caps.body["server_id"], health.body["server_id"]);
     assert_eq!(caps.body["server_epoch"], health.body["server_epoch"]);
-    assert_eq!(caps.body["schema_version"], "14");
+    assert_eq!(caps.body["schema_version"], "16");
     assert_eq!(
         caps.body["contract_digest"],
         playscale::v2::system::contract_digest()
@@ -2146,4 +2146,64 @@ async fn presentation_retains_default_extractor_body_limit() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn production_topcoat_mount_uses_real_identity_and_never_mock_data() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let router = playscale::presentation::router(f.app.clone(), None);
+    let anonymous = router
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[]))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let html = String::from_utf8(
+        anonymous
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Motion"));
+    assert!(!html.contains("Development mock"));
+    let authorization = format!("Bearer {OPERATOR}");
+    let authorized = router
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[("authorization", &authorization)]))
+        .await
+        .unwrap();
+    // Missing v2 catalog/viewing services fail explicitly, never substituting
+    // development fixture titles or an empty collection as production data.
+    assert_eq!(authorized.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let html = String::from_utf8(
+        authorized
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!html.contains("Development mock") && !html.contains("Night Train"));
+    let invalid = router
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[("authorization", "Bearer invalid")]))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+    let unknown = router
+        .oneshot(f.request("GET", "/api/v2/unknown", None, &[]))
+        .await
+        .unwrap();
+    assert!(
+        unknown.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("json")
+    );
 }

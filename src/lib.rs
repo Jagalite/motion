@@ -52,3 +52,7 @@ pub fn now() -> i64 {
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+pub mod desktop;
+
+pub mod presentation;

@@ -302,7 +302,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     quality_mode: "auto".into(),
                     allow_client_software_decode: true,
                     autoplay: false,
-                    completion_percent: 90,
+                    completion_percent: 90.0,
                     etag: format!("\"prefs-{}-1\"", who.profile_id),
                 },
             })

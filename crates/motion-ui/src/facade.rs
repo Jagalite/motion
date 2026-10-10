@@ -141,7 +141,7 @@ pub struct PlayerView {
 
 /// Profile preferences as shown and edited on the profiles page. `etag` is the
 /// strong validator the command must send back as If-Match.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreferencesView {
     pub audio_languages: Vec<String>,
     pub subtitle_languages: Vec<String>,
@@ -151,11 +151,11 @@ pub struct PreferencesView {
     pub quality_mode: String,
     pub allow_client_software_decode: bool,
     pub autoplay: bool,
-    pub completion_percent: u8,
+    pub completion_percent: f64,
     pub etag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProfilesView {
     pub profiles: Vec<ProfileOption>,
     pub current: String,

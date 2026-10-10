@@ -26,24 +26,46 @@ generation/resource admission and activation must be enforced by production
 server/core services. The mock proof server is only a transport fixture. This
 branch does not add or claim Rust core model/Stateless properties.
 
+## Implemented production integration
+
+- Opt-in `--topcoat` mounts the real presentation facade. Reads dispatch through
+  the authenticated public API router with per-request credentials and verified
+  ingress identity, bounded response size, read count and total deadline. Missing
+  backend routes return unavailable; they never substitute fixture data.
+- Native Start local server owns a spawned child, private bootstrap/readiness
+  pipes, verified player assets and the existing exclusive data-directory lock.
+  Live identity/epoch/contract validation precedes attachment. Shutdown targets
+  only the spawned child. Local state stays under private desktop userData.
+- Browser viewing records now use localStorage. Controlled native detach saves
+  them with OS encryption, scoped by server/origin and principal, and restores
+  them only after verified authentication. Save failure retains the window.
+  This checkpoint does not prove unexpected-crash recovery or offline authority.
+- Keyboard skip-to-content retains the player; narrow navigation can wrap.
+
+These are presentation/transport/process adapters. They do not create a second
+implementation of server viewing authority, authorization or durable ordering.
+The real API tests cover adapter authentication; the native integration test
+covers actual bootstrap, lock ownership and restart identity.
+
 ## Required integration work still open
 
-1. Connect `UiQueryFacade` and public command routes to the authenticated v2
-   backend. The organization adapter at `9844a5c` explicitly records missing v2
-   preferences, timeline viewing, continue-watching, next, playback plans and
-   viewing/delivery sessions. The A07 delivery surface remains experimental v1.
-   Do not translate between these contracts by guessing authority semantics.
-2. Qualify real conversion/HLS generation transitions and viewing conflicts,
-   including stale manual epochs and server restart. Mock range media does not
-   prove these behaviors. Queue/next playback also needs its production service.
-3. Define and integrate protected desktop-owned bootstrap, readiness and process
-   ownership. The current shell supports remote and service-owned attachment,
-   rejects desktop-owned mode, and never launches or kills a server process.
-4. Integrate the A13 durable offline host/outbox. Current sessionStorage supports
-   same-tab reload only; closing a browser/native view can lose pending progress.
-   The bounded final send is not a durability guarantee.
-5. Complete A14 packaging, signing, updates and installed-artifact qualification.
-   Current Electron runs are unpackaged and unsigned.
+1. The facade is connected, but committed v2 catalog, preferences, viewing,
+   continue-watching, next, playback planning and delivery services are still
+   incomplete in this worktree. Their active branches contain uncommitted work.
+   Do not import another worker's unfinished files or guess v1/v2 translations.
+   Resolve the provisional delivery migration number against committed catalog
+   migrations 0015/0016 through the migration owner before integrating it.
+2. Qualify real conversion/HLS transitions, viewing conflicts, stale manual
+   epochs, restart and queue/next playback against those services. Mock media
+   proves client transport behavior, not server authority or production parity.
+3. Implement the M5 presentation-only offline helper with the A13 cache/event
+   port, then qualify disconnected cold start and causal reconciliation. The
+   close-time encrypted online outbox is not a substitute for this cache port.
+4. Complete the applicable accessibility, UI load/performance and platform
+   matrix. Focused keyboard/narrow-layout checks are only part of those gates.
+
+Packaging, signing, updating and installed-artifact qualification belong to A14
+and remain separate release gates. Current Electron runs are unpackaged.
 
 ## Reproduction and evidence boundaries
 
@@ -56,12 +78,14 @@ local evidence and are not shipped product dependencies.
 
 ## Latest local verification
 
-On 2026-10-09 (America/New_York), the final client suite passed 37 tests and
-`cargo test -p motion-ui --locked` passed 16 presentation tests. The Electron
-playback receipt passed all 21 checks, including actual range playback, seek,
-ordered viewing commands, generation replacement, lease renewal and retirement.
-The native shell receipt passed all seven checks. Both Electron receipts use
-mock services and the scope limitations above still apply. Rust formatting and
-`git diff --check` also passed. The player run uses a 180-second bound and emits
-incremental checkpoints; an earlier 120-second run timed out during this host's
-slow process startup and is not counted as a passing run.
+Current source has passed 47 focused JavaScript tests, 23 real access/API
+integration tests, 16 presentation composition tests and four production facade/asset-verification unit tests. Earlier in this run,
+all 9 catalog persistence and 14 catalog workflow tests passed after integrating
+schema migrations 0015/0016. The real owned-server receipt records four passing
+bootstrap/locking/restart checks. The latest native run timed out before its first checkpoint; its receipt is
+failed. The latest playback attempt also timed out at 180 seconds before any
+observations (see latest-player-attempt.json); the older passing playback receipt
+does not qualify current source. Staging the pinned Electron runtime internally
+then failed with ENOSPC. The failed temporary runtime copy was removed; no user
+files were deleted. Rust formatting, JavaScript syntax and diff checks passed.
+No full A11/A12 completion is claimed.

@@ -57,7 +57,9 @@ pub(crate) fn principal(cx: &Cx) -> Result<&UiPrincipal> {
 }
 
 pub(crate) fn facade(cx: &Cx) -> &Facade {
-    app_context::<Facade>(cx)
+    extensions(cx)
+        .get::<Facade>()
+        .unwrap_or_else(|| app_context::<Facade>(cx))
 }
 
 pub(crate) fn ui_error(error: UiError) -> topcoat::Error {
