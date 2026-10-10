@@ -3,18 +3,23 @@ pub mod api;
 pub mod artwork;
 pub mod catalog;
 pub mod config;
+pub mod curation;
 pub mod db;
 pub mod encoding;
 pub mod events;
 pub mod maintenance;
+pub mod matching;
 pub mod media;
 pub mod metadata;
 pub mod operations;
+pub mod organization;
 pub mod playback;
 pub mod processing;
 pub mod renditions;
 pub mod scan;
 pub mod storage;
+pub mod upgrade;
+pub mod v2;
 pub mod viewing;
 
 use std::{path::PathBuf, sync::Arc};
@@ -34,6 +39,7 @@ pub struct App {
     pub event_streams: Arc<Semaphore>,
     pub processing: Arc<processing::Runtime>,
     pub storage: Arc<storage::Runtime>,
+    pub access: Arc<v2::Runtime>,
 }
 
 pub fn now() -> i64 {

@@ -225,7 +225,7 @@ pub async fn relocate(
     })?;
     let mut tx = crate::db::begin_write(&app.db).await?;
     sqlx::query(
-        "UPDATE libraries SET root=?,root_identity=?,enabled=1,revision=revision+1 WHERE id=?",
+        "UPDATE libraries SET root=?,root_identity=?,enabled=1,revision=revision+1,binding_revision=binding_revision+1 WHERE id=?",
     )
     .bind(root)
     .bind(identity)

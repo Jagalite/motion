@@ -98,6 +98,11 @@ pub struct JobRow {
     pub full_scan: bool,
     pub reused_files: i64,
     pub inspected_files: i64,
+    /// `complete` or `partial` once published; absence was inferred only in
+    /// the completely listed directories.
+    pub outcome: Option<String>,
+    pub complete_directories: i64,
+    pub incomplete_directories: i64,
 }
 impl JobRow {
     pub fn state(&self) -> anyhow::Result<Job> {
@@ -122,6 +127,132 @@ pub struct Progress {
 }
 
 pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
+    connect_with(path, &sqlx::migrate!("./migrations")).await
+}
+
+/// A verified copy of the database taken before pending migrations were applied.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradeBackup {
+    pub path: std::path::PathBuf,
+    pub from_version: i64,
+    pub to_version: i64,
+}
+
+/// Open, back up when an upgrade is pending, migrate, then run data upgrades.
+/// Each migration runs in its own transaction; a failure leaves the schema at
+/// the last complete version and the verified backup in place for restore.
+pub async fn connect_with(
+    path: &Path,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<SqlitePool> {
+    let db = open(path).await?;
+    let backup = prepare_upgrade(&db, path, migrator).await?;
+    if let Err(error) = migrator.run(&db).await {
+        db.close().await;
+        return Err(match &backup {
+            Some(b) => anyhow::Error::new(error).context(format!(
+                "schema migration failed; verified pre-upgrade backup at {}",
+                b.path.display()
+            )),
+            None => anyhow::Error::new(error).context("schema migration failed"),
+        });
+    }
+    crate::upgrade::run(&db, backup.as_ref()).await?;
+    Ok(db)
+}
+
+async fn prepare_upgrade(
+    db: &SqlitePool,
+    path: &Path,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<Option<UpgradeBackup>> {
+    let tracked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='_sqlx_migrations'",
+    )
+    .fetch_one(db)
+    .await?;
+    if tracked == 0 {
+        return Ok(None);
+    }
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version")
+            .fetch_all(db)
+            .await?;
+    let known: std::collections::BTreeSet<i64> = migrator
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| m.version)
+        .collect();
+    if let Some(newer) = applied.iter().find(|v| !known.contains(v)) {
+        anyhow::bail!(
+            "database schema version {newer} is unknown to this server; restore a compatible build or a pre-upgrade backup"
+        );
+    }
+    let (Some(&from_version), Some(&to_version)) = (applied.last(), known.last()) else {
+        return Ok(None);
+    };
+    if applied.len() == known.len() {
+        return Ok(None);
+    }
+    let dir = path
+        .parent()
+        .context("database path has no directory")?
+        .join("upgrade-backups");
+    tokio::fs::create_dir_all(&dir).await?;
+    let size = tokio::fs::metadata(path).await?.len();
+    crate::storage::require_space(&dir, size, 64 * 1024 * 1024)?;
+    let target = dir.join(format!(
+        "pre-upgrade-{from_version}-to-{to_version}-{}-{}.sqlite3",
+        now(),
+        new_id()
+    ));
+    let target_text = target.to_str().context("backup path must be UTF-8")?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(target_text)
+        .execute(db)
+        .await
+        .context("pre-upgrade backup failed; schema left unchanged")?;
+    verify_backup(&target, applied.len())
+        .await
+        .context("pre-upgrade backup failed verification; schema left unchanged")?;
+    let backup = UpgradeBackup {
+        path: target,
+        from_version,
+        to_version,
+    };
+    tracing::info!(path=%backup.path.display(), from_version, to_version, "verified pre-upgrade backup");
+    Ok(Some(backup))
+}
+
+/// A backup is usable only if SQLite can read it completely and it carries the
+/// exact migration history it was taken at.
+pub async fn verify_backup(path: &Path, applied_migrations: usize) -> anyhow::Result<()> {
+    use sqlx::Connection;
+    let mut conn = sqlx::SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(path).read_only(true),
+    )
+    .await?;
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&mut conn)
+        .await?;
+    anyhow::ensure!(integrity == "ok", "integrity check failed: {integrity}");
+    let dangling = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut conn)
+        .await?;
+    anyhow::ensure!(dangling.is_empty(), "backup has dangling references");
+    let migrations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success=1")
+            .fetch_one(&mut conn)
+            .await?;
+    anyhow::ensure!(
+        usize::try_from(migrations)? == applied_migrations,
+        "backup migration history differs"
+    );
+    conn.close().await?;
+    Ok(())
+}
+
+async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -133,7 +264,6 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
         .max_connections(4)
         .connect_with(options)
         .await?;
-    sqlx::migrate!("./migrations").run(&db).await?;
     Ok(db)
 }
 

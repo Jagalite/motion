@@ -315,7 +315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
         let library = db::add_library(&db, "fixture", dir.path()).await.unwrap();
-        sqlx::query("INSERT INTO items VALUES ('item','Fixture','video')")
+        sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
             .execute(&db)
             .await
             .unwrap();
@@ -342,6 +342,10 @@ mod tests {
             processing: Arc::new(crate::processing::Runtime::new(
                 dir.path().join("cache"),
                 Default::default(),
+            )),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
             )),
         };
         let (entered, mut receiver) = tokio::sync::mpsc::unbounded_channel();
