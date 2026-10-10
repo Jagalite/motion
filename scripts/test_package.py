@@ -59,21 +59,27 @@ def exercise(archive, work, keep_running=False):
     success = False
     try:
         wait_for(lambda: request(port, 'GET', '/ready')[0] == 200, seconds=45)
+        # The package runs in its default restricted access mode: the legacy
+        # API is closed to anonymous clients and open to the operator token.
+        auth = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
+        assert request(port, 'GET', '/api/v1/items')[0] in (401, 403)
+        checks.append('restricted_default_refuses_anonymous_legacy')
         def catalog():
-            result = json.loads(request(port, 'GET', '/api/v1/items')[2])['items']
+            status, _, raw = request(port, 'GET', '/api/v1/items', headers=auth)
+            assert status == 200, (status, raw)
+            result = json.loads(raw)['items']
             return result[0] if result else None
         item = wait_for(catalog, seconds=45)
         assert abs(item['duration_seconds'] - 8) < .1
         checks.append('server_scan_with_bundled_ffprobe')
-        status, headers, payload = request(port, 'GET', item['media_url'])
+        status, headers, payload = request(port, 'GET', item['media_url'], headers=auth)
         assert status == 200 and hashlib.sha256(payload).hexdigest() == sha(fixture)
-        status, _, payload = request(port, 'GET', item['media_url'], headers={'Range': 'bytes=0-63'})
+        status, _, payload = request(port, 'GET', item['media_url'], headers={**auth, 'Range': 'bytes=0-63'})
         assert status == 206 and payload == fixture.read_bytes()[:64]
         checks.append('media_bytes_and_ranges')
         status, _, payload = request(port, 'GET', '/assets/demuxe/package.json')
         assert status == 200 and json.loads(payload)['version'] == manifest['demuxe']['version']
         checks.append('npm_demuxe_served')
-        auth = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
         status, _, payload = request(port, 'POST', '/api/v1/processing-jobs', {
             'source_file_id': item['file_id'], 'source_revision': item['revision'],
             'recipe': 'h264720p', 'backend': 'software', 'idempotency_key': 'package-test'}, auth)
@@ -88,11 +94,12 @@ def exercise(archive, work, keep_running=False):
         assert result['output_file_id']
         checks.append('server_transcode_with_bundled_ffmpeg')
         progress = f'/api/v1/profiles/default/progress/{item["id"]}'
-        assert request(port, 'PUT', progress, {'position_seconds': 2.5})[0] == 200
+        assert request(port, 'PUT', progress, {'position_seconds': 2.5}, auth)[0] == 200
         stop(process)
         process = subprocess.Popen(command, cwd=work, env=clean_env, stdout=log, stderr=log)
         wait_for(lambda: request(port, 'GET', '/ready')[0] == 200, seconds=45)
-        assert json.loads(request(port, 'GET', progress)[2])['position_seconds'] == 2.5
+        auth = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
+        assert json.loads(request(port, 'GET', progress, headers=auth)[2])['position_seconds'] == 2.5
         checks.append('restart_retains_progress')
         receipt = {'checks': checks, 'archive_sha256': sha(archive), 'port': port,
                    'pid': process.pid, 'app': app.name, 'item_id': item['id'],

@@ -210,15 +210,7 @@ pub async fn delete_owned_in(
         .fetch_one(&mut *conn)
         .await?;
     org::removable(revision(current)?, expected, 0)?;
-    if table == "queues" {
-        // Queue hints name the owning profile; queues have no delete trigger.
-        sqlx::query(
-            "INSERT INTO change_events(topic,resource_id) SELECT 'queues',profile_id FROM queues WHERE id=?",
-        )
-        .bind(id)
-        .execute(&mut *conn)
-        .await?;
-    }
+    // Delete hints (queues name their profile) come from triggers (0029).
     sqlx::query(&format!("DELETE FROM {table} WHERE id=?"))
         .bind(id)
         .execute(&mut *conn)
@@ -825,4 +817,167 @@ pub async fn change_queue_in(
     };
     store_queue(&mut *conn, id, &next).await?;
     Ok(next)
+}
+
+// ---------------------------------------------------------------------------
+// Reads and deletes (profile-scoped; deletions are revision-checked)
+
+async fn delete_owned(
+    app: &App,
+    table: &str,
+    profile: &str,
+    id: &str,
+    expected_revision: u64,
+) -> Result<(), OrgError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let current: i64 = sqlx::query_scalar(&format!(
+        "SELECT revision FROM {table} WHERE id=? AND profile_id=?"
+    ))
+    .bind(id)
+    .bind(profile)
+    .fetch_one(&mut *tx)
+    .await?;
+    org::advance(revision(current)?, expected_revision)?;
+    let result = sqlx::query(&format!("DELETE FROM {table} WHERE id=?"))
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
+    match result {
+        // A saved filter still used by a smart collection cannot disappear.
+        Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => {
+            return Err(OrgError::InvalidReference(id.into()));
+        }
+        other => {
+            other?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_filter(
+    app: &App,
+    profile: &str,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    delete_owned(app, "saved_filters", profile, id, expected).await
+}
+pub async fn delete_collection(
+    app: &App,
+    profile: &str,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    delete_owned(app, "collections", profile, id, expected).await
+}
+pub async fn delete_playlist(
+    app: &App,
+    profile: &str,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    delete_owned(app, "playlists", profile, id, expected).await
+}
+pub async fn delete_queue(
+    app: &App,
+    profile: &str,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    delete_owned(app, "queues", profile, id, expected).await
+}
+
+async fn ids(db: &SqlitePool, table: &str, profile: &str) -> Result<Vec<String>, OrgError> {
+    let order = if table == "queues" { "id" } else { "name,id" };
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT id FROM {table} WHERE profile_id=? ORDER BY {order}"
+    ))
+    .bind(profile)
+    .fetch_all(db)
+    .await?)
+}
+
+pub async fn list_filters(db: &SqlitePool, profile: &str) -> Result<Vec<SavedFilter>, OrgError> {
+    let mut out = Vec::new();
+    for id in ids(db, "saved_filters", profile).await? {
+        out.push(get_filter(db, profile, &id).await?);
+    }
+    Ok(out)
+}
+
+pub async fn get_collection(
+    db: &SqlitePool,
+    profile: &str,
+    id: &str,
+) -> Result<Collection, OrgError> {
+    let mut tx = db.begin().await?;
+    let (rev, name, kind, filter_id): (i64, String, String, Option<String>) = sqlx::query_as(
+        "SELECT revision,name,kind,filter_id FROM collections WHERE id=? AND profile_id=?",
+    )
+    .bind(id)
+    .bind(profile)
+    .fetch_one(&mut *tx)
+    .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM collection_items WHERE collection_id=? ORDER BY item_id",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Collection {
+        id: id.into(),
+        revision: revision(rev)?,
+        profile_id: profile.into(),
+        name,
+        kind: serde_json::from_value(serde_json::Value::String(kind))?,
+        item_ids,
+        filter_id,
+    })
+}
+
+pub async fn list_collections(db: &SqlitePool, profile: &str) -> Result<Vec<Collection>, OrgError> {
+    let mut out = Vec::new();
+    for id in ids(db, "collections", profile).await? {
+        out.push(get_collection(db, profile, &id).await?);
+    }
+    Ok(out)
+}
+
+pub async fn get_playlist(db: &SqlitePool, profile: &str, id: &str) -> Result<Playlist, OrgError> {
+    let mut tx = db.begin().await?;
+    let (rev, name): (i64, String) =
+        sqlx::query_as("SELECT revision,name FROM playlists WHERE id=? AND profile_id=?")
+            .bind(id)
+            .bind(profile)
+            .fetch_one(&mut *tx)
+            .await?;
+    let entries = load_entries(&mut tx, "playlist_entries", id).await?;
+    tx.commit().await?;
+    Ok(Playlist {
+        id: id.into(),
+        revision: revision(rev)?,
+        profile_id: profile.into(),
+        name,
+        entries,
+    })
+}
+
+pub async fn list_playlists(db: &SqlitePool, profile: &str) -> Result<Vec<Playlist>, OrgError> {
+    let mut out = Vec::new();
+    for id in ids(db, "playlists", profile).await? {
+        out.push(get_playlist(db, profile, &id).await?);
+    }
+    Ok(out)
+}
+
+pub async fn list_queues(db: &SqlitePool, profile: &str) -> Result<Vec<(String, Queue)>, OrgError> {
+    let mut out = Vec::new();
+    for id in ids(db, "queues", profile).await? {
+        let queue = get_queue(db, profile, &id).await?;
+        out.push((id, queue));
+    }
+    Ok(out)
 }

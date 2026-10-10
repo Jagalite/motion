@@ -370,6 +370,8 @@ Implement deterministic filename/tag parsing separately from provider matching. 
 
 Use provider adapters for candidate search, exact-identity fetch, permitted artwork, rate-limit/retry handling, and provenance. The first online provider adapter is TMDB for movies/television; its registration/attribution/access terms are a release dependency to verify before enabling it. Local metadata and unmatched playback must work without provider credentials. NFO is a bounded, deliberately supported dialect; document unsupported fields and disable external entity/network expansion.
 
+> **Deferred (2026-10-10):** the TMDB adapter and other online providers are deferred and are not part of the current A04 scope. Until they are resumed, metadata comes from filename/tag parsing, NFO sidecars, and local edits; the provider-neutral proposal/decision workflow (match, fix match, unmatch, manual identify) stays in place so an adapter can be added later without changing core rules. Provider artwork is deferred with it. Resuming requires the registration/attribution/access terms check above.
+
 Each contribution records provider/source key, observation time, adapter version, external identity, language, fields, and errors. Local edits and field locks win under explicit precedence. Absence withdraws a source's contribution; an intentional local blank is distinct from no opinion. Provider conflicts are retained for diagnosis. Source refresh must not erase curation.
 
 ### 8.2 Identification workflow
@@ -887,7 +889,7 @@ The package contains [individual agent briefs](agents/README.md). Each agent rec
 | A01 | Catalog domain/use cases; catalog modules in `motion-domain`, `motion-catalog` | A00 contracts | Timeline/edition/move/merge semantics and golden fixtures. |
 | A02 | Persistence/migrations; `motion-store-sqlite`, `migrations` | A00/A01 identity model | Verified Motion upgrade, transactions, indexes, restore and conflict receipts. |
 | A03 | Scanning/filesystem; `motion-scanner`, source ports | A00/A02 ports | Real partial/unavailable/move/stale/cancel tests and model adapter. |
-| A04 | Metadata/artwork/markers; `motion-metadata` | A00/A01 interfaces | Fix-match survives refresh; bounded NFO/provider/assets; selected component evidence. |
+| A04 | Metadata/artwork/markers; `motion-metadata` | A00/A01 interfaces | Fix-match survives refresh; bounded NFO/local assets; selected component evidence. Online provider adapters (TMDB) deferred; see §8.1. |
 | A05 | Statelessness/corpus; `motion-verification`, qualification models | Production transition contracts | Independent oracles, minimized replay traces, cross-workflow fault cases. |
 | A06 | Jobs/admission/process execution; `motion-work`, `motion-execution` | A00/A02 contracts | Native tree cleanup, stuck-worker accounting, durable publication and fairness. |
 | A07 | Viewing/delivery; `motion-playback`, relevant domain modules | A00/A01/A06 | Timeline state, generation changes, HLS before-complete, exact tracks, cleanup. |

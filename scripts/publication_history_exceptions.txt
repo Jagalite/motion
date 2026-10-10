@@ -1,0 +1,5 @@
+# Published commits whose identity predates or escaped the publication check.
+# Format: <full commit hash> <author|committer>  # reason
+# Add entries only for commits already pushed to origin; fix unpublished commits instead.
+2341f802359b4bf0dc8d1b73037103204c8b9639 author  # PR #5 web merge, published 2026-10-10
+ce1288ed57546d97c8668af0b4581bd5116d8141 author  # first PR #1 web merge, on origin/catalog-sources (PR #4) and other pushed branches

@@ -31,6 +31,10 @@ enum Input {
     ReplaceFile,
     /// An automatic provider contribution asserts an identity (`3` withdraws it).
     ProviderUpdate(u8),
+    /// Fix-match: reopen the decided proposal (optionally with a stale revision).
+    Reopen {
+        stale: bool,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Effect {
@@ -126,6 +130,19 @@ impl Model for Matching {
                 }
                 Effect::Updated
             }
+            Input::Reopen { stale } => {
+                match playscale_core::matching::reopen(
+                    &s.proposal,
+                    s.proposal.revision - u64::from(*stale),
+                    Some(&s.file_revision),
+                ) {
+                    Ok(p) => {
+                        next.proposal = p;
+                        Effect::Updated
+                    }
+                    Err(e) => Effect::Rejected(e),
+                }
+            }
             Input::ProviderUpdate(n) => {
                 let incoming = (*n < 3).then(|| identity(*n));
                 if provider_identity_allowed(s.match_state, s.identity.as_ref(), incoming.as_ref())
@@ -186,7 +203,9 @@ impl Model for Matching {
         Ok(vec![
             check(
                 "match.fix_match_survives_refresh",
-                !decided_before || after.proposal == before.proposal,
+                !decided_before
+                    || after.proposal == before.proposal
+                    || matches!(input, Input::Reopen { stale: false }),
             ),
             check(
                 "match.decision_exactly_on_current_review",
@@ -258,6 +277,11 @@ impl Enumerate for Matching {
         }
         if s.file_revision.len() < 4 {
             inputs.push(Input::ReplaceFile);
+        }
+        if open {
+            for stale in [false, true] {
+                inputs.push(Input::Reopen { stale });
+            }
         }
         for n in 0..4 {
             inputs.push(Input::ProviderUpdate(n));
@@ -378,4 +402,44 @@ fn decided_proposals_are_kept_and_pins_survive_merges() {
         MatchState::Ambiguous
     );
     assert_eq!(merged_state(&[]), MatchState::Unmatched);
+}
+
+#[test]
+fn reopen_allows_fix_match_only_on_the_reviewed_decision() {
+    use playscale_core::matching::{reopen, unmatch};
+    let open = propose("p".into(), "f".into(), "r".into(), candidates(2)).unwrap();
+    assert!(reopen(&open, 1, Some("r")).is_err(), "undecided");
+    let (accepted, _) = decide(
+        &open,
+        1,
+        Some("r"),
+        Decision::Accept {
+            candidate_id: "c0".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reopen(&accepted, 1, Some("r")),
+        Err(MatchError::StaleProposal)
+    );
+    assert_eq!(
+        reopen(&accepted, 2, Some("r2")),
+        Err(MatchError::FileChanged)
+    );
+    let reopened = reopen(&accepted, 2, Some("r")).unwrap();
+    assert_eq!(reopened.status, Status::Review);
+    assert_eq!(reopened.decision, None);
+    assert_eq!(reopened.revision, 3);
+    let (fixed, id) = decide(
+        &reopened,
+        3,
+        Some("r"),
+        Decision::Accept {
+            candidate_id: "c1".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(fixed.status, Status::Accepted);
+    assert_eq!(id.unwrap().candidate.id, "c1");
+    assert_eq!(unmatch(MatchState::Manual), MatchState::Unmatched);
 }

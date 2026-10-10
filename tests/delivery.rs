@@ -1195,6 +1195,18 @@ async fn videotoolbox_live_transcode_uses_the_hardware_encoder() {
         return;
     }
     let f = Fixture::new().await;
+    // Hosted CI runners are VMs without a hardware encoder session; the server
+    // then answers backend_unavailable for every VideoToolbox request.
+    // MOTION_REQUIRE_VIDEOTOOLBOX=1 makes a failed probe an error on hosts that
+    // are known to have the encoder, so a probe regression cannot hide here.
+    if !playscale::processing::videotoolbox_available(&f.app).await {
+        assert!(
+            std::env::var_os("MOTION_REQUIRE_VIDEOTOOLBOX").is_none(),
+            "MOTION_REQUIRE_VIDEOTOOLBOX is set but the VideoToolbox probe failed"
+        );
+        eprintln!("SKIPPED: no VideoToolbox encoder session on this host");
+        return;
+    }
     let status = Command::new("ffmpeg")
         .args([
             "-v",

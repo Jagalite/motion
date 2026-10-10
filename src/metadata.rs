@@ -285,6 +285,9 @@ pub(crate) async fn replace(
     project_title(conn, id)
         .await
         .map_err(ContributionError::Storage)?;
+    crate::search::refresh(conn, 100)
+        .await
+        .map_err(ContributionError::Storage)?;
     Ok(())
 }
 

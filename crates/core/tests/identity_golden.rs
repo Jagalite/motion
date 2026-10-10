@@ -287,9 +287,19 @@ fn splits_reassignments_and_renditions_respect_reviewed_content() {
         Err(IdentityError::SharedFileSplit("shared".into()))
     );
     let facts = |bound: Option<(&str, usize)>, copy| ReassignFacts {
+        bound_versions: usize::from(bound.is_some()),
         bound: bound.map(|(v, n)| (v.to_string(), n)),
         pinned_copy_remains: copy,
     };
+    assert!(
+        reassignment(&ReassignFacts {
+            bound: Some(("v".into(), 1)),
+            pinned_copy_remains: false,
+            bound_versions: 2,
+        })
+        .is_err(),
+        "shared multi-episode file"
+    );
     assert_eq!(
         reassignment(&facts(None, false)),
         Ok(Reassignment::DeclareNew)
@@ -325,4 +335,149 @@ fn splits_reassignments_and_renditions_respect_reviewed_content() {
         rendition_placement(&[pinned("multi", 2, false), pinned("episode", 1, true)]),
         RenditionPlacement::OwnTimeline
     );
+}
+
+#[test]
+fn explicit_versions_order_groups_and_relationships() {
+    use playscale_core::identity::{
+        RelationshipKind, VersionRequest, place_in_order, plan_version, validate_relationship,
+    };
+    let part = |file: &str, revision: &str, start: Option<u64>, end: Option<u64>| Binding {
+        file_id: file.into(),
+        revision: revision.into(),
+        part: 1,
+        start_ms: start,
+        end_ms: end,
+    };
+    let empty = Timeline {
+        id: "ep2".into(),
+        versions: vec![],
+    };
+    let files: std::collections::BTreeMap<String, (String, String)> = [
+        (
+            "double".to_string(),
+            ("ep1-ed".to_string(), "r".to_string()),
+        ),
+        ("own".to_string(), ("ep2-ed".to_string(), "r2".to_string())),
+    ]
+    .into();
+    let request = |b: Binding| VersionRequest {
+        bindings: vec![b],
+        equivalence: Equivalence::Unknown,
+    };
+    // Episode 2 may bind the second half of episode 1's double-episode file...
+    let shared = [("ep1".to_string(), part("double", "r", Some(0), Some(1_000)))];
+    assert_eq!(
+        plan_version(
+            &empty,
+            "ep2-ed",
+            &request(part("double", "r", Some(1_000), Some(2_000))),
+            &files,
+            &shared
+        ),
+        Ok(())
+    );
+    // ...but never the whole file, nor an unknown split point.
+    assert!(
+        plan_version(
+            &empty,
+            "ep2-ed",
+            &request(part("double", "r", None, None)),
+            &files,
+            &[]
+        )
+        .is_err()
+    );
+    assert!(
+        plan_version(
+            &empty,
+            "ep2-ed",
+            &request(part("double", "r", None, None)),
+            &files,
+            &shared
+        )
+        .is_err()
+    );
+    // Bindings pin the file's current reviewed revision.
+    assert_eq!(
+        plan_version(
+            &empty,
+            "ep2-ed",
+            &request(part("own", "old", None, None)),
+            &files,
+            &[]
+        ),
+        Err(IdentityError::ReviewedContentChanged("own".into()))
+    );
+    assert_eq!(
+        plan_version(
+            &empty,
+            "ep2-ed",
+            &request(part("own", "r2", None, None)),
+            &files,
+            &[]
+        ),
+        Ok(())
+    );
+
+    let occupied: std::collections::BTreeMap<u32, String> = [(1, "ep1".to_string())].into();
+    let ancestors = ["season".to_string(), "series".to_string()];
+    assert!(place_in_order("ep2", &ancestors, "series", 2, &occupied).is_ok());
+    assert!(place_in_order("ep2", &ancestors, "series", 1, &occupied).is_err());
+    assert!(
+        place_in_order("ep1", &ancestors, "series", 1, &occupied).is_ok(),
+        "same place"
+    );
+    assert!(place_in_order("ep2", &ancestors, "other-series", 2, &occupied).is_err());
+
+    let edges = vec![("a".to_string(), "b".to_string(), RelationshipKind::PartOf)];
+    assert!(validate_relationship("b", "c", RelationshipKind::PartOf, &edges).is_ok());
+    assert!(
+        validate_relationship("b", "a", RelationshipKind::PartOf, &edges).is_err(),
+        "cycle"
+    );
+    assert!(validate_relationship("b", "a", RelationshipKind::PerformedBy, &edges).is_ok());
+    assert!(
+        validate_relationship("a", "b", RelationshipKind::PartOf, &edges).is_err(),
+        "duplicate"
+    );
+    assert!(validate_relationship("a", "a", RelationshipKind::CreatedBy, &edges).is_err());
+}
+
+#[test]
+fn merges_remap_relationships_and_order_memberships_follow_ancestry() {
+    use playscale_core::identity::{
+        Edge, RelationshipKind::*, order_membership_valid, remap_relationships,
+    };
+    let edge = |id: &str, s: &str, t: &str, k| Edge {
+        id: id.into(),
+        source: s.into(),
+        target: t.into(),
+        kind: k,
+    };
+    let edges = vec![
+        edge("1", "dup", "show", ExtraOf),
+        edge("2", "film", "show", ExtraOf),
+        edge("3", "dup", "film", CreatedBy),
+        edge("4", "film", "dup", PerformedBy),
+    ];
+    let remap = remap_relationships(&edges, &["dup".into()], "film").unwrap();
+    // dup->show becomes a duplicate of film->show; dup<->film become self edges.
+    assert_eq!(remap.deletes, ["1", "3", "4"]);
+    assert!(remap.updates.is_empty());
+    let chain = vec![edge("a", "x", "y", PartOf), edge("b", "y", "dup", PartOf)];
+    assert!(
+        remap_relationships(&chain, &["dup".into()], "x").is_err(),
+        "x part_of y part_of x"
+    );
+    let ok = remap_relationships(&chain, &["dup".into()], "z").unwrap();
+    assert_eq!(
+        ok.updates,
+        [("b".to_string(), "y".to_string(), "z".to_string())]
+    );
+    assert!(order_membership_valid(
+        &["e1".into(), "s1".into(), "show".into()],
+        "show"
+    ));
+    assert!(!order_membership_valid(&["split-off".into()], "show"));
 }

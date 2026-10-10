@@ -239,6 +239,58 @@ mod tests {
         assert_eq!(overlapping("/srv/music", &roots), None);
     }
     #[test]
+    fn relocation_commit_rechecks_every_reviewed_fact() {
+        let plan = RelocationPlan {
+            source: "s".into(),
+            expected_revision: 2,
+            binding_revision: 1,
+            root: "/new".into(),
+            root_identity: "dev:ino".into(),
+            verified: vec![("f".into(), "stamp".into())],
+            out_of_scope: vec![],
+            catalog: vec![("f".into(), "rev".into(), true)],
+        };
+        let facts = || RelocationFacts {
+            revision: 2,
+            binding_revision: 1,
+            root_identity: Some("dev:ino".into()),
+            fingerprints: [("f".to_string(), Some("stamp".to_string()))].into(),
+            overlapping_root: None,
+            catalog: vec![("f".into(), "rev".into(), true)],
+        };
+        assert_eq!(relocation_commit(&plan, &facts()), Ok(()));
+        let mut f = facts();
+        f.binding_revision = 2;
+        assert_eq!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::SourceChanged)
+        );
+        let mut f = facts();
+        f.root_identity = Some("other".into());
+        assert_eq!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::RootChanged)
+        );
+        let mut f = facts();
+        f.fingerprints.insert("f".into(), None);
+        assert_eq!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::FileChanged("f".into()))
+        );
+        let mut f = facts();
+        f.catalog[0].1 = "rescanned".into();
+        assert_eq!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::SourceChanged)
+        );
+        let mut f = facts();
+        f.overlapping_root = Some("/new/inner".into());
+        assert!(matches!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::Overlaps(_))
+        ));
+    }
+    #[test]
     fn availability_is_derived_from_enablement_and_last_scan() {
         use Availability::*;
         assert_eq!(source_availability(false, Some(true), false), Unavailable);
@@ -255,4 +307,71 @@ mod tests {
         assert_eq!(library_availability(&[Available, Unavailable]), Degraded);
         assert_eq!(library_availability(&[Unknown, Available]), Degraded);
     }
+}
+
+/// What a relocation preview verified: the new root's identity and the
+/// fingerprint of every in-scope cataloged file at the new location (each
+/// already content-verified by hashing during the preview).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocationPlan {
+    pub source: Id,
+    pub expected_revision: u64,
+    pub binding_revision: u64,
+    pub root: String,
+    pub root_identity: String,
+    /// `(file id, fingerprint at the new root)` for verified files.
+    pub verified: Vec<(Id, String)>,
+    /// Files outside the source's scope (exclusions) at preview time.
+    pub out_of_scope: Vec<Id>,
+    /// The source's complete catalog at preview: `(file, revision, available)`.
+    pub catalog: Vec<(Id, String, bool)>,
+}
+
+/// Facts observed at commit, inside the writer transaction (stat only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelocationFacts {
+    pub revision: u64,
+    pub binding_revision: u64,
+    pub root_identity: Option<String>,
+    pub fingerprints: std::collections::BTreeMap<Id, Option<String>>,
+    pub overlapping_root: Option<String>,
+    /// The source's catalog now, in the same order as the plan's.
+    pub catalog: Vec<(Id, String, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelocationConflict {
+    SourceChanged,
+    RootChanged,
+    FileChanged(Id),
+    Overlaps(String),
+}
+
+/// Commit applies only the reviewed plan: the source must be unchanged, the
+/// new root must still be the same volume, no verified file may have changed
+/// since its hash was checked, and the root must not overlap another source.
+pub fn relocation_commit(
+    plan: &RelocationPlan,
+    facts: &RelocationFacts,
+) -> Result<(), RelocationConflict> {
+    // A scan publishing in between changes revisions or availability without
+    // touching the source revision; the reviewed catalog must be unchanged.
+    if facts.revision != plan.expected_revision
+        || facts.binding_revision != plan.binding_revision
+        || facts.catalog != plan.catalog
+    {
+        return Err(RelocationConflict::SourceChanged);
+    }
+    if facts.root_identity.as_deref() != Some(plan.root_identity.as_str()) {
+        return Err(RelocationConflict::RootChanged);
+    }
+    if let Some(other) = &facts.overlapping_root {
+        return Err(RelocationConflict::Overlaps(other.clone()));
+    }
+    for (file, fingerprint) in &plan.verified {
+        if facts.fingerprints.get(file).and_then(|f| f.as_deref()) != Some(fingerprint.as_str()) {
+            return Err(RelocationConflict::FileChanged(file.clone()));
+        }
+    }
+    Ok(())
 }

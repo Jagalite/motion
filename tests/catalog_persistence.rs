@@ -622,3 +622,68 @@ async fn whole_timeline_split_matches_core_application() {
     assert_ne!(editions[1].1, "cut-a");
     assert_eq!(editions[1].1, editions[2].1);
 }
+
+#[tokio::test]
+async fn coverage_is_backfilled_for_demands_resolved_before_0022() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 21, None).await)
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO libraries (id,name,root,root_identity) VALUES ('lib','L','/m','1:2')",
+        "INSERT INTO catalog_libraries (id,name,kind) VALUES ('lib','L','mixed')",
+        "INSERT INTO jobs (id,library_id,phase,created_at,complete_directories,incomplete_directories,outcome) VALUES ('job','lib','completed',1,7,2,'partial')",
+        "INSERT INTO scan_requests VALUES ('req','lib',0,1)",
+        "INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status,job_id) VALUES ('d','req','lib',1,0,'partial','job')",
+    ] {
+        sqlx::query(sql).execute(&old).await.unwrap();
+    }
+    old.close().await;
+    let pool = db::connect(&path).await.unwrap();
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT complete_directories,incomplete_directories FROM scan_demands WHERE id='d'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (7, 2));
+}
+
+#[tokio::test]
+async fn restore_into_verifies_upgrades_and_refuses_existing_destinations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
+        .await
+        .unwrap();
+    legacy_fixture(&old).await;
+    old.close().await;
+    // Use the schema-9 database itself as the backup to restore.
+    let destination = dir.path().join("restored").join("motion.sqlite");
+    let receipt = db::restore_into(&path, &destination).await.unwrap();
+    assert_eq!(receipt.restored_from_version, 9);
+    assert!(receipt.schema_version > 9);
+    let pool = SqlitePool::connect(&format!("sqlite://{}", destination.display()))
+        .await
+        .unwrap();
+    let (titles, receipts): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM items),(SELECT count(*) FROM catalog_receipts WHERE kind='migration:restore')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((titles, receipts), (3, 1));
+    pool.close().await;
+    // A second restore into the same destination is refused.
+    assert!(db::restore_into(&path, &destination).await.is_err());
+    // A corrupt backup is refused before anything is written.
+    let corrupt = dir.path().join("corrupt.sqlite");
+    std::fs::write(&corrupt, b"not a database").unwrap();
+    assert!(
+        db::restore_into(&corrupt, &dir.path().join("other.sqlite"))
+            .await
+            .is_err()
+    );
+    assert!(!dir.path().join("other.sqlite").exists());
+}

@@ -445,3 +445,27 @@ fn exhausted_attempts_become_terminal_and_cannot_retry() {
         assert_eq!(transition(&failed, Input::Retry), (failed, vec![]));
     }
 }
+
+#[test]
+fn excluded_content_still_identifies_copies() {
+    use playscale_core::scan::reconcile_scoped;
+    let old = vec![Existing {
+        id: "hidden".into(),
+        edition: "e".into(),
+        path: "Extras/a.mkv".into(),
+        revision: "same".into(),
+    }];
+    let found = vec![Observed {
+        path: "a.mkv".into(),
+        revision: "same".into(),
+    }];
+    let (plan, excluded) = reconcile_scoped(&old, &found, &Coverage::Complete, &["Extras".into()]);
+    assert_eq!(excluded, ["hidden"]);
+    assert!(plan.unavailable.is_empty());
+    assert_eq!(
+        plan.assignments,
+        [Assignment::Copy {
+            edition: "e".into()
+        }]
+    );
+}
