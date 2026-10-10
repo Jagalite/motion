@@ -1,4 +1,5 @@
 {
+  "access_mode": "restricted",
   "listen": "127.0.0.1:8787",
   "public_origin": null,
   "libraries": []

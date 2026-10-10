@@ -155,10 +155,22 @@ pub async fn register_source(
     name: &str,
     exclusions: &[String],
 ) -> Result<SourceView, LibraryError> {
-    core::valid_name(name)?;
-    let exclusions = core::normalize_exclusions(exclusions)?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let view = register_source_in(&mut tx, candidate, name, exclusions).await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+/// Caller reserves the writer and reauthorizes before this effect; no commit here.
+pub(crate) async fn register_source_in(
+    tx: &mut SqliteConnection,
+    candidate: VerifiedRoot,
+    name: &str,
+    exclusions: &[String],
+) -> Result<SourceView, LibraryError> {
+    core::valid_name(name)?;
+    let exclusions = core::normalize_exclusions(exclusions)?;
     let roots: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries")
         .fetch_all(&mut *tx)
         .await?;
@@ -193,8 +205,7 @@ pub async fn register_source(
             id
         }
     };
-    tx.commit().await?;
-    get_source(&app.db, &id).await
+    source_in(tx, &id).await
 }
 
 /// Change a source's exclusions. The source must be idle so no running scan
@@ -240,7 +251,10 @@ async fn registered(conn: &mut SqliteConnection) -> anyhow::Result<BTreeSet<Stri
         .collect())
 }
 
-async fn library_view(conn: &mut SqliteConnection, id: &str) -> Result<LibraryView, LibraryError> {
+pub(crate) async fn library_view(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<LibraryView, LibraryError> {
     let (rev, name, kind, language): (i64, String, String, String) =
         sqlx::query_as("SELECT revision,name,kind,language FROM catalog_libraries WHERE id=?")
             .bind(id)
@@ -298,7 +312,21 @@ pub async fn save_library(
 ) -> Result<LibraryView, LibraryError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    core::validate_library(name, language, source_ids, &registered(&mut tx).await?)?;
+    let view = save_library_in(&mut tx, existing, name, kind, language, source_ids).await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+/// Caller reserves the writer and reauthorizes before this effect; no commit here.
+pub(crate) async fn save_library_in(
+    tx: &mut SqliteConnection,
+    existing: Option<(&str, u64)>,
+    name: &str,
+    kind: LibraryKind,
+    language: &str,
+    source_ids: &[String],
+) -> Result<LibraryView, LibraryError> {
+    core::validate_library(name, language, source_ids, &registered(tx).await?)?;
     let kind = enum_name(&kind)?;
     let id = match existing {
         None => {
@@ -343,8 +371,7 @@ pub async fn save_library(
             .execute(&mut *tx)
             .await?;
     }
-    let view = library_view(&mut tx, &id).await?;
-    tx.commit().await?;
+    let view = library_view(tx, &id).await?;
     Ok(view)
 }
 
@@ -369,6 +396,18 @@ pub async fn delete_library(
 ) -> Result<(), LibraryError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    delete_library_in(&mut tx, id, expected_revision).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `delete_library` inside the caller's writer transaction (caller holds
+/// `App.jobs` and commits).
+pub(crate) async fn delete_library_in(
+    tx: &mut SqliteConnection,
+    id: &str,
+    expected_revision: u64,
+) -> Result<(), LibraryError> {
     let current: i64 = sqlx::query_scalar("SELECT revision FROM catalog_libraries WHERE id=?")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -391,7 +430,6 @@ pub async fn delete_library(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -414,6 +452,18 @@ pub async fn delete_source(
 ) -> Result<SourceRemoval, LibraryError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let outcome = delete_source_in(&mut tx, id, expected_revision).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// `delete_source` inside the caller's writer transaction (caller holds
+/// `App.jobs` and commits).
+pub(crate) async fn delete_source_in(
+    tx: &mut SqliteConnection,
+    id: &str,
+    expected_revision: u64,
+) -> Result<SourceRemoval, LibraryError> {
     let current: i64 = sqlx::query_scalar("SELECT revision FROM sources WHERE id=?")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -461,7 +511,6 @@ pub async fn delete_source(
             .await?;
         SourceRemoval::Disabled
     };
-    tx.commit().await?;
     Ok(outcome)
 }
 
@@ -675,4 +724,15 @@ pub async fn commit_relocation(
     }
     tx.commit().await?;
     Ok(get_source(&app.db, &plan.source).await?)
+}
+
+pub(crate) async fn source_in(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<SourceView, LibraryError> {
+    let row: SourceRow = sqlx::query_as(&format!("SELECT {SOURCE_COLUMNS} WHERE id=?"))
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    source_view(conn, row).await
 }

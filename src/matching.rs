@@ -59,11 +59,11 @@ fn status_value(name: &str) -> anyhow::Result<Status> {
     ))?)
 }
 
-type Row = (String, i64, String, String, String, String, Option<String>);
+pub(crate) type Row = (String, i64, String, String, String, String, Option<String>);
 const COLUMNS: &str =
     "id,revision,file_id,file_revision,status,candidates_json,decision_json FROM match_proposals";
 
-fn decode(row: Row) -> anyhow::Result<Proposal> {
+pub(crate) fn decode(row: Row) -> anyhow::Result<Proposal> {
     let (id, revision, file_id, file_revision, status, candidates, decision) = row;
     Ok(Proposal {
         id,
@@ -182,25 +182,36 @@ async fn local_candidates(
 pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let proposal = propose_in_transaction(&mut tx, file_id).await?;
+    tx.commit().await?;
+    Ok(proposal)
+}
+
+/// `propose` inside the caller's writer transaction; the caller holds
+/// `App.jobs` and commits.
+pub(crate) async fn propose_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    file_id: &str,
+) -> Result<Proposal, MatchingError> {
     let (revision, path, item): (String, String, String) = sqlx::query_as(
         "SELECT revision,relative_path,item_id FROM catalog_files WHERE id=? AND generated=0",
     )
     .bind(file_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    let candidates = local_candidates(&mut tx, file_id, &path, &item).await?;
+    let candidates = local_candidates(tx, file_id, &path, &item).await?;
     // An open proposal for an older file revision becomes stale first.
     let open: Option<Row> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} WHERE file_id=? AND status IN ('pending','review','deferred')"
     ))
     .bind(file_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = open {
         let current = decode(row)?;
         if current.file_revision != revision {
             let stale = matching::refresh(&current, Some(&revision), current.candidates.clone())?;
-            store(&mut tx, &stale, false).await?;
+            store(tx, &stale, false).await?;
         }
     }
     let latest: Option<Row> = sqlx::query_as(&format!(
@@ -209,7 +220,7 @@ pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError
         "SELECT {COLUMNS} WHERE file_id=? ORDER BY status IN ('pending','review','deferred') DESC,rowid DESC LIMIT 1"
     ))
     .bind(file_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let latest = latest.map(decode).transpose()?;
     let proposal = match (
@@ -221,17 +232,16 @@ pub async fn propose(app: &App, file_id: &str) -> Result<Proposal, MatchingError
         (ProposalAction::Refresh, Some(current)) => {
             let next = matching::refresh(&current, Some(&revision), candidates)?;
             if next != current {
-                store(&mut tx, &next, false).await?;
+                store(tx, &next, false).await?;
             }
             next
         }
         _ => {
             let fresh = matching::propose(new_id(), file_id.into(), revision, candidates)?;
-            store(&mut tx, &fresh, true).await?;
+            store(tx, &fresh, true).await?;
             fresh
         }
     };
-    tx.commit().await?;
     Ok(proposal)
 }
 
@@ -251,15 +261,28 @@ pub async fn decide(
 ) -> Result<Decided, MatchingError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let decided = decide_in_transaction(&mut tx, id, expected_revision, decision).await?;
+    tx.commit().await?;
+    Ok(decided)
+}
+
+/// `decide` inside the caller's writer transaction; the caller holds
+/// `App.jobs` and commits.
+pub(crate) async fn decide_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    expected_revision: u64,
+    decision: Decision,
+) -> Result<Decided, MatchingError> {
     let row: Row = sqlx::query_as(&format!("SELECT {COLUMNS} WHERE id=?"))
         .bind(id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
     let proposal = decode(row)?;
     let current: Option<(String, String)> =
         sqlx::query_as("SELECT revision,item_id FROM catalog_files WHERE id=?")
             .bind(&proposal.file_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
     let (next, identification) = matching::decide(
         &proposal,
@@ -276,17 +299,17 @@ pub async fn decide(
                 "SELECT count(*) FROM media_versions v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE e.item_id=?",
             )
             .bind(&item)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             match matching::attachment(&item, target, usize::try_from(versions).unwrap_or(0)) {
                 Attachment::AlreadyIdentified => {}
                 Attachment::SplitRequired => return Err(MatchingError::SplitRequired),
                 Attachment::MergeWork => {
                     let plan =
-                        curation::plan_in_transaction(&mut tx, vec![item.clone()], target.clone())
+                        curation::plan_in_transaction(tx, vec![item.clone()], target.clone())
                             .await
                             .map_err(MatchingError::Curation)?;
-                    let receipt = curation::merge_in_transaction(&mut tx, &plan)
+                    let receipt = curation::merge_in_transaction(tx, &plan)
                         .await
                         .map_err(MatchingError::Curation)?;
                     merge_receipt = Some(receipt.id);
@@ -295,16 +318,15 @@ pub async fn decide(
             }
         }
         if let Some((namespace, value)) = &candidate.external_id {
-            identify(&mut tx, &item, namespace, value).await?;
+            identify(tx, &item, namespace, value).await?;
         }
         sqlx::query("UPDATE items SET match_state='manual' WHERE id=?")
             .bind(&item)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
     }
-    store(&mut tx, &next, false).await?;
-    crate::search::refresh(&mut tx, 100).await?;
-    tx.commit().await?;
+    store(tx, &next, false).await?;
+    crate::search::refresh(tx, 100).await?;
     Ok(Decided {
         proposal: next,
         item_id: item,

@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motion</title><link rel="stylesheet" href="chrome.css"></head>
+<body><header><h1>Motion</h1><form id="connect">
+<label>Server URL <input id="origin" type="url" required placeholder="https://your-server.your-tailnet.ts.net"></label>
+<label>Server ID <input id="server" required autocomplete="off"></label>
+<label>Device credential <input id="credential" type="password" autocomplete="off"></label>
+<label><input id="remember" type="checkbox"> Remember securely</label>
+<button type="submit">Connect</button><button id="disconnect" type="button">Disconnect</button>
+</form><button id="start-local" type="button">Start local server</button> <button id="stop-local" type="button">Stop local server</button> <button id="downloads" type="button">Open downloads offline</button><p id="status" role="status">Enter a server URL, its expected ID, and a paired device credential.</p></header>
+<main><p>Your library opens here after the server is verified.</p></main>
+<script src="chrome.js" defer></script></body></html>

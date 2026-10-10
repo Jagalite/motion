@@ -1,0 +1,664 @@
+{
+  "kind": "topcoat-electron-local-origin-smoke-proof",
+  "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
+  "wave": 0,
+  "passed": true,
+  "recorded_at": "2026-10-10T04:28:51.299Z",
+  "motion_commit": "de331b3d4bfef1fa047f6c161f441b1300c1af6a",
+  "worktree_dirty": true,
+  "environment": {
+    "electron": "44.7.0",
+    "chromium": "152.0.7977.130",
+    "node": "24.21.0",
+    "os": "darwin 25.5.0",
+    "arch": "arm64"
+  },
+  "topcoat": {
+    "version": "0.10.0",
+    "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
+    "features": "router, view, tower, discover (no runtime)"
+  },
+  "proof_server_sha256": "3c5d8a678252f2cab7e09c344919d1c66e21c22f253129b72ff8fe82f84f3254",
+  "proof_driver_sha256": "7700301380967c53b8743a9a615c5260040e14d41343302dfe3e981825aa2da1",
+  "proof_server_launch": {
+    "location": "host-temporary-directory",
+    "sha256": "3c5d8a678252f2cab7e09c344919d1c66e21c22f253129b72ff8fe82f84f3254",
+    "matches_build": true
+  },
+  "rust_toolchain": "1.98.0",
+  "origin": "single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media",
+  "demuxe": {
+    "name": "demuxe",
+    "version": "1.1.0",
+    "archive_sha256": "ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f",
+    "files_verified": 266,
+    "mismatched_files": []
+  },
+  "bfcache_restored": false,
+  "media": {
+    "generator": "ffmpeg lavfi testsrc2+sine, H.264 High/AAC-LC, 640x360@24, 12 s, faststart",
+    "sha256": "bf542c8af5cac2ca726dfdc033fb434a3511ff71b468de975850f9388adfcecf"
+  },
+  "results": {
+    "session_cookie_http_only": true,
+    "bootstrap_one_use": true,
+    "strict_csp_served": true,
+    "no_node_in_page": true,
+    "eval_blocked_by_csp": true,
+    "inline_script_blocked": true,
+    "player_ready": true,
+    "keyboard_skip_link_preserves_player": true,
+    "narrow_player_layout_and_labels": true,
+    "played_past_2_5s": true,
+    "seek_landed_and_continued": true,
+    "range_requests": true,
+    "every_delivery_retired": true,
+    "waited_for_starting_generation": true,
+    "active_delivery_lease_renewed": true,
+    "viewing_authority_admitted": true,
+    "ordered_viewing_progress": true,
+    "plays_after_back_navigation": true,
+    "command_form_creates_scan": true,
+    "if_match_conflict_surfaced": true,
+    "generation_replacement_activated": true,
+    "demuxe_bytes_match_install_receipt": true,
+    "no_permission_granted_beyond_fullscreen": true,
+    "screen_semantics_and_responsive_layout": true,
+    "reduced_motion_respected": true,
+    "concurrent_html_and_range_responses_preserved": true
+  },
+  "observations": {
+    "sessionExchangeStatus": 200,
+    "sessionCookie": [
+      {
+        "name": "motion_session",
+        "httpOnly": true,
+        "sameSite": "strict"
+      }
+    ],
+    "bootstrapReplay": {
+      "status": 401,
+      "code": "unauthenticated"
+    },
+    "pageCsp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'sha256-smNQpTGGdipSJJHMEztOmlzNusICCiQBd+JnOrZepKs='; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "nodeAvailable": false,
+    "crossOriginIsolated": true,
+    "evalBlocked": "EvalError",
+    "inlineScriptBlocked": true,
+    "playerHost": {
+      "state": "ready",
+      "text": ""
+    },
+    "skipLink": {
+      "focused": true,
+      "retained": true,
+      "players": 1
+    },
+    "narrowLayout": {
+      "width": 390,
+      "scrollWidth": 390,
+      "labelled": true
+    },
+    "playback": {
+      "played": true,
+      "before": 2.600014,
+      "afterSeek": 7.001456,
+      "seekElapsedMs": 49,
+      "landed": true,
+      "advancing": true,
+      "finalTime": 7.747019,
+      "mode": "native",
+      "duration": 12,
+      "audioTracks": 0,
+      "error": null,
+      "decodedFrames": null
+    },
+    "generationSwitch": {
+      "replaced": true,
+      "logicalTime": 5.005876,
+      "muted": true,
+      "players": 1
+    },
+    "homeTitle": "Home",
+    "afterBack": {
+      "state": "ready",
+      "players": 1,
+      "restoredFromBfcache": false
+    },
+    "afterBackPlayback": {
+      "advancing": true,
+      "start": 0.004373,
+      "now": 1.010747
+    },
+    "playbackProcessSnapshot": [
+      {
+        "pid": 17540,
+        "type": "Browser",
+        "cpu": {
+          "cumulativeCPUUsage": 0.856149,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 154832,
+          "peakWorkingSetSize": 160256
+        }
+      },
+      {
+        "pid": 17555,
+        "type": "GPU",
+        "cpu": {
+          "cumulativeCPUUsage": 0.900933,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 93552,
+          "peakWorkingSetSize": 94464
+        }
+      },
+      {
+        "pid": 17556,
+        "type": "Utility",
+        "cpu": {
+          "cumulativeCPUUsage": 0.236714,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 48880,
+          "peakWorkingSetSize": 56576
+        }
+      },
+      {
+        "pid": 17560,
+        "type": "Tab",
+        "cpu": {
+          "cumulativeCPUUsage": 0.866941,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 160304,
+          "peakWorkingSetSize": 160304
+        }
+      },
+      {
+        "pid": 17561,
+        "type": "Utility",
+        "cpu": {
+          "cumulativeCPUUsage": 0.172076,
+          "percentCPUUsage": 0,
+          "idleWakeupsPerSecond": 0
+        },
+        "memory": {
+          "workingSetSize": 40496,
+          "peakWorkingSetSize": 46000
+        }
+      }
+    ],
+    "afterScanTitle": "Sources and scans",
+    "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again.",
+    "screenMatrix": [
+      {
+        "path": "/",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/library/lib1",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/item/item2",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/search?q=sample",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/profiles",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/sources",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.sources-320.png",
+          "sha256": "65f00330f71eda3207088815ac6b44ecb0adcb10090ac8283b46c772278076b7"
+        },
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/matches",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/processing",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.processing-320.png",
+          "sha256": "28c77a29c7f0c7dc03acd082e119f054954552091c115d2bbd686e809c907952"
+        },
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/diagnostics",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/library/lib1",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/item/item2",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/search?q=sample",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/profiles",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/sources",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.sources-1280.png",
+          "sha256": "7f144d6ece051ede47c54a8b115aee61b269e385d7166512ad2db9804b935b03"
+        },
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/matches",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/processing",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "screenshot": {
+          "file": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-lQeJfq/observed.json.processing-1280.png",
+          "sha256": "5c7f1983e68b0af601d25b6f63d9339505312b7ec2a4d6f076862ecf787e4f54"
+        },
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/diagnostics",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      }
+    ],
+    "renderLoad": {
+      "requests": 24,
+      "htmlBytesMin": 1763,
+      "htmlBytesMax": 2934,
+      "simultaneousRangeRead": true,
+      "allSucceeded": true,
+      "elapsedMs": 26,
+      "p50Ms": 16,
+      "p95Ms": 24
+    }
+  },
+  "csp_console": [
+    "error: Executing inline script violates the following Content Security Policy directive 'script-src 'self' 'wasm-unsafe-eval''. Either the 'unsafe-inline' keyword, a hash ('sha256-3ESihh3MurRVVlneQHpXxx54JMAaWXY5YvlFn21oZjw='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked."
+  ],
+  "permission_requests": [],
+  "permission_checks": [
+    "background-sync"
+  ],
+  "navigation_blocked": [],
+  "commands": [
+    {
+      "body": {
+        "delivery_id": "del1",
+        "expected_viewing_revision": "0"
+      },
+      "operation": "createViewingSession",
+      "session": {
+        "delivery_id": "del1",
+        "id": "view1",
+        "manual_epoch": "0",
+        "position_ms": 0,
+        "profile_id": "everyone",
+        "revision": "1",
+        "sequence": "0",
+        "status": "paused",
+        "timeline_id": "tl2"
+      }
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "f58a4d3baf6f4da288c5e0981e80fcd0",
+        "position_ms": 0,
+        "sequence": "1",
+        "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "active_generation": "1"
+      },
+      "delivery": "del1",
+      "operation": "heartbeatDelivery"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "c30924d733cf4fa18804880728065218",
+        "position_ms": 0,
+        "sequence": "2",
+        "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "b91a7776d4d24e3dbc524a19ddd6ed52",
+        "position_ms": 5,
+        "sequence": "3",
+        "status": "playing"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "active_generation": "1"
+      },
+      "delivery": "del1",
+      "operation": "heartbeatDelivery"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "daae3aa3edf646a48bda8dfa42838ecc",
+        "position_ms": 7747,
+        "sequence": "4",
+        "status": "playing"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "expected_generation": "1",
+        "kind": "seek",
+        "position_ms": 5000
+      },
+      "delivery": "del1",
+      "operation": "changeDelivery"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "c98642bbbd414a1089f91f1533790f0e",
+        "position_ms": 7861,
+        "sequence": "5",
+        "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "expected_active_generation": "1"
+      },
+      "delivery": "del1",
+      "generation": "2",
+      "operation": "activateGeneration"
+    },
+    {
+      "body": {
+        "delivery_generation": "2",
+        "event_id": "792a4752621741aba632e1367e25dd41",
+        "position_ms": 5000,
+        "sequence": "6",
+        "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "delivery_generation": "2",
+        "event_id": "76e291659f884c81b2d8935b7c4a648e",
+        "position_ms": 5002,
+        "sequence": "7",
+        "status": "playing"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "delivery_generation": "2",
+        "event_id": "78bf0a5103e04803a883c81fb4dc3f04",
+        "position_ms": 5006,
+        "sequence": "8",
+        "status": "stopped"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "delivery_id": "del2",
+        "expected_viewing_revision": "0"
+      },
+      "operation": "createViewingSession",
+      "session": {
+        "delivery_id": "del2",
+        "id": "view2",
+        "manual_epoch": "0",
+        "position_ms": 0,
+        "profile_id": "everyone",
+        "revision": "1",
+        "sequence": "0",
+        "status": "paused",
+        "timeline_id": "tl2"
+      }
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "be869c8c75444fa88636150b0ee8885b",
+        "position_ms": 0,
+        "sequence": "1",
+        "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view2"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "60b8e76addee45b68dec34555c14df49",
+        "position_ms": 2,
+        "sequence": "2",
+        "status": "playing"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view2"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "70da2cc57fb3439c96ff080ac3e352b5",
+        "position_ms": 1011,
+        "sequence": "3",
+        "status": "stopped"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view2"
+    },
+    {
+      "body": {
+        "mode": "incremental",
+        "require_complete": false
+      },
+      "key": "a44ed4c78aa34f5b8a1c884aabaebed9",
+      "library": "lib1",
+      "operation": "createScan",
+      "replay": false
+    },
+    {
+      "body": {
+        "candidate_id": "mc1",
+        "decision": "accept"
+      },
+      "if_match": "\"r1\"",
+      "operation": "decideMatch",
+      "status": 200
+    },
+    {
+      "body": {
+        "candidate_id": "mc1",
+        "decision": "accept"
+      },
+      "if_match": "\"r1\"",
+      "operation": "decideMatch",
+      "status": 412
+    }
+  ],
+  "http": {
+    "requests": 228,
+    "deliveries_admitted": [
+      "del1",
+      "del2"
+    ],
+    "deliveries_closed": [
+      "del1",
+      "del2"
+    ]
+  },
+  "limitations": [
+    "Proof server uses a mock UiQueryFacade, mock session exchange and mock playback routes; it is not the Motion server.",
+    "Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.",
+    "Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.",
+    "Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.",
+    "Viewing authority and event replies use static mock fixtures; production authority conflicts and persistence require real-backend qualification.",
+    "Generation replacement is exercised against mock range media; real FFmpeg/HLS transport remains unqualified.",
+    "Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron."
+  ],
+  "visual_review": {
+    "screens": [
+      "sources at 320 and 1280 CSS pixels",
+      "processing at 320 CSS pixels"
+    ],
+    "result": "Readable wrapping, labelled fields and contained horizontal table scrolling; reviewed captured images. Physical assistive technology is not covered."
+  }
+}

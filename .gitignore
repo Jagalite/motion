@@ -22,3 +22,6 @@ admin-token
 /.npmrc
 /.netrc
 /.pypirc
+
+# Desktop host tooling
+node_modules/

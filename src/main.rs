@@ -1,5 +1,5 @@
 use clap::Parser;
-use playscale::{App, api, db, scan};
+use playscale::{App, db, scan};
 use std::{io::Write, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,16 @@ fn execute(work: impl std::future::Future<Output = anyhow::Result<()>>) -> anyho
 
 async fn run() -> anyhow::Result<()> {
     let cli = Args::parse();
+    if let Some(fd) = cli.ready_fd {
+        anyhow::ensure!(
+            fd > 2 && Some(fd) != cli.bootstrap_fd,
+            "readiness requires a distinct private descriptor"
+        );
+        anyhow::ensure!(
+            cli.bootstrap_fd.is_some(),
+            "native readiness requires protected bootstrap"
+        );
+    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let defaults =
         playscale::config::packaged_defaults(&std::env::current_exe()?, home.as_deref())?;
@@ -86,6 +96,10 @@ async fn run() -> anyhow::Result<()> {
         )
         .init();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let ingress = match &args.api.trusted_ingress {
+        Some(settings) => Some(playscale::v2::ingress_listener(&settings.socket)?),
+        None => None,
+    };
     let address = listener.local_addr()?;
     let origin = playscale::config::canonical_origin(
         &args
@@ -106,6 +120,9 @@ async fn run() -> anyhow::Result<()> {
         .join("web/generated/player/index.js")
         .is_file()
         .then_some(args.demuxe_dir.clone());
+    if cli.ready_fd.is_some() {
+        playscale::desktop::verify_player_assets(&args.demuxe_dir)?;
+    }
     let app = App {
         health: Arc::new(playscale::operations::Health::new(assets.is_some())),
         db,
@@ -126,14 +143,33 @@ async fn run() -> anyhow::Result<()> {
                 .join("generated"),
             args.processing,
         )),
+        access: Arc::new(
+            playscale::v2::Runtime::new(
+                args.access_mode,
+                playscale::v2::auth::load_or_create_key(&args.data_dir.join("credential-key"))?,
+            )
+            .with_settings(args.api.clone()),
+        ),
     };
+    if let Some(fd) = cli.bootstrap_fd {
+        app.access.set_bootstrap(&read_bootstrap(fd)?)?;
+    }
     playscale::processing::recover(&app).await?;
+    playscale::delivery::recover(&app).await?;
     if assets.is_none() {
         tracing::warn!(
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
         );
     }
-    let router = api::router(app.clone(), assets);
+    let router = if cli.topcoat {
+        playscale::api::router_with(
+            app.clone(),
+            assets,
+            Some(playscale::presentation::router(app.clone())),
+        )
+    } else {
+        playscale::api::router(app.clone(), assets)
+    };
     let shutdown = CancellationToken::new();
     app.health
         .worker_running
@@ -144,6 +180,7 @@ async fn run() -> anyhow::Result<()> {
         let result = tokio::try_join!(
             scan::worker(worker_app.clone(), worker_stop.clone()),
             playscale::processing::worker(worker_app.clone(), worker_stop.clone()),
+            playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
             playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
             playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
             playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
@@ -155,12 +192,43 @@ async fn run() -> anyhow::Result<()> {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         result
     });
+    if let Some(socket) = ingress {
+        // Identity headers are trusted only on this listener.
+        let router = router
+            .clone()
+            .layer(axum::Extension(playscale::v2::auth::TrustedIngress));
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(socket, router)
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+            {
+                tracing::error!(%error, "trusted ingress listener stopped");
+            }
+        });
+    }
     let stop_http = shutdown.clone();
     let mut http = tokio::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(stop_http.cancelled_owned())
             .await
     });
+    if let Some(fd) = cli.ready_fd {
+        let (server_id, _) = playscale::v2::system::server_identity(&app)
+            .await
+            .map_err(|_| anyhow::anyhow!("cannot read server identity"))?;
+        playscale::desktop::publish(
+            fd,
+            &playscale::desktop::Ready {
+                protocol: 1,
+                server_id,
+                server_epoch: app.access.server_epoch.clone(),
+                origin: origin.clone(),
+                version: env!("CARGO_PKG_VERSION"),
+                contract_digest: playscale::v2::system::contract_digest(),
+            },
+        )?;
+    }
     tracing::info!(%address, %origin, admin_token_file=%token_path.display(), "Playscale listening");
     println!(
         "Motion is running at {origin}\nAdmin token file: {}\nPress Ctrl+C to stop.",
@@ -201,6 +269,29 @@ async fn run() -> anyhow::Result<()> {
     app.db.close().await;
     drop(lock);
     outcome
+}
+
+/// Read the bootstrap secret from an inherited descriptor and close it.
+#[cfg(unix)]
+fn read_bootstrap(fd: i32) -> anyhow::Result<String> {
+    use std::{io::Read, os::fd::FromRawFd};
+    anyhow::ensure!(
+        fd > 2,
+        "bootstrap descriptor must not be stdin/stdout/stderr"
+    );
+    // SAFETY: the launcher passes this descriptor to us for exclusive use;
+    // it is consumed and closed here exactly once.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut secret = String::new();
+    Read::by_ref(&mut file)
+        .take(256)
+        .read_to_string(&mut secret)?;
+    Ok(secret.trim().to_owned())
+}
+
+#[cfg(not(unix))]
+fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
+    anyhow::bail!("bootstrap descriptors are supported on Unix only")
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {

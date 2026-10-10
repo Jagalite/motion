@@ -18,13 +18,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    process::Command,
-    sync::Semaphore,
-};
+use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
+
+mod progress;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -34,6 +32,14 @@ pub struct Settings {
     pub max_output_bytes: u64,
     pub retention_seconds: u64,
     pub timeout_seconds: u64,
+    /// Optional liveness limits; omitted preserves the total-timeout-only policy.
+    pub startup_timeout_seconds: Option<u64>,
+    pub no_progress_timeout_seconds: Option<u64>,
+    pub expected_duration: Option<playscale_core::execution_deadline::ExpectedDurationPolicy>,
+    /// Admit live stream-copy routes (remux, audio conversion). Implemented but
+    /// not qualified: source timestamp mapping and browser playback of copied
+    /// streams are unverified, so they stay off unless explicitly enabled.
+    pub experimental_copy_routes: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +49,10 @@ impl Default for Settings {
             max_output_bytes: 2 * 1024 * 1024 * 1024,
             retention_seconds: 30 * 86400,
             timeout_seconds: 7200,
+            startup_timeout_seconds: None,
+            no_progress_timeout_seconds: None,
+            expected_duration: None,
+            experimental_copy_routes: false,
         }
     }
 }
@@ -59,6 +69,22 @@ impl Settings {
                 && (1..=86400).contains(&self.timeout_seconds),
             "invalid processing retention/timeout"
         );
+        anyhow::ensure!(
+            self.expected_duration.is_none_or(|policy| policy.valid()),
+            "invalid expected-duration policy"
+        );
+        for value in [
+            self.startup_timeout_seconds,
+            self.no_progress_timeout_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            anyhow::ensure!(
+                (1..=86400).contains(&value),
+                "invalid processing liveness timeout"
+            );
+        }
         Ok(())
     }
 }
@@ -69,15 +95,30 @@ pub struct Runtime {
     pub io: Arc<Semaphore>,
     pub inspection: Arc<Semaphore>,
     pub maintenance: tokio::sync::Mutex<()>,
+    /// Shared encoder capacity; released only after confirmed worker termination.
+    pub execution: Arc<crate::execution::Coordinator>,
+    /// Hardware encoder sessions, accounted like CPU capacity.
+    pub hardware: Arc<crate::execution::Coordinator>,
+    /// Whether this machine can open a VideoToolbox encoder session (probed once).
+    pub videotoolbox: tokio::sync::OnceCell<bool>,
+    /// Executable that accepts `--internal-ffmpeg-supervisor`.
+    pub supervisor: PathBuf,
+    /// Live delivery sessions share the execution infrastructure.
+    pub deliveries: crate::delivery::Runtime,
 }
 impl Runtime {
     pub fn new(root: PathBuf, settings: Settings) -> Self {
         Self {
-            root,
             settings,
             io: Arc::new(Semaphore::new(1)),
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
+            execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
+            hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
+            videotoolbox: tokio::sync::OnceCell::new(),
+            supervisor: std::env::current_exe().unwrap_or_default(),
+            deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
+            root,
         }
     }
 }
@@ -332,7 +373,37 @@ pub async fn control(
     .await?;
     Ok(Json(load(&app, &id).await?))
 }
+/// Witness files under `root` still held by live executions. Fails rather than
+/// under-reporting: an unreadable directory or witness means ownership is unknown.
+pub fn held_witnesses(root: &FsPath) -> anyhow::Result<Vec<(PathBuf, crate::execution::Witness)>> {
+    if !root.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut held = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() == ".owner" {
+            let witness = crate::execution::Witness::open(entry.path())?;
+            if !witness.released() {
+                held.push((entry.path().to_owned(), witness));
+            }
+        }
+    }
+    Ok(held)
+}
 pub async fn recover(app: &App) -> anyhow::Result<()> {
+    // Encoders of a previous process that are still alive keep their capacity until
+    // they are gone; their attempt directories are left alone until then.
+    let root = app.processing.root.clone();
+    for (path, witness) in tokio::task::spawn_blocking(move || held_witnesses(&root)).await?? {
+        app.processing.execution.recovered(
+            format!("recovered:{}", path.display()),
+            playscale_core::work::Class::Preparation,
+            1,
+            witness,
+            || {},
+        );
+    }
     // A DB-only restore must not borrow another installation's disposable cache.
     sqlx::query("UPDATE media_files SET available=0 WHERE generated=1 AND library_id IN (SELECT id FROM libraries WHERE managed=1 AND root<>?)")
         .bind(app.processing.root.to_string_lossy().as_ref()).execute(&app.db).await?;
@@ -396,13 +467,16 @@ async fn command(
     app: &App,
     job: &ProcessingJob,
     stop: &CancellationToken,
+    lease: &crate::execution::Lease,
+    owner: &FsPath,
     cmd: &mut Command,
     progress: bool,
+    media_ms: u64,
 ) -> anyhow::Result<()> {
     // A separate supervisor watches this pipe. Even SIGKILL of the server closes
     // it, so an encoder cannot outlive its owner and overlap a recovered attempt.
     let command = cmd.as_std();
-    let mut supervisor = Command::new(std::env::current_exe()?);
+    let mut supervisor = Command::new(&app.processing.supervisor);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(command.get_program())
@@ -410,7 +484,16 @@ async fn command(
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped());
-    let mut child = supervisor.spawn()?;
+    // The encoder tree inherits the witness; capacity returns only once it is free.
+    let (witness, held) = crate::execution::Witness::create(owner)?;
+    #[cfg(unix)]
+    crate::execution::inherit(&mut supervisor, &[&held.0]);
+    // Register ownership before spawning: a failed witness open must never
+    // leave a live child whose lease can be released without termination proof.
+    lease.started(owner)?;
+    let child = supervisor.spawn();
+    drop(held);
+    let mut child = child?;
     let heartbeat = child.stdin.take();
     let mut stderr = child.stderr.take().context("missing encoder stderr")?;
     let diagnostics = tokio::spawn(async move {
@@ -427,12 +510,33 @@ async fn command(
         }
         String::from_utf8_lossy(&tail).into_owned()
     });
-    let stdout = child.stdout.take();
-    let mut lines =
-        BufReader::new(stdout.unwrap_or_else(|| unreachable!("command requires progress pipe")))
-            .lines();
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("missing encoder progress pipe")?;
+    let mut output_buffer = [0u8; 4096];
+    let mut decoder = progress::Decoder::default();
     let deadline = tokio::time::sleep(Duration::from_secs(app.processing.settings.timeout_seconds));
     tokio::pin!(deadline);
+    let started = tokio::time::Instant::now();
+    let mut liveness = playscale_core::execution_deadline::Deadline::new(
+        app.processing.settings.timeout_seconds * 1000,
+        app.processing
+            .settings
+            .startup_timeout_seconds
+            .map(|v| v * 1000),
+        app.processing
+            .settings
+            .no_progress_timeout_seconds
+            .map(|v| v * 1000),
+    )
+    .with_expected_duration(
+        app.processing
+            .settings
+            .expected_duration
+            .map(|p| p.budget_ms(media_ms)),
+    );
+    let elapsed = || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut output_open = true;
     let mut pending_progress = 0.0f64;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
@@ -440,17 +544,41 @@ async fn command(
         loop {tokio::select!{
             _=&mut deadline=>anyhow::bail!("processing timeout"),
             _=stop.cancelled()=>anyhow::bail!("server stopping"),
-            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");break;},
-            line=lines.next_line(),if output_open=>{if let Some(line)=line? {if let Some(v)=line.strip_prefix("out_time_us=").and_then(|s|s.parse::<f64>().ok()).filter(|v|v.is_finite()&&*v>=0.0){pending_progress=v/1_000_000.0;}}else{output_open=false;}},
-            _=poll.tick()=>{active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
+            _=lease.termination_requested().cancelled()=>anyhow::bail!("termination requested"),
+            status=child.wait()=>{anyhow::ensure!(status?.success(),"FFmpeg failed");if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } break;},
+            read=stdout.read(&mut output_buffer),if output_open=>{
+                let count = read?;
+                let observed = if count == 0 {
+                    output_open = false;
+                    decoder.finish()
+                } else {
+                    decoder.push(&output_buffer[..count])
+                };
+                if let Some(seconds) = observed {
+                    liveness.observe(elapsed(), (seconds * 1000.0) as u64);
+                    pending_progress = pending_progress.max(seconds);
+                }
+            },
+            _=poll.tick()=>{if let Some(reason) = liveness.expired(elapsed()) { anyhow::bail!("processing {reason:?} timeout"); } active(app,job,stop).await?;if progress{sqlx::query("UPDATE processing_jobs SET progress_seconds=max(progress_seconds,?),updated_at=? WHERE id=? AND attempt=? AND phase='running'").bind(pending_progress).bind(now()).bind(&job.id).bind(job.attempt).execute(&app.db).await?;}}
         }} Ok(())
     }.await;
     drop(heartbeat);
-    if result.is_err() {
-        // EOF asks the supervisor to kill and reap its child. Dropping this future
-        // also closes the pipe; deliberately do not kill the supervisor first.
-        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-    }
+    // On failure, EOF asks the supervisor to terminate the encoder's process group;
+    // deliberately do not kill the supervisor first. Either way capacity is released
+    // only after the supervisor exits and the witness is free; otherwise the
+    // reservation is held as stuck.
+    let confirmed = crate::execution::confirm_exit(
+        lease,
+        result.is_err().then_some(child),
+        Some(witness),
+        crate::execution::TERMINATION_DEADLINE,
+        || {},
+    )
+    .await;
+    let result = result.and_then(|()| {
+        anyhow::ensure!(confirmed, "encoder descendants outlived the supervisor");
+        Ok(())
+    });
     if result.is_err()
         && let Ok(Ok(stderr)) = tokio::time::timeout(Duration::from_secs(1), diagnostics).await
     {
@@ -463,6 +591,7 @@ async fn convert(
     job: &ProcessingJob,
     stop: &CancellationToken,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    lease: &crate::execution::Lease,
 ) -> anyhow::Result<(scan::Found, String)> {
     active(app, job, stop).await?;
     let source: db::ItemRow =
@@ -479,6 +608,11 @@ async fn convert(
             .bind(&source.library_id)
             .fetch_one(&app.db)
             .await?;
+    let duration = source
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("source duration unknown")?;
+    let media_ms = (duration * 1000.0).ceil() as u64;
     let directory = app.processing.root.join(job.relative());
     let stage = directory.clone();
     let cache = app.processing.root.clone();
@@ -618,7 +752,17 @@ async fn convert(
         .arg(app.processing.settings.max_output_bytes.to_string())
         .args(["-progress", "pipe:1", "-stats_period", "0.2", "-f", "mp4"])
         .arg(&output);
-    command(app, job, stop, &mut cmd, true).await?;
+    command(
+        app,
+        job,
+        stop,
+        lease,
+        &directory.join(".owner"),
+        &mut cmd,
+        true,
+        media_ms,
+    )
+    .await?;
     let found = scan::inspect(
         app.processing.root.clone(),
         job.relative().join("output.mp4"),
@@ -627,7 +771,6 @@ async fn convert(
         permit.clone(),
     )
     .await?;
-    let duration = source.duration_seconds.context("source duration unknown")?;
     let source_tracks: Vec<db::Track> = serde_json::from_str(&source.tracks_json)?;
     let observations = |tracks: &[db::Track]| {
         tracks
@@ -678,7 +821,17 @@ async fn convert(
             "null",
             "-",
         ]);
-    command(app, job, stop, &mut decode, false).await?;
+    command(
+        app,
+        job,
+        stop,
+        lease,
+        &directory.join(".owner"),
+        &mut decode,
+        false,
+        media_ms,
+    )
+    .await?;
     let (root, identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&source.library_id)
@@ -817,11 +970,82 @@ async fn finish(
     tx.commit().await?;
     Ok(())
 }
+/// Whether VideoToolbox can encode here: one tiny hardware-only encode, cached.
+/// macOS alone is not enough (virtual machines and some hosts lack sessions).
+pub async fn videotoolbox_available(app: &App) -> bool {
+    *app.processing
+        .videotoolbox
+        .get_or_init(|| async {
+            if !cfg!(target_os = "macos") {
+                return false;
+            }
+            let probe = Command::new(&app.processing.settings.ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:d=0.2",
+                    "-c:v",
+                    "h264_videotoolbox",
+                    "-allow_sw",
+                    "0",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status();
+            matches!(
+                tokio::time::timeout(Duration::from_secs(20), probe).await,
+                Ok(Ok(status)) if status.success()
+            )
+        })
+        .await
+}
+
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     loop {
         if stop.is_cancelled() {
             return Ok(());
         }
+        // Hold no capacity while idle: only reserve when work is queued.
+        let queued: Option<String> = sqlx::query_scalar(
+            "SELECT backend FROM processing_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
+        )
+        .fetch_optional(&app.db)
+        .await?;
+        let Some(next_backend) = queued else {
+            tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(500))=>{}}
+            continue;
+        };
+        // A hardware session is reserved before the I/O permit too, so waiting for
+        // one never blocks maintenance.
+        let reserve_hardware = || {
+            app.processing.hardware.reserve(
+                format!("processing-hw:{}", new_id()),
+                playscale_core::work::Class::Preparation,
+                1,
+            )
+        };
+        let mut hardware = None;
+        if next_backend == "videotoolbox" {
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
+        }
+        // Reserve encoder capacity before any I/O permit, so a stuck previous worker
+        // blocks replacement here without holding up maintenance.
+        let lease = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            lease = app.processing.execution.reserve(format!("processing:{}", new_id()), playscale_core::work::Class::Preparation, 1) => lease.map_err(|e| anyhow::anyhow!("encoder reservation rejected: {e:?}"))?,
+        };
         let permit = tokio::select! {_ = stop.cancelled()=>return Ok(()),p=app.processing.io.clone().acquire_owned()=>Arc::new(p?)};
         let job = {
             let _lock = app.jobs.lock().await;
@@ -843,10 +1067,20 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 None
             }
         };
+        if let Some(job) = job.as_ref().filter(|j| j.backend == "videotoolbox")
+            && hardware.is_none()
+        {
+            // The queue head changed since the peek; reserve now.
+            tracing::debug!(job_id=%job.id, "reserving hardware after selection");
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
+        }
         if let Some(job) = job {
             // Do not detach a blocked snapshot and start another job. The permit and this
             // waiter both remain until it finishes; cancellation is checked before FFmpeg.
-            let result = convert(&app, &job, &stop, permit.clone()).await;
+            let result = convert(&app, &job, &stop, permit.clone(), &lease).await;
             if stop.is_cancelled() {
                 return Ok(());
             }
@@ -854,7 +1088,18 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 tracing::warn!(job_id=%job.id,%error,"processing failed");
             }
             finish(&app, &job, result.ok()).await?;
-            if load(&app, &job.id).await?.phase != "completed" {
+            // A stuck encoder keeps its hardware session too, until its witness frees.
+            if lease.is_stuck()
+                && let Some(hardware) = &hardware
+            {
+                let owner = app.processing.root.join(job.relative()).join(".owner");
+                match crate::execution::Witness::open(&owner) {
+                    Ok(witness) => hardware.stuck(witness.wait()),
+                    Err(_) => hardware.stuck(std::future::pending()),
+                }
+            }
+            // A stuck attempt's directory holds its live witness: keep it for recovery.
+            if load(&app, &job.id).await?.phase != "completed" && !lease.is_stuck() {
                 let directory = app.processing.root.join(job.relative());
                 blocking(permit.clone(), move || {
                     if directory.exists() {
@@ -866,39 +1111,274 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             }
         }
         drop(permit);
+        drop(hardware);
+        drop(lease);
         tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
 }
 
 /// Private child entry point. No HTTP caller can supply executable arguments.
 pub fn supervise_encoder(args: impl Iterator<Item = std::ffi::OsString>) -> anyhow::Result<i32> {
-    use std::{
-        io::Read,
-        sync::atomic::{AtomicBool, Ordering},
-    };
     let mut args = args;
     let program = args.next().context("missing encoder")?;
-    let alive = Arc::new(AtomicBool::new(true));
-    let flag = alive.clone();
+    supervise(program, args.collect(), std::io::stdin(), SUPERVISOR_GRACE)
+}
+
+/// Time between asking an encoder's process group to stop and killing it.
+pub const SUPERVISOR_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `program` in its own process group and own that group until it is gone.
+/// EOF on `control` (the server closed the pipe or died) terminates the group:
+/// SIGTERM, then SIGKILL after `grace`. A natural exit also kills any remaining
+/// group members. The group is signalled only while the leader is an unreaped
+/// child, so its ID cannot have been reused by an unrelated process group.
+/// Descendants that create their own session or group escape this containment.
+pub fn supervise(
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+    control: impl std::io::Read + Send + 'static,
+    grace: Duration,
+) -> anyhow::Result<i32> {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // Control protocol: b'p' pauses the group, b'r' resumes it; EOF, an error or
+    // any other byte terminates it.
+    const RUN: u8 = 0;
+    const PAUSE: u8 = 1;
+    const STOP: u8 = 2;
+    let wanted = Arc::new(AtomicU8::new(RUN));
+    let flag = wanted.clone();
     std::thread::spawn(move || {
+        let mut control = control;
         let mut byte = [0u8; 1];
-        let _ = std::io::stdin().read(&mut byte);
-        flag.store(false, Ordering::SeqCst);
+        loop {
+            let next = match control.read(&mut byte) {
+                Ok(1) if byte[0] == b'p' => PAUSE,
+                Ok(1) if byte[0] == b'r' => RUN,
+                _ => STOP,
+            };
+            flag.store(next, Ordering::SeqCst);
+            if next == STOP {
+                return;
+            }
+        }
     });
-    let mut child = std::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .spawn()?;
+    let mut paused = false;
+    let mut command = std::process::Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if group::exited(&mut child)? {
+            group::signal(&mut child, group::Signal::Kill);
+            let status = child.wait()?;
+            group::wait_empty(&child);
             return Ok(status.code().unwrap_or(1));
         }
-        if !alive.load(Ordering::SeqCst) {
-            let _ = child.kill();
+        let wanted = wanted.load(Ordering::SeqCst);
+        if wanted != STOP && (wanted == PAUSE) != paused {
+            paused = wanted == PAUSE;
+            group::signal(
+                &mut child,
+                if paused {
+                    group::Signal::Pause
+                } else {
+                    group::Signal::Resume
+                },
+            );
+        }
+        if wanted == STOP {
+            // A stopped process acts on SIGTERM only after it is continued.
+            group::signal(&mut child, group::Signal::Resume);
+            group::signal(&mut child, group::Signal::Terminate);
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline && !group::exited(&mut child)? {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            group::signal(&mut child, group::Signal::Kill);
             let _ = child.wait();
+            group::wait_empty(&child);
             return Ok(1);
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+mod group {
+    pub enum Signal {
+        Terminate,
+        Kill,
+        Pause,
+        Resume,
+    }
+    /// Whether the child exited, without reaping it (its PID/PGID stay reserved).
+    #[cfg(unix)]
+    pub fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // macOS can report a stopped child here despite WEXITED alone; only an
+        // actual exit counts.
+        Ok(unsafe { info.si_pid() } != 0
+            && matches!(
+                info.si_code,
+                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+            ))
+    }
+    /// After the leader is reaped, wait (bounded) until no member of its group
+    /// remains. The group ID cannot be reused while any member exists, and only
+    /// the null signal is sent here, so a later reuse cannot be harmed. The
+    /// execution witness remains the server's authoritative evidence.
+    #[cfg(unix)]
+    pub fn wait_empty(child: &std::process::Child) {
+        let group = -(child.id() as libc::pid_t);
+        for _ in 0..400 {
+            if unsafe { libc::kill(group, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    #[cfg(not(unix))]
+    pub fn wait_empty(_: &std::process::Child) {}
+    #[cfg(unix)]
+    pub fn signal(child: &mut std::process::Child, signal: Signal) {
+        let signal = match signal {
+            Signal::Terminate => libc::SIGTERM,
+            Signal::Kill => libc::SIGKILL,
+            Signal::Pause => libc::SIGSTOP,
+            Signal::Resume => libc::SIGCONT,
+        };
+        // ESRCH (group already empty) is expected and ignored.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), signal);
+        }
+    }
+    // Without a Job Object adapter only the direct child is owned. It is killed
+    // through its handle, never by a possibly reused PID.
+    #[cfg(not(unix))]
+    pub fn exited(child: &mut std::process::Child) -> std::io::Result<bool> {
+        Ok(child.try_wait()?.is_some())
+    }
+    #[cfg(not(unix))]
+    pub fn signal(child: &mut std::process::Child, signal: Signal) {
+        // No pausing without a Job Object adapter; only termination is supported.
+        if matches!(signal, Signal::Terminate | Signal::Kill) {
+            let _ = child.kill();
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod supervisor_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+    fn wait_gone(pid: i32) -> bool {
+        (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            !alive(pid)
+        })
+    }
+    fn grandchild(dir: &FsPath) -> i32 {
+        let path = dir.join("pid");
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("grandchild did not start");
+    }
+
+    #[test]
+    fn control_eof_kills_whole_group_including_term_ignoring_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "trap '' TERM; (trap '' TERM; exec sleep 300) & echo $! > {}/pid; wait",
+            dir.path().display()
+        );
+        let (server, supervisor) = UnixStream::pair().unwrap();
+        let task = std::thread::spawn(move || {
+            supervise(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                supervisor,
+                Duration::from_millis(200),
+            )
+        });
+        let pid = grandchild(dir.path());
+        assert!(alive(pid));
+        drop(server);
+        assert_eq!(task.join().unwrap().unwrap(), 1);
+        assert!(wait_gone(pid), "descendant survived supervisor");
+    }
+
+    #[test]
+    fn pause_and_resume_the_group_then_terminate_while_paused() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = dir.path().join("ticks");
+        let script = format!(
+            "echo $$ > {}/pid; while :; do echo x >> {}; sleep 0.05; done",
+            dir.path().display(),
+            ticks.display()
+        );
+        let (mut server, supervisor) = UnixStream::pair().unwrap();
+        let task = std::thread::spawn(move || {
+            supervise(
+                "/bin/sh".into(),
+                vec!["-c".into(), script.into()],
+                supervisor,
+                Duration::from_millis(500),
+            )
+        });
+        let pid = grandchild(dir.path());
+        let size = || std::fs::metadata(&ticks).map_or(0, |m| m.len());
+        std::thread::sleep(Duration::from_millis(300));
+        server.write_all(b"p").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let paused = size();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(size(), paused, "group kept running while paused");
+        server.write_all(b"r").unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(size() > paused, "group did not resume");
+        server.write_all(b"p").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        drop(server);
+        assert_eq!(task.join().unwrap().unwrap(), 1);
+        assert!(wait_gone(pid));
+    }
+
+    #[test]
+    fn natural_exit_cleans_up_remaining_group_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!("sleep 300 & echo $! > {}/pid; exit 3", dir.path().display());
+        let (_server, supervisor) = UnixStream::pair().unwrap();
+        let code = supervise(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            supervisor,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+        assert!(wait_gone(grandchild(dir.path())));
     }
 }
 
@@ -971,6 +1451,10 @@ mod publication_tests {
                 Default::default(),
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
         };
         let output = || {
             Some((
@@ -1033,5 +1517,34 @@ mod publication_tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    #[test]
+    fn liveness_limits_are_opt_in_and_bounded() {
+        let default: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.startup_timeout_seconds, None);
+        assert_eq!(default.no_progress_timeout_seconds, None);
+        assert_eq!(default.expected_duration, None);
+        for (allowance, multiplier, valid) in [
+            (1, 1, true),
+            (86400, 100, true),
+            (0, 1, false),
+            (86401, 1, false),
+            (1, 0, false),
+            (1, 101, false),
+        ] {
+            let settings: super::Settings = serde_json::from_value(serde_json::json!({"expected_duration":{"allowance_seconds":allowance,"media_duration_multiplier":multiplier}})).unwrap();
+            assert_eq!(settings.validate().is_ok(), valid);
+        }
+        for field in ["startup_timeout_seconds", "no_progress_timeout_seconds"] {
+            for (value, valid) in [(0, false), (1, true), (86400, true), (86401, false)] {
+                let settings: super::Settings =
+                    serde_json::from_value(serde_json::json!({field: value})).unwrap();
+                assert_eq!(settings.validate().is_ok(), valid, "{field}={value}");
+            }
+        }
     }
 }

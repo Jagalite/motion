@@ -221,3 +221,29 @@ pub fn normalize_contribution(c: &Contribution) -> Result<Contribution, &'static
         excluded_tags: tags(&c.excluded_tags)?,
     })
 }
+
+/// The revision of an item's metadata resource, from its stored source
+/// revisions. Source revisions only increase, documents are never deleted, a
+/// merge only adds documents to the surviving work, and the scanned origin is
+/// immutable (counted as 1). The sum therefore strictly increases with every
+/// change to the item's metadata inputs and never repeats, so it is a sound
+/// precondition for the whole resource. `None` if it would overflow.
+pub fn item_revision(source_revisions: impl IntoIterator<Item = u64>) -> Option<u64> {
+    source_revisions
+        .into_iter()
+        .try_fold(1u64, |sum, revision| sum.checked_add(revision))
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::item_revision;
+    #[test]
+    fn item_revision_counts_origin_and_every_source_change() {
+        assert_eq!(item_revision([]), Some(1));
+        assert_eq!(item_revision([1]), Some(2));
+        // Advancing any one source advances the item.
+        assert_eq!(item_revision([1, 3]), Some(5));
+        assert_eq!(item_revision([2, 3]), Some(6));
+        assert_eq!(item_revision([u64::MAX]), None);
+    }
+}

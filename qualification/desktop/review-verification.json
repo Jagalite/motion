@@ -1,0 +1,27 @@
+{
+  "source_commit": "427663d99cc53577c534969738cc8813461804a1",
+  "source_sha256": {
+    "packages/playback/viewing.mjs": "8fdb43a58cfb3f3cad65fe8b49636938fbbb4407f76d64e4804a6fe49c6e6596",
+    "packages/ui-bridge/offline-player.js": "bb930f3ce38bbc2c36f5bc9fba2035453fa38df2235a93d19056543790a0f45d",
+    "crates/motion-ui-host/src/lib.rs": "2d1fad56e932e45336164fb93b95a5629b5fc0e8857da1be62e0a1134bdfdf5d"
+  },
+  "logs": {
+    "js": {
+      "path": "/tmp/a11-a12-review-js.log",
+      "sha256": "dbfba420dac47eb487d1487d54b9bf0fd7ad9517c1a371c700fac7a6bfde9364"
+    },
+    "rust": {
+      "path": "/tmp/a11-a12-review-rust.log",
+      "sha256": "4470e60872076f67c1b523cc71150871019a1748c8951d3bbd9dfaff0081e987"
+    },
+    "clippy": {
+      "path": "/tmp/a11-a12-review-clippy.log",
+      "sha256": "57ae96db26eb6ef0bc10a2814cb21316ba640dd730981e056ff2912d3fb1963e"
+    },
+    "offline": {
+      "path": "/tmp/a11-a12-review-offline.log",
+      "sha256": "604caaae7464633b5c92ffcfb18948a773e255a23ceaca1309b7d4567f887631"
+    }
+  },
+  "limits": "Focused final-source validation; historical broader receipts retain their original source identities. External integration and release gates remain open."
+}

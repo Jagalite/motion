@@ -1,6 +1,6 @@
 //! Catalog search over the rebuildable FTS5 projection. Document text and
 //! query syntax come from `playscale_core::search`; canonical rows mark works
-//! dirty (migration 0019) and `refresh` rebuilds their documents. Writers call
+//! dirty (migration 0021) and `refresh` rebuilds their documents. Writers call
 //! `refresh` inside their own transactions; maintenance drains the rest, and
 //! results report `stale` while any work awaits reindexing.
 use playscale_core::{

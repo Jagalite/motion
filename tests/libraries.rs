@@ -18,6 +18,10 @@ impl Fixture {
         let state = dir.path().join("state");
         std::fs::create_dir(&state).unwrap();
         let app = App {
+            access: Arc::new(playscale::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale::v2::auth::random_key(),
+            )),
             health: Arc::new(playscale::operations::Health::new(false)),
             db,
             admin_token: Arc::new("test-secret-token".into()),
@@ -193,7 +197,7 @@ async fn exclusions_narrow_scope_without_inferring_absence() {
 }
 
 #[tokio::test]
-async fn upgraded_roots_become_one_library_and_source_each() {
+async fn legacy_registration_creates_one_library_and_source_each() {
     let f = Fixture::new().await;
     let legacy = db::add_library(&f.app.db, "Legacy", &f.root("legacy"))
         .await
@@ -207,7 +211,8 @@ async fn upgraded_roots_become_one_library_and_source_each() {
         .unwrap();
     let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
     assert_eq!(library.source_ids, std::slice::from_ref(&v1.id));
-    assert!(libraries::get_library(&f.app.db, &legacy.id).await.is_err());
+    let paired = libraries::get_library(&f.app.db, &legacy.id).await.unwrap();
+    assert_eq!(paired.source_ids, std::slice::from_ref(&legacy.id));
     let sources = libraries::list_sources(&f.app.db).await.unwrap();
     assert_eq!(sources.len(), 2);
 }
@@ -444,4 +449,47 @@ async fn relocation_is_previewed_then_committed_against_unchanged_facts() {
         libraries::preview_relocation(&f.app, &source.id, candidate).await,
         Err(libraries::RelocationError::CandidateMismatch(_))
     ));
+}
+
+#[tokio::test]
+async fn pre_split_database_backfills_stable_logical_library_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let migrations = dir.path().join("migrations");
+    std::fs::create_dir(&migrations).unwrap();
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if name[..4].parse::<u32>().unwrap() <= 16 {
+            std::fs::copy(&path, migrations.join(name)).unwrap();
+        }
+    }
+    let path = dir.path().join("db.sqlite");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await
+        .unwrap()
+        .run(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO libraries(id,name,root,root_identity) VALUES ('old-source','Old library','/fixture/source','fixture-volume')").execute(&pool).await.unwrap();
+    pool.close().await;
+    let upgraded = db::connect(&path).await.unwrap();
+    let library = libraries::get_library(&upgraded, "old-source")
+        .await
+        .unwrap();
+    assert_eq!(library.source_ids, ["old-source"]);
+    assert_eq!(library.name, "Old library");
+    let source = libraries::get_source(&upgraded, "old-source")
+        .await
+        .unwrap();
+    assert_eq!(source.root_path, "/fixture/source");
+    assert_eq!(source.volume_identity, "fixture-volume");
 }

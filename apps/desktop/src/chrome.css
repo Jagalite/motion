@@ -1,0 +1,6 @@
+:root { color-scheme: dark; font: 14px system-ui, sans-serif; background: #151719; color: #eee; }
+body { margin: 0; } header { padding: 12px 20px; } h1 { margin: 0 0 12px; font-size: 22px; }
+form { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; } label { display: grid; gap: 4px; }
+label:has(input[type=checkbox]) { display: flex; align-items: center; } input, button { font: inherit; padding: 6px; }
+button { cursor: pointer; } :focus-visible { outline: 2px solid #8ec9ff; outline-offset: 2px; }
+main { padding: 25px; } #status { margin: 10px 0; } [role=alert] { color: #ffc6b8; }

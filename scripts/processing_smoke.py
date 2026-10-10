@@ -17,12 +17,26 @@ def main():
         wrapper.write_text('#!'+sys.executable+'\nimport os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\nwhile pathlib.Path('+repr(str(gate))+').exists(): time.sleep(.05)\nos.execv('+repr(ffmpeg)+',['+repr(ffmpeg)+']+__import__("sys").argv[1:])\n');wrapper.chmod(0o700)
         normal_wrapper=wrapper.read_text()
         port=free_port();state=root/'state';config=root/'config.json'
-        config.write_text(json.dumps({'listen':f'127.0.0.1:{port}','data_dir':str(state),'libraries':[str(media)],'processing':{'ffmpeg':str(wrapper),'cache_bytes':32*1024*1024,'max_output_bytes':4*1024*1024,'timeout_seconds':20,'retention_seconds':60}}))
+        config.write_text(json.dumps({'access_mode':'trusted_household','listen':f'127.0.0.1:{port}','data_dir':str(state),'libraries':[str(media)],'processing':{'ffmpeg':str(wrapper),'cache_bytes':32*1024*1024,'max_output_bytes':4*1024*1024,'timeout_seconds':20,'retention_seconds':60}}))
         log=(root/'log').open('wb'); process=None
         def boot(data=None):
             p=subprocess.Popen([str(BINARY),'--config',str(config)]+(['--data-dir',str(data)] if data else []),stdout=log,stderr=log)
-            wait_for(lambda:request(port,'GET','/ready')[0]==200)
-            return p
+            def ready():
+                assert p.poll() is None, ('server exited before readiness', p.returncode)
+                return request(port,'GET','/ready')[0]==200
+            try:
+                wait_for(ready)
+                return p
+            except BaseException:
+                # A failed boot must not leave an untracked server behind, and
+                # restore failures need diagnostics from the restored root.
+                if p.poll() is None:
+                    p.terminate()
+                    try: p.wait(timeout=5)
+                    except subprocess.TimeoutExpired: p.kill();p.wait()
+                diagnostic=(data or state)/'logs/server.log'
+                if diagnostic.exists(): print(diagnostic.read_text()[-4000:],file=sys.stderr)
+                raise
         try:
             process=boot();auth={'Authorization':'Bearer '+(state/'admin-token').read_text().strip()}
             def api(method,path,body=None,expected=200,protected=True):
@@ -51,6 +65,80 @@ def main():
             assert len(api('GET','/items')['items'])==1
             assert len(api('GET','/libraries'))==1
             checks.append('three_real_recipes_decode_idempotency_and_original_isolation')
+            # Both pipes can flood without a newline. Parsing/storage must stay
+            # bounded, and a partial progress line must not prevent cancellation.
+            flooded=root/'flood-drained'
+            flood_code=('chunk=b"x"*4096\n'
+                        'for _ in range(4096): os.write(1,chunk); os.write(2,chunk)\n'
+                        'if not pathlib.Path('+repr(str(gate))+').exists(): os.write(1,b"\\nout_time_us=1000000\\n")\n'
+                        'pathlib.Path('+repr(str(flooded))+').touch()\n')
+            wrapper.write_text(normal_wrapper.replace('while pathlib.Path(',flood_code+'while pathlib.Path(',1))
+            try:
+                job=submit();row=terminal(job)
+                assert flooded.exists() and row['phase']=='completed' and row['output_file_id'],row
+                checks.append('stdout_stderr_flood_recovers_into_real_encode')
+                flooded.unlink();gate.touch();job=submit()
+                wait_for(flooded.exists)
+                assert request(port,'GET','/ready')[0]==200
+                api('POST',f"/processing-jobs/{job['id']}/control",{'action':'cancel'})
+                row=terminal(job)
+                assert row['phase']=='cancelled' and row['output_file_id'] is None,row
+                checks.append('unterminated_stdout_flood_remains_cancellable')
+            finally:
+                gate.unlink(missing_ok=True)
+                wrapper.write_text(normal_wrapper)
+            # Explicit liveness settings distinguish never-started and stalled
+            # tools. Repeated valid progress and stderr noise must not renew them.
+            stop(process)
+            settings=json.loads(config.read_text())
+            settings['processing'].update(startup_timeout_seconds=5,no_progress_timeout_seconds=5)
+            config.write_text(json.dumps(settings));process=boot()
+            try:
+                for initial,reason in [('', 'Startup'),('os.write(1,b"out_time_us=1000000\\n")\n', 'NoProgress')]:
+                    reported='1000000' if initial else '0'
+                    wrapper.write_text('#!'+sys.executable+'\nimport os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\n'+initial+'while True:\n os.write(1,b"out_time_us='+reported+'\\n"); os.write(2,b"still alive\\n"); time.sleep(.05)\n')
+                    pidfile.unlink(missing_ok=True)
+                    server_log=state/'logs/server.log'
+                    log_offset=server_log.stat().st_size
+                    job=submit();wait_for(pidfile.exists);encoder_pid=int(pidfile.read_text())
+                    row=terminal(job)
+                    assert row['phase']=='failed' and row['output_file_id'] is None,row
+                    wait_for(lambda: ('processing '+reason+' timeout').encode() in server_log.read_bytes()[log_offset:],seconds=5)
+                    try: os.kill(encoder_pid,0)
+                    except ProcessLookupError: pass
+                    else: raise AssertionError('timed out encoder was not reaped')
+                    checks.append(reason.lower()+'_deadline_reaps_noisy_encoder_without_publication')
+                wrapper.write_text(normal_wrapper)
+                assert terminal(submit())['phase']=='completed'
+                checks.append('liveness_timeout_releases_capacity_after_reaping')
+            finally:
+                wrapper.write_text(normal_wrapper);stop(process)
+                settings['processing'].pop('startup_timeout_seconds');settings['processing'].pop('no_progress_timeout_seconds')
+                config.write_text(json.dumps(settings));process=boot()
+            # Advancing media time cannot extend a duration-derived wall-clock budget.
+            stop(process)
+            settings['processing']['expected_duration']={'allowance_seconds':2,'media_duration_multiplier':1}
+            config.write_text(json.dumps(settings));process=boot()
+            try:
+                wrapper.write_text('#!'+sys.executable+'\nimport os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\ni=0\nwhile True:\n i+=100000; os.write(1,("out_time_us="+str(i)+"\\n").encode()); time.sleep(.05)\n')
+                pidfile.unlink(missing_ok=True)
+                server_log=state/'logs/server.log';log_offset=server_log.stat().st_size
+                job=submit();wait_for(pidfile.exists);encoder_pid=int(pidfile.read_text())
+                row=terminal(job)
+                assert row['phase']=='failed' and row['output_file_id'] is None,row
+                assert row['progress_seconds'] > 0,row
+                wait_for(lambda: b'processing ExpectedDuration timeout' in server_log.read_bytes()[log_offset:],seconds=5)
+                try: os.kill(encoder_pid,0)
+                except ProcessLookupError: pass
+                else: raise AssertionError('duration-limited encoder was not reaped')
+                checks.append('expected_duration_deadline_reaps_advancing_encoder_without_publication')
+                wrapper.write_text(normal_wrapper)
+                assert terminal(submit())['phase']=='completed'
+                checks.append('expected_duration_timeout_releases_capacity_after_reaping')
+            finally:
+                wrapper.write_text(normal_wrapper);stop(process)
+                settings['processing'].pop('expected_duration')
+                config.write_text(json.dumps(settings));process=boot()
             hardware={'attempted':sys.platform=='darwin'}
             if sys.platform=='darwin':
                 row=terminal(submit(backend='videotoolbox'));hardware.update(phase=row['phase'],error=row['error']);
@@ -123,7 +211,10 @@ def main():
             spec=api('GET','/openapi.json');assert '/api/v1/events' in spec['paths'] and '/api/v1/processing-jobs' in spec['paths']
             print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware},indent=2))
         except BaseException:
-            log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr);raise
+            log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr)
+            server_log=state/'logs/server.log'
+            if server_log.exists(): print(server_log.read_text()[-8000:],file=sys.stderr)
+            raise
         finally:
             if process is not None and process.poll() is None:stop(process)
             log.close()

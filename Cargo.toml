@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/core"]
-default-members = [".", "crates/core"]
+members = [".", "crates/core", "crates/motion-ui", "crates/motion-ui-host"]
+default-members = [".", "crates/core", "crates/motion-ui", "crates/motion-ui-host"]
 exclude = ["research/framework-review"]
 resolver = "2"
 
@@ -12,11 +12,13 @@ name = "playscale"
 license = "MIT"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.98"
 publish = false
 
 [dependencies]
 playscale-core = { path = "crates/core" }
+motion-ui = { path = "crates/motion-ui" }
+tower = { version = "0.5", features = ["util"] }
 anyhow = "1"
 axum = "=0.8.9"
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +32,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = "0.12"
 walkdir = "2"
 cap-std = "3"
 mime_guess = "2"
@@ -43,6 +46,9 @@ futures-core = "0.3"
 fs2 = "0.4"
 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -17,6 +17,10 @@ impl Fixture {
         let state = dir.path().join("state");
         std::fs::create_dir(&state).unwrap();
         let app = App {
+            access: Arc::new(playscale::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale::v2::auth::random_key(),
+            )),
             health: Arc::new(playscale::operations::Health::new(false)),
             db,
             admin_token: Arc::new("test-secret-token".into()),

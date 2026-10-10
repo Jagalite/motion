@@ -26,6 +26,10 @@ async fn fixture() -> (tempfile::TempDir, App) {
             dir.path().join("cache"),
             Default::default(),
         )),
+        access: Arc::new(playscale::v2::Runtime::new(
+            playscale_core::access::AccessMode::TrustedHousehold,
+            playscale::v2::auth::random_key(),
+        )),
     };
     (dir, app)
 }
@@ -234,4 +238,32 @@ async fn search_pages_by_keyset_and_respects_library_scope() {
         .await
         .unwrap();
     assert_eq!(none.total, 0);
+}
+
+#[tokio::test]
+async fn replacing_an_origin_title_reindexes_the_work() {
+    let (_dir, app) = fixture().await;
+    work(
+        &app,
+        "w",
+        "Old Name",
+        json!({"values":{"title":"Shown"},"tags":[],"excluded_tags":[]}),
+    )
+    .await;
+    maintenance::refresh_search(&app).await.unwrap();
+    sqlx::query("UPDATE item_origins SET title='Renamed Origin' WHERE item_id='w'")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    assert!(
+        search::search(&app.db, "renamed", None, 10, None)
+            .await
+            .unwrap()
+            .stale
+    );
+    maintenance::refresh_search(&app).await.unwrap();
+    let page = search::search(&app.db, "renamed", None, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
 }

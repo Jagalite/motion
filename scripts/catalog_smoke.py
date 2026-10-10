@@ -24,7 +24,7 @@ def main():
         media.mkdir()
         subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=12', '-t', '1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(media / 'Episode.mp4')], check=True)
         port = free_port()
-        command = [str(BINARY), '--listen', f'127.0.0.1:{port}', '--data-dir', str(base / 'state'), '--library', str(media)]
+        command = [str(BINARY), '--access-mode','trusted_household','--listen', f'127.0.0.1:{port}', '--data-dir', str(base / 'state'), '--library', str(media)]
         with (base / 'server.log').open('wb') as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             try:

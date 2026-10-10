@@ -6,8 +6,11 @@ pub mod components;
 pub mod config;
 pub mod curation;
 pub mod db;
+pub mod delivery;
 pub mod encoding;
 pub mod events;
+pub mod execution;
+pub mod fmp4;
 pub mod interchange;
 pub mod libraries;
 pub mod maintenance;
@@ -26,6 +29,7 @@ pub mod scans;
 pub mod search;
 pub mod storage;
 pub mod upgrade;
+pub mod v2;
 pub mod viewing;
 
 use std::{path::PathBuf, sync::Arc};
@@ -45,6 +49,7 @@ pub struct App {
     pub event_streams: Arc<Semaphore>,
     pub processing: Arc<processing::Runtime>,
     pub storage: Arc<storage::Runtime>,
+    pub access: Arc<v2::Runtime>,
 }
 
 pub fn now() -> i64 {
@@ -57,3 +62,7 @@ pub fn now() -> i64 {
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+pub mod desktop;
+
+pub mod presentation;

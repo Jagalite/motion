@@ -88,10 +88,24 @@ pub async fn save_filter(
     name: &str,
     terms: Vec<Term>,
 ) -> Result<SavedFilter, OrgError> {
-    org::valid_name(name)?;
-    org::validate_filter(&terms)?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let saved = save_filter_in(&mut tx, profile, existing, name, terms).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// `save_filter` inside the caller's write transaction (the v2 adapter commits
+/// its idempotency record and authorization recheck in the same transaction).
+pub async fn save_filter_in(
+    conn: &mut SqliteConnection,
+    profile: &str,
+    existing: Option<(&str, u64)>,
+    name: &str,
+    terms: Vec<Term>,
+) -> Result<SavedFilter, OrgError> {
+    org::valid_name(name)?;
+    org::validate_filter(&terms)?;
     let json = serde_json::to_string(&terms)?;
     let (id, next) = match existing {
         None => {
@@ -101,7 +115,7 @@ pub async fn save_filter(
                 .bind(profile)
                 .bind(name.trim())
                 .bind(json)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id, 1)
         }
@@ -111,7 +125,7 @@ pub async fn save_filter(
             )
             .bind(id)
             .bind(profile)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
             let next = org::advance(revision(current)?, expected)?;
             sqlx::query("UPDATE saved_filters SET revision=?,name=?,terms_json=? WHERE id=?")
@@ -119,12 +133,11 @@ pub async fn save_filter(
                 .bind(name.trim())
                 .bind(json)
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id.to_string(), next)
         }
     };
-    tx.commit().await?;
     Ok(SavedFilter {
         id,
         revision: next,
@@ -132,6 +145,94 @@ pub async fn save_filter(
         name: name.trim().into(),
         all: terms,
     })
+}
+
+/// A filter by ID with its owning profile, for adapters that authorize the
+/// owner before disclosing it.
+pub async fn load_filter(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<SavedFilter>, OrgError> {
+    let row: Option<(i64, String, String, String)> =
+        sqlx::query_as("SELECT revision,profile_id,name,terms_json FROM saved_filters WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    row.map(|(revision_value, profile_id, name, terms)| {
+        Ok(SavedFilter {
+            id: id.into(),
+            revision: revision(revision_value)?,
+            profile_id,
+            name,
+            all: serde_json::from_str(&terms)?,
+        })
+    })
+    .transpose()
+}
+
+/// Revision-checked removal. A filter that defines a smart collection stays.
+pub async fn delete_filter_in(
+    conn: &mut SqliteConnection,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    let current: i64 = sqlx::query_scalar("SELECT revision FROM saved_filters WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM collections WHERE filter_id=?")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    org::removable(
+        revision(current)?,
+        expected,
+        usize::try_from(users).unwrap_or(usize::MAX),
+    )?;
+    sqlx::query("DELETE FROM saved_filters WHERE id=?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Revision-checked removal of a collection, playlist or queue (entries and
+/// members cascade).
+pub async fn delete_owned_in(
+    conn: &mut SqliteConnection,
+    table: Owned,
+    id: &str,
+    expected: u64,
+) -> Result<(), OrgError> {
+    let table = table.table();
+    let current: i64 = sqlx::query_scalar(&format!("SELECT revision FROM {table} WHERE id=?"))
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    org::removable(revision(current)?, expected, 0)?;
+    // Delete hints (queues name their profile) come from triggers (0029).
+    sqlx::query(&format!("DELETE FROM {table} WHERE id=?"))
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Profile-owned aggregates without dependants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owned {
+    Collection,
+    Playlist,
+    Queue,
+}
+impl Owned {
+    pub fn table(self) -> &'static str {
+        match self {
+            Self::Collection => "collections",
+            Self::Playlist => "playlists",
+            Self::Queue => "queues",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,16 +274,32 @@ pub async fn save_collection(
     item_ids: Vec<String>,
     filter_id: Option<String>,
 ) -> Result<Collection, OrgError> {
-    org::validate_collection(name, kind, &item_ids, filter_id.as_ref())?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    live_items(&mut tx, &item_ids).await?;
+    let saved =
+        save_collection_in(&mut tx, profile, existing, name, kind, item_ids, filter_id).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// `save_collection` inside the caller's write transaction.
+pub async fn save_collection_in(
+    conn: &mut SqliteConnection,
+    profile: &str,
+    existing: Option<(&str, u64)>,
+    name: &str,
+    kind: CollectionKind,
+    item_ids: Vec<String>,
+    filter_id: Option<String>,
+) -> Result<Collection, OrgError> {
+    org::validate_collection(name, kind, &item_ids, filter_id.as_ref())?;
+    live_items(&mut *conn, &item_ids).await?;
     if let Some(filter) = &filter_id {
         let own: i64 =
             sqlx::query_scalar("SELECT count(*) FROM saved_filters WHERE id=? AND profile_id=?")
                 .bind(filter)
                 .bind(profile)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *conn)
                 .await?;
         if own == 0 {
             return Err(OrgError::InvalidReference(filter.clone()));
@@ -201,7 +318,7 @@ pub async fn save_collection(
                 .bind(name.trim())
                 .bind(kind_name)
                 .bind(&filter_id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id, 1)
         }
@@ -210,7 +327,7 @@ pub async fn save_collection(
                 sqlx::query_scalar("SELECT revision FROM collections WHERE id=? AND profile_id=?")
                     .bind(id)
                     .bind(profile)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut *conn)
                     .await?;
             let next = org::advance(revision(current)?, expected)?;
             sqlx::query("UPDATE collections SET revision=?,name=?,kind=?,filter_id=? WHERE id=?")
@@ -219,11 +336,11 @@ pub async fn save_collection(
                 .bind(kind_name)
                 .bind(&filter_id)
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             sqlx::query("DELETE FROM collection_items WHERE collection_id=?")
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id.to_string(), next)
         }
@@ -232,10 +349,9 @@ pub async fn save_collection(
         sqlx::query("INSERT INTO collection_items VALUES (?,?)")
             .bind(&id)
             .bind(item)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
-    tx.commit().await?;
     Ok(Collection {
         id,
         revision: next,
@@ -245,6 +361,60 @@ pub async fn save_collection(
         item_ids,
         filter_id,
     })
+}
+
+/// Live members of a manual collection in deterministic `(title, id)` order;
+/// members merged into another work resolve to that work once.
+pub async fn manual_members(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Vec<String>, OrgError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT i.title,i.id FROM collection_items c LEFT JOIN item_aliases a ON a.alias_id=c.item_id JOIN items i ON i.id=coalesce(a.item_id,c.item_id) WHERE c.collection_id=? ORDER BY i.title,i.id",
+    )
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut seen = BTreeSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(_, id)| seen.insert(id.clone()))
+        .map(|(_, id)| id)
+        .collect())
+}
+
+/// A collection by ID with its owning profile and live manual members.
+pub async fn load_collection(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<Collection>, OrgError> {
+    let row: Option<(i64, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT revision,profile_id,name,kind,filter_id FROM collections WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((revision_value, profile_id, name, kind, filter_id)) = row else {
+        return Ok(None);
+    };
+    let kind = if kind == "manual" {
+        CollectionKind::Manual
+    } else {
+        CollectionKind::Smart
+    };
+    let item_ids = match kind {
+        CollectionKind::Manual => manual_members(conn, id).await?,
+        CollectionKind::Smart => Vec::new(),
+    };
+    Ok(Some(Collection {
+        id: id.into(),
+        revision: revision(revision_value)?,
+        profile_id,
+        name,
+        kind,
+        item_ids,
+        filter_id,
+    }))
 }
 
 /// Facts a filter may observe, from effective metadata and the profile's
@@ -299,21 +469,9 @@ pub async fn members(db: &SqlitePool, profile: &str, id: &str) -> Result<Vec<Str
             .bind(profile)
             .fetch_one(db)
             .await?;
-    let ordered = |rows: Vec<(String, String)>| {
-        let mut seen = BTreeSet::new();
-        rows.into_iter()
-            .filter(|(_, id)| seen.insert(id.clone()))
-            .map(|(_, id)| id)
-            .collect::<Vec<_>>()
-    };
     if kind == "manual" {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT i.title,i.id FROM collection_items c LEFT JOIN item_aliases a ON a.alias_id=c.item_id JOIN items i ON i.id=coalesce(a.item_id,c.item_id) WHERE c.collection_id=? ORDER BY i.title,i.id",
-        )
-        .bind(id)
-        .fetch_all(db)
-        .await?;
-        return Ok(ordered(rows));
+        let mut conn = db.acquire().await?;
+        return manual_members(&mut conn, id).await;
     }
     let filter = get_filter(db, profile, filter.as_deref().unwrap_or_default()).await?;
     let candidates: Vec<(String, String)> = sqlx::query_as(
@@ -414,11 +572,24 @@ pub async fn save_playlist(
     name: &str,
     entries: Vec<Entry>,
 ) -> Result<Playlist, OrgError> {
-    org::valid_name(name)?;
-    org::validate_entries(&entries)?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    valid_timelines(&mut tx, &entries).await?;
+    let saved = save_playlist_in(&mut tx, profile, existing, name, entries).await?;
+    tx.commit().await?;
+    Ok(saved)
+}
+
+/// `save_playlist` inside the caller's write transaction.
+pub async fn save_playlist_in(
+    conn: &mut SqliteConnection,
+    profile: &str,
+    existing: Option<(&str, u64)>,
+    name: &str,
+    entries: Vec<Entry>,
+) -> Result<Playlist, OrgError> {
+    org::valid_name(name)?;
+    org::validate_entries(&entries)?;
+    valid_timelines(&mut *conn, &entries).await?;
     let (id, next) = match existing {
         None => {
             let id = new_id();
@@ -426,7 +597,7 @@ pub async fn save_playlist(
                 .bind(&id)
                 .bind(profile)
                 .bind(name.trim())
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id, 1)
         }
@@ -435,20 +606,19 @@ pub async fn save_playlist(
                 sqlx::query_scalar("SELECT revision FROM playlists WHERE id=? AND profile_id=?")
                     .bind(id)
                     .bind(profile)
-                    .fetch_one(&mut *tx)
+                    .fetch_one(&mut *conn)
                     .await?;
             let next = org::advance(revision(current)?, expected)?;
             sqlx::query("UPDATE playlists SET revision=?,name=? WHERE id=?")
                 .bind(stored(next)?)
                 .bind(name.trim())
                 .bind(id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             (id.to_string(), next)
         }
     };
-    store_entries(&mut tx, "playlist_entries", &id, &entries).await?;
-    tx.commit().await?;
+    store_entries(&mut *conn, "playlist_entries", &id, &entries).await?;
     Ok(Playlist {
         id,
         revision: next,
@@ -456,6 +626,28 @@ pub async fn save_playlist(
         name: name.trim().into(),
         entries,
     })
+}
+
+/// A playlist by ID with its owning profile and ordered entries.
+pub async fn load_playlist(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<Playlist>, OrgError> {
+    let row: Option<(i64, String, String)> =
+        sqlx::query_as("SELECT revision,profile_id,name FROM playlists WHERE id=?")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((revision_value, profile_id, name)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(Playlist {
+        id: id.into(),
+        revision: revision(revision_value)?,
+        profile_id,
+        name,
+        entries: load_entries(conn, "playlist_entries", id).await?,
+    }))
 }
 
 fn repeat_name(repeat: Repeat) -> &'static str {
@@ -505,6 +697,24 @@ async fn store_queue(conn: &mut SqliteConnection, id: &str, queue: &Queue) -> Re
     Ok(())
 }
 
+/// The owning profile and state of a queue, read in the caller's transaction.
+pub async fn load_queue_by_id(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<(String, Queue)>, OrgError> {
+    let profile: Option<String> = sqlx::query_scalar("SELECT profile_id FROM queues WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    match profile {
+        None => Ok(None),
+        Some(profile) => {
+            let queue = load_queue(conn, &profile, id).await?;
+            Ok(Some((profile, queue)))
+        }
+    }
+}
+
 /// Header and entries come from one read snapshot so `current` is always a
 /// member of the returned entries.
 pub async fn get_queue(db: &SqlitePool, profile: &str, id: &str) -> Result<Queue, OrgError> {
@@ -521,10 +731,23 @@ pub async fn create_queue(
     repeat: Repeat,
     shuffle_seed: Option<u64>,
 ) -> Result<(String, Queue), OrgError> {
-    org::validate_entries(&entries)?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    valid_timelines(&mut tx, &entries).await?;
+    let created = create_queue_in(&mut tx, profile, entries, repeat, shuffle_seed).await?;
+    tx.commit().await?;
+    Ok(created)
+}
+
+/// `create_queue` inside the caller's write transaction.
+pub async fn create_queue_in(
+    conn: &mut SqliteConnection,
+    profile: &str,
+    entries: Vec<Entry>,
+    repeat: Repeat,
+    shuffle_seed: Option<u64>,
+) -> Result<(String, Queue), OrgError> {
+    org::validate_entries(&entries)?;
+    valid_timelines(&mut *conn, &entries).await?;
     let id = new_id();
     let queue = Queue {
         revision: 1,
@@ -538,10 +761,9 @@ pub async fn create_queue(
         .bind(profile)
         .bind(repeat_name(repeat))
         .bind(shuffle_seed.map(|s| s.to_string()))
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    store_entries(&mut tx, "queue_entries", &id, &queue.entries).await?;
-    tx.commit().await?;
+    store_entries(&mut *conn, "queue_entries", &id, &queue.entries).await?;
     Ok((id, queue))
 }
 
@@ -565,7 +787,20 @@ pub async fn change_queue(
 ) -> Result<Queue, OrgError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let current = load_queue(&mut tx, profile, id).await?;
+    let next = change_queue_in(&mut tx, profile, id, expected_revision, change).await?;
+    tx.commit().await?;
+    Ok(next)
+}
+
+/// `change_queue` inside the caller's write transaction.
+pub async fn change_queue_in(
+    conn: &mut SqliteConnection,
+    profile: &str,
+    id: &str,
+    expected_revision: u64,
+    change: QueueChange,
+) -> Result<Queue, OrgError> {
+    let current = load_queue(&mut *conn, profile, id).await?;
     let next = match change {
         QueueChange::Step(step) => org::advance_queue(&current, expected_revision, step)?,
         QueueChange::Select(entry) => org::select(&current, expected_revision, &entry)?,
@@ -574,14 +809,13 @@ pub async fn change_queue(
             repeat,
             shuffle_seed,
         } => {
-            valid_timelines(&mut tx, &entries).await?;
+            valid_timelines(&mut *conn, &entries).await?;
             let next = org::edit_queue(&current, expected_revision, entries, repeat, shuffle_seed)?;
-            store_entries(&mut tx, "queue_entries", id, &next.entries).await?;
+            store_entries(&mut *conn, "queue_entries", id, &next.entries).await?;
             next
         }
     };
-    store_queue(&mut tx, id, &next).await?;
-    tx.commit().await?;
+    store_queue(&mut *conn, id, &next).await?;
     Ok(next)
 }
 

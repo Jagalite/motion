@@ -611,3 +611,25 @@ by default), after terminal cache cleanup. A key whose record has been pruned is
 new request. Current viewing state and its authoritative session are preserved;
 older pruned session IDs return 404. Clients should retain their own long-term
 request audit history if needed.
+
+
+## Experimental live delivery admission
+
+`POST /api/v1/deliveries` accepts an optional `Idempotency-Key` header of 16–128
+bytes. Clients retrying admission must retain the key and the same file revision,
+start position and audio selection. Exact retries replay the original `201`
+acknowledgement; different content with the same key returns `409
+idempotency_conflict`. The legacy endpoint has one admin principal. Requests
+without a key retain the original create-a-new-delivery behavior.
+
+The initial delivery state and receipt commit atomically before encoder dispatch.
+Losing the HTTP waiter does not cancel an admission already in progress. Replaying
+a closed, interrupted or retired delivery returns its saved acknowledgement and
+never starts another encoder. Fetch the delivery to learn its current state.
+Receipts currently remain durable without automatic expiry; diagnostic-record
+retention does not remove them.
+
+The internal `delivery::AdmissionAuthority` port rechecks current permission and
+source visibility within the admission transaction, including on replay. A08's
+v2 adapter must implement that authority and bind the authenticated plan contract;
+this experimental v1 endpoint does not provide v2 plan tokens.

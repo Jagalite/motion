@@ -1,0 +1,86 @@
+{
+  "recorded_at": "2026-10-10T04:37:27.049665+00:00",
+  "implementation_commit": "a1531494e6ae1d46c6b85eef6a8c9e47f53d54b6",
+  "status": "available implementation checks passed across full run and final affected reruns; external acceptance gates remain",
+  "runs": {
+    "workspace": {
+      "log": "/tmp/motion-a11-a12-workspace.log",
+      "sha256": "1654fd740a4670e11e50fb28c5b44181bf9b656e7e632817f5be292702916d58",
+      "passed": 289,
+      "failed": 1,
+      "ignored": 0,
+      "status": "completed; original catalog setup race and stale-dependency doctest failure resolved by final targeted reruns"
+    },
+    "access_final": {
+      "log": "/tmp/motion-a11-a12-access-final.log",
+      "sha256": "e3531c66fe7a45da91e84f19dcd63a17b87f0f39a35fff5465296d19682e84d2",
+      "passed": 32,
+      "failed": 0,
+      "ignored": 0
+    },
+    "persistence_final": {
+      "log": "/tmp/motion-a11-a12-persistence.log",
+      "sha256": "f630ac9c3c815f129ff929269f04717ac5b19bd1afff874a795f930236af95e8",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    "offline_host_final": {
+      "log": "/tmp/motion-a11-a12-host-final.log",
+      "sha256": "d34aff1bb96c73765c9458811157833fd27371c735b8f0d805ccc7498f4744a7",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    "snapshot_final": {
+      "log": "/tmp/motion-a11-a12-snapshot.log",
+      "sha256": "c1ef9735ab5fb5babaeb4e7d14234a744f937a62bc469021ff361b3b30fc0769",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "doctests_final": {
+      "log": "/tmp/motion-a11-a12-doc-final.log",
+      "sha256": "b8fc83e9341a30a218b5ee6a0abdc55bb2aa3e393844f3e8b98c898639f627e5",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "clippy_final": {
+      "log": "/tmp/motion-a11-a12-clippy-final.log",
+      "sha256": "ef569545a211148a8326b31d0e921c4c86dfc0da45bd32b20ef3f43f724a558c",
+      "status": "passed with -D warnings; workspace all targets"
+    },
+    "javascript_final": {
+      "log": "/tmp/motion-a11-a12-js.log",
+      "sha256": "0548024d6aa5f1ea6f2782a89f563db606917517029fde3bbedcd07399167867",
+      "passed": 59,
+      "failed": 0
+    }
+  },
+  "source_sha256": {
+    "Cargo.lock": "c58370e9c862598e2fb368e6110ea88ce137495f4c3b942988031141a9612a5f",
+    "crates/core/src/offline.rs": "d3374bc7d66c707a07abfd4a82fbe5021571fc2b6064a121d1685ba26a7552b8",
+    "crates/core/tests/offline_model.rs": "351e092a53281b063c51fba137da6e03631eda067187c7f7537c08f263ac5314",
+    "crates/motion-ui/src/lib.rs": "097a63e588d90d97c0d7a7d949a9b457a14c607c9cf6dde2ee9bb1ec11dd621c",
+    "crates/motion-ui/src/app.rs": "d0123f3d370d1f3caaa764757e933cb53cdab2b005d2de7134263bc14c03f8e6",
+    "crates/motion-ui/src/screens.rs": "477ed9851a9cc4fbfa9f89655df4edba4d6f280422970de0ebffafa9e788df87",
+    "crates/motion-ui-host/src/lib.rs": "879ee9453a98995ff0f5062f539bd0ce0467c69196cdf8d2c79133dd4b9d9ca4",
+    "crates/motion-ui-host/src/main.rs": "b128d6d5314f6fcd05aaf9c727121fca2c260b899560ccf1b27dc2295a0c4dc2",
+    "src/presentation.rs": "274ac5dbf0f3dbbbb512a078f6f2ca3df5aba4b5390a69124dc6469d380680d6",
+    "src/api.rs": "78e7f1d6b6e5096a4f23333bf2aacc461d151b04605e1d7efe28142786af9cf1",
+    "apps/desktop/proof/main.mjs": "7700301380967c53b8743a9a615c5260040e14d41343302dfe3e981825aa2da1",
+    "tests/catalog_persistence.rs": "88fe01d0458cf1f896d2b4647eb1e8e89fc087115067bb2d26124c677cede3ba"
+  },
+  "native_receipts": {
+    "topcoat-electron-proof-darwin-arm64.json": true,
+    "native-shell-darwin-arm64.json": true,
+    "offline-cold-start.json": true,
+    "owned-server.json": true
+  },
+  "limitations": [
+    "No clean single final-source workspace invocation is claimed; long-run compiled tests were followed by affected final-source reruns.",
+    "Production viewing/delivery/scan routes and A13 reconciliation are not qualified by mocks.",
+    "Native results cover unpackaged macOS arm64 only; physical accessibility/A/V and A14 release gates remain."
+  ]
+}

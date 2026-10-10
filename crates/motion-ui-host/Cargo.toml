@@ -1,0 +1,31 @@
+[package]
+name = "motion-ui-host"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+description = "Presentation-only offline cache host; no authoritative server or database"
+
+[dependencies]
+motion-ui = { path = "../motion-ui" }
+playscale-core = { path = "../core" }
+anyhow = "1"
+axum = "=0.8.9"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "=0.7.1", features = ["fs"] }
+topcoat = { git = "https://github.com/tokio-rs/topcoat", rev = "341f3ff2fe16a73af5469685cf597693af5acb25", default-features = false, features = ["router", "view", "tower", "discover"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+cap-std = "3"
+fs2 = "0.4"
+futures-util = "0.3"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+mime_guess = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -28,6 +28,10 @@ fn app(dir: &Path, db: SqlitePool) -> App {
             dir.join("cache"),
             Default::default(),
         )),
+        access: Arc::new(playscale::v2::Runtime::new(
+            playscale_core::access::AccessMode::TrustedHousehold,
+            playscale::v2::auth::random_key(),
+        )),
     }
 }
 
@@ -520,7 +524,7 @@ async fn split_sql_matches_core_application_and_replay_is_rejected() {
 async fn concurrent_commits_over_one_target_apply_exactly_once() {
     let (_dir, app) = catalog_fixture().await;
     let before = snapshot(&app.db, &["film", "dup", "single"]).await;
-    let mut tasks = Vec::new();
+    let mut plans = Vec::new();
     for source in ["dup", "single"] {
         let plan = curation::preview_merge(
             &app.db,
@@ -535,16 +539,42 @@ async fn concurrent_commits_over_one_target_apply_exactly_once() {
         )
         .await
         .unwrap();
-        let app = app.clone();
-        tasks.push(tokio::spawn(async move {
-            curation::commit_merge(&app, &plan).await.is_ok()
-        }));
+        plans.push(plan);
     }
+    // Both previews must observe the same revision before either writer starts.
+    // Otherwise the first task can finish while the second preview is reading.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(plans.len()));
+    let tasks: Vec<_> = plans
+        .into_iter()
+        .map(|plan| {
+            let app = app.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                curation::commit_merge(&app, &plan).await
+            })
+        })
+        .collect();
     let mut outcomes = Vec::new();
     for task in tasks {
         outcomes.push(task.await.unwrap());
     }
-    assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(|error| matches!(
+                error,
+                curation::CurationError::Rejected(IdentityError::StaleRevision(_))
+            )),
+        "losing writer must be fenced by revision: {outcomes:?}"
+    );
+    assert_consistent(&app.db).await;
 }
 
 #[tokio::test]
@@ -594,10 +624,10 @@ async fn whole_timeline_split_matches_core_application() {
 }
 
 #[tokio::test]
-async fn coverage_is_backfilled_for_demands_resolved_before_0020() {
+async fn coverage_is_backfilled_for_demands_resolved_before_0022() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("db.sqlite");
-    let old = db::connect_with(&path, &migrator(dir.path(), 19, None).await)
+    let old = db::connect_with(&path, &migrator(dir.path(), 21, None).await)
         .await
         .unwrap();
     for sql in [
