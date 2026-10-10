@@ -80,9 +80,16 @@ pub static PLAYER: Asset = Asset::new(
     .as_bytes(),
 );
 
+pub static OFFLINE_PLAYER: Asset = Asset::new(
+    "offline-player",
+    "js",
+    "text/javascript; charset=utf-8",
+    include_bytes!("../../../packages/ui-bridge/offline-player.js"),
+);
+
 /// Every embedded asset, for routing and the release inventory.
-pub fn all() -> [&'static Asset; 3] {
-    [&STYLESHEET, &BRIDGE, &PLAYER]
+pub fn all() -> [&'static Asset; 4] {
+    [&STYLESHEET, &BRIDGE, &PLAYER, &OFFLINE_PLAYER]
 }
 
 /// Resolve a request under `/ui/` to an embedded asset by exact hashed name.

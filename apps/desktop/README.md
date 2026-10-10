@@ -14,8 +14,8 @@ extend playback leases. Explicit connection changes clear the old browser state.
 
 Remembered credentials use Electron safeStorage and a private file. Plaintext
 fallback is rejected. The shell smoke includes pending-progress encryption through the OS storage API;
-the latest run timed out before exercising it.
-unit tests separately exercise identity isolation and failure handling.
+the current smoke passes that check.
+Unit tests separately exercise identity isolation and failure handling.
 Closing the window or disconnecting requests a bounded player teardown and leaves
 the independently managed server running. The trusted Start local server action launches the configured server with separate
 inherited bootstrap and readiness pipes. The server owns its existing OS data
@@ -45,6 +45,23 @@ On controlled native disconnect/close, pending records are encrypted in a privat
 host outbox scoped to server/origin and principal, then restored after verified
 reconnection. The desktop-owned scope remains stable across ephemeral loopback
 ports. Old runtime records remain history; restoring them grants no new viewing
-authority. Encryption or save failure keeps the window open. Unexpected app or
-renderer crashes before this close-time checkpoint remain a recovery gap; this
-is not the A13 offline event/cache implementation.
+authority. Encryption or save failure keeps the window open. On reconnection, a temporary script-free same-origin document recovers the
+authenticated principal’s browser records, encrypts them, and restores them before
+server page scripts run. Failed encryption preserves the browser copy. A crashed
+desktop-owned server may restart on another port, so observations after the last
+native checkpoint on the old origin remain a recovery limitation. These online
+records do not grant offline viewing authority.
+
+
+**Open downloads offline** explicitly launches the separate Rust presentation
+helper against a private cache root, with one-use bootstrap and a parent lifetime
+pipe. The renderer remains sandboxed. Leaving offline mode waits for local event
+persistence, then stops only that helper. Remote connection failures never create
+an offline host or a library. See [the cache port](../../crates/motion-ui-host/README.md)
+for scope, limits and the A13 integration boundary.
+
+`node test/run-offline.mjs` builds and tests cold-start playback, seek, durable
+progress, restart resume and parent-pipe loss against a synthetic cache. Use
+`MOTION_DEMUXE_DIR` for the installed player. `MOTION_ELECTRON_BINARY` can point to
+a byte-identical internally staged Electron runtime when external-volume launches
+stall. Current native receipts qualify macOS arm64, Electron 44.7.0, unpackaged.

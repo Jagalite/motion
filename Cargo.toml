@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "crates/core", "crates/motion-ui"]
-default-members = [".", "crates/core", "crates/motion-ui"]
+members = [".", "crates/core", "crates/motion-ui", "crates/motion-ui-host"]
+default-members = [".", "crates/core", "crates/motion-ui", "crates/motion-ui-host"]
 exclude = ["research/framework-review"]
 resolver = "2"
 

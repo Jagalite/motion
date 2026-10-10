@@ -32,3 +32,24 @@ export function verifyCapabilities(capabilities, selected, epoch, contractDigest
   }
 }
 
+// Parse remote handshake observations under a native-process memory bound.
+// Streamed bytes enforce the limit even when Content-Length is absent or false.
+export async function boundedJson(response, limit = 512 * 1024) {
+  if (!response.body) throw new Error('Empty server response');
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) throw new Error('Server response exceeds the connection limit');
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes));
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}

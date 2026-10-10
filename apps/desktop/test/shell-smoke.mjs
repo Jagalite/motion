@@ -73,6 +73,9 @@ try {
   assert.equal(await remote.executeJavaScript('document.querySelector("h1").textContent'), 'Verified server view');
   checks.http_only_session = (await remote.session.cookies.get({url: origin})).some(cookie => cookie.name === 'fixture' && cookie.httpOnly);
   assert.equal(checks.http_only_session, true);
+  await window.webContents.executeJavaScript('window.motionHost.stopLocal()');
+  assert.equal(remote.isDestroyed(), false);
+  checks.stop_local_preserves_unrelated_connection = true;
   await remote.executeJavaScript('location.href = "https://example.invalid/escape"');
   await sleep(250);
   assert.equal(remote.getURL(), `${origin}/`);
