@@ -40,7 +40,11 @@ def main():
                     assert status == expected, (path, status, raw)
                     return json.loads(raw) if raw else None
                 def unavailable_reported():
-                    return any(s['name'] == 'configured_libraries' and s['error'] for s in api('GET', '/admin/storage')['state'])
+                    status, _, raw = request(port, 'GET', '/api/v1/admin/storage', None, auth)
+                    if status == 503 and json.loads(raw)['code'] == 'storage_busy':
+                        return False  # non-blocking inspection lost to library I/O; poll again
+                    assert status == 200, ('/admin/storage', status, raw)
+                    return any(s['name'] == 'configured_libraries' and s['error'] for s in json.loads(raw)['state'])
                 wait_for(unavailable_reported)
                 checks.append('unavailable_configured_root_does_not_block_readiness')
                 library = api('POST', '/libraries', {'name': 'Inventory', 'root': str(media)}, 201)

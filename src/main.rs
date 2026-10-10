@@ -170,6 +170,10 @@ async fn run() -> anyhow::Result<()> {
     } else {
         playscale::api::router(app.clone(), assets)
     };
+    // Install the shutdown handlers before anything serves. Until a handler is
+    // registered, SIGINT/SIGTERM still have their default action and would kill
+    // a server that is already answering requests, skipping graceful shutdown.
+    let shutdown_requested = shutdown_signal()?;
     let shutdown = CancellationToken::new();
     app.health
         .worker_running
@@ -245,7 +249,7 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     let outcome: anyhow::Result<()> = tokio::select! {
-        result = shutdown_signal() => result,
+        result = shutdown_requested => result,
         result = &mut worker => match result { Ok(Ok(())) => Err(anyhow::anyhow!("scan worker stopped unexpectedly")), Ok(Err(e)) => Err(e), Err(e) => Err(e.into()) },
         result = &mut http => match result { Ok(Ok(())) => Err(anyhow::anyhow!("HTTP server stopped unexpectedly")), Ok(Err(e)) => Err(e.into()), Err(e) => Err(e.into()) },
     };
@@ -295,15 +299,30 @@ fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
     anyhow::bail!("bootstrap descriptors are supported on Unix only")
 }
 
-async fn shutdown_signal() -> anyhow::Result<()> {
+/// Register for SIGINT and SIGTERM (Ctrl+C on Windows) now; the returned
+/// future completes on either. Registration happens in this call, not on
+/// first poll.
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result = tokio::signal::ctrl_c() => { result?; }, _ = term.recv() => {} }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        Ok(async move {
+            tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+            Ok(())
+        })
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+            Ok(())
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    Ok(async { Ok(tokio::signal::ctrl_c().await?) })
 }
 
 #[cfg(test)]
@@ -324,5 +343,31 @@ mod tests {
         .unwrap();
         release.send(()).unwrap();
         assert!(before.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A signal delivered after `shutdown_signal()` returns but before its
+    /// future is first polled must request shutdown, not kill the process
+    /// (SIGINT's default action). The server serves in exactly that window.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_signals_are_registered_before_first_poll() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let requested = {
+                let _context = runtime.enter(); // signal() needs the runtime's driver
+                super::shutdown_signal().unwrap()
+            };
+            // SAFETY: raise only queues a signal for this process.
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), requested).await
+                })
+                .expect("shutdown not requested")
+                .unwrap();
+        }
     }
 }
