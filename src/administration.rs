@@ -179,6 +179,11 @@ pub async fn relocate(
         .filter(|f| !playscale_core::sources::excluded(&f.relative_path, &scope))
         .cloned()
         .collect();
+    let out_of_scope: Vec<String> = files
+        .iter()
+        .filter(|f| playscale_core::sources::excluded(&f.relative_path, &scope))
+        .map(|f| f.id.clone())
+        .collect();
     let data_root = app.storage.root.clone();
     let (root, identity, stamps) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use std::io::Read;
@@ -249,6 +254,14 @@ pub async fn relocate(
     .bind(&id)
     .execute(&mut *tx)
     .await?;
+    // Excluded files are not offered by the relocated source, even if no scan
+    // has run since the exclusion changed.
+    for file in &out_of_scope {
+        sqlx::query("UPDATE media_files SET available=0 WHERE id=? AND available=1")
+            .bind(file)
+            .execute(&mut *tx)
+            .await?;
+    }
     for (file, stamp) in stamps {
         sqlx::query("UPDATE media_files SET fingerprint=?,available=1 WHERE id=?")
             .bind(stamp)
@@ -381,6 +394,25 @@ pub async fn register_root(
             identity == candidate.identity,
             "library root identity changed"
         );
+        // A source registered without a library (v2) gains its paired library
+        // once; an existing library definition is never modified.
+        let paired: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_libraries WHERE id=?")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if paired == 0 {
+            sqlx::query("INSERT INTO catalog_libraries (id,name,kind) VALUES (?,?,'mixed')")
+                .bind(&id)
+                .bind(&name)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("INSERT INTO library_sources VALUES (?,?)")
+                .bind(&id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
         return Ok(db::Library { id, name });
     }
     let roots: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries")

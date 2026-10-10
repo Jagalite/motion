@@ -251,10 +251,11 @@ async fn re_registration_keeps_library_edits_and_relocation_honors_exclusions() 
     std::fs::write(root.join("Extras/gone.mp4"), b"gone").unwrap();
     f.scan(&v1.id).await;
     let source = libraries::get_source(&f.app.db, &v1.id).await.unwrap();
+    // No scan after changing exclusions: relocation itself must stop
+    // offering the excluded file.
     libraries::set_exclusions(&f.app, &v1.id, source.revision, &["Extras".into()])
         .await
         .unwrap();
-    f.scan(&v1.id).await;
     let moved = f.dir.path().join("v1-moved");
     std::fs::rename(&root, &moved).unwrap();
     std::fs::remove_file(moved.join("Extras/gone.mp4")).unwrap();
@@ -291,4 +292,19 @@ async fn re_registration_keeps_library_edits_and_relocation_honors_exclusions() 
             ("keep.mp4".to_string(), true)
         ]
     );
+}
+
+#[tokio::test]
+async fn v1_registration_pairs_a_source_only_root_once() {
+    let f = Fixture::new().await;
+    let source = f.source("shared", &[]).await;
+    let candidate = administration::candidate_root(&f.app, f.root("shared"))
+        .await
+        .unwrap();
+    let v1 = administration::register_root(&f.app, candidate, Some("Shared"))
+        .await
+        .unwrap();
+    assert_eq!(v1.id, source.id);
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    assert_eq!(library.source_ids, std::slice::from_ref(&source.id));
 }
