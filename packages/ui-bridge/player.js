@@ -182,10 +182,21 @@ function viewingStorage(data) {
   const scope = JSON.stringify([data.serverEpoch, data.principalId, data.profileId, data.timelineId]);
   const storageKey = `motion:viewing:${scope}`;
   return {
-    load: () => JSON.parse(sessionStorage.getItem(storageKey) ?? 'null'),
-    save: value => value === null ? sessionStorage.removeItem(storageKey) : sessionStorage.setItem(storageKey, JSON.stringify(value)),
-    archive: value => sessionStorage.setItem(`${storageKey}:rejected`, JSON.stringify(value)),
-    hasRejected: () => sessionStorage.getItem(`${storageKey}:rejected`) !== null,
+    load: () => JSON.parse(localStorage.getItem(storageKey) ?? sessionStorage.getItem(storageKey) ?? 'null'),
+    save: value => {
+      if (value === null) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, JSON.stringify(value));
+      sessionStorage.removeItem(storageKey);
+    },
+    archive: value => localStorage.setItem(`${storageKey}:rejected`, JSON.stringify(value)),
+    hasRejected: () => Object.keys(localStorage).some(key => {
+      if (!key.startsWith('motion:viewing:')) return false;
+      try {
+        const prior = JSON.parse(key.slice(15).replace(/:rejected$/, ''));
+        return prior[1] === data.principalId && prior[2] === data.profileId && prior[3] === data.timelineId
+          && (prior[0] !== data.serverEpoch || key.endsWith(':rejected'));
+      } catch { return false; }
+    }),
   };
 }
 
@@ -217,7 +228,7 @@ async function recoverViewing(data, current) {
   const storage = viewingStorage(data);
   if (storage.hasRejected()) {
     const panel = document.getElementById('motion-progress-status');
-    if (panel) panel.textContent = 'An earlier viewing event was rejected. Its last position is retained on this device; it was not saved to the server.';
+    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session.';
   }
   const saved = storage.load();
   if (!saved) return data.viewingRevision;
@@ -541,11 +552,18 @@ controls?.addEventListener('click', event => {
 });
 
 addEventListener('pagehide', () => { void close({unloading: true}); });
+// Fragment navigation changes focus/scroll within the owned document.
+function leavesPlayerDocument(destination, currentUrl) {
+  const next = new URL(destination, currentUrl);
+  const current = new URL(currentUrl);
+  return next.origin === current.origin && !(next.pathname === current.pathname
+    && next.search === current.search && destination.includes('#'));
+}
 // Ordinary navigation gets the same bounded flush as explicit teardown.
 document.addEventListener('click', event => {
   const link = event.target?.closest?.('a[href]');
   if (!host || !link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
-    || link.target || link.hasAttribute('download') || new URL(link.href).origin !== location.origin) return;
+    || link.target || link.hasAttribute('download') || !leavesPlayerDocument(link.href, location.href)) return;
   event.preventDefault();
   void close().finally(() => location.assign(link.href));
 });

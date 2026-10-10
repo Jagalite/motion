@@ -1675,6 +1675,7 @@ dependencies = [
  "httpdate",
  "image",
  "mime_guess",
+ "motion-ui",
  "playscale-core",
  "serde",
  "serde_json",

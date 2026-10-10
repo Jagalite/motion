@@ -28,7 +28,9 @@ const code = await new Promise((resolve, reject) => {
   child.once('error', reject);
   child.once('exit', resolve);
 }).finally(() => clearTimeout(timer));
-const receipt = JSON.parse(readFileSync(output, 'utf8'));
+let receipt;
+try { receipt = JSON.parse(readFileSync(output, 'utf8')); }
+catch { receipt = {passed: false, checks: {}, failure: 'Electron exited or timed out before writing its receipt', exit_code: code}; }
 receipt.source_sha256 = hashes;
 receipt.source_location = 'byte-identical temporary copy';
 const directory = join(root, 'qualification/desktop');

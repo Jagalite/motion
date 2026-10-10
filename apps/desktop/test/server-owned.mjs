@@ -1,0 +1,52 @@
+// Integration test with the real Rust binary, isolated DB and private pipes.
+import assert from 'node:assert/strict';
+import {mkdtempSync, readFileSync, writeFileSync, mkdirSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join, resolve} from 'node:path';
+import {createHash} from 'node:crypto';
+import {createOwnedServer} from '../src/owned.mjs';
+const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+const root = new URL('../../../', import.meta.url);
+const work = mkdtempSync(join(tmpdir(), 'motion-owned-server-'));
+const source = resolve(process.env.MOTION_SERVER_BINARY ?? '/private/tmp/motion-a11-a12-20261010-target/debug/playscale');
+const bytes = readFileSync(source);
+const executable = join(work, 'motion-server');
+writeFileSync(executable, bytes, {mode: 0o700, flag: 'wx'});
+const contractDigest = `sha256:${hash(readFileSync(new URL('contracts/Motion_Server_API_v2.yaml', root)))}`;
+const options = {executable, dataDir: join(work, 'data'), demuxeDir: resolve(process.env.MOTION_DEMUXE_DIR ?? '/Volumes/seed2/Projects/playscale/web/vendor/demuxe'), contractDigest};
+const first = createOwnedServer(options);
+const second = createOwnedServer(options);
+const checks = {};
+let failure;
+try {
+  const ready = await first.start();
+  const health = await (await fetch(`${ready.origin}/api/v2/system/health`)).json();
+  assert.equal(health.server_id, ready.serverId);
+  assert.equal(health.server_epoch, ready.serverEpoch);
+  assert.equal(health.status, 'ok');
+  checks.private_readiness_matches_live_identity = true;
+  const exchange = () => fetch(`${ready.origin}/api/v2/auth/session`, {method: 'POST', headers: {'Origin': ready.origin, 'Content-Type': 'application/json'}, body: JSON.stringify({kind: 'credential', credential: ready.credential})});
+  const session = await exchange();
+  assert.equal(session.status, 200);
+  assert.match(session.headers.get('set-cookie'), /HttpOnly/i);
+  const body = await session.json();
+  assert.ok(body.principal.id && body.csrf_token);
+  assert.equal((await exchange()).status, 401);
+  checks.real_bootstrap_is_one_use = true;
+  await assert.rejects(second.start(), /exited before readiness|readiness pipe closed/);
+  assert.equal((await fetch(`${ready.origin}/api/v2/system/health`)).status, 200);
+  checks.exclusive_lock_preserves_existing_server = true;
+  await first.stop();
+  assert.equal(first.running, false);
+  const restarted = await second.start();
+  assert.equal(restarted.serverId, ready.serverId);
+  assert.notEqual(restarted.serverEpoch, ready.serverEpoch);
+  checks.shutdown_releases_lock_and_restart_changes_epoch = true;
+} catch (error) { failure = String(error.stack ?? error); }
+finally { await first.stop(); await second.stop(); }
+const directory = new URL('qualification/desktop/', root);
+mkdirSync(directory, {recursive: true});
+const receipt = {passed: !failure, recorded_at: new Date().toISOString(), binary_sha256: hash(bytes), contract_digest: contractDigest, checks, failure, scope: 'Real server bootstrap, exclusive data lock and child ownership in a disposable data directory', artifacts: work};
+writeFileSync(new URL('owned-server.json', directory), JSON.stringify(receipt, null, 2) + '\n');
+console.log(JSON.stringify(receipt, null, 2));
+process.exitCode = failure ? 1 : 0;

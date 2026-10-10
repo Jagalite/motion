@@ -2,7 +2,9 @@ import {app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage} from
 import {readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
-import {join} from 'node:path';
+import {join, resolve} from 'node:path';
+import {createOwnedServer} from './owned.mjs';
+import {createOutboxStore} from './outbox.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities} from './policy.mjs';
 
 const chromeUrl = new URL('./chrome.html', import.meta.url).href;
@@ -10,7 +12,10 @@ const contractDigest = `sha256:${createHash('sha256').update(readFileSync(new UR
 let window;
 let content;
 let selectedSession;
+let outboxContext;
+const outboxes = () => createOutboxStore(join(app.getPath('userData'), 'viewing-outbox'), safeStorage);
 let monitor;
+let ownedServer;
 let epoch = 0;
 let transition = Promise.resolve();
 function serialize(work) {
@@ -43,8 +48,7 @@ async function detach() {
   monitor = null;
   const previous = content;
   const previousSession = selectedSession;
-  content = null;
-  selectedSession = null;
+  const previousOutbox = outboxContext;
   if (previous) {
     if (!previous.webContents.isDestroyed()) {
       // The unprivileged page can only acknowledge its own bounded teardown.
@@ -57,9 +61,17 @@ async function detach() {
         new Promise(resolve => setTimeout(resolve, 3000)),
       ]);
     }
-    window?.contentView.removeChildView(previous);
+    if (previousOutbox && !previous.webContents.isDestroyed()) {
+      const records = await Promise.race([
+        previous.webContents.executeJavaScript(`Object.fromEntries(Object.keys(localStorage).filter(key => key.startsWith('motion:viewing:')).map(key => [key, localStorage.getItem(key)]))`),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Viewing history could not be saved; the window remains open')), 3000)),
+      ]);
+      outboxes().save(previousOutbox.scope, previousOutbox.principal, records);
+    }
+    try { window?.contentView.removeChildView(previous); } catch { /* Startup may fail before attachment. */ }
     if (!previous.webContents.isDestroyed()) previous.webContents.close();
   }
+  content = null; selectedSession = null; outboxContext = null;
   // Partitions remain isolated by server; explicitly remove browser credentials
   // and renderer storage when the user changes connection/auth context.
   if (previousSession) await previousSession.clearStorageData();
@@ -76,7 +88,7 @@ function secureSession(ses, origin) {
   });
 }
 
-async function connectOwned(input, owner) {
+async function connectOwned(input, owner, locallyOwned = false) {
   const selected = connection(input);
   if (typeof input.credential !== 'string' || input.credential.length > 4096) throw new Error('Invalid credential');
   await detach();
@@ -96,6 +108,7 @@ async function connectOwned(input, owner) {
   try {
     const health = await request('/api/v2/system/health');
     const serverEpoch = verifyHealth(health, selected);
+    if (input.expectedEpoch && input.expectedEpoch !== serverEpoch) throw new Error('Local server restarted before attachment');
     const credential = input.credential || readCredential(selected);
     if (credential.length < 32) throw new Error('A paired device credential is required');
     const browserSession = await request('/api/v2/auth/session', {method: 'POST',
@@ -104,6 +117,8 @@ async function connectOwned(input, owner) {
     verifyCapabilities(await request('/api/v2/system/capabilities'), selected, serverEpoch, contractDigest);
     if (!current()) throw new Error('Connection changed');
     if (input.remember === true) saveCredential(selected, credential);
+    const history = {scope: [locallyOwned ? 'desktop-owned' : selected.origin, selected.serverId], principal: browserSession.principal.id};
+    const pending = outboxes().load(history.scope, history.principal);
     const view = new WebContentsView({webPreferences: {session: ses, sandbox: true, contextIsolation: true,
       nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true,
       allowRunningInsecureContent: false, webviewTag: false}});
@@ -113,9 +128,11 @@ async function connectOwned(input, owner) {
     view.webContents.on('will-frame-navigate', event => { if (!sameOrigin(event.url, selected.origin)) event.preventDefault(); });
     view.webContents.on('will-attach-webview', event => event.preventDefault());
     content = view;
+    await view.webContents.loadURL(selected.origin);
+    await view.webContents.executeJavaScript(`Object.entries(${JSON.stringify(pending)}).forEach(([key, value]) => localStorage.setItem(key, value))`);
+    outboxContext = history;
     window.contentView.addChildView(view);
     resize();
-    await view.webContents.loadURL(selected.origin);
     if (!current()) throw new Error('Connection changed');
     const inspect = async () => {
       if (!current()) return;
@@ -143,9 +160,16 @@ const connect = input => serialize(owner => connectOwned(input, owner));
 const disconnect = () => serialize(() => detach());
 
 function resize() {
-  if (!content || !window) return;
-  const [width, height] = window.getContentSize();
-  content.setBounds({x: 0, y: 190, width, height: Math.max(0, height - 190)});
+  const view = content;
+  const chrome = window;
+  if (!view || !chrome) return;
+  void chrome.webContents.executeJavaScript('Math.ceil(document.querySelector("header").getBoundingClientRect().bottom)')
+    .then(header => {
+      if (content !== view || window !== chrome || chrome.isDestroyed()) return;
+      const [width, height] = chrome.getContentSize();
+      const y = Math.min(height, Math.max(0, Number(header) || 190));
+      view.setBounds({x: 0, y, width, height: Math.max(0, height - y)});
+    }).catch(() => {});
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -164,12 +188,43 @@ else {
       if (closing) return;
       event.preventDefault();
       closing = true;
-      void disconnect().finally(() => window?.close());
+      const stopped = ownedServer && !ownedServer.ready ? ownedServer.stop() : null;
+      void disconnect().then(() => stopped ?? ownedServer?.stop()).then(() => window?.close()).catch(error => { closing = false; window?.webContents.send('motion:status', error.message); });
     });
     window.on('closed', () => { window = null; });
     ipcMain.handle('motion:connect', (event, input) => { authorize(event); return connect(input); });
     ipcMain.handle('motion:disconnect', event => { authorize(event); return disconnect(); });
+    ipcMain.handle('motion:start-local', event => {
+      authorize(event);
+      return serialize(async owner => {
+        if (owner !== epoch) throw new Error('Local startup cancelled');
+        ownedServer ??= createOwnedServer({
+          executable: app.isPackaged ? join(process.resourcesPath, 'bin', 'motion-server') : resolve(process.env.MOTION_SERVER_BINARY || fileURLToPath(new URL('../../../target/debug/playscale', import.meta.url))),
+          dataDir: join(app.getPath('userData'), 'server'),
+          demuxeDir: app.isPackaged ? join(process.resourcesPath, 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
+          contractDigest,
+        });
+        if (ownedServer.running) throw new Error('The local server is already running. Disconnecting does not stop it; use Stop local server before restarting.');
+        const local = await ownedServer.start();
+        if (owner !== epoch) throw new Error('Local connection cancelled');
+        try { return await connectOwned({...local, expectedEpoch: local.serverEpoch, remember: false}, owner, true); }
+        catch (error) { await ownedServer.stop(); throw error; }
+      });
+    });
+    ipcMain.handle('motion:stop-local', event => {
+      authorize(event);
+      const stopped = ownedServer && !ownedServer.ready ? ownedServer.stop() : null;
+      return serialize(async () => { await detach(); await (stopped ?? ownedServer?.stop()); });
+    });
     await window.loadURL(chromeUrl);
   }).catch(error => { console.error('Desktop startup failed:', error.message); app.exit(1); });
-  app.on('window-all-closed', () => app.quit());
+  let quitting = false;
+  app.on('before-quit', event => {
+    if (quitting || !ownedServer?.running) return;
+    event.preventDefault();
+    quitting = true;
+    const stopped = !ownedServer.ready ? ownedServer.stop() : null;
+    void disconnect().then(() => stopped ?? ownedServer.stop()).then(() => app.quit()).catch(error => { quitting = false; window?.webContents.send('motion:status', error.message); });
+  });
+  app.on('window-all-closed', () => { void ownedServer?.stop().finally(() => app.quit()); if (!ownedServer) app.quit(); });
 }

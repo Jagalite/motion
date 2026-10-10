@@ -1,5 +1,5 @@
 use clap::Parser;
-use playscale::{App, api, db, scan};
+use playscale::{App, db, scan};
 use std::{io::Write, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,16 @@ fn execute(work: impl std::future::Future<Output = anyhow::Result<()>>) -> anyho
 
 async fn run() -> anyhow::Result<()> {
     let cli = Args::parse();
+    if let Some(fd) = cli.ready_fd {
+        anyhow::ensure!(
+            fd > 2 && Some(fd) != cli.bootstrap_fd,
+            "readiness requires a distinct private descriptor"
+        );
+        anyhow::ensure!(
+            cli.bootstrap_fd.is_some(),
+            "native readiness requires protected bootstrap"
+        );
+    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let defaults =
         playscale::config::packaged_defaults(&std::env::current_exe()?, home.as_deref())?;
@@ -110,6 +120,9 @@ async fn run() -> anyhow::Result<()> {
         .join("web/generated/player/index.js")
         .is_file()
         .then_some(args.demuxe_dir.clone());
+    if cli.ready_fd.is_some() {
+        playscale::desktop::verify_player_assets(&args.demuxe_dir)?;
+    }
     let app = App {
         health: Arc::new(playscale::operations::Health::new(assets.is_some())),
         db,
@@ -147,7 +160,11 @@ async fn run() -> anyhow::Result<()> {
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
         );
     }
-    let router = api::router(app.clone(), assets);
+    let router = if cli.topcoat {
+        playscale::presentation::router(app.clone(), assets)
+    } else {
+        playscale::api::router(app.clone(), assets)
+    };
     let shutdown = CancellationToken::new();
     app.health
         .worker_running
@@ -190,6 +207,22 @@ async fn run() -> anyhow::Result<()> {
             .with_graceful_shutdown(stop_http.cancelled_owned())
             .await
     });
+    if let Some(fd) = cli.ready_fd {
+        let (server_id, _) = playscale::v2::system::server_identity(&app)
+            .await
+            .map_err(|_| anyhow::anyhow!("cannot read server identity"))?;
+        playscale::desktop::publish(
+            fd,
+            &playscale::desktop::Ready {
+                protocol: 1,
+                server_id,
+                server_epoch: app.access.server_epoch.clone(),
+                origin: origin.clone(),
+                version: env!("CARGO_PKG_VERSION"),
+                contract_digest: playscale::v2::system::contract_digest(),
+            },
+        )?;
+    }
     tracing::info!(%address, %origin, admin_token_file=%token_path.display(), "Playscale listening");
     println!(
         "Motion is running at {origin}\nAdmin token file: {}\nPress Ctrl+C to stop.",

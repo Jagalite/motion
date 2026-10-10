@@ -138,7 +138,7 @@ pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
             <label><input type="checkbox" name="autoplay" data-type=(kind(Field::Bool)) checked=(prefs.autoplay)>
                 " Play the next episode automatically"</label>
             <label>"Count as watched at "
-                <input type="number" name="completion_percent" data-type=(kind(Field::Number)) required=(true) min="50" max="100" value=(prefs.completion_percent)>"%"
+                <input type="number" name="completion_percent" data-type=(kind(Field::Number)) required=(true) min="50" max="100" step="any" value=(prefs.completion_percent)>"%"
             </label>
         )
     })

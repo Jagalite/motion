@@ -20,10 +20,11 @@ main:focus, h1:focus { outline: none; }
 .mock-banner { background: #8a1a12; color: #fff; font-weight: 600; padding: .4rem 1rem; text-align: center; }
 .app-header { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1.25rem; padding: .75rem 1.25rem; border-bottom: 1px solid var(--line); }
 .brand { font-weight: 800; text-decoration: none; font-size: 1.2rem; }
-.app-header nav ul { display: flex; gap: .9rem; list-style: none; margin: 0; padding: 0; }
+.app-header nav { max-width: 100%; }
+.app-header nav ul { display: flex; flex-wrap: wrap; gap: .9rem; list-style: none; margin: 0; padding: 0; }
 .app-header .search { margin-left: auto; }
 .profile { color: var(--muted); }
-input, button, select { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .4rem .6rem; }
+input, button, select { max-width: 100%; font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .4rem .6rem; }
 .grid { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); gap: .9rem; }
 .card a { display: flex; flex-direction: column; gap: .3rem; padding: .9rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; text-decoration: none; min-height: 5rem; }
 .card-title { font-weight: 600; }

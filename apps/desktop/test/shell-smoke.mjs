@@ -31,8 +31,7 @@ const server = createServer(async (req, res) => {
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'");
   res.end('<!doctype html><html><head><title>Shell fixture</title></head><body><h1>Verified server view</h1></body></html>');
 });
-await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-const origin = `http://127.0.0.1:${server.address().port}`;
+
 let failure;
 const checks = {};
 const watchdog = setTimeout(() => { failure = 'Shell smoke exceeded 150 seconds'; finish(); }, 150000);
@@ -48,9 +47,12 @@ function finish() {
   app.exit(failure ? 1 : 0);
 }
 app.on('browser-window-created', (_, window) => window.hide());
-await import('../src/main.mjs');
 void (async () => {
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+const origin = `http://127.0.0.1:${server.address().port}`;
+await import('../src/main.mjs');
 await app.whenReady();
+console.log('Shell checkpoint: app ready');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 try {
   let window;
@@ -63,7 +65,8 @@ try {
   const result = await window.webContents.executeJavaScript(`window.motionHost.connect(${JSON.stringify({origin, serverId: 'shell-fixture', credential: secret, remember: false})})`);
   assert.equal(result.serverId, 'shell-fixture');
   checks.connection_verified = true;
-  const remote = webContents.getAllWebContents().find(contents => contents.getURL() === `${origin}/`);
+  console.log('Shell checkpoint: connection verified');
+  let remote = webContents.getAllWebContents().find(contents => contents.getURL() === `${origin}/`);
   assert.ok(remote);
   checks.unprivileged_remote = await remote.executeJavaScript('typeof require === "undefined" && typeof process === "undefined" && typeof motionHost === "undefined"');
   assert.equal(checks.unprivileged_remote, true);
@@ -75,16 +78,26 @@ try {
   assert.equal(remote.getURL(), `${origin}/`);
   checks.cross_origin_navigation_blocked = true;
   writeFileSync(join(work, 'shell.png'), (await window.capturePage()).toPNG());
+  console.log('Shell checkpoint: screenshot captured');
+  const pendingKey = 'motion:viewing:' + JSON.stringify(['epoch1', 'fixture-principal', 'profile1', 'timeline1']);
+  const pendingValue = JSON.stringify({event_id: 'pending-native-event', sequence: '9007199254740993'});
+  await remote.executeJavaScript(`localStorage.setItem(${JSON.stringify(pendingKey)}, ${JSON.stringify(pendingValue)})`);
+  await window.webContents.executeJavaScript('window.motionHost.disconnect()');
+  assert.equal(remote.isDestroyed(), true);
+  await window.webContents.executeJavaScript(`window.motionHost.connect(${JSON.stringify({origin, serverId: 'shell-fixture', credential: secret, remember: false})})`);
+  remote = webContents.getAllWebContents().find(contents => contents.getURL() === `${origin}/`);
+  assert.equal(await remote.executeJavaScript(`localStorage.getItem(${JSON.stringify(pendingKey)})`), pendingValue);
+  checks.encrypted_pending_progress_survives_reconnect = true;
   serverEpoch = 'epoch2';
   for (let i = 0; i < 150 && !remote.isDestroyed(); i++) await sleep(100);
   assert.equal(remote.isDestroyed(), true);
   checks.runtime_epoch_change_disconnects = true;
   await assert.rejects(window.webContents.executeJavaScript(`window.motionHost.connect(${JSON.stringify({origin, serverId: 'wrong-server', credential: secret})})`));
-  assert.equal(seen.filter(request => request.path === '/api/v2/auth/session').length, 1);
+  assert.equal(seen.filter(request => request.path === '/api/v2/auth/session').length, 2);
   checks.identity_checked_before_secret = true;
   await window.webContents.executeJavaScript('window.motionHost.disconnect()');
   assert.equal((await (await fetch(`${origin}/api/v2/system/health`)).json()).status, 'ok');
   checks.disconnect_leaves_server_running = true;
 } catch (error) { failure = String(error.stack ?? error); }
 finish();
-})();
+})().catch(error => { failure = String(error.stack ?? error); finish(); });

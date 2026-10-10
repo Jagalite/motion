@@ -36,6 +36,12 @@ pub struct Args {
     /// (read once at startup; never place the secret in argv).
     #[arg(long)]
     pub bootstrap_fd: Option<i32>,
+    /// Private inherited output pipe for native-host readiness (one JSON line).
+    #[arg(long)]
+    pub ready_fd: Option<i32>,
+    /// Serve the production Topcoat presentation (requires matching v2 services).
+    #[arg(long)]
+    pub topcoat: bool,
     /// `trusted_household` keeps the unauthenticated legacy v1 surface;
     /// `restricted` requires paired credentials (v1 is operator-only).
     #[arg(long, value_parser = parse_access_mode)]

@@ -122,3 +122,47 @@ test('invalid lease data fails closed without a busy loop', async () => {
     assert.equal(h.tasks.size, 0);
   }
 });
+
+test('skip links retain the current player; document navigation still tears down', () => {
+  const leaves = runInNewContext(source.replace('export {close, maintainLease};', 'leavesPlayerDocument;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  const current = 'https://motion.test/play/tl2?profile=p1';
+  assert.equal(leaves(`${current}#main`, current), false);
+  assert.equal(leaves('#main', current), false);
+  assert.equal(leaves(`${current}#`, current), false);
+  assert.equal(leaves('https://motion.test/play/tl3#main', current), true);
+  assert.equal(leaves('https://motion.test/play/tl2?profile=p2#main', current), true);
+  assert.equal(leaves(current, current), true);
+  assert.equal(leaves('https://other.test/', current), false);
+});
+
+test('viewing storage migrates tab data and keeps prior runtime history out of current authority', () => {
+  const makeStorage = () => {
+    const store = {};
+    Object.defineProperties(store, {
+      getItem: {value: key => store[key] ?? null},
+      setItem: {value: (key, value) => { store[key] = value; }},
+      removeItem: {value: key => { delete store[key]; }},
+    });
+    return store;
+  };
+  const localStorage = makeStorage(), sessionStorage = makeStorage();
+  const factory = runInNewContext(source.replace('export {close, maintainLease};', 'viewingStorage;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, localStorage, sessionStorage,
+  });
+  const data = {serverEpoch: 'e1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
+  const key = 'motion:viewing:' + JSON.stringify(Object.values(data));
+  sessionStorage.setItem(key, '{"event_id":"immutable"}');
+  const storage = factory(data);
+  assert.equal(storage.load().event_id, 'immutable');
+  storage.save(storage.load());
+  assert.equal(sessionStorage.getItem(key), null);
+  assert.equal(JSON.parse(localStorage.getItem(key)).event_id, 'immutable');
+  const restarted = factory({...data, serverEpoch: 'e2'});
+  assert.equal(restarted.load(), null);
+  assert.equal(restarted.hasRejected(), true);
+  assert.equal(factory({...data, principalId: 'p2'}).hasRejected(), false);
+  storage.save(null);
+  assert.equal(localStorage.getItem(key), null);
+});

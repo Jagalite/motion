@@ -17,6 +17,8 @@ publish = false
 
 [dependencies]
 playscale-core = { path = "crates/core" }
+motion-ui = { path = "crates/motion-ui" }
+tower = { version = "0.5", features = ["util"] }
 anyhow = "1"
 axum = "=0.8.9"
 tokio = { version = "1", features = ["full"] }

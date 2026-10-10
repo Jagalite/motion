@@ -28,6 +28,6 @@ test('identity, runtime epoch, readiness and contract mismatches fail closed', (
     assert.throws(() => verifyCapabilities({...cap, ...extra}, selected, 'epoch1', 'sha256:abc'));
   }
 });
-test('desktop-owned startup is rejected until the server readiness/ownership protocol is available', () => {
+test('a connection request cannot confer desktop process ownership', () => {
   assert.throws(() => connection({origin: 'http://127.0.0.1:9999', serverId: 'server1', mode: 'desktop_owned'}));
 });
