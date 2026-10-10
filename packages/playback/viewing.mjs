@@ -6,7 +6,7 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
   let inFlight = null;
   let rejected = false;
   let sealed = latest?.status === 'stopped' || pending?.status === 'stopped';
-  const revision = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value);
+  const revision = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 18446744073709551615n;
   if (!revision(session.sequence)) throw new Error('Invalid viewing sequence');
   const save = () => persist(pending || latest ? {session: accepted, pending, latest} : null);
   const snapshot = value => {
@@ -38,8 +38,9 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
         if (!revision(sequence)) throw new Error('Viewing sequence exhausted');
         pending = Object.freeze({...latest, event_id: uuid(), sequence});
         latest = null;
-        save();
       }
+      // A previous persistence failure must not let a later flush bypass durability.
+      save();
       try {
         const ack = await send(accepted.id, pending);
         if (!current()) return false;
