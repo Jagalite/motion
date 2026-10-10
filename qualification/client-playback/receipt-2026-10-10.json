@@ -1,9 +1,9 @@
 {
-  "started": "2026-10-10T17:18:46.142Z",
+  "started": "2026-10-10T19:28:26.028Z",
   "kind": "production-evidence",
   "server": {
     "binary": "<checkout>/target/debug/playscale",
-    "sha256": "069801065e06c021317edb17659010e1d1655d751dc558e303f6491f2901073a"
+    "sha256": "b35cf9686873dc82ab113c0b7d422845f605ef245d70758a95fbcadd57aa0399"
   },
   "demuxe": {
     "dir": "<checkout>/web/vendor/demuxe",
@@ -28,7 +28,7 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "play": "/play/1a36f1a1-6276-4807-999d-aa0f3bc5865e"
+            "play": "/play/43347f2e-8861-4771-b1af-25ac7afc497c"
           }
         },
         {
@@ -39,7 +39,7 @@
             "transport": "http_range",
             "operation": "original",
             "status": "ready",
-            "candidate": "o-578b44fc-d987-4b4c-a026-54f0d009d121",
+            "candidate": "o-22e160a5-ade3-49a7-b976-50db19f192ec",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -61,8 +61,8 @@
           "gap": null,
           "detail": {
             "advancing": true,
-            "from": 0.005491,
-            "to": 3.135451,
+            "from": 0.006704,
+            "to": 3.13665,
             "logical": 3.1,
             "mode": "native"
           }
@@ -87,8 +87,8 @@
             },
             "seekPlay": {
               "advancing": true,
-              "from": 40.029012,
-              "to": 42.073205,
+              "from": 40.03717,
+              "to": 42.076849,
               "logical": 42.1,
               "mode": "native"
             }
@@ -99,13 +99,13 @@
           "status": "pass",
           "gap": null,
           "detail": [
-            "POST faca7674-b859-4559-9423-682000be436c_3148117f-dc99-421b-ad70-b8420a658dcd/events 200",
-            "POST 3148117f-dc99-421b-ad70-b8420a658dcd/changes 202",
-            "GET 578b44fc-d987-4b4c-a026-54f0d009d121/content 206",
-            "POST faca7674-b859-4559-9423-682000be436c_3148117f-dc99-421b-ad70-b8420a658dcd/events 200",
+            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
+            "POST af22a0af-a696-4ee3-9009-3efded636d8b/changes 202",
+            "GET 22e160a5-ade3-49a7-b976-50db19f192ec/content 206",
+            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
             "POST 2/activate 200",
-            "POST faca7674-b859-4559-9423-682000be436c_3148117f-dc99-421b-ad70-b8420a658dcd/events 200",
-            "POST faca7674-b859-4559-9423-682000be436c_3148117f-dc99-421b-ad70-b8420a658dcd/events 200"
+            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
+            "POST 195d98ad-b961-486d-983a-de750b640785/events 200"
           ]
         },
         {
@@ -115,11 +115,11 @@
           "detail": {
             "manual_epoch": "0",
             "manual_watched": null,
-            "position_ms": 48611,
+            "position_ms": 48609,
             "profile_id": "default",
             "revision": "9",
-            "session_id": "faca7674-b859-4559-9423-682000be436c_3148117f-dc99-421b-ad70-b8420a658dcd",
-            "timeline_id": "1a36f1a1-6276-4807-999d-aa0f3bc5865e",
+            "session_id": "195d98ad-b961-486d-983a-de750b640785",
+            "timeline_id": "43347f2e-8861-4771-b1af-25ac7afc497c",
             "watched": false
           }
         },
@@ -156,16 +156,16 @@
                 "state": "ready",
                 "text": ""
               },
-              "resume": 48611
+              "resume": 48609
             },
             "resumedPlay": {
               "advancing": true,
-              "from": 48.613457,
-              "to": 49.629999,
+              "from": 48.611287,
+              "to": 49.621677,
               "logical": 49.6,
               "mode": "native"
             },
-            "saved": 48611
+            "saved": 48609
           }
         },
         {
@@ -186,7 +186,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-578b44fc-d987-4b4c-a026-54f0d009d121",
+            "candidate": "t-22e160a5-ade3-49a7-b976-50db19f192ec",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -200,9 +200,8 @@
           "detail": [
             "2/master.m3u8 200",
             "2/variants/main/index.m3u8 200",
-            "2/segments/0.m4s 200",
             "2/variants/main/init.mp4 200",
-            "2/segments/1.m4s 200"
+            "2/segments/0.m4s 200"
           ]
         },
         {
@@ -222,9 +221,9 @@
             },
             "switchedPlay": {
               "advancing": true,
-              "from": 50.275215,
-              "to": 52.285347,
-              "logical": 52.3,
+              "from": 50.277109,
+              "to": 52.54191,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -237,9 +236,9 @@
             "before": 49.6,
             "switchedPlay": {
               "advancing": true,
-              "from": 50.275215,
-              "to": 52.285347,
-              "logical": 52.3,
+              "from": 50.277109,
+              "to": 52.54191,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -250,10 +249,10 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 53422,
+              "position_ms": 53841,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "60d6e335da1746e1b646d6b4501ccfb4",
+              "event_id": "5df23ee7205a43068768bf428c284ce0",
               "sequence": "5"
             }
           }
@@ -264,23 +263,23 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 53422,
+              "position_ms": 53841,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "60d6e335da1746e1b646d6b4501ccfb4",
+              "event_id": "5df23ee7205a43068768bf428c284ce0",
               "sequence": "5"
             },
             "drained": {
               "status": 200,
               "request": {
-                "position_ms": 53422,
+                "position_ms": 53841,
                 "status": "paused",
                 "delivery_generation": "1",
-                "event_id": "60d6e335da1746e1b646d6b4501ccfb4",
+                "event_id": "5df23ee7205a43068768bf428c284ce0",
                 "sequence": "5"
               }
             },
-            "server": 53471
+            "server": 53889
           }
         },
         {
@@ -288,20 +287,20 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "durable": 53471,
+            "durable": 53889,
             "afterRestart": {
               "ready": {
                 "state": "ready",
                 "text": ""
               },
-              "resume": 53471,
+              "resume": 53889,
               "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
             },
             "restartPlay": {
               "advancing": true,
-              "from": 53.474524,
-              "to": 55.546666,
-              "logical": 55.5,
+              "from": 53.892854,
+              "to": 55.969627,
+              "logical": 56,
               "mode": "native"
             }
           }
@@ -325,11 +324,11 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "product": "1150c86c-1085-4598-905b-dd487957f1b7",
+            "product": "84c233fb-678a-436a-87f0-fb10d88ffa0f",
             "retired": "not observed",
-            "after": 404,
-            "state": 404,
-            "elapsedMs": 5087
+            "after": 200,
+            "state": "closed",
+            "elapsedMs": 5123
           }
         },
         {
@@ -346,7 +345,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-72eb5eea-6e44-470c-8d10-a4f81b4f8547",
+            "candidate": "t-3d72f8c0-4aee-47bf-a0a0-896484d826b7",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -384,8 +383,8 @@
         }
       ],
       "serverStartsMs": [
-        1065,
-        119
+        2908,
+        116
       ],
       "summary": {
         "pass": 23,
@@ -411,7 +410,7 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "play": "/play/366dab87-4750-468b-9537-9ac60f8f399c"
+            "play": "/play/02af9fb4-e5d4-4cea-9932-396678b7305b"
           }
         },
         {
@@ -422,7 +421,7 @@
             "transport": "http_range",
             "operation": "original",
             "status": "ready",
-            "candidate": "o-bc364b44-9285-4ae8-bf48-54a851119e69",
+            "candidate": "o-5a16c916-366f-4ea3-bbde-8170bc57f5a3",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -445,7 +444,7 @@
           "detail": {
             "advancing": true,
             "from": 0,
-            "to": 3.245283791670907,
+            "to": 3.2482074170039805,
             "logical": 3.2,
             "mode": "native"
           }
@@ -471,9 +470,9 @@
             },
             "seekPlay": {
               "advancing": true,
-              "from": 40.04049070832616,
-              "to": 42.24768108334455,
-              "logical": 42.2,
+              "from": 40.07869791631477,
+              "to": 42.25387212466641,
+              "logical": 42.3,
               "mode": "native"
             }
           }
@@ -483,14 +482,14 @@
           "status": "pass",
           "gap": null,
           "detail": [
-            "POST 999f5037-7ca4-4230-940f-493842358883_8598df70-1cb7-462b-8ccf-991e731e440a/events 200",
-            "POST 8598df70-1cb7-462b-8ccf-991e731e440a/changes 202",
-            "GET bc364b44-9285-4ae8-bf48-54a851119e69/content 206",
-            "GET bc364b44-9285-4ae8-bf48-54a851119e69/content 206",
-            "POST 999f5037-7ca4-4230-940f-493842358883_8598df70-1cb7-462b-8ccf-991e731e440a/events 200",
+            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
+            "POST 1183c3f8-4b2b-491b-be9d-8530802cfe4f/changes 202",
+            "GET 5a16c916-366f-4ea3-bbde-8170bc57f5a3/content 206",
+            "GET 5a16c916-366f-4ea3-bbde-8170bc57f5a3/content 206",
+            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
             "POST 2/activate 200",
-            "POST 999f5037-7ca4-4230-940f-493842358883_8598df70-1cb7-462b-8ccf-991e731e440a/events 200",
-            "POST 999f5037-7ca4-4230-940f-493842358883_8598df70-1cb7-462b-8ccf-991e731e440a/events 200"
+            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
+            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200"
           ]
         },
         {
@@ -500,11 +499,11 @@
           "detail": {
             "manual_epoch": "0",
             "manual_watched": null,
-            "position_ms": 48823,
+            "position_ms": 48765,
             "profile_id": "default",
             "revision": "9",
-            "session_id": "999f5037-7ca4-4230-940f-493842358883_8598df70-1cb7-462b-8ccf-991e731e440a",
-            "timeline_id": "366dab87-4750-468b-9537-9ac60f8f399c",
+            "session_id": "2414e273-64d7-4bf3-b661-234a20745058",
+            "timeline_id": "02af9fb4-e5d4-4cea-9932-396678b7305b",
             "watched": false
           }
         },
@@ -541,16 +540,16 @@
                 "state": "ready",
                 "text": ""
               },
-              "resume": 48823
+              "resume": 48765
             },
             "resumedPlay": {
               "advancing": true,
-              "from": 48.823,
-              "to": 50.070760124659365,
-              "logical": 50.1,
+              "from": 48.765,
+              "to": 50.014235875321916,
+              "logical": 50,
               "mode": "native"
             },
-            "saved": 48823
+            "saved": 48765
           }
         },
         {
@@ -571,7 +570,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-bc364b44-9285-4ae8-bf48-54a851119e69",
+            "candidate": "t-5a16c916-366f-4ea3-bbde-8170bc57f5a3",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -595,7 +594,7 @@
           "status": "blocked",
           "gap": "demuxe-live-hls",
           "detail": {
-            "before": 50.1,
+            "before": 50,
             "switched": {
               "options": [
                 "",
@@ -607,9 +606,9 @@
             },
             "switchedPlay": {
               "advancing": true,
-              "from": 50.893449624336306,
-              "to": 53.07614454133445,
-              "logical": 53.1,
+              "from": 51.03850874999775,
+              "to": 53.28244616699539,
+              "logical": 53.3,
               "mode": "native"
             }
           }
@@ -619,12 +618,12 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "before": 50.1,
+            "before": 50,
             "switchedPlay": {
               "advancing": true,
-              "from": 50.893449624336306,
-              "to": 53.07614454133445,
-              "logical": 53.1,
+              "from": 51.03850874999775,
+              "to": 53.28244616699539,
+              "logical": 53.3,
               "mode": "native"
             }
           }
@@ -635,10 +634,10 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54306,
+              "position_ms": 54902,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "6021163ea1d74bcd923c2867df5ca7ea",
+              "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
               "sequence": "5"
             }
           }
@@ -649,23 +648,23 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54306,
+              "position_ms": 54902,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "6021163ea1d74bcd923c2867df5ca7ea",
+              "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
               "sequence": "5"
             },
             "drained": {
               "status": 200,
               "request": {
-                "position_ms": 54306,
+                "position_ms": 54902,
                 "status": "paused",
                 "delivery_generation": "1",
-                "event_id": "6021163ea1d74bcd923c2867df5ca7ea",
+                "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
                 "sequence": "5"
               }
             },
-            "server": 54307
+            "server": 54903
           }
         },
         {
@@ -673,20 +672,20 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "durable": 54307,
+            "durable": 54903,
             "afterRestart": {
               "ready": {
                 "state": "ready",
                 "text": ""
               },
-              "resume": 54307,
+              "resume": 54903,
               "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
             },
             "restartPlay": {
               "advancing": true,
-              "from": 54.307,
-              "to": 56.55435970800194,
-              "logical": 56.6,
+              "from": 54.903,
+              "to": 57.15208883297832,
+              "logical": 57.2,
               "mode": "native"
             }
           }
@@ -710,11 +709,11 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "product": "e2e22cc9-9403-419b-be6b-fddec1153744",
+            "product": "b3c5bd13-3249-4375-9e78-4399afe76484",
             "retired": "not observed",
-            "after": 404,
-            "state": 404,
-            "elapsedMs": 5110
+            "after": 200,
+            "state": "closed",
+            "elapsedMs": 5156
           }
         },
         {
@@ -731,7 +730,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-339e9f46-06dd-405e-8377-b3f7c1cac58c",
+            "candidate": "t-f2095782-d054-4d14-bc0e-d81c25a7ba57",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -761,7 +760,7 @@
             "plan": "hls",
             "admitted": 201,
             "played": true,
-            "currentTime": 4.100144708674224,
+            "currentTime": 4.0068929996422575,
             "width": 640,
             "height": 360,
             "error": null
@@ -769,8 +768,8 @@
         }
       ],
       "serverStartsMs": [
-        1022,
-        107
+        2990,
+        110
       ],
       "summary": {
         "pass": 23,
@@ -797,7 +796,7 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "play": "/play/694c24b4-bd2e-4dd5-9596-ddc140a92523"
+            "play": "/play/754a3c03-3a36-4496-936a-47b580f47fe4"
           }
         },
         {
@@ -808,7 +807,7 @@
             "transport": "http_range",
             "operation": "original",
             "status": "ready",
-            "candidate": "o-ed6ab7b6-2d53-40d6-90c6-d29d65dd441b",
+            "candidate": "o-66f58b0b-4a03-47a3-aacf-1442fc595fad",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -830,9 +829,9 @@
           "gap": null,
           "detail": {
             "advancing": true,
-            "from": 0.004735,
-            "to": 3.13609,
-            "logical": 3.1,
+            "from": 0.05211,
+            "to": 3.189607,
+            "logical": 3.2,
             "mode": "native"
           }
         },
@@ -856,9 +855,9 @@
             },
             "seekPlay": {
               "advancing": true,
-              "from": 40.047898,
-              "to": 42.056053,
-              "logical": 42.1,
+              "from": 40.11421,
+              "to": 42.22598,
+              "logical": 42.2,
               "mode": "native"
             }
           }
@@ -868,13 +867,13 @@
           "status": "pass",
           "gap": null,
           "detail": [
-            "POST 48976c9d-3cc3-4f4c-93db-6964107b4fa4_9538ec80-a266-46da-96a2-e785599e848c/events 200",
-            "POST 9538ec80-a266-46da-96a2-e785599e848c/changes 202",
-            "GET ed6ab7b6-2d53-40d6-90c6-d29d65dd441b/content 206",
-            "POST 48976c9d-3cc3-4f4c-93db-6964107b4fa4_9538ec80-a266-46da-96a2-e785599e848c/events 200",
+            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
+            "POST 998812c9-2683-43ea-b4a4-9174e6c6026f/changes 202",
+            "GET 66f58b0b-4a03-47a3-aacf-1442fc595fad/content 206",
+            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
             "POST 2/activate 200",
-            "POST 48976c9d-3cc3-4f4c-93db-6964107b4fa4_9538ec80-a266-46da-96a2-e785599e848c/events 200",
-            "POST 48976c9d-3cc3-4f4c-93db-6964107b4fa4_9538ec80-a266-46da-96a2-e785599e848c/events 200"
+            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
+            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200"
           ]
         },
         {
@@ -884,11 +883,11 @@
           "detail": {
             "manual_epoch": "0",
             "manual_watched": null,
-            "position_ms": 48610,
+            "position_ms": 48737,
             "profile_id": "default",
             "revision": "9",
-            "session_id": "48976c9d-3cc3-4f4c-93db-6964107b4fa4_9538ec80-a266-46da-96a2-e785599e848c",
-            "timeline_id": "694c24b4-bd2e-4dd5-9596-ddc140a92523",
+            "session_id": "daf10861-a4c0-41ba-9a92-3d2ba79de58d",
+            "timeline_id": "754a3c03-3a36-4496-936a-47b580f47fe4",
             "watched": false
           }
         },
@@ -925,16 +924,16 @@
                 "state": "ready",
                 "text": ""
               },
-              "resume": 48610
+              "resume": 48737
             },
             "resumedPlay": {
               "advancing": true,
-              "from": 48.612444,
-              "to": 49.630919,
-              "logical": 49.6,
+              "from": 48.742792,
+              "to": 49.7486,
+              "logical": 49.7,
               "mode": "native"
             },
-            "saved": 48610
+            "saved": 48737
           }
         },
         {
@@ -955,7 +954,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-ed6ab7b6-2d53-40d6-90c6-d29d65dd441b",
+            "candidate": "t-66f58b0b-4a03-47a3-aacf-1442fc595fad",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -969,8 +968,8 @@
           "detail": [
             "2/master.m3u8 200",
             "2/variants/main/index.m3u8 200",
-            "2/variants/main/init.mp4 200",
             "2/segments/0.m4s 200",
+            "2/variants/main/init.mp4 200",
             "2/segments/1.m4s 200"
           ]
         },
@@ -979,7 +978,7 @@
           "status": "blocked",
           "gap": "demuxe-live-hls",
           "detail": {
-            "before": 49.6,
+            "before": 49.7,
             "switched": {
               "options": [
                 "",
@@ -991,9 +990,9 @@
             },
             "switchedPlay": {
               "advancing": true,
-              "from": 50.280507,
-              "to": 52.287554,
-              "logical": 52.3,
+              "from": 51.101849,
+              "to": 53.205642,
+              "logical": 53.2,
               "mode": "native"
             }
           }
@@ -1003,12 +1002,12 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "before": 49.6,
+            "before": 49.7,
             "switchedPlay": {
               "advancing": true,
-              "from": 50.280507,
-              "to": 52.287554,
-              "logical": 52.3,
+              "from": 51.101849,
+              "to": 53.205642,
+              "logical": 53.2,
               "mode": "native"
             }
           }
@@ -1019,10 +1018,10 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 53539,
+              "position_ms": 54650,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "6a12ae5a3ceb4181942d46b6948dc2c8",
+              "event_id": "3d76888dba534a2b93939a60461e285e",
               "sequence": "5"
             }
           }
@@ -1033,23 +1032,23 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 53539,
+              "position_ms": 54650,
               "status": "paused",
               "delivery_generation": "1",
-              "event_id": "6a12ae5a3ceb4181942d46b6948dc2c8",
+              "event_id": "3d76888dba534a2b93939a60461e285e",
               "sequence": "5"
             },
             "drained": {
               "status": 200,
               "request": {
-                "position_ms": 53539,
+                "position_ms": 54650,
                 "status": "paused",
                 "delivery_generation": "1",
-                "event_id": "6a12ae5a3ceb4181942d46b6948dc2c8",
+                "event_id": "3d76888dba534a2b93939a60461e285e",
                 "sequence": "5"
               }
             },
-            "server": 53590
+            "server": 54698
           }
         },
         {
@@ -1057,20 +1056,20 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "durable": 53590,
+            "durable": 54698,
             "afterRestart": {
               "ready": {
                 "state": "ready",
                 "text": ""
               },
-              "resume": 53590,
+              "resume": 54698,
               "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
             },
             "restartPlay": {
               "advancing": true,
-              "from": 53.592422,
-              "to": 55.662121,
-              "logical": 55.7,
+              "from": 54.700729,
+              "to": 56.769176,
+              "logical": 56.8,
               "mode": "native"
             }
           }
@@ -1094,11 +1093,11 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "product": "b2034f48-291e-4e47-b982-030b96189508",
+            "product": "b0cc1912-f299-4d8a-974a-c43fd38d5468",
             "retired": "not observed",
-            "after": 404,
-            "state": 404,
-            "elapsedMs": 5093
+            "after": 200,
+            "state": "closed",
+            "elapsedMs": 5287
           }
         },
         {
@@ -1115,7 +1114,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-09ead1b6-2ea7-4a3c-9481-476431317594",
+            "candidate": "t-c542872e-4311-44e9-9b62-097c2ccd1530",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -1153,8 +1152,8 @@
         }
       ],
       "serverStartsMs": [
-        1858,
-        117
+        1128,
+        182
       ],
       "summary": {
         "pass": 23,
@@ -1166,13 +1165,13 @@
   "media": [
     {
       "name": "Legacy Broadcast.mkv",
-      "sha256": "60ee37c4f91a7ceb2e3c421f90cd7f6016bdac030d3615d0e8cbb4d9d2de9aa9"
+      "sha256": "51ac0f90ef84ae133b7b1b4c92426a638d4c6c6781c3acf395ec9cf02a19b4c3"
     },
     {
       "name": "Signal Film.mp4",
       "sha256": "6f04e56f06ce0b4f31d56b8766272e8a91be1bbbf5377c533b8de961c7543832"
     }
   ],
-  "finished": "2026-10-10T17:21:02.616Z",
+  "finished": "2026-10-10T19:31:26.973Z",
   "result": "pass-with-blocked-gaps"
 }

@@ -1,6 +1,7 @@
 # Client playback against production APIs (A11/A12 integration)
 
-Recorded October 10, 2026 on macOS 26.5 arm64. The receipt is
+Recorded October 10, 2026 on macOS 26.5 arm64, against the combined branch:
+the playback API server commits plus these client commits. The receipt is
 [receipt-2026-10-10.json](receipt-2026-10-10.json). Screenshots, network and
 console logs, server logs and browser videos were kept outside the repository
 with the run.
@@ -106,18 +107,21 @@ the media hashes, every check with its detail, and `result`, which is one of
   delivery contract has no sidecar field.
 - **Live HLS in the Motion player:** the Demuxe/Shaka gap above. Chromium native
   live-HLS parsing also remains unresolved.
-- **Prepared renditions:** not offered by the v2 planner yet. Conversion is live
-  only.
+- **Prepared renditions:** the server plans them (`V2_PLAYBACK.md`); this harness
+  exercises only originals and live conversion.
 - **Restart outbox reconciliation:** outbox records left from before a restart
   are retained and not replayed. That is the A11 design, which needs a server
   restore/runtime signal before cross-runtime replay can be safe. The banner
   shown in that case is informational.
-- **Server items (moving to the playback API workstream):**
-  - timeline-keyed viewing with a real manual epoch and stored event IDs
-  - `PUT viewing-sessions/{id}/delivery`
-  - ticket auth on stream routes
-  - the transactional and authorization review findings recorded in that
-    workstream's PR
+- **Server items** (server-side record in `V2_PLAYBACK.md`):
+  - no media-ticket auth on stream routes
+  - no hardware or copy routes in v2 plans
+  - v1 and v2 progress are separate authorities after migration 0032
+  - an atomic predecessor takeover on `ViewingCreate` needs a contract change
+    (A00); the client's interim check is fenced by the server revision
+- **Restart banner:** after any server restart the player shows "Earlier
+  progress belongs to a rejected session or another server runtime…". That's
+  accurate about retention but alarming after an ordinary restart.
 - **Next title:** the player's Next action and the `/timelines/{t}/next` resolver
   are not exercised by this harness.
 - **Other platforms:** Windows, Linux, physical devices, installed/signed packages
