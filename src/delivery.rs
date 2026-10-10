@@ -43,8 +43,44 @@ pub const TARGET_SECONDS: u64 = 6;
 pub const GENERATION_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 /// A published segment larger than this fails its generation.
 pub const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Recipe identity bound into every generation pin.
+/// Recipe identity bound into every transcoding generation pin.
 pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
+/// Stream copy of H.264 and AAC into fMP4 HLS, source timestamps preserved.
+pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
+/// Stream copy of H.264 with audio converted to stereo AAC.
+pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
+/// Copied segments end at source keyframes; GOPs up to this long are served.
+pub const COPY_TARGET_SECONDS: u64 = 12;
+
+/// Live routes a client may request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveOperation {
+    VideoTranscode,
+    Remux,
+    AudioConvert,
+}
+impl LiveOperation {
+    fn operation(self) -> Operation {
+        match self {
+            LiveOperation::VideoTranscode => Operation::VideoTranscode,
+            LiveOperation::Remux => Operation::Remux,
+            LiveOperation::AudioConvert => Operation::AudioConvert,
+        }
+    }
+}
+
+fn copies_video(operation: Operation) -> bool {
+    matches!(operation, Operation::Remux | Operation::AudioConvert)
+}
+
+fn target_seconds(operation: Operation) -> u64 {
+    if copies_video(operation) {
+        COPY_TARGET_SECONDS
+    } else {
+        TARGET_SECONDS
+    }
+}
 const HEARTBEAT_SECONDS: u64 = 10;
 
 pub struct Runtime {
@@ -130,7 +166,21 @@ impl Session {
 /// Apply one input and dispatch its effects while holding the session lock, so
 /// effects of consecutive transitions cannot be reordered (e.g. Stop before Start).
 fn apply(app: &App, session: &Arc<Session>, input: Input) -> Result<Delivery, core::Error> {
+    apply_if(app, session, |_| true, input)
+}
+
+/// `apply`, refused with a generation conflict unless `current` holds for the
+/// state the input would apply to (checked under the same lock).
+fn apply_if(
+    app: &App,
+    session: &Arc<Session>,
+    current: impl FnOnce(&Delivery) -> bool,
+    input: Input,
+) -> Result<Delivery, core::Error> {
     let mut inner = session.inner.lock().unwrap();
+    if !current(&inner.delivery) {
+        return Err(core::Error::GenerationConflict);
+    }
     let (next, effects) = core::transition(&inner.delivery, &input)?;
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
@@ -316,7 +366,13 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
-fn arguments(start_ms: u64, audio: Option<u32>, directory: &FsPath) -> Vec<String> {
+fn arguments(
+    operation: Operation,
+    start_ms: u64,
+    audio: Option<u32>,
+    directory: &FsPath,
+) -> Vec<String> {
+    let copy = copies_video(operation);
     let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -329,6 +385,11 @@ fn arguments(start_ms: u64, audio: Option<u32>, directory: &FsPath) -> Vec<Strin
     .map(str::to_owned)
     .to_vec();
     args.push(format!("{}.{:03}", start_ms / 1000, start_ms % 1000));
+    if copy {
+        // Keep source timestamps: copied video starts at the preceding keyframe,
+        // and its media time is timeline time (the route requires a zero start).
+        args.push("-copyts".into());
+    }
     args.extend(
         [
             // The validated source descriptor inherited as fd 3.
@@ -342,37 +403,37 @@ fn arguments(start_ms: u64, audio: Option<u32>, directory: &FsPath) -> Vec<Strin
         args.push("-map".into());
         args.push(format!("0:a:{audio}"));
     }
+    args.extend(["-sn", "-dn", "-map_metadata", "-1"].map(str::to_owned));
+    if copy {
+        args.extend(["-c:v", "copy"].map(str::to_owned));
+    } else {
+        args.extend(
+            [
+                "-vf",
+                "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-threads",
+                "2",
+                "-force_key_frames",
+            ]
+            .map(str::to_owned),
+        );
+        args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
+    }
+    if operation == Operation::Remux {
+        args.extend(["-c:a", "copy"].map(str::to_owned));
+    } else {
+        args.extend(["-c:a", "aac", "-b:a", "160k", "-ac", "2"].map(str::to_owned));
+    }
     args.extend(
         [
-            "-sn",
-            "-dn",
-            "-map_metadata",
-            "-1",
-            "-vf",
-            "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-threads",
-            "2",
-            "-force_key_frames",
-        ]
-        .map(str::to_owned),
-    );
-    args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
-    args.extend(
-        [
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-ac",
-            "2",
             "-f",
             "hls",
             "-hls_list_size",
@@ -396,6 +457,45 @@ fn arguments(start_ms: u64, audio: Option<u32>, directory: &FsPath) -> Vec<Strin
     args
 }
 
+/// Video start time of segment 0, in milliseconds. The init fragment and
+/// segment are piped to FFprobe, so no path is interpreted by it.
+async fn segment_zero_start(app: &App, directory: &FsPath) -> Option<u64> {
+    use tokio::io::AsyncWriteExt;
+    let mut bytes = tokio::fs::read(directory.join("init.mp4")).await.ok()?;
+    bytes.extend(tokio::fs::read(directory.join("seg0.m4s")).await.ok()?);
+    let mut probe = Command::new(app.ffprobe.as_ref())
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "pipe",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=start_time",
+            "-of",
+            "csv=p=0",
+            "-i",
+            "pipe:0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdin = probe.stdin.take()?;
+    let writer = tokio::spawn(async move {
+        // FFprobe may stop reading once it has what it needs.
+        let _ = stdin.write_all(&bytes).await;
+    });
+    let output = probe.wait_with_output().await.ok()?;
+    let _ = writer.await;
+    let seconds: f64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
+    (output.status.success() && seconds.is_finite() && seconds >= 0.0)
+        .then(|| (seconds * 1000.0).round() as u64)
+}
+
 /// Report newly published segments (and completion) in order.
 async fn observe(
     app: &App,
@@ -404,6 +504,7 @@ async fn observe(
     directory: &FsPath,
     reported: &mut u32,
     start_ms: u64,
+    operation: Operation,
 ) {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -443,12 +544,30 @@ async fn observe(
             return;
         }
         let input = if segment.index == 0 {
-            // Input seeking before decoding starts output at the requested time.
-            Input::Ready {
-                generation,
-                media_time_origin_ms: start_ms,
-                first_segment_ms: segment.duration_ms,
-                target_duration_s: TARGET_SECONDS,
+            if copies_video(operation) {
+                // Copied output keeps source time (timeline time): segment 0 begins
+                // at the keyframe FFmpeg seeked to, measured from the output itself.
+                let Some(begin) = segment_zero_start(app, directory).await else {
+                    tracing::warn!(delivery=%session.id, generation, "segment 0 start not measurable");
+                    let _ = apply(app, session, Input::Failed { generation });
+                    return;
+                };
+                Input::Ready {
+                    generation,
+                    media_time_origin_ms: 0,
+                    first_segment_start_ms: begin,
+                    first_segment_ms: segment.duration_ms,
+                    target_duration_s: target_seconds(operation),
+                }
+            } else {
+                // Input seeking before decoding starts output at the requested time.
+                Input::Ready {
+                    generation,
+                    media_time_origin_ms: start_ms,
+                    first_segment_start_ms: 0,
+                    first_segment_ms: segment.duration_ms,
+                    target_duration_s: target_seconds(operation),
+                }
             }
         } else {
             Input::Segment {
@@ -526,6 +645,7 @@ async fn run_generation(
             None => return,
         }
     };
+    let operation = pin.operation;
     let directory = session.directory(&app, generation);
     let audio = pin
         .tracks
@@ -577,7 +697,7 @@ async fn run_generation(
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(&app.processing.settings.ffmpeg)
-        .args(arguments(start_ms, audio, &directory))
+        .args(arguments(operation, start_ms, audio, &directory))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -644,7 +764,7 @@ async fn run_generation(
                     _ = stop.cancelled() => break None,
                     observed = tokio::time::timeout(
                         OBSERVE_DEADLINE,
-                        observe(&app, &session, generation, &directory, &mut reported, start_ms),
+                        observe(&app, &session, generation, &directory, &mut reported, start_ms, operation),
                     ) => observed,
                 };
                 if observed.is_err() {
@@ -669,6 +789,7 @@ async fn run_generation(
                     &directory,
                     &mut reported,
                     start_ms,
+                    operation,
                 ),
             )
             .await;
@@ -888,6 +1009,10 @@ pub struct CreateRequest {
     pub start_ms: u64,
     /// Zero-based audio stream among the source's audio streams. Null omits audio.
     pub audio_track: Option<u32>,
+    /// Live route; omitted means video_transcode. Copy routes require H.264
+    /// starting at zero (remux: AAC or no audio; audio_convert: non-AAC audio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<LiveOperation>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -900,6 +1025,9 @@ pub struct ChangeRequest {
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<u32>)]
     pub audio_track: Option<Option<u32>>,
+    /// Replace the live route; omitted keeps the current one.
+    #[serde(default)]
+    pub operation: Option<LiveOperation>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1060,37 +1188,87 @@ fn tracks(audio: Option<u32>) -> Vec<String> {
     tracks
 }
 
-fn pin(file: &db::ItemRow, audio: Option<u32>) -> Pin {
+fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
+    let recipe = match operation {
+        Operation::Remux => REMUX_RECIPE,
+        Operation::AudioConvert => AUDIO_RECIPE,
+        _ => RECIPE,
+    };
     Pin {
         source_file: file.id.clone(),
         source_revision: file.revision.clone(),
         tracks: tracks(audio),
-        operation: Operation::VideoTranscode,
-        recipe_digest: Some(RECIPE.into()),
+        operation,
+        recipe_digest: Some(recipe.into()),
     }
 }
 
-fn validate_audio(file: &db::ItemRow, audio: Option<u32>) -> Result<(), ApiError> {
+fn pinned_audio(pin: &Pin) -> Option<u32> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()))
+}
+
+/// Check the exact selected streams against the core's live route rule.
+fn validate_route(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    operation: Operation,
+    copy_enabled: bool,
+) -> Result<(), ApiError> {
+    if copies_video(operation) && !copy_enabled {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unqualified",
+            "Live stream-copy routes are not enabled on this server",
+        ));
+    }
     let streams: Vec<db::Track> =
         serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
     let Some(video) = streams.iter().find(|t| t.kind == "video") else {
         return Err(ApiError::bad("Live conversion requires a video stream"));
     };
-    // This recipe has no qualified tone-mapping path.
-    if matches!(
+    let audios: Vec<&db::Track> = streams.iter().filter(|t| t.kind == "audio").collect();
+    let selected = match audio {
+        Some(index) => Some(
+            *audios
+                .get(index as usize)
+                .ok_or_else(|| ApiError::bad("Unknown audio track"))?,
+        ),
+        None => None,
+    };
+    let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
-    ) {
-        return Err(ApiError::new(
+    );
+    let source = core::SourceStreams {
+        video: Some(video.codec.as_str()),
+        audio: selected.map(|t| t.codec.as_str()),
+        hdr,
+        // Every stream, not only the video: the earliest one is the container
+        // start that input seeking is relative to.
+        starts_at_zero: streams
+            .iter()
+            .all(|t| t.start_time_seconds.is_some_and(|s| s.abs() < 0.0005)),
+        eight_bit_420: matches!(video.pixel_format.as_deref(), Some("yuv420p" | "yuvj420p")),
+    };
+    if core::live_route_supported(operation, &source) {
+        return Ok(());
+    }
+    Err(if hdr {
+        // No live route has a qualified tone-mapping path.
+        ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "hdr_unsupported",
             "Live conversion of HDR video is not supported",
-        ));
-    }
-    if audio.is_some_and(|a| a as usize >= streams.iter().filter(|t| t.kind == "audio").count()) {
-        return Err(ApiError::bad("Unknown audio track"));
-    }
-    Ok(())
+        )
+    } else {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "The selected streams cannot use this live route",
+        )
+    })
 }
 
 #[utoipa::path(operation_id="create_delivery",post,path="/api/v1/deliveries",params(("Idempotency-Key"=Option<String>,Header,description="16–128 bytes; exact retries replay the durable acknowledgement")),request_body=CreateRequest,security(("admin_token"=[])),responses((status=201,description="Delivery admitted; its first generation starts encoding",body=DeliveryView),(status=400,description="Invalid position or track",body=crate::api::ErrorBody),(status=404,description="Unknown or unavailable file",body=crate::api::ErrorBody),(status=409,description="Source revision or idempotency conflict",body=crate::api::ErrorBody),(status=503,description="Too many deliveries",body=crate::api::ErrorBody)))]
@@ -1251,7 +1429,16 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    validate_audio(&file, r.audio_track)?;
+    let operation = r
+        .operation
+        .unwrap_or(LiveOperation::VideoTranscode)
+        .operation();
+    validate_route(
+        &file,
+        r.audio_track,
+        operation,
+        app.processing.settings.experimental_copy_routes,
+    )?;
     let duration_ms = file
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -1273,7 +1460,7 @@ async fn admit_owned(
     let (delivery, effects) = Delivery::admit(
         // The current catalog binds one timeline per edition.
         file.edition_id.clone(),
-        pin(&file, r.audio_track),
+        pin(&file, r.audio_track, operation),
         r.start_ms,
         Some(duration_ms),
         runtime.now_ms(),
@@ -1405,9 +1592,21 @@ pub async fn change(
     let Ok(session) = app.processing.deliveries.session(&id) else {
         return Err(not_live(&app, &id).await);
     };
-    let replan = match r.audio_track {
-        None => None,
-        Some(audio) => {
+    let replan = match (r.audio_track, r.operation) {
+        (None, None) => None,
+        (audio, operation) => {
+            // Unchanged parts of the newest selection carry over.
+            let current = {
+                let inner = session.inner.lock().unwrap();
+                let d = &inner.delivery;
+                d.pending
+                    .or(d.active)
+                    .and_then(|n| d.generations.get(&n))
+                    .map(|g| g.pin.clone())
+            };
+            let current = current.ok_or_else(|| error(core::Error::GenerationConflict))?;
+            let audio = audio.unwrap_or_else(|| pinned_audio(&current));
+            let operation = operation.map_or(current.operation, LiveOperation::operation);
             let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
                 .bind(&session.file_id)
                 .fetch_optional(&app.db)
@@ -1419,13 +1618,36 @@ pub async fn change(
                     "Create a new delivery",
                 ));
             }
-            validate_audio(&file, audio)?;
-            Some((file.edition_id.clone(), pin(&file, audio)))
+            validate_route(
+                &file,
+                audio,
+                operation,
+                app.processing.settings.experimental_copy_routes,
+            )?;
+            Some((
+                current,
+                (file.edition_id.clone(), pin(&file, audio, operation)),
+            ))
         }
     };
-    let d = apply(
+    // A partial change was merged with the selection read before the catalog
+    // query; if another change replaced that selection meanwhile, the merge is
+    // stale and must not supersede it.
+    let (basis, replan) = match replan {
+        Some((basis, replan)) => (Some(basis), Some(replan)),
+        None => (None, None),
+    };
+    let d = apply_if(
         &app,
         &session,
+        |d| {
+            basis.as_ref().is_none_or(|basis| {
+                d.pending
+                    .or(d.active)
+                    .and_then(|n| d.generations.get(&n))
+                    .is_some_and(|g| &g.pin == basis)
+            })
+        },
         Input::Change {
             expected_generation: generation_number(&r.expected_generation)?,
             position_ms: r.position_ms,
@@ -1593,6 +1815,65 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
+    use super::{Operation, db, validate_route};
+
+    #[tokio::test]
+    async fn copy_routes_are_refused_unless_enabled_and_eligible() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+        let tracks = |pixel_format: &str, start: f64| {
+            serde_json::json!([
+                {"index":0,"kind":"video","codec":"h264","language":null,"pixel_format":pixel_format,"start_time_seconds":0.0},
+                {"index":1,"kind":"audio","codec":"aac","language":null,"start_time_seconds":start}
+            ])
+            .to_string()
+        };
+        let file = |tracks_json: String| db::ItemRow {
+            id: "f".into(),
+            item_id: "i".into(),
+            edition_id: "e".into(),
+            edition_label: "Original".into(),
+            kind: "video".into(),
+            library_id: "l".into(),
+            relative_path: "a.mkv".into(),
+            title: "A".into(),
+            revision: "r".into(),
+            fingerprint: "x".into(),
+            bytes: 1,
+            duration_seconds: Some(60.0),
+            tracks_json,
+            available: true,
+        };
+        async fn code(result: Result<(), crate::api::ApiError>) -> Option<String> {
+            let response = result.err()?.into_response();
+            let bytes = response.into_body().collect().await.ok()?.to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            body["code"].as_str().map(str::to_owned)
+        }
+        let eligible = file(tracks("yuv420p", 0.0));
+        assert!(validate_route(&eligible, Some(0), Operation::Remux, true).is_ok());
+        assert_eq!(
+            code(validate_route(&eligible, Some(0), Operation::Remux, false))
+                .await
+                .as_deref(),
+            Some("route_unqualified")
+        );
+        assert!(validate_route(&eligible, Some(0), Operation::VideoTranscode, false).is_ok());
+        // Audio starting before zero moves the container start; 10-bit video
+        // cannot be copied into the browser pipeline.
+        for ineligible in [
+            file(tracks("yuv420p", -0.5)),
+            file(tracks("yuv420p10le", 0.0)),
+        ] {
+            assert_eq!(
+                code(validate_route(&ineligible, Some(0), Operation::Remux, true))
+                    .await
+                    .as_deref(),
+                Some("route_unsupported")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn recorded_state_is_monotonic_and_restart_fence_is_permanent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1618,6 +1899,7 @@ mod tests {
             &Input::Ready {
                 generation: 1,
                 media_time_origin_ms: 0,
+                first_segment_start_ms: 0,
                 first_segment_ms: 4000,
                 target_duration_s: 6,
             },

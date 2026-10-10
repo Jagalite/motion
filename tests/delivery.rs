@@ -36,6 +36,13 @@ impl Fixture {
         Self::with_realtime(storage, false).await
     }
     async fn with_realtime(storage: playscale::storage::Settings, realtime: bool) -> Self {
+        Self::with_options(storage, realtime, false).await
+    }
+    async fn with_options(
+        storage: playscale::storage::Settings,
+        realtime: bool,
+        copy_routes: bool,
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter("playscale=debug")
@@ -61,6 +68,7 @@ impl Fixture {
         let mut processing =
             playscale::processing::Runtime::new(dir.path().join("cache"), Default::default());
         processing.supervisor = PathBuf::from(env!("CARGO_BIN_EXE_playscale"));
+        processing.settings.experimental_copy_routes = copy_routes;
         if realtime {
             // A survivor test must own an encoder that cannot finish the entire
             // fixture before the restart assertions reach it.
@@ -1009,5 +1017,148 @@ async fn lost_waiter_does_not_cancel_admission_and_replay_rechecks_authority() {
     })
     .await
     .unwrap();
+    f.stop.cancel();
+}
+
+/// Copy routes keep the source video bitstream and timestamps: a seek starts at
+/// the preceding keyframe, and only eligible stream combinations are admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_routes_start_at_keyframes_and_keep_source_video() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    // Copy routes are implemented but unqualified, so off unless enabled.
+    let f = Fixture::with_options(Default::default(), false, true).await;
+    // A 2 s GOP (48 frames at 24 fps); one file with AAC, one with AC-3 audio.
+    for (name, audio) in [("aac.mkv", "aac"), ("ac3.mkv", "ac3")] {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "60",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                audio,
+            ])
+            .arg(f.dir.path().join("media").join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    // The copy routes require every stream (hence the container) to start at
+    // zero: check the fixture really does, so a shifted encode fails loudly here.
+    for name in ["aac.mkv", "ac3.mkv"] {
+        let probed = probe(&f.dir.path().join("media").join(name));
+        for stream in probed["streams"].as_array().unwrap() {
+            let start: f64 = stream["start_time"].as_str().unwrap().parse().unwrap();
+            assert!(start.abs() < 0.0005, "{name} stream starts at {start}");
+        }
+    }
+    f.scan().await;
+    let mut files = Vec::new();
+    for name in ["aac.mkv", "ac3.mkv"] {
+        let row: (String, String) =
+            sqlx::query_as("SELECT id,revision FROM media_files WHERE relative_path=?")
+                .bind(name)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap();
+        files.push(row);
+    }
+    let [(aac, aac_revision), (ac3, ac3_revision)]: [(String, String); 2] =
+        files.try_into().unwrap();
+    let create = |id: &str, revision: &str, operation: &str, start: u64| json!({"file_id":id,"file_revision":revision,"start_ms":start,"audio_track":0,"operation":operation});
+    // Ineligible combinations are refused before anything starts.
+    for body in [
+        create(&ac3, &ac3_revision, "remux", 0),
+        create(&aac, &aac_revision, "audio_convert", 0),
+    ] {
+        let (status, refused) = f.json("POST", "/api/v1/deliveries", Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert_eq!(refused["code"], "route_unsupported");
+    }
+    let source_profile =
+        probe(&f.dir.path().join("media/aac.mkv"))["streams"][0]["profile"].clone();
+    assert_ne!(
+        source_profile,
+        json!("High"),
+        "source must differ from the transcode profile"
+    );
+
+    let mut deliveries = Vec::new();
+    for (id, revision, operation, start, audio_codec) in [
+        (&aac, &aac_revision, "remux", 31_000, "aac"),
+        (&ac3, &ac3_revision, "audio_convert", 0, "aac"),
+    ] {
+        let (status, created) = f
+            .json(
+                "POST",
+                "/api/v1/deliveries",
+                Some(create(id, revision, operation, start)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let delivery = created["id"].as_str().unwrap().to_owned();
+        let ready = f
+            .until(&delivery, |d| d["active"]["status"] == "active")
+            .await;
+        assert_eq!(ready["active"]["operation"], operation);
+        // Segment 0 begins at the keyframe at or before the request.
+        let begin = ready["active"]["available_start_ms"].as_u64().unwrap();
+        assert_eq!(begin, start / 2_000 * 2_000, "{ready}");
+        let base = format!("/api/v1/streams/{delivery}/1");
+        let playlist =
+            String::from_utf8(f.raw("GET", &format!("{base}/index.m3u8"), None).await.1).unwrap();
+        assert!(
+            playlist.contains("#EXT-X-TARGETDURATION:12\n"),
+            "{playlist}"
+        );
+        let (_, init) = f.raw("GET", &format!("{base}/init.mp4"), None).await;
+        let (_, first) = f.raw("GET", &format!("{base}/segments/0.m4s"), None).await;
+        let fragment = f.dir.path().join(format!("{operation}.mp4"));
+        std::fs::write(&fragment, [init, first].concat()).unwrap();
+        let streams = probe(&fragment)["streams"].as_array().unwrap().clone();
+        let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+        assert_eq!(video["codec_name"], "h264");
+        assert_eq!(video["profile"], source_profile, "video was re-encoded");
+        assert_eq!(video["width"], 320);
+        let audio = streams.iter().find(|s| s["codec_type"] == "audio").unwrap();
+        assert_eq!(audio["codec_name"], audio_codec);
+        deliveries.push(delivery);
+    }
+    for delivery in &deliveries {
+        assert_eq!(
+            f.raw("DELETE", &format!("/api/v1/deliveries/{delivery}"), None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("copy route capacity was not released");
     f.stop.cancel();
 }

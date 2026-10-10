@@ -36,6 +36,10 @@ pub struct Settings {
     pub startup_timeout_seconds: Option<u64>,
     pub no_progress_timeout_seconds: Option<u64>,
     pub expected_duration: Option<playscale_core::execution_deadline::ExpectedDurationPolicy>,
+    /// Admit live stream-copy routes (remux, audio conversion). Implemented but
+    /// not qualified: source timestamp mapping and browser playback of copied
+    /// streams are unverified, so they stay off unless explicitly enabled.
+    pub experimental_copy_routes: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -48,6 +52,7 @@ impl Default for Settings {
             startup_timeout_seconds: None,
             no_progress_timeout_seconds: None,
             expected_duration: None,
+            experimental_copy_routes: false,
         }
     }
 }
