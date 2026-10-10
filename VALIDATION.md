@@ -45,7 +45,8 @@ restricted mode. Verified: exactly one verified pre-upgrade backup named
 9→latest; identical item, file and library identities, media bytes, title and
 position; the full on-disk migration set; integrity_check ok and no foreign-key
 violations; one schema receipt and one exact legacy-progress attribution to
-the fixture's single timeline; anonymous legacy reads refused (401). A restart
+the fixture's single timeline; anonymous `GET /api/v1/items` refused (401 or
+403 accepted; 401 observed). A restart
 adds no backup and leaves receipt and attribution identities unchanged. The
 baseline refuses the upgraded database with sqlx's "migration 10 was
 previously applied but is missing" and the database stays usable. Rollback:
@@ -58,8 +59,9 @@ Integration: 13 checks (HTTP smoke, operations, catalog, viewing, processing
 with FFmpeg, reliability, video profiles, backup and packaging tool tests, four
 browser-module Node tests). Each runs in its own session, with its servers and
 encoders terminated afterwards and leaked processes counted as failures.
-`scripts/test_demuxe_bundle.mjs` needs an installed Demuxe bundle and is not
-run.
+`scripts/test_demuxe_bundle.mjs` needs an installed Demuxe bundle; the
+integration suite does not run it, but `scripts/package_app.py` runs it against
+the staged bundle in the package job.
 
 Local evidence (Apple silicon, macOS 26; shared and heavily loaded host; Rust
 via the kyoto queue with rustup's pinned toolchains, because Homebrew's cargo
