@@ -22,7 +22,7 @@ for (const relative of [
 const output = join(staged, 'receipt.json');
 const env = {...process.env, MOTION_SHELL_RECEIPT: output};
 delete env.ELECTRON_RUN_AS_NODE;
-const child = spawn(electron, [join(staged, 'apps/desktop/test/shell-smoke.mjs')], {env, stdio: 'inherit'});
+const child = spawn(process.env.MOTION_ELECTRON_BINARY || electron, [join(staged, 'apps/desktop/test/shell-smoke.mjs')], {env, stdio: 'inherit'});
 const timer = setTimeout(() => child.kill('SIGKILL'), 180000);
 const code = await new Promise((resolve, reject) => {
   child.once('error', reject);

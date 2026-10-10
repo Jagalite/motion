@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {join, resolve} from 'node:path';
 import {createOwnedServer} from './owned.mjs';
 import {createOutboxStore} from './outbox.mjs';
+import {restoreViewing} from './recovery.mjs';
 import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities} from './policy.mjs';
 
@@ -50,6 +51,7 @@ async function detach() {
   const previous = content;
   const previousSession = selectedSession;
   const previousOutbox = outboxContext;
+  let checkpointed = false;
   if (previous) {
     if (!previous.webContents.isDestroyed()) {
       // The unprivileged page can only acknowledge its own bounded teardown.
@@ -68,6 +70,7 @@ async function detach() {
         new Promise((_, reject) => setTimeout(() => reject(new Error('Viewing history could not be saved; the window remains open')), 3000)),
       ]);
       outboxes().save(previousOutbox.scope, previousOutbox.principal, records);
+      checkpointed = true;
     }
     try { window?.contentView.removeChildView(previous); } catch { /* Startup may fail before attachment. */ }
     if (!previous.webContents.isDestroyed()) previous.webContents.close();
@@ -75,7 +78,7 @@ async function detach() {
   content = null; selectedSession = null; outboxContext = null;
   // Partitions remain isolated by server; explicitly remove browser credentials
   // and renderer storage when the user changes connection/auth context.
-  if (previousSession) await previousSession.clearStorageData();
+  if (previousSession) await previousSession.clearStorageData(checkpointed ? {} : {storages: ['cookies']});
 }
 
 function secureSession(ses, origin) {
@@ -97,7 +100,9 @@ async function connectOwned(input, owner, locallyOwned = false) {
   const current = () => owner === epoch && window && !window.isDestroyed();
   const ses = session.fromPartition(partitionFor(selected), {cache: false});
   selectedSession = ses;
-  await ses.clearStorageData();
+  // Retain crash-surviving localStorage until the authenticated principal is
+  // known and its records have been encrypted. Never reuse old credentials.
+  await ses.clearStorageData({storages: ['cookies']});
   secureSession(ses, selected.origin);
   const request = async (path, options = {}) => {
     const response = await ses.fetch(`${selected.origin}${path}`, {redirect: 'error', cache: 'no-store',
@@ -119,7 +124,6 @@ async function connectOwned(input, owner, locallyOwned = false) {
     if (!current()) throw new Error('Connection changed');
     if (input.remember === true) saveCredential(selected, credential);
     const history = {scope: [locallyOwned ? 'desktop-owned' : selected.origin, selected.serverId], principal: browserSession.principal.id};
-    const pending = outboxes().load(history.scope, history.principal);
     const view = new WebContentsView({webPreferences: {session: ses, sandbox: true, contextIsolation: true,
       nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true,
       allowRunningInsecureContent: false, webviewTag: false}});
@@ -129,9 +133,10 @@ async function connectOwned(input, owner, locallyOwned = false) {
     view.webContents.on('will-frame-navigate', event => { if (!sameOrigin(event.url, selected.origin)) event.preventDefault(); });
     view.webContents.on('will-attach-webview', event => event.preventDefault());
     content = view;
-    await view.webContents.loadURL(selected.origin);
-    await view.webContents.executeJavaScript(`Object.entries(${JSON.stringify(pending)}).forEach(([key, value]) => localStorage.setItem(key, value))`);
+    await restoreViewing(view, ses, selected.origin, history, outboxes());
+    if (!current()) throw new Error('Connection changed');
     outboxContext = history;
+    await view.webContents.loadURL(selected.origin);
     if (!current()) throw new Error('Connection changed');
     window.contentView.addChildView(view);
     resize();
