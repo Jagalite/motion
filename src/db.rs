@@ -328,7 +328,7 @@ pub fn root_identity(meta: &std::fs::Metadata) -> String {
 /// Reserve SQLite's writer before observing state that this transaction changes.
 /// App.jobs serializes domain writers; background diagnostic writes can otherwise
 /// invalidate a deferred read snapshot before its first write (SQLITE_BUSY_SNAPSHOT).
-pub(crate) async fn begin_write(
+pub async fn begin_write(
     db: &SqlitePool,
 ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
     db.begin_with("BEGIN IMMEDIATE").await
