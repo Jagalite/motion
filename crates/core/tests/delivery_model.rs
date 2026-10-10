@@ -905,7 +905,6 @@ fn bounded_delivery_window_checks_production_reducer() {
 }
 
 #[test]
-#[ignore = "fuzzing deferred; see the A06/A07 TODO doc"]
 fn seeded_delivery_sequences_with_more_generations() {
     let report = stateless::explore::fuzz(
         &Deliveries {
@@ -926,13 +925,121 @@ fn seeded_delivery_sequences_with_more_generations() {
             seed: 20261009,
             cases: 3000,
             max_steps: 150,
-            max_transitions: 400_000,
+            max_transitions: 450_000,
             mutation_percent: 50,
         },
     )
     .unwrap();
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
+    assert_eq!(
+        report.termination,
+        stateless::explore::FuzzTermination::CasesCompleted
+    );
+    assert_eq!(report.cases, 3000);
+    assert_eq!(report.transitions, 450000);
+    println!(
+        "Stateless delivery seeded sequences: seed {}; {} cases, {} transitions; {:?}",
+        report.seed, report.cases, report.transitions, report.termination
+    );
+}
+
+/// Exact end-of-duration tolerance and generation/lease error precedence do not
+/// depend on a random sequence reaching a valid heartbeat at the boundary.
+#[test]
+fn heartbeat_boundaries_renew_only_valid_generation_leases() {
+    let (initial, _) = Delivery::admit(
+        TIMELINE.into(),
+        pin(&["audio-1"], Operation::VideoTranscode),
+        0,
+        Some(60_000),
+        0,
+    )
+    .unwrap();
+    let (active, _) = transition(
+        &initial,
+        &Input::Ready {
+            generation: 1,
+            media_time_origin_ms: 0,
+            first_segment_ms: 4_000,
+            target_duration_s: TARGET,
+        },
+    )
+    .unwrap();
+    let (staged, _) = transition(
+        &active,
+        &Input::Change {
+            expected_generation: 1,
+            position_ms: 30_000,
+            replan: None,
+            overlap: true,
+            now_ms: 1,
+        },
+    )
+    .unwrap();
+    for generation in [1, 2] {
+        for position in [0, 60_000, 61_000] {
+            let (after, effects) = transition(
+                &staged,
+                &Input::Heartbeat {
+                    active_generation: generation,
+                    position_ms: Some(position),
+                    now_ms: 2,
+                },
+            )
+            .unwrap();
+            assert_eq!(after.lease_expires_ms, 2 + LEASE_MS);
+            assert_eq!(after.revision, staged.revision + 1);
+            assert_eq!(after.playhead, (generation == 1).then_some((1, position)));
+            assert_eq!(effects, []);
+        }
+        for position in [61_001, u64::MAX] {
+            assert_eq!(
+                transition(
+                    &staged,
+                    &Input::Heartbeat {
+                        active_generation: generation,
+                        position_ms: Some(position),
+                        now_ms: 2,
+                    }
+                ),
+                Err(Error::InvalidPosition)
+            );
+        }
+        assert_eq!(
+            transition(
+                &staged,
+                &Input::Heartbeat {
+                    active_generation: generation,
+                    position_ms: Some(0),
+                    now_ms: staged.lease_expires_ms,
+                }
+            ),
+            Err(Error::DeliveryClosed)
+        );
+    }
+    assert_eq!(
+        transition(
+            &staged,
+            &Input::Heartbeat {
+                active_generation: 3,
+                position_ms: Some(u64::MAX),
+                now_ms: 2,
+            }
+        ),
+        Err(Error::GenerationConflict)
+    );
+    assert_eq!(
+        transition(
+            &staged,
+            &Input::Heartbeat {
+                active_generation: 3,
+                position_ms: Some(u64::MAX),
+                now_ms: staged.lease_expires_ms,
+            }
+        ),
+        Err(Error::DeliveryClosed)
+    );
 }
 
 #[test]
