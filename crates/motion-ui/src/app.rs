@@ -416,7 +416,9 @@ async fn play(cx: &Cx) -> Result<impl View> {
                     <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
                 }
             </select></label>
-            <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))><option value="">"Default"</option>
+            <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))
+                data-file-id=(view_model.audio_file.as_ref().map(|f| f.0.as_str()).unwrap_or(""))
+                data-file-revision=(view_model.audio_file.as_ref().map(|f| f.1.as_str()).unwrap_or(""))><option value="">"Default"</option>
                 for track in view_model.audio_tracks.iter() {
                     <option value=(track.id.as_str())>(track.label.as_str())</option>
                 }

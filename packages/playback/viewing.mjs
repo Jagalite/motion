@@ -79,16 +79,18 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
 }
 
 // A viewing-session start names the revision the page rendered. A newer
-// revision may be this browser's own previous player delivering its final
-// event during unload, after this page rendered. Adopt it only when the
-// current authority is still that session of ours (another device's start
-// replaces session_id), no manual change happened (same manual epoch, no
-// override, unwatched) and the resume position is within tolerance. Anything
-// else fails closed and must be re-read.
+// revision may be this page's predecessor (the session this browser last
+// created for the title, captured synchronously when this page started)
+// delivering its final event during unload. Adopt it only when the current
+// authority is still that predecessor, the server reports it terminal
+// (stopped/ended: it can take no more events), no manual change happened and
+// the resume position is within tolerance. The retried start still names the
+// adopted revision, so any competing start in between fails closed.
 export function adoptableRevision(current, rendered, toleranceMs = 2000) {
   const revision = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
   if (!revision || current.watched !== false || current.manual_watched !== null) return null;
   if (typeof rendered?.ownSession !== 'string' || current.session_id !== rendered.ownSession) return null;
+  if (!['stopped', 'ended'].includes(rendered.ownSessionStatus)) return null;
   if (current.manual_epoch !== rendered.manualEpoch) return null;
   const renderedResumeMs = rendered.resumeMs;
   if (!Number.isSafeInteger(current.position_ms) || !Number.isSafeInteger(renderedResumeMs)) return null;

@@ -129,7 +129,10 @@ impl Queries {
     /// scope-filtered v2 versions read; only that bound file's stored stream
     /// list is then read (the v2 contract has no track read yet). IDs match
     /// the planner's `a{n}` ordinals for that version.
-    async fn audio_tracks(&self, timeline: &str) -> (Option<String>, Vec<TrackOption>) {
+    async fn audio_tracks(
+        &self,
+        timeline: &str,
+    ) -> (Option<(String, String, String)>, Vec<TrackOption>) {
         let Ok(versions) = self
             .complete_list(&format!(
                 "/catalog/timelines/{}/versions?limit=200",
@@ -180,7 +183,7 @@ impl Queries {
                 ),
             })
             .collect();
-        (Some(version), options)
+        (Some((version, file, revision)), options)
     }
 
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
@@ -463,7 +466,7 @@ impl UiQueryFacade for Queries {
                 .await
                 .ok_or(UiError::Unavailable)?;
             let position = viewing["position_ms"].as_u64().unwrap_or(0);
-            let (audio_version, audio_tracks) = self.audio_tracks(timeline_id).await;
+            let (audio_source, audio_tracks) = self.audio_tracks(timeline_id).await;
             // A watched title, or one stopped in its final second, starts over.
             let finished = viewing["watched"].as_bool().unwrap_or(false)
                 || duration_ms.is_some_and(|d| position.saturating_add(1000) >= d);
@@ -476,7 +479,8 @@ impl UiQueryFacade for Queries {
                 viewing_revision: text(&viewing, "revision"),
                 viewing_manual_epoch: text(&viewing, "manual_epoch"),
                 audio_tracks,
-                audio_version,
+                audio_version: audio_source.as_ref().map(|s| s.0.clone()),
+                audio_file: audio_source.map(|(_, file, revision)| (file, revision)),
             })
         })
     }

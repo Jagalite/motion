@@ -290,6 +290,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 viewing_manual_epoch: "0".into(),
                 audio_tracks: vec![],
                 audio_version: None,
+                audio_file: None,
             })
         })
     }
