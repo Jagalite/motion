@@ -4,7 +4,7 @@ Real processes, generated media and disposable directories only; no user library
 
     python3 scripts/upgrade_restore_check.py --work artifacts/upgrade-restore
 
-builds the baseline server from Git with its own toolchain and target directory
+builds the baseline server from Git with its pinned toolchain (via rustup) and target directory
 under --baseline-dir (reused when it matches), and uses target/debug/playscale as
 the candidate unless --binary is given. A JSON receipt is written to --work.
 
@@ -37,6 +37,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tomllib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from smoke import free_port, request, stop, wait_for  # noqa: E402
@@ -76,11 +77,17 @@ def build_baseline(directory):
     archive = subprocess.check_output(['git', 'archive', '--format=tar', BASELINE], cwd=ROOT)
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(source, filter='data')
+    # Build with the baseline's pinned toolchain explicitly: a `cargo` earlier on
+    # PATH than the rustup proxy (e.g. Homebrew's) would ignore rust-toolchain.toml.
+    channel = tomllib.loads((source / 'rust-toolchain.toml').read_text())['toolchain']['channel']
     env = dict(os.environ, CARGO_TARGET_DIR=str(directory / 'target'))
-    env.pop('RUSTUP_TOOLCHAIN', None)  # honor the baseline's rust-toolchain.toml
+    env.pop('RUSTUP_TOOLCHAIN', None)
     with (directory / 'build.log').open('wb') as log:
-        subprocess.run(['cargo', 'build', '--locked', '-p', 'playscale', '--bin', 'playscale'],
-                       cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(['rustup', 'run', channel, 'rustc', '--version'], cwd=source, env=env,
+                       stdout=log, stderr=subprocess.STDOUT, check=True)
+        subprocess.run(['rustup', 'run', channel, 'cargo', 'build', '--locked', '-p', 'playscale',
+                        '--bin', 'playscale'], cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT,
+                       check=True)
     stamp.write_text(BASELINE)
     return binary, tool
 
@@ -157,17 +164,24 @@ def upgrade_receipts(path, item_id):
     try:
         receipts = db.execute('SELECT id, kind, document_json FROM catalog_receipts '
                               "WHERE kind LIKE 'migration:%' ORDER BY kind, id").fetchall()
-        attribution = db.execute('SELECT profile_id, item_id, outcome, timeline_id IS NOT NULL, receipt_id '
+        attribution = db.execute('SELECT profile_id, item_id, outcome, timeline_id, candidates_json, receipt_id '
                                  'FROM legacy_progress_attribution ORDER BY profile_id, item_id').fetchall()
+        timelines = [t for (t,) in db.execute(
+            'SELECT t.id FROM timelines t JOIN editions e ON e.id = t.edition_id WHERE e.item_id = ? ORDER BY t.id',
+            (item_id,))]
     finally:
         db.close()
     kinds = [kind for _, kind, _ in receipts]
     assert kinds == ['migration:legacy_progress', 'migration:schema'], kinds
     progress_receipt, schema_receipt = receipts
     assert json.loads(progress_receipt[2]) == {'outcomes': {'exact': 1}}, progress_receipt
-    # The fixture has one timeline with one original, so attribution is exact.
-    assert attribution == [('default', item_id, 'exact', 1, progress_receipt[0])], attribution
-    return {'receipt_ids': [r[0] for r in receipts], 'schema': json.loads(schema_receipt[2])}
+    # The fixture has one timeline holding one original: attribution is exact,
+    # to that timeline, with it as the only candidate.
+    assert len(timelines) == 1, timelines
+    expected = [('default', item_id, 'exact', timelines[0], json.dumps([[timelines[0], 1]], separators=(',', ':')),
+                 progress_receipt[0])]
+    assert attribution == expected, (attribution, expected)
+    return {'receipts': receipts, 'attribution': attribution, 'schema': json.loads(schema_receipt[2])}
 
 
 def upgrade_backups(data):

@@ -42,27 +42,46 @@ CHECKS = [
 ]
 
 
-def terminate_group(process):
-    """Stop everything left in the check's process group; True if anything was."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        process.wait()
-        return False
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        process.poll()  # reap the leader so a zombie does not keep the group alive
+def session_members(sid):
+    """Live processes in session `sid`. Encoders start their own process groups
+    (src/processing.rs) but stay in the session, even after reparenting."""
+    members = []
+    for line in subprocess.run(['ps', '-A', '-o', 'pid=,stat='], capture_output=True, text=True,
+                               check=True).stdout.splitlines():
+        pid, stat = line.split(None, 1)
+        if stat.startswith('Z'):
+            continue
         try:
-            os.killpg(process.pid, 0)
-        except (ProcessLookupError, PermissionError):  # macOS: EPERM once only exiting members remain
-            break
-        time.sleep(.1)
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if os.getsid(int(pid)) == sid:
+                members.append(int(pid))
         except (ProcessLookupError, PermissionError):
             pass
+    return members
+
+
+def terminate_session(process):
+    """Stop everything left in the check's session; True if anything was."""
+    process.poll()
+    members = session_members(process.pid)
+    if not members:
+        process.wait()
+        return False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in members:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + 10
+        while members and time.monotonic() < deadline:
+            time.sleep(.1)
+            process.poll()  # reap the leader
+            members = session_members(process.pid)
+        if not members:
+            break
     process.wait()
+    if members:
+        raise SystemExit(f'processes {members} survived SIGKILL')
     return True
 
 
@@ -85,8 +104,9 @@ def main():
         log = work / f'{name}.log'
         started = time.monotonic()
         with log.open('wb') as stream:
-            # Own process group: a timed-out check's servers and encoders are
-            # terminated with it instead of outliving it into later checks.
+            # Own session: a timed-out check's servers, supervisors and encoders
+            # (in their own process groups) are terminated with it instead of
+            # outliving it into later checks.
             process = subprocess.Popen(command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                                        stdin=subprocess.DEVNULL, start_new_session=True)
             try:
@@ -94,7 +114,7 @@ def main():
             except subprocess.TimeoutExpired:
                 code = 'timeout'
             finally:
-                leftovers = terminate_group(process)
+                leftovers = terminate_session(process)
         if leftovers and code == 0:
             code = 'left processes running'
         results.append({'check': name, 'exit': code, 'seconds': round(time.monotonic() - started, 1)})

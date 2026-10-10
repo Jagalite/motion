@@ -192,8 +192,7 @@ fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 /// Rust source with comments blanked, and a copy of the same byte length
 /// whose string-literal contents are also blanked, so a call is found only in
-/// code while its literal argument is read from the first copy. Raw strings
-/// are not used for routes and are not handled.
+/// code while its literal argument is read from the first copy.
 fn code_of(text: &str) -> (String, String) {
     let (mut code, mut mask) = (String::with_capacity(text.len()), String::new());
     let blank = |out: &mut String, c: char| out.extend(std::iter::repeat_n(' ', c.len_utf8()));
@@ -210,11 +209,11 @@ fn code_of(text: &str) -> (String, String) {
                         break;
                     }
                     blank(&mut mask, c);
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            code.push(escaped);
-                            blank(&mut mask, escaped);
-                        }
+                    if c == '\\'
+                        && let Some(escaped) = chars.next()
+                    {
+                        code.push(escaped);
+                        blank(&mut mask, escaped);
                     }
                 }
             }
@@ -240,7 +239,7 @@ fn code_of(text: &str) -> (String, String) {
                 let mut skipped = String::from("//");
                 let mut depth = 1;
                 let mut previous = ' ';
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if !block && c == '\n' {
                         code.push_str(&" ".repeat(skipped.len()));
                         mask.push_str(&" ".repeat(skipped.len()));
@@ -264,6 +263,34 @@ fn code_of(text: &str) -> (String, String) {
                 code.push_str(&" ".repeat(skipped.len()));
                 mask.push_str(&" ".repeat(skipped.len()));
             }
+            'r' | 'b'
+                if !code.ends_with(|p: char| p.is_alphanumeric() || p == '_')
+                    && raw_hashes(c, chars.clone()).is_some() =>
+            {
+                // r"..", r#".."#, br"..": no escapes; ends at a quote and as many #.
+                let hashes = raw_hashes(c, chars.clone()).unwrap();
+                code.push(c);
+                mask.push(c);
+                for c in chars.by_ref() {
+                    code.push(c);
+                    mask.push(c);
+                    if c == '"' {
+                        break;
+                    }
+                }
+                let closing = format!("\"{}", "#".repeat(hashes));
+                let mut body = String::new();
+                for c in chars.by_ref() {
+                    body.push(c);
+                    if body.ends_with(&closing) {
+                        break;
+                    }
+                }
+                let content = &body[..body.len().saturating_sub(closing.len())];
+                code.push_str(&body);
+                content.chars().for_each(|c| blank(&mut mask, c));
+                mask.push_str(&body[content.len()..]);
+            }
             _ => {
                 code.push(c);
                 mask.push(c);
@@ -272,6 +299,21 @@ fn code_of(text: &str) -> (String, String) {
     }
     debug_assert_eq!(code.len(), mask.len());
     (code, mask)
+}
+
+/// The number of `#` if `first` followed by `rest` opens a raw string literal.
+fn raw_hashes(first: char, mut rest: impl Iterator<Item = char>) -> Option<usize> {
+    if first == 'b' && rest.next() != Some('r') {
+        return None;
+    }
+    let mut hashes = 0;
+    loop {
+        match rest.next() {
+            Some('#') => hashes += 1,
+            Some('"') => return Some(hashes),
+            _ => return None,
+        }
+    }
 }
 
 /// Arguments that follow each call of method `name`, e.g. `.route ( "..."`.
@@ -329,13 +371,14 @@ fn route_scan_sees_through_whitespace_comments_and_strings() {
     let code = code_of(
         "r.route (\n \"/a/{id}\", get(h)) // .route(\"/commented\")\n\
          /* .nest(\"/x\", /* nested */ y) */ .route_layer(l).route(\"/b\", get(h));\n\
-         let s = \"// .route(\\\" .nest(\"; let q = '\"'; .route(\"/c\", get(h))",
+         let s = \"// .route(\\\" .nest(\"; let q = '\"'; .route(\"/c\", get(h));\n\
+         let raw = r#\"a \" .route(\"/hidden\") b\"#; let br = br\"x\"; ident_r(\"y\"); .route(\"/d\", get(h))",
     );
     let routes: Vec<_> = calls(&code, "route")
         .into_iter()
         .map(|a| a.split('"').nth(1).unwrap())
         .collect();
-    assert_eq!(routes, ["/a/{id}", "/b", "/c"]);
+    assert_eq!(routes, ["/a/{id}", "/b", "/c", "/d"]);
     assert!(calls(&code, "nest").is_empty());
     assert_eq!(calls(&code_of("x.nest (\"/p\", r)"), "nest").len(), 1);
 }
