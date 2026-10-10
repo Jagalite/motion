@@ -48,6 +48,28 @@ class NoticeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Empty license'):
             notice_files(package)
 
+    def test_git_workspace_crate_uses_its_checkout_license(self):
+        checkout = self.root / 'checkout'
+        (checkout / 'crates').mkdir(parents=True)
+        (checkout / '.cargo-ok').write_text('')
+        (checkout / 'LICENSE').write_text('Repository terms\n')
+        (checkout / 'README.md').write_text('Not a notice\n')
+        crate = checkout / 'crates/member'
+        crate.mkdir()
+        (crate / 'Cargo.toml').write_text('')
+        package = dict(id='member', name='member', version='1.0.0', license='MIT',
+                       manifest_path=str(crate / 'Cargo.toml'), source='git+https://example.invalid/repo')
+        self.assertEqual(notice_files(package), [('repository/LICENSE', 'Repository terms\n')])
+        # Only git checkouts fall back; a registry package must ship its own notices.
+        package['source'] = 'registry+test'
+        with self.assertRaisesRegex(ValueError, 'No license/notice'):
+            notice_files(package)
+        # Without a checkout marker there is no repository root to trust.
+        package['source'] = 'git+https://example.invalid/repo'
+        (checkout / '.cargo-ok').unlink()
+        with self.assertRaisesRegex(ValueError, 'No license/notice'):
+            notice_files(package)
+
     def test_escaped_license_file_fails(self):
         package = self.package('escape')
         (self.root / 'outside.txt').write_text('Unrelated terms')

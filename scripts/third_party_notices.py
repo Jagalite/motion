@@ -10,6 +10,16 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTICE_PREFIXES = ('LICENSE', 'LICENCE', 'COPYING', 'NOTICE', 'COPYRIGHT', 'AUTHORS')
 
 
+def checkout_root(package):
+    """The root of the Cargo git checkout holding a git-sourced package, if any."""
+    if not (package.get('source') or '').startswith('git+'):
+        return None
+    for directory in Path(package['manifest_path']).parent.resolve().parents:
+        if (directory / '.cargo-ok').is_file():
+            return directory
+    return None
+
+
 def notice_files(package):
     root = Path(package['manifest_path']).parent.resolve()
     selected = {
@@ -21,16 +31,25 @@ def notice_files(package):
     }
     if package.get('license_file'):
         selected.add(root / package['license_file'])
+    base, prefix = root, ''
+    repository = checkout_root(package)
+    if not selected and repository is not None:
+        # A crate in a git workspace may rely on the repository's top-level license.
+        selected = {
+            path for path in repository.iterdir()
+            if path.is_file() and path.name.upper().startswith(NOTICE_PREFIXES)
+        }
+        base, prefix = repository, 'repository/'
     if not selected:
         raise ValueError(f"No license/notice files found: {package['name']} {package['version']}")
     notices = []
     for path in sorted(selected):
-        if not path.resolve().is_relative_to(root):
+        if not path.resolve().is_relative_to(base):
             raise ValueError(f'License file escapes package: {path}')
         content = path.read_text(encoding='utf-8')
         if not content.strip():
             raise ValueError(f'Empty license/notice file: {path}')
-        notices.append((path.relative_to(root).as_posix(), content))
+        notices.append((prefix + path.relative_to(base).as_posix(), content))
     return notices
 
 
