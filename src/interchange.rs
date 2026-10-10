@@ -5,7 +5,7 @@ use crate::{App, curation::Receipt, new_id, now};
 use playscale_core::{
     interchange::{
         self as core, Action, Export, ExportedCollection, ExportedEntry, ExportedPlaylist,
-        ExportedWork, ImportPlan, InterchangeError, WorkFacts,
+        ExportedWork, ImportPlan, InterchangeError, Segment, WorkFacts,
     },
     metadata::Contribution,
 };
@@ -52,21 +52,30 @@ async fn facts(conn: &mut SqliteConnection) -> anyhow::Result<Vec<WorkFacts>> {
         .bind(&id)
         .fetch_optional(&mut *conn)
         .await?;
-        let pinned: Vec<(String, String)> = sqlx::query_as(
-            "SELECT t.id,b.file_revision FROM timelines t JOIN editions e ON e.id=t.edition_id JOIN media_versions v ON v.timeline_id=t.id JOIN version_files b ON b.version_id=v.id WHERE e.item_id=? AND v.origin='original' ORDER BY t.id",
+        #[allow(clippy::type_complexity)]
+        let pinned: Vec<(String, String, String, i64, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT t.id,v.id,b.file_revision,b.part,b.start_ms,b.end_ms FROM timelines t JOIN editions e ON e.id=t.edition_id JOIN media_versions v ON v.timeline_id=t.id JOIN version_files b ON b.version_id=v.id WHERE e.item_id=? AND v.origin='original' ORDER BY t.id,v.id,b.part",
         )
         .bind(&id)
         .fetch_all(&mut *conn)
         .await?;
-        let mut timelines: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for (timeline, revision) in &pinned {
+        // Timeline -> version -> ordered segments.
+        let mut timelines: BTreeMap<String, BTreeMap<String, Vec<Segment>>> = BTreeMap::new();
+        for (timeline, version, revision, part, start, end) in &pinned {
             timelines
                 .entry(timeline.clone())
                 .or_default()
-                .insert(revision.clone());
+                .entry(version.clone())
+                .or_default()
+                .push(Segment {
+                    revision: revision.clone(),
+                    part: u32::try_from(*part)?,
+                    start_ms: start.map(u64::try_from).transpose()?,
+                    end_ms: end.map(u64::try_from).transpose()?,
+                });
         }
         out.push(WorkFacts {
-            content_revisions: pinned.into_iter().map(|(_, r)| r).collect(),
+            content_revisions: pinned.into_iter().map(|(_, _, r, ..)| r).collect(),
             external_ids,
             local_revision: local
                 .as_ref()
@@ -74,7 +83,10 @@ async fn facts(conn: &mut SqliteConnection) -> anyhow::Result<Vec<WorkFacts>> {
             local: local
                 .map(|(_, doc)| serde_json::from_str::<Contribution>(&doc))
                 .transpose()?,
-            timelines: timelines.into_iter().collect(),
+            timelines: timelines
+                .into_iter()
+                .map(|(t, versions)| (t, versions.into_values().collect()))
+                .collect(),
             id,
         });
     }
@@ -131,14 +143,24 @@ pub async fn export(db: &SqlitePool, profile: &str) -> anyhow::Result<Export> {
     let mut exported_collections = Vec::new();
     for (id, name) in collections {
         let members: Vec<String> = sqlx::query_scalar(
-            "SELECT item_id FROM collection_items WHERE collection_id=? ORDER BY item_id",
+            "SELECT DISTINCT coalesce(a.item_id,c.item_id) AS member FROM collection_items c LEFT JOIN item_aliases a ON a.alias_id=c.item_id WHERE c.collection_id=? ORDER BY member",
         )
         .bind(&id)
         .fetch_all(&mut *tx)
         .await?;
+        // Retired members resolve to their surviving work (above); indices
+        // are deduplicated in case two members now share one work.
+        let mut indices: Vec<usize> = Vec::new();
+        for member in &members {
+            if let Some(i) = add(member, &mut works)
+                && !indices.contains(&i)
+            {
+                indices.push(i);
+            }
+        }
         exported_collections.push(ExportedCollection {
             name,
-            members: members.iter().filter_map(|m| add(m, &mut works)).collect(),
+            members: indices,
         });
     }
     let mut exported_playlists = Vec::new();
@@ -154,15 +176,16 @@ pub async fn export(db: &SqlitePool, profile: &str) -> anyhow::Result<Export> {
             let Some(work) = add(&item, &mut works) else {
                 continue;
             };
-            let content_revisions = by_id
+            // The first original version's ordered segments identify the
+            // timeline; one without an original version cannot be matched.
+            let Some(segments) = by_id
                 .get(item.as_str())
                 .and_then(|f| f.timelines.iter().find(|(t, _)| *t == timeline))
-                .map(|(_, r)| r.iter().cloned().collect())
-                .unwrap_or_default();
-            out.push(ExportedEntry {
-                work,
-                content_revisions,
-            });
+                .and_then(|(_, versions)| versions.first().cloned())
+            else {
+                continue;
+            };
+            out.push(ExportedEntry { work, segments });
         }
         exported_playlists.push(ExportedPlaylist { name, entries: out });
     }

@@ -35,12 +35,24 @@ pub struct ExportedCollection {
     pub members: Vec<usize>,
 }
 
+/// One ordered part of a version: content revision plus the interval it
+/// covers (`None` ends are open). Identical bytes with different intervals
+/// (multi-episode files) are different timelines.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Segment {
+    pub revision: String,
+    pub part: u32,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExportedEntry {
     pub work: usize,
-    /// Content revisions identifying the timeline within the work.
-    pub content_revisions: Vec<String>,
+    /// Ordered segments of one version of the timeline.
+    pub segments: Vec<Segment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,8 +82,8 @@ pub struct WorkFacts {
     /// Revision of its `local` contribution (0 if none) and its document.
     pub local_revision: u64,
     pub local: Option<Contribution>,
-    /// Timelines with the content revisions their versions pin.
-    pub timelines: Vec<(Id, BTreeSet<String>)>,
+    /// Timelines with the ordered segments of each of their versions.
+    pub timelines: Vec<(Id, Vec<Vec<Segment>>)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,14 +211,24 @@ pub fn plan_import(
             ));
             continue;
         }
+        let local = match crate::metadata::normalize_contribution(local) {
+            Ok(local) => local,
+            Err(reason) => {
+                warnings.push(format!(
+                    "'{}' local metadata rejected: {reason}",
+                    work.title
+                ));
+                continue;
+            }
+        };
         let current = facts_by_id[id];
-        if current.local.as_ref() == Some(local) {
+        if current.local.as_ref() == Some(&local) {
             continue;
         }
         actions.push(Action::SetLocal {
             work: id.clone(),
             expected_revision: current.local_revision,
-            contribution: local.clone(),
+            contribution: local,
         });
     }
     let mut names = existing_names.clone();
@@ -234,6 +256,13 @@ pub fn plan_import(
                 )),
             }
         }
+        if members.len() > crate::organization::MAX_MEMBERS {
+            warnings.push(format!(
+                "collection '{}' exceeds the member limit; skipped",
+                collection.name
+            ));
+            continue;
+        }
         actions.push(Action::CreateCollection {
             name: collection.name.trim().into(),
             members,
@@ -259,16 +288,12 @@ pub fn plan_import(
                 warnings.push(format!("playlist '{}' entry unresolved", playlist.name));
                 continue;
             };
-            // The timeline whose pinned content overlaps the entry's, if unique.
+            // The timeline with a version whose ordered segments (content,
+            // part and interval) equal the entry's, if unique.
             let candidates: Vec<&Id> = facts_by_id[id]
                 .timelines
                 .iter()
-                .filter(|(_, revisions)| {
-                    entry
-                        .content_revisions
-                        .iter()
-                        .any(|r| revisions.contains(r))
-                })
+                .filter(|(_, versions)| versions.contains(&entry.segments))
                 .map(|(t, _)| t)
                 .collect();
             match candidates.as_slice() {
@@ -279,6 +304,13 @@ pub fn plan_import(
                     candidates.len()
                 )),
             }
+        }
+        if timelines.len() > crate::organization::MAX_MEMBERS {
+            warnings.push(format!(
+                "playlist '{}' exceeds the entry limit; skipped",
+                playlist.name
+            ));
+            continue;
         }
         actions.push(Action::CreatePlaylist {
             name: playlist.name.trim().into(),
@@ -323,8 +355,22 @@ mod tests {
             local: None,
             timelines: vec![(
                 format!("{id}-tl"),
-                revisions.iter().map(|r| r.to_string()).collect(),
+                vec![
+                    revisions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| seg(r, i as u32 + 1))
+                        .collect(),
+                ],
             )],
+        }
+    }
+    fn seg(revision: &str, part: u32) -> Segment {
+        Segment {
+            revision: revision.into(),
+            part,
+            start_ms: None,
+            end_ms: None,
         }
     }
     fn work(title: &str, revisions: &[&str], ids: &[(&str, &str)]) -> ExportedWork {
@@ -361,7 +407,7 @@ mod tests {
                 name: "Mix".into(),
                 entries: vec![ExportedEntry {
                     work: 0,
-                    content_revisions: vec!["ra".into()],
+                    segments: vec![seg("ra", 1)],
                 }],
             }],
         };
@@ -410,6 +456,94 @@ mod tests {
         assert_eq!(
             plan_import(&bad, &current, "default", &BTreeSet::new()),
             Err(InterchangeError::UnsupportedFormat)
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn intervals_limits_and_invalid_metadata() {
+        let segment = |start, end| Segment {
+            revision: "double".into(),
+            part: 1,
+            start_ms: Some(start),
+            end_ms: Some(end),
+        };
+        let facts = vec![WorkFacts {
+            id: "e2".into(),
+            external_ids: BTreeSet::new(),
+            content_revisions: ["double".to_string()].into(),
+            local_revision: 0,
+            local: None,
+            timelines: vec![("e2-tl".into(), vec![vec![segment(1000, 2000)]])],
+        }];
+        let mut bad_local = Contribution::default();
+        bad_local
+            .values
+            .insert("title".into(), serde_json::Value::Null);
+        let export = Export {
+            format: FORMAT.into(),
+            works: vec![ExportedWork {
+                title: "Episode".into(),
+                external_ids: vec![],
+                content_revisions: vec!["double".into()],
+                local: Some(bad_local),
+            }],
+            collections: vec![],
+            playlists: vec![ExportedPlaylist {
+                name: "P".into(),
+                entries: vec![ExportedEntry {
+                    work: 0,
+                    segments: vec![segment(0, 1000)],
+                }],
+            }],
+        };
+        let plan = plan_import(&export, &facts, "default", &BTreeSet::new()).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .all(|a| !matches!(a, Action::SetLocal { .. })),
+            "invalid local metadata is skipped"
+        );
+        assert!(
+            plan.actions.contains(&Action::CreatePlaylist {
+                name: "P".into(),
+                timelines: vec![]
+            }),
+            "another episode's interval in the same file does not match"
+        );
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+        let mut exact = export.clone();
+        exact.playlists[0].entries[0].segments = vec![segment(1000, 2000)];
+        let plan = plan_import(&exact, &facts, "default", &BTreeSet::new()).unwrap();
+        assert!(plan.actions.contains(&Action::CreatePlaylist {
+            name: "P".into(),
+            timelines: vec!["e2-tl".into()]
+        }));
+        let mut big = exact.clone();
+        big.playlists[0].entries = vec![
+            ExportedEntry {
+                work: 0,
+                segments: vec![segment(1000, 2000)],
+            };
+            crate::organization::MAX_MEMBERS + 1
+        ];
+        let plan = plan_import(&big, &facts, "default", &BTreeSet::new()).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .all(|a| !matches!(a, Action::CreatePlaylist { .. }))
+        );
+        // Tags are normalized like the metadata API does.
+        let mut tagged = Contribution::default();
+        tagged.tags.insert("  Sci   FI ".into());
+        assert_eq!(
+            crate::metadata::normalize_contribution(&tagged)
+                .unwrap()
+                .tags,
+            ["sci fi".to_string()].into()
         );
     }
 }

@@ -184,3 +184,40 @@ mod field_tests {
         ));
     }
 }
+
+/// Validate and normalize a contribution with the same rules the metadata
+/// API applies: at most 100 fields/tags, non-empty field names, non-null and
+/// registry-valid values, tags whitespace-collapsed and lower-cased (1–100
+/// bytes). Excluded tags are normalized the same way.
+pub fn normalize_contribution(c: &Contribution) -> Result<Contribution, &'static str> {
+    if c.values.len() > 100 || c.tags.len() > 100 || c.excluded_tags.len() > 100 {
+        return Err("too many fields or tags");
+    }
+    for (key, value) in &c.values {
+        if key.is_empty() || key.len() > 100 || value.is_null() || !valid_field(key, value) {
+            return Err("invalid metadata field");
+        }
+    }
+    let tags = |values: &BTreeSet<String>| -> Result<BTreeSet<String>, &'static str> {
+        values
+            .iter()
+            .map(|tag| {
+                let tag = tag
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                if tag.is_empty() || tag.len() > 100 {
+                    Err("tags must contain 1-100 bytes")
+                } else {
+                    Ok(tag)
+                }
+            })
+            .collect()
+    };
+    Ok(Contribution {
+        values: c.values.clone(),
+        tags: tags(&c.tags)?,
+        excluded_tags: tags(&c.excluded_tags)?,
+    })
+}

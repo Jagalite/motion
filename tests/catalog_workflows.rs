@@ -1794,6 +1794,58 @@ async fn curation_exports_and_imports_between_servers_by_content() {
 }
 
 #[tokio::test]
+async fn export_resolves_retired_collection_members_and_exact_segments() {
+    let f = Fixture::new().await;
+    f.write("a.mkv", b"first copy");
+    f.write("b.mkv", b"second copy");
+    f.scan().await;
+    let (_, a, _, a_timeline) = f.file("a.mkv").await;
+    let (_, b, ..) = f.file("b.mkv").await;
+    orgs::save_collection(
+        &f.app,
+        "default",
+        None,
+        "Both",
+        CollectionKind::Manual,
+        vec![a.clone(), b.clone()],
+        None,
+    )
+    .await
+    .unwrap();
+    orgs::save_playlist(
+        &f.app,
+        "default",
+        None,
+        "One",
+        vec![Entry {
+            entry_id: "1".into(),
+            timeline_id: a_timeline.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    merge(&f, &b, &a).await;
+    let exported = playscale::interchange::export(&f.app.db, "default")
+        .await
+        .unwrap();
+    assert_eq!(exported.collections[0].members.len(), 1, "{exported:?}");
+    let survivor = &exported.works[exported.collections[0].members[0]];
+    assert_eq!(survivor.content_revisions.len(), 2, "the surviving work");
+    let entry = &exported.playlists[0].entries[0];
+    assert_eq!(entry.segments.len(), 1);
+    assert_eq!(entry.segments[0].part, 1);
+    // Round-trips onto the same server by exact segment identity.
+    let plan = playscale::interchange::preview_import(&f.app.db, "other", &exported)
+        .await
+        .unwrap();
+    assert!(plan.actions.iter().any(|a| matches!(
+        a,
+        playscale_core::interchange::Action::CreatePlaylist { timelines, .. }
+            if timelines == std::slice::from_ref(&a_timeline)
+    )));
+}
+
+#[tokio::test]
 async fn refresh_ignores_replaced_roots_and_stale_observations() {
     let f = Fixture::new().await;
     f.write("film.mkv", b"film");
