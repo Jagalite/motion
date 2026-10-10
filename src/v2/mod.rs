@@ -33,6 +33,10 @@ use std::{
 pub const BODY_LIMIT: usize = 256 * 1024;
 pub const PAGE_DEFAULT: u32 = 50;
 pub const PAGE_MAX: u32 = 200;
+/// How long a desktop bootstrap secret may be exchanged after startup.
+pub const BOOTSTRAP_SECONDS: u64 = 60;
+/// The local desktop device a bootstrap exchange authenticates as.
+pub const DESKTOP_DEVICE: &str = "desktop-local";
 /// Pairing creation is unauthenticated: bound it globally per minute.
 const PAIRINGS_PER_MINUTE: usize = 30;
 
@@ -45,6 +49,25 @@ pub struct ApiSettings {
     pub approved_origins: Vec<String>,
     /// Requests per minute per authenticated principal; 0 disables.
     pub requests_per_minute: u32,
+    /// Verified private ingress (e.g. `tailscale serve unix:<socket>`).
+    pub trusted_ingress: Option<IngressSettings>,
+}
+
+/// Identity headers are trusted only on this dedicated Unix-socket listener,
+/// which only the configured ingress proxy can reach. A missing or unmapped
+/// login fails closed; mapped logins act as their device, never as admin.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IngressSettings {
+    pub socket: std::path::PathBuf,
+    #[serde(default = "default_login_header")]
+    pub login_header: String,
+    /// Verified login → paired device ID whose grant and policy apply.
+    pub logins: std::collections::BTreeMap<String, String>,
+}
+
+fn default_login_header() -> String {
+    "tailscale-user-login".into()
 }
 
 impl Default for ApiSettings {
@@ -52,6 +75,7 @@ impl Default for ApiSettings {
         Self {
             approved_origins: vec![],
             requests_per_minute: 1_200,
+            trusted_ingress: None,
         }
     }
 }
@@ -61,6 +85,14 @@ impl ApiSettings {
         for origin in &mut self.approved_origins {
             *origin = crate::config::canonical_origin(origin)?;
         }
+        if let Some(ingress) = &mut self.trusted_ingress {
+            anyhow::ensure!(
+                ingress.socket.is_absolute(),
+                "trusted_ingress.socket must be an absolute path"
+            );
+            ingress.login_header = ingress.login_header.to_ascii_lowercase();
+            axum::http::HeaderName::from_bytes(ingress.login_header.as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -69,6 +101,8 @@ impl ApiSettings {
 pub struct Runtime {
     pub settings: ApiSettings,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
+    /// Hash and deadline of the one-use desktop bootstrap secret.
+    bootstrap: Mutex<Option<(String, Instant)>>,
     pub mode: AccessMode,
     /// Changes on every process start; distinct from the database restore epoch.
     pub server_epoch: String,
@@ -84,6 +118,7 @@ impl Runtime {
         Self {
             settings: ApiSettings::default(),
             buckets: Mutex::new(HashMap::new()),
+            bootstrap: Mutex::new(None),
             key,
             mode,
             server_epoch: crate::new_id(),
@@ -92,6 +127,33 @@ impl Runtime {
             server_hash: tokio::sync::OnceCell::new(),
         }
     }
+    /// Accept a desktop bootstrap secret for `BOOTSTRAP_SECONDS`, once.
+    pub fn set_bootstrap(&self, secret: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(secret.len() >= 32, "bootstrap secret is too short");
+        *self.bootstrap.lock().unwrap() = Some((
+            auth::token_hash(secret),
+            Instant::now() + std::time::Duration::from_secs(BOOTSTRAP_SECONDS),
+        ));
+        Ok(())
+    }
+
+    /// Consume the bootstrap secret if `secret` is it and it is still fresh.
+    /// Any presentation, right or wrong, after the deadline clears it.
+    pub(crate) fn take_bootstrap(&self, secret: &str) -> bool {
+        let mut slot = self.bootstrap.lock().unwrap();
+        match slot.as_ref() {
+            Some((_, deadline)) if Instant::now() >= *deadline => {
+                *slot = None;
+                false
+            }
+            Some((hash, _)) if *hash == auth::token_hash(secret) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn with_settings(mut self, settings: ApiSettings) -> Self {
         self.settings = settings;
         self
@@ -608,6 +670,21 @@ pub async fn page<T>(
         }
         .encode(),
     })
+}
+
+/// Bind the trusted-ingress Unix socket (mode 0600). A stale socket from a
+/// previous run is replaced; any other file at the path is an error.
+pub fn ingress_listener(path: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path)?,
+        Ok(_) => anyhow::bail!("{} exists and is not a socket", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
 
 /// A SQL condition admitting rows whose library column is readable under

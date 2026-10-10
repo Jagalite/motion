@@ -162,7 +162,18 @@ async fn classify(
 
 async fn reauthenticate(app: &App, caller: &Caller) -> Result<Principal, AccessError> {
     let Some((hash, _)) = &caller.credential else {
-        return Ok(Principal::operator());
+        let Some(device_id) = &caller.ingress else {
+            return Ok(Principal::operator());
+        };
+        let mut conn = app
+            .db
+            .acquire()
+            .await
+            .map_err(|_| AccessError::Unauthenticated)?;
+        let device = auth::load_device(&mut conn, device_id)
+            .await
+            .map_err(|_| AccessError::Unauthenticated)?;
+        return playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device));
     };
     let now = crate::now();
     let mut conn = app

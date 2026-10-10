@@ -1632,6 +1632,7 @@ async fn approved_origins_get_bearer_only_cors_and_principals_are_rate_limited()
     let settings = playscale::v2::ApiSettings {
         approved_origins: vec!["https://app.example".into()],
         requests_per_minute: 3,
+        trusted_ingress: None,
     };
     f.app.access = Arc::new(
         playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
@@ -1723,4 +1724,196 @@ async fn approved_origins_get_bearer_only_cors_and_principals_are_rate_limited()
         .await;
     problem(&limited, StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     assert!(limited.headers.contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn trusted_ingress_identity_is_listener_bound_mapped_and_never_admin() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    let (device_id, _) = f
+        .pair(&["default"], &["catalog:read", "system:admin"])
+        .await;
+    let settings = playscale::v2::ApiSettings {
+        trusted_ingress: Some(playscale::v2::IngressSettings {
+            socket: "/tmp/unused.sock".into(),
+            login_header: "tailscale-user-login".into(),
+            logins: [("alice@example.com".to_string(), device_id.clone())].into(),
+        }),
+        ..Default::default()
+    };
+    let key = playscale::v2::auth::random_key();
+    f.app.access =
+        Arc::new(playscale::v2::Runtime::new(AccessMode::Restricted, key).with_settings(settings));
+    let ingress = |method: &str, path: &str, body: Option<Value>, headers: Vec<(&str, String)>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "127.0.0.1:8787");
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        for (k, v) in headers {
+            request = request.header(k, v);
+        }
+        let router = api::router(f.app.clone(), None)
+            .layer(axum::Extension(playscale::v2::auth::TrustedIngress));
+        async move {
+            let response = router
+                .oneshot(
+                    request
+                        .body(body.map(|v| Body::from(v.to_string())).unwrap_or_default())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let alice = ("tailscale-user-login", "alice@example.com".to_string());
+    let (status, me) = ingress("GET", "/api/v2/me", None, vec![alice.clone()]).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["mode"], "trusted_private");
+    assert!(
+        !me["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("system:admin"))
+    );
+    let (status, _) = ingress(
+        "GET",
+        "/api/v2/me",
+        None,
+        vec![("tailscale-user-login", "mallory@example.com".into())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The same header on the ordinary listener is ignored.
+    let plain = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("tailscale-user-login", "alice@example.com")],
+        )
+        .await;
+    assert_eq!(plain.status, StatusCode::UNAUTHORIZED);
+    // The exchange returns the CSRF token unsafe requests need.
+    let (status, session) = ingress(
+        "POST",
+        "/api/v2/auth/session",
+        Some(json!({"kind":"trusted_private"})),
+        vec![alice.clone(), ("origin", ORIGIN.into())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let csrf = session["csrf_token"].as_str().unwrap().to_owned();
+    let refused = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"trusted_private"})),
+            &[
+                ("origin", ORIGIN),
+                ("tailscale-user-login", "alice@example.com"),
+            ],
+        )
+        .await;
+    problem(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "trusted_private_unavailable",
+    );
+    let (status, _) = ingress(
+        "DELETE",
+        "/api/v2/auth/session",
+        None,
+        vec![alice.clone(), ("origin", ORIGIN.into())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = ingress("GET", "/api/v2/devices", None, vec![alice.clone()]).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ingress callers are never administrators"
+    );
+    let _ = csrf;
+    // Revoking the mapped device fails the identity closed.
+    let etag = f.device_etag(&device_id).await;
+    let revoked = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{device_id}"),
+            None,
+            &[("authorization", &bearer(OPERATOR)), ("if-match", &etag)],
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT);
+    let (status, _) = ingress("GET", "/api/v2/me", None, vec![alice]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn desktop_bootstrap_is_one_use_and_never_exposed() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let secret = "desktop-bootstrap-0123456789abcdef0123456789";
+    f.app.access.set_bootstrap(secret).unwrap();
+    let exchange = json!({"kind":"credential","credential":secret});
+    let wrong = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":"desktop-bootstrap-wrong-0123456789abcdef"})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    let session = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(exchange.clone()),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(session.status, StatusCode::OK, "{:?}", session.body);
+    assert_eq!(session.body["principal"]["device_id"], "desktop-local");
+    assert!(
+        session.headers["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("HttpOnly")
+    );
+    let cookie = session.headers["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let me = f
+        .call("GET", "/api/v2/me", None, &[("cookie", &cookie)])
+        .await;
+    assert_eq!(me.status, StatusCode::OK);
+    let again = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(exchange),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(
+        again.status,
+        StatusCode::UNAUTHORIZED,
+        "bootstrap is one-use"
+    );
+    assert!(
+        !session.body.to_string().contains("mdv_"),
+        "device credential exposed"
+    );
 }

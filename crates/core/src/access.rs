@@ -450,6 +450,26 @@ pub fn authenticate(
     })
 }
 
+/// A request through the trusted private-ingress listener whose verified
+/// login is mapped to a device. It carries that device's grant and policy but
+/// can never act as an administrator, and fails closed if the device is
+/// missing or revoked.
+pub fn authenticate_ingress(device: Option<&Device>) -> Result<Principal, AccessError> {
+    let device = device
+        .filter(|d| !d.revoked)
+        .ok_or(AccessError::CredentialRevoked)?;
+    let mut grant = device.grant.clone();
+    grant.permissions.remove(&Permission::SystemAdmin);
+    Ok(Principal {
+        id: device.id.clone(),
+        device_id: Some(device.id.clone()),
+        mode: Mode::TrustedPrivate,
+        grant,
+        policy: device.policy.clone(),
+        policy_revision: device.revision,
+    })
+}
+
 /// Derive a narrower credential. Only a device credential may derive; children
 /// inherit its scope and never outlive it, so a child cannot extend itself.
 pub fn derive(
@@ -1473,6 +1493,24 @@ mod tests {
         assert_eq!(
             admit_file_bytes(&narrowed, Some(&facts)),
             Err(TicketError::Forbidden(Permission::PlaybackRequest))
+        );
+    }
+
+    #[test]
+    fn ingress_identity_is_never_administrative() {
+        let mut d = device();
+        d.grant.permissions.insert(Permission::SystemAdmin);
+        let p = authenticate_ingress(Some(&d)).unwrap();
+        assert!(!p.is_admin() && p.mode == Mode::TrustedPrivate);
+        assert!(p.allows(Permission::CatalogRead));
+        d.revoked = true;
+        assert_eq!(
+            authenticate_ingress(Some(&d)),
+            Err(AccessError::CredentialRevoked)
+        );
+        assert_eq!(
+            authenticate_ingress(None),
+            Err(AccessError::CredentialRevoked)
         );
     }
 

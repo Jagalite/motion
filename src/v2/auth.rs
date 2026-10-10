@@ -61,6 +61,7 @@ pub enum Purpose {
     Session,
     PairingCode,
     Ticket,
+    IngressCsrf,
 }
 
 impl Purpose {
@@ -71,6 +72,7 @@ impl Purpose {
             Self::Session => "mss",
             Self::PairingCode => "mdc",
             Self::Ticket => "mtk",
+            Self::IngressCsrf => "csrf",
         }
     }
 }
@@ -294,10 +296,24 @@ pub async fn authenticate_stored(
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub principal: Principal,
-    /// Hash and row of the presented credential; absent for the operator.
+    /// Hash and row of the presented credential; absent for the operator
+    /// and for trusted-ingress callers.
     pub credential: Option<(String, Credential)>,
     /// Present only for cookie sessions.
     pub csrf: Option<String>,
+    /// Device mapped from a verified private-ingress login.
+    pub ingress: Option<String>,
+}
+
+/// Marks requests that arrived through the trusted private-ingress listener.
+/// Only that listener inserts it; identity headers are ignored elsewhere.
+#[derive(Clone, Copy, Debug)]
+pub struct TrustedIngress;
+
+/// Ingress callers have no stored session, so their CSRF token is derived
+/// from the verified login instead.
+pub fn ingress_csrf(app: &App, login: &str) -> String {
+    derive_secret(&app.access.key, Purpose::IngressCsrf, login)
 }
 
 impl Caller {
@@ -317,9 +333,13 @@ impl Caller {
         conn: &mut sqlx::SqliteConnection,
         permission: Option<Permission>,
     ) -> Result<Principal, Problem> {
-        let principal = match &self.credential {
-            None => Principal::operator(),
-            Some((hash, _)) => {
+        let principal = match (&self.credential, &self.ingress) {
+            (None, Some(device_id)) => {
+                let device = load_device(conn, device_id).await?;
+                playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device))?
+            }
+            (None, None) => Principal::operator(),
+            (Some((hash, _)), _) => {
                 let stored = load_credential(conn, hash)
                     .await?
                     .ok_or(AccessError::CredentialRevoked)?;
@@ -364,14 +384,66 @@ pub fn is_operator(app: &App, token: &str) -> bool {
 
 /// Resolve the caller from current stored state.
 pub async fn resolve(app: &App, method: &Method, headers: &HeaderMap) -> Result<Caller, Problem> {
+    resolve_with(app, method, headers, None).await
+}
+
+/// As `resolve`, honoring a verified ingress identity when the request came
+/// through the trusted ingress listener.
+pub async fn resolve_with(
+    app: &App,
+    method: &Method,
+    headers: &HeaderMap,
+    ingress: Option<TrustedIngress>,
+) -> Result<Caller, Problem> {
     let now = crate::now();
     let mut conn = app.db.acquire().await?;
+    if bearer(headers)?.is_none()
+        && let (Some(TrustedIngress), Some(settings)) =
+            (ingress, app.access.settings.trusted_ingress.as_ref())
+        && let Some(login) = headers
+            .get(settings.login_header.as_str())
+            .and_then(|v| v.to_str().ok())
+    {
+        let device_id = settings
+            .logins
+            .get(login)
+            .ok_or(AccessError::Unauthenticated)?;
+        let device = load_device(&mut conn, device_id).await?;
+        let principal =
+            playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device))?;
+        let csrf = ingress_csrf(app, login);
+        if !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            // Ingress identity is ambient, like a cookie: unsafe requests need
+            // the exact origin and the CSRF token.
+            let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+            let presented = headers
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if origin != Some(app.origin.as_str())
+                || Sha256::digest(presented.as_bytes()) != Sha256::digest(csrf.as_bytes())
+            {
+                return Err(Problem::new(
+                    StatusCode::FORBIDDEN,
+                    "csrf_required",
+                    "Ingress-authenticated unsafe requests require the server origin and X-CSRF-Token",
+                ));
+            }
+        }
+        return Ok(Caller {
+            principal,
+            credential: None,
+            csrf: Some(csrf),
+            ingress: Some(device_id.clone()),
+        });
+    }
     if let Some(token) = bearer(headers)? {
         if is_operator(app, token) {
             return Ok(Caller {
                 principal: Principal::operator(),
                 credential: None,
                 csrf: None,
+                ingress: None,
             });
         }
         let hash = token_hash(token);
@@ -384,6 +456,7 @@ pub async fn resolve(app: &App, method: &Method, headers: &HeaderMap) -> Result<
             principal,
             credential: Some((hash, stored.credential)),
             csrf: None,
+            ingress: None,
         });
     }
     let token = session_cookie(headers).ok_or(AccessError::Unauthenticated)?;
@@ -413,13 +486,15 @@ pub async fn resolve(app: &App, method: &Method, headers: &HeaderMap) -> Result<
         principal,
         credential: Some((hash, stored.credential)),
         csrf: Some(csrf),
+        ingress: None,
     })
 }
 
 impl FromRequestParts<App> for Caller {
     type Rejection = Problem;
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Problem> {
-        let caller = resolve(app, &parts.method, &parts.headers).await?;
+        let ingress = parts.extensions.get::<TrustedIngress>().copied();
+        let caller = resolve_with(app, &parts.method, &parts.headers, ingress).await?;
         app.access.admit_request(&caller.principal.id)?;
         Ok(caller)
     }

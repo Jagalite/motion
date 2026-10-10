@@ -32,6 +32,10 @@ pub struct Args {
     pub ffprobe: Option<PathBuf>,
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
+    /// Inherited file descriptor carrying a one-use desktop bootstrap secret
+    /// (read once at startup; never place the secret in argv).
+    #[arg(long)]
+    pub bootstrap_fd: Option<i32>,
     /// `trusted_household` keeps the unauthenticated legacy v1 surface;
     /// `restricted` requires paired credentials (v1 is operator-only).
     #[arg(long, value_parser = parse_access_mode)]
