@@ -49,12 +49,55 @@ function observedCapability() {
   const probe = type => (globalThis.MediaSource?.isTypeSupported?.(type) ?? false) || video.canPlayType(type) !== '';
   return {
     client_id: 'motion-ui-bridge', client_build: 'wave0', demuxe_asset_digest: null,
-    transports: ['http_range'],
+    transports: video.canPlayType('application/vnd.apple.mpegurl') ? ['http_range', 'hls'] : ['http_range'],
     video_codecs: probe('video/mp4; codecs="avc1.640028"') ? ['avc1'] : [],
     audio_codecs: probe('audio/mp4; codecs="mp4a.40.2"') ? ['mp4a'] : [],
     subtitle_modes: ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
     cross_origin_isolated: globalThis.crossOriginIsolated === true,
   };
+}
+
+// Preference vocabulary differs from the planning contract. Automatic retains
+// the server's forced/foreign-audio policy; always is an explicit requirement.
+function subtitlePolicy(preference) {
+  if (preference === 'off') return 'off';
+  if (preference === 'always') return 'require';
+  return 'auto';
+}
+
+function demuxeSource(generation, origin) {
+  const value = generation.transport === 'hls' ? generation.manifest_url : generation.media_url;
+  if (!['hls', 'http_range'].includes(generation.transport) || typeof value !== 'string' || !value) throw new Error('Invalid media transport');
+  const url = new URL(value, origin);
+  if (url.origin !== origin || url.username || url.password) throw new Error('Media must use the selected server origin.');
+  return generation.transport === 'hls' ? {url: url.href, format: 'hls'} : url.href;
+}
+
+function nextTimeline(page, currentTimeline) {
+  if (!Array.isArray(page?.items) || page.items.length > 1) throw new Error('Invalid next-title response');
+  if (!page.items.length) return null;
+  const id = page.items[0]?.id;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id) || id === currentTimeline) throw new Error('Invalid next-title identity');
+  return id;
+}
+
+let advancing = false;
+async function playNext(current = () => true) {
+  if (advancing || !current()) return;
+  advancing = true;
+  try {
+    if (state.viewing && !await state.viewing.flush()) throw new Error('Progress is still pending. Retry next title when connected.');
+    if (!current()) return;
+    const page = await api('GET', `/api/v2/profiles/${encodeURIComponent(host.dataset.profileId)}/timelines/${encodeURIComponent(host.dataset.timelineId)}/next`, undefined, undefined, AbortSignal.timeout(10000));
+    if (!current()) return;
+    const id = nextTimeline(page, host.dataset.timelineId);
+    if (!id) { status('There is no next title in this release order.'); return; }
+    const finishing = close();
+    const closedEpoch = state.epoch;
+    await finishing;
+    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}`);
+  } catch (error) { if (current()) status(`Next title could not start: ${error.message}`, 'alert'); }
+  finally { advancing = false; }
 }
 
 // Same pattern as the existing Motion web client: define the element and,
@@ -256,7 +299,11 @@ function observeViewing(element, generation, writer, current) {
     const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
     const output = document.getElementById('motion-position');
     if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
-    if (!writer || !['playing', 'paused', 'ended'].includes(observation.status)) return;
+    if (!writer) {
+      if (observation.status === 'ended' && host.dataset.autoplay === 'true') void playNext(current);
+      return;
+    }
+    if (!['playing', 'paused', 'ended'].includes(observation.status)) return;
     const instant = Date.now();
     if (observation.status === previous && instant - last < 5000) return;
     last = instant;
@@ -266,6 +313,7 @@ function observeViewing(element, generation, writer, current) {
         status: observation.status, delivery_generation: generation.generation});
       void writer.flush().then(saved => {
         if (current() && !saved) status('Progress is queued until the server responds.');
+        if (current() && saved && observation.status === 'ended' && host.dataset.autoplay === 'true') void playNext(current);
       }).catch(error => {
         if (current()) { status(`Progress could not be saved: ${error.message}`, 'alert'); void close(); }
       });
@@ -311,9 +359,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   element.allowFileDrop = false;
   host.append(element);
   try {
-    const url = new URL(generation.transport === 'hls' ? generation.manifest_url : generation.media_url, location.origin);
-    if (url.origin !== location.origin || url.username || url.password) throw new Error('Media must use the selected server origin.');
-    await element.open(url.href, {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
+    await element.open(demuxeSource(generation, location.origin), {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
     if (preferences) {
       await element.setVolume(preferences.volume);
       await element.setMuted(preferences.muted);
@@ -411,7 +457,7 @@ async function changePlayback(change) {
 }
 
 async function start() {
-  if (state.closing) await state.closing;
+  if (state.closing) { await state.closing; state.closing = null; }
   const epoch = ++state.epoch;
   state.closing = null;
   const current = () => epoch === state.epoch;
@@ -423,7 +469,7 @@ async function start() {
     status('Choosing how to play this on this device…');
     state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
-      tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: data.subtitlePolicy || 'off', audio_track_id: null, subtitle_track_id: null},
+      tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: subtitlePolicy(data.subtitlePolicy), audio_track_id: null, subtitle_track_id: null},
       quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
       client: observedCapability(), failed_candidate_ids: [],
     };
@@ -538,6 +584,7 @@ controls?.addEventListener('click', event => {
     if (action === 'play') await state.element.play();
     if (action === 'pause') await state.element.pause();
     if (action === 'mute') await state.element.setMuted(!state.element.muted);
+    if (action === 'next') { const owner = state.epoch; await playNext(() => owner === state.epoch); }
     if (action === 'quality') {
       const epoch = state.epoch;
       const next = {...state.planInput, version_id: controls.elements.version.value || null, quality: {...state.planInput.quality, mode: controls.elements.quality.value}};

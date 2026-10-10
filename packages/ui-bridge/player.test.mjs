@@ -10,6 +10,40 @@ const maintainLease = runInNewContext(source.replace('export {close, maintainLea
 const delivery = (expires = 30000, extra = {}) => ({id: 'd1', status: 'ready', active: {generation: 'g1'},
   lease_expires_at: new Date(expires).toISOString(), heartbeat_interval_seconds: 5, ...extra});
 
+test('planning subtitle vocabulary and explicit HLS source match the pinned contracts', () => {
+  const {subtitlePolicy, demuxeSource, nextTimeline} = runInNewContext(source.replace('export {close, maintainLease};', '({subtitlePolicy, demuxeSource, nextTimeline});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  assert.equal(subtitlePolicy('off'), 'off');
+  assert.equal(subtitlePolicy('always'), 'require');
+  for (const preference of ['forced', 'foreign_audio', undefined]) assert.equal(subtitlePolicy(preference), 'auto');
+  const hls = demuxeSource({transport: 'hls', manifest_url: '/media/manifest'}, 'https://motion.test');
+  assert.equal(hls.format, 'hls'); assert.equal(hls.url, 'https://motion.test/media/manifest');
+  assert.equal(demuxeSource({transport: 'http_range', media_url: '/media/file'}, 'https://motion.test'), 'https://motion.test/media/file');
+  assert.throws(() => demuxeSource({transport: 'hls', manifest_url: 'https://other.test/media'}, 'https://motion.test'), /selected server/);
+  assert.throws(() => demuxeSource({transport: 'hls'}, 'https://motion.test'), /Invalid media/);
+  assert.equal(nextTimeline({items: []}, 'a'), null);
+  assert.equal(nextTimeline({items: [{id: 'b'}]}, 'a'), 'b');
+  for (const page of [{items: [{id: 'a'}]}, {items: [{id: '../bad'}]}, {items: [{id: 'b'}, {id: 'c'}]}, {}]) assert.throws(() => nextTimeline(page, 'a'), /Invalid next-title/);
+});
+
+test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
+  const panel = {setAttribute() {}, remove() {}};
+  const host = {dataset: {}, querySelector: () => panel};
+  const lifecycle = runInNewContext(source.replace('export {close, maintainLease};', '({state, start, close});'), {
+    document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null,
+      createElement: () => ({canPlayType: () => ''}), addEventListener() {}},
+    addEventListener() {}, openCandidates: async () => null, URL, AbortSignal,
+  });
+  await Promise.resolve();
+  await lifecycle.close();
+  const prior = lifecycle.state.epoch;
+  await lifecycle.start();
+  assert.equal(lifecycle.state.closing, null);
+  await lifecycle.close();
+  assert.equal(lifecycle.state.epoch, prior + 2);
+});
+
 function setup(send, initial = delivery()) {
   let time = 0;
   let sequence = 0;
