@@ -3,8 +3,8 @@
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
   "passed": true,
-  "recorded_at": "2026-10-09T23:03:38.961Z",
-  "motion_commit": "786a837950d9496d26e68ae1a8adf1e44e86af27",
+  "recorded_at": "2026-10-10T00:17:51.592Z",
+  "motion_commit": "6ab3fa4e56eb61ba8861055f1a09def09a908feb",
   "worktree_dirty": false,
   "environment": {
     "electron": "44.7.0",
@@ -18,7 +18,7 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "59994c15b37c17a49a3d72e0a0a58713e97dab557a0a4e3a7064ac51277ca812",
+  "proof_server_sha256": "f7a6bd169effffeba913ed77a84c1838910c488484348204844f7898ce873e31",
   "rust_toolchain": "1.98.0",
   "origin": "single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media",
   "demuxe": {
@@ -47,6 +47,8 @@
     "every_delivery_retired": true,
     "waited_for_starting_generation": true,
     "plays_after_back_navigation": true,
+    "command_form_creates_scan": true,
+    "if_match_conflict_surfaced": true,
     "demuxe_bytes_match_install_receipt": true,
     "no_permission_granted_beyond_fullscreen": true
   },
@@ -74,12 +76,12 @@
     },
     "playback": {
       "played": true,
-      "before": 2.612595,
-      "afterSeek": 7.001428,
-      "seekElapsedMs": 42,
+      "before": 2.673889,
+      "afterSeek": 7.004421,
+      "seekElapsedMs": 63,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.743678,
+      "finalTime": 7.752026,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -94,9 +96,11 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.004337,
-      "now": 1.010846
-    }
+      "start": 0.003284,
+      "now": 1.017678
+    },
+    "afterScanTitle": "Sources and scans",
+    "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again."
   },
   "csp_console": [
     "error: Executing inline script violates the following Content Security Policy directive 'script-src 'self' 'wasm-unsafe-eval''. Either the 'unsafe-inline' keyword, a hash ('sha256-3ESihh3MurRVVlneQHpXxx54JMAaWXY5YvlFn21oZjw='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked."
@@ -106,8 +110,38 @@
     "background-sync"
   ],
   "navigation_blocked": [],
+  "commands": [
+    {
+      "body": {
+        "mode": "incremental",
+        "require_complete": false
+      },
+      "key": "baf34930bfe140c4831dc11b0e9d1fdf",
+      "library": "lib1",
+      "operation": "createScan",
+      "replay": false
+    },
+    {
+      "body": {
+        "candidate_id": "mc1",
+        "decision": "accept"
+      },
+      "if_match": "\"r1\"",
+      "operation": "decideMatch",
+      "status": 200
+    },
+    {
+      "body": {
+        "candidate_id": "mc1",
+        "decision": "accept"
+      },
+      "if_match": "\"r1\"",
+      "operation": "decideMatch",
+      "status": 412
+    }
+  ],
   "http": {
-    "requests": 159,
+    "requests": 166,
     "deliveries_admitted": [
       "del1",
       "del2"
