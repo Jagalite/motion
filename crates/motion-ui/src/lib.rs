@@ -11,6 +11,7 @@ mod app;
 pub mod assets;
 pub mod facade;
 pub mod mock;
+pub mod offline;
 mod screens;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -105,7 +106,7 @@ async fn api_not_found(request: Request) -> Response {
         .into_response()
 }
 
-async fn ui_asset(Path(file): Path<String>) -> Response {
+pub async fn ui_asset(Path(file): Path<String>) -> Response {
     match assets::lookup(&file) {
         Some(asset) => (
             [
@@ -125,7 +126,7 @@ async fn ui_asset(Path(file): Path<String>) -> Response {
 }
 
 /// Topcoat reads the transport peer from `RemoteAddr`; in-process embedding adds no proxy hop.
-async fn remote_addr(mut request: Request) -> Request {
+pub async fn remote_addr(mut request: Request) -> Request {
     if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
         let addr = *addr;
         request.extensions_mut().insert(RemoteAddr(addr));
@@ -134,7 +135,7 @@ async fn remote_addr(mut request: Request) -> Request {
 }
 
 /// Security and caching headers for presentation responses only.
-async fn presentation_headers(request: Request, next: Next) -> Response {
+pub async fn presentation_headers(request: Request, next: Next) -> Response {
     let head = request.method() == Method::HEAD;
     let mut response = next.run(request).await;
     // HEAD carries headers only, even when the page handler produced a body.

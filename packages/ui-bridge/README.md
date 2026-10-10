@@ -58,8 +58,10 @@ The browser admits viewing authority with the rendered revision, queues ordered
 progress before sending, and retries the exact event identity after an uncertain
 response. Decimal sequences use BigInt. A rejected authority is archived for
 explicit reconciliation; the client does not silently acquire replacement
-writing authority. The outbox survives reloads in the same tab via sessionStorage;
-it is not a durable offline store across browser or native-window closure.
+writing authority. The outbox survives reloads in localStorage, with migration from older tab storage.
+The native host restores encrypted checkpoints before server scripts run and
+recovers principal-scoped records left in the browser partition after a crash.
+These records retain online authority identities; they are not offline events.
 
 Candidate trials are bounded to three in automatic quality mode and one for an
 explicit mode. Every trial preserves timeline, source and track pins. Generation
@@ -91,10 +93,18 @@ production backend correctness. HLS replacement, real conversion workers and
 cross-process offline recovery need separate qualification. The native connection
 shell and its test instructions are documented in `apps/desktop/README.md`.
 
-Real `UiQueryFacade` integration and API/SSR parity require the backend's
-production interfaces. The API branch currently lacks v2 preferences, timeline
-viewing, next/continue-watching, playback plans and viewing/delivery sessions.
-The A07 delivery implementation is still an experimental v1 surface.
-Desktop-owned startup additionally needs a protected bootstrap/readiness and
-process-ownership protocol. Offline-host integration, packaging, signing and
-updates belong to their planned integration stages and remain unqualified.
+The production `UiQueryFacade` now dispatches reads through the authenticated
+public API router. Missing services return unavailable, never mock data. Current
+v2 preferences, timeline viewing, next/continue-watching, playback plans and
+viewing/delivery services still need integration by their owners. The separate
+`motion-ui-host` supplies offline cache views through `OfflinePresentationReader`;
+see `crates/motion-ui-host/README.md` for the port and its limits.
+
+The player maps subtitle preferences to the public planning vocabulary and
+passes explicit HLS sources to Demuxe. It advertises HLS only when native HLS
+support is observed; the installed reduced native-only bundle does not qualify
+Chromium HLS conversion. “Next title” uses the contracted release-order resolver,
+flushes pending progress and retires the old delivery before navigation. Autoplay
+uses the profile preference; browser autoplay denial leaves a usable Play control.
+No client queue order, shuffle algorithm or server current-entry mutation is
+invented where the service contract lacks an advancement operation.

@@ -8,6 +8,7 @@ publish = false
 description = "Motion Topcoat presentation: server-rendered pages over UiQueryFacade (A11)"
 
 [dependencies]
+playscale-core = { path = "../core" }
 # Pinned to the inspected source (research/TOPCOAT_RESEARCH.md [T0]). Explicit
 # minimum features: no reactive runtime, sessions, cookies, compression,
 # remote fonts/icons or asset downloads (plan sections 12.5, 14.3, 14.5).

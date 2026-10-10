@@ -6,7 +6,7 @@ import {isAbsolute} from 'node:path';
 import {connection} from './policy.mjs';
 
 export function createOwnedServer({executable, dataDir, demuxeDir, contractDigest,
-  launch = spawn, startupMs = 120000, shutdownMs = 15000}) {
+  launch = spawn, startupMs = 120000, shutdownMs = 15000, presentationOnly = false}) {
   if (![executable, dataDir, demuxeDir].every(isAbsolute)) throw new Error('Native server paths must be absolute');
   let child = null;
   let starting = null;
@@ -36,9 +36,11 @@ export function createOwnedServer({executable, dataDir, demuxeDir, contractDiges
       if (stopping) await stopping;
       if (owner !== generation) throw new Error('Local startup cancelled');
       const credential = randomBytes(32).toString('hex');
-      const owned = launch(executable, ['--data-dir', dataDir, '--demuxe-dir', demuxeDir,
-        '--topcoat', '--listen', '127.0.0.1:0', '--access-mode', 'restricted', '--bootstrap-fd', '3', '--ready-fd', '4'],
-      {stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: true});
+      const args = presentationOnly
+        ? ['--cache-dir', dataDir, '--demuxe-dir', demuxeDir, '--bootstrap-fd', '3', '--ready-fd', '4', '--lifetime-fd', '5']
+        : ['--data-dir', dataDir, '--demuxe-dir', demuxeDir, '--topcoat', '--listen', '127.0.0.1:0', '--access-mode', 'restricted', '--bootstrap-fd', '3', '--ready-fd', '4'];
+      const owned = launch(executable, args,
+        {stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe', ...(presentationOnly ? ['pipe'] : [])], windowsHide: true});
       child = owned;
       try {
         const message = await new Promise((resolve, reject) => {
@@ -65,6 +67,14 @@ export function createOwnedServer({executable, dataDir, demuxeDir, contractDiges
           owned.stdio[4].on('end', () => { if (!settled) finish(new Error('Local readiness pipe closed')); });
           owned.stdio[3].end(credential);
         });
+        if (presentationOnly) {
+          const selected = connection({origin: message.origin, serverId: 'offline-cache', mode: 'service_owned'});
+          if (message.protocol !== 1 || message.kind !== 'offline-presentation' || typeof message.epoch !== 'string' || !message.epoch
+            || owner !== generation || child !== owned || !alive(owned)) throw new Error('Offline helper readiness mismatch');
+          ready = {...selected, helperEpoch: message.epoch, credential, mode: 'offline'};
+          owned.once('exit', () => { if (child === owned) { child = null; ready = null; } });
+          return ready;
+        }
         const selected = connection({origin: message.origin, serverId: message.server_id, mode: 'service_owned'});
         if (message.protocol !== 1 || !message.server_epoch || !message.version
           || message.contract_digest !== contractDigest || owner !== generation || child !== owned || !alive(owned)) {

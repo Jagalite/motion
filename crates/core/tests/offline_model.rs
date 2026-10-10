@@ -83,7 +83,13 @@ impl Model for Offline {
         Ok(vec![])
     }
     fn check_state(&self, s: &Self::State) -> Result<Vec<Check>, ModelError> {
-        Ok(vec![check("offline.bounded_consecutive_log", s.len() <= 4 && s.iter().enumerate().all(|(i,e)| e.device_sequence == (i+1).to_string()))])
+        Ok(vec![check(
+            "offline.bounded_consecutive_log",
+            s.len() <= 4
+                && s.iter()
+                    .enumerate()
+                    .all(|(i, e)| e.device_sequence == (i + 1).to_string()),
+        )])
     }
     fn step(
         &self,

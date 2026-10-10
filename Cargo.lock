@@ -1464,6 +1464,7 @@ dependencies = [
  "axum",
  "http",
  "http-body-util",
+ "playscale-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1471,6 +1472,31 @@ dependencies = [
  "topcoat",
  "tower",
  "tower-http",
+]
+
+[[package]]
+name = "motion-ui-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "cap-std",
+ "clap",
+ "fs2",
+ "http-body-util",
+ "mime_guess",
+ "motion-ui",
+ "playscale-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "topcoat",
+ "tower",
+ "tower-http",
+ "uuid",
 ]
 
 [[package]]

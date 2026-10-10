@@ -29,6 +29,7 @@ window.motionHost.onStatus(message => show(message, true));
 for (const [id, operation, message] of [
   ['start-local', 'startLocal', 'Connected to the local server owned by this desktop. Quitting stops this server.'],
   ['stop-local', 'stopLocal', 'The desktop-owned server has stopped.'],
+  ['downloads', 'openDownloads', 'Offline downloads are open. Progress is saved on this device.'],
 ]) document.getElementById(id).addEventListener('click', async event => {
   event.target.disabled = true;
   try { await window.motionHost[operation](); show(message); }

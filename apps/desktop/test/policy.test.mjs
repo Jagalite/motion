@@ -31,3 +31,14 @@ test('identity, runtime epoch, readiness and contract mismatches fail closed', (
 test('a connection request cannot confer desktop process ownership', () => {
   assert.throws(() => connection({origin: 'http://127.0.0.1:9999', serverId: 'server1', mode: 'desktop_owned'}));
 });
+
+test('native handshake JSON is bounded by received bytes, including chunked responses', async () => {
+  const {boundedJson} = await import('../src/policy.mjs');
+  assert.deepEqual(await boundedJson(new Response('{"ok":true}')), {ok:true});
+  let cancelled = false;
+  const response = new Response(new ReadableStream({pull(controller) {controller.enqueue(new Uint8Array(1024));}, cancel() {cancelled=true;}}));
+  await assert.rejects(boundedJson(response, 1024), /connection limit/);
+  assert.equal(cancelled, true);
+  await assert.rejects(boundedJson(new Response('not json')));
+  await assert.rejects(boundedJson(new Response(new Uint8Array([255]))));
+});

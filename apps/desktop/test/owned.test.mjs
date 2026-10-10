@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {createOwnedServer} from '../src/owned.mjs';
-function fixture(response = {}) {
+function fixture(response = {}, options = {}) {
   const processes = [];
   const launches = [];
   const launch = (path, args, options) => {
@@ -15,7 +15,7 @@ function fixture(response = {}) {
     processes.push(child);
     return child;
   };
-  const owner = createOwnedServer({executable: '/server', dataDir: '/private/data', demuxeDir: '/assets', contractDigest: 'digest', launch});
+  const owner = createOwnedServer({executable: '/server', dataDir: '/private/data', demuxeDir: '/assets', contractDigest: 'digest', launch, ...options});
   return {owner, processes, launches};
 }
 test('owned launch passes secrets only through a private descriptor and shares one startup', async () => {
@@ -59,4 +59,23 @@ test('spawn failure rejects without waiting for a nonexistent process to exit', 
   const owner = createOwnedServer({executable: '/definitely/missing/motion-server', dataDir: '/unused', demuxeDir: '/unused', contractDigest: 'digest'});
   await assert.rejects(owner.start(), /ENOENT/);
   assert.equal(owner.running, false);
+});
+
+test('offline helper receives cache paths and a parent-lifetime pipe, never server startup flags', async () => {
+  const {owner, launches, processes} = fixture({kind: 'offline-presentation', epoch: 'helper1'}, {presentationOnly: true});
+  const ready = await owner.start();
+  assert.equal(ready.mode, 'offline');
+  assert.equal(ready.helperEpoch, 'helper1');
+  assert.ok(launches[0].args.includes('--cache-dir'));
+  assert.ok(launches[0].args.includes('--lifetime-fd'));
+  assert.equal(launches[0].args.includes('--data-dir'), false);
+  assert.equal(launches[0].options.stdio[5], 'pipe');
+  await owner.stop();
+  assert.deepEqual(processes[0].signals, ['SIGTERM']);
+});
+
+test('offline readiness cannot be substituted with an authoritative server response', async () => {
+  const {owner, processes} = fixture({}, {presentationOnly: true});
+  await assert.rejects(owner.start(), /Offline helper readiness mismatch/);
+  assert.deepEqual(processes[0].signals, ['SIGTERM']);
 });
