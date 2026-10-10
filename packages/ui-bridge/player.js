@@ -76,8 +76,11 @@ function demuxeSource(generation, origin) {
 // A version, quality or audio choice replans the same timeline. An audio
 // track other than the default asks the planner for a conversion that carries
 // exactly that stream; the server decides whether one is admissible.
-function replanInput(input, {version, quality, audio}) {
+function replanInput(input, {version, quality, audio, audioVersion}) {
   if (audio && !/^a[0-9]{1,4}$/.test(audio)) throw new Error('Invalid audio track');
+  // Track IDs are ordinals of one version's streams; another version may
+  // number them differently, so a version change drops the audio choice.
+  if (version && version !== audioVersion) audio = null;
   return {...input, version_id: version || null, failed_candidate_ids: [],
     quality: {...input.quality, mode: quality},
     tracks: {...input.tracks, audio_track_id: audio || null}};
@@ -228,6 +231,11 @@ async function firstGeneration(delivery, current) {
     if (!current()) return null;
   }
 }
+
+// The last viewing session this browser created for a principal/profile/
+// timeline, across server runtimes: the only authority adoptableRevision may
+// recognise as our own.
+const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
 
 // Outbox is scoped to this server runtime, principal, profile and timeline.
 // It contains session/event identities only, never reusable authentication.
@@ -525,7 +533,8 @@ async function start() {
         // Possibly the previous player's final event landing after render.
         const latest = await api('GET', `/api/v2/profiles/${encodeURIComponent(data.profileId)}/timelines/${encodeURIComponent(data.timelineId)}/viewing`,
           undefined, undefined, AbortSignal.timeout(10000));
-        const adopted = adoptableRevision(latest, Number(data.resumeMs) || 0);
+        const adopted = adoptableRevision(latest, {ownSession: localStorage.getItem(ownSessionKey(data)),
+          manualEpoch: data.viewingManualEpoch, resumeMs: Number(data.resumeMs) || 0});
         if (adopted === null || !current()) throw error;
         session = await createSession(adopted);
       }
@@ -533,6 +542,7 @@ async function start() {
       if (session.delivery_id !== delivery.id || session.profile_id !== data.profileId || session.timeline_id !== data.timelineId) {
         throw new Error('The server returned a different viewing context.');
       }
+      localStorage.setItem(ownSessionKey(data), session.id);
       state.viewingOwner = {active: true};
       state.viewing = makeViewingWriter(session, viewingStorage(data), state.viewingOwner);
 
@@ -613,7 +623,8 @@ controls?.addEventListener('click', event => {
     if (action === 'quality') {
       const epoch = state.epoch;
       const next = replanInput(state.planInput, {version: controls.elements.version.value,
-        quality: controls.elements.quality.value, audio: controls.elements.audio?.value});
+        quality: controls.elements.quality.value, audio: controls.elements.audio?.value,
+        audioVersion: controls.elements.audio?.dataset.version});
       const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));
       if (epoch !== state.epoch) return;
       if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) {

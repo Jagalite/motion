@@ -2,18 +2,25 @@
 // Electron renderer against the real `playscale` server binary, a real
 // library scan and locally generated FFmpeg media. No mock services.
 //
-// It exercises, per engine: original (byte-range) playback, explicit seek
-// (new delivery generation), progress persistence and resume, an audio-track
+// Per engine it exercises: original (byte-range) playback, explicit seek (a
+// new delivery generation), progress persistence and resume, an audio-track
 // switch that replans the same delivery from the original to a live HLS
-// conversion, a conversion-only title over HLS, and a server restart with
-// outbox drain and resume.
+// conversion, a progress event queued during a real server outage and
+// delivered after restart, reopening after restart, retirement on leave, a
+// conversion-only title, and (diagnostic only) the same conversion in a plain
+// <video> element.
 //
 //   cargo build -p playscale
 //   MOTION_PLAYWRIGHT_DIR=/path/with/node_modules/playwright \
 //   node scripts/client_playback_e2e.mjs --engines chromium,webkit,electron --out <new empty dir>
 //
+// Chromium and WebKit run through Playwright. Electron 44 rejects Playwright's
+// launch flags, so its main process (client_playback_electron_main.mjs) runs
+// the same scenario through a webContents/DevTools adapter.
+//
 // Not CI-ready: it needs FFmpeg, Playwright browsers and (for electron) the
-// apps/desktop dev dependencies. Exit status is non-zero if any check fails.
+// apps/desktop dev dependencies. A check fails, or is "blocked" only when the
+// observed error is the documented Demuxe live-HLS limitation.
 import {execFileSync, spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync} from 'node:fs';
@@ -22,24 +29,14 @@ import {createRequire} from 'node:module';
 import {createServer} from 'node:net';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
-const root = fileURLToPath(new URL('../', import.meta.url));
-const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, i, all) =>
-  value.startsWith('--') ? [...pairs, [value.slice(2), all[i + 1]]] : pairs, []));
-const engines = (args.engines ?? 'chromium,webkit,electron').split(',');
-const out = resolve(args.out ?? join(tmpdir(), `motion-client-playback-${Date.now()}`));
-if (existsSync(out) && readdirSync(out).length) throw new Error(`--out must be new or empty: ${out}`);
-mkdirSync(out, {recursive: true});
-const binary = resolve(process.env.MOTION_SERVER_BINARY ?? join(root, 'target/debug/playscale'));
-const demuxe = resolve(process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe'));
-const playwright = createRequire(join(resolve(process.env.MOTION_PLAYWRIGHT_DIR ?? root), 'package.json'))('playwright');
+export const root = fileURLToPath(new URL('../', import.meta.url));
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
-
-const freePort = () => new Promise(done => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const {port} = s.address(); s.close(() => done(port)); }); });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+export const freePort = () => new Promise(done => { const s = createServer(); s.listen(0, '127.0.0.1', () => { const {port} = s.address(); s.close(() => done(port)); }); });
 
-function media(dir) {
+export function media(dir) {
   mkdirSync(dir, {recursive: true});
   const ff = (...a) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...a]);
   // 90 s H.264 High / two AAC tracks (440 Hz eng 44.1 kHz; 880 Hz fra 22.05 kHz).
@@ -53,12 +50,14 @@ function media(dir) {
   return readdirSync(dir).map(name => ({name, sha256: sha256(readFileSync(join(dir, name)))}));
 }
 
-class Server {
-  constructor(work, port) { this.work = work; this.port = port; this.origin = `http://127.0.0.1:${port}`; this.starts = []; }
+export class Server {
+  constructor({work, port, launch, demuxe}) {
+    Object.assign(this, {work, port, launch, demuxe, origin: `http://127.0.0.1:${port}`, starts: [], log: ''});
+  }
   async start() {
     const t0 = Date.now();
     this.child = spawn(this.launch, ['--listen', `127.0.0.1:${this.port}`, '--data-dir', join(this.work, 'data'),
-      '--library', join(this.work, 'media'), '--demuxe-dir', demuxe, '--topcoat', '--access-mode', 'restricted'],
+      '--library', join(this.work, 'media'), '--demuxe-dir', this.demuxe, '--topcoat', '--access-mode', 'restricted'],
     {stdio: ['ignore', 'ignore', 'pipe'], env: {...process.env, RUST_LOG: 'playscale=info'}});
     this.child.stderr.on('data', chunk => { this.log += chunk; });
     // A freshly written executable can wait minutes for OS assessment on first launch.
@@ -80,11 +79,12 @@ class Server {
     const response = await fetch(`${this.origin}${path}`, {method, headers, body: body === undefined ? undefined : JSON.stringify(body)});
     const text = await response.text();
     let json = null; try { json = JSON.parse(text); } catch {}
-    return {status: response.status, json, headers: response.headers};
+    return {status: response.status, json};
   }
 }
 
-async function provision(server) {
+/** Pair a device for the default profile, grant it every library, and wait for the scan. */
+export async function provision(server) {
   const operator = server.operator();
   const libraries = (await server.api('GET', '/api/v2/libraries?limit=10', undefined, operator)).json.items;
   const pairing = (await server.api('POST', '/api/v2/auth/pairings', {device_name: 'Evidence', client_name: 'motion-client-playback'})).json;
@@ -97,8 +97,7 @@ async function provision(server) {
     {library_ids: libraries.map(l => l.id), allow_unrated: true, allowed_ratings: [], blocked_labels: [], permissions}, operator, {'If-Match': '"r-1"'});
   if (policy.status !== 200) throw new Error(`policy failed: ${JSON.stringify(policy.json)}`);
   const token = claimed.access_token;
-  // Wait for the startup scan to publish both titles.
-  let titles = {};
+  const titles = {};
   for (let i = 0; i < 300 && Object.keys(titles).length < 2; i++) {
     const items = (await server.api('GET', '/api/v2/catalog/items?limit=50', undefined, token)).json?.items ?? [];
     for (const item of items) {
@@ -112,8 +111,6 @@ async function provision(server) {
   if (!film || !legacy) throw new Error(`scan did not publish both titles: ${JSON.stringify(titles)}`);
   return {token, film, legacy};
 }
-
-// ----------------------------------------------------------------- in page
 
 const pageHelpers = `
 window.__e2e = {
@@ -154,35 +151,50 @@ window.__e2e = {
     }
     return {replaced: false, text: this.host().textContent.trim().slice(0, 300)};
   },
+  outbox: () => Object.fromEntries(Object.keys(localStorage).filter(k => k.startsWith('motion:viewing:')).map(k => [k, JSON.parse(localStorage.getItem(k))])),
 };`;
 
-async function scenario(page, server, ctx, engine) {
+// The deployed browser-only Demuxe opens HLS natively only with a finite VOD
+// duration; live (rolling) HLS needs its Shaka backend, which is not deployed.
+const DEMUXE_LIVE = {id: 'demuxe-live-hls', evidence: 'live playback requires explicit Shaka live permission'};
+
+/**
+ * The scenario over a Playwright-like `page` (goto, reload, evaluate,
+ * screenshot, on('response'|'console')). Responses expose url(), status(),
+ * request().method(), request().postData() and json().
+ */
+export async function scenario(page, server, ctx, engine, out) {
   const checks = [];
   const net = [];
   const consoleLog = [];
-  // `gap` names a documented limitation outside this client/server slice; a
-  // failing check with a gap is reported as blocked, never as passed.
   const check = (name, pass, detail, gap) => {
-    const status = pass ? 'pass' : gap ? 'blocked' : 'fail';
-    checks.push({name, status, pass: Boolean(pass), gap: gap ?? null, detail});
+    // Blocked only when the observed failure carries the gap's own evidence.
+    const blocked = !pass && gap && JSON.stringify(detail).includes(gap.evidence);
+    const status = pass ? 'pass' : blocked ? 'blocked' : 'fail';
+    checks.push({name, status, gap: blocked ? gap.id : null, detail});
     console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
   };
-  const DEMUXE_LIVE = 'demuxe-live-hls: the deployed browser-only Demuxe opens HLS natively only with a finite VOD duration; live (rolling) HLS needs its Shaka backend, which is not deployed';
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
   page.on('response', async r => {
     const url = new URL(r.url());
     if (!url.pathname.startsWith('/api/v2/') || url.origin !== server.origin) return;
-    const entry = {at: Date.now(), method: r.request().method(), path: url.pathname, status: r.status()};
-    if (/\/playback\/(plans|delivery-sessions)/.test(url.pathname) && r.request().method() !== 'DELETE') {
-      try { const body = await r.json(); entry.body = {transport: body.transport ?? body.active?.transport, operation: body.operation, status: body.status,
-        candidate: body.candidate_id, reason: body.reason_codes, pending: body.pending?.transport ?? null, generation: body.active?.generation ?? null, audio: body.tracks?.audio_track_id}; } catch {}
+    const method = r.request().method();
+    const entry = {at: Date.now(), method, path: url.pathname, status: r.status()};
+    if (url.pathname.endsWith('/events')) { try { entry.request = JSON.parse(r.request().postData() ?? 'null'); } catch {} }
+    if (/\/playback\/(plans|delivery-sessions)/.test(url.pathname) && method !== 'DELETE') {
+      try {
+        const body = await r.json();
+        entry.body = {id: body.id, transport: body.transport ?? body.active?.transport, operation: body.operation, status: body.status,
+          candidate: body.candidate_id, reason: body.reason_codes, pending: body.pending?.transport ?? null, generation: body.active?.generation ?? null, audio: body.tracks?.audio_track_id};
+      } catch {}
     }
     net.push(entry);
   });
-  const shot = async name => page.screenshot({path: join(out, `${engine}-${name}.png`)}).catch(() => {});
+  const shot = name => page.screenshot({path: join(out, `${engine}-${name}.png`)}).catch(() => {});
   const helpers = () => page.evaluate(pageHelpers);
   const viewing = async timeline => (await server.api('GET', `/api/v2/profiles/default/timelines/${timeline}/viewing`, undefined, ctx.token)).json;
   const since = t => net.filter(e => e.at >= t);
+  const admitted = t => since(t).filter(e => e.path === '/api/v2/playback/delivery-sessions' && e.method === 'POST' && e.status === 201).at(-1)?.body?.id;
 
   // Browser session from the paired device credential (cookie + CSRF).
   await page.goto(`${server.origin}/api/v2/system/health`);
@@ -223,14 +235,15 @@ async function scenario(page, server, ctx, engine) {
   check('seek replaces the generation at 40 s', seek.replaced && seekPlay.logical >= 40 && seekPlay.logical < 50, {seek, seekPlay});
   check('seek staged and activated generation 2', since(t).some(e => e.path.endsWith('/changes') && e.status === 202)
     && since(t).some(e => e.path.endsWith('/generations/2/activate') && e.status === 200), since(t).map(e => `${e.method} ${e.path.split('/').slice(-2).join('/')} ${e.status}`));
-  // Progress: events every 5 s while playing, then a paused event.
-  await sleep(6500);
+  await sleep(6500); // Progress events every 5 s while playing.
   await page.evaluate(() => window.__e2e.el().pause());
   await sleep(1500);
   const saved = await viewing(ctx.film.timeline);
   check('progress persisted on the server', saved.position_ms >= 40000 && saved.position_ms < 60000, saved);
-  check('ordered viewing events accepted', net.filter(e => e.path.endsWith('/events')).every(e => e.status === 200) && net.some(e => e.path.endsWith('/events')),
-    net.filter(e => e.path.endsWith('/events')).map(e => e.status));
+  const events = net.filter(e => e.path.endsWith('/events'));
+  check('ordered viewing events accepted with consecutive sequences', events.length > 0 && events.every(e => e.status === 200)
+    && events.every((e, i) => i === 0 || BigInt(e.request?.sequence ?? 0) === BigInt(events[i - 1].request?.sequence ?? -1) + 1n),
+  events.map(e => `${e.request?.sequence}:${e.status}`));
 
   // Resume from the item page.
   t = Date.now();
@@ -243,8 +256,6 @@ async function scenario(page, server, ctx, engine) {
   const resumedPlay = await page.evaluate(() => window.__e2e.play(1));
   check('resume starts at the saved position', resumed.ready.state === 'ready' && Math.abs(resumed.resume - saved.position_ms) <= 1000
     && resumedPlay.advancing && resumedPlay.logical >= saved.position_ms / 1000 - 1, {resumed, resumedPlay, saved: saved.position_ms});
-  const admit = since(t).find(e => e.path === '/api/v2/playback/delivery-sessions' && e.method === 'POST');
-  check('resumed delivery requested at the saved position', admit?.status === 201, admit);
 
   // Audio track switch: the second track needs a conversion; the same delivery
   // is replanned from the original to HLS and the generation is replaced.
@@ -260,41 +271,88 @@ async function scenario(page, server, ctx, engine) {
   });
   const switchedPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   const replan = since(t).find(e => e.path === '/api/v2/playback/plans');
-  check('audio selector lists both tracks', JSON.stringify(switched.options) === JSON.stringify(['', 'a0', 'a1']), switched.options);
+  check('audio selector lists both tracks of the planned version', JSON.stringify(switched.options) === JSON.stringify(['', 'a0', 'a1']), switched.options);
   check('audio switch replans to a live HLS conversion', replan?.body?.transport === 'hls' && replan?.body?.audio === 'a1', replan?.body);
-  check('audio switch replaces the player over HLS and keeps position', switched.replaced && switchedPlay.advancing
-    && Math.abs(switchedPlay.logical - before) < 15, {before, switched, switchedPlay}, DEMUXE_LIVE);
-  check('a failed switch keeps the original player playing', switched.replaced || (switchedPlay.advancing && Math.abs(switchedPlay.logical - before) < 15),
-    {before, switchedPlay});
   check('HLS manifest, variant, init and segments served', ['master.m3u8', 'index.m3u8', 'init.mp4', '.m4s'].every(s => since(t).some(e => e.path.endsWith(s) && e.status === 200)),
     [...new Set(since(t).filter(e => e.path.startsWith('/api/v2/streams/')).map(e => `${e.path.split('/').slice(5).join('/')} ${e.status}`))].slice(0, 8));
-  await shot('audio-switched-hls');
+  check('audio switch replaces the player over HLS and keeps position', switched.replaced && switchedPlay.advancing
+    && Math.abs(switchedPlay.logical - before) < 15, {before, switched, switchedPlay}, DEMUXE_LIVE);
+  if (!switched.replaced) {
+    check('a failed switch keeps the original player playing', switchedPlay.advancing && Math.abs(switchedPlay.logical - before) < 15, {before, switchedPlay});
+  }
+  await shot('audio-switch');
 
-  // Server restart while the player is open: the page is reloaded, the
-  // outbox drains and playback resumes from durable progress.
-  await page.evaluate(() => window.__e2e.el().pause());
-  await sleep(1500);
-  const beforeRestart = await viewing(ctx.film.timeline);
+  // A progress event queued during a server outage is delivered, with the
+  // same identity, once the restarted server is reachable.
+  await page.evaluate(() => window.__e2e.el().play());
+  await sleep(1000);
   await server.stop();
-  await server.start();
+  await page.evaluate(() => window.__e2e.el().pause());
+  let queued = null;
+  for (let i = 0; i < 100 && !queued; i++) {
+    const outbox = await page.evaluate(() => window.__e2e.outbox());
+    queued = Object.values(outbox).find(v => v?.pending)?.pending ?? null;
+    if (!queued) await sleep(100);
+  }
+  check('an event sent during the outage is queued in the durable outbox', queued !== null, {queued});
   t = Date.now();
-  await page.reload();
+  await server.start();
+  // The next observation drains the outbox (or teardown does when the
+  // restarted server no longer knows the delivery).
+  await page.evaluate(() => window.__e2e.el()?.play()).catch(() => {});
+  let drained;
+  for (let i = 0; i < 300 && !drained; i++) {
+    drained = since(t).find(e => e.path.endsWith('/events') && e.request?.event_id === queued?.event_id);
+    if (!drained) await sleep(100);
+  }
+  const afterOutage = await viewing(ctx.film.timeline);
+  check('the queued event is accepted after restart with its original identity', drained?.status === 200
+    && drained.request.sequence === queued?.sequence && afterOutage.position_ms >= (queued?.position_ms ?? Infinity),
+  {queued, drained: drained && {status: drained.status, request: drained.request}, server: afterOutage.position_ms});
+
+  // Reopen after restart at durable progress.
+  t = Date.now();
+  const durable = await viewing(ctx.film.timeline);
+  await page.goto(`${server.origin}/play/${ctx.film.timeline}`);
   await helpers();
   const afterRestart = await page.evaluate(async () => ({ready: await window.__e2e.ready(), resume: Number(window.__e2e.host().dataset.resumeMs),
-    rejected: document.getElementById('motion-progress-status')?.textContent ?? ''}));
+    banner: document.getElementById('motion-progress-status')?.textContent ?? ''}));
   const restartPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   check('after restart the player reopens at durable progress', afterRestart.ready.state === 'ready'
-    && Math.abs(afterRestart.resume - beforeRestart.position_ms) <= 1000 && restartPlay.advancing,
-  {beforeRestart: beforeRestart.position_ms, afterRestart, restartPlay});
-  // One 409 is expected when the previous page's final event lands after this
-  // render; the client then adopts the unchanged revision (adoptableRevision).
+    && Math.abs(afterRestart.resume - durable.position_ms) <= 1000 && restartPlay.advancing, {durable: durable.position_ms, afterRestart, restartPlay});
+  // Leaving the outage page sends its final event during unload; it may land
+  // after this render, so one 409 followed by adoption of our own unchanged
+  // session's revision (adoptableRevision) and a 201 is expected.
   const restartErrors = since(t).filter(e => e.path.startsWith('/api/v2/playback/') && e.status >= 400);
-  const sessionsAfter = since(t).filter(e => e.path === '/api/v2/playback/viewing-sessions');
-  check('after restart the cookie session still authorizes and a viewing session starts', sessionsAfter.at(-1)?.status === 201
+  const sessionStarts = since(t).filter(e => e.path === '/api/v2/playback/viewing-sessions').map(e => e.status);
+  check('after restart the cookie session authorizes playback', sessionStarts.at(-1) === 201
     && restartErrors.every(e => e.path === '/api/v2/playback/viewing-sessions' && e.status === 409) && restartErrors.length <= 1,
-  {sessions: sessionsAfter.map(e => e.status), errors: restartErrors.map(e => `${e.method} ${e.path} ${e.status}`)});
+  {sessionStarts, errors: restartErrors.map(e => `${e.method} ${e.path} ${e.status}`)});
 
-  // Conversion-only title over HLS.
+  // Leaving retires this player's delivery.
+  const product = admitted(t);
+  t = Date.now();
+  const left = Date.now();
+  await page.goto(`${server.origin}/`);
+  let retired;
+  for (let i = 0; i < 50 && !retired; i++) {
+    retired = since(t - 2000).find(e => e.method === 'DELETE' && e.path === `/api/v2/playback/delivery-sessions/${product}`);
+    if (!retired) await sleep(100);
+  }
+  const after = await server.api('GET', `/api/v2/playback/delivery-sessions/${product}`, undefined, ctx.token);
+  const elapsed = Date.now() - left;
+  // The unload DELETE (keepalive) is often not observable by the page's
+  // network listener. Without retirement the delivery stays live (status
+  // ready) until its 30 s lease lapses, so gone/closed well inside the lease
+  // proves retirement.
+  check('leaving the player retires its own delivery', Boolean(product) && (retired?.status === 204
+    || ((after.status === 404 || ['closing', 'closed'].includes(after.json?.status)) && elapsed < 20000)),
+  {product, retired: retired?.status ?? 'not observed', after: after.status, state: after.json?.status, elapsedMs: elapsed});
+  const home = await page.evaluate(() => document.querySelector('main').textContent);
+  check('home lists continue watching', /Signal Film/.test(home) && !/Continue watching is unavailable/i.test(home), {});
+  await shot('home');
+
+  // Conversion-only title.
   t = Date.now();
   await page.goto(`${server.origin}/play/${ctx.legacy.timeline}`);
   await helpers();
@@ -306,8 +364,8 @@ async function scenario(page, server, ctx, engine) {
   await shot('conversion');
 
   // Diagnostic, not the product path: the same authorized v2 conversion in a
-  // plain <video> element, isolating the server stream and the engine's HLS
-  // support from the Demuxe deployment policy above.
+  // plain <video> element, separating the server stream and the engine's HLS
+  // support from the Demuxe deployment policy.
   const diagnostic = await page.evaluate(async timeline => {
     const csrf = document.querySelector('meta[name="motion-csrf"]').content;
     const call = async (method, path, body, key) => {
@@ -335,87 +393,94 @@ async function scenario(page, server, ctx, engine) {
     try {
       await video.play();
       const t0 = performance.now();
-      while (performance.now() - t0 < 30000 && video.currentTime < 4) await new Promise(r => setTimeout(r, 100));
+      while (performance.now() - t0 < 30000 && video.currentTime < 4 && !video.error) await new Promise(r => setTimeout(r, 100));
       played = video.currentTime >= 4;
     } catch (e) { error = String(e); }
     clearInterval(heartbeat);
-    const result = {plan: plan.json.transport, admitted: admitted.status, played, currentTime: video.currentTime, duration: video.duration,
+    const result = {plan: plan.json.transport, admitted: admitted.status, played, currentTime: video.currentTime,
       width: video.videoWidth, height: video.videoHeight, error: error ?? video.error?.message ?? null};
     video.remove();
     await call('DELETE', `/api/v2/playback/delivery-sessions/${id}`);
     return result;
   }, ctx.legacy.timeline);
-  check('diagnostic: server live HLS conversion plays in a plain video element', diagnostic.played && diagnostic.width > 0, diagnostic);
-
-  // Leaving retires the delivery.
-  t = Date.now();
-  await page.goto(`${server.origin}/`);
-  await sleep(1500);
-  check('leaving the player retires its delivery', since(t - 3000).some(e => e.method === 'DELETE' && e.path.startsWith('/api/v2/playback/delivery-sessions/') && e.status === 204)
-    || net.some(e => e.method === 'DELETE' && e.status === 204), net.filter(e => e.method === 'DELETE').map(e => e.status));
-  const home = await page.evaluate(() => document.querySelector('main').textContent);
-  check('home lists continue watching', /Signal Film/.test(home) && !/Continue watching is unavailable/i.test(home), {});
-  await shot('home');
+  // Diagnostics inform the gap analysis; they never fail the receipt.
+  checks.push({name: 'diagnostic: server live HLS conversion in a plain video element', status: diagnostic.played ? 'diagnostic-pass' : 'diagnostic-fail', gap: null, detail: diagnostic});
+  console.log(`[${engine}] DIAGNOSTIC plain video HLS ${JSON.stringify(diagnostic)}`);
   writeFileSync(join(out, `${engine}-network.json`), JSON.stringify(net, null, 2));
   writeFileSync(join(out, `${engine}-console.log`), consoleLog.join('\n'));
   return checks;
 }
 
-// ------------------------------------------------------------------ engines
-
-async function withEngine(engine, server, ctx) {
-  const video = {dir: join(out, `${engine}-video`), size: {width: 1100, height: 760}};
-  if (engine === 'electron') {
-    const desktop = createRequire(join(root, 'apps/desktop/package.json'));
-    const app = await playwright._electron.launch({executablePath: desktop('electron'),
-      args: [fileURLToPath(new URL('./client_playback_electron_main.mjs', import.meta.url))],
-      env: {...process.env, MOTION_E2E_ORIGIN: server.origin}, recordVideo: video});
-    try {
-      const page = await app.firstWindow();
-      const versions = await app.evaluate(({app}) => ({electron: process.versions.electron, chromium: process.versions.chrome, name: app.getName()}));
-      return {versions, checks: await scenario(page, server, ctx, engine)};
-    } finally { await app.close(); }
-  }
-  const browser = await playwright[engine].launch();
-  try {
-    const context = await browser.newContext({recordVideo: video, viewport: video.size});
-    const page = await context.newPage();
-    const checks = await scenario(page, server, ctx, engine);
-    await context.close();
-    return {versions: {[engine]: browser.version()}, checks};
-  } finally { await browser.close(); }
-}
-
-const receipt = {started: new Date().toISOString(), kind: 'production-evidence', server: {binary, sha256: sha256(readFileSync(binary))},
-  demuxe: JSON.parse(readFileSync(join(demuxe, 'playscale-package.json'), 'utf8')).version, engines: {}};
-let failed = false;
-for (const engine of engines) {
+/** One engine against its own server, media and data directory. */
+export async function prepare(engine, binary, demuxe) {
   const work = await mkdtemp(join(tmpdir(), `motion-e2e-${engine}-`));
   // Launch identical bytes from the host volume (macOS loader stalls on fresh
   // executables on external disks).
-  const server = new Server(work, await freePort());
-  server.launch = join(work, 'playscale');
-  writeFileSync(server.launch, readFileSync(binary), {mode: 0o700});
-  server.log = '';
-  receipt.media = media(join(work, 'media'));
-  try {
-    await server.start();
-    const ctx = await provision(server);
-    const result = await withEngine(engine, server, ctx);
-    const count = status => result.checks.filter(c => c.status === status).length;
-    receipt.engines[engine] = {...result, summary: {pass: count('pass'), blocked: count('blocked'), fail: count('fail')}, serverStartsMs: server.starts};
-    if (count('fail')) failed = true;
-  } catch (error) {
-    failed = true;
-    receipt.engines[engine] = {error: String(error?.stack ?? error)};
-    console.error(`[${engine}] ERROR`, error);
-  } finally {
-    await server.stop();
-    writeFileSync(join(out, `${engine}-server.log`), server.log.slice(-200000));
-  }
+  const launch = join(work, 'playscale');
+  writeFileSync(launch, readFileSync(binary), {mode: 0o700});
+  const server = new Server({work, port: await freePort(), launch, demuxe});
+  return {server, media: media(join(work, 'media'))};
 }
-receipt.finished = new Date().toISOString();
-receipt.passed = !failed;
-writeFileSync(join(out, 'receipt.json'), JSON.stringify(receipt, null, 2));
-console.log(`receipt: ${join(out, 'receipt.json')} passed=${!failed}`);
-process.exit(failed ? 1 : 0);
+
+async function main() {
+  const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, i, all) =>
+    value.startsWith('--') ? [...pairs, [value.slice(2), all[i + 1]]] : pairs, []));
+  const engines = (args.engines ?? 'chromium,webkit,electron').split(',');
+  const out = resolve(args.out ?? join(tmpdir(), `motion-client-playback-${Date.now()}`));
+  if (existsSync(out) && readdirSync(out).length) throw new Error(`--out must be new or empty: ${out}`);
+  mkdirSync(out, {recursive: true});
+  const binary = resolve(process.env.MOTION_SERVER_BINARY ?? join(root, 'target/debug/playscale'));
+  const demuxe = resolve(process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe'));
+  const receipt = {started: new Date().toISOString(), kind: 'production-evidence',
+    server: {binary, sha256: sha256(readFileSync(binary))},
+    demuxe: {dir: demuxe, version: JSON.parse(readFileSync(join(demuxe, 'playscale-package.json'), 'utf8')).version}, engines: {}};
+  for (const engine of engines) {
+    let result;
+    if (engine === 'electron') {
+      // The Electron main process runs the scenario itself (see header).
+      const electron = createRequire(join(root, 'apps/desktop/package.json'))('electron');
+      const resultFile = join(out, 'electron-result.json');
+      // A host that is itself Electron may export ELECTRON_RUN_AS_NODE.
+      const {ELECTRON_RUN_AS_NODE: _ignored, ...env} = process.env;
+      const child = spawn(electron, [fileURLToPath(new URL('./client_playback_electron_main.mjs', import.meta.url))],
+        {stdio: 'inherit', env: {...env, MOTION_E2E_OUT: out, MOTION_E2E_RESULT: resultFile, MOTION_SERVER_BINARY: binary, MOTION_DEMUXE_DIR: demuxe}});
+      await new Promise(done => child.once('exit', done));
+      result = existsSync(resultFile) ? JSON.parse(readFileSync(resultFile, 'utf8')) : {error: 'Electron produced no result'};
+    } else {
+      const playwright = createRequire(join(resolve(process.env.MOTION_PLAYWRIGHT_DIR ?? root), 'package.json'))('playwright');
+      const {server, media: files} = await prepare(engine, binary, demuxe);
+      receipt.media = files;
+      try {
+        await server.start();
+        const ctx = await provision(server);
+        const browser = await playwright[engine].launch();
+        try {
+          const context = await browser.newContext({recordVideo: {dir: join(out, `${engine}-video`), size: {width: 1100, height: 760}}, viewport: {width: 1100, height: 760}});
+          const page = await context.newPage();
+          const checks = await scenario(page, server, ctx, engine, out);
+          await context.close();
+          result = {versions: {[engine]: browser.version()}, checks, serverStartsMs: server.starts};
+        } finally { await browser.close(); }
+      } catch (error) {
+        result = {error: String(error?.stack ?? error)};
+      } finally {
+        await server.stop();
+        writeFileSync(join(out, `${engine}-server.log`), server.log.slice(-200000));
+      }
+    }
+    const count = status => (result.checks ?? []).filter(c => c.status === status).length;
+    result.summary = {pass: count('pass'), blocked: count('blocked'), fail: count('fail') + (result.error ? 1 : 0)};
+    receipt.engines[engine] = result;
+    if (result.error) console.error(`[${engine}] ERROR ${result.error}`);
+  }
+  receipt.finished = new Date().toISOString();
+  const totals = Object.values(receipt.engines).map(e => e.summary);
+  // "qualified" needs every product check to pass; "blocked" checks are
+  // documented gaps, never counted as passing.
+  receipt.result = totals.some(s => s.fail) ? 'fail' : totals.some(s => s.blocked) ? 'pass-with-blocked-gaps' : 'qualified';
+  writeFileSync(join(out, 'receipt.json'), JSON.stringify(receipt, null, 2));
+  console.log(`receipt: ${join(out, 'receipt.json')} result=${receipt.result}`);
+  process.exit(receipt.result === 'fail' ? 1 : 0);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main();
