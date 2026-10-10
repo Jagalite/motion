@@ -22,6 +22,7 @@ applying any pending migration to an existing database.
 | 0020 | `0020_scan_demand_facts.sql` | A03 | direct-request attempts; retained demand coverage |
 | 0021 | `0021_nfo_origins.sql` | A04 | sidecar NFO contribution origin |
 | 0022 | `0022_search_rows_coverage_backfill.sql` | A09/A03 | indexed FTS row map; demand coverage backfill |
+| 0023 | `0023_structure.sql` | A01 | order groups, item relationships, multi-episode bindings |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

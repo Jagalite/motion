@@ -706,7 +706,13 @@ pub async fn reassign_file(
         None => None,
     };
     let _ = revision;
+    let bound_versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM version_files WHERE file_id=?")
+            .bind(file)
+            .fetch_one(&mut *conn)
+            .await?;
     let decision = identity::reassignment(&identity::ReassignFacts {
+        bound_versions: usize::try_from(bound_versions).unwrap_or(usize::MAX),
         bound: bound
             .as_ref()
             .map(|(v, parts, _)| (v.clone(), usize::try_from(*parts).unwrap_or(usize::MAX))),
@@ -944,4 +950,388 @@ pub async fn resolve(db: &SqlitePool, id: &str) -> anyhow::Result<Option<Resolve
         from: id.into(),
         to,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Explicit structure operations
+
+async fn expect_revision(
+    conn: &mut SqliteConnection,
+    item: &str,
+    expected: u64,
+) -> Result<Aggregate, CurationError> {
+    let aggregate = load_aggregate(conn, item)
+        .await?
+        .ok_or_else(|| IdentityError::UnknownItem(item.into()))?;
+    if aggregate.work.revision != expected {
+        return Err(IdentityError::StaleRevision(item.into()).into());
+    }
+    Ok(aggregate)
+}
+
+/// Add a timeline to one of the work's editions (e.g. an alternate ordering
+/// or a separately tracked cut), fenced on the work's structural revision.
+pub async fn create_timeline(
+    app: &App,
+    item: &str,
+    edition: &str,
+    expected_revision: u64,
+    duration_ms: Option<u64>,
+) -> Result<String, CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let aggregate = expect_revision(&mut tx, item, expected_revision).await?;
+    if !aggregate.editions.iter().any(|e| e.id == edition) {
+        return Err(
+            IdentityError::InvalidBindings("edition belongs to another work".into()).into(),
+        );
+    }
+    let id = new_id();
+    sqlx::query("INSERT INTO timelines (id,edition_id,duration_ms) VALUES (?,?,?)")
+        .bind(&id)
+        .bind(edition)
+        .bind(
+            duration_ms
+                .map(i64::try_from)
+                .transpose()
+                .map_err(anyhow::Error::from)?,
+        )
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Explicitly attach a version (one or more parts) to a timeline.
+pub async fn create_version_explicit(
+    app: &App,
+    timeline: &str,
+    label: &str,
+    request: &identity::VersionRequest,
+    expected_revision: u64,
+) -> Result<String, CurationError> {
+    if label.len() > 200 {
+        return Err(IdentityError::InvalidTitle.into());
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let (edition, item): (String, String) = sqlx::query_as(
+        "SELECT t.edition_id,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(timeline)
+    .fetch_one(&mut *tx)
+    .await?;
+    let aggregate = expect_revision(&mut tx, &item, expected_revision).await?;
+    let current = aggregate
+        .editions
+        .iter()
+        .flat_map(|e| &e.timelines)
+        .find(|t| t.id == timeline)
+        .cloned()
+        .ok_or_else(|| IdentityError::UnknownItem(timeline.into()))?;
+    let mut files = BTreeMap::new();
+    let mut generated = Vec::new();
+    let mut others = Vec::new();
+    for binding in &request.bindings {
+        let file: Option<(String, String, bool)> =
+            sqlx::query_as("SELECT edition_id,revision,generated FROM media_files WHERE id=?")
+                .bind(&binding.file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some((edition, revision, is_generated)) = file {
+            files.insert(binding.file_id.clone(), (edition, revision));
+            generated.push(is_generated);
+        }
+        type Row = (String, String, String, i64, Option<i64>, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT v.timeline_id,b.file_id,b.file_revision,b.part,b.start_ms,b.end_ms FROM version_files b JOIN media_versions v ON v.id=b.version_id WHERE b.file_id=? AND v.timeline_id<>?",
+        )
+        .bind(&binding.file_id)
+        .bind(timeline)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (t, file_id, revision, part, start, end) in rows {
+            others.push((
+                t,
+                Binding {
+                    file_id,
+                    revision,
+                    part: u32::try_from(part).map_err(anyhow::Error::from)?,
+                    start_ms: start
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(anyhow::Error::from)?,
+                    end_ms: end
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(anyhow::Error::from)?,
+                },
+            ));
+        }
+    }
+    identity::plan_version(&current, &edition, request, &files, &others)?;
+    let id = new_id();
+    let origin = if !generated.is_empty() && generated.iter().all(|g| *g) {
+        "generated"
+    } else {
+        "original"
+    };
+    sqlx::query(
+        "INSERT INTO media_versions (id,timeline_id,label,origin,equivalence) VALUES (?,?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(timeline)
+    .bind(label.trim())
+    .bind(origin)
+    .bind(enum_name(&request.equivalence)?)
+    .execute(&mut *tx)
+    .await?;
+    for binding in &request.bindings {
+        sqlx::query("INSERT INTO version_files (version_id,part,file_id,file_revision,start_ms,end_ms) VALUES (?,?,?,?,?,?)")
+            .bind(&id)
+            .bind(i64::from(binding.part))
+            .bind(&binding.file_id)
+            .bind(&binding.revision)
+            .bind(binding.start_ms.map(i64::try_from).transpose().map_err(anyhow::Error::from)?)
+            .bind(binding.end_ms.map(i64::try_from).transpose().map_err(anyhow::Error::from)?)
+            .execute(&mut *tx)
+            .await?;
+    }
+    ensure_consistent(&mut tx).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderKind {
+    Aired,
+    Dvd,
+    Absolute,
+    Custom,
+}
+
+pub async fn create_order_group(
+    app: &App,
+    edition: &str,
+    name: &str,
+    kind: OrderKind,
+) -> Result<String, CurationError> {
+    if name.trim().is_empty() || name.len() > 200 {
+        return Err(IdentityError::InvalidTitle.into());
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let id = new_id();
+    sqlx::query("INSERT INTO order_groups (id,edition_id,name,kind) VALUES (?,?,?,?)")
+        .bind(&id)
+        .bind(edition)
+        .bind(name.trim())
+        .bind(enum_name(&kind)?)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Place a timeline at a position in an order group, fenced on the group's
+/// revision. The timeline's work must descend from the group's work.
+pub async fn place_timeline(
+    app: &App,
+    timeline: &str,
+    group: &str,
+    position: u32,
+    expected_group_revision: u64,
+) -> Result<u64, CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let (revision, owner): (i64, String) = sqlx::query_as(
+        "SELECT g.revision,e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
+    )
+    .bind(group)
+    .fetch_one(&mut *tx)
+    .await?;
+    if u64::try_from(revision).map_err(anyhow::Error::from)? != expected_group_revision {
+        return Err(IdentityError::StaleRevision(group.into()).into());
+    }
+    let item: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(timeline)
+    .fetch_one(&mut *tx)
+    .await?;
+    // The work itself and up to two hierarchy ancestors (season, series).
+    let mut ancestors = vec![item.clone()];
+    let mut current = item;
+    for _ in 0..2 {
+        let parent: Option<Option<String>> =
+            sqlx::query_scalar("SELECT parent_id FROM item_structure WHERE item_id=?")
+                .bind(&current)
+                .fetch_optional(&mut *tx)
+                .await?;
+        match parent.flatten() {
+            Some(p) => {
+                ancestors.push(p.clone());
+                current = p;
+            }
+            None => break,
+        }
+    }
+    let occupied: BTreeMap<u32, String> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT order_position,id FROM timelines WHERE order_group_id=? AND order_position IS NOT NULL",
+    )
+    .bind(group)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .filter_map(|(p, id)| u32::try_from(p).ok().map(|p| (p, id)))
+    .collect();
+    identity::place_in_order(timeline, &ancestors, &owner, position, &occupied)?;
+    sqlx::query(
+        "UPDATE timelines SET order_group_id=?,order_position=?,revision=revision+1 WHERE id=?",
+    )
+    .bind(group)
+    .bind(i64::from(position))
+    .bind(timeline)
+    .execute(&mut *tx)
+    .await?;
+    let next = expected_group_revision + 1;
+    sqlx::query("UPDATE order_groups SET revision=? WHERE id=?")
+        .bind(i64::try_from(next).map_err(anyhow::Error::from)?)
+        .bind(group)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(next)
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RelationshipView {
+    pub id: String,
+    pub revision: u64,
+    pub source_item_id: String,
+    pub target_item_id: String,
+    pub kind: identity::RelationshipKind,
+    pub position: Option<u32>,
+}
+
+pub async fn create_relationship(
+    app: &App,
+    source: &str,
+    target: &str,
+    kind: identity::RelationshipKind,
+    position: Option<u32>,
+) -> Result<RelationshipView, CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    for id in [source, target] {
+        if load_aggregate(&mut tx, id).await?.is_none() {
+            return Err(IdentityError::UnknownItem(id.into()).into());
+        }
+    }
+    let existing: Vec<(String, String, identity::RelationshipKind)> =
+        sqlx::query_as::<_, (String, String, String)>(
+            "SELECT source_item_id,target_item_id,kind FROM item_relationships",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(s, t, k)| Ok((s, t, enum_value(&k)?)))
+        .collect::<anyhow::Result<_>>()?;
+    identity::validate_relationship(source, target, kind, &existing)?;
+    let view = RelationshipView {
+        id: new_id(),
+        revision: 1,
+        source_item_id: source.into(),
+        target_item_id: target.into(),
+        kind,
+        position,
+    };
+    sqlx::query("INSERT INTO item_relationships (id,source_item_id,target_item_id,kind,position) VALUES (?,?,?,?,?)")
+        .bind(&view.id)
+        .bind(source)
+        .bind(target)
+        .bind(enum_name(&kind)?)
+        .bind(position.map(i64::from))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+pub async fn delete_relationship(
+    app: &App,
+    id: &str,
+    expected_revision: u64,
+) -> Result<(), CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM item_relationships WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if u64::try_from(revision).map_err(anyhow::Error::from)? != expected_revision {
+        return Err(IdentityError::StaleRevision(id.into()).into());
+    }
+    sqlx::query("DELETE FROM item_relationships WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Relationships touching a work (as source or target), live works only.
+pub async fn relationships(db: &SqlitePool, item: &str) -> anyhow::Result<Vec<RelationshipView>> {
+    type Row = (String, i64, String, String, String, Option<i64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id,revision,source_item_id,target_item_id,kind,position FROM item_relationships WHERE source_item_id=? OR target_item_id=? ORDER BY kind,position,id",
+    )
+    .bind(item)
+    .bind(item)
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(id, revision, source, target, kind, position)| {
+            Ok(RelationshipView {
+                id,
+                revision: u64::try_from(revision)?,
+                source_item_id: source,
+                target_item_id: target,
+                kind: enum_value(&kind)?,
+                position: position.map(u32::try_from).transpose()?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FileView {
+    pub id: String,
+    pub edition_id: String,
+    pub revision: String,
+    pub available: bool,
+    pub generated: bool,
+    pub bytes: i64,
+}
+
+/// Physical occurrences belonging to a work's editions (source-relative paths
+/// are deliberately not exposed here).
+pub async fn item_files(db: &SqlitePool, item: &str) -> anyhow::Result<Vec<FileView>> {
+    Ok(sqlx::query_as::<_, (String, String, String, bool, bool, i64)>(
+        "SELECT f.id,f.edition_id,f.revision,f.available,f.generated,f.bytes FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=? ORDER BY f.id",
+    )
+    .bind(item)
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|(id, edition_id, revision, available, generated, bytes)| FileView {
+        id,
+        edition_id,
+        revision,
+        available,
+        generated,
+        bytes,
+    })
+    .collect())
 }

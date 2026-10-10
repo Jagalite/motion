@@ -925,6 +925,9 @@ pub struct ReassignFacts {
     pub bound: Option<(Id, usize)>,
     /// A file left in the old edition holds the binding's pinned content.
     pub pinned_copy_remains: bool,
+    /// Number of versions binding this file (more than one: a shared,
+    /// multi-episode file, which cannot move to one edition).
+    pub bound_versions: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reassignment {
@@ -937,6 +940,11 @@ pub enum Reassignment {
     DeclareNew,
 }
 pub fn reassignment(facts: &ReassignFacts) -> Result<Reassignment, IdentityError> {
+    if facts.bound_versions > 1 {
+        return Err(invalid(
+            "a file shared by several timelines cannot be reassigned",
+        ));
+    }
     match (&facts.bound, facts.pinned_copy_remains) {
         (None, _) => Ok(Reassignment::DeclareNew),
         (Some((version, _)), true) => Ok(Reassignment::RebindToCopyAndDeclareNew {
@@ -949,4 +957,134 @@ pub fn reassignment(facts: &ReassignFacts) -> Result<Reassignment, IdentityError
             "a multipart version cannot be split by reassigning one file",
         )),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Explicit timelines, order groups, versions and relationships
+
+/// A version part may bind a file from another edition only through a known
+/// interval: a multi-episode file shared by several episodes' timelines. A
+/// whole-file binding must stay inside the file's own edition.
+pub fn binding_edition_allowed(
+    file_edition: &str,
+    timeline_edition: &str,
+    binding: &Binding,
+) -> bool {
+    file_edition == timeline_edition || (binding.start_ms.is_some() && binding.end_ms.is_some())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionRequest {
+    pub bindings: Vec<Binding>,
+    pub equivalence: Equivalence,
+}
+
+/// Decide an explicit version attachment: equivalence policy for the target
+/// timeline, binding shape, multi-episode sharing, and the edition rule.
+/// `files` maps each bound file to its edition and current revision; every
+/// binding must pin the file's current (reviewed) revision.
+pub fn plan_version(
+    timeline: &Timeline,
+    timeline_edition: &str,
+    request: &VersionRequest,
+    files: &BTreeMap<Id, (Id, String)>,
+    other_timeline_bindings: &[(Id, Binding)],
+) -> Result<(), IdentityError> {
+    attach_version(timeline, request.equivalence)?;
+    validate_bindings(&request.bindings, other_timeline_bindings)?;
+    for binding in &request.bindings {
+        let (edition, revision) = files
+            .get(&binding.file_id)
+            .ok_or_else(|| invalid("bound file is not cataloged"))?;
+        if revision != &binding.revision {
+            return Err(IdentityError::ReviewedContentChanged(
+                binding.file_id.clone(),
+            ));
+        }
+        if !binding_edition_allowed(edition, timeline_edition, binding) {
+            return Err(invalid(
+                "a whole-file binding must use a file of the timeline's edition",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A timeline may join an order group (e.g. aired or DVD order of a series
+/// release) only if its work descends from the group's work, at a position
+/// no other timeline in the group holds.
+pub fn place_in_order(
+    timeline: &str,
+    ancestors: &[Id],
+    group_owner: &str,
+    position: u32,
+    occupied: &BTreeMap<u32, Id>,
+) -> Result<(), IdentityError> {
+    if !ancestors.iter().any(|a| a == group_owner) {
+        return Err(invalid(
+            "timeline does not belong to the order group's work",
+        ));
+    }
+    match occupied.get(&position) {
+        Some(other) if other != timeline => Err(invalid("order position is taken")),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipKind {
+    PartOf,
+    EditionOf,
+    PerformedBy,
+    CreatedBy,
+    ExtraOf,
+    DerivedFrom,
+}
+
+/// Validate a new relationship edge against existing ones. No self edges or
+/// duplicates; containment-like kinds (part_of, extra_of, derived_from,
+/// edition_of) must stay acyclic.
+pub fn validate_relationship(
+    source: &str,
+    target: &str,
+    kind: RelationshipKind,
+    existing: &[(Id, Id, RelationshipKind)],
+) -> Result<(), IdentityError> {
+    if source == target {
+        return Err(invalid("a work cannot relate to itself"));
+    }
+    if existing
+        .iter()
+        .any(|(s, t, k)| s == source && t == target && *k == kind)
+    {
+        return Err(invalid("relationship already exists"));
+    }
+    let acyclic = matches!(
+        kind,
+        RelationshipKind::PartOf
+            | RelationshipKind::ExtraOf
+            | RelationshipKind::DerivedFrom
+            | RelationshipKind::EditionOf
+    );
+    if acyclic {
+        // Adding source -> target closes a cycle if target already reaches source.
+        let mut stack = vec![target.to_string()];
+        let mut seen = BTreeSet::new();
+        while let Some(node) = stack.pop() {
+            if node == source {
+                return Err(invalid("relationship would create a cycle"));
+            }
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            stack.extend(
+                existing
+                    .iter()
+                    .filter(|(s, _, k)| *s == node && *k == kind)
+                    .map(|(_, t, _)| t.clone()),
+            );
+        }
+    }
+    Ok(())
 }
