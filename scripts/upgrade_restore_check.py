@@ -115,9 +115,15 @@ class Server:
             raise
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, exc, traceback):
         try:
-            stop(self.process)
+            if exc_type is None:
+                stop(self.process)  # a clean, bounded SIGINT shutdown is part of the check
+            else:
+                # Report the failure that ended the block, not a shutdown assertion.
+                if self.process.poll() is None:
+                    self.process.kill()
+                self.process.wait()
         finally:
             self.stream.close()
 
