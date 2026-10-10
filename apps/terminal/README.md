@@ -12,6 +12,10 @@ motion auth approve PAIRING_ID --code ABCD-EFGH \
   --permission catalog:read --permission events:read \
   --operator-token-file /path/to/data/admin-token   # on the server host
 motion profiles list
+motion libraries list --json
+motion catalog search "Film"
+motion jobs list
+motion diagnostics --operator-token-file /path/to/data/admin-token
 motion events tail --json
 motion tui
 motion serve --data-dir ... --access-mode restricted  # runs the bundled Rust server
@@ -66,10 +70,10 @@ is not evidence that every operation is routed. This audit inspects
 | --- | --- | --- |
 | A08 identity/system | Health, capabilities, pairing, sessions, access tokens, devices/policies, profiles, scoped SSE; restricted legacy boundary, approved-origin CORS, per-principal limits, trusted ingress and desktop bootstrap. | Ingress capabilities distinguish implementation, configured enablement and unqualified deployment status. Qualify real ingress deployment separately. |
 | A08 content | Content-access issue/revoke and original-file GET/HEAD. | Delivery-generation and managed-download ticket integration depends on those resource services; original-file tests do not qualify HLS or delivery lifecycles. |
-| A08 presentation | Optional router composition, full URI, verified identity, JSON API/media fallbacks and shared host/origin boundary. | Wire the actual A11 Topcoat service and authorized query facade; qualify HTML/API visibility parity, CSP, streaming/media preservation and browser lifecycle. A stand-in router test does not satisfy these gates. |
-| A08 other domains | Existing legacy services remain available under their existing access rules. | Catalog/storage/scans, metadata, viewing/playback, processing, organization, offline and operations v2 adapters are not routed here. Integrate each owner's service and adapter with contract/scope/precondition/idempotency tests; do not substitute legacy wire shapes. |
-| A10 CLI | Server status, pairing/approval/status/logout, device/policy/profile management, event tail, TUI launch and Rust `serve` delegation. | Library/source creation, scans, catalog search/show, jobs/cancel, authorized player launch and lifecycle-safe `server stop`. `libraries list` has a typed client/command but its v2 server route is absent here. |
-| A10 TUI | Overview, profiles, devices and events; bounded event queue, reset/re-query and stale-load rejection. | Library/catalog/search, scans/jobs, diagnostics and selected playback controls, followed by real-server workflow qualification. |
+| A08 presentation | Actual pinned Topcoat Tower service at the composition root; request-scoped facade traverses authorized v2 reads, preserves the original URI and genuine peer metadata, and bounds renders to eight concurrent requests and 15 seconds. Home, libraries, search, matches, jobs and diagnostics have real reads. | Timeline viewing/player, profile preferences, scan-backed sources still need their complete service bridges. Missing services render unavailable; continue-watching explicitly says unavailable. Qualify the real browser independently of router tests. |
+| A08 other domains | Logical libraries/source registration; catalog item CRUD/search, editions, reviewed merge/split, timeline/version reads; metadata contributions, matching and artwork reads; collections/filters/playlists/queues; owned jobs and cancellation/retry; diagnostics. | Source relocation and scan demands, relationships and timeline/version creation, full file-track evidence, metadata refresh/upload/selection/markers, v2 viewing/delivery, preparation/schedules, offline/downloads, durable backup/import jobs. The reviewed contract remains the target, not a claim that every operation is routed. |
+| A10 CLI | Identity/device/profile commands, event tail, Rust `serve`, library/source creation, catalog search/show, jobs list/show/cancel, diagnostics, typed scan requests and capability-gated token-free browser-player launch. | Real source-scan and playback workflows depend on v2 domain services. `server stop` has no reviewed lifecycle operation yet; no PID guessing or unrelated-process termination is used. |
+| A10 TUI | Overview, profiles, devices, events, libraries, catalog/search, scans, jobs/cancellation and diagnostics; selected browser-player launch is capability-gated. Unicode input focus, narrow-screen navigation, cancellation, bounded paging, event reset/re-query and stale-load rejection are tested. | An isolated real-server PTY check exercised overview, libraries, catalog, search, jobs and diagnostics; scans correctly returned the missing-endpoint error. Scan and playback completion require the services above; a typed command or screen is not backend completion. |
 | A10 credentials | Explicit opt-in restrictive file store and server-identity checks. | OS credential-store integration is not implemented; the documented file-store limitation remains. |
 
 Transport URL encoding and reconnect delay calculation stay in the Go HTTP
@@ -80,8 +84,8 @@ attempt counts. Existing race tests cover request identity, cancellation,
 reconnect, reset and stale query completion. These are client tests, not new
 Stateless model-checking claims.
 
-Next integration order: integrate the catalog v2
-adapter and exercise `libraries list` against it; expand the typed CLI/TUI as
-owner services land; then qualify the real A11 presentation mount and the
-remaining cross-domain workflows. This table must not be read as full A08/A10
-completion.
+Integration inputs are recorded in [`research/a08-a10-integration-inputs.json`](../../research/a08-a10-integration-inputs.json). The original worktrees were not modified. The provisional delivery migration was assigned 0018 in this integration, after timelines/occurrences and logical sources; 0019 adds job requester identity and revisions. Legacy jobs retain an explicit unknown requester (`legacy`) and are administrative, rather than being assigned to the current caller.
+
+Correctness boundaries: logical source membership is observed by SQLite and passed to core access policies. Catalog filters apply before page limits, version availability uses the production identity policy with authorized occurrences, and shared-file edits require every containing library. Job ownership and cancellation use core rules; the adapter reserves the writer, reauthorizes, and commits the change with its retry acknowledgement. Filesystem root inspection and actual worker execution remain adapter effects. SSR uses the same read adapter and credential checks as HTTP clients and never synthesizes an administrator. Browser cookies cover the root presentation routes, and session exchange expires the former API-only cookie path. Match and reconciliation retries recheck current visibility before returning stored acknowledgements.
+
+This remains a partial A08/A10 integration until the listed dependencies and qualification gates are resolved.

@@ -41,7 +41,7 @@ func NewRoot(env *Env) *cobra.Command {
 	f.StringVar(&env.OperatorTokenFile, "operator-token-file", "", "act as the server operator using its 0600 token file")
 	f.StringVar(&env.ConfigDir, "config-dir", "", "configuration directory (default: $MOTION_CONFIG_DIR or the user config dir)")
 	root.AddCommand(serverCmd(env), authCmd(env), devicesCmd(env), profilesCmd(env),
-		librariesCmd(env), eventsCmd(env), tuiCmd(env), serveCmd())
+		librariesCmd(env), sourcesCmd(env), catalogCmd(env), jobsCmd(env), diagnosticsCmd(env), playCmd(env), eventsCmd(env), tuiCmd(env), serveCmd())
 	classifyArgs(root)
 	return root
 }
@@ -575,7 +575,7 @@ func librariesCmd(env *Env) *cobra.Command {
 		}),
 	}
 	pageFlags(list, &cursor, &limit)
-	cmd.AddCommand(list)
+	cmd.AddCommand(list, libraryAddCmd(env))
 	return cmd
 }
 

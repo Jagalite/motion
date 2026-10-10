@@ -246,3 +246,101 @@ func TestDropAfterPublishedResyncSchedulesAnother(t *testing.T) {
 		t.Fatal("a drop after the first resync was never covered")
 	}
 }
+
+func (f *fake) ListLibraries(context.Context, string, int) (api.Page[api.Library], error) {
+	return api.Page[api.Library]{Items: []api.Library{{ID: "lib", Name: "Movies"}}}, nil
+}
+func (f *fake) ListCatalog(context.Context, string, int, string) (api.Page[api.CatalogItem], error) {
+	return api.Page[api.CatalogItem]{Items: []api.CatalogItem{{ID: "film", Title: "Film"}}}, nil
+}
+func (f *fake) SearchCatalog(_ context.Context, q, c string, n int) (api.Page[api.CatalogItem], error) {
+	return api.Page[api.CatalogItem]{Items: []api.CatalogItem{{ID: q, Title: q}}}, nil
+}
+
+func TestSearchFocusUnicodeAndStaleReply(t *testing.T) {
+	m := New(context.Background(), &fake{}, "http://srv", nil)
+	m, _ = step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m, _ = step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q猫")})
+	if !m.editing || m.query != "q猫" {
+		t.Fatal("search input lost focus or quit")
+	}
+	m, _ = step(t, m, tea.KeyMsg{Type: tea.KeyBackspace})
+	if m.query != "q" {
+		t.Fatal("backspace split Unicode")
+	}
+	old := m.load(search)
+	m, _ = step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" new")})
+	m, cmd := step(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = drain(t, m, cmd)
+	m, _ = step(t, m, old())
+	if m.editing || len(m.results) != 1 || m.results[0].ID != "q new" {
+		t.Fatal("stale query replaced results")
+	}
+	m, _ = step(t, m, resyncMsg{})
+	if m.results != nil || m.catalog != nil || m.libraries != nil {
+		t.Fatal("reset retained catalog views")
+	}
+}
+
+func TestRepeatedEmptyPageFailsBoundedly(t *testing.T) {
+	calls := 0
+	_, _, err := all(context.Background(), func(context.Context, string, int) (api.Page[api.Profile], error) {
+		calls++
+		cursor := "repeat"
+		return api.Page[api.Profile]{NextCursor: &cursor}, nil
+	})
+	if err == nil || calls != 2 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+func (f *fake) ListScans(context.Context, string, int) (api.Page[api.Scan], error) {
+	return api.Page[api.Scan]{}, nil
+}
+func (f *fake) ListJobs(context.Context, string, int) (api.Page[api.Job], error) {
+	return api.Page[api.Job]{}, nil
+}
+func (f *fake) CancelJob(context.Context, string, string) (api.Tagged[api.Job], error) {
+	return api.Tagged[api.Job]{}, nil
+}
+func (f *fake) Diagnostics(context.Context) (api.Diagnostics, error) { return api.Diagnostics{}, nil }
+
+func (f *fake) GetTimeline(_ context.Context, id string) (api.Tagged[api.Timeline], error) {
+	return api.Tagged[api.Timeline]{Value: api.Timeline{ID: id}}, nil
+}
+func (f *fake) GetProfile(_ context.Context, id string) (api.Tagged[api.Profile], error) {
+	return api.Tagged[api.Profile]{Value: api.Profile{ID: id}}, nil
+}
+func TestSelectedPlaybackLaunchUsesNoCredentialAndRequiresCapability(t *testing.T) {
+	m := New(context.Background(), &fake{}, "https://server", nil)
+	id := "timeline/猫"
+	m.tab = catalog
+	m.catalog = []api.CatalogItem{{ID: "film", DefaultTimelineID: &id}}
+	m.me = &api.Principal{Permissions: []string{api.PermPlaybackRequest}}
+	m.caps = &api.Capabilities{}
+	m, cmd := step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmd != nil || m.errs[catalog] == nil {
+		t.Fatal("opened unavailable player")
+	}
+	m.caps.Features = []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}
+	target := ""
+	m.openBrowser = func(_ context.Context, url string) error { target = url; return nil }
+	m, cmd = step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if cmd == nil {
+		t.Fatal("no playback command")
+	}
+	m, _ = step(t, m, cmd())
+	if target != "https://server/play/timeline%2F%E7%8C%AB" || m.errs[catalog] != nil {
+		t.Fatalf("%s %v", target, m.errs[catalog])
+	}
+}
+
+func TestNarrowTerminalKeepsActiveScreenName(t *testing.T) {
+	m := New(context.Background(), &fake{}, "http://srv", nil)
+	m.tab = diagnostics
+	m.width = 24
+	m.height = 10
+	if !strings.Contains(m.View(), "Diagnostics") {
+		t.Fatal("active screen clipped out of navigation")
+	}
+}
