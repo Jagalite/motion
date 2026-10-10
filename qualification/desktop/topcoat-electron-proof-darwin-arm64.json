@@ -2,9 +2,9 @@
   "kind": "topcoat-electron-local-origin-smoke-proof",
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
-  "passed": false,
-  "recorded_at": "2026-10-10T04:14:10.950Z",
-  "motion_commit": "b9db52f6589afc8ca6f753b83aa7027cc4550615",
+  "passed": true,
+  "recorded_at": "2026-10-10T04:19:03.906Z",
+  "motion_commit": "a9ea89558e81344b0c7f8a023d2e7fe0d6402025",
   "worktree_dirty": true,
   "environment": {
     "electron": "44.7.0",
@@ -18,11 +18,11 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "9bbb4d2bc4bc108d3724e4f7be8f31f083b8448551fcf55a7b362706cf5861cf",
+  "proof_server_sha256": "ca293b62fa7dba52baf6cce804e3bc857e5a908617ebb9d7a1bdfa520c3de1ed",
   "proof_driver_sha256": "c51c7886feaa4fe1befe424119d96be8a61b5036263c6e2d8e8829349661a0bb",
   "proof_server_launch": {
     "location": "host-temporary-directory",
-    "sha256": "9bbb4d2bc4bc108d3724e4f7be8f31f083b8448551fcf55a7b362706cf5861cf",
+    "sha256": "ca293b62fa7dba52baf6cce804e3bc857e5a908617ebb9d7a1bdfa520c3de1ed",
     "matches_build": true
   },
   "rust_toolchain": "1.98.0",
@@ -63,7 +63,7 @@
     "generation_replacement_activated": true,
     "demuxe_bytes_match_install_receipt": true,
     "no_permission_granted_beyond_fullscreen": true,
-    "screen_semantics_and_responsive_layout": false,
+    "screen_semantics_and_responsive_layout": true,
     "reduced_motion_respected": true,
     "concurrent_html_and_range_responses_preserved": true
   },
@@ -101,12 +101,12 @@
     },
     "playback": {
       "played": true,
-      "before": 2.605448,
-      "afterSeek": 7.001353,
-      "seekElapsedMs": 46,
+      "before": 2.599956,
+      "afterSeek": 7.000929,
+      "seekElapsedMs": 39,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.741244,
+      "finalTime": 7.750695,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -115,7 +115,7 @@
     },
     "generationSwitch": {
       "replaced": true,
-      "logicalTime": 5.004921,
+      "logicalTime": 5.002727,
       "muted": true,
       "players": 1
     },
@@ -127,8 +127,8 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.003576,
-      "now": 1.0155
+      "start": 0.003523,
+      "now": 1.008882
     },
     "afterScanTitle": "Sources and scans",
     "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again.",
@@ -206,7 +206,7 @@
       {
         "path": "/processing",
         "width": 320,
-        "scrollWidth": 372,
+        "scrollWidth": 320,
         "main": 1,
         "headings": 1,
         "labelled": true,
@@ -318,9 +318,9 @@
       "requests": 24,
       "simultaneousRangeRead": true,
       "allSucceeded": true,
-      "elapsedMs": 17,
-      "p50Ms": 9,
-      "p95Ms": 15
+      "elapsedMs": 14,
+      "p50Ms": 8,
+      "p95Ms": 12
     }
   },
   "csp_console": [
@@ -353,7 +353,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "dbd2e47a56cb487f91754dfbd3cb2fb5",
+        "event_id": "f33f12355aa14015816141865643a1c2",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -371,7 +371,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "0299fdbd00f742b3b8e4d6a58cdc3b37",
+        "event_id": "89db9360e92141e9bea6982e3f9eb940",
         "position_ms": 0,
         "sequence": "2",
         "status": "paused"
@@ -382,7 +382,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "54ed6b1b33a441fdb5b210954fa8106d",
+        "event_id": "d9e3954b47bc4b1990c39d11dcc1217b",
         "position_ms": 5,
         "sequence": "3",
         "status": "playing"
@@ -400,8 +400,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "696df846ccd54641bb9540586e634d4c",
-        "position_ms": 7741,
+        "event_id": "7757f31ba40d442fb313274460a6ecaa",
+        "position_ms": 7751,
         "sequence": "4",
         "status": "playing"
       },
@@ -420,8 +420,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "f6e6f265a5304ccda2fab5745aaddd15",
-        "position_ms": 7875,
+        "event_id": "1be1533a2bec461f9643e80c93222c06",
+        "position_ms": 7835,
         "sequence": "5",
         "status": "paused"
       },
@@ -439,7 +439,7 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "ed2e05dd13c3404e82553a0cc6525eb9",
+        "event_id": "2901d24b10294ac9b8269483e708f243",
         "position_ms": 5000,
         "sequence": "6",
         "status": "paused"
@@ -450,8 +450,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "820e426d5e3d470383df0f552aa7043b",
-        "position_ms": 5003,
+        "event_id": "4a46ffd4672a421bb1ec2f318376425a",
+        "position_ms": 5001,
         "sequence": "7",
         "status": "playing"
       },
@@ -461,8 +461,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "581be4bb07cf46809fab12c9b6c2a29d",
-        "position_ms": 5005,
+        "event_id": "9f0516b9f0e3425b8b51e71551b70af3",
+        "position_ms": 5003,
         "sequence": "8",
         "status": "stopped"
       },
@@ -490,7 +490,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "363a586567b24aafb6afe1b58fe554cb",
+        "event_id": "0ca96cfe6e5f4695b9a1a7c355b6b9ed",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -501,8 +501,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "40f26ea6476949e29318d1dd309ba08e",
-        "position_ms": 0,
+        "event_id": "f7cb22568f134dec9c9a7129ce352b9c",
+        "position_ms": 2,
         "sequence": "2",
         "status": "playing"
       },
@@ -512,8 +512,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "5b9c7d4abd3a4427bf797d028f00fc85",
-        "position_ms": 1016,
+        "event_id": "e3bd4a9b3e20415382f1ca549e7f7679",
+        "position_ms": 1009,
         "sequence": "3",
         "status": "stopped"
       },
@@ -525,7 +525,7 @@
         "mode": "incremental",
         "require_complete": false
       },
-      "key": "15a5f11444bc4ea8816f0c5cbf6ee5f1",
+      "key": "4572ef6672a74ac588810950ea2f02e0",
       "library": "lib1",
       "operation": "createScan",
       "replay": false

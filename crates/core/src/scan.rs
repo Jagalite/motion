@@ -74,6 +74,8 @@ pub enum Assignment {
     /// attempt at the given index: another occurrence of whatever that earlier
     /// observation was assigned to.
     CopyOf { observation: usize },
+    /// The observation lies under a source exclusion and is not cataloged.
+    OutOfScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +84,44 @@ pub struct Plan {
     pub unavailable: Vec<String>,
     /// One entry per observation.
     pub assignments: Vec<Assignment>,
+}
+
+/// Reconcile within a source's scope. Known files under an exclusion are out
+/// of scope (returned separately, never as proven absences); observations
+/// under an exclusion are assigned `OutOfScope`. Assignments stay aligned
+/// with `found`.
+pub fn reconcile_scoped(
+    old: &[Existing],
+    found: &[Observed],
+    coverage: &Coverage,
+    exclusions: &[String],
+) -> (Plan, Vec<String>) {
+    let out = |path: &str| crate::sources::excluded(path, exclusions);
+    let excluded: Vec<String> = old
+        .iter()
+        .filter(|f| out(&f.path))
+        .map(|f| f.id.clone())
+        .collect();
+    let in_scope_old: Vec<Existing> = old.iter().filter(|f| !out(&f.path)).cloned().collect();
+    let positions: Vec<usize> = (0..found.len()).filter(|i| !out(&found[*i].path)).collect();
+    let in_scope_found: Vec<Observed> = positions.iter().map(|i| found[*i].clone()).collect();
+    let plan = reconcile_covered(&in_scope_old, &in_scope_found, coverage);
+    let mut assignments = vec![Assignment::OutOfScope; found.len()];
+    for (k, assignment) in plan.assignments.into_iter().enumerate() {
+        assignments[positions[k]] = match assignment {
+            Assignment::CopyOf { observation } => Assignment::CopyOf {
+                observation: positions[observation],
+            },
+            other => other,
+        };
+    }
+    (
+        Plan {
+            unavailable: plan.unavailable,
+            assignments,
+        },
+        excluded,
+    )
 }
 
 pub fn reconcile(old: &[Existing], found: &[Observed]) -> Plan {
@@ -194,6 +234,9 @@ pub struct Completion {
     pub complete_inventory_roots: Option<(String, String)>,
     pub current_root: String,
     pub library_enabled: bool,
+    /// Source binding revision when the attempt started, and now.
+    pub binding_at_start: u64,
+    pub binding_now: u64,
 }
 pub fn finish(
     job: &crate::jobs::Job,
@@ -204,6 +247,7 @@ pub fn finish(
         crate::jobs::Input::Finished {
             attempt: observed.attempt,
             success: observed.library_enabled
+                && crate::sources::binding_current(observed.binding_at_start, observed.binding_now)
                 && observed
                     .complete_inventory_roots
                     .as_ref()

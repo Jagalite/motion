@@ -612,15 +612,14 @@ async fn browser_sessions_require_origin_cookie_flags_and_csrf() {
         .await;
     assert_eq!(session.status, StatusCode::OK, "{:?}", session.body);
     let cookie = session.headers["set-cookie"].to_str().unwrap().to_owned();
-    for flag in [
-        "HttpOnly",
-        "SameSite=Strict",
-        "Path=/api/v2",
-        "Max-Age=43200",
-    ] {
+    for flag in ["HttpOnly", "SameSite=Strict", "Path=/;", "Max-Age=43200"] {
         assert!(cookie.contains(flag), "{cookie}");
     }
     assert!(!cookie.contains("Secure"), "plain-http origin");
+    assert!(session.headers.get_all("set-cookie").iter().any(|v| {
+        let value = v.to_str().unwrap();
+        value.contains("Path=/api/v2;") && value.contains("Max-Age=0")
+    }));
     let pair = cookie.split(';').next().unwrap().to_owned();
     let csrf = session.body["csrf_token"].as_str().unwrap().to_owned();
     let read = f
@@ -1266,7 +1265,7 @@ async fn problems_contract_and_capabilities() {
     assert_eq!(caps.status, StatusCode::OK, "{:?}", caps.body);
     assert_eq!(caps.body["server_id"], health.body["server_id"]);
     assert_eq!(caps.body["server_epoch"], health.body["server_epoch"]);
-    assert_eq!(caps.body["schema_version"], "16");
+    assert_eq!(caps.body["schema_version"], "19");
     assert_eq!(
         caps.body["contract_digest"],
         playscale::v2::system::contract_digest()
@@ -2149,17 +2148,265 @@ async fn presentation_retains_default_extractor_body_limit() {
 }
 
 #[tokio::test]
-async fn production_topcoat_mount_uses_real_identity_and_never_mock_data() {
+async fn ingress_capability_separates_implementation_configuration_and_qualification() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    for configured in [false, true] {
+        let settings = playscale::v2::ApiSettings {
+            trusted_ingress: configured.then(|| playscale::v2::IngressSettings {
+                socket: "/tmp/unused.sock".into(),
+                login_header: "tailscale-user-login".into(),
+                logins: Default::default(),
+            }),
+            ..Default::default()
+        };
+        f.app.access = Arc::new(
+            playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
+                .with_settings(settings),
+        );
+        let reply = f
+            .call(
+                "GET",
+                "/api/v2/system/capabilities",
+                None,
+                &[("authorization", &bearer(OPERATOR))],
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let feature = reply.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == "identity.trusted_private_ingress")
+            .unwrap();
+        assert_eq!(feature["implemented"], true);
+        assert_eq!(feature["enabled"], configured);
+        assert_eq!(feature["qualification"], "unqualified");
+        assert_eq!(feature["receipt_ids"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn logical_libraries_are_scoped_before_paging_and_authorize_source_files() {
     let f = Fixture::new(AccessMode::Restricted).await;
-    let router = playscale::presentation::router(f.app.clone(), None);
-    let anonymous = router
+    let (file, revision) = f.scanned_file("scope.mp4", b"0123456789").await;
+    let operator = bearer(OPERATOR);
+    let input =
+        json!({"name":"Logical movies","kind":"movies","language":"en","source_ids":[f.library]});
+    let headers = [
+        ("authorization", operator.as_str()),
+        ("idempotency-key", "logical-library-create-1"),
+    ];
+    let created = f
+        .call("POST", "/api/v2/libraries", Some(input.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let logical = created.body["id"].as_str().unwrap();
+    assert_ne!(logical, f.library);
+    assert_eq!(created.body["revision"], "1");
+    let replay = f
+        .call("POST", "/api/v2/libraries", Some(input), &headers)
+        .await;
+    assert_eq!(replay.body, created.body);
+    let conflict = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(json!({"name":"Different","kind":"movies","language":"en","source_ids":[]})),
+            &headers,
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let (device, token) = f
+        .pair(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    let etag = f.device_etag(&device).await;
+    let policy = f.call("PUT", &format!("/api/v2/devices/{device}/policy"), Some(json!({"library_ids":[logical],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[],"permissions":["catalog:read","playback:request"]})), &[("authorization", &operator),("if-match", &etag)]).await;
+    assert_eq!(policy.status, StatusCode::OK, "{}", policy.body);
+    let auth = bearer(&token);
+    let listed = f
+        .call(
+            "GET",
+            "/api/v2/libraries?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(listed.body["items"][0]["id"], logical);
+    assert!(listed.body["next_cursor"].is_null());
+    let hidden = f
+        .call(
+            "GET",
+            &format!("/api/v2/libraries/{}", f.library),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    let (status, _, bytes) = f
+        .bytes(
+            &format!("/api/v2/media/files/{file}/content?revision={revision}"),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"0123456789");
+    let catalog = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(catalog.status, StatusCode::OK, "{}", catalog.body);
+    assert_eq!(catalog.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog.body["items"][0]["library_ids"], json!([logical]));
+}
+
+#[tokio::test]
+async fn source_library_crud_requires_authority_preconditions_and_preserves_media() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let root = f._dir.path().join("new-source");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("keep.txt"), b"keep").unwrap();
+    let input = json!({"name":"New source","root_path":root,"exclusions":[]});
+    let auth = bearer(OPERATOR);
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "source-create-crud-1"),
+    ];
+    assert_eq!(
+        f.call("POST", "/api/v2/sources", Some(input.clone()), &[])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    let created = f
+        .call("POST", "/api/v2/sources", Some(input.clone()), &headers)
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert!(created.body["binding_revision"].is_string());
+    let replay = f
+        .call("POST", "/api/v2/sources", Some(input), &headers)
+        .await;
+    assert_eq!(replay.body, created.body);
+    let source = created.body["id"].as_str().unwrap();
+    let library_input =
+        json!({"name":"Library","kind":"mixed","language":"","source_ids":[source]});
+    let library = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(library_input.clone()),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "library-create-crud-1"),
+            ],
+        )
+        .await;
+    assert_eq!(library.status, StatusCode::CREATED, "{}", library.body);
+    let library_path = format!("/api/v2/libraries/{}", library.body["id"].as_str().unwrap());
+    assert_eq!(
+        f.call(
+            "PUT",
+            &library_path,
+            Some(library_input.clone()),
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    assert_eq!(
+        f.call(
+            "PUT",
+            &library_path,
+            Some(library_input),
+            &[("authorization", &auth), ("if-match", "\"r-0\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let source_path = format!("/api/v2/sources/{source}");
+    let source_etag = created.headers["etag"].to_str().unwrap();
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &source_path,
+            None,
+            &[("authorization", &auth), ("if-match", source_etag)]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &library_path,
+            None,
+            &[
+                ("authorization", &auth),
+                ("if-match", library.headers["etag"].to_str().unwrap())
+            ]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &source_path,
+            None,
+            &[("authorization", &auth), ("if-match", source_etag)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(
+        f.call("GET", &source_path, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn topcoat_uses_real_authorized_library_reads_and_keeps_api_json() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let response = app
         .clone()
         .oneshot(f.request("GET", "/", None, &[]))
         .await
         .unwrap();
-    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    assert!(
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'")
+    );
+    let operator = bearer(OPERATOR);
+    let response = app
+        .clone()
+        .oneshot(f.request("GET", "/", None, &[("authorization", &operator)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(
-        anonymous
+        response
             .into_body()
             .collect()
             .await
@@ -2168,42 +2415,328 @@ async fn production_topcoat_mount_uses_real_identity_and_never_mock_data() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("Motion"));
+    assert!(html.contains("Movies"), "{html}");
     assert!(!html.contains("Development mock"));
-    let authorization = format!("Bearer {OPERATOR}");
-    let authorized = router
+    assert!(!html.contains(OPERATOR));
+    let response = app
         .clone()
-        .oneshot(f.request("GET", "/", None, &[("authorization", &authorization)]))
+        .oneshot(f.request(
+            "GET",
+            "/api/v2/not-real",
+            None,
+            &[("authorization", &operator)],
+        ))
         .await
         .unwrap();
-    // Missing v2 catalog/viewing services fail explicitly, never substituting
-    // development fixture titles or an empty collection as production data.
-    assert_eq!(authorized.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let html = String::from_utf8(
-        authorized
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(!html.contains("Development mock") && !html.contains("Night Train"));
-    let invalid = router
-        .clone()
-        .oneshot(f.request("GET", "/", None, &[("authorization", "Bearer invalid")]))
-        .await
-        .unwrap();
-    assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
-    let unknown = router
-        .oneshot(f.request("GET", "/api/v2/unknown", None, &[]))
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    let response = app
+        .oneshot(f.request("HEAD", "/", None, &[("authorization", &operator)]))
         .await
         .unwrap();
     assert!(
-        unknown.headers()["content-type"]
-            .to_str()
+        response
+            .into_body()
+            .collect()
+            .await
             .unwrap()
-            .contains("json")
+            .to_bytes()
+            .is_empty()
     );
+}
+
+#[tokio::test]
+async fn diagnostics_are_admin_only_and_do_not_expose_worker_output() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let denied = f.call("GET", "/api/v2/admin/diagnostics", None, &[]).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at,error) VALUES ('failed-job',?,'failed',0,'secret /private/media/path')").bind(&f.library).execute(&f.app.db).await.unwrap();
+    let d = f
+        .call(
+            "GET",
+            "/api/v2/admin/diagnostics",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(d.status, StatusCode::OK, "{:?}", d.body);
+    assert_eq!(d.body["worker_errors"], json!(["scan:failed-job:failed"]));
+    assert!(!d.body.to_string().contains("private"));
+    assert!(
+        d.body["uptime_seconds"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let (device, token) = f.pair(&["default"], &["processing:request"]).await;
+    let auth = bearer(&token);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at,requester_id) VALUES ('owned',?,'queued',0,?)").bind(&f.library).bind(&device).execute(&f.app.db).await.unwrap();
+    let page = f
+        .call(
+            "GET",
+            "/api/v2/jobs?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{:?}", page.body);
+    assert_eq!(page.body["items"][0]["id"], "owned");
+    let cancel = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/cancel",
+            None,
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "cancel-owned-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK, "{:?}", cancel.body);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/cancel",
+            None,
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "cancel-owned-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.body, replay.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at) VALUES ('legacy',?,'queued',0)")
+        .bind(&f.library)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let hidden = f
+        .call(
+            "GET",
+            "/api/v2/jobs/legacy",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    let page = f
+        .call(
+            "GET",
+            "/api/v2/jobs?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(page.body["items"].as_array().unwrap().len(), 1);
+    assert!(page.body["next_cursor"].is_null());
+    let busy = f
+        .call(
+            "POST",
+            "/api/v2/jobs/owned/retry",
+            None,
+            &[
+                ("authorization", &operator),
+                ("idempotency-key", "retry-busy-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(busy.status, StatusCode::CONFLICT, "{:?}", busy.body);
+}
+
+#[tokio::test]
+async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_authorization() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, token) = f.pair(&["default"], &["processing:request"]).await;
+    let auth = bearer(&token);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,attempt,created_at,requester_id,error) VALUES ('retry-owned',?,'failed',1,0,?,'old failure')")
+        .bind(&f.library).bind(&device).execute(&f.app.db).await.unwrap();
+    let path = "/api/v2/jobs/retry-owned/retry";
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "retry-owned-job-key"),
+    ];
+    let admitted = f.call("POST", path, None, &headers).await;
+    assert_eq!(admitted.status, StatusCode::OK, "{:?}", admitted.body);
+    assert_eq!(admitted.body["phase"], "queued");
+    assert_eq!(admitted.body["attempt_generation"], "1");
+    assert_eq!(admitted.body["revision"], "2");
+    assert!(admitted.body["error_code"].is_null());
+    // Simulate the worker's next attempt finishing before the client retries
+    // its lost acknowledgement. A replay must not enqueue another attempt.
+    sqlx::query(
+        "UPDATE jobs SET phase='failed',attempt=2,error='next failure' WHERE id='retry-owned'",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let replay = f.call("POST", path, None, &headers).await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.body, admitted.body);
+    assert_eq!(replay.headers["etag"], admitted.headers["etag"]);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let state: (String, i64, i64) =
+        sqlx::query_as("SELECT phase,attempt,revision FROM jobs WHERE id='retry-owned'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(state, ("failed".into(), 2, 3));
+    let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE operation='retryJob' AND target='retry-owned'")
+        .fetch_one(&f.app.db).await.unwrap();
+    assert_eq!(receipts, 1);
+    let (_, other) = f.pair(&["default"], &["processing:request"]).await;
+    let hidden = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", &bearer(&other)),
+                ("idempotency-key", "other-retry-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    // Revocation defeats even an otherwise valid replay.
+    sqlx::query("UPDATE devices SET revoked=1 WHERE id=?")
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let revoked = f.call("POST", path, None, &headers).await;
+    assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let other_root = f._dir.path().join("private");
+    std::fs::create_dir(&other_root).unwrap();
+    let other = db::add_library(&f.app.db, "Private", &other_root)
+        .await
+        .unwrap()
+        .id;
+    for (id, title, library) in [
+        ("visible", "Film <script>alert(1)</script>", &f.library),
+        ("hidden", "Secret title", &other),
+        ("public-child", "Public season", &f.library),
+    ] {
+        sqlx::query("INSERT INTO items(id,title,kind) VALUES (?,?,'video')")
+            .bind(id)
+            .bind(title)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_origins(item_id,title) VALUES (?,?)")
+            .bind(id)
+            .bind(title)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES (?,?,'Original')")
+            .bind(id)
+            .bind(id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO timelines(id,edition_id,duration_ms) VALUES (?,?,90000)")
+            .bind(id)
+            .bind(id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES (?,?,?,?,'hash','fp',1)").bind(id).bind(id).bind(library).bind(format!("{id}.mp4")).execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES (?,?,'Visible original','original','declared')").bind(id).bind(id).execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,1,?,'hash')").bind(id).bind(id).execute(&f.app.db).await.unwrap();
+    }
+    sqlx::query("INSERT INTO item_structure(item_id,media_type,parent_id,number) VALUES ('visible','series',NULL,NULL),('public-child','season','visible',1),('hidden','season','visible',2)")
+        .execute(&f.app.db).await.unwrap();
+    // Same title, private occurrence: the aggregate must not expose its version.
+    sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES ('private-file','visible',?,'private.mp4','private-hash','fp',1)").bind(&other).execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES ('private-version','visible','Secret version','original','declared')").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES ('private-version',1,'private-file','private-hash')").execute(&f.app.db).await.unwrap();
+    let (device, token) = f
+        .pair(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    f.grant_library(&device, &["catalog:read", "playback:request"])
+        .await;
+    let auth = bearer(&token);
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    for (path, expected) in [
+        ("/item/visible", StatusCode::OK),
+        ("/item/hidden", StatusCode::NOT_FOUND),
+        ("/item/missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(f.request("GET", path, None, &[("authorization", &auth)]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !html.contains("Secret title") && !html.contains("Secret version"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(!html.contains(&token));
+        assert!(!html.contains(other_root.to_str().unwrap()));
+        if expected == StatusCode::OK {
+            assert!(html.contains("Film &lt;script&gt;"), "{html}");
+            assert!(html.contains("Visible original"), "{html}");
+            assert!(html.contains("Public season"), "{html}");
+            assert!(html.contains("Viewing history is unavailable."), "{html}");
+            assert!(html.contains("Playback is unavailable."), "{html}");
+            assert!(!html.contains("Not started."));
+            assert!(!html.contains("href=\"/play/"));
+        }
+    }
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "rendering must not write domain state");
+    // Bounded aggregate reads fail explicitly instead of displaying an
+    // incomplete timeline set as if it were complete.
+    for n in 0..20 {
+        sqlx::query("INSERT INTO timelines(id,edition_id) VALUES (?,'visible')")
+            .bind(format!("extra-{n:02}"))
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let response = app
+        .oneshot(f.request("GET", "/item/visible", None, &[("authorization", &auth)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }

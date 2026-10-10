@@ -227,7 +227,16 @@ pub async fn preview_merge(
     request: &MergeRequest,
 ) -> Result<MergePlan, CurationError> {
     let mut conn = db.acquire().await?;
-    let (found, aliases) = merge_decision(&mut conn, request).await?;
+    preview_merge_on(&mut conn, request).await
+}
+
+/// Read-only preview on the caller's connection (for example inside the
+/// transaction that also records an idempotent acknowledgement).
+pub(crate) async fn preview_merge_on(
+    conn: &mut SqliteConnection,
+    request: &MergeRequest,
+) -> Result<MergePlan, CurationError> {
+    let (found, aliases) = merge_decision(conn, request).await?;
     Ok(identity::plan_merge(&found, &aliases, request)?)
 }
 
@@ -354,7 +363,15 @@ pub async fn preview_split(
     request: &SplitRequest,
 ) -> Result<SplitPlan, CurationError> {
     let mut conn = db.acquire().await?;
-    let current = load_aggregate(&mut conn, &request.item)
+    preview_split_on(&mut conn, request).await
+}
+
+/// Read-only preview on the caller's connection.
+pub(crate) async fn preview_split_on(
+    conn: &mut SqliteConnection,
+    request: &SplitRequest,
+) -> Result<SplitPlan, CurationError> {
+    let current = load_aggregate(conn, &request.item)
         .await?
         .ok_or_else(|| IdentityError::UnknownItem(request.item.clone()))?;
     Ok(identity::plan_split(&current, request, &mut new_id)?)
@@ -363,17 +380,26 @@ pub async fn preview_split(
 pub async fn commit_split(app: &App, reviewed: &SplitPlan) -> Result<Receipt, CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let current = load_aggregate(&mut tx, &reviewed.item).await?;
+    let receipt = split_in_transaction(&mut tx, reviewed).await?;
+    tx.commit().await?;
+    Ok(receipt)
+}
+
+/// Caller holds `App.jobs` and a reserved-writer transaction; nothing commits here.
+pub(crate) async fn split_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    reviewed: &SplitPlan,
+) -> Result<Receipt, CurationError> {
+    let current = load_aggregate(tx, &reviewed.item).await?;
     let taken = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM items WHERE id=?")
         .bind(&reviewed.new_item)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?
         > 0;
     let fresh = identity::commit_split(reviewed, current.as_ref(), taken)?;
     let current = current.expect("commit_split requires the source");
-    let receipt = receipt(&mut tx, "catalog:split", &fresh).await?;
-    apply_split(&mut tx, &current, &fresh).await?;
-    tx.commit().await?;
+    let receipt = receipt(tx, "catalog:split", &fresh).await?;
+    apply_split(tx, &current, &fresh).await?;
     Ok(receipt)
 }
 

@@ -1,7 +1,7 @@
 //! Stateless model of guarded observation: filesystem mutations interleaved with
 //! scans whose directory listings may fail. The model applies the production
 //! reconciliation plan literally and checks it against the true filesystem.
-use playscale_core::scan::{Assignment, Coverage, Existing, Observed, reconcile_covered};
+use playscale_core::scan::{Assignment, Coverage, Existing, Observed, reconcile_scoped};
 use serde::{Deserialize, Serialize};
 use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
@@ -23,6 +23,8 @@ struct State {
     fs: BTreeMap<String, String>,
     /// Existing subdirectories; emptying one does not remove it.
     dirs: BTreeSet<String>,
+    /// Source exclusions (directory prefixes).
+    exclusions: Vec<String>,
     records: BTreeMap<String, Record>,
     editions: u32,
     files: u32,
@@ -38,6 +40,8 @@ enum Input {
     },
     /// Remove a subdirectory with everything in it.
     RemoveDir(String),
+    /// Set (or clear) the source's exclusion of a subdirectory.
+    Exclude(Option<String>),
     /// Scan with one directory unreadable (or none).
     Scan {
         unreadable: Option<String>,
@@ -47,6 +51,7 @@ enum Input {
 enum Effect {
     Published {
         unavailable: Vec<String>,
+        excluded: Vec<String>,
         assignments: Vec<Assignment>,
     },
 }
@@ -72,6 +77,7 @@ impl Model for Observation {
                 ("d1/b.mkv".into(), "r2".into()),
             ]),
             dirs: ["d1".to_string()].into(),
+            exclusions: vec![],
             records: BTreeMap::new(),
             editions: 0,
             files: 0,
@@ -86,6 +92,9 @@ impl Model for Observation {
                 if !dir(path).is_empty() {
                     next.dirs.insert(dir(path).to_string());
                 }
+            }
+            Input::Exclude(d) => {
+                next.exclusions = d.iter().cloned().collect();
             }
             Input::RemoveDir(d) => {
                 next.dirs.remove(d);
@@ -106,13 +115,17 @@ impl Model for Observation {
                         revision: r.revision.clone(),
                     })
                     .collect();
-                let plan = reconcile_covered(&old, &found, &coverage);
-                for id in &plan.unavailable {
+                let (plan, excluded) = reconcile_scoped(&old, &found, &coverage, &s.exclusions);
+                for id in plan.unavailable.iter().chain(&excluded) {
                     next.records.get_mut(id).unwrap().available = false;
                 }
                 let mut assigned: Vec<String> = Vec::new();
                 for (file, assignment) in found.iter().zip(&plan.assignments) {
                     let (id, edition) = match assignment {
+                        Assignment::OutOfScope => {
+                            assigned.push(String::new());
+                            continue;
+                        }
                         Assignment::CopyOf { observation } => {
                             next.files += 1;
                             (format!("f{}", next.files), assigned[*observation].clone())
@@ -141,6 +154,7 @@ impl Model for Observation {
                 }
                 outputs.push(Effect::Published {
                     unavailable: plan.unavailable,
+                    excluded,
                     assignments: plan.assignments,
                 });
             }
@@ -177,18 +191,30 @@ impl Model for Observation {
         let unreadable = unreadable.as_ref().filter(|d| before.dirs.contains(*d));
         let Some(Effect::Published {
             unavailable,
+            excluded,
             assignments,
         }) = next.outputs.first()
         else {
             return Ok(vec![check("scan.exact_effect", false)]);
         };
-        let readable = |path: &str| unreadable.map(String::as_str) != Some(dir(path));
+        let out = |path: &str| playscale_core::sources::excluded(path, &before.exclusions);
+        let readable = |path: &str| unreadable.map(String::as_str) != Some(dir(path)) && !out(path);
         // Every known occurrence under an unreadable directory keeps its state.
         let retained = before
             .records
             .iter()
-            .filter(|(_, r)| !readable(&r.path))
+            .filter(|(_, r)| !readable(&r.path) && !out(&r.path))
             .all(|(id, r)| after.records.get(id) == Some(r));
+        // Exclusion narrows scope: excluded records are out of scope (not
+        // proven absent) and no excluded observation is cataloged.
+        let scoped = excluded
+            .iter()
+            .all(|id| out(&before.records[id].path) && !unavailable.contains(id))
+            && before
+                .records
+                .iter()
+                .filter(|(_, r)| out(&r.path))
+                .all(|(id, _)| excluded.contains(id) && !after.records[id].available);
         // Absence is inferred only for paths the attempt proved missing.
         let absence = unavailable.iter().all(|id| {
             let r = &before.records[id];
@@ -216,19 +242,28 @@ impl Model for Observation {
         });
         // Verified content held by one edition never creates a new work.
         let mut holders: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-        for r in before.records.values() {
+        for r in before.records.values().filter(|r| !out(&r.path)) {
             holders.entry(&r.revision).or_default().insert(&r.edition);
         }
+        let earlier_in_scope = |i: usize, revision: &str| {
+            found[..i]
+                .iter()
+                .any(|g| g.revision == revision && !out(&g.path))
+        };
         let classified = found
             .iter()
             .enumerate()
             .zip(assignments)
             .all(|((i, f), a)| match a {
                 // New only for unknown content (first sighting) or ambiguous content.
-                Assignment::New => match holders.get(f.revision.as_str()) {
-                    Some(e) => e.len() > 1,
-                    None => !found[..i].iter().any(|g| g.revision == f.revision),
-                },
+                Assignment::OutOfScope => out(&f.path),
+                Assignment::New => {
+                    !out(&f.path)
+                        && match holders.get(f.revision.as_str()) {
+                            Some(e) => e.len() > 1,
+                            None => !earlier_in_scope(i, &f.revision),
+                        }
+                }
                 Assignment::CopyOf { observation } => {
                     !holders.contains_key(f.revision.as_str())
                         && *observation < i
@@ -248,6 +283,7 @@ impl Model for Observation {
             .count() as u32;
         Ok(vec![
             check("scan.unvisited_retain_state", retained),
+            check("scan.exclusion_is_not_absence", scoped),
             check("scan.absence_requires_coverage", absence),
             check("scan.observed_files_cataloged", truthful),
             check("scan.covered_absence_recorded", complete),
@@ -315,6 +351,8 @@ impl Enumerate for Observation {
         for d in DIRS {
             inputs.push(Input::RemoveDir(d.into()));
         }
+        inputs.push(Input::Exclude(None));
+        inputs.push(Input::Exclude(Some("d2".into())));
         for path in PATHS {
             inputs.push(Input::Remove { path: path.into() });
             for revision in ["r1", "r2"] {
@@ -373,7 +411,7 @@ fn seeded_observation_sequences_check_production_reconciliation() {
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
     println!(
-        "Stateless fuzz: {} cases, {} transitions, {:?}; 4 paths x 2 revisions, one unreadable directory per scan",
+        "Stateless fuzz: {} cases, {} transitions, {:?}; 4 paths x 2 revisions, one unreadable directory per scan, d2 exclusion toggled",
         report.cases, report.transitions, report.termination
     );
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/cli"
+	"github.com/Jagalite/motion/apps/terminal/internal/store"
 )
 
 type server struct {
@@ -195,6 +197,53 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	if me.code != cli.ExitOK || data(t, me.stdout)["device_id"] != deviceID {
 		t.Fatalf("me: %+v", me)
 	}
+	// A real cookie jar enforces Path, unlike router tests that inject Cookie.
+	// The browser session must reach both SSR and API routes.
+	credential, err := (store.Store{Dir: device}).Credential(serverID)
+	if err != nil || credential == nil {
+		t.Fatal("cannot load paired test credential", err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	browser := &http.Client{Jar: jar, Timeout: 20 * time.Second}
+	exchange, err := json.Marshal(map[string]string{"kind": "credential", "credential": credential.AccessToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionRequest, err := http.NewRequest("POST", srv.url+"/api/v2/auth/session", bytes.NewReader(exchange))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionRequest.Header.Set("Origin", srv.url)
+	sessionRequest.Header.Set("Content-Type", "application/json")
+	sessionResponse, err := browser.Do(sessionRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionResponse.Body.Close()
+	if sessionResponse.StatusCode != http.StatusOK {
+		t.Fatalf("session exchange: %d", sessionResponse.StatusCode)
+	}
+	checkBrowser := func(path string, status int, contains string) {
+		t.Helper()
+		r, err := browser.Get(srv.url + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+		r.Body.Close()
+		if err != nil || r.StatusCode != status || !strings.Contains(string(body), contains) {
+			t.Fatalf("browser %s: status %d, expected %d and %q (%v)", path, r.StatusCode, status, contains, err)
+		}
+		if strings.Contains(string(body), credential.AccessToken) {
+			t.Fatal("SSR exposed credential")
+		}
+	}
+	checkBrowser("/", http.StatusOK, "Continue watching")
+	checkBrowser("/api/v2/auth/session", http.StatusOK, "csrf_token")
+	checkBrowser("/?profile_id=not-granted", http.StatusForbidden, "")
 	// Authorization is enforced: device management is administrative.
 	if denied := run(t, srv, device, "devices", "list"); denied.code != cli.ExitAuth {
 		t.Fatalf("device listed devices: %+v", denied)
@@ -219,6 +268,69 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 		t.Fatalf("stale rename: %+v", stale)
 	}
 
+	// Registered sources and logical libraries use the real v2 services.
+	mediaRoot := t.TempDir()
+	source := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "sources", "add", "Test source", "--root", mediaRoot)
+	if source.code != cli.ExitOK {
+		t.Fatalf("source: %+v", source)
+	}
+	sourceID := data(t, source.stdout)["id"].(string)
+	library := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "libraries", "add", "Test library", "--source", sourceID)
+	if library.code != cli.ExitOK {
+		t.Fatalf("library: %+v", library)
+	}
+	libraryID := data(t, library.stdout)["id"].(string)
+	if libraryID == sourceID {
+		t.Fatal("logical library reused source identity")
+	}
+	libraries := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "libraries", "list")
+	if libraries.code != cli.ExitOK || len(data(t, libraries.stdout)["items"].([]any)) != 1 {
+		t.Fatalf("libraries: %+v", libraries)
+	}
+	hiddenLibraries := run(t, srv, device, "--json", "libraries", "list")
+	if hiddenLibraries.code != cli.ExitOK || len(data(t, hiddenLibraries.stdout)["items"].([]any)) != 0 {
+		t.Fatalf("hidden libraries: %+v", hiddenLibraries)
+	}
+	checkBrowser("/", http.StatusOK, "No libraries")
+	// Catalog fixtures are created through HTTP, never by touching SQLite.
+	token, err := os.ReadFile(srv.operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest("POST", srv.url+"/api/v2/catalog/items", strings.NewReader(`{"kind":"video","title":"Unicode 猫 Film","library_ids":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "e2e-create-catalog-item")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created map[string]any
+	err = json.NewDecoder(response.Body).Decode(&created)
+	response.Body.Close()
+	if err != nil || response.StatusCode != 201 {
+		t.Fatalf("catalog creation %d %v %v", response.StatusCode, created, err)
+	}
+	found := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "catalog", "search", "猫")
+	if found.code != cli.ExitOK || len(data(t, found.stdout)["items"].([]any)) != 1 {
+		t.Fatalf("search: %+v", found)
+	}
+	shown := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "catalog", "show", created["id"].(string))
+	if shown.code != cli.ExitOK || data(t, shown.stdout)["title"] != "Unicode 猫 Film" {
+		t.Fatalf("show: %+v", shown)
+	}
+	diagnostics := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "diagnostics")
+	if diagnostics.code != cli.ExitOK || data(t, diagnostics.stdout)["server_epoch"] == "" {
+		t.Fatalf("diagnostics: %+v", diagnostics)
+	}
+	jobs := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "jobs", "list")
+	if jobs.code != cli.ExitOK {
+		t.Fatalf("jobs: %+v", jobs)
+	}
+
 	// Revocation ends the stream and every later request.
 	revoke := run(t, srv, admin, "--operator-token-file", srv.operator, "devices", "revoke", deviceID)
 	if revoke.code != cli.ExitOK {
@@ -232,6 +344,7 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("event stream survived revocation")
 	}
+	checkBrowser("/", http.StatusUnauthorized, "Sign in to Motion")
 	if after := run(t, srv, device, "auth", "status"); after.code != cli.ExitAuth {
 		t.Fatalf("revoked credential still works: %+v", after)
 	}

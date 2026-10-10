@@ -102,6 +102,7 @@ struct Hint<'a> {
 fn resource_type(topic: &str) -> &str {
     match topic {
         "libraries" => "library",
+        "sources" => "source",
         "catalog" => "catalog_item",
         "metadata" => "item_metadata",
         "artwork" => "item_artwork",
@@ -129,9 +130,10 @@ async fn classify(
     let prior = scope.iter().cloned().collect();
     Ok(match topic.as_str() {
         "libraries" => Resource::Library(id.clone()),
+        "sources" => Resource::Source,
         "catalog" | "metadata" | "artwork" if !principal.is_admin() => Resource::Item {
             libraries: sqlx::query_scalar(
-                "SELECT DISTINCT f.library_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?",
+                "SELECT DISTINCT ls.library_id FROM media_files f JOIN library_sources ls ON ls.source_id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE e.item_id=?",
             )
             .bind(id)
             .fetch_all(conn)
@@ -156,6 +158,11 @@ async fn classify(
             owner.map_or(Resource::Administrative, Resource::Profile)
         }
         "devices" => Resource::Device(id.clone()),
+        "scan" | "processing" => {
+            let requester:Option<String>=sqlx::query_scalar("SELECT requester_id FROM api_jobs WHERE id=?")
+                .bind(id).fetch_optional(conn).await?;
+            requester.map_or(Resource::Administrative, |requester|Resource::Job{requester})
+        },
         _ => Resource::Administrative,
     })
 }
