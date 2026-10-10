@@ -76,13 +76,16 @@ function demuxeSource(generation, origin) {
 // A version, quality or audio choice replans the same timeline. An audio
 // track other than the default asks the planner for a conversion that carries
 // exactly that stream; the server decides whether one is admissible.
-function replanInput(input, {version, quality, audio, audioVersion}) {
+function replanInput(input, {version, quality, audio, audioSource}) {
   if (audio && !/^a[0-9]{1,4}$/.test(audio)) throw new Error('Invalid audio track');
-  // Track IDs are ordinals of one version's streams; another version may
-  // number them differently, so a version change drops the audio choice.
-  if (version && version !== audioVersion) audio = null;
-  return {...input, version_id: version || null, failed_candidate_ids: [],
-    quality: {...input.quality, mode: quality},
+  // Track IDs are ordinals of one file revision's streams. A chosen track pins
+  // the exact version and file revision the options describe (the planner
+  // rejects a changed revision); a different version drops the choice.
+  const pinned = audio && audioSource?.version && audioSource.file_id && audioSource.file_revision;
+  if (audio && (!pinned || (version && version !== audioSource.version))) audio = null;
+  return {...input, failed_candidate_ids: [], quality: {...input.quality, mode: quality},
+    version_id: audio ? audioSource.version : version || null,
+    source: audio ? {file_id: audioSource.file_id, file_revision: audioSource.file_revision} : null,
     tracks: {...input.tracks, audio_track_id: audio || null}};
 }
 
@@ -480,6 +483,9 @@ async function start() {
   state.closing = null;
   const current = () => epoch === state.epoch;
   const data = host.dataset;
+  // Read before any await: another tab may record its own session later.
+  // Unavailable storage means no known predecessor: adoption fails closed.
+  const predecessor = (() => { try { return localStorage.getItem(ownSessionKey(data)); } catch { return null; } })();
   host.dataset.state = 'starting';
   try {
     const viewingRevision = data.canSaveViewing === 'true' ? await recoverViewing(data, current) : null;
@@ -533,7 +539,12 @@ async function start() {
         // Possibly the previous player's final event landing after render.
         const latest = await api('GET', `/api/v2/profiles/${encodeURIComponent(data.profileId)}/timelines/${encodeURIComponent(data.timelineId)}/viewing`,
           undefined, undefined, AbortSignal.timeout(10000));
-        const adopted = adoptableRevision(latest, {ownSession: localStorage.getItem(ownSessionKey(data)),
+        // Only the predecessor captured before any await; its terminal status
+        // is the evidence that the newer revision was its final event.
+        const ownSessionStatus = predecessor ? (await api('GET', `/api/v2/playback/viewing-sessions/${encodeURIComponent(predecessor)}`,
+          undefined, undefined, AbortSignal.timeout(10000)).catch(() => null))?.status : null;
+        if (!current()) throw error;
+        const adopted = adoptableRevision(latest, {ownSession: predecessor, ownSessionStatus,
           manualEpoch: data.viewingManualEpoch, resumeMs: Number(data.resumeMs) || 0});
         if (adopted === null || !current()) throw error;
         session = await createSession(adopted);
@@ -624,7 +635,8 @@ controls?.addEventListener('click', event => {
       const epoch = state.epoch;
       const next = replanInput(state.planInput, {version: controls.elements.version.value,
         quality: controls.elements.quality.value, audio: controls.elements.audio?.value,
-        audioVersion: controls.elements.audio?.dataset.version});
+        audioSource: {version: controls.elements.audio?.dataset.version, file_id: controls.elements.audio?.dataset.fileId,
+          file_revision: controls.elements.audio?.dataset.fileRevision}});
       const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));
       if (epoch !== state.epoch) return;
       if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) {

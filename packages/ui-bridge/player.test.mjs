@@ -31,23 +31,28 @@ test('audio, version and quality choices replan only the same timeline input', (
   const {replanInput} = runInNewContext(source.replace('export {close, maintainLease};', '({replanInput});'), {
     document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
   });
-  const input = {profile_id: 'p', timeline_id: 't', version_id: null, failed_candidate_ids: ['o-f'],
+  const input = {profile_id: 'p', timeline_id: 't', version_id: null, source: null, failed_candidate_ids: ['o-f'],
     tracks: {audio_track_id: null, subtitle_track_id: null, subtitle_policy: 'auto'}, quality: {mode: 'auto', max_height: null}};
-  const next = replanInput(input, {version: '', quality: 'auto', audio: 'a1'});
+  const audioSource = {version: 'v1', file_id: 'f1', file_revision: 'r1'};
+  const next = replanInput(input, {version: '', quality: 'auto', audio: 'a1', audioSource});
   assert.equal(next.tracks.audio_track_id, 'a1');
+  assert.equal(next.version_id, 'v1', 'a chosen track pins the version it was listed for');
+  assert.deepEqual({...next.source}, {file_id: 'f1', file_revision: 'r1'}, 'and the exact file revision');
   assert.equal(next.tracks.subtitle_policy, 'auto');
-  assert.equal(next.timeline_id, 't');
   assert.deepEqual([...next.failed_candidate_ids], [], 'a new choice is planned afresh');
   assert.equal(input.tracks.audio_track_id, null, 'the current input is not mutated');
-  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: '', audioVersion: 'v2'});
+  const other = replanInput(input, {version: 'v2', quality: 'auto', audio: 'a1', audioSource});
+  assert.equal(other.tracks.audio_track_id, null, 'ordinals of another version are not reused');
+  assert.equal(other.version_id, 'v2');
+  assert.equal(other.source, null);
+  const unpinned = replanInput(input, {version: '', quality: 'auto', audio: 'a1', audioSource: {version: 'v1'}});
+  assert.equal(unpinned.tracks.audio_track_id, null, 'a track without its file revision is never sent');
+  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: '', audioSource});
   assert.equal(back.tracks.audio_track_id, null);
   assert.equal(back.version_id, 'v2');
+  assert.equal(back.source, null);
   assert.equal(back.quality.mode, 'convert');
-  assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x'}), /Invalid audio/);
-  const sameVersion = replanInput(input, {version: 'v1', quality: 'auto', audio: 'a1', audioVersion: 'v1'});
-  assert.equal(sameVersion.tracks.audio_track_id, 'a1');
-  const otherVersion = replanInput(input, {version: 'v2', quality: 'auto', audio: 'a1', audioVersion: 'v1'});
-  assert.equal(otherVersion.tracks.audio_track_id, null, 'ordinals of another version are not reused');
+  assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x', audioSource}), /Invalid audio/);
 });
 
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {

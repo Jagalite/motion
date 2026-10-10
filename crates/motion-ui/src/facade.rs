@@ -151,6 +151,8 @@ pub struct PlayerView {
     /// (`a{n}`). Choosing one other than the first asks for a conversion.
     pub audio_tracks: Vec<TrackOption>,
     pub audio_version: Option<String>,
+    /// The exact file revision `audio_tracks` describe; a chosen track pins it.
+    pub audio_file: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
