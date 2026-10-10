@@ -322,7 +322,7 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
         if jobs.is_empty() {
             empty(message: "No background work.")
         } else {
-            <table>
+            <div class="table-scroll" role="region" aria-label="Background jobs" tabindex="0"><table>
                 <caption class="visually-hidden">"Background jobs"</caption>
                 <thead><tr><th scope="col">"Job"</th><th scope="col">"State"</th><th scope="col">"Progress"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
                 <tbody>
@@ -346,7 +346,7 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
                         </tr>
                     }
                 </tbody>
-            </table>
+            </table></div>
         }
     })
 }

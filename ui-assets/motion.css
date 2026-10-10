@@ -33,6 +33,7 @@ input, button, select { max-width: 100%; font: inherit; color: inherit; backgrou
 .card progress { width: 100%; }
 .status-panel { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
 .status-panel[role="alert"] { border-color: var(--danger); }
+.table-scroll { position: relative; max-width: 100%; overflow: auto; }
 .notice { border-left: 3px solid var(--accent); padding-left: .75rem; }
 a.button { display: inline-block; padding: .45rem .9rem; border-radius: 6px; border: 1px solid var(--line); text-decoration: none; }
 a.button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
