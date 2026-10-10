@@ -357,19 +357,57 @@ async fn play(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let id = path_param::<TimelineId>(cx);
     let view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
+    let preferences = facade(cx)
+        .0
+        .profiles(who)
+        .await
+        .map_err(ui_error)?
+        .preferences;
+    let versions = facade(cx)
+        .0
+        .item(who, &view_model.item_id)
+        .await
+        .map_err(ui_error)?
+        .timelines
+        .into_iter()
+        .find(|timeline| timeline.id == view_model.timeline_id)
+        .map(|timeline| timeline.versions)
+        .unwrap_or_default();
     Ok(view! {
         <h1>(view_model.title.as_str())</h1>
         <div id="motion-player" class="player-host"
             data-motion-player="v1"
             data-timeline-id=(view_model.timeline_id.as_str())
             data-profile-id=(who.profile_id.as_str())
+            data-principal-id=(who.principal_id.as_str())
+            data-server-epoch=(who.server_epoch.as_str())
+            data-can-save-viewing=(if who.can("viewing:write") { "true" } else { "false" })
             data-viewing-revision=(view_model.viewing_revision.as_str())
+            data-quality-mode=(preferences.quality_mode.as_str())
+            data-subtitle-policy=(preferences.subtitle_mode.as_str())
+            data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
             data-resume-ms=(view_model.resume_ms)
             data-duration-ms=(view_model.duration_ms.unwrap_or(0))
             data-demuxe-base=(assets::DEMUXE_BASE)>
             <p class="status-panel" role="status" data-state="loading">"Preparing playback…"</p>
         </div>
+        <form id="motion-playback-controls" aria-label="Playback controls">
+            <button type="button" data-player-action="play">"Play"</button>
+            <button type="button" data-player-action="pause">"Pause"</button>
+            <button type="button" data-player-action="mute">"Mute / unmute"</button>
+            <label>"Position in seconds "<input name="position" type="number" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
+            <button type="submit">"Seek"</button>
+            <label>"Version "<select name="version"><option value="">"Automatic"</option>
+                for version in versions {
+                    <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
+                }
+            </select></label>
+            <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
+            <button type="button" data-player-action="quality">"Apply quality"</button>
+            <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+        </form>
         <script type="module" src=(assets::PLAYER.url())></script>
+        <p id="motion-progress-status" role="status"></p>
         <p><a href=(href!(item, ItemId(view_model.item_id.as_str())))>"Back to title"</a></p>
     })
 }

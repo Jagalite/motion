@@ -11,7 +11,7 @@ const output = process.env.MOTION_PROOF_OUT;
 const page = process.env.MOTION_PROOF_PAGE ?? '/play/tl2';
 
 const observations = {checks: {}, console: [], navigationBlocked: [], permissionRequests: [], permissionChecks: [], permissionsGranted: []};
-const note = (name, value) => { observations.checks[name] = value; };
+const note = (name, value) => { observations.checks[name] = value; writeFileSync(output, JSON.stringify(observations, null, 2)); console.log(`Proof checkpoint: ${name}`); };
 
 app.whenReady().then(async () => {
   try {
@@ -118,6 +118,22 @@ app.whenReady().then(async () => {
           audioTracks: p.state.audioTracks.length, error: p.state.error, decodedFrames: stats?.decodedFrames ?? null};
       })()`);
       note('playback', playback);
+      note('generationSwitch', await evaluate(`(async () => {
+        const old = document.querySelector('#motion-player demuxe-player');
+        const form = document.getElementById('motion-playback-controls');
+        form.elements.position.value = '5';
+        form.requestSubmit();
+        const start = performance.now();
+        while (performance.now() - start < 15000) {
+          const players = [...document.querySelectorAll('#motion-player demuxe-player')];
+          const next = players.find(p => p !== old);
+          if (next && !old.isConnected && players.length === 1) return {replaced: true,
+            logicalTime: next.player.state.currentTime, muted: next.player.state.muted,
+            players: players.length};
+          await new Promise(r => setTimeout(r, 100));
+        }
+        return {replaced: false, text: document.getElementById('motion-player').textContent};
+      })()`));
     }
     // Leave the page: the bridge must retire its delivery on pagehide. A marker
     // survives only if the document is restored from the back/forward cache.

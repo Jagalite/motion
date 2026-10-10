@@ -8,13 +8,14 @@ import {createHash} from 'node:crypto';
 import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {mkdtemp} from 'node:fs/promises';
 import {release, tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join, resolve} from 'node:path';
 import {createInterface} from 'node:readline';
 import {fileURLToPath} from 'node:url';
 import electron from 'electron';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
-const server = join(root, 'target/debug/examples/proof_server');
+const target = process.env.CARGO_TARGET_DIR ? resolve(root, process.env.CARGO_TARGET_DIR) : join(root, 'target');
+const server = join(target, 'debug/examples/proof_server');
 const demuxe = process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe');
 if (!existsSync(join(demuxe, 'package.json'))) throw new Error(`Demuxe package not found at ${demuxe}; set MOTION_DEMUXE_DIR`);
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -50,6 +51,8 @@ const admitted = [];
 const commands = [];
 const closed = [];
 const output = join(work, 'observed.json');
+const launchMain = join(work, 'main.mjs');
+writeFileSync(launchMain, readFileSync(new URL('./main.mjs', import.meta.url)), {flag: 'wx'});
 let child;
 let electronChild;
 let lines;
@@ -85,12 +88,12 @@ try {
   const electronEnv = {...process.env};
   delete electronEnv.ELECTRON_RUN_AS_NODE;
   await new Promise((resolve, reject) => {
-    electronChild = spawn(electron, [fileURLToPath(new URL('./main.mjs', import.meta.url))], {
+    electronChild = spawn(electron, [launchMain], {
       stdio: 'inherit',
       // Private child environment for this proof; packaged host will use a pipe.
       env: {...electronEnv, MOTION_PROOF_ORIGIN: announced.listening, MOTION_PROOF_BOOTSTRAP: announced.bootstrap, MOTION_PROOF_OUT: output},
     });
-    const timer = setTimeout(() => reject(new Error('Electron proof exceeded 120 seconds')), 120000);
+    const timer = setTimeout(() => reject(new Error('Electron proof exceeded 180 seconds')), 120000);
     electronChild.once('error', error => { clearTimeout(timer); reject(error); });
     electronChild.once('exit', code => {
       clearTimeout(timer);
@@ -125,6 +128,14 @@ const results = {
   waited_for_starting_generation: requests.some(r => r.method === 'GET' && /^\/api\/v2\/playback\/delivery-sessions\/[^/]+$/.test(r.path) && r.status === 200),
   active_delivery_lease_renewed: commands.some(cmd => cmd.operation === 'heartbeatDelivery'
     && cmd.delivery === admitted[0] && cmd.body?.active_generation === '1'),
+  viewing_authority_admitted: commands.filter(cmd => cmd.operation === 'createViewingSession').length === 2
+    && commands.filter(cmd => cmd.operation === 'createViewingSession').every(cmd =>
+      cmd.body?.expected_viewing_revision === '0' && admitted.includes(cmd.body?.delivery_id)),
+  ordered_viewing_progress: commands.filter(cmd => cmd.operation === 'createViewingSession').every(cmd => {
+    const events = commands.filter(event => event.operation === 'recordViewingEvent' && event.session === cmd.session.id);
+    return events.length > 0 && events.every((event, index) => event.body.sequence === String(index + 1)
+      && ['1', '2'].includes(event.body.delivery_generation) && Number.isSafeInteger(event.body.position_ms));
+  }) && commands.some(cmd => cmd.operation === 'recordViewingEvent' && cmd.body?.position_ms >= 7000),
   plays_after_back_navigation: c.afterBack?.state === 'ready' && c.afterBack?.players === 1 && c.afterBackPlayback?.advancing === true && deliveriesCreated === 2,
   // A command form reached the public API with a 32-hex idempotency key and the typed body.
   command_form_creates_scan: commands.some(cmd => cmd.operation === 'createScan' && cmd.library === 'lib1'
@@ -133,6 +144,9 @@ const results = {
   if_match_conflict_surfaced: commands.filter(cmd => cmd.operation === 'decideMatch').map(cmd => cmd.status).join(',') === '200,412'
     && commands.some(cmd => cmd.operation === 'decideMatch' && cmd.if_match === '"r1"' && cmd.body?.decision === 'accept' && cmd.body?.candidate_id === 'mc1')
     && /changed somewhere else/.test(c.staleDecisionMessage ?? ''),
+  generation_replacement_activated: c.generationSwitch?.replaced === true
+    && c.generationSwitch.logicalTime >= 4.8 && c.generationSwitch.logicalTime < 8 && c.generationSwitch.muted === true
+    && commands.some(cmd => cmd.operation === 'activateGeneration' && cmd.generation === '2' && cmd.body?.expected_active_generation === '1'),
   demuxe_bytes_match_install_receipt: demuxeMismatches.length === 0,
   no_permission_granted_beyond_fullscreen: observed.permissionsGranted.every(p => p === 'fullscreen'),
 };
@@ -172,7 +186,8 @@ const receipt = {
     'Bootstrap passed through the child-process environment of the launcher, not yet an inherited pipe.',
     'Native route of the installed reduced Demuxe package only; no Wasm/WebCodecs providers are installed.',
     'Audio muted; audible output, A/V sync, colour and HDR not observed. Hidden window, unpackaged, unsigned.',
-    'Player bridge renews its active delivery lease; viewing authority, progress events and generation switching remain unimplemented.',
+    'Viewing authority and event replies use static mock fixtures; production authority conflicts and persistence require real-backend qualification.',
+    'Generation replacement is exercised against mock range media; real FFmpeg/HLS transport remains unqualified.',
     'Back navigation reloaded the page (no-store HTML is not bfcache-eligible), so the pageshow(persisted) restart path was not exercised in Electron.',
   ],
 };

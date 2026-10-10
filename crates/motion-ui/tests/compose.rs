@@ -257,6 +257,11 @@ async fn player_page_emits_a_stable_host_and_external_module() {
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(r#"id="motion-player""#));
     assert!(html.contains(r#"data-timeline-id="tl1""#));
+    assert!(html.contains(r#"data-principal-id="p1""#));
+    assert!(html.contains(r#"data-server-epoch="epoch1""#));
+    assert!(html.contains(r#"data-can-save-viewing="true""#));
+    assert!(html.contains(r#"id="motion-playback-controls""#));
+    assert!(html.contains(r#"name="version""#));
     assert!(html.contains(r#"data-resume-ms="1830000""#));
     assert!(html.contains(r#"data-demuxe-base="/assets/demuxe/""#));
     assert!(html.contains(&format!(r#"src="{}""#, assets::PLAYER.url())));
@@ -445,4 +450,16 @@ async fn command_bodies_satisfy_required_contract_fields() {
     assert!(m2.contains("No candidates were proposed."));
     assert!(!m2.contains(r#"value="accept""#));
     assert!(m2.contains(r#"value="reject""#) && m2.contains(r#"value="defer""#));
+}
+
+#[tokio::test]
+async fn playback_without_viewing_permission_does_not_offer_writing_authority() {
+    let app = app(
+        Some(principal("everyone", &["catalog:read", "playback:request"])),
+        None,
+    );
+    let (status, _, html) = get_page(&app, "/play/tl1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(r#"data-can-save-viewing="false""#));
+    assert!(!html.contains(r#"data-can-save-viewing="true""#));
 }

@@ -4,14 +4,13 @@
 //
 // Scope: plan -> admit delivery -> open the generation in Demuxe -> close the
 // delivery and dispose on leave, through the same-origin public API with
-// CSRF and idempotency keys. Viewing authority, ordered progress events,
-// generation switching belong to the full playback
-// coordinator and are NOT implemented here.
+// CSRF and idempotency keys. Ordered viewing events use the bundled pure
+// coordinator. Generation replacement is handled separately from viewing authority.
 
 const host = document.getElementById('motion-player');
 const csrf = document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 
-const state = {epoch: 0, deliveryId: null, element: null, closing: null, stopLease: null};
+const state = {epoch: 0, deliveryId: null, element: null, closing: null, stopLease: null, viewing: null, stopObserving: null, viewingOwner: null, generation: null, delivery: null, replace: null, planInput: null, changing: false};
 
 function status(message, kind = 'status') {
   let panel = host.querySelector('.status-panel');
@@ -30,7 +29,7 @@ async function api(method, path, body, idempotencyKey, signal) {
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
-    method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE',
+    method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE' || path.endsWith('/events'),
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
@@ -87,7 +86,7 @@ const retired = new Set();
 function retire(id) {
   if (!id || retired.has(id)) return Promise.resolve();
   retired.add(id);
-  return api('DELETE', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}`).catch(() => {});
+  return api('DELETE', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}`, undefined, undefined, AbortSignal.timeout(5000)).catch(() => {});
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -164,7 +163,7 @@ async function firstGeneration(delivery, current) {
   for (;;) {
     const generation = latest.active ?? latest.pending;
     if (['failed', 'closed', 'interrupted'].includes(latest.status) || generation?.status === 'failed') return null;
-    if (generation && (generation.status === 'ready' || generation.status === 'active')) return latest;
+    if (latest.active && ['ready', 'active'].includes(latest.active.status)) return latest;
     const remaining = deadline - Date.now();
     if (remaining <= 0) return null;
     status('The server is preparing the stream…');
@@ -177,64 +176,291 @@ async function firstGeneration(delivery, current) {
   }
 }
 
+// Outbox is scoped to this server runtime, principal, profile and timeline.
+// It contains session/event identities only, never reusable authentication.
+function viewingStorage(data) {
+  const scope = JSON.stringify([data.serverEpoch, data.principalId, data.profileId, data.timelineId]);
+  const storageKey = `motion:viewing:${scope}`;
+  return {
+    load: () => JSON.parse(sessionStorage.getItem(storageKey) ?? 'null'),
+    save: value => value === null ? sessionStorage.removeItem(storageKey) : sessionStorage.setItem(storageKey, JSON.stringify(value)),
+    archive: value => sessionStorage.setItem(`${storageKey}:rejected`, JSON.stringify(value)),
+    hasRejected: () => sessionStorage.getItem(`${storageKey}:rejected`) !== null,
+  };
+}
+
+async function retryCommand(path, body, identity, current) {
+  let last;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!current()) throw new Error('Playback ownership changed.');
+    try { return await api('POST', path, body, identity, AbortSignal.timeout(10000)); }
+    catch (error) {
+      last = error;
+      if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
+      await sleep(250 * (attempt + 1));
+    }
+  }
+  throw last;
+}
+
+function makeViewingWriter(session, storage, owner, saved = {}) {
+  return createViewingWriter(session, {
+    pending: saved.pending, latest: saved.latest, current: () => owner.active && (owner.current?.() ?? true),
+    send: (id, event) => api('POST', `/api/v2/playback/viewing-sessions/${encodeURIComponent(id)}/events`,
+      event, undefined, AbortSignal.timeout(5000)),
+    persist: storage.save, archive: storage.archive, uuid: key, wait: sleep,
+    changed: ack => { owner.revision = ack.viewing?.revision; },
+  });
+}
+
+async function recoverViewing(data, current) {
+  const storage = viewingStorage(data);
+  if (storage.hasRejected()) {
+    const panel = document.getElementById('motion-progress-status');
+    if (panel) panel.textContent = 'An earlier viewing event was rejected. Its last position is retained on this device; it was not saved to the server.';
+  }
+  const saved = storage.load();
+  if (!saved) return data.viewingRevision;
+  if (saved.session?.profile_id !== data.profileId || saved.session?.timeline_id !== data.timelineId) {
+    throw new Error('Saved viewing context does not match this player.');
+  }
+  const owner = {active: true, current};
+  try {
+    const writer = makeViewingWriter(saved.session, storage, owner, saved);
+    if (!await writer.flush()) throw new Error('Progress from the previous player is still pending. Retry when the server is reachable.');
+    if (!current()) throw new Error('Playback ownership changed.');
+    return owner.revision ?? data.viewingRevision;
+  } catch (error) {
+    // A known rejection fences the old authority. Never use a new revision to
+    // silently take over a newer session or manual watched change.
+    throw error;
+  } finally { owner.active = false; }
+}
+
+function observeViewing(element, generation, writer, current) {
+  let last = 0;
+  let previous;
+  return element.player.subscribe(observation => {
+    if (!current()) return;
+    const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
+    const output = document.getElementById('motion-position');
+    if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
+    if (!writer || !['playing', 'paused', 'ended'].includes(observation.status)) return;
+    const instant = Date.now();
+    if (observation.status === previous && instant - last < 5000) return;
+    last = instant;
+    previous = observation.status;
+    try {
+      writer.record({position_ms: Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms)),
+        status: observation.status, delivery_generation: generation.generation});
+      void writer.flush().then(saved => {
+        if (current() && !saved) status('Progress is queued until the server responds.');
+      }).catch(error => {
+        if (current()) { status(`Progress could not be saved: ${error.message}`, 'alert'); void close(); }
+      });
+    } catch (error) {
+      status(`Progress could not be queued: ${error.message}`, 'alert');
+      void close();
+    }
+  });
+}
+
+function renewLease(delivery, generation, current) {
+  state.stopLease?.();
+  state.stopLease = maintainLease(delivery, generation.generation, {
+    current,
+    send: async (id, active_generation, signal) => {
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+      if (current()) state.delivery = renewed;
+      return renewed;
+    },
+    failed: error => { status(`Playback stopped: ${error.message}`, 'alert'); host.dataset.state = 'failed'; void close(); },
+  });
+}
+
+async function disposePlayer(element) {
+  if (!element) return;
+  await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
+  element.remove();
+}
+
+async function preparePlayer(generation, position, current, savedPreferences = null) {
+  const data = host.dataset;
+  const previous = state.element?.player.state;
+  const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate} : null);
+  const shared = await loadDemuxe(data.demuxeBase);
+  if (!current()) throw new Error('Playback ownership changed.');
+  const element = document.createElement('demuxe-player');
+  if (shared) element.runtime = shared;
+  element.setAttribute('asset-base', data.demuxeBase);
+  // Rolling HLS transport time is not the logical movie duration. The Motion
+  // controls below the player own seeking for that route.
+  element.controls = generation.transport === 'http_range';
+  element.showSourceControls = false;
+  element.allowFileDrop = false;
+  host.append(element);
+  try {
+    const url = new URL(generation.transport === 'hls' ? generation.manifest_url : generation.media_url, location.origin);
+    if (url.origin !== location.origin || url.username || url.password) throw new Error('Media must use the selected server origin.');
+    await element.open(url.href, {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
+    if (preferences) {
+      await element.setVolume(preferences.volume);
+      await element.setMuted(preferences.muted);
+      await element.setPlaybackRate(preferences.rate);
+    }
+    return element;
+  } catch (error) { await disposePlayer(element); throw error; }
+}
+
+function makeSwitcher(current) {
+  let savedPreferences;
+  return createGenerationSwitcher({current,
+    stage: async (change, expected_generation) => {
+      const observed = state.element?.player.state;
+      savedPreferences = observed ? {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate} : null;
+      status('Preparing the requested playback change…');
+      return retryCommand(`/api/v2/playback/delivery-sessions/${encodeURIComponent(state.deliveryId)}/changes`,
+        {...change, expected_generation}, key(), current);
+    },
+    prepare: async staged => {
+      const deadline = Date.now() + 60000;
+      const identity = staged.pending.generation;
+      while (staged.pending?.generation === identity && staged.pending.status === 'starting') {
+        if (!current() || Date.now() >= deadline) throw new Error('Replacement preparation timed out.');
+        await sleep(500);
+        staged = await api('GET', `/api/v2/playback/delivery-sessions/${encodeURIComponent(staged.id)}`, undefined, undefined, AbortSignal.timeout(10000));
+      }
+      if (!current() || staged.pending?.generation !== identity || staged.pending.status !== 'ready') throw new Error('The replacement generation is no longer available.');
+      const element = await preparePlayer(staged.pending, staged.pending.requested_start_ms, current, savedPreferences);
+      return {element, generation: staged.pending};
+    },
+    activate: async (id, generation, expected_active_generation) => {
+      state.stopObserving?.();
+      state.stopObserving = null;
+      await state.element?.pause();
+      if (state.viewing && state.element) {
+        const observation = state.element.player.state;
+        state.viewing.record({position_ms: Math.max(0, Math.round(observation.currentTime * 1000 + state.generation.media_time_origin_ms)),
+          status: 'paused', delivery_generation: state.generation.generation});
+        if (!await state.viewing.flush()) throw Object.assign(new Error('Save pending progress before changing playback.'), {status: 409});
+      }
+      state.stopLease?.();
+      state.stopLease = null;
+      return retryCommand(`/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/generations/${encodeURIComponent(generation)}/activate`,
+        {expected_active_generation}, key(), current);
+    },
+    reconcile: id => api('GET', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}`, undefined, undefined, AbortSignal.timeout(10000)),
+    commit: async (candidate, confirmed) => {
+      state.element = candidate.element;
+      state.generation = candidate.generation;
+      state.delivery = confirmed;
+      renewLease(confirmed, candidate.generation, current);
+      state.stopObserving = observeViewing(candidate.element, candidate.generation, state.viewing, current);
+      status('');
+    },
+    dispose: disposePlayer,
+    disruptive: async active => {
+      status('The server requires a playback interruption for this change.');
+      state.stopLease?.(); state.stopLease = null;
+      state.stopObserving?.(); state.stopObserving = null;
+      await disposePlayer(active.element);
+      state.element = null;
+    },
+    fatal: async error => { status(`Playback stopped: ${error.message}`, 'alert'); host.dataset.state = 'failed'; await close(); },
+  });
+}
+
+async function changePlayback(change) {
+  if (!state.replace || !state.element || !state.generation || state.changing) return false;
+  state.changing = true;
+  const epoch = state.epoch;
+  const current = () => epoch === state.epoch;
+  const old = {deliveryId: state.deliveryId, generation: state.generation.generation, element: state.element};
+  const playing = state.element.player.state.status === 'playing';
+  try {
+    if (state.viewing) {
+      state.viewing.record({position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms)),
+        status: playing ? 'playing' : 'paused', delivery_generation: state.generation.generation});
+      if (!await state.viewing.flush()) throw new Error('Progress is still pending; retry the playback change when connected.');
+    }
+    const changed = await state.replace(old, change);
+    if (changed && current() && playing) await state.element.play();
+    return changed;
+  } catch (error) {
+    if (!current()) return;
+    status(`Playback change failed: ${error.message}`, 'alert');
+    if (state.element === old.element) {
+      renewLease(state.delivery, state.generation, current);
+      state.stopObserving?.();
+      state.stopObserving = observeViewing(state.element, state.generation, state.viewing, current);
+      if (playing) await state.element.play();
+    }
+    return false;
+  } finally { state.changing = false; }
+}
+
 async function start() {
+  if (state.closing) await state.closing;
   const epoch = ++state.epoch;
   state.closing = null;
   const current = () => epoch === state.epoch;
   const data = host.dataset;
   host.dataset.state = 'starting';
   try {
+    const viewingRevision = data.canSaveViewing === 'true' ? await recoverViewing(data, current) : null;
+    if (!current()) return;
     status('Choosing how to play this on this device…');
-    const plan = await api('POST', '/api/v2/playback/plans', {
+    state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
-      tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: 'off', audio_track_id: null, subtitle_track_id: null},
-      quality: {mode: 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: true, hdr_policy: 'preserve_if_supported'},
+      tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: data.subtitlePolicy || 'off', audio_track_id: null, subtitle_track_id: null},
+      quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
       client: observedCapability(), failed_candidate_ids: [],
-    });
-    if (!current()) return;
-    if (plan.status !== 'ready') {
-      status(`This title cannot play here: ${plan.reason_codes.join(', ') || 'no compatible version'}.`, 'alert');
-      host.dataset.state = 'blocked';
-      return;
-    }
-    status('Starting the stream…');
-    const delivery = await api('POST', '/api/v2/playback/delivery-sessions', {plan_token: plan.plan_token, start_ms: Number(data.resumeMs) || 0}, key());
-    // Closed while admission was in flight: retire what the server created.
-    if (!current()) return retire(delivery.id);
-    state.deliveryId = delivery.id;
-    const readyDelivery = await firstGeneration(delivery, current);
-    const generation = readyDelivery?.active ?? readyDelivery?.pending;
-    if (!current()) return;
-    if (!generation || generation.transport !== 'http_range' || !generation.media_url) {
-      status('The server could not offer a stream this page can open.', 'alert');
-      host.dataset.state = 'failed';
-      return close();
-    }
-    state.stopLease = maintainLease(readyDelivery, generation.generation, {
+    };
+    const opened = await openCandidates(state.planInput, {
       current,
-      send: (id, active_generation, signal) => api('POST',
-        `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal),
-      failed: error => {
-        status(`Playback stopped: ${error.message}`, 'alert');
-        host.dataset.state = 'failed';
-        void close();
+      dispose: opened => disposePlayer(opened.element),
+      plan: body => api('POST', '/api/v2/playback/plans', body, undefined, AbortSignal.timeout(10000)),
+      admit: plan => retryCommand('/api/v2/playback/delivery-sessions',
+        {plan_token: plan.plan_token, start_ms: Number(data.resumeMs) || 0}, key(), current),
+      retire: async id => {
+        if (state.deliveryId === id) {
+          state.stopLease?.(); state.stopLease = null;
+          state.deliveryId = null;
+        }
+        await retire(id);
+      },
+      prepare: async delivery => {
+        state.deliveryId = delivery.id;
+        const readyDelivery = await firstGeneration(delivery, current);
+        const generation = readyDelivery?.active ?? readyDelivery?.pending;
+        if (!current()) throw new Error('Playback ownership changed.');
+        if (!generation || !['http_range', 'hls'].includes(generation.transport) || !(generation.media_url || generation.manifest_url)) {
+          throw new Error('The server could not offer a stream this page can open.');
+        }
+        state.delivery = readyDelivery;
+        renewLease(readyDelivery, generation, current);
+        const element = await preparePlayer(generation, Number(data.resumeMs) || 0, current);
+        if (!current()) { await disposePlayer(element); throw new Error('Playback ownership changed.'); }
+        return {delivery, generation, element};
       },
     });
-    if (!current()) return;
-    const shared = await loadDemuxe(data.demuxeBase);
-    if (!current()) return;
-    const element = document.createElement('demuxe-player');
-    if (shared) element.runtime = shared;
-    element.setAttribute('asset-base', data.demuxeBase);
-    element.setAttribute('controls', '');
-    element.showSourceControls = false;
-    element.allowFileDrop = false;
-    host.append(element);
+    if (!opened || !current()) return;
+    const {delivery, generation, element} = opened;
     state.element = element;
-    status('Opening media…');
-    const start = Math.max(0, ((Number(data.resumeMs) || 0) - generation.media_time_origin_ms) / 1000);
-    await element.open(new URL(generation.media_url, location.origin).href, {startTime: start});
-    if (!current()) return;
+    state.generation = generation;
+    if (viewingRevision !== null) {
+      const session = await retryCommand('/api/v2/playback/viewing-sessions',
+        {delivery_id: delivery.id, expected_viewing_revision: viewingRevision}, key(), current);
+      if (!current()) return;
+      if (session.delivery_id !== delivery.id || session.profile_id !== data.profileId || session.timeline_id !== data.timelineId) {
+        throw new Error('The server returned a different viewing context.');
+      }
+      state.viewingOwner = {active: true};
+      state.viewing = makeViewingWriter(session, viewingStorage(data), state.viewingOwner);
+
+    }
+    state.stopObserving = observeViewing(element, generation, state.viewing, current);
+    state.replace = makeSwitcher(current);
     status('');
     host.dataset.state = 'ready';
   } catch (error) {
@@ -249,11 +475,30 @@ async function start() {
  * Teardown. The delivery is retired first, with a keepalive request, so that
  * leaving the page releases server capacity even if player disposal stalls.
  */
-function close() {
+function close({unloading = false} = {}) {
+  // During an actual document unload, code after an await may never resume.
+  // Dispatch retirement synchronously; the durable outbox retains unsent progress.
+  if (unloading) void retire(state.deliveryId);
   state.closing ??= (async () => {
+    state.stopObserving?.();
+    state.stopObserving = null;
+    const writer = state.viewing;
+    const owner = state.viewingOwner;
+    state.viewing = null;
+    state.viewingOwner = null;
+    if (writer && state.element && state.generation) {
+      try {
+        const observation = state.element.player.state;
+        writer.record({position_ms: Math.max(0, Math.round(observation.currentTime * 1000 + state.generation.media_time_origin_ms)),
+          status: observation.status === 'ended' ? 'ended' : 'stopped', delivery_generation: state.generation.generation});
+      } catch { /* The last successfully queued observation remains durable. */ }
+    }
     state.epoch++;
     state.stopLease?.();
     state.stopLease = null;
+    // Persist first, then allow a bounded final send before retiring delivery.
+    if (writer) await Promise.race([writer.flush().catch(() => false), sleep(1500)]);
+    if (owner) owner.active = false;
     const id = state.deliveryId;
     state.deliveryId = null;
     const retiring = retire(id);
@@ -266,9 +511,50 @@ function close() {
   return state.closing;
 }
 
-addEventListener('pagehide', () => { void close(); });
+const controls = document.getElementById('motion-playback-controls');
+controls?.addEventListener('submit', event => {
+  event.preventDefault();
+  const position = Math.round(Number(controls.elements.position.value) * 1000);
+  if (!Number.isSafeInteger(position) || position < 0 || (Number(host.dataset.durationMs) > 0 && position > Number(host.dataset.durationMs))) { status('Choose a position within this title.', 'alert'); return; }
+  // Explicit logical seek uses the generation API, including range routes,
+  // so the server preserves source and generation preconditions consistently.
+  void changePlayback({kind: 'seek', position_ms: position});
+});
+controls?.addEventListener('click', event => {
+  const action = event.target?.dataset?.playerAction;
+  if (!action || !state.element) return;
+  void (async () => {
+    if (action === 'play') await state.element.play();
+    if (action === 'pause') await state.element.pause();
+    if (action === 'mute') await state.element.setMuted(!state.element.muted);
+    if (action === 'quality') {
+      const epoch = state.epoch;
+      const next = {...state.planInput, version_id: controls.elements.version.value || null, quality: {...state.planInput.quality, mode: controls.elements.quality.value}};
+      const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));
+      if (epoch !== state.epoch) return;
+      if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) throw new Error('The selected quality is unavailable.');
+      const changed = await changePlayback({kind: 'replan', plan_token: plan.plan_token,
+        position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms))});
+      if (changed) state.planInput = next;
+    }
+  })().catch(error => status(error.message, 'alert'));
+});
+
+addEventListener('pagehide', () => { void close({unloading: true}); });
+// Ordinary navigation gets the same bounded flush as explicit teardown.
+document.addEventListener('click', event => {
+  const link = event.target?.closest?.('a[href]');
+  if (!host || !link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
+    || link.target || link.hasAttribute('download') || new URL(link.href).origin !== location.origin) return;
+  event.preventDefault();
+  void close().finally(() => location.assign(link.href));
+});
 // Restored from the back/forward cache: the old player and delivery are gone.
 addEventListener('pageshow', event => { if (event.persisted && host) void start(); });
 if (host) void start();
+
+document.addEventListener('motion:prepare-close', () => {
+  void close().finally(() => document.dispatchEvent(new Event('motion:closed')));
+});
 
 export {close, maintainLease};

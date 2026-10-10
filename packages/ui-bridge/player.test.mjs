@@ -5,7 +5,7 @@ import {runInNewContext} from 'node:vm';
 
 const source = readFileSync(new URL('./player.js', import.meta.url), 'utf8');
 const maintainLease = runInNewContext(source.replace('export {close, maintainLease};', 'maintainLease;'), {
-  document: {getElementById: () => null, querySelector: () => null}, addEventListener() {}, AbortController,
+  document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, AbortController,
 });
 const delivery = (expires = 30000, extra = {}) => ({id: 'd1', status: 'ready', active: {generation: 'g1'},
   lease_expires_at: new Date(expires).toISOString(), heartbeat_interval_seconds: 5, ...extra});

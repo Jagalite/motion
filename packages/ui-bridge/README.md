@@ -31,7 +31,7 @@ The runner launches a byte-identical copy of the built proof server from the
 host temporary directory to avoid the observed macOS loader stall on the
 external checkout volume. Both SHA-256 values are checked before launch and
 recorded in the receipt. Server readiness is bounded to 30 seconds and the
-Electron run to 120 seconds; child processes are stopped on success or failure.
+Electron run to 180 seconds; child processes are stopped on success or failure.
 Temporary diagnostic artifacts are retained. These launcher mechanics belong
 to the qualification adapter and do not change application/core transitions.
 
@@ -52,18 +52,49 @@ mismatch and stale callbacks. They do not establish server conformance or replac
 Stateless checks of the server's lease policy. The Electron proof separately
 requires an actual heartbeat command with the expected delivery/generation.
 
-## Remaining A11/A12 scope
+## Playback coordination
 
-The branch has authorized mock-backed Topcoat screens and a local-origin Electron
-smoke harness. The next playback work is viewing-session admission with an
-explicit viewing revision, ordered progress with exact retries, generation
-activation/replacement, and navigation flush. The current bridge does not save
-viewing progress. Full typed playback coordination is still outstanding.
+The browser admits viewing authority with the rendered revision, queues ordered
+progress before sending, and retries the exact event identity after an uncertain
+response. Decimal sequences use BigInt. A rejected authority is archived for
+explicit reconciliation; the client does not silently acquire replacement
+writing authority. The outbox survives reloads in the same tab via sessionStorage;
+it is not a durable offline store across browser or native-window closure.
 
-Real `UiQueryFacade` integration and API/SSR parity need the backend owners'
-production interfaces. The desktop directory remains a proof harness: packaged
-trusted connection chrome, verified local attachment, server-scoped remote
-sessions, ownership-aware shutdown, and offline-host lifecycle are not implemented
-by it. Packaging, update/signing and offline cache integration require their
-respective owners and separate qualification. Passing the smoke receipt does not
-complete these plan sections.
+Candidate trials are bounded to three in automatic quality mode and one for an
+explicit mode. Every trial preserves timeline, source and track pins. Generation
+changes prepare an overlapping candidate before activation, reconcile uncertain
+activation responses, and dispose late candidates. Disruptive replacement is
+explicit. Logical seek and quality/version controls use the public change APIs.
+The player preserves volume, mute, playback rate and playing intent on replacement.
+Initial playback waits for a server-confirmed active generation.
+
+Navigation and native-shell teardown request a bounded final progress flush.
+Lease expiry and server authority remain authoritative when transport fails.
+These client lifetime, transport ordering and presentation rules live in the
+JavaScript adapter; server/core remains responsible for viewing authority,
+generation admission and activation atomicity. Tests execute the production
+coordinators with controlled event interleavings, not a duplicate domain model.
+No additional Rust core or Stateless coverage is claimed.
+
+Run all focused client tests:
+
+```sh
+node --test packages/playback/*.test.mjs packages/ui-bridge/*.test.mjs apps/desktop/test/policy.test.mjs
+```
+
+## Integration limits
+
+The Electron playback proof uses mock viewing/delivery services. It tests real
+Demuxe opening, playback, replacement and browser commands, but does not establish
+production backend correctness. HLS replacement, real conversion workers and
+cross-process offline recovery need separate qualification. The native connection
+shell and its test instructions are documented in `apps/desktop/README.md`.
+
+Real `UiQueryFacade` integration and API/SSR parity require the backend's
+production interfaces. The API branch currently lacks v2 preferences, timeline
+viewing, next/continue-watching, playback plans and viewing/delivery sessions.
+The A07 delivery implementation is still an experimental v1 surface.
+Desktop-owned startup additionally needs a protected bootstrap/readiness and
+process-ownership protocol. Offline-host integration, packaging, signing and
+updates belong to their planned integration stages and remain unqualified.

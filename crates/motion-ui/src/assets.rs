@@ -67,7 +67,17 @@ pub static PLAYER: Asset = Asset::new(
     "player",
     "js",
     "text/javascript; charset=utf-8",
-    include_bytes!("../../../packages/ui-bridge/player.js"),
+    // One prebuilt ES module: pure coordinator followed by its DOM adapter.
+    concat!(
+        include_str!("../../../packages/playback/viewing.mjs"),
+        "\n",
+        include_str!("../../../packages/playback/generation.mjs"),
+        "\n",
+        include_str!("../../../packages/playback/open.mjs"),
+        "\n",
+        include_str!("../../../packages/ui-bridge/player.js")
+    )
+    .as_bytes(),
 );
 
 /// Every embedded asset, for routing and the release inventory.

@@ -41,6 +41,10 @@ struct Sessions {
     idempotency: HashMap<String, Value>,
     /// Match revision; a decision bumps it, so a stale If-Match gets 412.
     match_revision: u64,
+    viewing: HashMap<String, Value>,
+    viewing_events: HashMap<String, (Value, Value)>,
+    delivery_timelines: HashMap<String, String>,
+    generation_deliveries: HashMap<String, Value>,
 }
 
 #[derive(Clone)]
@@ -281,10 +285,21 @@ async fn admit(
     }
     let id = format!("del{}", sessions.deliveries.len() + 1);
     sessions.deliveries.insert(id.clone(), true);
+    let timeline = body
+        .get("plan_token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_start_matches("proof-plan-")
+        .trim_end_matches("-0000000000")
+        .to_string();
+    sessions.delivery_timelines.insert(id.clone(), timeline);
     let start = body.get("start_ms").and_then(Value::as_u64).unwrap_or(0);
     // Admitted while the first generation is still starting; it becomes
     // active on the next read (exercises the bridge's wait-for-ready path).
     let delivery = delivery_json(&id, start, false);
+    sessions
+        .generation_deliveries
+        .insert(id.clone(), delivery.clone());
     sessions
         .idempotency
         .insert(key.to_string(), delivery.clone());
@@ -306,11 +321,188 @@ fn delivery_json(id: &str, start: u64, ready: bool) -> Value {
 }
 
 async fn get_delivery(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.sessions.lock().unwrap().deliveries.get(&id) {
-        Some(true) => mock(StatusCode::OK, delivery_json(&id, 0, true)),
+    let mut sessions = state.sessions.lock().unwrap();
+    match sessions.deliveries.get(&id) {
+        Some(true) => {
+            let value = sessions.generation_deliveries.get_mut(&id).unwrap();
+            if value["active"].is_null() {
+                value["active"] = value["pending"].take();
+                value["active"]["status"] = json!("active");
+                value["status"] = json!("ready");
+            }
+            mock(StatusCode::OK, value.clone())
+        }
         Some(false) => problem(StatusCode::GONE, "delivery_closed"),
         None => problem(StatusCode::NOT_FOUND, "not_found"),
     }
+}
+
+async fn change_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) else {
+        return problem(StatusCode::BAD_REQUEST, "idempotency_key_required");
+    };
+    let mut sessions = state.sessions.lock().unwrap();
+    if let Some(saved) = sessions.idempotency.get(key) {
+        return mock(StatusCode::OK, saved.clone());
+    }
+    if sessions.deliveries.get(&id) != Some(&true) {
+        return problem(StatusCode::CONFLICT, "delivery_closed");
+    }
+    let value = sessions.generation_deliveries.get_mut(&id).unwrap();
+    if value["active"]["generation"] != body["expected_generation"] {
+        return problem(StatusCode::CONFLICT, "generation_conflict");
+    }
+    let next = value["active"]["generation"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        + 1;
+    let mut pending = value["active"].clone();
+    pending["generation"] = json!(next.to_string());
+    pending["status"] = json!("ready");
+    pending["requested_start_ms"] = body["position_ms"].clone();
+    pending["media_url"] = json!(format!(
+        "/api/v2/media/files/proof/content?generation={next}"
+    ));
+    value["pending"] = pending;
+    value["replacement_mode"] = json!("overlap");
+    value["status"] = json!("transitioning");
+    let result = value.clone();
+    sessions.idempotency.insert(key.into(), result.clone());
+    println!(
+        "{}",
+        json!({"command": {"operation": "changeDelivery", "delivery": id, "body": body}})
+    );
+    mock(StatusCode::OK, result)
+}
+
+async fn activate_generation(
+    State(state): State<AppState>,
+    Path((id, generation)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) else {
+        return problem(StatusCode::BAD_REQUEST, "idempotency_key_required");
+    };
+    let mut sessions = state.sessions.lock().unwrap();
+    if let Some(saved) = sessions.idempotency.get(key) {
+        return mock(StatusCode::OK, saved.clone());
+    }
+    if sessions.deliveries.get(&id) != Some(&true) {
+        return problem(StatusCode::CONFLICT, "delivery_closed");
+    }
+    let value = sessions.generation_deliveries.get_mut(&id).unwrap();
+    if value["active"]["generation"] != body["expected_active_generation"]
+        || value["pending"]["generation"] != generation
+    {
+        return problem(StatusCode::CONFLICT, "generation_conflict");
+    }
+    value["active"] = value["pending"].take();
+    value["active"]["status"] = json!("active");
+    value["status"] = json!("ready");
+    value["replacement_mode"] = json!("none");
+    let result = value.clone();
+    sessions.idempotency.insert(key.into(), result.clone());
+    println!(
+        "{}",
+        json!({"command": {"operation": "activateGeneration", "delivery": id, "generation": generation, "body": body}})
+    );
+    mock(StatusCode::OK, result)
+}
+
+// Transport fixtures only. The static mock facade always renders viewing
+// revision 0; these endpoints do not qualify production viewing authority.
+async fn create_viewing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) else {
+        return problem(StatusCode::BAD_REQUEST, "idempotency_key_required");
+    };
+    let mut sessions = state.sessions.lock().unwrap();
+    if let Some(saved) = sessions.idempotency.get(key) {
+        return mock(StatusCode::CREATED, saved.clone());
+    }
+    if body["expected_viewing_revision"] != "0" {
+        return problem(StatusCode::CONFLICT, "viewing_revision_conflict");
+    }
+    let delivery = body["delivery_id"].as_str().unwrap_or("");
+    if sessions.deliveries.get(delivery) != Some(&true) {
+        return problem(StatusCode::CONFLICT, "delivery_closed");
+    }
+    let timeline = sessions
+        .delivery_timelines
+        .get(delivery)
+        .cloned()
+        .unwrap_or_default();
+    let id = format!("view{}", sessions.viewing.len() + 1);
+    let session = json!({"id": id, "revision": "1", "profile_id": "everyone", "timeline_id": timeline,
+        "delivery_id": delivery, "sequence": "0", "manual_epoch": "0", "position_ms": 0, "status": "paused"});
+    sessions.viewing.insert(id, session.clone());
+    sessions.idempotency.insert(key.into(), session.clone());
+    println!(
+        "{}",
+        json!({"command": {"operation": "createViewingSession", "body": body, "session": session}})
+    );
+    mock(StatusCode::CREATED, session)
+}
+
+async fn record_viewing(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let mut sessions = state.sessions.lock().unwrap();
+    let event_key = format!("{}:{}", id, body["event_id"].as_str().unwrap_or(""));
+    if let Some((original, ack)) = sessions.viewing_events.get(&event_key) {
+        return if original == &body {
+            mock(StatusCode::OK, ack.clone())
+        } else {
+            problem(StatusCode::CONFLICT, "event_identity_conflict")
+        };
+    }
+    let active_generation = sessions
+        .viewing
+        .get(&id)
+        .and_then(|v| v["delivery_id"].as_str())
+        .and_then(|delivery| sessions.generation_deliveries.get(delivery))
+        .map(|v| v["active"]["generation"].clone())
+        .unwrap_or(Value::Null);
+    let Some(session) = sessions.viewing.get_mut(&id) else {
+        return problem(StatusCode::NOT_FOUND, "not_found");
+    };
+    let expected = session["sequence"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        + 1;
+    if body["sequence"] != expected.to_string() || body["delivery_generation"] != active_generation
+    {
+        return problem(StatusCode::CONFLICT, "event_sequence_conflict");
+    }
+    session["sequence"] = body["sequence"].clone();
+    session["position_ms"] = body["position_ms"].clone();
+    session["status"] = body["status"].clone();
+    let ack = json!({"session": session.clone(), "viewing": {"profile_id": "everyone", "timeline_id": session["timeline_id"],
+        "revision": "0", "manual_epoch": "0", "position_ms": body["position_ms"], "watched": false,
+        "manual_watched": null, "session_id": id}, "duplicate": false});
+    sessions
+        .viewing_events
+        .insert(event_key, (body.clone(), ack.clone()));
+    println!(
+        "{}",
+        json!({"command": {"operation": "recordViewingEvent", "session": id, "body": body}})
+    );
+    mock(StatusCode::OK, ack)
 }
 
 async fn heartbeat_delivery(
@@ -318,16 +510,18 @@ async fn heartbeat_delivery(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    if body != json!({"active_generation": "1"}) {
-        return problem(StatusCode::CONFLICT, "generation_conflict");
-    }
-    match state.sessions.lock().unwrap().deliveries.get(&id) {
+    let sessions = state.sessions.lock().unwrap();
+    match sessions.deliveries.get(&id) {
         Some(true) => {
+            let value = sessions.generation_deliveries.get(&id).unwrap();
+            if body["active_generation"] != value["active"]["generation"] {
+                return problem(StatusCode::CONFLICT, "generation_conflict");
+            }
             println!(
                 "{}",
                 json!({"command": {"operation": "heartbeatDelivery", "delivery": id, "body": body}})
             );
-            mock(StatusCode::OK, delivery_json(&id, 0, true))
+            mock(StatusCode::OK, value.clone())
         }
         Some(false) => problem(StatusCode::GONE, "delivery_closed"),
         None => problem(StatusCode::NOT_FOUND, "not_found"),
@@ -406,6 +600,11 @@ async fn main() {
             axum::routing::put(decide_match),
         )
         .route("/api/v2/playback/plans", post(plan))
+        .route("/api/v2/playback/viewing-sessions", post(create_viewing))
+        .route(
+            "/api/v2/playback/viewing-sessions/{id}/events",
+            post(record_viewing),
+        )
         .route("/api/v2/playback/delivery-sessions", post(admit))
         .route(
             "/api/v2/playback/delivery-sessions/{id}",
@@ -414,6 +613,14 @@ async fn main() {
         .route(
             "/api/v2/playback/delivery-sessions/{id}/heartbeat",
             post(heartbeat_delivery),
+        )
+        .route(
+            "/api/v2/playback/delivery-sessions/{id}/changes",
+            post(change_delivery),
+        )
+        .route(
+            "/api/v2/playback/delivery-sessions/{id}/generations/{generation}/activate",
+            post(activate_generation),
         )
         .route("/api/v2/media/files/proof/content", get(serve_media))
         .with_state(state.clone());
