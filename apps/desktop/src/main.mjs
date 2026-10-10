@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {join, resolve} from 'node:path';
 import {createOwnedServer} from './owned.mjs';
 import {createOutboxStore} from './outbox.mjs';
+import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities} from './policy.mjs';
 
 const chromeUrl = new URL('./chrome.html', import.meta.url).href;
@@ -131,6 +132,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
     await view.webContents.loadURL(selected.origin);
     await view.webContents.executeJavaScript(`Object.entries(${JSON.stringify(pending)}).forEach(([key, value]) => localStorage.setItem(key, value))`);
     outboxContext = history;
+    if (!current()) throw new Error('Connection changed');
     window.contentView.addChildView(view);
     resize();
     if (!current()) throw new Error('Connection changed');
@@ -183,14 +185,15 @@ else {
     window.webContents.on('will-navigate', event => event.preventDefault());
     window.webContents.on('will-attach-webview', event => event.preventDefault());
     window.on('resize', resize);
-    let closing = false;
-    window.on('close', event => {
-      if (closing) return;
-      event.preventDefault();
-      closing = true;
-      const stopped = ownedServer && !ownedServer.ready ? ownedServer.stop() : null;
-      void disconnect().then(() => stopped ?? ownedServer?.stop()).then(() => window?.close()).catch(error => { closing = false; window?.webContents.send('motion:status', error.message); });
-    });
+    window.on('close', closeGate({
+      prepare: async () => {
+        const stopped = ownedServer && !ownedServer.ready ? ownedServer.stop() : null;
+        await disconnect();
+        await (stopped ?? ownedServer?.stop());
+      },
+      finish: () => window?.close(),
+      failed: error => window?.webContents.send('motion:status', error.message),
+    }));
     window.on('closed', () => { window = null; });
     ipcMain.handle('motion:connect', (event, input) => { authorize(event); return connect(input); });
     ipcMain.handle('motion:disconnect', event => { authorize(event); return disconnect(); });
@@ -205,10 +208,8 @@ else {
           contractDigest,
         });
         if (ownedServer.running) throw new Error('The local server is already running. Disconnecting does not stop it; use Stop local server before restarting.');
-        const local = await ownedServer.start();
-        if (owner !== epoch) throw new Error('Local connection cancelled');
-        try { return await connectOwned({...local, expectedEpoch: local.serverEpoch, remember: false}, owner, true); }
-        catch (error) { await ownedServer.stop(); throw error; }
+        return attachOwnedServer(ownedServer, () => owner === epoch,
+          local => connectOwned({...local, expectedEpoch: local.serverEpoch, remember: false}, owner, true));
       });
     });
     ipcMain.handle('motion:stop-local', event => {
@@ -218,13 +219,15 @@ else {
     });
     await window.loadURL(chromeUrl);
   }).catch(error => { console.error('Desktop startup failed:', error.message); app.exit(1); });
-  let quitting = false;
-  app.on('before-quit', event => {
-    if (quitting || !ownedServer?.running) return;
-    event.preventDefault();
-    quitting = true;
-    const stopped = !ownedServer.ready ? ownedServer.stop() : null;
-    void disconnect().then(() => stopped ?? ownedServer.stop()).then(() => app.quit()).catch(error => { quitting = false; window?.webContents.send('motion:status', error.message); });
+  const quit = closeGate({
+    prepare: async () => {
+      const stopped = ownedServer && !ownedServer.ready ? ownedServer.stop() : null;
+      await disconnect();
+      await (stopped ?? ownedServer?.stop());
+    },
+    finish: () => app.quit(),
+    failed: error => window?.webContents.send('motion:status', error.message),
   });
+  app.on('before-quit', quit);
   app.on('window-all-closed', () => { void ownedServer?.stop().finally(() => app.quit()); if (!ownedServer) app.quit(); });
 }

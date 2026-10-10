@@ -78,14 +78,30 @@ local evidence and are not shipped product dependencies.
 
 ## Latest local verification
 
-Current source has passed 47 focused JavaScript tests, 23 real access/API
+Current source has passed 52 focused JavaScript tests, 23 real access/API
 integration tests, 16 presentation composition tests and four production facade/asset-verification unit tests. Earlier in this run,
 all 9 catalog persistence and 14 catalog workflow tests passed after integrating
 schema migrations 0015/0016. The real owned-server receipt records four passing
-bootstrap/locking/restart checks. The latest native run timed out before its first checkpoint; its receipt is
-failed. The latest playback attempt also timed out at 180 seconds before any
+bootstrap/locking/restart checks. The follow-up native run reached app readiness but timed out before connection
+checks completed; its receipt is failed. The latest playback attempt also timed out at 180 seconds before any
 observations (see latest-player-attempt.json); the older passing playback receipt
 does not qualify current source. Staging the pinned Electron runtime internally
 then failed with ENOSPC. The failed temporary runtime copy was removed; no user
 files were deleted. Rust formatting, JavaScript syntax and diff checks passed.
 No full A11/A12 completion is claimed.
+
+## Follow-up lifecycle review
+
+Repeated close/quit requests now remain blocked until persistence and owned-child
+shutdown succeed. Failure returns the gate to a retryable state; it never grants
+permission to close. A startup result superseded before attachment is stopped,
+and a superseded view is checked before it is attached. Disconnect persistence
+errors appear in trusted chrome and leave its control retryable.
+
+Five regression tests execute the production lifecycle adapter and chrome code,
+covering duplicate close, save failure/retry, cancellation after readiness,
+attachment failure/success, and disconnect error reporting. These rules concern
+Electron process/window ownership and remain in the native JavaScript adapter;
+server authorization and viewing ordering remain production core/API rules.
+The 52-test JavaScript suite and syntax/diff checks pass. Native GUI qualification
+remains separately gated; unit tests do not establish actual Electron event order.
