@@ -335,7 +335,7 @@ pub async fn members(db: &SqlitePool, profile: &str, id: &str) -> Result<Vec<Str
 
 async fn valid_timelines(conn: &mut SqliteConnection, entries: &[Entry]) -> Result<(), OrgError> {
     for entry in entries {
-        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM editions WHERE id=?")
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM timelines WHERE id=?")
             .bind(&entry.timeline_id)
             .fetch_one(&mut *conn)
             .await?;

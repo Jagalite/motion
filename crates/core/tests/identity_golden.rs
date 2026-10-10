@@ -175,3 +175,154 @@ fn external_namespaces_separate_movies_and_television() {
     assert_eq!(external_namespace("tmdb", "unclassified"), None);
     assert_eq!(external_namespace("", "movie"), None);
 }
+
+#[test]
+fn availability_is_derived_from_reviewed_content() {
+    use playscale_core::identity::{
+        Availability, Occurrence, Origin, Version, confirm_replacement, version_availability,
+    };
+    let bound = Binding {
+        file_id: "f".into(),
+        revision: "a".into(),
+        part: 1,
+        start_ms: None,
+        end_ms: None,
+    };
+    let occ = |file: &str, revision: &str, available| Occurrence {
+        file_id: file.into(),
+        revision: revision.into(),
+        available,
+    };
+    let b = std::slice::from_ref(&bound);
+    let reviewed = |r: &str| std::collections::BTreeMap::from([(1u32, r.to_string())]);
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", true)]),
+        Availability::Available
+    );
+    // The bound file is gone but a verified copy remains.
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", false), occ("copy", "a", true)]),
+        Availability::Available
+    );
+    assert_eq!(
+        version_availability(b, &[occ("f", "a", false)]),
+        Availability::Unavailable
+    );
+    // Replaced in place: stale until confirmed, never silently re-pinned.
+    let replaced = [occ("f", "b", true)];
+    assert_eq!(version_availability(b, &replaced), Availability::Stale);
+    let version = Version {
+        id: "v".into(),
+        origin: Origin::Original,
+        equivalence: Equivalence::Unknown,
+        bindings: vec![bound.clone()],
+    };
+    assert_eq!(
+        confirm_replacement(&version, 3, 2, &reviewed("b"), &replaced),
+        Err(IdentityError::StaleRevision("v".into()))
+    );
+    // The operator reviewed "b" but the file now holds "c": rejected.
+    assert_eq!(
+        confirm_replacement(&version, 3, 3, &reviewed("b"), &[occ("f", "c", true)]),
+        Err(IdentityError::ReviewedContentChanged("f".into()))
+    );
+    let (confirmed, revision) =
+        confirm_replacement(&version, 3, 3, &reviewed("b"), &replaced).unwrap();
+    assert_eq!(
+        (confirmed.bindings[0].revision.as_str(), revision),
+        ("b", 4)
+    );
+    assert_eq!(confirmed.equivalence, Equivalence::Declared);
+    assert_eq!(
+        version_availability(&confirmed.bindings, &replaced),
+        Availability::Available
+    );
+    assert!(confirm_replacement(&version, 3, 3, &reviewed("a"), &[occ("f", "a", true)]).is_err());
+}
+
+#[test]
+fn splits_reassignments_and_renditions_respect_reviewed_content() {
+    use playscale_core::identity::{
+        PinnedSource, ReassignFacts, Reassignment, RenditionPlacement, Version, reassignment,
+        rendition_placement,
+    };
+    // Two episodes bind disjoint intervals of one file; splitting one away
+    // would put the file in two works.
+    let part = |file: &str, start, end| Binding {
+        file_id: file.into(),
+        revision: "r".into(),
+        part: 1,
+        start_ms: Some(start),
+        end_ms: Some(end),
+    };
+    let version = |id: &str, b: Binding| Version {
+        id: id.into(),
+        origin: playscale_core::identity::Origin::Original,
+        equivalence: Equivalence::Declared,
+        bindings: vec![b],
+    };
+    let mut f = fixtures();
+    let film = f.works.get_mut("film").unwrap();
+    film.editions[0].timelines.push(Timeline {
+        id: "ep2".into(),
+        versions: vec![version("ep2-v", part("shared", 1000, 2000))],
+    });
+    film.editions[0].timelines[0].versions[0] = version("bluray-1080", part("shared", 0, 1000));
+    let mut n = 0;
+    let mut ids = || {
+        n += 1;
+        format!("id-{n}")
+    };
+    assert_eq!(
+        plan_split(
+            &f.works["film"],
+            &SplitRequest {
+                item: "film".into(),
+                versions: vec!["ep2-v".into()],
+                new_title: "Episode 2".into(),
+                expected_revision: 3,
+            },
+            &mut ids,
+        ),
+        Err(IdentityError::SharedFileSplit("shared".into()))
+    );
+    let facts = |bound: Option<(&str, usize)>, copy| ReassignFacts {
+        bound: bound.map(|(v, n)| (v.to_string(), n)),
+        pinned_copy_remains: copy,
+    };
+    assert_eq!(
+        reassignment(&facts(None, false)),
+        Ok(Reassignment::DeclareNew)
+    );
+    assert_eq!(
+        reassignment(&facts(Some(("v", 2)), true)),
+        Ok(Reassignment::RebindToCopyAndDeclareNew {
+            version: "v".into()
+        })
+    );
+    assert_eq!(
+        reassignment(&facts(Some(("v", 1)), false)),
+        Ok(Reassignment::MoveVersion {
+            version: "v".into()
+        })
+    );
+    assert!(reassignment(&facts(Some(("v", 2)), false)).is_err());
+    let pinned = |timeline: &str, parts, interval| PinnedSource {
+        timeline: timeline.into(),
+        parts,
+        interval,
+    };
+    assert_eq!(rendition_placement(&[]), RenditionPlacement::OwnTimeline);
+    assert_eq!(
+        rendition_placement(&[pinned("t", 1, false)]),
+        RenditionPlacement::Join {
+            timeline: "t".into()
+        }
+    );
+    // One part of a multipart version, or an episode interval of a shared
+    // file, does not represent the whole timeline.
+    assert_eq!(
+        rendition_placement(&[pinned("multi", 2, false), pinned("episode", 1, true)]),
+        RenditionPlacement::OwnTimeline
+    );
+}
