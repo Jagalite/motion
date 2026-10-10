@@ -1,5 +1,78 @@
 # Core validation
 
+## Release CI: contract, integration, package, upgrade and restore — 2026-10-10
+
+Main's only workflow (Dependency notices) had failed on every push since PR #1:
+`scripts/check_publication.py` rejected GitHub web-merge identities on two
+already-pushed commits. Those commits are now exempted by hash and role in
+`scripts/publication_history_exceptions.txt` (shared history is not rewritten);
+GitHub's web-flow identity is accepted only as committer, and the check reads the
+history reachable from HEAD with full-depth checkouts. Seven disposable-repository
+tests cover it.
+
+`.github/workflows/ci.yml` now runs on pushes and pull requests:
+
+| Job | Command(s) |
+|---|---|
+| rust | `cargo fmt --all --check`; `cargo clippy --locked --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::result_large_err`; `cargo test --locked --workspace --no-fail-fast` |
+| contract | `scripts/check_contract.py` (pinned `scripts/ci/contract-requirements.txt`, Python 3.13); `ruby scripts/contract_json.rb --check` |
+| integration | `python3 scripts/integration_checks.py --work artifacts/integration`; `python3 scripts/upgrade_restore_check.py --work artifacts/upgrade-restore` |
+| package | `package.yml` via `workflow_call` (build, then `scripts/test_package.py` on the extracted archive) |
+
+The two allowed clippy lints have no other hits: `src/delivery.rs` (541, 564,
+871) and `src/processing.rs` (466). They fire identically on the pinned 1.98.0
+toolchain and remain for their owners. One test-only clippy finding was fixed
+by renaming a Stateless model input (`Commit::CommittedThenCrashed`); the
+model's transitions, inputs and properties are unchanged.
+
+Contract: YAML without duplicate keys, exact JSON parity, 2,566 local references
+resolving (RFC 6901 fragments), OpenAPI 3.1 validation: 97 paths, 146
+operations, 148 schemas. `tests/contract.rs` checks the production v2 router:
+every `.route(` template under `src/v2` (comments and all string forms
+lexed) is a contract path; every contract operation has an operationId and
+owner/milestone/status; and the methods each path registers, read from the
+`Allow` header of axum's 405 method fallback, equal
+`contracts/served_operations.txt` — 82 of 146 operations today. It checks
+routing, not payload shapes. Limitation: an explicit HEAD handler on a path
+whose contract has GET but not HEAD is indistinguishable from axum's implicit
+HEAD.
+
+Upgrade/restore: the released baseline `52491bf` (schema 9) is built with its
+pinned 1.95.0 toolchain into `artifacts/baseline-server`. It writes a catalog,
+curated title and progress for generated media; its own backup tool takes an
+operator backup. The candidate then opens that directory in place in default
+restricted mode. Verified: exactly one verified pre-upgrade backup named
+9→latest; identical item, file and library identities, media bytes, title and
+position; the full on-disk migration set; integrity_check ok and no foreign-key
+violations; one schema receipt and one exact legacy-progress attribution to
+the fixture's single timeline; anonymous legacy reads refused (401). A restart
+adds no backup and leaves receipt and attribution identities unchanged. The
+baseline refuses the upgraded database with sqlx's "migration 10 was
+previously applied but is missing" and the database stays usable. Rollback:
+the baseline serves the original data from the operator backup (restored by
+the candidate's tool) and from the automatic pre-upgrade copy. The candidate's
+backup of upgraded data restores to a new directory, serves the same data and
+rotates the restore epoch.
+
+Integration: 13 checks (HTTP smoke, operations, catalog, viewing, processing
+with FFmpeg, reliability, video profiles, backup and packaging tool tests, four
+browser-module Node tests). Each runs in its own session, with its servers and
+encoders terminated afterwards and leaked processes counted as failures.
+`scripts/test_demuxe_bundle.mjs` needs an installed Demuxe bundle and is not
+run.
+
+Local evidence (Apple silicon, macOS 26; shared and heavily loaded host; Rust
+via the kyoto queue with rustup's pinned toolchains, because Homebrew's cargo
+1.99 earlier on PATH ignores `rust-toolchain.toml`): see the PR description
+for exact results. These checks have not yet run on GitHub-hosted runners.
+
+Correctness boundary: no production state, transition or adapter behavior
+changed. Upgrade ordering (verified backup before migration, refusal of unknown
+schema, receipts recorded once, restore-epoch rotation) stays in `src/db.rs`,
+`src/upgrade.rs` and `scripts/backup.py`; these checks exercise it end to end
+against a real released database rather than re-implementing it.
+
+
 ## Motion macOS arm64 package — 2026-10-08
 
 Built `artifacts/motion-release/Motion-macos-arm64.tar.gz`, SHA-256

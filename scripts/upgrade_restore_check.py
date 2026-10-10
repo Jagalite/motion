@@ -107,7 +107,11 @@ class Server:
             wait_for(lambda: self.process.poll() is not None or request(self.port, 'GET', '/health')[0] == 200, 60)
             assert self.process.poll() is None, f'server exited with {self.process.returncode}; see {self.log}'
         except BaseException:
-            self.__exit__(None, None, None)
+            # Keep the startup failure as the reported error: a server that is
+            # still starting may not handle SIGINT, so do not assert its exit.
+            self.process.kill()
+            self.process.wait()
+            self.stream.close()
             raise
         return self
 
