@@ -3,9 +3,9 @@
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
   "passed": true,
-  "recorded_at": "2026-10-10T00:17:51.592Z",
-  "motion_commit": "6ab3fa4e56eb61ba8861055f1a09def09a908feb",
-  "worktree_dirty": false,
+  "recorded_at": "2026-10-10T01:00:17.797Z",
+  "motion_commit": "7072d6e9bde637eaf1a460e043494c0bc2356143",
+  "worktree_dirty": true,
   "environment": {
     "electron": "44.7.0",
     "chromium": "152.0.7977.130",
@@ -18,7 +18,12 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "f7a6bd169effffeba913ed77a84c1838910c488484348204844f7898ce873e31",
+  "proof_server_sha256": "e2fe385eaf0f0d58bd57e340c8f96c67311197f64c1811b91264df86413b72bd",
+  "proof_server_launch": {
+    "location": "host-temporary-directory",
+    "sha256": "e2fe385eaf0f0d58bd57e340c8f96c67311197f64c1811b91264df86413b72bd",
+    "matches_build": true
+  },
   "rust_toolchain": "1.98.0",
   "origin": "single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media",
   "demuxe": {
@@ -76,12 +81,12 @@
     },
     "playback": {
       "played": true,
-      "before": 2.673889,
-      "afterSeek": 7.004421,
-      "seekElapsedMs": 63,
+      "before": 2.614616,
+      "afterSeek": 7.001384,
+      "seekElapsedMs": 40,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.752026,
+      "finalTime": 7.754786,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -96,8 +101,8 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.003284,
-      "now": 1.017678
+      "start": 0.00385,
+      "now": 1.022536
     },
     "afterScanTitle": "Sources and scans",
     "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again."
@@ -116,7 +121,7 @@
         "mode": "incremental",
         "require_complete": false
       },
-      "key": "baf34930bfe140c4831dc11b0e9d1fdf",
+      "key": "f1124591e9074089b0c42474ebb35c91",
       "library": "lib1",
       "operation": "createScan",
       "replay": false

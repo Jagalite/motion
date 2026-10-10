@@ -31,6 +31,13 @@ const demuxeMismatches = Object.entries(installReceipt.files ?? {})
   .map(([file]) => file);
 
 const work = await mkdtemp(join(tmpdir(), 'motion-desktop-proof-'));
+// Launch identical bytes from the host temporary volume: macOS can stall in
+// its loader when Node launches a freshly built executable on an external disk.
+const launchServer = join(work, 'proof_server');
+// Write bytes into a new file instead of cloning source filesystem metadata.
+writeFileSync(launchServer, readFileSync(server), {mode: 0o700, flag: 'wx'});
+const launchServerSha = sha256(readFileSync(launchServer));
+if (launchServerSha !== serverSha) throw new Error('Temporary proof server differs from the built executable');
 const media = join(work, 'sample.mp4');
 // 12 s H.264 High/AAC-LC SDR, faststart, generated locally (no third-party media).
 execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=24:duration=12',
@@ -38,40 +45,64 @@ execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i
   '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', '-shortest', media]);
 const mediaSha = createHash('sha256').update(readFileSync(media)).digest('hex');
 
-const child = spawn(server, ['--media', media, '--demuxe-dir', demuxe], {stdio: ['ignore', 'pipe', 'inherit']});
 const requests = [];
 const admitted = [];
 const commands = [];
 const closed = [];
-const lines = createInterface({input: child.stdout});
-const announced = await new Promise((resolve, reject) => {
-  lines.on('line', line => {
-    const message = JSON.parse(line);
-    if (message.listening) resolve(message);
-    else if (message.request) requests.push(message.request);
-    else if (message.delivery_admitted) admitted.push(message.delivery_admitted);
-    else if (message.delivery_closed) closed.push(message.delivery_closed);
-    else if (message.command) commands.push(message.command);
-  });
-  child.once('exit', code => reject(new Error(`proof server exited ${code}`)));
-});
-
 const output = join(work, 'observed.json');
-// A parent that is itself an Electron app may export ELECTRON_RUN_AS_NODE,
-// which would run this proof as plain Node instead of Electron.
-const electronEnv = {...process.env};
-delete electronEnv.ELECTRON_RUN_AS_NODE;
-await new Promise((resolve, reject) => {
-  const proc = spawn(electron, [fileURLToPath(new URL('./main.mjs', import.meta.url))], {
-    stdio: 'inherit',
-    // The bootstrap travels over this private environment of a child process the launcher owns;
-    // the packaged host will use an inherited pipe (plan 12.2).
-    env: {...electronEnv, MOTION_PROOF_ORIGIN: announced.listening, MOTION_PROOF_BOOTSTRAP: announced.bootstrap, MOTION_PROOF_OUT: output},
+let child;
+let electronChild;
+let lines;
+async function stop(proc) {
+  if (!proc?.pid || proc.exitCode !== null || proc.signalCode !== null) return;
+  await new Promise(resolve => {
+    const timer = setTimeout(() => proc.kill('SIGKILL'), 2000);
+    proc.once('exit', () => { clearTimeout(timer); resolve(); });
+    proc.kill('SIGTERM');
   });
-  proc.once('exit', code => (code === 0 ? resolve() : reject(new Error(`electron exited ${code}`))));
-});
-await new Promise(r => setTimeout(r, 300));
-child.kill('SIGTERM');
+}
+try {
+  child = spawn(launchServer, ['--media', media, '--demuxe-dir', demuxe], {stdio: ['ignore', 'pipe', 'inherit']});
+  lines = createInterface({input: child.stdout});
+  const announced = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Proof server did not announce readiness within 30 seconds')), 30000);
+    const fail = error => { clearTimeout(timer); reject(error); };
+    lines.on('line', line => {
+      let message;
+      try { message = JSON.parse(line); } catch { fail(new Error('Invalid proof server protocol output')); return; }
+      if (message.listening) { clearTimeout(timer); resolve(message); }
+      else if (message.request) requests.push(message.request);
+      else if (message.delivery_admitted) admitted.push(message.delivery_admitted);
+      else if (message.delivery_closed) closed.push(message.delivery_closed);
+      else if (message.command) commands.push(message.command);
+    });
+    child.once('error', fail);
+    child.once('exit', code => fail(new Error(`proof server exited ${code}`)));
+  });
+  console.log('Proof server ready; launching Electron');
+
+  // A parent Electron app may export this flag, causing plain Node execution.
+  const electronEnv = {...process.env};
+  delete electronEnv.ELECTRON_RUN_AS_NODE;
+  await new Promise((resolve, reject) => {
+    electronChild = spawn(electron, [fileURLToPath(new URL('./main.mjs', import.meta.url))], {
+      stdio: 'inherit',
+      // Private child environment for this proof; packaged host will use a pipe.
+      env: {...electronEnv, MOTION_PROOF_ORIGIN: announced.listening, MOTION_PROOF_BOOTSTRAP: announced.bootstrap, MOTION_PROOF_OUT: output},
+    });
+    const timer = setTimeout(() => reject(new Error('Electron proof exceeded 120 seconds')), 120000);
+    electronChild.once('error', error => { clearTimeout(timer); reject(error); });
+    electronChild.once('exit', code => {
+      clearTimeout(timer);
+      code === 0 ? resolve() : reject(new Error(`electron exited ${code}`));
+    });
+  });
+  await new Promise(r => setTimeout(r, 300));
+} finally {
+  await stop(electronChild);
+  await stop(child);
+  lines?.close();
+}
 
 const observed = JSON.parse(readFileSync(output, 'utf8'));
 const c = observed.checks;
@@ -117,6 +148,7 @@ const receipt = {
   environment: {electron: observed.electron, chromium: observed.chromium, node: observed.node, os: `${process.platform} ${release()}`, arch: observed.arch},
   topcoat: topcoatSource ? {version: topcoatSource[1], source: topcoatSource[2], features: 'router, view, tower, discover (no runtime)'} : null,
   proof_server_sha256: serverSha,
+  proof_server_launch: {location: 'host-temporary-directory', sha256: launchServerSha, matches_build: launchServerSha === serverSha},
   rust_toolchain: '1.98.0',
   origin: 'single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media',
   demuxe: {name: demuxePkg.name, version: demuxePkg.version, archive_sha256: demuxeInstall.archive_sha256 ?? null,

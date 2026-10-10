@@ -345,26 +345,35 @@ impl UiQueryFacade for MockUiQueryFacade {
             if !who.can("catalog:write") {
                 return Err(UiError::Denied);
             }
-            Ok(vec![MatchRow {
-                id: "m1".into(),
-                subject: "Harbour Lights".into(),
-                status: "review".into(),
-                etag: "\"r1\"".into(),
-                candidates: vec![
-                    MatchCandidateView {
-                        id: "mc1".into(),
-                        title: "Harbour Lights (1998)".into(),
-                        confidence_percent: Some(62),
-                        reasons: vec!["title".into(), "year".into()],
-                    },
-                    MatchCandidateView {
-                        id: "mc2".into(),
-                        title: "Harbour Lights (2017)".into(),
-                        confidence_percent: Some(55),
-                        reasons: vec!["title".into()],
-                    },
-                ],
-            }])
+            Ok(vec![
+                MatchRow {
+                    id: "m2".into(),
+                    subject: "Untitled home video".into(),
+                    status: "review".into(),
+                    etag: "\"r4\"".into(),
+                    candidates: vec![],
+                },
+                MatchRow {
+                    id: "m1".into(),
+                    subject: "Harbour Lights".into(),
+                    status: "review".into(),
+                    etag: "\"r1\"".into(),
+                    candidates: vec![
+                        MatchCandidateView {
+                            id: "mc1".into(),
+                            title: "Harbour Lights (1998)".into(),
+                            confidence_percent: Some(62),
+                            reasons: vec!["title".into(), "year".into()],
+                        },
+                        MatchCandidateView {
+                            id: "mc2".into(),
+                            title: "Harbour Lights (2017)".into(),
+                            confidence_percent: Some(55),
+                            reasons: vec!["title".into()],
+                        },
+                    ],
+                },
+            ])
         })
     }
 

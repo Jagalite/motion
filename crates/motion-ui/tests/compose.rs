@@ -426,3 +426,23 @@ async fn sign_in_offers_pairing_and_profiles_switch_among_allowed_profiles() {
     assert!(html.contains(r#"<option value="kids" selected="">Kids</option>"#));
     assert!(html.contains(r#"<option value="everyone">Everyone</option>"#));
 }
+
+#[tokio::test]
+async fn command_bodies_satisfy_required_contract_fields() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, sources) = get_page(&admin, "/sources").await;
+    // LibraryInput.source_ids is required even when no source is checked.
+    assert!(
+        sources.contains(r#"<input type="hidden" name="source_ids" data-type="json" value="[]">"#)
+    );
+    let (_, _, profiles) = get_page(&admin, "/profiles").await;
+    // Preferences.completion_percent is required (50..=100); the input cannot be left empty.
+    assert!(profiles.contains(r#"name="completion_percent" data-type="number" required="""#));
+    let (_, _, matches) = get_page(&admin, "/matches").await;
+    // A match without candidates cannot be accepted, but can be rejected or deferred.
+    let m2 = &matches
+        [matches.find(r#"id="match-m2""#).unwrap()..matches.find(r#"id="match-m1""#).unwrap()];
+    assert!(m2.contains("No candidates were proposed."));
+    assert!(!m2.contains(r#"value="accept""#));
+    assert!(m2.contains(r#"value="reject""#) && m2.contains(r#"value="defer""#));
+}

@@ -138,7 +138,7 @@ pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
             <label><input type="checkbox" name="autoplay" data-type=(kind(Field::Bool)) checked=(prefs.autoplay)>
                 " Play the next episode automatically"</label>
             <label>"Count as watched at "
-                <input type="number" name="completion_percent" data-type=(kind(Field::Number)) min="50" max="100" value=(prefs.completion_percent)>"%"
+                <input type="number" name="completion_percent" data-type=(kind(Field::Number)) required=(true) min="50" max="100" value=(prefs.completion_percent)>"%"
             </label>
         )
     })
@@ -221,6 +221,8 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                     </select>
                 </label>
                 <input type="hidden" name="language" data-type=(kind(Field::Text)) value="en">
+                // Always present (possibly empty) as LibraryInput requires; checked sources are appended.
+                <input type="hidden" name="source_ids" data-type=(kind(Field::Json)) value="[]">
                 <fieldset><legend>"Sources"</legend>
                     for (id, name) in source_options {
                         <label><input type="checkbox" name="source_ids" value=(id.as_str()) data-type=(kind(Field::Member))>" " (name.as_str())</label>
@@ -275,7 +277,10 @@ pub(crate) async fn matches(cx: &Cx) -> Result<impl View> {
             for row in rows {
                 <section class="match" aria-labelledby=(format!("match-{}", row.id))>
                     <h2 id=(format!("match-{}", row.id))>(row.subject.as_str()) <span class="muted small">" · " (row.status.as_str())</span></h2>
-                    if row.status == "review" || row.status == "pending" || row.status == "deferred" {
+                    if (row.status == "review" || row.status == "pending" || row.status == "deferred") && row.candidates.is_empty() {
+                        <p class="muted">"No candidates were proposed."</p>
+                    }
+                    if (row.status == "review" || row.status == "pending" || row.status == "deferred") && !row.candidates.is_empty() {
                         command_form(command: format!("PUT /api/v2/catalog/matches/{}/decision", row.id), label: "Accept selected", if_match: Some(row.etag.clone()),
                             <input type="hidden" name="decision" data-type=(kind(Field::Text)) value="accept">
                             <fieldset><legend>"Candidates"</legend>
@@ -289,6 +294,8 @@ pub(crate) async fn matches(cx: &Cx) -> Result<impl View> {
                                 }
                             </fieldset>
                         )
+                    }
+                    if row.status == "review" || row.status == "pending" || row.status == "deferred" {
                         command_form(command: format!("PUT /api/v2/catalog/matches/{}/decision", row.id), label: "None of these", if_match: Some(row.etag.clone()), class: Some("command inline"),
                             <input type="hidden" name="decision" data-type=(kind(Field::Text)) value="reject">
                             <input type="hidden" name="candidate_id" data-type=(kind(Field::Json)) value="null">

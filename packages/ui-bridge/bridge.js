@@ -67,38 +67,71 @@ function message(error) {
   return error.message;
 }
 
-// Idempotency keys survive retries of the same body until an outcome is known.
-const pendingKeys = new WeakMap();
+// Idempotency keys survive retries of the same request until its outcome is
+// known: one key per (operation, body), kept across edits and page reloads in
+// this tab, dropped only on success or a definite rejection.
+const keyStore = 'motion:pending-idempotency-keys';
+function pendingKeys() {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(keyStore) ?? '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+function savePendingKeys(keys) {
+  try { sessionStorage.setItem(keyStore, JSON.stringify(keys)); } catch { /* storage unavailable: keys live for this page only */ }
+}
+const memoryKeys = {};
+function keyFor(identity) {
+  const stored = pendingKeys();
+  const saved = stored[identity];
+  const key = (typeof saved === 'string' && /^[0-9a-f]{32}$/.test(saved) ? saved : null) ?? memoryKeys[identity] ?? newKey();
+  memoryKeys[identity] = key;
+  savePendingKeys({...stored, [identity]: key});
+  return key;
+}
+function settleKey(identity) {
+  delete memoryKeys[identity];
+  const stored = pendingKeys();
+  delete stored[identity];
+  savePendingKeys(stored);
+}
 
+/** True only when the server definitely did not apply the request. */
+function definitelyRejected(error) {
+  return Boolean(error.status) && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
+}
+
+const submitting = new WeakSet();
 async function submitCommand(form) {
+  if (submitting.has(form)) return;
+  submitting.add(form);
   const [method, path] = form.dataset.command.split(' ');
   const status = form.querySelector('.command-status');
   const button = form.querySelector('button[type="submit"]');
-  const body = bodyOf(form);
-  const signature = JSON.stringify(body ?? null);
-  const headers = {};
-  if (form.dataset.idempotent === 'true') {
-    const saved = pendingKeys.get(form);
-    const key = saved?.signature === signature ? saved.key : newKey();
-    pendingKeys.set(form, {signature, key});
-    headers['Idempotency-Key'] = key;
-  }
-  if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
-  button?.setAttribute('disabled', '');
-  if (status) status.textContent = 'Working…';
+  let identity;
   try {
+    const body = bodyOf(form);
+    identity = `${form.dataset.command} ${form.dataset.ifMatch ?? ''} ${JSON.stringify(body ?? null)}`;
+    const headers = {};
+    if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
+    if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
+    button?.setAttribute('disabled', '');
+    if (status) status.textContent = 'Working…';
     const result = await call(method, path, body, headers);
-    pendingKeys.delete(form);
-    if (form.classList.contains('pairing')) return pair(form, result);
+    settleKey(identity);
+    // Pairing keeps the button disabled for the whole flow (one flow at a time).
+    if (form.classList.contains('pairing')) return await pair(form, result);
     location.reload();
   } catch (error) {
-    // A known rejection ends this attempt; an unknown outcome keeps the key.
-    if (error.status) pendingKeys.delete(form);
+    // Only a definite rejection ends this request's identity; 5xx, 408/429
+    // and network failures may have been applied, so a retry reuses the key.
+    if (definitelyRejected(error)) settleKey(identity);
     if (status) {
       status.textContent = message(error);
       status.setAttribute('role', 'alert');
     }
   } finally {
+    submitting.delete(form);
     button?.removeAttribute('disabled');
   }
 }
@@ -108,16 +141,20 @@ async function pair(form, pairing) {
   const status = form.querySelector('.command-status');
   status.textContent = `Approve this code from an administrator device: ${pairing.user_code}`;
   const deadline = Date.parse(pairing.expires_at);
+  // The device code and any claimed credential stay in this closure only.
+  let credential = null;
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pairing.poll_interval_seconds * 1000));
     try {
-      const credential = await call('POST', `/api/v2/auth/pairings/${encodeURIComponent(pairing.id)}/claim`, {device_code: pairing.device_code});
+      // A lost claim response is recovered by claiming again with the same code.
+      credential ??= await call('POST', `/api/v2/auth/pairings/${encodeURIComponent(pairing.id)}/claim`, {device_code: pairing.device_code});
       await call('POST', '/api/v2/auth/session', {kind: 'credential', credential: credential.access_token});
       location.reload();
       return;
     } catch (error) {
-      // 409: not approved yet; 429: polling too fast. Anything else ends it.
-      if (error.status !== 409 && error.status !== 429) {
+      // Not approved yet, polling too fast, or no response: keep trying until expiry.
+      const transient = !error.status || error.status === 409 || error.status === 429 || error.status >= 500;
+      if (!transient) {
         status.textContent = message(error);
         status.setAttribute('role', 'alert');
         return;
