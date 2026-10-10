@@ -21,5 +21,6 @@ pub mod renditions;
 pub mod revision;
 pub mod scan;
 pub mod sources;
+pub mod timeline_viewing;
 pub mod viewing;
 pub mod work;

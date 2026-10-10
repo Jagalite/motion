@@ -1,6 +1,7 @@
 //! v2 playback authority: which route a plan selects, whether a plan token may
-//! admit a delivery, who may observe or control a delivery, and how a viewing
-//! session stays bound to the delivery it was created for.
+//! admit a delivery, who may observe or control a delivery, and who may write
+//! progress through it. Viewing order and authority are decided in
+//! `timeline_viewing`.
 //!
 //! The adapter supplies observations (current principal, file revision, catalog
 //! scope, client capability, source streams) and executes effects; it never
@@ -19,6 +20,9 @@ pub const PLAN_TTL_SECONDS: i64 = 5 * 60;
 pub enum Route {
     /// The stored original, byte ranges, browser-selected default streams.
     Original,
+    /// A stored, revision-valid generated rendition of the original, byte
+    /// ranges, its default streams.
+    Prepared,
     /// A live HLS conversion of the original with exactly the selected streams.
     Transcode,
 }
@@ -26,12 +30,13 @@ impl Route {
     pub fn operation(self) -> Operation {
         match self {
             Route::Original => Operation::Original,
+            Route::Prepared => Operation::Prepared,
             Route::Transcode => Operation::VideoTranscode,
         }
     }
     pub fn transport(self) -> &'static str {
         match self {
-            Route::Original => "http_range",
+            Route::Original | Route::Prepared => "http_range",
             Route::Transcode => "hls",
         }
     }
@@ -42,6 +47,7 @@ impl Route {
     pub fn candidate_id(self, file_id: &str) -> String {
         let prefix = match self {
             Route::Original => "o",
+            Route::Prepared => "p",
             Route::Transcode => "t",
         };
         if file_id.len() <= 126 {
@@ -66,6 +72,33 @@ pub struct SourceFacts {
     pub within_budget: bool,
     /// The core live-route rule admits a transcode of the selected streams.
     pub transcodable: bool,
+    /// The conversion's output honors the client's height and bitrate limits
+    /// (`conversion_fits`). A conversion never silently exceeds them.
+    pub conversion_within_budget: bool,
+    /// A stored rendition of this original whose output and source revisions
+    /// are both still the registered ones (`renditions::available`).
+    pub prepared: Option<PreparedFacts>,
+}
+
+/// Facts about one revision-valid prepared rendition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedFacts {
+    pub file: String,
+    pub client_support: Support,
+    pub within_budget: bool,
+}
+
+/// Whether a conversion whose output is at most `output_height` lines and, when
+/// capped, at most `output_max_bitrate` bits/s honors the requested limits. An
+/// uncapped (quality-targeted) encoder cannot promise any bitrate limit.
+pub fn conversion_fits(
+    max_height: Option<u32>,
+    max_bitrate: Option<u64>,
+    output_height: Option<u32>,
+    output_max_bitrate: Option<u64>,
+) -> bool {
+    max_height.is_none_or(|limit| output_height.is_some_and(|h| h <= limit))
+        && max_bitrate.is_none_or(|limit| output_max_bitrate.is_some_and(|b| b <= limit))
 }
 
 /// The client's transport capability and explicit selections.
@@ -77,6 +110,9 @@ pub struct Request {
     /// The client chose a stream other than the browser default (for example a
     /// second audio track or a subtitle). A byte route cannot honor that choice.
     pub explicit_streams: bool,
+    /// The client pinned the prepared rendition's version: nothing else may
+    /// serve the plan.
+    pub pinned_prepared: bool,
     pub failed: Vec<String>,
 }
 
@@ -86,31 +122,50 @@ pub enum Plan {
     Blocked(&'static str),
 }
 
-/// Select a route. Original byte delivery is preferred in Auto; a live
-/// conversion is used when the original is unsupported, failed on this client,
-/// requested explicitly (Convert), or needed to honor an explicit stream choice.
-/// Strict Original never converts. Nothing here starts processing.
+/// Select a route. Original byte delivery is preferred in Auto, then a
+/// prepared rendition, then a live conversion; Convert prefers a prepared
+/// rendition over a live conversion and never plays the original. A live
+/// conversion is also needed to honor an explicit stream choice. Strict
+/// Original never converts, and a pinned prepared version is never widened.
+/// Nothing here starts processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
-    let failed = |route: Route| request.failed.contains(&route.candidate_id(file_id));
+    let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
     if !source.available {
         return Plan::Blocked("source_unavailable");
     }
-    let original = Candidate {
-        original: true,
-        available: request.range && !request.explicit_streams && !failed(Route::Original),
-        support: source.client_support,
-        matches_recipe: false,
-        within_budget: source.within_budget,
-        can_process: source.transcodable,
-    };
-    let byte = match request.mode {
-        // Convert never plays the stored original; prepared renditions are not
-        // yet offered by this planner, so the live route serves Convert.
-        Mode::Convert => playback::Decision::Prepare(0),
-        mode => playback::decide(mode, std::slice::from_ref(&original), None),
-    };
-    match byte {
-        playback::Decision::Play(_) => Plan::Ready(Route::Original),
+    let byte = request.range && !request.explicit_streams;
+    let candidates = [
+        Candidate {
+            original: true,
+            available: byte && !request.pinned_prepared && !failed(Route::Original, file_id),
+            support: source.client_support,
+            matches_recipe: false,
+            within_budget: source.within_budget,
+            can_process: source.transcodable,
+        },
+        Candidate {
+            original: false,
+            available: byte
+                && source
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|p| !failed(Route::Prepared, &p.file)),
+            support: source
+                .prepared
+                .as_ref()
+                .map_or(Support::Unknown, |p| p.client_support),
+            matches_recipe: true,
+            within_budget: source.prepared.as_ref().is_some_and(|p| p.within_budget),
+            can_process: false,
+        },
+    ];
+    match playback::decide(request.mode, &candidates, None) {
+        playback::Decision::Play(0) => return Plan::Ready(Route::Original),
+        playback::Decision::Play(_) => return Plan::Ready(Route::Prepared),
+        _ => {}
+    }
+    match () {
+        _ if request.pinned_prepared => Plan::Blocked("selected_version_unavailable"),
         _ if request.mode == Mode::Original => Plan::Blocked(if request.explicit_streams {
             "stream_selection_requires_conversion"
         } else {
@@ -118,7 +173,8 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         }),
         _ if !request.hls => Plan::Blocked("client_cannot_play_conversion"),
         _ if !source.transcodable => Plan::Blocked("no_live_route"),
-        _ if failed(Route::Transcode) => Plan::Blocked("all_candidates_failed"),
+        _ if !source.conversion_within_budget => Plan::Blocked("conversion_exceeds_quality_limit"),
+        _ if failed(Route::Transcode, file_id) => Plan::Blocked("all_candidates_failed"),
         _ => Plan::Ready(Route::Transcode),
     }
 }
@@ -235,31 +291,15 @@ pub fn may_view(owner: &Owner, principal: &Principal, file: Option<&FileFacts>) 
     may_control(owner, principal, file) && principal.allows(Permission::ViewingWrite)
 }
 
-/// Record progress into an existing viewing session (also after its delivery
+/// Read or record into an existing viewing session (also after its delivery
 /// ended, so a durable client outbox can drain after a restart): viewing
-/// write, the session's profile, and the session's file still readable.
-/// Sessions are per profile; their unguessable identity names the session.
-pub fn may_record(principal: &Principal, profile: &str, file: Option<&FileFacts>) -> bool {
+/// write, the session's profile, and its timeline still readable under the
+/// caller's catalog scope (observed by the adapter). Sessions are per profile;
+/// their unguessable identity names the session.
+pub fn may_record(principal: &Principal, profile: &str, timeline_readable: bool) -> bool {
     principal.allows(Permission::ViewingWrite)
         && principal.may_use_profile(profile)
-        && readable(principal, file)
-}
-
-/// A viewing session's identity embeds the delivery it was created for, so the
-/// binding is durable with the session row itself and cannot drift after a
-/// restart. Both parts are server-generated identifiers.
-pub fn viewing_id(session: &str, delivery: &str) -> Option<String> {
-    let valid = |s: &str| {
-        !s.is_empty() && s.len() <= 60 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    };
-    (valid(session) && valid(delivery)).then(|| format!("{session}_{delivery}"))
-}
-
-/// The delivery a viewing session was created for; None for sessions that
-/// were not created through a delivery (v1 sessions).
-pub fn viewing_delivery(id: &str) -> Option<&str> {
-    let (session, delivery) = id.split_once('_')?;
-    viewing_id(session, delivery).map(|_| delivery)
+        && timeline_readable
 }
 
 #[cfg(test)]
@@ -297,6 +337,8 @@ mod tests {
             client_support: support,
             within_budget: true,
             transcodable: true,
+            conversion_within_budget: true,
+            prepared: None,
         }
     }
     fn request(mode: Mode) -> Request {
@@ -305,6 +347,7 @@ mod tests {
             range: true,
             hls: true,
             explicit_streams: false,
+            pinned_prepared: false,
             failed: vec![],
         }
     }
@@ -508,10 +551,10 @@ mod tests {
         // Losing the library (or the file) ends control and viewing.
         assert!(!may_control(&owner, &viewer, Some(&facts("r1", "other"))));
         assert!(!may_view(&owner, &viewer, None));
-        assert!(may_record(&viewer, "p", f));
-        assert!(!may_record(&player, "p", f));
-        assert!(!may_record(&viewer, "q", f));
-        assert!(!may_record(&viewer, "p", Some(&facts("r1", "other"))));
+        assert!(may_record(&viewer, "p", true));
+        assert!(!may_record(&player, "p", true));
+        assert!(!may_record(&viewer, "q", true));
+        assert!(!may_record(&viewer, "p", false));
         let mut c = claims();
         assert!(replan_compatible(&owner, &c));
         c.route = Route::Transcode;
@@ -533,7 +576,7 @@ mod tests {
     #[test]
     fn candidate_ids_are_stable_distinct_and_bounded() {
         let long = "x".repeat(128);
-        for route in [Route::Original, Route::Transcode] {
+        for route in [Route::Original, Route::Prepared, Route::Transcode] {
             assert_eq!(route.candidate_id(&long), route.candidate_id(&long));
             assert!(route.candidate_id(&long).len() <= 128);
         }
@@ -548,13 +591,100 @@ mod tests {
     }
 
     #[test]
-    fn viewing_ids_carry_their_delivery() {
-        let id = viewing_id("s-1", "d-2").unwrap();
-        assert_eq!(viewing_delivery(&id), Some("d-2"));
-        assert_eq!(viewing_delivery("legacy-session"), None);
-        assert_eq!(viewing_id("s_1", "d"), None);
-        assert_eq!(viewing_id("", "d"), None);
-        assert_eq!(viewing_delivery("a_b_c"), None);
-        assert!(id.len() <= 128);
+    fn prepared_renditions_serve_convert_and_back_up_an_unsupported_original() {
+        let prepared = |support| PreparedFacts {
+            file: "g".into(),
+            client_support: support,
+            within_budget: true,
+        };
+        let with = |original, p: Option<PreparedFacts>| SourceFacts {
+            prepared: p,
+            ..source(original)
+        };
+        // Convert: a usable rendition beats a live conversion.
+        let ready = with(Support::Supported, Some(prepared(Support::Unknown)));
+        assert_eq!(
+            plan("f", &ready, &request(Mode::Convert)),
+            Plan::Ready(Route::Prepared)
+        );
+        // Auto: the original first, then the rendition, then live.
+        assert_eq!(
+            plan("f", &ready, &request(Mode::Auto)),
+            Plan::Ready(Route::Original)
+        );
+        let unsupported = with(Support::Unsupported, Some(prepared(Support::Supported)));
+        assert_eq!(
+            plan("f", &unsupported, &request(Mode::Auto)),
+            Plan::Ready(Route::Prepared)
+        );
+        // Strict Original never uses it.
+        assert_eq!(
+            plan("f", &unsupported, &request(Mode::Original)),
+            Plan::Blocked("original_unavailable_or_unsupported")
+        );
+        // An unusable or failed rendition falls back to the live route.
+        let bad = with(Support::Unsupported, Some(prepared(Support::Unsupported)));
+        assert_eq!(
+            plan("f", &bad, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        let failed = Request {
+            failed: vec![Route::Prepared.candidate_id("g")],
+            ..request(Mode::Convert)
+        };
+        assert_eq!(plan("f", &ready, &failed), Plan::Ready(Route::Transcode));
+        // A byte route cannot honor an explicit stream choice.
+        let explicit = Request {
+            explicit_streams: true,
+            ..request(Mode::Convert)
+        };
+        assert_eq!(plan("f", &ready, &explicit), Plan::Ready(Route::Transcode));
+        // A pinned prepared version is never widened to another route.
+        let pinned = Request {
+            pinned_prepared: true,
+            ..request(Mode::Auto)
+        };
+        assert_eq!(plan("f", &ready, &pinned), Plan::Ready(Route::Prepared));
+        assert_eq!(
+            plan("f", &bad, &pinned),
+            Plan::Blocked("selected_version_unavailable")
+        );
+        assert_eq!(
+            plan("f", &with(Support::Supported, None), &pinned),
+            Plan::Blocked("selected_version_unavailable")
+        );
+    }
+
+    #[test]
+    fn conversions_never_exceed_client_limits() {
+        assert!(conversion_fits(None, None, Some(720), None));
+        assert!(conversion_fits(Some(720), None, Some(720), None));
+        assert!(!conversion_fits(Some(480), None, Some(720), None));
+        assert!(!conversion_fits(Some(480), None, None, None));
+        assert!(!conversion_fits(None, Some(8_000_000), Some(720), None));
+        assert!(conversion_fits(
+            None,
+            Some(3_000_000),
+            Some(720),
+            Some(2_500_000)
+        ));
+        let mut over = source(Support::Unsupported);
+        over.conversion_within_budget = false;
+        assert_eq!(
+            plan("f", &over, &request(Mode::Auto)),
+            Plan::Blocked("conversion_exceeds_quality_limit")
+        );
+        // The original still plays when it alone fits.
+        assert_eq!(
+            plan(
+                "f",
+                &SourceFacts {
+                    conversion_within_budget: false,
+                    ..source(Support::Supported)
+                },
+                &request(Mode::Auto)
+            ),
+            Plan::Ready(Route::Original)
+        );
     }
 }

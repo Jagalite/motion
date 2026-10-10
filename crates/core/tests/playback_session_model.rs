@@ -305,7 +305,7 @@ impl Enumerate for Playback {
         let mut inputs = vec![];
         if s.tokens.len() < 2 {
             for other in [false, true] {
-                for route in [Route::Original, Route::Transcode] {
+                for route in [Route::Original, Route::Prepared, Route::Transcode] {
                     inputs.push(Input::Plan { route, other });
                 }
             }
