@@ -845,6 +845,9 @@ pub async fn create_item(
         .bind(media_type)
         .execute(&mut *tx)
         .await?;
+    crate::search::refresh(&mut tx, 100)
+        .await
+        .map_err(Problem::internal)?;
     let (json, revision) = item_response(&mut tx, &scope, &id).await?;
     record
         .save(&mut tx, &digest, StatusCode::CREATED, Some(&json), None)
@@ -929,6 +932,9 @@ pub async fn replace_item(
             .bind(&row.id)
             .execute(&mut *tx)
             .await?;
+        crate::search::refresh(&mut tx, 100)
+            .await
+            .map_err(Problem::internal)?;
     }
     let (json, revision) = item_response(&mut tx, &scope, &row.id).await?;
     tx.commit().await?;

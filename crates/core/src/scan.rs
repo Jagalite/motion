@@ -106,11 +106,27 @@ pub fn reconcile_scoped(
     let positions: Vec<usize> = (0..found.len()).filter(|i| !out(&found[*i].path)).collect();
     let in_scope_found: Vec<Observed> = positions.iter().map(|i| found[*i].clone()).collect();
     let plan = reconcile_covered(&in_scope_old, &in_scope_found, coverage);
+    // Excluded files prove neither absence nor a move, but their known
+    // content identity still applies: a byte-identical included file is an
+    // occurrence of that edition, not a new work.
+    let mut holders: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for file in old {
+        holders
+            .entry(&file.revision)
+            .or_default()
+            .insert(&file.edition);
+    }
     let mut assignments = vec![Assignment::OutOfScope; found.len()];
     for (k, assignment) in plan.assignments.into_iter().enumerate() {
         assignments[positions[k]] = match assignment {
             Assignment::CopyOf { observation } => Assignment::CopyOf {
                 observation: positions[observation],
+            },
+            Assignment::New => match holders.get(found[positions[k]].revision.as_str()) {
+                Some(editions) if editions.len() == 1 => Assignment::Copy {
+                    edition: editions.iter().next().unwrap().to_string(),
+                },
+                _ => Assignment::New,
             },
             other => other,
         };

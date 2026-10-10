@@ -242,9 +242,17 @@ impl Model for Observation {
         });
         // Verified content held by one edition never creates a new work.
         let mut holders: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut holders_all: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for r in before.records.values() {
+            holders_all
+                .entry(&r.revision)
+                .or_default()
+                .insert(&r.edition);
+        }
         for r in before.records.values().filter(|r| !out(&r.path)) {
             holders.entry(&r.revision).or_default().insert(&r.edition);
         }
+
         let earlier_in_scope = |i: usize, revision: &str| {
             found[..i]
                 .iter()
@@ -257,11 +265,16 @@ impl Model for Observation {
             .all(|((i, f), a)| match a {
                 // New only for unknown content (first sighting) or ambiguous content.
                 Assignment::OutOfScope => out(&f.path),
+                // Content known to exactly one edition, even only through an
+                // excluded file, is never a new work.
                 Assignment::New => {
                     !out(&f.path)
                         && match holders.get(f.revision.as_str()) {
                             Some(e) => e.len() > 1,
-                            None => !earlier_in_scope(i, &f.revision),
+                            None => {
+                                !earlier_in_scope(i, &f.revision)
+                                    && only(&holders_all, &f.revision).is_none()
+                            }
                         }
                 }
                 Assignment::CopyOf { observation } => {
@@ -270,10 +283,9 @@ impl Model for Observation {
                         && found[*observation].revision == f.revision
                 }
                 Assignment::Copy { edition } => {
-                    holders
-                        .get(f.revision.as_str())
-                        .map(|e| e.iter().copied().collect::<Vec<_>>())
-                        == Some(vec![edition.as_str()])
+                    only(&holders, &f.revision) == Some(edition.as_str())
+                        || (!holders.contains_key(f.revision.as_str())
+                            && only(&holders_all, &f.revision) == Some(edition.as_str()))
                 }
                 Assignment::Existing { id, .. } => before.records.contains_key(id),
             });
@@ -298,6 +310,12 @@ impl Model for Observation {
     }
 }
 
+/// The single edition holding a revision, if exactly one does.
+fn only<'a>(m: &BTreeMap<&'a str, BTreeSet<&'a str>>, revision: &str) -> Option<&'a str> {
+    m.get(revision)
+        .filter(|e| e.len() == 1)
+        .and_then(|e| e.iter().next().copied())
+}
 fn dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(d, _)| d)
 }

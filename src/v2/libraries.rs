@@ -240,11 +240,11 @@ pub async fn delete_library(
     }
     let library = service::library_view(&mut tx, &id).await.map_err(error)?;
     access::revise(library.revision, expected, true)?;
-    // Only the logical definition is removed. Storage sources and media stay owned by their service.
-    sqlx::query("DELETE FROM catalog_libraries WHERE id=?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // Only the logical definition (and its finished scan history) is removed;
+    // the service refuses while scan demands are pending.
+    service::delete_library_in(&mut tx, &id, library.revision)
+        .await
+        .map_err(error)?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -388,12 +388,16 @@ pub async fn delete_source(
         .await?;
     let source = service::source_in(&mut tx, &id).await.map_err(error)?;
     access::revise(source.revision, expected, true)?;
-    let uses: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM library_sources WHERE source_id=?1)+(SELECT count(*) FROM media_files WHERE library_id=?1)+(SELECT count(*) FROM jobs WHERE library_id=?1 AND phase IN ('queued','running','cancelling'))").bind(&id).fetch_one(&mut *tx).await?;
-    playscale_core::catalog::library_idle(uses).map_err(|_| error(service::LibraryError::Busy))?;
-    sqlx::query("DELETE FROM libraries WHERE id=?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // A source still holding cataloged files is disabled rather than deleted
+    // (originals and history are retained) and its current view returned.
+    let outcome = service::delete_source_in(&mut tx, &id, source.revision)
+        .await
+        .map_err(error)?;
+    if outcome == service::SourceRemoval::Disabled {
+        let value = wire(service::source_in(&mut tx, &id).await.map_err(error)?)?;
+        tx.commit().await?;
+        return Ok(tagged(StatusCode::OK, value));
+    }
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
