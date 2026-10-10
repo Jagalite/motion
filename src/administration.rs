@@ -212,11 +212,16 @@ pub async fn relocate(
     version(current.revision, r.expected_revision)?;
     idle(&app, &id).await?;
     let current:Vec<File>=sqlx::query_as("SELECT id,relative_path,revision,fingerprint,available FROM media_files WHERE library_id=? ORDER BY id").bind(&id).fetch_all(&app.db).await?;
-    let other: i64 = sqlx::query_scalar("SELECT count(*) FROM libraries WHERE root=? AND id<>?")
-        .bind(&root)
+    // Another registration of the same root, or one nested with it, owns it.
+    let others: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries WHERE id<>?")
         .bind(&id)
-        .fetch_one(&app.db)
+        .fetch_all(&app.db)
         .await?;
+    let refs: Vec<&str> = others.iter().map(String::as_str).collect();
+    let other = i64::from(
+        refs.contains(&root.as_str())
+            || playscale_core::sources::overlapping(&root, &refs).is_some(),
+    );
     playscale_core::catalog::relocation(&files, &current, other).map_err(|code| {
         ApiError::conflict(
             code,
@@ -311,8 +316,8 @@ pub async fn remove_profile(
 }
 
 pub struct VerifiedRoot {
-    root: String,
-    identity: String,
+    pub(crate) root: String,
+    pub(crate) identity: String,
     _permit: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -351,7 +356,27 @@ pub async fn register_root(
             .unwrap_or("Media")
     });
     let _lock = app.jobs.lock().await;
+    let roots: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries")
+        .fetch_all(&app.db)
+        .await?;
+    let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
+    if let Some(other) = playscale_core::sources::overlapping(&candidate.root, &refs) {
+        anyhow::bail!("library root overlaps registered source {other}");
+    }
     // No second path resolution: a replacement is detected by scan/serving's
     // root identity checks, rather than silently registering a different root.
-    db::add_verified_library(&app.db, name, &candidate.root, &candidate.identity).await
+    let library =
+        db::add_verified_library(&app.db, name, &candidate.root, &candidate.identity).await?;
+    // A v1 root is both a source and a mixed library with the same ID.
+    sqlx::query("INSERT OR IGNORE INTO catalog_libraries (id,name,kind) VALUES (?,?,'mixed')")
+        .bind(&library.id)
+        .bind(&library.name)
+        .execute(&app.db)
+        .await?;
+    sqlx::query("INSERT OR IGNORE INTO library_sources VALUES (?,?)")
+        .bind(&library.id)
+        .bind(&library.id)
+        .execute(&app.db)
+        .await?;
+    Ok(library)
 }

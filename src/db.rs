@@ -103,6 +103,8 @@ pub struct JobRow {
     pub outcome: Option<String>,
     pub complete_directories: i64,
     pub incomplete_directories: i64,
+    /// Source binding revision observed by the running attempt.
+    pub binding_revision: Option<i64>,
 }
 impl JobRow {
     pub fn state(&self) -> anyhow::Result<Job> {

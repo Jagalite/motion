@@ -157,6 +157,14 @@ async fn upgrade_backs_up_preserves_ids_and_attributes_progress_without_guessing
     .await
     .unwrap();
     assert_eq!(structure, (3, 3, 3, 0));
+    // 0017: each legacy root is one source and one mixed library, same ID.
+    let paired: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM catalog_libraries c JOIN library_sources s ON s.library_id=c.id AND s.source_id=c.id WHERE c.id='lib' AND c.kind='mixed'),(SELECT count(*) FROM sources)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paired, (1, 1));
     let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM progress")
         .fetch_one(&pool)
         .await
