@@ -14,9 +14,12 @@ Checks, in order:
   2. The candidate opens that data directory in place with its default (restricted)
      access mode: it takes exactly one verified pre-upgrade backup, preserves item,
      library and file identities, bytes, curation and the position, applies every
-     migration on disk, and passes SQLite integrity and foreign-key checks.
-  3. Restarting the candidate takes no further upgrade backup.
-  4. The baseline server refuses the upgraded database and leaves it usable.
+     migration on disk, passes SQLite integrity and foreign-key checks, and records
+     one schema receipt and one exact legacy-progress attribution.
+  3. Restarting the candidate takes no further upgrade backup and records no
+     further data-upgrade receipts.
+  4. The baseline server refuses the upgraded database with its unknown-migration
+     diagnostic and leaves it usable.
   5. Rollback: the candidate's restore tool restores the baseline operator backup
      to a new directory and the baseline server serves the original data from it;
      the automatic pre-upgrade backup is likewise usable by the baseline server.
@@ -148,6 +151,25 @@ def database_facts(path):
         db.close()
 
 
+def upgrade_receipts(path, item_id):
+    """Data-upgrade receipts and the legacy progress attribution for the fixture."""
+    db = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+    try:
+        receipts = db.execute('SELECT id, kind, document_json FROM catalog_receipts '
+                              "WHERE kind LIKE 'migration:%' ORDER BY kind, id").fetchall()
+        attribution = db.execute('SELECT profile_id, item_id, outcome, timeline_id IS NOT NULL, receipt_id '
+                                 'FROM legacy_progress_attribution ORDER BY profile_id, item_id').fetchall()
+    finally:
+        db.close()
+    kinds = [kind for _, kind, _ in receipts]
+    assert kinds == ['migration:legacy_progress', 'migration:schema'], kinds
+    progress_receipt, schema_receipt = receipts
+    assert json.loads(progress_receipt[2]) == {'outcomes': {'exact': 1}}, progress_receipt
+    # The fixture has one timeline with one original, so attribution is exact.
+    assert attribution == [('default', item_id, 'exact', 1, progress_receipt[0])], attribution
+    return {'receipt_ids': [r[0] for r in receipts], 'schema': json.loads(schema_receipt[2])}
+
+
 def upgrade_backups(data):
     directory = data / 'upgrade-backups'
     return sorted(directory.glob('pre-upgrade-*.sqlite3')) if directory.exists() else []
@@ -198,6 +220,10 @@ def run(baseline, baseline_backup_tool, candidate, work):
     on_disk = sorted(int(p.name[:4]) for p in (ROOT / 'migrations').glob('[0-9][0-9][0-9][0-9]_*.sql'))
     assert upgraded == {'integrity': 'ok', 'foreign_key_violations': 0, 'migrations': on_disk}, upgraded
     assert database_facts(backups[0]) == baseline_facts
+    receipts = upgrade_receipts(data / 'playscale.sqlite3', before['item_id'])
+    assert receipts['schema']['from_version'] == baseline_facts['migrations'][-1], receipts
+    assert receipts['schema']['to_version'] == latest, receipts
+    assert pathlib.Path(receipts['schema']['verified_backup']).name == backups[0].name, receipts
     checks['in_place_upgrade'] = {'from': baseline_facts['migrations'][-1], 'to': latest,
                                   'legacy_anonymous_status': anonymous, 'upgrade_backup': backups[0].name}
 
@@ -205,16 +231,22 @@ def run(baseline, baseline_backup_tool, candidate, work):
     with Server(candidate, data, media, log) as server:
         assert observe(server) == before
     assert upgrade_backups(data) == backups
-    checks['restart_is_not_an_upgrade'] = True
+    assert upgrade_receipts(data / 'playscale.sqlite3', before['item_id']) == receipts
+    checks['restart_is_not_an_upgrade'] = {'upgrade_backups': 1, 'receipt_ids_unchanged': True}
 
     # 4. The baseline refuses the newer schema without damaging it.
     refused = subprocess.run(Server(baseline, data, media, log).command, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, timeout=60)
+    with log.open('ab') as stream:
+        stream.write(refused.stdout)
     assert refused.returncode != 0, 'baseline server accepted a newer schema'
+    # The baseline's sqlx migrator rejects the first migration it does not know.
+    unknown = f'migration {baseline_facts["migrations"][-1] + 1} was previously applied but is missing'
+    assert unknown.encode() in refused.stdout, refused.stdout[-2000:]
     assert database_facts(data / 'playscale.sqlite3') == upgraded
     with Server(candidate, data, media, log) as server:
         assert observe(server) == before
-    checks['baseline_refuses_newer_schema'] = {'exit_code': refused.returncode}
+    checks['baseline_refuses_newer_schema'] = {'exit_code': refused.returncode, 'diagnostic': unknown}
 
     # 5. Rollback to the baseline from either pre-upgrade copy.
     rollback = work / 'rollback-from-operator-backup'

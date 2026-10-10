@@ -13,7 +13,9 @@ runs in the package workflow; scripts/test_package.py needs a built archive.
 import argparse
 import hashlib
 import json
+import os
 import pathlib
+import signal
 import subprocess
 import sys
 import time
@@ -40,6 +42,30 @@ CHECKS = [
 ]
 
 
+def terminate_group(process):
+    """Stop everything left in the check's process group; True if anything was."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return False
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        process.poll()  # reap the leader so a zombie does not keep the group alive
+        try:
+            os.killpg(process.pid, 0)
+        except (ProcessLookupError, PermissionError):  # macOS: EPERM once only exiting members remain
+            break
+        time.sleep(.1)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    process.wait()
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--work', type=pathlib.Path, required=True, help='new directory for logs and receipt')
@@ -59,11 +85,18 @@ def main():
         log = work / f'{name}.log'
         started = time.monotonic()
         with log.open('wb') as stream:
+            # Own process group: a timed-out check's servers and encoders are
+            # terminated with it instead of outliving it into later checks.
+            process = subprocess.Popen(command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, start_new_session=True)
             try:
-                code = subprocess.run(command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                                      stdin=subprocess.DEVNULL, timeout=limit).returncode
+                code = process.wait(timeout=limit)
             except subprocess.TimeoutExpired:
                 code = 'timeout'
+            finally:
+                leftovers = terminate_group(process)
+        if leftovers and code == 0:
+            code = 'left processes running'
         results.append({'check': name, 'exit': code, 'seconds': round(time.monotonic() - started, 1)})
         print(f'{name}: {"ok" if code == 0 else f"FAILED ({code}), see {log}"}', flush=True)
     receipt = {'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'results': results}
