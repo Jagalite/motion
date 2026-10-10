@@ -7,7 +7,7 @@ use axum::{
     Router,
     body::Body,
     extract::{MatchedPath, Request},
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
 };
@@ -123,12 +123,15 @@ fn probe(method: &str, path: &str) -> axum::http::Request<Body> {
         .unwrap()
 }
 
-/// Every `(method, contract path)` the production v2 router dispatches to a
-/// handler. `route_layer` runs only for matched routes, never the fallback.
-/// It also wraps a matched path's method fallback, which answers 405, so each
-/// path is first probed with a method no route registers: if that does not
-/// answer 405, method-level detection is unreliable there and the test fails
-/// instead of guessing.
+/// Every `(method, contract path)` the production v2 router registers. Each
+/// path is probed with a method no route registers: `route_layer` marks only
+/// matched routes (never the fallback), and a matched path's method fallback
+/// answers 405 with an `Allow` header naming exactly the registered methods,
+/// independent of what those handlers would return.
+///
+/// Limitation: axum also lists HEAD for every GET route, so an explicit HEAD
+/// handler on a path whose contract declares GET but not HEAD is not
+/// distinguishable from axum's implicit HEAD and is not reported.
 async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
     let router: Router = Router::new()
         .nest(
@@ -143,35 +146,34 @@ async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
             .oneshot(probe("CONTRACTPROBE", path))
             .await
             .unwrap();
-        if response.headers().contains_key(MATCHED) {
-            assert_eq!(
-                response.status(),
-                StatusCode::METHOD_NOT_ALLOWED,
-                "{path}: an unregistered method did not reach the 405 method fallback"
-            );
-        }
-        for method in METHODS {
-            // Axum answers HEAD from a GET handler; only an explicit HEAD
-            // operation in the contract is checked for HEAD.
-            if method == "head" && item.get("head").is_none() && item.get("get").is_some() {
+        let Some(matched) = response.headers().get(MATCHED) else {
+            continue; // no route template matches this path
+        };
+        assert_eq!(
+            shape(matched.to_str().unwrap()),
+            shape(path),
+            "{path} is routed by a different template"
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{path}: an unregistered method did not reach the 405 method fallback"
+        );
+        let allow: BTreeSet<String> = response
+            .headers()
+            .get(header::ALLOW)
+            .unwrap_or_else(|| panic!("{path}: 405 without an Allow header"))
+            .to_str()
+            .unwrap()
+            .split(',')
+            .map(|m| m.trim().to_ascii_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect();
+        for method in &allow {
+            if method == "head" && item.get("head").is_none() && allow.contains("get") {
                 continue;
             }
-            let response = router.clone().oneshot(probe(method, path)).await.unwrap();
-            let matched = response
-                .headers()
-                .get(MATCHED)
-                .map(|v| v.to_str().unwrap().to_owned());
-            if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-                continue;
-            }
-            if let Some(matched) = matched {
-                assert_eq!(
-                    shape(&matched),
-                    shape(path),
-                    "{method} {path} was served by a different route template"
-                );
-                served.insert((method.to_string(), path.clone()));
-            }
+            served.insert((method.clone(), path.clone()));
         }
     }
     served
@@ -188,6 +190,109 @@ fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Rust source with comments blanked, and a copy of the same byte length
+/// whose string-literal contents are also blanked, so a call is found only in
+/// code while its literal argument is read from the first copy. Raw strings
+/// are not used for routes and are not handled.
+fn code_of(text: &str) -> (String, String) {
+    let (mut code, mut mask) = (String::with_capacity(text.len()), String::new());
+    let blank = |out: &mut String, c: char| out.extend(std::iter::repeat_n(' ', c.len_utf8()));
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                code.push(c);
+                mask.push(c);
+                while let Some(c) = chars.next() {
+                    code.push(c);
+                    if c == '"' {
+                        mask.push(c);
+                        break;
+                    }
+                    blank(&mut mask, c);
+                    if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            code.push(escaped);
+                            blank(&mut mask, escaped);
+                        }
+                    }
+                }
+            }
+            '\'' => {
+                // A char literal such as '"' must not open a string; lifetimes
+                // ('a) have no closing quote and are copied unchanged.
+                code.push(c);
+                mask.push(c);
+                let literal: String = chars.clone().take(4).collect();
+                let len = match literal.find('\'') {
+                    Some(1) => 1,
+                    Some(2) if literal.starts_with('\\') => 2,
+                    _ => 0,
+                };
+                for _ in 0..len {
+                    let c = chars.next().unwrap();
+                    code.push(c);
+                    blank(&mut mask, c);
+                }
+            }
+            '/' if matches!(chars.peek(), Some('/') | Some('*')) => {
+                let block = chars.next() == Some('*');
+                let mut skipped = String::from("//");
+                let mut depth = 1;
+                let mut previous = ' ';
+                while let Some(c) = chars.next() {
+                    if !block && c == '\n' {
+                        code.push_str(&" ".repeat(skipped.len()));
+                        mask.push_str(&" ".repeat(skipped.len()));
+                        skipped.clear();
+                        code.push('\n');
+                        mask.push('\n');
+                        break;
+                    }
+                    skipped.push(c);
+                    if block {
+                        match (previous, c) {
+                            ('/', '*') => (depth, previous) = (depth + 1, ' '),
+                            ('*', '/') => (depth, previous) = (depth - 1, ' '),
+                            _ => previous = c,
+                        }
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                code.push_str(&" ".repeat(skipped.len()));
+                mask.push_str(&" ".repeat(skipped.len()));
+            }
+            _ => {
+                code.push(c);
+                mask.push(c);
+            }
+        }
+    }
+    debug_assert_eq!(code.len(), mask.len());
+    (code, mask)
+}
+
+/// Arguments that follow each call of method `name`, e.g. `.route ( "..."`.
+fn calls<'a>((code, mask): &'a (String, String), name: &str) -> Vec<&'a str> {
+    let needle = format!(".{name}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = mask[from..].find(&needle) {
+        from += at + needle.len();
+        let rest = &mask[from..];
+        if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            continue; // a longer identifier such as route_layer
+        }
+        let gap = rest.len() - rest.trim_start().len();
+        if rest[gap..].starts_with('(') {
+            out.push(code[from + gap + 1..].trim_start());
+        }
+    }
+    out
+}
+
 /// String literals passed to `.route(` anywhere under src/v2. The scan relies
 /// on every route being registered with a literal at the v2 root, so it
 /// rejects nesting and non-literal templates rather than misreading them.
@@ -197,18 +302,16 @@ fn route_literals() -> BTreeSet<String> {
     sources(&Path::new(ROOT).join("src/v2"), &mut files);
     files.sort();
     for file in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        for forbidden in [".nest(", ".nest_service(", ".route_service("] {
+        let code = code_of(&std::fs::read_to_string(&file).unwrap());
+        for forbidden in ["nest", "nest_service", "route_service"] {
             assert!(
-                !text.contains(forbidden),
-                "{}: {forbidden} is not understood by tests/contract.rs; extend the scan",
+                calls(&code, forbidden).is_empty(),
+                "{}: .{forbidden}( is not understood by tests/contract.rs; extend the scan",
                 file.display()
             );
         }
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find(".route(") {
-            rest = rest[at + ".route(".len()..].trim_start();
-            let literal = rest.strip_prefix('"').unwrap_or_else(|| {
+        for arguments in calls(&code, "route") {
+            let literal = arguments.strip_prefix('"').unwrap_or_else(|| {
                 panic!(
                     "{}: .route( without a string literal template",
                     file.display()
@@ -219,6 +322,22 @@ fn route_literals() -> BTreeSet<String> {
         }
     }
     out
+}
+
+#[test]
+fn route_scan_sees_through_whitespace_comments_and_strings() {
+    let code = code_of(
+        "r.route (\n \"/a/{id}\", get(h)) // .route(\"/commented\")\n\
+         /* .nest(\"/x\", /* nested */ y) */ .route_layer(l).route(\"/b\", get(h));\n\
+         let s = \"// .route(\\\" .nest(\"; let q = '\"'; .route(\"/c\", get(h))",
+    );
+    let routes: Vec<_> = calls(&code, "route")
+        .into_iter()
+        .map(|a| a.split('"').nth(1).unwrap())
+        .collect();
+    assert_eq!(routes, ["/a/{id}", "/b", "/c"]);
+    assert!(calls(&code, "nest").is_empty());
+    assert_eq!(calls(&code_of("x.nest (\"/p\", r)"), "nest").len(), 1);
 }
 
 fn ledger() -> BTreeSet<String> {

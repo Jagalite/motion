@@ -50,11 +50,17 @@ def references(value):
 
 
 def resolve(document, ref):
-    if not ref.startswith('#/'):
+    """Resolve a same-document reference: a URI fragment holding a JSON Pointer
+    (RFC 6901 section 6). `#` is the whole document."""
+    if not ref.startswith('#'):
         raise ValueError(f'external reference {ref}')
-    # A URI fragment holding a JSON Pointer (RFC 6901 section 6).
+    pointer = unquote(ref[1:])
+    if pointer == '':
+        return document
+    if not pointer.startswith('/'):
+        raise ValueError(f'not a JSON Pointer fragment: {ref}')
     node = document
-    for part in unquote(ref[2:]).split('/'):
+    for part in pointer[1:].split('/'):
         part = part.replace('~1', '/').replace('~0', '~')
         if isinstance(node, list):
             if not part.isdigit() or (len(part) > 1 and part[0] == '0'):
