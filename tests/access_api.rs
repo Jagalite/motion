@@ -2555,3 +2555,66 @@ async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition()
         .await;
     assert_eq!(busy.status, StatusCode::CONFLICT, "{:?}", busy.body);
 }
+
+#[tokio::test]
+async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_authorization() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, token) = f.pair(&["default"], &["processing:request"]).await;
+    let auth = bearer(&token);
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,attempt,created_at,requester_id,error) VALUES ('retry-owned',?,'failed',1,0,?,'old failure')")
+        .bind(&f.library).bind(&device).execute(&f.app.db).await.unwrap();
+    let path = "/api/v2/jobs/retry-owned/retry";
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "retry-owned-job-key"),
+    ];
+    let admitted = f.call("POST", path, None, &headers).await;
+    assert_eq!(admitted.status, StatusCode::OK, "{:?}", admitted.body);
+    assert_eq!(admitted.body["phase"], "queued");
+    assert_eq!(admitted.body["attempt_generation"], "1");
+    assert_eq!(admitted.body["revision"], "2");
+    assert!(admitted.body["error_code"].is_null());
+    // Simulate the worker's next attempt finishing before the client retries
+    // its lost acknowledgement. A replay must not enqueue another attempt.
+    sqlx::query(
+        "UPDATE jobs SET phase='failed',attempt=2,error='next failure' WHERE id='retry-owned'",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let replay = f.call("POST", path, None, &headers).await;
+    assert_eq!(replay.status, StatusCode::OK);
+    assert_eq!(replay.body, admitted.body);
+    assert_eq!(replay.headers["etag"], admitted.headers["etag"]);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let state: (String, i64, i64) =
+        sqlx::query_as("SELECT phase,attempt,revision FROM jobs WHERE id='retry-owned'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(state, ("failed".into(), 2, 3));
+    let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE operation='retryJob' AND target='retry-owned'")
+        .fetch_one(&f.app.db).await.unwrap();
+    assert_eq!(receipts, 1);
+    let (_, other) = f.pair(&["default"], &["processing:request"]).await;
+    let hidden = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", &bearer(&other)),
+                ("idempotency-key", "other-retry-job-key"),
+            ],
+        )
+        .await;
+    assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    // Revocation defeats even an otherwise valid replay.
+    sqlx::query("UPDATE devices SET revoked=1 WHERE id=?")
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let revoked = f.call("POST", path, None, &headers).await;
+    assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
+}
