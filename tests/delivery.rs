@@ -1031,6 +1031,8 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
     // Copy routes are implemented but unqualified, so off unless enabled.
     let f = Fixture::with_options(Default::default(), false, true).await;
     // A 2 s GOP (48 frames at 24 fps); one file with AAC, one with AC-3 audio.
+    // The AC-3 file is converted from its start, where B-frame decode times are
+    // negative: a shifted output would fail the keyframe verification.
     for (name, audio) in [("aac.mkv", "aac"), ("ac3.mkv", "ac3")] {
         let status = Command::new("ffmpeg")
             .args([
@@ -1046,10 +1048,15 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
                 "sine=frequency=440:sample_rate=48000",
                 "-t",
                 "60",
+                // Main profile with B-frames: negative decode times at the start
+                // exercise timestamp preservation, and Main differs from the
+                // High profile a transcode would produce.
                 "-c:v",
                 "libx264",
                 "-preset",
-                "ultrafast",
+                "medium",
+                "-profile:v",
+                "main",
                 "-g",
                 "48",
                 "-keyint_min",
@@ -1098,10 +1105,11 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
     }
     let source_profile =
         probe(&f.dir.path().join("media/aac.mkv"))["streams"][0]["profile"].clone();
-    assert_ne!(
-        source_profile,
-        json!("High"),
-        "source must differ from the transcode profile"
+    assert_eq!(source_profile, json!("Main"));
+    let b_frames = probe(&f.dir.path().join("media/aac.mkv"))["streams"][0]["has_b_frames"].clone();
+    assert!(
+        b_frames.as_i64().is_some_and(|b| b > 0),
+        "fixture must contain B-frames: {b_frames}"
     );
 
     let mut deliveries = Vec::new();

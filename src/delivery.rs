@@ -427,6 +427,11 @@ fn arguments(
         );
         args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
     }
+    if copy {
+        // Keep negative B-frame decode times rather than shifting every stream,
+        // so presentation times stay equal to the source (and the timeline).
+        args.extend(["-avoid_negative_ts", "disabled"].map(str::to_owned));
+    }
     if operation == Operation::Remux {
         args.extend(["-c:a", "copy"].map(str::to_owned));
     } else {
@@ -457,7 +462,270 @@ fn arguments(
     args
 }
 
-/// Video start time of segment 0, in milliseconds. The init fragment and
+/// H.264 bitstream details of a source, observed through its validated descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyDetails {
+    pub revision: String,
+    pub profile: String,
+    pub level: i64,
+    pub progressive: bool,
+    pub rotated: bool,
+}
+impl CopyDetails {
+    fn observed(&self) -> core::VideoDetails<'_> {
+        core::VideoDetails {
+            profile: &self.profile,
+            level: self.level,
+            progressive: self.progressive,
+            rotated: self.rotated,
+        }
+    }
+}
+
+/// Bound on one source probe.
+const PROBE_DEADLINE: Duration = Duration::from_secs(15);
+/// Probe output larger than this is not trusted.
+const MAX_PROBE_OUTPUT: u64 = 8 * 1024 * 1024;
+/// FFmpeg's live segment length; a cut happens at the first keyframe after it.
+const HLS_TIME_SECONDS: u64 = SEGMENT_SECONDS;
+
+/// Why a probe produced no answer.
+enum ProbeFailure {
+    /// FFprobe could not run, failed, or timed out and was reaped.
+    Unavailable,
+    /// It timed out and did not exit when killed: ownership must be retained.
+    Stalled(tokio::process::Child),
+}
+
+/// Run FFprobe on an already validated source descriptor (inherited as fd 3),
+/// so the probed bytes are the ones the encoder will read. The descriptor's
+/// offset is shared with that child, so it is rewound once the child has exited.
+async fn probe_descriptor(
+    app: &App,
+    input: &std::fs::File,
+    args: &[&str],
+) -> Result<Vec<u8>, ProbeFailure> {
+    use std::io::{Seek, SeekFrom};
+    use tokio::io::AsyncReadExt;
+    let mut command = Command::new(app.ffprobe.as_ref());
+    command
+        .args(["-v", "error"])
+        .args(args)
+        .args(["-i", "/dev/fd/3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(false);
+    #[cfg(unix)]
+    execution::inherit(&mut command, &[input]);
+    let mut child = command.spawn().map_err(|_| ProbeFailure::Unavailable)?;
+    let mut stdout = child.stdout.take().ok_or(ProbeFailure::Unavailable)?;
+    let mut output = Vec::new();
+    let finished = tokio::time::timeout(PROBE_DEADLINE, async {
+        (&mut stdout)
+            .take(MAX_PROBE_OUTPUT)
+            .read_to_end(&mut output)
+            .await?;
+        child.wait().await
+    })
+    .await;
+    let rewind = || (&*input).seek(SeekFrom::Start(0)).is_ok();
+    match finished {
+        Ok(Ok(status)) if status.success() && rewind() => Ok(output),
+        Ok(_) => {
+            rewind();
+            Err(ProbeFailure::Unavailable)
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(_) => {
+                    rewind();
+                    Err(ProbeFailure::Unavailable)
+                }
+                Err(_) => Err(ProbeFailure::Stalled(child)),
+            }
+        }
+    }
+}
+
+/// Observe the details stream copy eligibility needs, before any admission
+/// transaction (a probe must not hold the database writer).
+async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
+    let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+        .bind(file_id)
+        .fetch_optional(&app.db)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    let (root, root_identity): (String, String) =
+        sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
+            .bind(&file.library_id)
+            .fetch_one(&app.db)
+            .await?;
+    let source = Source {
+        root: root.into(),
+        relative: file.relative_path.clone().into(),
+        root_identity,
+        fingerprint: file.fingerprint.clone(),
+    };
+    let input = tokio::task::spawn_blocking(move || source_valid(&source))
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(|error| {
+            // A missing file is absent; anything else means it changed.
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                ApiError::not_found()
+            } else {
+                ApiError::conflict("source_revision_changed", "Refresh the item")
+            }
+        })?;
+    let stdout = match probe_descriptor(
+        app,
+        &input,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=profile,level,field_order:stream_side_data=rotation",
+            "-of",
+            "json",
+        ],
+    )
+    .await
+    {
+        Ok(stdout) => stdout,
+        Err(failure) => {
+            if let ProbeFailure::Stalled(mut child) = failure {
+                // Not tied to execution capacity: admission has not reserved any.
+                tracing::error!(file_id, "source probe did not exit when killed");
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "probe_unavailable",
+                "The source could not be probed; try again",
+            ));
+        }
+    };
+    parse_copy_details(&stdout, file.revision).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "The source's video stream could not be qualified for stream copy",
+        )
+    })
+}
+
+fn parse_copy_details(stdout: &[u8], revision: String) -> Option<CopyDetails> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let stream = value["streams"].get(0)?;
+    let rotated = stream["side_data_list"].as_array().is_some_and(|list| {
+        list.iter().any(|d| {
+            d["rotation"]
+                .as_f64()
+                .is_some_and(|r| r.rem_euclid(360.0) != 0.0)
+        })
+    });
+    Some(CopyDetails {
+        revision,
+        profile: stream["profile"].as_str()?.to_owned(),
+        level: stream["level"].as_i64()?,
+        // Unknown field order is not assumed progressive.
+        progressive: stream["field_order"].as_str() == Some("progressive"),
+        rotated,
+    })
+}
+
+/// The source keyframe a stream copy of `start_ms` begins at, in microseconds.
+/// Keyframes are the demuxer's sync packets, which is where the HLS muxer cuts;
+/// the core decides from them whether every segment in the observed window fits
+/// the copy target. A stalled probe stays owned by `lease`.
+async fn copy_keyframe(
+    app: &App,
+    input: &std::fs::File,
+    start_ms: u64,
+    duration_ms: Option<u64>,
+    lease: &execution::Lease,
+) -> Option<u64> {
+    let from = start_ms.saturating_sub(COPY_TARGET_SECONDS * 1000);
+    let mut until = start_ms + 60_000 + COPY_TARGET_SECONDS * 1000;
+    // Reaching the end of the media also bounds the final segment.
+    let eof = duration_ms.is_some_and(|d| d <= until);
+    if let Some(d) = duration_ms.filter(|_| eof) {
+        until = d;
+    }
+    let interval = format!(
+        "{}.{:03}%{}.{:03}",
+        from / 1000,
+        from % 1000,
+        until / 1000,
+        until % 1000
+    );
+    let stdout = match probe_descriptor(
+        app,
+        input,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "csv=p=0",
+            "-read_intervals",
+            &interval,
+        ],
+    )
+    .await
+    {
+        Ok(stdout) => stdout,
+        Err(ProbeFailure::Stalled(mut child)) => {
+            lease.stuck(async move {
+                let _ = child.wait().await;
+            });
+            return None;
+        }
+        Err(ProbeFailure::Unavailable) => return None,
+    };
+    let mut keyframes_us = Vec::new();
+    let mut last_us = 0;
+    for line in String::from_utf8(stdout).ok()?.lines() {
+        let (pts, flags) = line.split_once(',')?;
+        // A packet without a timestamp leaves coverage unknown.
+        let pts: f64 = pts
+            .trim()
+            .parse()
+            .ok()
+            .filter(|t: &f64| t.is_finite() && *t >= 0.0)?;
+        let us = (pts * 1_000_000.0).round() as u64;
+        last_us = last_us.max(us);
+        if flags.contains('K') {
+            keyframes_us.push(us);
+        }
+    }
+    keyframes_us.sort_unstable();
+    keyframes_us.dedup();
+    let keyframes_ms: Vec<u64> = keyframes_us.iter().map(|us| us / 1000).collect();
+    // Coverage reaches the requested end, or the last packet at end of media.
+    let end_ms = if eof { duration_ms? } else { until };
+    if !eof && last_us / 1000 + COPY_TARGET_SECONDS * 1000 < until {
+        return None;
+    }
+    let start = core::copy_start(
+        &keyframes_ms,
+        start_ms,
+        HLS_TIME_SECONDS,
+        COPY_TARGET_SECONDS,
+        end_ms,
+    )?;
+    keyframes_us.into_iter().find(|us| us / 1000 == start)
+}
+
+/// Video start time of segment 0, in microseconds. The init fragment and
 /// segment are piped to FFprobe, so no path is interpreted by it.
 async fn segment_zero_start(app: &App, directory: &FsPath) -> Option<u64> {
     use tokio::io::AsyncWriteExt;
@@ -493,7 +761,7 @@ async fn segment_zero_start(app: &App, directory: &FsPath) -> Option<u64> {
     let _ = writer.await;
     let seconds: f64 = String::from_utf8(output.stdout).ok()?.trim().parse().ok()?;
     (output.status.success() && seconds.is_finite() && seconds >= 0.0)
-        .then(|| (seconds * 1000.0).round() as u64)
+        .then(|| (seconds * 1_000_000.0).round() as u64)
 }
 
 /// Report newly published segments (and completion) in order.
@@ -505,6 +773,7 @@ async fn observe(
     reported: &mut u32,
     start_ms: u64,
     operation: Operation,
+    copy_start: Option<u64>,
 ) {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -547,8 +816,15 @@ async fn observe(
             if copies_video(operation) {
                 // Copied output keeps source time (timeline time): segment 0 begins
                 // at the keyframe FFmpeg seeked to, measured from the output itself.
-                let Some(begin) = segment_zero_start(app, directory).await else {
-                    tracing::warn!(delivery=%session.id, generation, "segment 0 start not measurable");
+                // Media time equals timeline time only if FFmpeg kept the source
+                // timestamps: the measured start must be the probed keyframe.
+                // Both times are FFprobe's microsecond values for the same packet.
+                let begin = segment_zero_start(app, directory).await;
+                let Some(begin) = begin
+                    .filter(|b| copy_start.is_some_and(|expected| b.abs_diff(expected) <= 1))
+                    .map(|us| us / 1000)
+                else {
+                    tracing::warn!(delivery=%session.id, generation, ?begin, ?copy_start, "segment 0 does not start at the source keyframe");
                     let _ = apply(app, session, Input::Failed { generation });
                     return;
                 };
@@ -638,10 +914,14 @@ async fn run_generation(
         return fail(&app, &session);
     };
     let lease = Arc::new(lease);
-    let (pin, start_ms) = {
+    let (pin, start_ms, duration_ms) = {
         let inner = session.inner.lock().unwrap();
         match inner.delivery.generations.get(&generation) {
-            Some(g) => (g.pin.clone(), g.requested_start_ms),
+            Some(g) => (
+                g.pin.clone(),
+                g.requested_start_ms,
+                inner.delivery.duration_ms,
+            ),
             None => return,
         }
     };
@@ -692,6 +972,23 @@ async fn run_generation(
             tracing::warn!(delivery=%session.id, generation, %error, "delivery preparation panicked");
             return fail(&app, &session);
         }
+    };
+    // A stream copy begins at the source keyframe at or before the request; know
+    // which one before encoding, so the published start can be verified.
+    let copy_start = if copies_video(operation) {
+        // Bounded by its own deadline; not abandoned on stop, which would leave
+        // the probe unowned.
+        let probed = copy_keyframe(&app, &input, start_ms, duration_ms, &lease).await;
+        if stop.is_cancelled() {
+            return stopped(&app, &session);
+        }
+        let Some(keyframe) = probed else {
+            tracing::warn!(delivery=%session.id, generation, "no usable keyframe or keyframe spacing exceeds the copy target");
+            return fail(&app, &session);
+        };
+        Some(keyframe)
+    } else {
+        None
     };
     let mut supervisor = Command::new(&app.processing.supervisor);
     supervisor
@@ -764,7 +1061,16 @@ async fn run_generation(
                     _ = stop.cancelled() => break None,
                     observed = tokio::time::timeout(
                         OBSERVE_DEADLINE,
-                        observe(&app, &session, generation, &directory, &mut reported, start_ms, operation),
+                        observe(
+                            &app,
+                            &session,
+                            generation,
+                            &directory,
+                            &mut reported,
+                            start_ms,
+                            operation,
+                            copy_start,
+                        ),
                     ) => observed,
                 };
                 if observed.is_err() {
@@ -790,6 +1096,7 @@ async fn run_generation(
                     &mut reported,
                     start_ms,
                     operation,
+                    copy_start,
                 ),
             )
             .await;
@@ -1215,6 +1522,7 @@ fn validate_route(
     audio: Option<u32>,
     operation: Operation,
     copy_enabled: bool,
+    details: Option<&CopyDetails>,
 ) -> Result<(), ApiError> {
     if copies_video(operation) && !copy_enabled {
         return Err(ApiError::new(
@@ -1251,6 +1559,9 @@ fn validate_route(
             .iter()
             .all(|t| t.start_time_seconds.is_some_and(|s| s.abs() < 0.0005)),
         eight_bit_420: matches!(video.pixel_format.as_deref(), Some("yuv420p" | "yuvj420p")),
+        details: details
+            .filter(|d| d.revision == file.revision)
+            .map(CopyDetails::observed),
     };
     if core::live_route_supported(operation, &source) {
         return Ok(());
@@ -1363,6 +1674,18 @@ async fn admit_owned(
     use playscale_core::delivery_admission::{self as admission, Decision, Identity, Receipt};
     use sha2::{Digest, Sha256};
     let runtime = &app.processing.deliveries;
+    // Stream-copy eligibility needs the source's bitstream details; probe them
+    // before taking the admission lock or the database writer.
+    // A probe failure is reported only for a new admission: an exact retry of an
+    // acknowledged one replays its receipt below.
+    let copy_probe = match r.operation.map(LiveOperation::operation) {
+        Some(operation)
+            if copies_video(operation) && app.processing.settings.experimental_copy_routes =>
+        {
+            Some(probe_copy_details(app, &r.file_id).await)
+        }
+        _ => None,
+    };
     let _admission = runtime.admission.lock().await;
     let mut transaction = db::begin_write(&app.db).await?;
     let principal = authority.reauthorize(&mut transaction, &r).await?;
@@ -1433,11 +1756,22 @@ async fn admit_owned(
         .operation
         .unwrap_or(LiveOperation::VideoTranscode)
         .operation();
+    let copy_details = copy_probe.transpose()?;
+    if copy_details
+        .as_ref()
+        .is_some_and(|d| d.revision != file.revision)
+    {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Refresh the item",
+        ));
+    }
     validate_route(
         &file,
         r.audio_track,
         operation,
         app.processing.settings.experimental_copy_routes,
+        copy_details.as_ref(),
     )?;
     let duration_ms = file
         .duration_seconds
@@ -1618,11 +1952,27 @@ pub async fn change(
                     "Create a new delivery",
                 ));
             }
+            let details =
+                if copies_video(operation) && app.processing.settings.experimental_copy_routes {
+                    Some(probe_copy_details(&app, &session.file_id).await?)
+                } else {
+                    None
+                };
+            if details
+                .as_ref()
+                .is_some_and(|d| d.revision != file.revision)
+            {
+                return Err(ApiError::conflict(
+                    "source_revision_changed",
+                    "Create a new delivery",
+                ));
+            }
             validate_route(
                 &file,
                 audio,
                 operation,
                 app.processing.settings.experimental_copy_routes,
+                details.as_ref(),
             )?;
             Some((
                 current,
@@ -1815,7 +2165,39 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, db, validate_route};
+    use super::{CopyDetails, Operation, db, parse_copy_details, validate_route};
+
+    #[test]
+    fn copy_details_parse_profile_level_field_order_and_rotation() {
+        let parse = |json: &str| parse_copy_details(json.as_bytes(), "r".into());
+        let plain =
+            parse(r#"{"streams":[{"profile":"High","level":40,"field_order":"progressive"}]}"#)
+                .unwrap();
+        assert_eq!(
+            (
+                plain.profile.as_str(),
+                plain.level,
+                plain.progressive,
+                plain.rotated
+            ),
+            ("High", 40, true, false)
+        );
+        let rotated = parse(r#"{"streams":[{"profile":"Main","level":31,"field_order":"progressive","side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]}]}"#).unwrap();
+        assert!(rotated.rotated);
+        let upright = parse(r#"{"streams":[{"profile":"Main","level":31,"field_order":"progressive","side_data_list":[{"rotation":0}]}]}"#).unwrap();
+        assert!(!upright.rotated);
+        assert!(
+            !parse(r#"{"streams":[{"profile":"High","level":40}]}"#)
+                .unwrap()
+                .progressive
+        );
+        assert!(
+            !parse(r#"{"streams":[{"profile":"High","level":40,"field_order":"tt"}]}"#)
+                .unwrap()
+                .progressive
+        );
+        assert_eq!(parse(r#"{"streams":[]}"#), None);
+    }
 
     #[tokio::test]
     async fn copy_routes_are_refused_unless_enabled_and_eligible() {
@@ -1850,15 +2232,45 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             body["code"].as_str().map(str::to_owned)
         }
+        let details = CopyDetails {
+            revision: "r".into(),
+            profile: "High".into(),
+            level: 40,
+            progressive: true,
+            rotated: false,
+        };
         let eligible = file(tracks("yuv420p", 0.0));
-        assert!(validate_route(&eligible, Some(0), Operation::Remux, true).is_ok());
+        // Details observed for another revision do not count.
+        let stale = CopyDetails {
+            revision: "old".into(),
+            ..details.clone()
+        };
         assert_eq!(
-            code(validate_route(&eligible, Some(0), Operation::Remux, false))
-                .await
-                .as_deref(),
+            code(validate_route(
+                &eligible,
+                Some(0),
+                Operation::Remux,
+                true,
+                Some(&stale)
+            ))
+            .await
+            .as_deref(),
+            Some("route_unsupported")
+        );
+        assert!(validate_route(&eligible, Some(0), Operation::Remux, true, Some(&details)).is_ok());
+        assert_eq!(
+            code(validate_route(
+                &eligible,
+                Some(0),
+                Operation::Remux,
+                false,
+                Some(&details)
+            ))
+            .await
+            .as_deref(),
             Some("route_unqualified")
         );
-        assert!(validate_route(&eligible, Some(0), Operation::VideoTranscode, false).is_ok());
+        assert!(validate_route(&eligible, Some(0), Operation::VideoTranscode, false, None).is_ok());
         // Audio starting before zero moves the container start; 10-bit video
         // cannot be copied into the browser pipeline.
         for ineligible in [
@@ -1866,9 +2278,15 @@ mod tests {
             file(tracks("yuv420p10le", 0.0)),
         ] {
             assert_eq!(
-                code(validate_route(&ineligible, Some(0), Operation::Remux, true))
-                    .await
-                    .as_deref(),
+                code(validate_route(
+                    &ineligible,
+                    Some(0),
+                    Operation::Remux,
+                    true,
+                    Some(&details)
+                ))
+                .await
+                .as_deref(),
                 Some("route_unsupported")
             );
         }

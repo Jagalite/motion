@@ -60,6 +60,54 @@ pub struct SourceStreams<'a> {
     pub starts_at_zero: bool,
     /// The video is 8-bit 4:2:0, the only layout the browser pipeline decodes.
     pub eight_bit_420: bool,
+    /// Bitstream details observed from the source itself; None = not observed,
+    /// which makes stream copy ineligible.
+    pub details: Option<VideoDetails<'a>>,
+}
+
+/// H.264 bitstream properties that decide whether a copied stream is playable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoDetails<'a> {
+    pub profile: &'a str,
+    /// level_idc, e.g. 31 for 3.1.
+    pub level: i64,
+    pub progressive: bool,
+    /// A display rotation is present (copied streams would play unrotated).
+    pub rotated: bool,
+}
+
+/// Profiles every supported browser decodes, and the highest level (5.1).
+const COPY_PROFILES: [&str; 4] = ["Constrained Baseline", "Baseline", "Main", "High"];
+const COPY_MAX_LEVEL: i64 = 51;
+
+/// Where a stream copy for `requested_ms` begins: the last source keyframe at or
+/// before it. The HLS muxer cuts at the first keyframe at least `hls_time_s`
+/// after the current segment's start; every segment so produced up to `end_ms`
+/// (the end of the observed keyframes, or of the media) must fit `target_s`.
+/// None when no keyframe precedes the request or some segment would not fit.
+pub fn copy_start(
+    keyframes_ms: &[u64],
+    requested_ms: u64,
+    hls_time_s: u64,
+    target_s: u64,
+    end_ms: u64,
+) -> Option<u64> {
+    let start = keyframes_ms
+        .iter()
+        .copied()
+        .filter(|k| *k <= requested_ms)
+        .max()?;
+    let mut segment = start;
+    for keyframe in keyframes_ms.iter().copied().filter(|k| *k > start) {
+        if keyframe - segment >= hls_time_s * 1000 {
+            if !fits_target(keyframe - segment, target_s) {
+                return None;
+            }
+            segment = keyframe;
+        }
+    }
+    // The open segment runs at least to the end of what was observed.
+    (end_ms <= segment || fits_target(end_ms - segment, target_s)).then_some(start)
 }
 
 /// Whether a live segmented route can serve these streams. Stream copy is only
@@ -69,7 +117,15 @@ pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool
     if s.hdr || s.video.is_none() {
         return false;
     }
-    let copy = s.video == Some("h264") && s.starts_at_zero && s.eight_bit_420;
+    let copy = s.video == Some("h264")
+        && s.starts_at_zero
+        && s.eight_bit_420
+        && s.details.is_some_and(|d| {
+            COPY_PROFILES.contains(&d.profile)
+                && (1..=COPY_MAX_LEVEL).contains(&d.level)
+                && d.progressive
+                && !d.rotated
+        });
     match operation {
         Operation::VideoTranscode => true,
         Operation::Remux => copy && s.audio.is_none_or(|a| a == "aac"),
@@ -1342,6 +1398,12 @@ mod tests {
             hdr,
             starts_at_zero: true,
             eight_bit_420: true,
+            details: Some(VideoDetails {
+                profile: "High",
+                level: 40,
+                progressive: true,
+                rotated: false,
+            }),
         };
         let h264_aac = streams(Some("h264"), Some("aac"), false);
         let h264_ac3 = streams(Some("h264"), Some("ac3"), false);
@@ -1373,5 +1435,55 @@ mod tests {
         };
         assert!(!live_route_supported(Operation::Remux, &ten_bit));
         assert!(live_route_supported(Operation::VideoTranscode, &ten_bit));
+        let detail = |profile, level, progressive, rotated| SourceStreams {
+            details: Some(VideoDetails {
+                profile,
+                level,
+                progressive,
+                rotated,
+            }),
+            ..h264_aac
+        };
+        for ineligible in [
+            detail("High 10", 40, true, false),
+            detail("High 4:2:2", 40, true, false),
+            detail("High", 52, true, false),
+            detail("High", 40, false, false),
+            detail("High", 40, true, true),
+            SourceStreams {
+                details: None,
+                ..h264_aac
+            },
+        ] {
+            assert!(!live_route_supported(Operation::Remux, &ineligible));
+            assert!(live_route_supported(Operation::VideoTranscode, &ineligible));
+        }
+        assert!(live_route_supported(
+            Operation::Remux,
+            &detail("Constrained Baseline", 31, true, false)
+        ));
+    }
+
+    #[test]
+    fn copy_starts_at_the_preceding_keyframe_within_target_spacing() {
+        let keyframes = [28_000, 30_000, 32_000, 36_000, 40_000];
+        let start = |k: &[u64], requested, end| copy_start(k, requested, 4, 12, end);
+        assert_eq!(start(&keyframes, 31_000, 44_000), Some(30_000));
+        assert_eq!(start(&keyframes, 30_000, 44_000), Some(30_000));
+        assert_eq!(
+            start(&keyframes, 27_000, 44_000),
+            None,
+            "no keyframe at or before"
+        );
+        // A 13 s gap cannot fit a 12 s target.
+        assert_eq!(start(&[0, 4_000, 17_000], 1_000, 17_000), None);
+        assert_eq!(start(&[0, 4_000, 16_000], 1_000, 16_000), Some(0));
+        assert_eq!(start(&[], 0, 0), None);
+        // The muxer skips a keyframe before hls_time: 0, 5, 15 with hls_time 6
+        // cuts at 15, a 15 s segment, although no single gap exceeds 10 s.
+        assert_eq!(copy_start(&[0, 5_000, 15_000], 0, 6, 12, 15_000), None);
+        assert_eq!(copy_start(&[0, 5_000, 15_000], 0, 4, 12, 15_000), Some(0));
+        // Keyframes stop 32 s before the observed end: the open segment is too long.
+        assert_eq!(start(&[30_000, 34_000, 58_000], 31_000, 90_000), None);
     }
 }
