@@ -78,7 +78,7 @@ local evidence and are not shipped product dependencies.
 
 ## Latest local verification
 
-Current source has passed 52 focused JavaScript tests, 23 real access/API
+Current source has passed 35 focused JavaScript tests (18 bridge, 17 desktop), 23 real access/API
 integration tests, 16 presentation composition tests and four production facade/asset-verification unit tests. Earlier in this run,
 all 9 catalog persistence and 14 catalog workflow tests passed after integrating
 schema migrations 0015/0016. The real owned-server receipt records four passing
@@ -103,5 +103,5 @@ covering duplicate close, save failure/retry, cancellation after readiness,
 attachment failure/success, and disconnect error reporting. These rules concern
 Electron process/window ownership and remain in the native JavaScript adapter;
 server authorization and viewing ordering remain production core/API rules.
-The 52-test JavaScript suite and syntax/diff checks pass. Native GUI qualification
+The JavaScript suites (35 tests) and syntax/diff checks pass. Native GUI qualification
 remains separately gated; unit tests do not establish actual Electron event order.
