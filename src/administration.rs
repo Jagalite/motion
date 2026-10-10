@@ -166,7 +166,19 @@ pub async fn relocate(
     let old = load(&app, &id).await?;
     version(old.revision, r.expected_revision)?;
     let files:Vec<File>=sqlx::query_as("SELECT id,relative_path,revision,fingerprint,available FROM media_files WHERE library_id=? ORDER BY id").bind(&id).fetch_all(&app.db).await?;
-    let expected = files.clone();
+    // Excluded paths are outside the source's scope: neither required to exist
+    // at the new root nor re-enabled. Changing exclusions advances the source
+    // revision, which is rechecked under the writer lock below.
+    let scope: String = sqlx::query_scalar("SELECT exclusions_json FROM libraries WHERE id=?")
+        .bind(&id)
+        .fetch_one(&app.db)
+        .await?;
+    let scope: Vec<String> = serde_json::from_str(&scope).map_err(ApiError::internal)?;
+    let expected: Vec<File> = files
+        .iter()
+        .filter(|f| !playscale_core::sources::excluded(&f.relative_path, &scope))
+        .cloned()
+        .collect();
     let data_root = app.storage.root.clone();
     let (root, identity, stamps) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use std::io::Read;
@@ -356,27 +368,54 @@ pub async fn register_root(
             .unwrap_or("Media")
     });
     let _lock = app.jobs.lock().await;
+    // Source, paired library and membership commit together; an existing
+    // registration is returned unchanged so restarts never undo library edits.
+    let mut tx = db::begin_write(&app.db).await?;
+    let existing: Option<(String, String, String)> =
+        sqlx::query_as("SELECT id,name,root_identity FROM libraries WHERE root=?")
+            .bind(&candidate.root)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some((id, name, identity)) = existing {
+        anyhow::ensure!(
+            identity == candidate.identity,
+            "library root identity changed"
+        );
+        return Ok(db::Library { id, name });
+    }
     let roots: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries")
-        .fetch_all(&app.db)
+        .fetch_all(&mut *tx)
         .await?;
     let refs: Vec<&str> = roots.iter().map(String::as_str).collect();
     if let Some(other) = playscale_core::sources::overlapping(&candidate.root, &refs) {
         anyhow::bail!("library root overlaps registered source {other}");
     }
-    // No second path resolution: a replacement is detected by scan/serving's
-    // root identity checks, rather than silently registering a different root.
-    let library =
-        db::add_verified_library(&app.db, name, &candidate.root, &candidate.identity).await?;
-    // A v1 root is both a source and a mixed library with the same ID.
-    sqlx::query("INSERT OR IGNORE INTO catalog_libraries (id,name,kind) VALUES (?,?,'mixed')")
+    anyhow::ensure!(
+        !name.trim().is_empty() && name.len() <= 200,
+        "invalid library name"
+    );
+    let library = db::Library {
+        id: crate::new_id(),
+        name: name.trim().into(),
+    };
+    sqlx::query("INSERT INTO libraries (id,name,root,root_identity) VALUES (?,?,?,?)")
         .bind(&library.id)
         .bind(&library.name)
-        .execute(&app.db)
+        .bind(&candidate.root)
+        .bind(&candidate.identity)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT OR IGNORE INTO library_sources VALUES (?,?)")
+    // A v1 root is both a source and a mixed library with the same ID.
+    sqlx::query("INSERT INTO catalog_libraries (id,name,kind) VALUES (?,?,'mixed')")
+        .bind(&library.id)
+        .bind(&library.name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO library_sources VALUES (?,?)")
         .bind(&library.id)
         .bind(&library.id)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(library)
 }

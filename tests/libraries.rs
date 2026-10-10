@@ -5,6 +5,7 @@ use playscale_core::sources::{Availability, LibraryKind, SourceError};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -209,4 +210,85 @@ async fn upgraded_roots_become_one_library_and_source_each() {
     assert!(libraries::get_library(&f.app.db, &legacy.id).await.is_err());
     let sources = libraries::list_sources(&f.app.db).await.unwrap();
     assert_eq!(sources.len(), 2);
+}
+
+#[tokio::test]
+async fn re_registration_keeps_library_edits_and_relocation_honors_exclusions() {
+    let f = Fixture::new().await;
+    let root = f.root("v1");
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    let v1 = administration::register_root(&f.app, candidate, Some("V1"))
+        .await
+        .unwrap();
+    let other = f.source("other", &[]).await;
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    libraries::save_library(
+        &f.app,
+        Some((&library.id, library.revision)),
+        "V1",
+        LibraryKind::Mixed,
+        "",
+        std::slice::from_ref(&other.id),
+    )
+    .await
+    .unwrap();
+    // Startup re-registers configured roots; the edit must survive.
+    let again = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    administration::register_root(&f.app, again, Some("V1"))
+        .await
+        .unwrap();
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    assert_eq!(library.source_ids, std::slice::from_ref(&other.id));
+
+    // Exclude a scanned file, delete it, then relocate: the excluded path is
+    // neither required at the new root nor re-enabled.
+    std::fs::create_dir_all(root.join("Extras")).unwrap();
+    std::fs::write(root.join("keep.mp4"), b"keep").unwrap();
+    std::fs::write(root.join("Extras/gone.mp4"), b"gone").unwrap();
+    f.scan(&v1.id).await;
+    let source = libraries::get_source(&f.app.db, &v1.id).await.unwrap();
+    libraries::set_exclusions(&f.app, &v1.id, source.revision, &["Extras".into()])
+        .await
+        .unwrap();
+    f.scan(&v1.id).await;
+    let moved = f.dir.path().join("v1-moved");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::remove_file(moved.join("Extras/gone.mp4")).unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM libraries WHERE id=?")
+        .bind(&v1.id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let response = playscale::api::router(f.app.clone(), None)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/admin/libraries/{}/relocate", v1.id))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"expected_revision":revision,"root":moved}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let rows: Vec<(String, bool)> =
+        sqlx::query_as("SELECT relative_path,available FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("Extras/gone.mp4".to_string(), false),
+            ("keep.mp4".to_string(), true)
+        ]
+    );
 }
