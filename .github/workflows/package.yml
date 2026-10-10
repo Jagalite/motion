@@ -2,6 +2,7 @@ name: Build Motion package
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -12,6 +13,11 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          # As in licenses.yml: check the pushed head, not GitHub's synthetic
+          # merge commit, with the full history the identity check reads.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

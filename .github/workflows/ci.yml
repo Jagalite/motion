@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, unit, model and HTTP integration tests)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install project Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        # Two lints are allowed until their owners refactor the flagged code:
+        # src/delivery.rs (ProbeFailure size, observe arity) and
+        # src/processing.rs (command arity). Every other warning fails.
+        run: >-
+          cargo clippy --locked --workspace --all-targets --
+          -D warnings -A clippy::too_many_arguments -A clippy::result_large_err
+      - name: Tests (includes tests/contract.rs route conformance)
+        run: cargo test --locked --workspace --no-fail-fast
+
+  contract:
+    name: API contract (structure, JSON parity)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install pinned validator
+        run: |
+          python3 -m venv "$RUNNER_TEMP/contract"
+          "$RUNNER_TEMP/contract/bin/pip" install --disable-pip-version-check -r scripts/ci/contract-requirements.txt
+      - name: Validate contract
+        run: '"$RUNNER_TEMP/contract/bin/python" scripts/check_contract.py'
+      - name: JSON form matches YAML (Ruby)
+        run: ruby scripts/contract_json.rb --check
+
+  integration:
+    name: Real-process integration, upgrade and restore
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Install toolchains
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          # The released baseline builds with its own rust-toolchain.toml.
+          rustup toolchain install 1.95.0 --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: integration-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: integration-${{ runner.os }}-
+      - name: Cache released baseline server
+        uses: actions/cache@v4
+        with:
+          path: artifacts/baseline-server
+          key: baseline-server-${{ runner.os }}-${{ hashFiles('scripts/upgrade_restore_check.py') }}
+      - name: Build candidate server
+        run: cargo build --locked -p playscale --bin playscale
+      - name: Integration checks
+        run: python3 scripts/integration_checks.py --work artifacts/integration
+      - name: Upgrade from the released baseline, rollback and restore
+        run: python3 scripts/upgrade_restore_check.py --work artifacts/upgrade-restore
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-evidence
+          path: |
+            artifacts/integration
+            artifacts/upgrade-restore/receipt.json
+            artifacts/upgrade-restore/servers.log
+            artifacts/baseline-server/build.log
+          if-no-files-found: ignore
+
+  package:
+    name: Package
+    uses: ./.github/workflows/package.yml
