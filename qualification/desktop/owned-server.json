@@ -1,7 +1,7 @@
 {
   "passed": true,
-  "recorded_at": "2026-10-10T02:35:11.988Z",
-  "binary_sha256": "96f3853285c441c0331fff2b7aab94a0ac27b5efa8be5d5c3f7aa9d8da409360",
+  "recorded_at": "2026-10-10T04:10:25.189Z",
+  "binary_sha256": "b21e8e6f3cd8ce7a50b71395fe08a6cf95d4b643d2244b2b86ddaea3a8997218",
   "contract_digest": "sha256:cd4100be3f80c4172e9b6af729b8d3211c363ee5cdae3949b0e4fe7e15a3cfa0",
   "checks": {
     "private_readiness_matches_live_identity": true,
@@ -10,5 +10,5 @@
     "shutdown_releases_lock_and_restart_changes_epoch": true
   },
   "scope": "Real server bootstrap, exclusive data lock and child ownership in a disposable data directory",
-  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-owned-server-WfugT5"
+  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-owned-server-rXULvv"
 }
