@@ -153,6 +153,21 @@ app.whenReady().then(async () => {
     })()`));
     await window.loadURL(`${origin}/`);
     await new Promise(r => setTimeout(r, 1500));
+    // Command forms: one generic external module turns them into API calls.
+    const submitAndWait = async (selector, waitForReload) => {
+      const reloaded = waitForReload ? new Promise(r => contents.once('did-finish-load', r)) : null;
+      await evaluate(`document.querySelector(${JSON.stringify(selector)}).requestSubmit()`);
+      if (reloaded) await Promise.race([reloaded, new Promise(r => setTimeout(r, 10000))]);
+      else await new Promise(r => setTimeout(r, 1500));
+    };
+    await window.loadURL(`${origin}/sources`);
+    await submitAndWait('form[data-command="POST /api/v2/libraries/lib1/scans"]', true);
+    note('afterScanTitle', await evaluate('document.querySelector("h1")?.textContent ?? null'));
+    await window.loadURL(`${origin}/matches`);
+    await submitAndWait('form[data-command="PUT /api/v2/catalog/matches/m1/decision"]', true);
+    // The page still shows revision r1 (mock facade); the server is now at r2.
+    await submitAndWait('form[data-command="PUT /api/v2/catalog/matches/m1/decision"]', false);
+    note('staleDecisionMessage', await evaluate(`document.querySelector('form[data-command="PUT /api/v2/catalog/matches/m1/decision"] .command-status')?.textContent ?? null`));
   } catch (error) {
     note('exception', String(error?.stack ?? error));
   }

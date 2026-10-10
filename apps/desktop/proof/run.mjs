@@ -41,6 +41,7 @@ const mediaSha = createHash('sha256').update(readFileSync(media)).digest('hex');
 const child = spawn(server, ['--media', media, '--demuxe-dir', demuxe], {stdio: ['ignore', 'pipe', 'inherit']});
 const requests = [];
 const admitted = [];
+const commands = [];
 const closed = [];
 const lines = createInterface({input: child.stdout});
 const announced = await new Promise((resolve, reject) => {
@@ -50,6 +51,7 @@ const announced = await new Promise((resolve, reject) => {
     else if (message.request) requests.push(message.request);
     else if (message.delivery_admitted) admitted.push(message.delivery_admitted);
     else if (message.delivery_closed) closed.push(message.delivery_closed);
+    else if (message.command) commands.push(message.command);
   });
   child.once('exit', code => reject(new Error(`proof server exited ${code}`)));
 });
@@ -91,6 +93,13 @@ const results = {
     && closed.length === admitted.length && admitted.every(id => closed.includes(id)),
   waited_for_starting_generation: requests.some(r => r.method === 'GET' && /^\/api\/v2\/playback\/delivery-sessions\/[^/]+$/.test(r.path) && r.status === 200),
   plays_after_back_navigation: c.afterBack?.state === 'ready' && c.afterBack?.players === 1 && c.afterBackPlayback?.advancing === true && deliveriesCreated === 2,
+  // A command form reached the public API with a 32-hex idempotency key and the typed body.
+  command_form_creates_scan: commands.some(cmd => cmd.operation === 'createScan' && cmd.library === 'lib1'
+    && /^[0-9a-f]{32}$/.test(cmd.key) && cmd.body?.mode === 'incremental' && cmd.body?.require_complete === false && !cmd.replay),
+  // The decision carried the rendered validator; the stale second one got 412 and a conflict message.
+  if_match_conflict_surfaced: commands.filter(cmd => cmd.operation === 'decideMatch').map(cmd => cmd.status).join(',') === '200,412'
+    && commands.some(cmd => cmd.operation === 'decideMatch' && cmd.if_match === '"r1"' && cmd.body?.decision === 'accept' && cmd.body?.candidate_id === 'mc1')
+    && /changed somewhere else/.test(c.staleDecisionMessage ?? ''),
   demuxe_bytes_match_install_receipt: demuxeMismatches.length === 0,
   no_permission_granted_beyond_fullscreen: observed.permissionsGranted.every(p => p === 'fullscreen'),
 };
@@ -122,6 +131,7 @@ const receipt = {
   permission_requests: observed.permissionRequests,
   permission_checks: [...new Set(observed.permissionChecks)],
   navigation_blocked: observed.navigationBlocked,
+  commands,
   http: {requests: requests.length, deliveries_admitted: admitted, deliveries_closed: closed},
   limitations: [
     'Proof server uses a mock UiQueryFacade, mock session exchange and mock playback routes; it is not the Motion server.',

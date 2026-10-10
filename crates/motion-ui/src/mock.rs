@@ -289,4 +289,126 @@ impl UiQueryFacade for MockUiQueryFacade {
             })
         })
     }
+
+    fn profiles<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<ProfilesView>> {
+        Box::pin(async move {
+            Ok(ProfilesView {
+                profiles: who.profiles.clone(),
+                current: who.profile_id.clone(),
+                preferences: PreferencesView {
+                    audio_languages: vec!["en".into()],
+                    subtitle_languages: vec!["en".into()],
+                    subtitle_mode: "foreign_audio".into(),
+                    quality_mode: "auto".into(),
+                    allow_client_software_decode: true,
+                    autoplay: false,
+                    completion_percent: 90,
+                    etag: format!("\"prefs-{}-1\"", who.profile_id),
+                },
+            })
+        })
+    }
+
+    fn sources<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<SourcesView>> {
+        Box::pin(async move {
+            if !who.can("sources:manage") {
+                return Err(UiError::Denied);
+            }
+            Ok(SourcesView {
+                sources: vec![SourceRow {
+                    id: "src1".into(),
+                    name: "Movies disk".into(),
+                    root_path: "/media/movies".into(),
+                    availability: Availability::Available,
+                }],
+                libraries: libraries(),
+                scans: vec![ScanRow {
+                    id: "scan1".into(),
+                    library_name: "Television".into(),
+                    status: "partial".into(),
+                    started: "2026-10-09 12:00".into(),
+                    sources: vec![ScanSourceRow {
+                        source_name: "Movies disk".into(),
+                        status: "partial".into(),
+                        observed_files: 14,
+                        complete_directories: 3,
+                        incomplete_directories: 1,
+                        error_codes: vec!["permission_denied".into()],
+                    }],
+                }],
+            })
+        })
+    }
+
+    fn matches<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<MatchRow>>> {
+        Box::pin(async move {
+            if !who.can("catalog:write") {
+                return Err(UiError::Denied);
+            }
+            Ok(vec![MatchRow {
+                id: "m1".into(),
+                subject: "Harbour Lights".into(),
+                status: "review".into(),
+                etag: "\"r1\"".into(),
+                candidates: vec![
+                    MatchCandidateView {
+                        id: "mc1".into(),
+                        title: "Harbour Lights (1998)".into(),
+                        confidence_percent: Some(62),
+                        reasons: vec!["title".into(), "year".into()],
+                    },
+                    MatchCandidateView {
+                        id: "mc2".into(),
+                        title: "Harbour Lights (2017)".into(),
+                        confidence_percent: Some(55),
+                        reasons: vec!["title".into()],
+                    },
+                ],
+            }])
+        })
+    }
+
+    fn jobs<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<JobRow>>> {
+        Box::pin(async move {
+            if !who.can("processing:request") {
+                return Err(UiError::Denied);
+            }
+            Ok(vec![
+                JobRow {
+                    id: "job1".into(),
+                    kind: "probe".into(),
+                    phase: "completed".into(),
+                    progress_percent: Some(100),
+                    error_code: None,
+                },
+                JobRow {
+                    id: "job2".into(),
+                    kind: "rendition".into(),
+                    phase: "running".into(),
+                    progress_percent: Some(40),
+                    error_code: None,
+                },
+            ])
+        })
+    }
+
+    fn diagnostics<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>> {
+        Box::pin(async move {
+            if !who.can("system:admin") {
+                return Err(UiError::Denied);
+            }
+            Ok(DiagnosticsView {
+                server_id: "mock-server".into(),
+                server_version: "motion-mock".into(),
+                api_version: "2.0.0".into(),
+                schema_version: "0".into(),
+                health: "ok".into(),
+                uptime_seconds: 3600,
+                active_deliveries: 0,
+                queued_jobs: 0,
+                running_jobs: 1,
+                worker_errors: vec![],
+            })
+        })
+    }
 }

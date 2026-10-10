@@ -39,6 +39,8 @@ struct Sessions {
     sessions: HashMap<String, String>,
     deliveries: HashMap<String, bool>,
     idempotency: HashMap<String, Value>,
+    /// Match revision; a decision bumps it, so a stale If-Match gets 412.
+    match_revision: u64,
 }
 
 #[derive(Clone)]
@@ -107,11 +109,16 @@ async fn authenticate(State(state): State<AppState>, mut request: Request, next:
                 id: "everyone".into(),
                 name: "Everyone".into(),
             }],
-            permissions: vec![
-                "catalog:read".into(),
-                "playback:request".into(),
-                "viewing:write".into(),
-            ],
+            permissions: [
+                "catalog:read",
+                "catalog:write",
+                "sources:manage",
+                "playback:request",
+                "processing:request",
+                "viewing:write",
+            ]
+            .map(String::from)
+            .to_vec(),
             server_epoch: "proof-epoch".into(),
             csrf_token: csrf,
         });
@@ -178,6 +185,69 @@ async fn create_session(
         .headers_mut()
         .insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     response
+}
+
+/// Mock scan request: requires an idempotency key; logs exactly what arrived.
+async fn create_scan(
+    State(state): State<AppState>,
+    Path(library): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(key) = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
+        return problem(StatusCode::BAD_REQUEST, "idempotency_key_required");
+    };
+    let mode_ok = matches!(
+        body.get("mode").and_then(Value::as_str),
+        Some("incremental" | "verify")
+    );
+    if !mode_ok || !body.get("require_complete").is_some_and(Value::is_boolean) {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "invalid_body");
+    }
+    let mut sessions = state.sessions.lock().unwrap();
+    let replay = sessions.idempotency.contains_key(&key);
+    let scan = sessions
+        .idempotency
+        .entry(key.clone())
+        .or_insert_with(|| json!({"id": "scan-proof", "library_id": library, "status": "queued"}))
+        .clone();
+    println!(
+        "{}",
+        json!({"command": {"operation": "createScan", "library": library, "key": key, "body": body, "replay": replay}})
+    );
+    mock(StatusCode::CREATED, scan)
+}
+
+/// Mock match decision: requires If-Match for the current revision.
+async fn decide_match(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let mut sessions = state.sessions.lock().unwrap();
+    let current = format!("\"r{}\"", sessions.match_revision + 1);
+    let condition = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let outcome = match condition.as_deref() {
+        None => problem(StatusCode::PRECONDITION_REQUIRED, "precondition_required"),
+        Some(c) if c != current => problem(StatusCode::PRECONDITION_FAILED, "precondition_failed"),
+        Some(_) => {
+            sessions.match_revision += 1;
+            mock(StatusCode::OK, json!({"id": id, "status": "accepted"}))
+        }
+    };
+    println!(
+        "{}",
+        json!({"command": {"operation": "decideMatch", "if_match": condition, "body": body, "status": outcome.status().as_u16()}})
+    );
+    outcome
 }
 
 async fn plan(Json(body): Json<Value>) -> Response {
@@ -309,6 +379,11 @@ async fn main() {
     };
     let api = Router::new()
         .route("/api/v2/auth/session", post(create_session))
+        .route("/api/v2/libraries/{id}/scans", post(create_scan))
+        .route(
+            "/api/v2/catalog/matches/{id}/decision",
+            axum::routing::put(decide_match),
+        )
         .route("/api/v2/playback/plans", post(plan))
         .route("/api/v2/playback/delivery-sessions", post(admit))
         .route(

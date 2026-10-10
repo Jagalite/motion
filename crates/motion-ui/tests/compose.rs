@@ -321,3 +321,108 @@ async fn head_requests_and_unknown_pages() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_presentation_headers(&headers);
 }
+
+const ADMIN: &[&str] = &[
+    "catalog:read",
+    "catalog:write",
+    "sources:manage",
+    "profiles:manage",
+    "viewing:write",
+    "playback:request",
+    "processing:request",
+    "system:admin",
+];
+
+#[tokio::test]
+async fn administrative_screens_require_their_permissions() {
+    let viewer = app(Some(principal("everyone", VIEWER)), None);
+    for uri in ["/sources", "/matches", "/processing", "/diagnostics"] {
+        let (status, headers, html) = get_page(&viewer, uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+        assert_presentation_headers(&headers);
+        assert!(!html.contains("data-command=\"POST /api/v2/sources\""));
+    }
+    let (_, _, home) = get_page(&viewer, "/").await;
+    assert!(!home.contains(r#"href="/sources""#) && !home.contains(r#"href="/diagnostics""#));
+    assert!(home.contains(r#"href="/profiles""#));
+
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, home) = get_page(&admin, "/").await;
+    for link in [
+        "/matches",
+        "/processing",
+        "/sources",
+        "/profiles",
+        "/diagnostics",
+    ] {
+        assert!(home.contains(&format!(r#"href="{link}""#)), "{link}");
+    }
+    for uri in [
+        "/sources",
+        "/matches",
+        "/processing",
+        "/diagnostics",
+        "/profiles",
+    ] {
+        let (status, _, html) = get_page(&admin, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_strict_markup(&html);
+    }
+}
+
+#[tokio::test]
+async fn command_forms_name_public_operations_with_preconditions() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, sources) = get_page(&admin, "/sources").await;
+    assert!(sources.contains(r#"data-command="POST /api/v2/sources" data-idempotent="true""#));
+    assert!(
+        sources
+            .contains(r#"data-command="POST /api/v2/libraries/lib1/scans" data-idempotent="true""#)
+    );
+    assert!(sources.contains(r#"data-command="POST /api/v2/libraries" data-idempotent="true""#));
+    assert!(
+        sources.contains("Partial — some folders could not be read; nothing unseen was removed")
+    );
+    assert!(sources.contains("1 incomplete"));
+    let (_, _, matches) = get_page(&admin, "/matches").await;
+    assert!(matches.contains(r#"data-command="PUT /api/v2/catalog/matches/m1/decision" data-idempotent="false" data-if-match="&quot;r1&quot;""#));
+    assert!(matches.contains(r#"value="reject""#) && matches.contains(r#"value="defer""#));
+    let (_, _, processing) = get_page(&admin, "/processing").await;
+    assert!(processing.contains(r#"data-command="POST /api/v2/jobs/job2/cancel""#));
+    assert!(
+        !processing.contains("/api/v2/jobs/job1/cancel"),
+        "finished jobs offer no cancel"
+    );
+    let (_, _, profiles) = get_page(&admin, "/profiles").await;
+    assert!(profiles.contains(r#"data-command="PUT /api/v2/profiles/everyone/preferences" data-idempotent="false" data-if-match="&quot;prefs-everyone-1&quot;""#));
+    assert!(profiles.contains(r#"<option value="foreign_audio" selected="">"#));
+}
+
+#[tokio::test]
+async fn sign_in_offers_pairing_and_profiles_switch_among_allowed_profiles() {
+    let anonymous = app(None, None);
+    let (status, _, html) = get_page(&anonymous, "/profiles").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(html.contains(r#"data-command="POST /api/v2/auth/pairings""#));
+    assert!(
+        !html.contains("device_code"),
+        "device codes never appear in HTML"
+    );
+
+    let mut who = principal("kids", VIEWER);
+    who.profiles = vec![
+        ProfileOption {
+            id: "everyone".into(),
+            name: "Everyone".into(),
+        },
+        ProfileOption {
+            id: "kids".into(),
+            name: "Kids".into(),
+        },
+    ];
+    let app = app(Some(who), None);
+    let (_, _, html) = get_page(&app, "/").await;
+    assert!(html.contains(r#"data-profile-switch="motion_profile""#));
+    assert!(html.contains(r#"<option value="kids" selected="">Kids</option>"#));
+    assert!(html.contains(r#"<option value="everyone">Everyone</option>"#));
+}

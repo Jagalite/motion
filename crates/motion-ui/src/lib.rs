@@ -11,6 +11,7 @@ mod app;
 pub mod assets;
 pub mod facade;
 pub mod mock;
+mod screens;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 

@@ -139,6 +139,107 @@ pub struct PlayerView {
     pub viewing_revision: String,
 }
 
+/// Profile preferences as shown and edited on the profiles page. `etag` is the
+/// strong validator the command must send back as If-Match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreferencesView {
+    pub audio_languages: Vec<String>,
+    pub subtitle_languages: Vec<String>,
+    /// off | forced | always | foreign_audio
+    pub subtitle_mode: String,
+    /// auto | original | convert
+    pub quality_mode: String,
+    pub allow_client_software_decode: bool,
+    pub autoplay: bool,
+    pub completion_percent: u8,
+    pub etag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfilesView {
+    pub profiles: Vec<ProfileOption>,
+    pub current: String,
+    pub preferences: PreferencesView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRow {
+    pub id: String,
+    pub name: String,
+    /// Host path of an administrative source; only shown to `sources:manage`.
+    pub root_path: String,
+    pub availability: Availability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanSourceRow {
+    pub source_name: String,
+    /// queued | running | complete | partial | unavailable | stale | cancelled | failed
+    pub status: String,
+    pub observed_files: u64,
+    pub complete_directories: u64,
+    pub incomplete_directories: u64,
+    pub error_codes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRow {
+    pub id: String,
+    pub library_name: String,
+    /// queued | running | complete | partial | unavailable | cancelled | failed
+    pub status: String,
+    pub started: String,
+    pub sources: Vec<ScanSourceRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourcesView {
+    pub sources: Vec<SourceRow>,
+    pub libraries: Vec<LibraryCard>,
+    pub scans: Vec<ScanRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchCandidateView {
+    pub id: String,
+    pub title: String,
+    pub confidence_percent: Option<u8>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchRow {
+    pub id: String,
+    pub subject: String,
+    /// pending | review | accepted | rejected | deferred | stale
+    pub status: String,
+    pub etag: String,
+    pub candidates: Vec<MatchCandidateView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRow {
+    pub id: String,
+    pub kind: String,
+    pub phase: String,
+    pub progress_percent: Option<u8>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticsView {
+    pub server_id: String,
+    pub server_version: String,
+    pub api_version: String,
+    pub schema_version: String,
+    pub health: String,
+    pub uptime_seconds: u64,
+    pub active_deliveries: u64,
+    pub queued_jobs: u64,
+    pub running_jobs: u64,
+    pub worker_errors: Vec<String>,
+}
+
 /// Read-only, principal-scoped presentation queries.
 pub trait UiQueryFacade: Send + Sync + 'static {
     /// True for development/test doubles; pages then label themselves.
@@ -160,6 +261,15 @@ pub trait UiQueryFacade: Send + Sync + 'static {
         who: &'a UiPrincipal,
         timeline_id: &'a str,
     ) -> BoxFuture<'a, UiResult<PlayerView>>;
+    fn profiles<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<ProfilesView>>;
+    /// Requires `sources:manage`.
+    fn sources<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<SourcesView>>;
+    /// Requires `catalog:write`.
+    fn matches<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<MatchRow>>>;
+    /// Requires `processing:request`.
+    fn jobs<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<JobRow>>>;
+    /// Requires `system:admin`.
+    fn diagnostics<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>>;
 }
 
 /// The facade as stored in Topcoat's app context.

@@ -41,21 +41,26 @@ pub fn router(facade: Facade) -> Router {
         .page(item)
         .page(search)
         .page(play)
+        .page(crate::screens::profiles)
+        .page(crate::screens::sources)
+        .page(crate::screens::matches)
+        .page(crate::screens::processing)
+        .page(crate::screens::diagnostics)
         .build()
 }
 
 /// The authenticated principal placed in request extensions by the host.
-fn principal(cx: &Cx) -> Result<&UiPrincipal> {
+pub(crate) fn principal(cx: &Cx) -> Result<&UiPrincipal> {
     extensions(cx)
         .get::<UiPrincipal>()
         .ok_or_else(|| unauthorized().into())
 }
 
-fn facade(cx: &Cx) -> &Facade {
+pub(crate) fn facade(cx: &Cx) -> &Facade {
     app_context::<Facade>(cx)
 }
 
-fn ui_error(error: UiError) -> topcoat::Error {
+pub(crate) fn ui_error(error: UiError) -> topcoat::Error {
     match error {
         UiError::NotFound => not_found().into(),
         UiError::Denied => forbidden().into(),
@@ -73,7 +78,7 @@ fn clock(ms: u64) -> String {
     }
 }
 
-fn availability_text(value: Availability) -> &'static str {
+pub(crate) fn availability_text(value: Availability) -> &'static str {
     match value {
         Availability::Available => "Available",
         Availability::Unavailable => "Offline",
@@ -114,13 +119,30 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     <a class="brand" href=(href!(home))>"Motion"</a>
                     if let Some(who) = &who {
                         <nav aria-label="Main">
-                            <ul><li><a href=(href!(home))>"Home"</a></li></ul>
+                            <ul>
+                                <li><a href=(href!(home))>"Home"</a></li>
+                                if who.can("catalog:write") { <li><a href=(href!(crate::screens::matches))>"Matches"</a></li> }
+                                if who.can("processing:request") { <li><a href=(href!(crate::screens::processing))>"Processing"</a></li> }
+                                if who.can("sources:manage") { <li><a href=(href!(crate::screens::sources))>"Sources"</a></li> }
+                                <li><a href=(href!(crate::screens::profiles))>"Profiles"</a></li>
+                                if who.can("system:admin") { <li><a href=(href!(crate::screens::diagnostics))>"Diagnostics"</a></li> }
+                            </ul>
                         </nav>
                         <form role="search" class="search" method="get" action=(href!(search))>
                             <label class="visually-hidden" for="global-search">"Search the catalog"</label>
                             <input id="global-search" type="search" name="q" placeholder="Search">
                         </form>
-                        <span class="profile">"Profile: " (who.profile_name.as_str())</span>
+                        if who.profiles.len() > 1 {
+                            <label class="profile">"Profile "
+                                <select data-profile-switch="motion_profile">
+                                    for option in who.profiles.iter() {
+                                        <option value=(option.id.as_str()) selected=(option.id == who.profile_id)>(option.name.as_str())</option>
+                                    }
+                                </select>
+                            </label>
+                        } else {
+                            <span class="profile">"Profile: " (who.profile_name.as_str())</span>
+                        }
                     }
                 </header>
                 <main id="main" tabindex="-1">
@@ -137,11 +159,15 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             } else {
                                 return Err(error);
                             };
+                            let sign_in = status == StatusCode::UNAUTHORIZED;
                             Ok(view! {
                                 (status)
                                 <section class="status-panel" role="alert" data-state=(status.as_u16())>
                                     <h1>(title)</h1>
                                     <p>(message)</p>
+                                    if sign_in {
+                                        crate::screens::pairing_form()
+                                    }
                                 </section>
                             })
                         },
@@ -178,7 +204,7 @@ async fn item_grid(items: Vec<ItemCard>, label: &str) -> Result<impl View> {
 }
 
 #[component]
-async fn empty(message: &str) -> Result<impl View> {
+pub(crate) async fn empty(message: &str) -> Result<impl View> {
     Ok(view! { <p class="status-panel" role="status" data-state="empty">(message)</p> })
 }
 
