@@ -2626,7 +2626,7 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
 }
 
 #[tokio::test]
-async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state() {
+async fn topcoat_item_details_use_scoped_catalog_and_production_viewing_state() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let other_root = f._dir.path().join("private");
     std::fs::create_dir(&other_root).unwrap();
@@ -2720,10 +2720,12 @@ async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state
             assert!(html.contains("Film &lt;script&gt;"), "{html}");
             assert!(html.contains("Visible original"), "{html}");
             assert!(html.contains("Public season"), "{html}");
-            assert!(html.contains("Viewing history is unavailable."), "{html}");
-            assert!(html.contains("Playback is unavailable."), "{html}");
-            assert!(!html.contains("Not started."));
-            assert!(!html.contains("href=\"/play/"));
+            // Viewing state and the Play action come from the production v2
+            // viewing read and version availability, never invented.
+            assert!(html.contains("Not started."), "{html}");
+            assert!(!html.contains("Viewing history is unavailable."), "{html}");
+            assert!(!html.contains("Playback is unavailable."), "{html}");
+            assert!(html.contains("href=\"/play/visible\""), "{html}");
         }
     }
     let after: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")

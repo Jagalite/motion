@@ -73,6 +73,16 @@ function demuxeSource(generation, origin) {
   return generation.transport === 'hls' ? {url: url.href, format: 'hls'} : url.href;
 }
 
+// A version, quality or audio choice replans the same timeline. An audio
+// track other than the default asks the planner for a conversion that carries
+// exactly that stream; the server decides whether one is admissible.
+function replanInput(input, {version, quality, audio}) {
+  if (audio && !/^a[0-9]{1,4}$/.test(audio)) throw new Error('Invalid audio track');
+  return {...input, version_id: version || null, failed_candidate_ids: [],
+    quality: {...input.quality, mode: quality},
+    tracks: {...input.tracks, audio_track_id: audio || null}};
+}
+
 function nextTimeline(page, currentTimeline) {
   if (!Array.isArray(page?.items) || page.items.length > 1) throw new Error('Invalid next-title response');
   if (!page.items.length) return null;
@@ -506,8 +516,19 @@ async function start() {
     state.element = element;
     state.generation = generation;
     if (viewingRevision !== null) {
-      const session = await retryCommand('/api/v2/playback/viewing-sessions',
-        {delivery_id: delivery.id, expected_viewing_revision: viewingRevision}, key(), current);
+      const createSession = expected => retryCommand('/api/v2/playback/viewing-sessions',
+        {delivery_id: delivery.id, expected_viewing_revision: expected}, key(), current);
+      let session;
+      try { session = await createSession(viewingRevision); }
+      catch (error) {
+        if (error.status !== 409 || !current()) throw error;
+        // Possibly the previous player's final event landing after render.
+        const latest = await api('GET', `/api/v2/profiles/${encodeURIComponent(data.profileId)}/timelines/${encodeURIComponent(data.timelineId)}/viewing`,
+          undefined, undefined, AbortSignal.timeout(10000));
+        const adopted = adoptableRevision(latest, Number(data.resumeMs) || 0);
+        if (adopted === null || !current()) throw error;
+        session = await createSession(adopted);
+      }
       if (!current()) return;
       if (session.delivery_id !== delivery.id || session.profile_id !== data.profileId || session.timeline_id !== data.timelineId) {
         throw new Error('The server returned a different viewing context.');
@@ -591,10 +612,13 @@ controls?.addEventListener('click', event => {
     if (action === 'next') { const owner = state.epoch; await playNext(() => owner === state.epoch); }
     if (action === 'quality') {
       const epoch = state.epoch;
-      const next = {...state.planInput, version_id: controls.elements.version.value || null, quality: {...state.planInput.quality, mode: controls.elements.quality.value}};
+      const next = replanInput(state.planInput, {version: controls.elements.version.value,
+        quality: controls.elements.quality.value, audio: controls.elements.audio?.value});
       const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));
       if (epoch !== state.epoch) return;
-      if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) throw new Error('The selected quality is unavailable.');
+      if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) {
+        throw new Error(`The selected playback is unavailable${plan.reason_codes?.length ? ` (${plan.reason_codes.join(', ')})` : ''}.`);
+      }
       const changed = await changePlayback({kind: 'replan', plan_token: plan.plan_token,
         position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms))});
       if (changed) state.planInput = next;

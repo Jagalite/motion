@@ -67,6 +67,10 @@ fn segment(s: &str) -> String {
 }
 impl Queries {
     async fn read(&self, path: &str) -> UiResult<Value> {
+        Ok(self.read_tagged(path).await?.0)
+    }
+    /// A read and its strong validator, for views that submit If-Match.
+    async fn read_tagged(&self, path: &str) -> UiResult<(Value, Option<String>)> {
         let mut request = Request::builder()
             .uri(path)
             .body(Body::empty())
@@ -83,10 +87,29 @@ impl Queries {
         if !response.status().is_success() {
             return Err(error(response.status()));
         }
+        let etag = response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
             .await
             .map_err(|_| UiError::Unavailable)?;
-        serde_json::from_slice(&bytes).map_err(|_| UiError::Unavailable)
+        Ok((
+            serde_json::from_slice(&bytes).map_err(|_| UiError::Unavailable)?,
+            etag,
+        ))
+    }
+    /// The profile's viewing state for a timeline; None when unavailable
+    /// (a missing service must not read as an unstarted title).
+    async fn viewing(&self, who: &UiPrincipal, timeline: &str) -> Option<Value> {
+        self.read(&format!(
+            "/profiles/{}/timelines/{}/viewing",
+            segment(&who.profile_id),
+            segment(timeline)
+        ))
+        .await
+        .ok()
     }
     /// An item aggregate must not present a truncated edition/version set as
     /// complete. Bound the work and report unavailable when paging is needed.
@@ -99,6 +122,43 @@ impl Queries {
             .as_array()
             .cloned()
             .ok_or(UiError::Unavailable)
+    }
+
+    /// Audio streams of the timeline's first original, labelled for the
+    /// player's selector. The v2 contract has no track read yet, so this is a
+    /// narrow catalog read made only after the timeline itself was authorized
+    /// through the v2 adapter above; IDs match the planner's `a{n}`.
+    async fn audio_tracks(&self, timeline: &str) -> Vec<TrackOption> {
+        let tracks: Option<String> = sqlx::query_scalar(
+            "SELECT f.tracks_json FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+             JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND v.origin='original' AND f.available=1 \
+             ORDER BY v.id,b.file_id LIMIT 1",
+        )
+        .bind(timeline)
+        .fetch_optional(&self.app.db)
+        .await
+        .ok()
+        .flatten();
+        let streams: Vec<crate::db::Track> = tracks
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        streams
+            .iter()
+            .filter(|t| t.kind == "audio")
+            .enumerate()
+            .map(|(n, t)| TrackOption {
+                id: format!("a{n}"),
+                label: format!(
+                    "Track {} ({}{})",
+                    n + 1,
+                    t.language
+                        .as_deref()
+                        .map(|l| format!("{l}, "))
+                        .unwrap_or_default(),
+                    t.codec
+                ),
+            })
+            .collect()
     }
 
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
@@ -208,8 +268,27 @@ impl UiQueryFacade for Queries {
     fn is_mock(&self) -> bool {
         false
     }
-    fn home<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<HomeView>> {
+    fn home<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<HomeView>> {
         Box::pin(async move {
+            // Continue watching is optional on the home page: its absence is
+            // reported as unavailable, never as an empty history.
+            let entries = self
+                .list(&format!(
+                    "/profiles/{}/continue-watching?limit=20",
+                    segment(&who.profile_id)
+                ))
+                .await;
+            let continue_available = entries.is_ok();
+            let continue_watching = entries
+                .unwrap_or_default()
+                .iter()
+                .map(|v| ContinueCard {
+                    item: item(&v["item"]),
+                    timeline_id: text(&v["timeline"], "id"),
+                    position_ms: v["viewing"]["position_ms"].as_u64().unwrap_or(0),
+                    duration_ms: v["timeline"]["duration_ms"].as_u64(),
+                })
+                .collect();
             Ok(HomeView {
                 libraries: self
                     .list("/libraries?limit=200")
@@ -217,8 +296,8 @@ impl UiQueryFacade for Queries {
                     .iter()
                     .map(library)
                     .collect(),
-                continue_watching: vec![],
-                continue_available: false,
+                continue_watching,
+                continue_available,
             })
         })
     }
@@ -265,7 +344,7 @@ impl UiQueryFacade for Queries {
             })
         })
     }
-    fn item<'a>(&'a self, _: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<ItemView>> {
+    fn item<'a>(&'a self, who: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<ItemView>> {
         Box::pin(async move {
             let path = format!("/catalog/items/{}", segment(id));
             let value = self.read(&path).await?;
@@ -313,27 +392,104 @@ impl UiQueryFacade for Queries {
                         }
                     })
                     .collect();
+                let viewing = self.viewing(who, &timeline).await.map(|v| TimelineViewing {
+                    position_ms: v["position_ms"].as_u64().unwrap_or(0),
+                    watched: v["watched"].as_bool().unwrap_or(false),
+                });
                 timelines.push(TimelineView {
                     id: timeline,
                     edition: text(edition, "label"),
                     duration_ms: row["duration_ms"].as_u64(),
-                    viewing: None,
+                    viewing,
                     versions,
                 });
             }
+            // The planner decides per request; this only offers the action
+            // when some version could be played at all.
+            let playback_available = timelines.iter().any(|t| {
+                t.versions
+                    .iter()
+                    .any(|v| v.availability == Availability::Available)
+            });
             Ok(ItemView {
                 item: item(&value),
                 children,
                 timelines,
-                playback_available: false,
+                playback_available,
             })
         })
     }
-    fn player<'a>(&'a self, _: &'a UiPrincipal, _: &'a str) -> BoxFuture<'a, UiResult<PlayerView>> {
-        Box::pin(async { Err(UiError::Unavailable) })
+    fn player<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        timeline_id: &'a str,
+    ) -> BoxFuture<'a, UiResult<PlayerView>> {
+        Box::pin(async move {
+            if !who.can("playback:request") {
+                return Err(UiError::Denied);
+            }
+            let timeline = self
+                .read(&format!("/catalog/timelines/{}", segment(timeline_id)))
+                .await?;
+            let item_id = text(&timeline, "item_id");
+            let work = self
+                .read(&format!("/catalog/items/{}", segment(&item_id)))
+                .await?;
+            let duration_ms = timeline["duration_ms"].as_u64();
+            let viewing = self
+                .viewing(who, timeline_id)
+                .await
+                .ok_or(UiError::Unavailable)?;
+            let position = viewing["position_ms"].as_u64().unwrap_or(0);
+            // A watched title, or one stopped in its final second, starts over.
+            let finished = viewing["watched"].as_bool().unwrap_or(false)
+                || duration_ms.is_some_and(|d| position.saturating_add(1000) >= d);
+            Ok(PlayerView {
+                item_id,
+                title: text(&work, "title"),
+                timeline_id: timeline_id.into(),
+                duration_ms,
+                resume_ms: if finished { 0 } else { position },
+                viewing_revision: text(&viewing, "revision"),
+                audio_tracks: self.audio_tracks(timeline_id).await,
+            })
+        })
     }
-    fn profiles<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<ProfilesView>> {
-        Box::pin(async { Err(UiError::Unavailable) })
+    fn profiles<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<ProfilesView>> {
+        Box::pin(async move {
+            let (prefs, etag) = self
+                .read_tagged(&format!(
+                    "/profiles/{}/preferences",
+                    segment(&who.profile_id)
+                ))
+                .await?;
+            let languages = |key: &str| -> Vec<String> {
+                prefs[key]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            Ok(ProfilesView {
+                profiles: who.profiles.clone(),
+                current: who.profile_id.clone(),
+                preferences: PreferencesView {
+                    audio_languages: languages("audio_languages"),
+                    subtitle_languages: languages("subtitle_languages"),
+                    subtitle_mode: text(&prefs, "subtitle_mode"),
+                    quality_mode: text(&prefs, "quality_mode"),
+                    allow_client_software_decode: prefs["allow_client_software_decode"]
+                        .as_bool()
+                        .unwrap_or(true),
+                    autoplay: prefs["autoplay"].as_bool().unwrap_or(false),
+                    completion_percent: prefs["completion_percent"].as_f64().unwrap_or(90.0),
+                    etag: etag.ok_or(UiError::Unavailable)?,
+                },
+            })
+        })
     }
     fn sources<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<SourcesView>> {
         Box::pin(async move {

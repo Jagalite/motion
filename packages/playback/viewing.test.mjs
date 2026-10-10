@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {createViewingWriter} from './viewing.mjs';
+import {adoptableRevision, createViewingWriter} from './viewing.mjs';
 
 const session = {id: 'v1', delivery_id: 'd1', profile_id: 'p1', timeline_id: 't1', sequence: '0', position_ms: 0, status: 'paused'};
 const snapshot = (position_ms, status = 'playing') => ({position_ms, status, delivery_generation: '1'});
@@ -136,4 +136,15 @@ test('u64 limits reject invalid observations and exhausted sequences', async () 
   const writer = createViewingWriter({...session, sequence: '18446744073709551615'}, options);
   writer.record(snapshot(1));
   await assert.rejects(writer.flush(), /exhausted/);
+});
+
+test('a newer viewing revision is adopted only when it cannot change the offered resume', () => {
+  const state = (over = {}) => ({revision: '7', watched: false, manual_watched: null, position_ms: 52720, ...over});
+  assert.equal(adoptableRevision(state(), 52720), '7');
+  assert.equal(adoptableRevision(state({position_ms: 54000}), 52720), '7');
+  assert.equal(adoptableRevision(state({position_ms: 60000}), 52720), null, 'progress moved elsewhere');
+  assert.equal(adoptableRevision(state({watched: true}), 52720), null, 'watched since render');
+  assert.equal(adoptableRevision(state({manual_watched: false}), 52720), null, 'manual override');
+  assert.equal(adoptableRevision(state({revision: 'x'}), 52720), null);
+  assert.equal(adoptableRevision(null, 0), null);
 });

@@ -415,6 +415,11 @@ async fn play(cx: &Cx) -> Result<impl View> {
                     <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
                 }
             </select></label>
+            <label>"Audio "<select name="audio"><option value="">"Default"</option>
+                for track in view_model.audio_tracks.iter() {
+                    <option value=(track.id.as_str())>(track.label.as_str())</option>
+                }
+            </select></label>
             <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
             <button type="button" data-player-action="quality">"Apply quality"</button>
             <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>

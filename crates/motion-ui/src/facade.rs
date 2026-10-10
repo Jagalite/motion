@@ -145,6 +145,15 @@ pub struct PlayerView {
     pub duration_ms: Option<u64>,
     pub resume_ms: u64,
     pub viewing_revision: String,
+    /// Audio streams of the planned original, by planning track ID (`a{n}`).
+    /// Choosing one other than the first asks the planner for a conversion.
+    pub audio_tracks: Vec<TrackOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackOption {
+    pub id: String,
+    pub label: String,
 }
 
 /// Profile preferences as shown and edited on the profiles page. `etag` is the
