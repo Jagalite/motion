@@ -2349,6 +2349,12 @@ async fn source_library_crud_requires_authority_preconditions_and_preserves_medi
         .status,
         StatusCode::CONFLICT
     );
+    // Finished scan history does not block (or break) deleting the library.
+    sqlx::query("INSERT INTO scan_requests VALUES ('finished-req',?,0,1)")
+        .bind(library.body["id"].as_str().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     assert_eq!(
         f.call(
             "DELETE",

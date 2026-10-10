@@ -5,6 +5,7 @@ use playscale_core::sources::{Availability, LibraryKind, SourceError};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -214,6 +215,240 @@ async fn legacy_registration_creates_one_library_and_source_each() {
     assert_eq!(paired.source_ids, std::slice::from_ref(&legacy.id));
     let sources = libraries::list_sources(&f.app.db).await.unwrap();
     assert_eq!(sources.len(), 2);
+}
+
+#[tokio::test]
+async fn re_registration_keeps_library_edits_and_relocation_honors_exclusions() {
+    let f = Fixture::new().await;
+    let root = f.root("v1");
+    let candidate = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    let v1 = administration::register_root(&f.app, candidate, Some("V1"))
+        .await
+        .unwrap();
+    let other = f.source("other", &[]).await;
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    libraries::save_library(
+        &f.app,
+        Some((&library.id, library.revision)),
+        "V1",
+        LibraryKind::Mixed,
+        "",
+        std::slice::from_ref(&other.id),
+    )
+    .await
+    .unwrap();
+    // Startup re-registers configured roots; the edit must survive.
+    let again = administration::candidate_root(&f.app, root.clone())
+        .await
+        .unwrap();
+    administration::register_root(&f.app, again, Some("V1"))
+        .await
+        .unwrap();
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    assert_eq!(library.source_ids, std::slice::from_ref(&other.id));
+
+    // Exclude a scanned file, delete it, then relocate: the excluded path is
+    // neither required at the new root nor re-enabled.
+    std::fs::create_dir_all(root.join("Extras")).unwrap();
+    std::fs::write(root.join("keep.mp4"), b"keep").unwrap();
+    std::fs::write(root.join("Extras/gone.mp4"), b"gone").unwrap();
+    f.scan(&v1.id).await;
+    let source = libraries::get_source(&f.app.db, &v1.id).await.unwrap();
+    // No scan after changing exclusions: relocation itself must stop
+    // offering the excluded file.
+    libraries::set_exclusions(&f.app, &v1.id, source.revision, &["Extras".into()])
+        .await
+        .unwrap();
+    let moved = f.dir.path().join("v1-moved");
+    std::fs::rename(&root, &moved).unwrap();
+    std::fs::remove_file(moved.join("Extras/gone.mp4")).unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM libraries WHERE id=?")
+        .bind(&v1.id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let response = playscale::api::router(f.app.clone(), None)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/admin/libraries/{}/relocate", v1.id))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", "Bearer test-secret-token")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"expected_revision":revision,"root":moved}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let rows: Vec<(String, bool)> =
+        sqlx::query_as("SELECT relative_path,available FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("Extras/gone.mp4".to_string(), false),
+            ("keep.mp4".to_string(), true)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn v1_registration_pairs_a_source_only_root_once() {
+    let f = Fixture::new().await;
+    let source = f.source("shared", &[]).await;
+    let candidate = administration::candidate_root(&f.app, f.root("shared"))
+        .await
+        .unwrap();
+    let v1 = administration::register_root(&f.app, candidate, Some("Shared"))
+        .await
+        .unwrap();
+    assert_eq!(v1.id, source.id);
+    let library = libraries::get_library(&f.app.db, &v1.id).await.unwrap();
+    assert_eq!(library.source_ids, std::slice::from_ref(&source.id));
+}
+
+#[tokio::test]
+async fn deleting_libraries_and_sources_never_touches_originals() {
+    let f = Fixture::new().await;
+    let used = f.source("used", &[]).await;
+    let empty = f.source("empty", &[]).await;
+    std::fs::write(f.root("used").join("film.mp4"), b"film").unwrap();
+    let library = libraries::save_library(
+        &f.app,
+        None,
+        "L",
+        LibraryKind::Mixed,
+        "",
+        std::slice::from_ref(&used.id),
+    )
+    .await
+    .unwrap();
+    // A source referenced by a library cannot be removed.
+    let used_view = libraries::get_source(&f.app.db, &used.id).await.unwrap();
+    assert!(matches!(
+        libraries::delete_source(&f.app, &used.id, used_view.revision).await,
+        Err(libraries::LibraryError::Busy)
+    ));
+    f.scan(&used.id).await;
+    assert!(matches!(
+        libraries::delete_library(&f.app, &library.id, 0).await,
+        Err(libraries::LibraryError::Rejected(
+            SourceError::StaleRevision
+        ))
+    ));
+    libraries::delete_library(&f.app, &library.id, library.revision)
+        .await
+        .unwrap();
+    assert!(
+        libraries::get_library(&f.app.db, &library.id)
+            .await
+            .is_err()
+    );
+    // With cataloged files the source is disabled, not deleted.
+    let used_view = libraries::get_source(&f.app.db, &used.id).await.unwrap();
+    assert_eq!(
+        libraries::delete_source(&f.app, &used.id, used_view.revision)
+            .await
+            .unwrap(),
+        libraries::SourceRemoval::Disabled
+    );
+    assert!(
+        f.root("used").join("film.mp4").exists(),
+        "originals untouched"
+    );
+    let available: bool = sqlx::query_scalar("SELECT available FROM media_files")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(!available);
+    // An unused source with no catalog is deleted outright.
+    assert_eq!(
+        libraries::delete_source(&f.app, &empty.id, empty.revision)
+            .await
+            .unwrap(),
+        libraries::SourceRemoval::Deleted
+    );
+    assert!(libraries::get_source(&f.app.db, &empty.id).await.is_err());
+}
+
+#[tokio::test]
+async fn relocation_is_previewed_then_committed_against_unchanged_facts() {
+    let f = Fixture::new().await;
+    let source = f.source("old", &[]).await;
+    std::fs::write(f.root("old").join("a.mp4"), b"alpha").unwrap();
+    f.scan(&source.id).await;
+    let moved = f.dir.path().join("new");
+    std::fs::rename(f.root("old"), &moved).unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
+    assert_eq!(plan.verified.len(), 1);
+    // The file changes after preview: commit is refused.
+    std::fs::write(moved.join("a.mp4"), b"alpha!").unwrap();
+    assert!(matches!(
+        libraries::commit_relocation(&f.app, &plan).await,
+        Err(libraries::RelocationError::Conflict(
+            playscale_core::sources::RelocationConflict::FileChanged(_)
+        ))
+    ));
+    std::fs::write(moved.join("a.mp4"), b"alpha").unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
+    // A publication between preview and commit changes the reviewed catalog.
+    sqlx::query("UPDATE media_files SET available=0 WHERE library_id=?")
+        .bind(&source.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        libraries::commit_relocation(&f.app, &plan).await,
+        Err(libraries::RelocationError::Conflict(
+            playscale_core::sources::RelocationConflict::SourceChanged
+        ))
+    ));
+    sqlx::query("UPDATE media_files SET available=1 WHERE library_id=?")
+        .bind(&source.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
+    let view = libraries::commit_relocation(&f.app, &plan).await.unwrap();
+    assert_eq!(view.binding_revision, source.binding_revision + 1);
+    assert!(
+        matches!(
+            libraries::commit_relocation(&f.app, &plan).await,
+            Err(libraries::RelocationError::Conflict(
+                playscale_core::sources::RelocationConflict::SourceChanged
+            ))
+        ),
+        "a committed plan cannot be replayed"
+    );
+    // A candidate missing content is rejected at preview.
+    let empty = f.root("empty");
+    let candidate = administration::candidate_root(&f.app, empty).await.unwrap();
+    assert!(matches!(
+        libraries::preview_relocation(&f.app, &source.id, candidate).await,
+        Err(libraries::RelocationError::CandidateMismatch(_))
+    ));
 }
 
 #[tokio::test]

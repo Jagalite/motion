@@ -326,6 +326,7 @@ pub(crate) async fn decide_in_transaction(
             .await?;
     }
     store(tx, &next, false).await?;
+    crate::search::refresh(tx, 100).await?;
     Ok(Decided {
         proposal: next,
         item_id: item,
@@ -401,4 +402,105 @@ pub(crate) async fn provider_identity_allowed(
         current.as_ref(),
         incoming.as_ref(),
     ))
+}
+
+/// Fix-match: reopen a decided proposal at its reviewed revision. The work's
+/// manual pin stays until a new decision (or an explicit unmatch).
+pub async fn reopen(
+    app: &App,
+    id: &str,
+    expected_revision: u64,
+) -> Result<Proposal, MatchingError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let row: Row = sqlx::query_as(&format!("SELECT {COLUMNS} WHERE id=?"))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let proposal = decode(row)?;
+    let current: Option<String> = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&proposal.file_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let next = matching::reopen(&proposal, expected_revision, current.as_deref())?;
+    // Only one undecided proposal per file may exist.
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM match_proposals WHERE file_id=? AND status IN ('pending','review','deferred')",
+    )
+    .bind(&proposal.file_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if open > 0 {
+        return Err(MatchingError::Rejected(MatchError::StaleProposal));
+    }
+    // The replaced decision is preserved as an immutable receipt.
+    sqlx::query("INSERT INTO catalog_receipts VALUES (?,?,?,?)")
+        .bind(new_id())
+        .bind("match:reopen")
+        .bind(now())
+        .bind(serde_json::to_string(&proposal)?)
+        .execute(&mut *tx)
+        .await?;
+    store(&mut tx, &next, false).await?;
+    tx.commit().await?;
+    Ok(next)
+}
+
+/// Release a work's manual pin; contributions remain as evidence.
+pub async fn unmatch(app: &App, item: &str) -> Result<(), MatchingError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let state: String = sqlx::query_scalar("SELECT match_state FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)")
+        .bind(item)
+        .fetch_one(&mut *tx)
+        .await?;
+    let state: MatchState = serde_json::from_value(serde_json::Value::String(state))?;
+    let next = serde_json::to_value(matching::unmatch(state))?;
+    sqlx::query("UPDATE items SET match_state=? WHERE id=?")
+        .bind(next.as_str())
+        .bind(item)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Manual identification without a proposal: record the provider identity
+/// on the work and pin it. A different identity already pinned in that
+/// namespace must be unmatched first.
+pub async fn identify_manually(
+    app: &App,
+    item: &str,
+    namespace: &str,
+    value: &str,
+) -> Result<(), MatchingError> {
+    let source = namespace.split(':').next().unwrap_or(namespace);
+    if value.is_empty() || value.len() > 256 || source.is_empty() {
+        return Err(MatchingError::Rejected(MatchError::UnknownCandidate(
+            value.into(),
+        )));
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)",
+    )
+    .bind(item)
+    .fetch_one(&mut *tx)
+    .await?;
+    if live == 0 {
+        // Retired (merged) works take no new identity; identify the live work.
+        return Err(MatchingError::NotFound);
+    }
+    if !provider_identity_allowed(&mut tx, item, source, Some(value)).await? {
+        return Err(MatchingError::IdentityTaken);
+    }
+    identify(&mut tx, item, namespace, value).await?;
+    sqlx::query("UPDATE items SET match_state='manual' WHERE id=?")
+        .bind(item)
+        .execute(&mut *tx)
+        .await?;
+    crate::search::refresh(&mut tx, 100).await?;
+    tx.commit().await?;
+    Ok(())
 }

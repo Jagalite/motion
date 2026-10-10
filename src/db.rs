@@ -34,6 +34,17 @@ pub struct Track {
     pub color_transfer: Option<String>,
     #[serde(default)]
     pub start_time_seconds: Option<f64>,
+    /// Container disposition flags and title, when the probe reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_track: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hearing_impaired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commentary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Item {
@@ -105,6 +116,8 @@ pub struct JobRow {
     pub incomplete_directories: i64,
     /// Source binding revision observed by the running attempt.
     pub binding_revision: Option<i64>,
+    /// Freshness barrier observed when traversal started.
+    pub started_barrier: Option<i64>,
 }
 impl JobRow {
     pub fn state(&self) -> anyhow::Result<Job> {
@@ -381,6 +394,12 @@ pub(crate) async fn enqueue_transaction(
     playscale_core::scan::admit(existing.as_ref().map(|j| j.full_scan), full)
         .map_err(anyhow::Error::msg)?;
     if let Some(row) = existing {
+        // The direct requester now relies on this attempt: no demand
+        // cancellation may stop it.
+        sqlx::query("UPDATE jobs SET direct_request=1 WHERE id=?")
+            .bind(&row.id)
+            .execute(&mut **tx)
+            .await?;
         return Ok(row.id);
     }
     let id = new_id();
@@ -414,29 +433,62 @@ pub fn phase_name(phase: Phase) -> &'static str {
 }
 pub async fn cancel(app: &App, id: &str) -> anyhow::Result<JobRow> {
     let _guard = app.jobs.lock().await;
-    let row = get_job(&app.db, id).await?;
+    let mut tx = begin_write(&app.db).await?;
+    let row: JobRow = sqlx::query_as("SELECT * FROM jobs WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
     let (next, _) = transition(&row.state()?, Input::Cancel);
     sqlx::query("UPDATE jobs SET phase=? WHERE id=?")
         .bind(phase_name(next.phase))
         .bind(id)
-        .execute(&app.db)
+        .execute(&mut *tx)
         .await?;
+    // A directly cancelled attempt no longer serves pending demands; they get
+    // a follow-up in the same transaction.
+    crate::scans::after_attempt(&mut tx, id).await?;
+    tx.commit().await?;
     get_job(&app.db, id).await
 }
+
 pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
-    let rows: Vec<JobRow> =
-        sqlx::query_as("SELECT * FROM jobs WHERE phase IN ('running','cancelling')")
-            .fetch_all(db)
-            .await?;
-    let mut tx = db.begin().await?;
+    let rows: Vec<JobRow> = sqlx::query_as(
+        "SELECT * FROM jobs WHERE phase IN ('running','cancelling') ORDER BY created_at,id",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut tx = begin_write(db).await?;
     for row in rows {
-        let (next, _) = transition(&row.state()?, Input::Recover);
-        sqlx::query("UPDATE jobs SET phase=? WHERE id=?")
+        let (mut next, _) = transition(&row.state()?, Input::Recover);
+        if next.phase == Phase::Queued {
+            // A queued follow-up already exists: it absorbs the interrupted
+            // attempt's mode, and the interrupted attempt is cancelled rather
+            // than becoming a second queued attempt for the source.
+            let queued: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE library_id=? AND phase='queued' AND id<>?",
+            )
+            .bind(&row.library_id)
+            .bind(&row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(queued) = queued {
+                // Mode and direct-requester ownership both carry over.
+                sqlx::query("UPDATE jobs SET full_scan=max(full_scan,?),direct_request=max(direct_request,(SELECT direct_request FROM jobs WHERE id=?)) WHERE id=?")
+                    .bind(row.full_scan)
+                    .bind(&row.id)
+                    .bind(&queued)
+                    .execute(&mut *tx)
+                    .await?;
+                next = transition(&next, Input::Cancel).0;
+            }
+        }
+        sqlx::query("UPDATE jobs SET phase=?,started_barrier=NULL WHERE id=?")
             .bind(phase_name(next.phase))
             .bind(row.id)
             .execute(&mut *tx)
             .await?;
     }
+    crate::scans::reconcile_all(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -478,4 +530,109 @@ mod transaction_tests {
             .await
             .unwrap();
     }
+}
+
+/// Result of restoring a verified backup into a fresh destination.
+#[derive(Debug, Clone, Serialize)]
+pub struct RestoreReceipt {
+    pub destination: std::path::PathBuf,
+    pub restored_from_version: i64,
+    pub schema_version: i64,
+    /// Rotated restore epoch, when the access schema (A08) is present.
+    pub restore_epoch: Option<String>,
+}
+
+/// Restore a backup into a new destination: verify the backup, copy it,
+/// upgrade the copy through the normal migrator (taking its own pre-upgrade
+/// backup), check integrity and references, and rotate the restore epoch so
+/// cursors and ephemeral authority from another history are invalidated.
+/// The active installation is switched by the operator only afterwards; the
+/// destination must not already exist and original media are never touched.
+pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<RestoreReceipt> {
+    anyhow::ensure!(!destination.exists(), "restore destination already exists");
+    let applied = {
+        use sqlx::Connection;
+        let mut conn = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(backup).read_only(true),
+        )
+        .await?;
+        let versions: Vec<i64> = sqlx::query_scalar(
+            "SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version",
+        )
+        .fetch_all(&mut conn)
+        .await?;
+        conn.close().await?;
+        versions
+    };
+    verify_backup(backup, applied.len()).await?;
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    // Copy through SQLite so committed WAL content is included and the
+    // destination is a single clean file, never a torn file-level copy.
+    {
+        use sqlx::Connection;
+        let mut source = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(backup).read_only(true),
+        )
+        .await?;
+        sqlx::query("VACUUM INTO ?")
+            .bind(destination.to_str().context("destination must be UTF-8")?)
+            .execute(&mut source)
+            .await?;
+        source.close().await?;
+    }
+    let restored = match connect(destination).await {
+        Ok(db) => db,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(destination).await;
+            return Err(error.context("restored database could not be upgraded"));
+        }
+    };
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&restored)
+        .await?;
+    let dangling = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&restored)
+        .await?;
+    anyhow::ensure!(
+        integrity == "ok" && dangling.is_empty(),
+        "restored database failed integrity checks"
+    );
+    let has_identity: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='server_identity'",
+    )
+    .fetch_one(&restored)
+    .await?;
+    let restore_epoch = if has_identity > 0 {
+        let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
+            .fetch_one(&restored)
+            .await?;
+        sqlx::query("UPDATE server_identity SET restore_epoch=?")
+            .bind(&epoch)
+            .execute(&restored)
+            .await?;
+        Some(epoch)
+    } else {
+        None
+    };
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success=1")
+            .fetch_one(&restored)
+            .await?;
+    let receipt = RestoreReceipt {
+        destination: destination.to_path_buf(),
+        restored_from_version: applied.last().copied().unwrap_or(0),
+        schema_version,
+        restore_epoch,
+    };
+    sqlx::query("INSERT INTO catalog_receipts VALUES (?,?,?,?)")
+        .bind(new_id())
+        .bind("migration:restore")
+        .bind(now())
+        .bind(serde_json::to_string(&receipt)?)
+        .execute(&restored)
+        .await?;
+    restored.close().await;
+    Ok(receipt)
 }

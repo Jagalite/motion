@@ -24,6 +24,8 @@ pub struct Found {
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
     pub reused: bool,
+    /// Sidecar NFO observed and parsed beside the file (outside the writer).
+    pub nfo: crate::nfo::Sidecar,
 }
 
 pub fn fingerprint(meta: &std::fs::Metadata) -> String {
@@ -74,6 +76,9 @@ const INCOMPLETE_REPORT_LIMIT: usize = 200;
 #[derive(Default)]
 pub struct Inventory {
     pub files: Vec<PathBuf>,
+    /// Subtitle-looking sidecar names per directory with a stat fingerprint,
+    /// matched to media stems at publication.
+    pub subtitles: BTreeMap<String, Vec<(String, String)>>,
     pub complete: BTreeSet<String>,
     pub incomplete: BTreeMap<String, &'static str>,
 }
@@ -112,6 +117,7 @@ fn device(meta: &std::fs::Metadata) -> u64 {
         0
     }
 }
+const SUBTITLES: [&str; 4] = ["srt", "vtt", "ass", "ssa"];
 const MEDIA: [&str; 14] = [
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "ts", "m2ts", "mp3", "m4a", "flac", "ogg", "wav",
     "opus",
@@ -142,6 +148,7 @@ fn inventory(
     let mut out = Inventory::default();
     let mut pending = vec![PathBuf::new()];
     let mut first = true;
+    let mut subtitle_count = 0usize;
     while let Some(relative) = pending.pop() {
         anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
         let Some(name) = key(&relative) else {
@@ -190,6 +197,22 @@ fn inventory(
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            if kind.is_file() && SUBTITLES.contains(&extension.as_str()) {
+                // An unobservable sidecar leaves its directory unproven, so
+                // previously recorded sidecars there are retained.
+                match (child.file_name().and_then(|n| n.to_str()), entry.metadata()) {
+                    _ if subtitle_count >= FILE_LIMIT => reason = Some("file_limit"),
+                    (Some(file), Ok(meta)) => {
+                        subtitle_count += 1;
+                        out.subtitles
+                            .entry(name.clone())
+                            .or_default()
+                            .push((file.to_string(), fingerprint(&meta)));
+                    }
+                    _ => reason = Some("unreadable_entry"),
+                }
+                continue;
+            }
             if !kind.is_file() || !MEDIA.contains(&extension.as_str()) {
                 continue;
             }
@@ -267,7 +290,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment",
             "-of",
             "json",
             "-i",
@@ -337,6 +360,16 @@ pub(crate) async fn inspect(
                 .as_str()
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f64| v.is_finite()),
+            default_track: s["disposition"]["default"].as_i64().map(|v| v == 1),
+            forced: s["disposition"]["forced"].as_i64().map(|v| v == 1),
+            hearing_impaired: s["disposition"]["hearing_impaired"]
+                .as_i64()
+                .map(|v| v == 1),
+            commentary: s["disposition"]["comment"].as_i64().map(|v| v == 1),
+            title: s["tags"]["title"]
+                .as_str()
+                .filter(|t| t.len() <= 200)
+                .map(str::to_owned),
         })
         .collect();
     Ok(Found {
@@ -348,6 +381,7 @@ pub(crate) async fn inspect(
         duration,
         tracks,
         reused: false,
+        nfo: crate::nfo::Sidecar::Absent,
     })
 }
 
@@ -426,6 +460,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         duration: row.duration_seconds,
                         tracks: serde_json::from_str(&row.tracks_json)?,
                         reused: true,
+                        nfo: crate::nfo::Sidecar::Absent,
                     }))
                 })
                 .await?
@@ -474,6 +509,21 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         }
     }
     anyhow::ensure!(!shutdown.is_cancelled(), "server stopping");
+    // Sidecar NFOs are small bounded reads, done before the writer transaction.
+    let sidecar_root = path.clone();
+    let hold = permit.clone();
+    found = tokio::task::spawn_blocking(move || {
+        let _hold = hold;
+        let mut budget = crate::nfo::SCAN_BUDGET;
+        found
+            .into_iter()
+            .map(|mut f| {
+                f.nfo = crate::nfo::read(&sidecar_root, &f.relative, &mut budget);
+                f
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
     let hold = permit.clone();
     let final_identity = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let _hold = hold;
@@ -578,7 +628,8 @@ async fn finish(
                 .await?;
         }
         let mut assigned: Vec<String> = Vec::with_capacity(files.len());
-        for (file, assignment) in files.into_iter().zip(plan.assignments) {
+        for (mut file, assignment) in files.into_iter().zip(plan.assignments) {
+            let sidecar = std::mem::replace(&mut file.nfo, crate::nfo::Sidecar::Absent);
             use playscale_core::scan::Assignment;
             let mut first_version = false;
             let (id, edition) = match assignment {
@@ -625,6 +676,7 @@ async fn finish(
             };
             assigned.push(edition.clone());
             let file_id = id.clone();
+            let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
             sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
                 .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
@@ -640,6 +692,15 @@ async fn finish(
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
+            crate::nfo::publish(&mut tx, &file_id, &sidecar).await?;
+            crate::components::publish_sidecars(
+                &mut tx,
+                &file_id,
+                &file_relative,
+                &inventory.subtitles,
+                &inventory.complete,
+            )
+            .await?;
         }
     }
     crate::matching::invalidate_changed(&mut tx).await?;
@@ -653,6 +714,8 @@ async fn finish(
         .bind(&job.id)
         .execute(&mut *tx)
         .await?;
+    crate::scans::after_attempt(&mut tx, &job.id).await?;
+    crate::search::refresh(&mut tx, 500).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -674,7 +737,7 @@ pub async fn worker(app: App, shutdown: CancellationToken) -> anyhow::Result<()>
                 let runs = matches!(effects.as_slice(), [Effect::Run { .. }]);
                 // The attempt records the source binding it observes; a rebind
                 // before publication fences it.
-                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=?,binding_revision=(SELECT binding_revision FROM libraries WHERE id=jobs.library_id) WHERE id=?")
+                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=?,binding_revision=(SELECT binding_revision FROM libraries WHERE id=jobs.library_id),started_barrier=(SELECT scan_barrier FROM libraries WHERE id=jobs.library_id) WHERE id=?")
                     .bind(db::phase_name(next.phase))
                     .bind(next.attempt)
                     .bind((!runs).then_some("job attempt limit reached"))
