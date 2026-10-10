@@ -1314,3 +1314,164 @@ async fn videotoolbox_live_transcode_uses_the_hardware_encoder() {
     .expect("encoder capacity was not released");
     f.stop.cancel();
 }
+
+/// Text subtitles are delivered as a WebVTT sidecar in timeline time, on the
+/// generation that pins them; removing the choice removes the sidecar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_subtitles_are_served_as_webvtt_sidecars() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let srt = f.dir.path().join("cues.srt");
+    std::fs::write(
+        &srt,
+        "1\n00:00:01,000 --> 00:00:03,000\nFirst cue\n\n2\n00:00:40,500 --> 00:00:42,000\nLater cue\n",
+    )
+    .unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+        ])
+        .arg("-i")
+        .arg(&srt)
+        .args([
+            "-t",
+            "60",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            "-c:s",
+            "srt",
+            // A container that starts at 5 s: cues and video are both relative
+            // to the container start (timeline time).
+            "-output_ts_offset",
+            "5",
+        ])
+        .arg(f.dir.path().join("media/clip.mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let (status, refused) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":0,"subtitle_track":1})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (status, created) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(json!({"file_id":file_id,"file_revision":revision,"start_ms":30000,"audio_track":0,"subtitle_track":0})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    let ready = f.until(&id, |d| d["active"]["status"] == "active").await;
+    assert_eq!(ready["active"]["subtitle_track"], 0);
+    let url = ready["active"]["subtitles_url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = f.raw("GET", &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let vtt = String::from_utf8(body).unwrap();
+    assert!(vtt.starts_with("WEBVTT"), "{vtt}");
+    // Cues keep source time, which is timeline time, even for a seek to 30 s.
+    assert!(
+        vtt.contains("00:01.000 --> 00:03.000") && vtt.contains("First cue"),
+        "{vtt}"
+    );
+    assert!(
+        vtt.contains("00:40.500 --> 00:42.000") && vtt.contains("Later cue"),
+        "{vtt}"
+    );
+    // A second request is served from the cached sidecar, not reconverted.
+    let cached = f
+        .app
+        .processing
+        .deliveries
+        .root
+        .join(&id)
+        .join("subtitles-0.vtt");
+    let modified = std::fs::metadata(&cached).unwrap().modified().unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(f.raw("GET", &url, None).await.1, vtt.as_bytes());
+    assert_eq!(
+        std::fs::metadata(&cached).unwrap().modified().unwrap(),
+        modified
+    );
+    // An explicit null removes the subtitle in the replacement generation.
+    let (status, changed) = f
+        .json(
+            "POST",
+            &format!("/api/v1/deliveries/{id}/changes"),
+            Some(json!({"expected_generation":"1","position_ms":0,"subtitle_track":null})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{changed}");
+    assert!(
+        changed["pending"]
+            .get("subtitle_track")
+            .is_some_and(Value::is_null),
+        "{changed}"
+    );
+    let staged = f.until(&id, |d| d["pending"]["status"] == "ready").await;
+    assert!(
+        staged["pending"]
+            .get("subtitles_url")
+            .is_some_and(Value::is_null),
+        "{staged}"
+    );
+    assert_eq!(
+        f.raw(
+            "GET",
+            &format!("/api/v1/streams/{id}/2/subtitles.vtt"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.raw("DELETE", &format!("/api/v1/deliveries/{id}"), None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    f.stop.cancel();
+}

@@ -588,6 +588,10 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
             get(crate::delivery::segment),
         )
         .route(
+            "/api/v1/streams/{id}/{generation}/subtitles.vtt",
+            get(crate::delivery::subtitles),
+        )
+        .route(
             "/",
             get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
         )

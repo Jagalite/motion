@@ -110,6 +110,14 @@ pub fn copy_start(
     (end_ms <= segment || fits_target(end_ms - segment, target_s)).then_some(start)
 }
 
+/// Text subtitle codecs that can be delivered as a WebVTT sidecar in timeline
+/// time, on any route, without losing meaning. ASS/SSA are excluded: WebVTT
+/// drops their positioning, fonts and effects, which can merge signs with
+/// dialogue. Bitmap subtitles (PGS, DVD, DVB) need burn-in, not yet offered.
+pub fn sidecar_subtitle(codec: &str) -> bool {
+    matches!(codec, "subrip" | "srt" | "mov_text" | "webvtt" | "text")
+}
+
 /// Whether a live segmented route can serve these streams. Stream copy is only
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.
@@ -1485,5 +1493,22 @@ mod tests {
         assert_eq!(copy_start(&[0, 5_000, 15_000], 0, 4, 12, 15_000), Some(0));
         // Keyframes stop 32 s before the observed end: the open segment is too long.
         assert_eq!(start(&[30_000, 34_000, 58_000], 31_000, 90_000), None);
+    }
+
+    #[test]
+    fn only_text_subtitles_become_sidecars() {
+        for codec in ["subrip", "mov_text", "webvtt"] {
+            assert!(sidecar_subtitle(codec), "{codec}");
+        }
+        for codec in [
+            "ass",
+            "ssa",
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvb_subtitle",
+            "",
+        ] {
+            assert!(!sidecar_subtitle(codec), "{codec}");
+        }
     }
 }

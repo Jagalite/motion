@@ -92,6 +92,8 @@ pub struct Runtime {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     admission: tokio::sync::Mutex<()>,
     admission_slots: Arc<tokio::sync::Semaphore>,
+    /// Concurrent subtitle conversions (each reads the whole source once).
+    subtitle_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
 }
 
@@ -121,6 +123,8 @@ struct Session {
     revision: String,
     source: Source,
     inner: Mutex<Inner>,
+    /// Serializes subtitle sidecar extraction for this delivery.
+    subtitles: tokio::sync::Mutex<()>,
 }
 
 impl Runtime {
@@ -131,6 +135,7 @@ impl Runtime {
             sessions: Mutex::new(HashMap::new()),
             admission: tokio::sync::Mutex::new(()),
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
+            subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -527,13 +532,34 @@ async fn probe_descriptor(
     input: &std::fs::File,
     args: &[&str],
 ) -> Result<Vec<u8>, ProbeFailure> {
+    let mut full = vec!["-v", "error"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["-i", "/dev/fd/3"]);
+    run_descriptor(
+        app.ffprobe.as_ref(),
+        input,
+        &full,
+        MAX_PROBE_OUTPUT,
+        PROBE_DEADLINE,
+    )
+    .await
+}
+
+/// Run a media tool reading the validated descriptor as fd 3 and collect its
+/// bounded stdout. The descriptor is rewound once the child has exited; a child
+/// that does not exit when killed is returned for its owner to account for.
+async fn run_descriptor(
+    program: &FsPath,
+    input: &std::fs::File,
+    args: &[&str],
+    max_output: u64,
+    deadline: Duration,
+) -> Result<Vec<u8>, ProbeFailure> {
     use std::io::{Seek, SeekFrom};
     use tokio::io::AsyncReadExt;
-    let mut command = Command::new(app.ffprobe.as_ref());
+    let mut command = Command::new(program);
     command
-        .args(["-v", "error"])
         .args(args)
-        .args(["-i", "/dev/fd/3"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -543,17 +569,19 @@ async fn probe_descriptor(
     let mut child = command.spawn().map_err(|_| ProbeFailure::Unavailable)?;
     let mut stdout = child.stdout.take().ok_or(ProbeFailure::Unavailable)?;
     let mut output = Vec::new();
-    let finished = tokio::time::timeout(PROBE_DEADLINE, async {
+    // Read one byte past the limit so overflow is detected, not truncated.
+    let finished = tokio::time::timeout(deadline, async {
         (&mut stdout)
-            .take(MAX_PROBE_OUTPUT)
+            .take(max_output + 1)
             .read_to_end(&mut output)
             .await?;
         child.wait().await
     })
     .await;
     let rewind = || (&*input).seek(SeekFrom::Start(0)).is_ok();
+    let overflow = output.len() as u64 > max_output;
     match finished {
-        Ok(Ok(status)) if status.success() && rewind() => Ok(output),
+        Ok(Ok(status)) if status.success() && !overflow && rewind() => Ok(output),
         Ok(_) => {
             rewind();
             Err(ProbeFailure::Unavailable)
@@ -1378,6 +1406,9 @@ pub struct CreateRequest {
     /// starting at zero (remux: AAC or no audio; audio_convert: non-AAC audio).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<LiveOperation>,
+    /// Zero-based text subtitle stream, delivered as a WebVTT sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_track: Option<u32>,
     /// Encoder for video_transcode; omitted means software. videotoolbox is
     /// macOS hardware encoding and fails rather than falling back to software.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1400,6 +1431,10 @@ pub struct ChangeRequest {
     /// Replace the transcode encoder; omitted keeps the current one.
     #[serde(default)]
     pub backend: Option<crate::processing::Backend>,
+    /// Replace the text subtitle (null removes it); omitted keeps the current one.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<u32>)]
+    pub subtitle_track: Option<Option<u32>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1436,6 +1471,9 @@ pub struct GenerationView {
     pub audio_track: Option<u32>,
     /// software or videotoolbox for a transcode; null for stream copy.
     pub backend: Option<String>,
+    pub subtitle_track: Option<u32>,
+    /// WebVTT sidecar for the selected text subtitle, in timeline time.
+    pub subtitles_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1490,6 +1528,10 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                         "software".to_owned()
                     }
                 }),
+                subtitle_track: pinned_subtitle(&g.pin),
+                subtitles_url: (pinned_subtitle(&g.pin).is_some()
+                    && d.serves(n, app.processing.deliveries.now_ms()))
+                .then(|| format!("/api/v1/streams/{id}/{n}/subtitles.vtt")),
                 audio_track: g
                     .pin
                     .tracks
@@ -1562,14 +1604,52 @@ fn generation_number(value: &str) -> Result<u64, ApiError> {
         .ok_or_else(|| ApiError::bad("Generation must be a positive decimal string"))
 }
 
-fn tracks(audio: Option<u32>) -> Vec<String> {
-    // Explicit choices only: "audio:none" records an intentional absence.
-    let mut tracks = vec!["video:0".to_owned()];
-    tracks.push(audio.map_or_else(|| "audio:none".into(), |a| format!("audio:{a}")));
-    tracks
+fn tracks(audio: Option<u32>, subtitle: Option<u32>) -> Vec<String> {
+    // Explicit choices only: "none" records an intentional absence.
+    vec![
+        "video:0".to_owned(),
+        audio.map_or_else(|| "audio:none".into(), |a| format!("audio:{a}")),
+        subtitle.map_or_else(|| "subtitle:none".into(), |s| format!("subtitle:{s}")),
+    ]
 }
 
-fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation, hardware: bool) -> Pin {
+fn pinned_subtitle(pin: &Pin) -> Option<u32> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix("subtitle:").and_then(|i| i.parse().ok()))
+}
+
+/// The selected subtitle stream must exist and be a text format (sidecar).
+fn validate_subtitle(file: &db::ItemRow, subtitle: Option<u32>) -> Result<(), ApiError> {
+    let Some(index) = subtitle else {
+        return Ok(());
+    };
+    let streams: Vec<db::Track> =
+        serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
+    let codec = streams
+        .iter()
+        .filter(|t| t.kind == "subtitle")
+        .nth(index as usize)
+        .map(|t| t.codec.as_str())
+        .ok_or_else(|| ApiError::bad("Unknown subtitle track"))?;
+    if core::sidecar_subtitle(codec) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "Only text subtitles are delivered (as WebVTT); bitmap subtitles are not yet supported",
+        ))
+    }
+}
+
+fn pin(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    subtitle: Option<u32>,
+    operation: Operation,
+    hardware: bool,
+) -> Pin {
     let recipe = match operation {
         Operation::Remux => REMUX_RECIPE,
         Operation::AudioConvert => AUDIO_RECIPE,
@@ -1579,7 +1659,7 @@ fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation, hardware: b
     Pin {
         source_file: file.id.clone(),
         source_revision: file.revision.clone(),
-        tracks: tracks(audio),
+        tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: Some(recipe.into()),
     }
@@ -1885,6 +1965,7 @@ async fn admit_owned(
         app.processing.settings.experimental_copy_routes,
         copy_details.as_ref(),
     )?;
+    validate_subtitle(&file, r.subtitle_track)?;
     let duration_ms = file
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -1906,7 +1987,7 @@ async fn admit_owned(
     let (delivery, effects) = Delivery::admit(
         // The current catalog binds one timeline per edition.
         file.edition_id.clone(),
-        pin(&file, r.audio_track, operation, hardware),
+        pin(&file, r.audio_track, r.subtitle_track, operation, hardware),
         r.start_ms,
         Some(duration_ms),
         runtime.now_ms(),
@@ -1926,6 +2007,7 @@ async fn admit_owned(
             delivery: delivery.clone(),
             workers: HashMap::new(),
         }),
+        subtitles: tokio::sync::Mutex::new(()),
     });
     if runtime.sessions.lock().unwrap().len() >= MAX_SESSIONS {
         return Err(ApiError::new(
@@ -2038,9 +2120,14 @@ pub async fn change(
     let Ok(session) = app.processing.deliveries.session(&id) else {
         return Err(not_live(&app, &id).await);
     };
-    let replan = match (r.audio_track, r.operation, r.backend.as_ref()) {
-        (None, None, None) => None,
-        (audio, operation, backend) => {
+    let replan = match (
+        r.audio_track,
+        r.operation,
+        r.backend.as_ref(),
+        r.subtitle_track,
+    ) {
+        (None, None, None, None) => None,
+        (audio, operation, backend, subtitle) => {
             // Unchanged parts of the newest selection carry over.
             let current = {
                 let inner = session.inner.lock().unwrap();
@@ -2052,6 +2139,7 @@ pub async fn change(
             };
             let current = current.ok_or_else(|| error(core::Error::GenerationConflict))?;
             let audio = audio.unwrap_or_else(|| pinned_audio(&current));
+            let subtitle = subtitle.unwrap_or_else(|| pinned_subtitle(&current));
             let operation = operation.map_or(current.operation, LiveOperation::operation);
             let hardware = match backend {
                 Some(backend) => {
@@ -2100,11 +2188,12 @@ pub async fn change(
                 app.processing.settings.experimental_copy_routes,
                 details.as_ref(),
             )?;
+            validate_subtitle(&file, subtitle)?;
             Some((
                 current,
                 (
                     file.edition_id.clone(),
-                    pin(&file, audio, operation, hardware),
+                    pin(&file, audio, subtitle, operation, hardware),
                 ),
             ))
         }
@@ -2257,6 +2346,15 @@ async fn file(
     permit: tokio::sync::OwnedSemaphorePermit,
     path: PathBuf,
 ) -> Result<Response, ApiError> {
+    streamed(permit, path, "video/mp4").await
+}
+
+/// Stream an owned file, holding the transfer permit until the body ends.
+async fn streamed(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    path: PathBuf,
+    content_type: &'static str,
+) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|_| ApiError::not_found())?;
@@ -2271,7 +2369,7 @@ async fn file(
             yield chunk;
         }
     });
-    Ok((stream_headers("video/mp4"), body).into_response())
+    Ok((stream_headers(content_type), body).into_response())
 }
 
 pub async fn init(
@@ -2284,6 +2382,140 @@ pub async fn init(
     })
     .await?;
     file(permit, session.directory(&app, generation).join("init.mp4")).await
+}
+
+/// WebVTT sidecar of a generation's pinned text subtitle, in timeline time
+/// (cues keep source time, which is timeline time). Converted once per
+/// delivery from the validated source descriptor and cached with its files.
+pub async fn subtitles(
+    State(app): State<App>,
+    Path((id, generation)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(&generation)?;
+    let pinned = |d: &Delivery, now| {
+        d.serves(generation, now) && pinned_subtitle(&d.generations[&generation].pin).is_some()
+    };
+    let session = app.processing.deliveries.session(&id)?;
+    let index = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        if !pinned(d, app.processing.deliveries.now_ms()) {
+            return Err(ApiError::not_found());
+        }
+        pinned_subtitle(&d.generations[&generation].pin).ok_or_else(ApiError::not_found)?
+    };
+    let path = app
+        .processing
+        .deliveries
+        .root
+        .join(&session.id)
+        .join(format!("subtitles-{index}.vtt"));
+    // Convert (once) before taking a transfer permit, in a task that owns the
+    // converter even if this request is cancelled.
+    tokio::spawn(ensure_subtitles(
+        app.clone(),
+        session.clone(),
+        index,
+        path.clone(),
+    ))
+    .await
+    .map_err(ApiError::internal)??;
+    let (_, permit) = admit_stream(&app, &id, pinned).await?;
+    streamed(permit, path, "text/vtt; charset=utf-8").await
+}
+
+/// Largest sidecar accepted from the converter.
+const MAX_SUBTITLE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn subtitles_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "subtitles_unavailable",
+        "The subtitle track could not be converted; try again",
+    )
+}
+
+/// Produce the cached sidecar unless it exists. Waiters for the same delivery
+/// queue on its lock (no permits held); conversions share a small global slot
+/// pool; a converter that does not exit keeps both until it is reaped.
+async fn ensure_subtitles(
+    app: App,
+    session: Arc<Session>,
+    index: u32,
+    path: PathBuf,
+) -> Result<(), ApiError> {
+    let _extraction = session.subtitles.lock().await;
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let _slot = app
+        .processing
+        .deliveries
+        .subtitle_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| subtitles_unavailable())?;
+    let source = session.source.clone();
+    let opened = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || source_valid(&source)),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?;
+    let input = opened
+        .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
+    let map = format!("0:s:{index}");
+    let converted = run_descriptor(
+        &app.processing.settings.ffmpeg,
+        &input,
+        &[
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            "/dev/fd/3",
+            "-map",
+            &map,
+            "-c:s",
+            "webvtt",
+            "-f",
+            "webvtt",
+            "pipe:1",
+        ],
+        MAX_SUBTITLE_BYTES,
+        Duration::from_secs(120),
+    )
+    .await;
+    let text = match converted {
+        Ok(text) if text.starts_with(b"WEBVTT") => text,
+        Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
+        Err(ProbeFailure::Stalled(mut child)) => {
+            tracing::error!(delivery=%session.id, "subtitle conversion did not exit when killed");
+            // Keep the lock and slot until the converter is actually gone.
+            let _ = child.wait().await;
+            return Err(subtitles_unavailable());
+        }
+    };
+    // Publish into the existing delivery directory only: if cleanup removed it,
+    // the delivery is gone and nothing is resurrected.
+    let partial = path.with_extension("vtt.partial");
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &text).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&partial, &path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::not_found());
+    }
+    Ok(())
 }
 
 pub async fn segment(
@@ -2446,7 +2678,7 @@ mod tests {
             Pin {
                 source_file: "file".into(),
                 source_revision: "revision".into(),
-                tracks: tracks(None),
+                tracks: tracks(None, None),
                 operation: Operation::VideoTranscode,
                 recipe_digest: Some(RECIPE.into()),
             },
@@ -2526,6 +2758,13 @@ mod tests {
             ]
         );
         assert!(ended);
-        assert_eq!(tracks(None), ["video:0", "audio:none"]);
+        assert_eq!(
+            tracks(None, None),
+            ["video:0", "audio:none", "subtitle:none"]
+        );
+        assert_eq!(
+            tracks(Some(1), Some(0)),
+            ["video:0", "audio:1", "subtitle:0"]
+        );
     }
 }
