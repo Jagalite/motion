@@ -23,7 +23,7 @@
 // observed error is the documented Demuxe live-HLS limitation.
 import {execFileSync, spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync} from 'node:fs';
 import {mkdtemp} from 'node:fs/promises';
 import {createRequire} from 'node:module';
 import {createServer} from 'node:net';
@@ -39,9 +39,9 @@ export const freePort = () => new Promise(done => { const s = createServer(); s.
 export function media(dir) {
   mkdirSync(dir, {recursive: true});
   const ff = (...a) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...a]);
-  // 90 s H.264 High / two AAC tracks (440 Hz eng 44.1 kHz; 880 Hz fra 22.05 kHz).
+  // 180 s H.264 High / two AAC tracks (440 Hz eng 44.1 kHz; 880 Hz fra 22.05 kHz).
   ff('-f', 'lavfi', '-i', 'testsrc2=size=640x360:rate=24', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100',
-    '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=22050', '-t', '90', '-map', '0', '-map', '1', '-map', '2',
+    '-f', 'lavfi', '-i', 'sine=frequency=880:sample_rate=22050', '-t', '180', '-map', '0', '-map', '1', '-map', '2',
     '-c:v', 'libx264', '-profile:v', 'high', '-pix_fmt', 'yuv420p', '-g', '48', '-c:a', 'aac',
     '-metadata:s:a:0', 'language=eng', '-metadata:s:a:1', 'language=fra', '-movflags', '+faststart', join(dir, 'Signal Film.mp4'));
   // 60 s MPEG-2 video / AC-3 in Matroska: never browser-native, so planning converts it.
@@ -317,9 +317,14 @@ export async function scenario(page, server, ctx, engine, out) {
   await helpers();
   const afterRestart = await page.evaluate(async () => ({ready: await window.__e2e.ready(), resume: Number(window.__e2e.host().dataset.resumeMs),
     banner: document.getElementById('motion-progress-status')?.textContent ?? ''}));
+  // The previous page's final event may land between the snapshot above and
+  // this render; the page must resume at the server's state when it rendered
+  // (never behind the snapshot), which the new session then starts from.
+  const atRender = await viewing(ctx.film.timeline);
   const restartPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   check('after restart the player reopens at durable progress', afterRestart.ready.state === 'ready'
-    && Math.abs(afterRestart.resume - durable.position_ms) <= 1000 && restartPlay.advancing, {durable: durable.position_ms, afterRestart, restartPlay});
+    && afterRestart.resume >= durable.position_ms - 1000 && Math.abs(afterRestart.resume - atRender.position_ms) <= 1000 && restartPlay.advancing,
+  {durable: durable.position_ms, atRender: atRender.position_ms, afterRestart, restartPlay});
   // Leaving the outage page sends its final event during unload; it may land
   // after this render, so one 409 followed by adoption of our own unchanged
   // session's revision (adoptableRevision) and a 201 is expected.
@@ -328,6 +333,50 @@ export async function scenario(page, server, ctx, engine, out) {
   check('after restart the cookie session authorizes playback', sessionStarts.at(-1) === 201
     && restartErrors.every(e => e.path === '/api/v2/playback/viewing-sessions' && e.status === 409) && restartErrors.length <= 1,
   {sessionStarts, errors: restartErrors.map(e => `${e.method} ${e.path} ${e.status}`)});
+
+  // Version switch to a prepared rendition (another file): a new delivery is
+  // admitted at the current position, the viewing session is rebound to it,
+  // and the predecessor is retired.
+  const operator = server.operator();
+  const legacy = (await server.api('GET', '/api/v1/items', undefined, operator)).json;
+  const filmFile = (legacy.items ?? legacy).find(i => /film/i.test(i.title));
+  const job = await server.api('POST', '/api/v1/processing-jobs', {source_file_id: filmFile.file_id, source_revision: filmFile.revision,
+    recipe: 'remux_mp4', backend: 'software', idempotency_key: `e2e-${engine}-${Date.now()}`}, operator);
+  let phase = job.json?.phase;
+  for (let i = 0; i < 1200 && ['queued', 'running', 'cancelling'].includes(phase); i++) {
+    await sleep(100);
+    phase = (await server.api('GET', `/api/v1/processing-jobs/${job.json.id}`, undefined, operator)).json?.phase;
+  }
+  check('a prepared rendition is produced by a real processing job', job.status === 201 && phase === 'completed', {status: job.status, phase});
+  const beforeDelivery = admitted(t);
+  t = Date.now();
+  await page.evaluate(() => window.__e2e.el().play());
+  const beforeSwitch = await page.evaluate(() => window.__e2e.logical());
+  const versionSwitch = await page.evaluate(async () => {
+    const old = window.__e2e.el();
+    const form = document.getElementById('motion-playback-controls');
+    form.elements.audio.value = '';
+    form.elements.quality.value = 'convert';
+    form.querySelector('[data-player-action="quality"]').click();
+    return window.__e2e.replaced(old, 60000);
+  });
+  const switchPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
+  const preparedPlan = since(t).find(e => e.path === '/api/v2/playback/plans');
+  const rebound = since(t).find(e => e.method === 'PUT' && e.path.endsWith('/delivery'));
+  const replacement = admitted(t);
+  check('Convert plans the prepared rendition by byte range', preparedPlan?.body?.operation === 'prepared' && preparedPlan?.body?.transport === 'http_range', preparedPlan?.body);
+  check('the version switch admits a new delivery, rebinds viewing and keeps playing at position',
+    versionSwitch.replaced && Boolean(replacement) && replacement !== beforeDelivery && rebound?.status === 200
+    && switchPlay.advancing && Math.abs(switchPlay.logical - beforeSwitch) < 10,
+  {versionSwitch, switchPlay, beforeSwitch, rebound: rebound?.status, delivery: replacement, previous: beforeDelivery});
+  await sleep(2000);
+  const previous = await server.api('GET', `/api/v2/playback/delivery-sessions/${beforeDelivery}`, undefined, ctx.token);
+  check('the predecessor delivery is retired after the switch', previous.status === 404 || ['closing', 'closed'].includes(previous.json?.status),
+    {status: previous.status, state: previous.json?.status});
+  const progressAfterSwitch = await page.evaluate(() => window.__e2e.el().pause()).then(() => sleep(1500)).then(() => viewing(ctx.film.timeline));
+  check('progress continues on the rebound session', progressAfterSwitch.position_ms >= Math.round(beforeSwitch * 1000) - 1000,
+    {position: progressAfterSwitch.position_ms, beforeSwitch});
+  await shot('version-switch');
 
   // Leaving retires this player's delivery.
   const product = admitted(t);
@@ -348,8 +397,13 @@ export async function scenario(page, server, ctx, engine, out) {
   check('leaving the player retires its own delivery', Boolean(product) && (retired?.status === 204
     || ((after.status === 404 || ['closing', 'closed'].includes(after.json?.status)) && elapsed < 20000)),
   {product, retired: retired?.status ?? 'not observed', after: after.status, state: after.json?.status, elapsedMs: elapsed});
+  // Listed exactly when the server holds it unwatched with progress (the
+  // server marks a title watched past its completion percentage).
   const home = await page.evaluate(() => document.querySelector('main').textContent);
-  check('home lists continue watching', /Signal Film/.test(home) && !/Continue watching is unavailable/i.test(home), {});
+  const state = await viewing(ctx.film.timeline);
+  const expected = !state.watched && state.position_ms > 0;
+  check('home continue watching matches server viewing state', !/Continue watching is unavailable/i.test(home)
+    && /Signal Film/.test(home) === expected, {listed: /Signal Film/.test(home), watched: state.watched, position: state.position_ms});
   await shot('home');
 
   // Conversion-only title.
@@ -414,11 +468,10 @@ export async function scenario(page, server, ctx, engine, out) {
 /** One engine against its own server, media and data directory. */
 export async function prepare(engine, binary, demuxe) {
   const work = await mkdtemp(join(tmpdir(), `motion-e2e-${engine}-`));
-  // Launch identical bytes from the host volume (macOS loader stalls on fresh
-  // executables on external disks).
-  const launch = join(work, 'playscale');
-  writeFileSync(launch, readFileSync(binary), {mode: 0o700});
-  const server = new Server({work, port: await freePort(), launch, demuxe});
+  // Launch the build output in place. A fresh copy is a new executable that
+  // macOS may hold in the loader for minutes; launch the binary once before
+  // running this (for example with --help) so its first assessment is done.
+  const server = new Server({work, port: await freePort(), launch: binary, demuxe});
   return {server, media: media(join(work, 'media'))};
 }
 
@@ -466,6 +519,8 @@ async function main() {
       } finally {
         await server.stop();
         writeFileSync(join(out, `${engine}-server.log`), server.log.slice(-200000));
+        // Media, database and delivery caches are scratch; the evidence is in --out.
+        rmSync(server.work, {recursive: true, force: true});
       }
     }
     const count = status => (result.checks ?? []).filter(c => c.status === status).length;

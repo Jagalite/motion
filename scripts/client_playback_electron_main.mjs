@@ -7,7 +7,7 @@
 // same-origin-only requests. The connection chrome and OS credential storage
 // are not exercised here (see apps/desktop/test/shell-smoke.mjs).
 import {app, BrowserWindow, session} from 'electron';
-import {writeFileSync} from 'node:fs';
+import {rmSync, writeFileSync} from 'node:fs';
 import {prepare, provision, scenario} from './client_playback_e2e.mjs';
 
 const out = process.env.MOTION_E2E_OUT;
@@ -80,6 +80,7 @@ app.whenReady().then(async () => {
   } finally {
     await server.stop();
     writeFileSync(`${out}/electron-server.log`, server.log.slice(-200000));
+    rmSync(server.work, {recursive: true, force: true});
     writeFileSync(resultFile, JSON.stringify(result, null, 2));
     app.exit(0);
   }

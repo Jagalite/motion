@@ -55,6 +55,17 @@ test('audio, version and quality choices replan only the same timeline input', (
   assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x', audioSource}), /Invalid audio/);
 });
 
+test('only a plan for the same file revision replans in place', () => {
+  const {sameSource} = runInNewContext(source.replace('export {close, maintainLease};', '({sameSource});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const delivery = {source: {file_id: 'f1', file_revision: 'r1'}};
+  assert.equal(sameSource(delivery, {source: {file_id: 'f1', file_revision: 'r1'}}), true);
+  assert.equal(sameSource(delivery, {source: {file_id: 'f2', file_revision: 'r1'}}), false, 'another version or rendition');
+  assert.equal(sameSource(delivery, {source: {file_id: 'f1', file_revision: 'r2'}}), false, 'a changed revision');
+  assert.equal(sameSource(delivery, {source: null}), false);
+});
+
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};

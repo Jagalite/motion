@@ -24,8 +24,8 @@ function status(message, kind = 'status') {
   if (!message) panel.remove();
 }
 
-async function api(method, path, body, idempotencyKey, signal) {
-  const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf};
+async function api(method, path, body, idempotencyKey, signal, extra = {}) {
+  const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf, ...extra};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
@@ -87,6 +87,13 @@ function replanInput(input, {version, quality, audio, audioSource}) {
     version_id: audio ? audioSource.version : version || null,
     source: audio ? {file_id: audioSource.file_id, file_revision: audioSource.file_revision} : null,
     tracks: {...input.tracks, audio_track_id: audio || null}};
+}
+
+// A delivery replans in place only within its own source file revision; a
+// plan for another file (version or prepared rendition) needs a new delivery.
+function sameSource(delivery, plan) {
+  return delivery?.source?.file_id === plan?.source?.file_id
+    && delivery?.source?.file_revision === plan?.source?.file_revision;
 }
 
 function nextTimeline(page, currentTimeline) {
@@ -477,6 +484,66 @@ async function changePlayback(change) {
   } finally { state.changing = false; }
 }
 
+/**
+ * Move playback to a new delivery for another source: admit it at the
+ * current position, prepare its player, rebind the viewing session to it
+ * (revision precondition), then swap players and retire the predecessor. Any
+ * failure before the swap retires the replacement and keeps the current one.
+ */
+async function switchDelivery(plan) {
+  if (!state.element || !state.generation || state.changing) return false;
+  state.changing = true;
+  const epoch = state.epoch;
+  const current = () => epoch === state.epoch;
+  const old = {id: state.deliveryId, element: state.element, generation: state.generation};
+  const observed = old.element.player.state;
+  const playing = observed.status === 'playing';
+  const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
+  const preferences = {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate};
+  let replacement = null;
+  let element = null;
+  try {
+    status('Preparing the selected version…');
+    if (state.viewing) {
+      state.viewing.record({position_ms: position, status: playing ? 'playing' : 'paused', delivery_generation: old.generation.generation});
+      if (!await state.viewing.flush()) throw new Error('Progress is still pending; retry when connected.');
+    }
+    replacement = await retryCommand('/api/v2/playback/delivery-sessions', {plan_token: plan.plan_token, start_ms: position}, key(), current);
+    const ready = await firstGeneration(replacement, current);
+    const generation = ready?.active;
+    if (!current() || !generation) throw new Error('The selected version could not be prepared.');
+    element = await preparePlayer(generation, position, current, preferences);
+    if (state.viewing) {
+      const session = state.viewing.session;
+      const rebound = await api('PUT', `/api/v2/playback/viewing-sessions/${encodeURIComponent(session.id)}/delivery`,
+        {delivery_id: replacement.id}, undefined, AbortSignal.timeout(10000), {'If-Match': `"r-${session.revision}"`});
+      if (!current()) throw new Error('Playback ownership changed.');
+      state.viewing.rebind(rebound);
+    }
+    // Swap: the replacement owns the page from here on.
+    state.stopLease?.(); state.stopLease = null;
+    state.stopObserving?.(); state.stopObserving = null;
+    state.deliveryId = replacement.id;
+    state.delivery = ready;
+    state.generation = generation;
+    state.element = element;
+    renewLease(ready, generation, current);
+    state.stopObserving = observeViewing(element, generation, state.viewing, current);
+    element = null;
+    replacement = null;
+    await disposePlayer(old.element);
+    void retire(old.id);
+    status('');
+    if (playing && current()) await state.element.play();
+    return true;
+  } catch (error) {
+    if (element) await disposePlayer(element);
+    if (replacement) void retire(replacement.id);
+    if (current()) status(`Version change failed: ${error.message}`, 'alert');
+    return false;
+  } finally { state.changing = false; }
+}
+
 async function start() {
   if (state.closing) { await state.closing; state.closing = null; }
   const epoch = ++state.epoch;
@@ -485,7 +552,10 @@ async function start() {
   const data = host.dataset;
   // Read before any await: another tab may record its own session later.
   // Unavailable storage means no known predecessor: adoption fails closed.
-  const predecessor = (() => { try { return localStorage.getItem(ownSessionKey(data)); } catch { return null; } })();
+  // sessionStorage is per tab: a match there is this tab's previous page.
+  const read = storage => { try { return storage.getItem(ownSessionKey(data)); } catch { return null; } };
+  const tabPredecessor = read(globalThis.sessionStorage);
+  const predecessor = tabPredecessor ?? read(globalThis.localStorage);
   host.dataset.state = 'starting';
   try {
     const viewingRevision = data.canSaveViewing === 'true' ? await recoverViewing(data, current) : null;
@@ -536,16 +606,21 @@ async function start() {
       try { session = await createSession(viewingRevision); }
       catch (error) {
         if (error.status !== 409 || !current()) throw error;
-        // Possibly the previous player's final event landing after render.
-        const latest = await api('GET', `/api/v2/profiles/${encodeURIComponent(data.profileId)}/timelines/${encodeURIComponent(data.timelineId)}/viewing`,
-          undefined, undefined, AbortSignal.timeout(10000));
-        // Only the predecessor captured before any await; its terminal status
-        // is the evidence that the newer revision was its final event.
-        const ownSessionStatus = predecessor ? (await api('GET', `/api/v2/playback/viewing-sessions/${encodeURIComponent(predecessor)}`,
-          undefined, undefined, AbortSignal.timeout(10000)).catch(() => null))?.status : null;
-        if (!current()) throw error;
-        const adopted = adoptableRevision(latest, {ownSession: predecessor, ownSessionStatus,
-          manualEpoch: data.viewingManualEpoch, resumeMs: Number(data.resumeMs) || 0});
+        // Possibly the previous player's final event landing after render; it
+        // may still be in flight, so wait briefly for its predecessor to become
+        // terminal. Only the predecessor captured before any await is eligible.
+        let adopted = null;
+        for (let attempt = 0; attempt < 6 && adopted === null; attempt++) {
+          if (attempt) await sleep(500);
+          if (!current()) throw error;
+          const latest = await api('GET', `/api/v2/profiles/${encodeURIComponent(data.profileId)}/timelines/${encodeURIComponent(data.timelineId)}/viewing`,
+            undefined, undefined, AbortSignal.timeout(10000));
+          const ownSessionStatus = predecessor ? (await api('GET', `/api/v2/playback/viewing-sessions/${encodeURIComponent(predecessor)}`,
+            undefined, undefined, AbortSignal.timeout(10000)).catch(() => null))?.status : null;
+          adopted = adoptableRevision(latest, {ownSession: predecessor, ownSessionStatus, sameTab: tabPredecessor !== null && tabPredecessor === predecessor,
+            manualEpoch: data.viewingManualEpoch, resumeMs: Number(data.resumeMs) || 0});
+          if (!predecessor) break;
+        }
         if (adopted === null || !current()) throw error;
         session = await createSession(adopted);
       }
@@ -553,7 +628,9 @@ async function start() {
       if (session.delivery_id !== delivery.id || session.profile_id !== data.profileId || session.timeline_id !== data.timelineId) {
         throw new Error('The server returned a different viewing context.');
       }
-      localStorage.setItem(ownSessionKey(data), session.id);
+      for (const storage of [globalThis.sessionStorage, globalThis.localStorage]) {
+        try { storage.setItem(ownSessionKey(data), session.id); } catch { /* adoption then fails closed */ }
+      }
       state.viewingOwner = {active: true};
       state.viewing = makeViewingWriter(session, viewingStorage(data), state.viewingOwner);
 
@@ -642,8 +719,10 @@ controls?.addEventListener('click', event => {
       if (plan.status !== 'ready' || plan.timeline_id !== host.dataset.timelineId) {
         throw new Error(`The selected playback is unavailable${plan.reason_codes?.length ? ` (${plan.reason_codes.join(', ')})` : ''}.`);
       }
-      const changed = await changePlayback({kind: 'replan', plan_token: plan.plan_token,
-        position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms))});
+      const changed = sameSource(state.delivery, plan)
+        ? await changePlayback({kind: 'replan', plan_token: plan.plan_token,
+          position_ms: Math.max(0, Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms))})
+        : await switchDelivery(plan);
       if (changed) state.planInput = next;
     }
   })().catch(error => status(error.message, 'alert'));

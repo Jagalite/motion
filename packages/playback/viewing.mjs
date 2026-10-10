@@ -5,7 +5,10 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
   let accepted = {...session};
   let inFlight = null;
   let rejected = false;
-  let sealed = latest?.status === 'stopped' || pending?.status === 'stopped';
+  // Both terminal statuses close the session in core; nothing may follow
+  // them except exact retries of a still-pending terminal event.
+  const terminal = status => status === 'stopped' || status === 'ended';
+  let sealed = terminal(latest?.status) || terminal(pending?.status) || terminal(session.status);
   const revision = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(value) && BigInt(value) <= 18446744073709551615n;
   if (!revision(session.sequence)) throw new Error('Invalid viewing sequence');
   const save = () => persist(pending || latest ? {session: accepted, pending, latest} : null);
@@ -27,7 +30,7 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
   function record(value) {
     if (rejected || sealed || !current()) return;
     latest = snapshot(value);
-    sealed = latest.status === 'stopped';
+    sealed = terminal(latest.status);
     save(); // Persist before sending; no credentials or CSRF tokens are stored.
   }
   async function drain() {
@@ -75,22 +78,33 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
     if (!inFlight) inFlight = drain().finally(() => { inFlight = null; });
     return inFlight;
   }
-  return {record, flush, get session() { return {...accepted}; }, get rejected() { return rejected; }};
+  // Adopt the server's rebinding of this same session to another delivery.
+  // Only with nothing in flight or queued: ordering stays with the session.
+  function rebind(next) {
+    if (inFlight || pending || latest) throw new Error('Save pending progress before changing delivery');
+    if (next?.id !== accepted.id || next.profile_id !== accepted.profile_id || next.timeline_id !== accepted.timeline_id
+      || next.sequence !== accepted.sequence || typeof next.delivery_id !== 'string') throw new Error('Invalid viewing rebind');
+    accepted = {...next};
+    save();
+  }
+  return {record, flush, rebind, get session() { return {...accepted}; }, get rejected() { return rejected; }};
 }
 
 // A viewing-session start names the revision the page rendered. A newer
-// revision may be this page's predecessor (the session this browser last
-// created for the title, captured synchronously when this page started)
-// delivering its final event during unload. Adopt it only when the current
-// authority is still that predecessor, the server reports it terminal
-// (stopped/ended: it can take no more events), no manual change happened and
-// the resume position is within tolerance. The retried start still names the
-// adopted revision, so any competing start in between fails closed.
-export function adoptableRevision(current, rendered, toleranceMs = 2000) {
+// revision may come from this page's predecessor (the session last created
+// for the title, captured synchronously when this page started) delivering
+// events during its unload. Adopt it only when the current authority is still
+// that predecessor and either it was created in this same tab (the previous
+// page here, which is going away) or the server reports it terminal (it can
+// take no more events, so no other tab is still using it). No manual change
+// may have happened and the resume position must be within tolerance. The
+// retried start still names the adopted revision, so any competing start in
+// between fails closed.
+export function adoptableRevision(current, rendered, toleranceMs = 5000) {
   const revision = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
   if (!revision || current.watched !== false || current.manual_watched !== null) return null;
   if (typeof rendered?.ownSession !== 'string' || current.session_id !== rendered.ownSession) return null;
-  if (!['stopped', 'ended'].includes(rendered.ownSessionStatus)) return null;
+  if (rendered.sameTab !== true && !['stopped', 'ended'].includes(rendered.ownSessionStatus)) return null;
   if (current.manual_epoch !== rendered.manualEpoch) return null;
   const renderedResumeMs = rendered.resumeMs;
   if (!Number.isSafeInteger(current.position_ms) || !Number.isSafeInteger(renderedResumeMs)) return null;
