@@ -30,9 +30,9 @@ func TestNoDatabaseScannerProviderOrMediaToolDependencies(t *testing.T) {
 	}
 }
 
-// Process launches are allowed only in the `serve` delegation to the bundled
-// Rust server. Inspects every non-test source file's syntax tree.
-func TestOnlyServeDelegationStartsProcesses(t *testing.T) {
+// Process launches are limited to the bundled Rust server and the platform
+// browser opener. Inspects every non-test source file's syntax tree.
+func TestOnlyServerDelegationAndBrowserOpenerStartProcesses(t *testing.T) {
 	launch := map[string]bool{
 		"os/exec.Command": true, "os/exec.CommandContext": true,
 		"os.StartProcess": true, "syscall.Exec": true, "syscall.ForkExec": true,
@@ -62,8 +62,28 @@ func TestOnlyServeDelegationStartsProcesses(t *testing.T) {
 				switch n := n.(type) {
 				case *ast.SelectorExpr:
 					if id, ok := n.X.(*ast.Ident); ok && launch[imports[id.Name]+"."+n.Sel.Name] {
-						if fn == nil || fn.Name.Name != "serveCmd" || path != filepath.Join("internal", "cli", "root.go") {
-							t.Errorf("%s: process launch outside serve delegation", fset.Position(n.Pos()))
+						serve := fn != nil && fn.Name.Name == "serveCmd" && path == filepath.Join("internal", "cli", "root.go")
+						browser := fn != nil && fn.Name.Name == "OpenBrowser" && path == filepath.Join("internal", "cli", "play.go")
+						if !serve && !browser {
+							t.Errorf("%s: process launch outside server/browser delegation", fset.Position(n.Pos()))
+						}
+					}
+				case *ast.CallExpr:
+					if fn != nil && fn.Name.Name == "OpenBrowser" {
+						if selector, ok := n.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "CommandContext" {
+							if len(n.Args) < 2 {
+								t.Error("browser command has no executable")
+								break
+							}
+							literal, ok := n.Args[1].(*ast.BasicLit)
+							if !ok {
+								t.Error("browser executable is not fixed")
+								break
+							}
+							executable, _ := strconv.Unquote(literal.Value)
+							if executable != "open" && executable != "xdg-open" && executable != "rundll32" {
+								t.Errorf("unexpected browser executable %s", executable)
+							}
 						}
 					}
 				case *ast.BasicLit:
