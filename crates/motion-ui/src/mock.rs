@@ -287,6 +287,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 duration_ms: Some(title.duration_ms),
                 resume_ms: progress(who, timeline_id),
                 viewing_revision: "0".into(),
+                audio_tracks: vec![],
             })
         })
     }

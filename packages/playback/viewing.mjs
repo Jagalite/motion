@@ -77,3 +77,16 @@ export function createViewingWriter(session, {send, persist, uuid, wait,
   }
   return {record, flush, get session() { return {...accepted}; }, get rejected() { return rejected; }};
 }
+
+// A viewing-session start names the revision the page rendered. A newer
+// revision may only be the previous player's final event, sent during
+// unload, arriving after this page rendered. Adopt it only when it cannot
+// change what this page offered: still unwatched, no manual override, and the
+// resume position within tolerance. Anything else (another device, a manual
+// watched change, a different position) must fail closed and be re-read.
+export function adoptableRevision(current, renderedResumeMs, toleranceMs = 2000) {
+  const revision = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
+  if (!revision || current.watched !== false || current.manual_watched !== null) return null;
+  if (!Number.isSafeInteger(current.position_ms) || !Number.isSafeInteger(renderedResumeMs)) return null;
+  return Math.abs(current.position_ms - renderedResumeMs) <= toleranceMs ? current.revision : null;
+}

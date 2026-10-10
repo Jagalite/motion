@@ -27,6 +27,25 @@ test('planning subtitle vocabulary and explicit HLS source match the pinned cont
   for (const page of [{items: [{id: 'a'}]}, {items: [{id: '../bad'}]}, {items: [{id: 'b'}, {id: 'c'}]}, {}]) assert.throws(() => nextTimeline(page, 'a'), /Invalid next-title/);
 });
 
+test('audio, version and quality choices replan only the same timeline input', () => {
+  const {replanInput} = runInNewContext(source.replace('export {close, maintainLease};', '({replanInput});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const input = {profile_id: 'p', timeline_id: 't', version_id: null, failed_candidate_ids: ['o-f'],
+    tracks: {audio_track_id: null, subtitle_track_id: null, subtitle_policy: 'auto'}, quality: {mode: 'auto', max_height: null}};
+  const next = replanInput(input, {version: '', quality: 'auto', audio: 'a1'});
+  assert.equal(next.tracks.audio_track_id, 'a1');
+  assert.equal(next.tracks.subtitle_policy, 'auto');
+  assert.equal(next.timeline_id, 't');
+  assert.deepEqual([...next.failed_candidate_ids], [], 'a new choice is planned afresh');
+  assert.equal(input.tracks.audio_track_id, null, 'the current input is not mutated');
+  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: ''});
+  assert.equal(back.tracks.audio_track_id, null);
+  assert.equal(back.version_id, 'v2');
+  assert.equal(back.quality.mode, 'convert');
+  assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x'}), /Invalid audio/);
+});
+
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};
