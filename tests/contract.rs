@@ -263,11 +263,11 @@ fn code_of(text: &str) -> (String, String) {
                 code.push_str(&" ".repeat(skipped.len()));
                 mask.push_str(&" ".repeat(skipped.len()));
             }
-            'r' | 'b'
+            'r' | 'b' | 'c'
                 if !code.ends_with(|p: char| p.is_alphanumeric() || p == '_')
                     && raw_hashes(c, chars.clone()).is_some() =>
             {
-                // r"..", r#".."#, br"..": no escapes; ends at a quote and as many #.
+                // r"..", r#".."#, br"..", cr"..": no escapes; ends at a quote and as many #.
                 let hashes = raw_hashes(c, chars.clone()).unwrap();
                 code.push(c);
                 mask.push(c);
@@ -303,7 +303,7 @@ fn code_of(text: &str) -> (String, String) {
 
 /// The number of `#` if `first` followed by `rest` opens a raw string literal.
 fn raw_hashes(first: char, mut rest: impl Iterator<Item = char>) -> Option<usize> {
-    if first == 'b' && rest.next() != Some('r') {
+    if matches!(first, 'b' | 'c') && rest.next() != Some('r') {
         return None;
     }
     let mut hashes = 0;
@@ -372,7 +372,7 @@ fn route_scan_sees_through_whitespace_comments_and_strings() {
         "r.route (\n \"/a/{id}\", get(h)) // .route(\"/commented\")\n\
          /* .nest(\"/x\", /* nested */ y) */ .route_layer(l).route(\"/b\", get(h));\n\
          let s = \"// .route(\\\" .nest(\"; let q = '\"'; .route(\"/c\", get(h));\n\
-         let raw = r#\"a \" .route(\"/hidden\") b\"#; let br = br\"x\"; ident_r(\"y\"); .route(\"/d\", get(h))",
+         let raw = r#\"a \" .route(\"/hidden\") b\"#; let br = br\"x\"; let c = cr#\"q \" .route(\"/hidden\")\"#; ident_r(\"y\"); .route(\"/d\", get(h))",
     );
     let routes: Vec<_> = calls(&code, "route")
         .into_iter()
