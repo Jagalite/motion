@@ -384,7 +384,8 @@ pub fn normalize_title(text: &str) -> String {
             }
             space = false;
             out.push(ch);
-        } else if ch != '\'' {
+        } else if !matches!(ch, '\'' | '\u{2019}' | '\u{2018}' | '\u{02BC}') {
+            // Apostrophe variants (straight, curly, modifier) are elisions.
             space = true;
         }
     }

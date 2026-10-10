@@ -31,7 +31,7 @@ pub fn body(document: &Document) -> String {
         // Both elision forms: "d'Amélie" indexes as "damélie" and "d amélie",
         // "Director's" as "directors" and "director s".
         let joined = normalize(field);
-        let split = normalize(&field.replace(['\'', '’'], " "));
+        let split = normalize(&field.replace(['\'', '\u{2019}', '\u{2018}', '\u{02BC}'], " "));
         for word in joined
             .split(' ')
             .chain(split.split(' '))
@@ -88,6 +88,13 @@ mod tests {
             "amélie le fabuleux destin damélie poulain d audrey tautou favorite"
         );
         assert_eq!(terms("  AMÉLIE  tautou amélie "), ["amélie", "tautou"]);
+        // Curly and straight apostrophes normalize identically.
+        let curly = body(&Document {
+            title: "Director\u{2019}s Cut".into(),
+            ..Default::default()
+        });
+        assert!(curly.split(' ').any(|w| w == "directors"));
+        assert_eq!(terms("Director's"), ["directors"]);
         assert_eq!(
             fts_query(&terms("audrey tau")).unwrap(),
             "\"audrey\"* AND \"tau\"*"

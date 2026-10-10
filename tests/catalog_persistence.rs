@@ -592,3 +592,30 @@ async fn whole_timeline_split_matches_core_application() {
     assert_ne!(editions[1].1, "cut-a");
     assert_eq!(editions[1].1, editions[2].1);
 }
+
+#[tokio::test]
+async fn coverage_is_backfilled_for_demands_resolved_before_0020() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 19, None).await)
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO libraries (id,name,root,root_identity) VALUES ('lib','L','/m','1:2')",
+        "INSERT INTO catalog_libraries (id,name,kind) VALUES ('lib','L','mixed')",
+        "INSERT INTO jobs (id,library_id,phase,created_at,complete_directories,incomplete_directories,outcome) VALUES ('job','lib','completed',1,7,2,'partial')",
+        "INSERT INTO scan_requests VALUES ('req','lib',0,1)",
+        "INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status,job_id) VALUES ('d','req','lib',1,0,'partial','job')",
+    ] {
+        sqlx::query(sql).execute(&old).await.unwrap();
+    }
+    old.close().await;
+    let pool = db::connect(&path).await.unwrap();
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT complete_directories,incomplete_directories FROM scan_demands WHERE id='d'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (7, 2));
+}

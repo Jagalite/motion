@@ -24,9 +24,12 @@ async fn document(conn: &mut SqliteConnection, item: &str) -> anyhow::Result<Opt
     let Some(title) = title else {
         return Ok(None);
     };
+    // Retired works contribute both their last display title and their
+    // scanned origin title.
     let mut aliases: Vec<String> = sqlx::query_scalar(
-        "SELECT i.title FROM item_aliases a JOIN items i ON i.id=a.alias_id WHERE a.item_id=? ORDER BY i.id",
+        "SELECT i.title FROM item_aliases a JOIN items i ON i.id=a.alias_id WHERE a.item_id=? UNION ALL SELECT o.title FROM item_aliases a JOIN item_origins o ON o.item_id=a.alias_id WHERE a.item_id=?",
     )
+    .bind(item)
     .bind(item)
     .fetch_all(&mut *conn)
     .await?;
@@ -72,14 +75,28 @@ pub async fn refresh(conn: &mut SqliteConnection, limit: i64) -> anyhow::Result<
         .fetch_all(&mut *conn)
         .await?;
     for item in &dirty {
-        sqlx::query("DELETE FROM search_fts WHERE item_id=?")
-            .bind(item)
-            .execute(&mut *conn)
-            .await?;
+        // Delete through the indexed row map, never by scanning search_fts.
+        let previous: Option<i64> =
+            sqlx::query_scalar("DELETE FROM search_rows WHERE item_id=? RETURNING fts_rowid")
+                .bind(item)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if let Some(rowid) = previous {
+            sqlx::query("DELETE FROM search_fts WHERE rowid=?")
+                .bind(rowid)
+                .execute(&mut *conn)
+                .await?;
+        }
         if let Some(doc) = document(conn, item).await? {
-            sqlx::query("INSERT INTO search_fts (item_id,body) VALUES (?,?)")
+            let rowid = sqlx::query("INSERT INTO search_fts (item_id,body) VALUES (?,?)")
                 .bind(item)
                 .bind(core::body(&doc))
+                .execute(&mut *conn)
+                .await?
+                .last_insert_rowid();
+            sqlx::query("INSERT INTO search_rows VALUES (?,?)")
+                .bind(item)
+                .bind(rowid)
                 .execute(&mut *conn)
                 .await?;
         }

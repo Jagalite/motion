@@ -146,6 +146,12 @@ async fn search_finds_normalized_titles_people_tags_and_aliases() {
     .await
     .unwrap();
     curation::commit_merge(&app, &plan).await.unwrap();
+    // The retired work's scanned origin title stays searchable too.
+    sqlx::query("UPDATE items SET title='Renamed duplicate' WHERE id='dup'")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    maintenance::refresh_search(&app).await.unwrap();
     let page = search::search(&app.db, "fabuleux", None, 10, None)
         .await
         .unwrap();

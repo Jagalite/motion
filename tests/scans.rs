@@ -321,3 +321,28 @@ async fn direct_requests_are_respected_and_empty_requests_rejected() {
         Err(scans::ScanError::NoSources)
     ));
 }
+
+#[tokio::test]
+async fn recovery_keeps_direct_ownership_when_merging_attempts() {
+    let f = Fixture::new().await;
+    let a = f.source("a").await;
+    let library = f.library(std::slice::from_ref(&a)).await;
+    // A direct (v1) attempt is running when a demand queues a follow-up.
+    let direct = db::enqueue(&f.app, &a).await.unwrap();
+    sqlx::query("UPDATE jobs SET phase='running',attempt=1,started_barrier=0 WHERE id=?")
+        .bind(&direct.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let demand = scans::request(&f.app, &library, None, false, false)
+        .await
+        .unwrap();
+    db::recover(&f.app.db).await.unwrap();
+    // Cancelling the demand must not cancel the direct requester's work.
+    scans::cancel(&f.app, &demand.id).await.unwrap();
+    let jobs = f.jobs(&a).await;
+    assert_eq!(
+        jobs.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
+        ["cancelled", "queued"]
+    );
+}

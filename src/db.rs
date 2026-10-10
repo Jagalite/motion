@@ -447,8 +447,10 @@ pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(queued) = queued {
-                sqlx::query("UPDATE jobs SET full_scan=max(full_scan,?) WHERE id=?")
+                // Mode and direct-requester ownership both carry over.
+                sqlx::query("UPDATE jobs SET full_scan=max(full_scan,?),direct_request=max(direct_request,(SELECT direct_request FROM jobs WHERE id=?)) WHERE id=?")
                     .bind(row.full_scan)
+                    .bind(&row.id)
                     .bind(&queued)
                     .execute(&mut *tx)
                     .await?;
