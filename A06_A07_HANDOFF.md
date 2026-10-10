@@ -1,9 +1,9 @@
 # A06/A07 execution and delivery handoff
 
-Status: the scoped macOS/Unix execution and experimental v1 H.264/AAC SDR
-delivery implementation and handoff are complete. Native qualification in this
-pass is macOS arm64 only. Full Motion A06/A07 integration and release gates remain
-open below; `VALIDATION.md` records exact checks and bounds.
+Status: A06/A07 implementation is in progress. The earlier macOS/Unix baseline
+passed its listed checks, but that baseline is not completion of the assigned
+workstreams. Native qualification recorded here is macOS arm64 only. Remaining
+implementation and integration gates are listed below.
 
 ## Implemented boundaries
 
@@ -18,6 +18,9 @@ open below; `VALIDATION.md` records exact checks and bounds.
   deadline expiry from monotonic elapsed time and advancing media time. The
   processing adapter supplies observations, drains bounded pipes and executes
   termination. Optional liveness settings preserve existing defaults.
+- `crates/core/src/delivery_admission.rs` decides durable receipt replay and
+  request conflicts. The adapter commits the initial state and receipt before
+  dispatch, survives lost HTTP waiters, and rechecks transactional authority.
 - `crates/core/src/delivery.rs` owns generations, activation, leases, playheads,
   pacing and retention. The live adapter validates source descriptors and output,
   shares execution capacity, and persists restart fences. Pending-generation
@@ -29,8 +32,8 @@ open below; `VALIDATION.md` records exact checks and bounds.
 | Item | Required next artifact or qualification |
 | --- | --- |
 | Authenticated v2 plans and delivery admission | A08 principal/profile authorization, authenticated expiring plan tokens, current-permission revalidation, ticket routes and transactional idempotency receipts. The v1 live endpoint is not that contract. |
-| Lost create acknowledgment and retired-delivery replay | Integrate admission with A08's durable principal-scoped idempotency transaction. Replaying a retired receipt must never start another encoder. Creation is not currently idempotent. |
-| Migration allocation | A02 must finalize the delivery-session migration number. This branch has provisional 0015; the A08 checkout was observed preparing an uncommitted rename to 0018. Do not apply both. |
+| Lost create acknowledgment and retired-delivery replay | Integrate admission with A08's durable principal-scoped idempotency transaction. Replaying a retired receipt must never start another encoder. The resumed implementation adds durable, principal-scoped admission receipts and a transactional authority callback; validation and v2 plan integration are tracked in VALIDATION.md. |
+| Migration allocation | A02 must finalize the delivery-session migration number. This branch has provisional 0015 and admission receipts at 0020; the A08 checkout was observed preparing an uncommitted rename to 0018. Do not apply both. |
 | Windows containment | Implement and natively qualify a Job Object adapter, including descendants and parent death. The existing direct-child fallback is not whole-tree qualification; live delivery rejects non-Unix platforms. |
 | Broader execution policy | Resource estimates/limits beyond the current scalar capacity ledger and expected-media-duration execution policy remain to be integrated with agreed policy/configuration contracts. |
 | Live pipeline breadth | Remux, audio-only conversion, hardware live encoding, HDR/subtitles and broader exact-track combinations need implementation/qualification beyond the current H.264/AAC SDR live recipe. |
@@ -55,7 +58,7 @@ historical migration. Downgrades must account for retained diagnostic rows.
 
 No changes in this handoff have been pushed or deployed by this workstream.
 
-## Final local acceptance
+## Earlier Unix baseline acceptance
 
 On macOS 26.5.2 arm64 with Rust 1.99.0 and FFmpeg 8.1.2:
 

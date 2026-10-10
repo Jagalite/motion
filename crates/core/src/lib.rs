@@ -2,6 +2,7 @@
 pub mod artwork;
 pub mod catalog;
 pub mod delivery;
+pub mod delivery_admission;
 pub mod events;
 pub mod execution_deadline;
 pub mod jobs;

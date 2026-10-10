@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check seven execution/delivery regressions in a disposable core-only workspace.
+"""Check ten execution/delivery regressions in a disposable core-only workspace.
 
 Requires cached Cargo dependencies. Never edits the checkout or shares its target
 directory. A compile error, timeout, or missing test is not a detected mutation.
@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HEARTBEAT = "heartbeat_boundaries_renew_only_valid_generation_leases"
 STUCK = "work::tests::stuck_owner_keeps_capacity_until_exit"
 LIVENESS = "liveness_graph_covers_stalls_duplicates_regressions_and_expiry"
+ADMISSION = "admission_graph_covers_lost_ack_retirement_restart_conflict_and_rollback"
+SCOPE = "delivery_admission::tests::exact_retries_replay_but_changed_requests_and_foreign_receipts_do_not"
 
 
 def check(workspace, target, test, should_fail=False):
@@ -55,14 +57,18 @@ def main():
         )
         delivery_target = ["--test", "delivery_model"]
         liveness_target = ["--test", "execution_deadline_model"]
-        print("Checking unmodified delivery, work and deadline baselines", flush=True)
+        admission_target = ["--test", "delivery_admission_model"]
+        print("Checking unmodified delivery, work, deadline and admission baselines", flush=True)
         check(workspace, delivery_target, HEARTBEAT)
         check(workspace, ["--lib"], STUCK)
         check(workspace, liveness_target, LIVENESS)
+        check(workspace, admission_target, ADMISSION)
+        check(workspace, ["--lib"], SCOPE)
         delivery = workspace / "crates/core/src/delivery.rs"
         work = workspace / "crates/core/src/work.rs"
         deadline = workspace / "crates/core/src/execution_deadline.rs"
-        originals = {path: path.read_text() for path in [delivery, work, deadline]}
+        admission = workspace / "crates/core/src/delivery_admission.rs"
+        originals = {path: path.read_text() for path in [delivery, work, deadline, admission]}
         original_delivery = originals[delivery]
         # Restrict heartbeat edits to the production transition arm, not the
         # input enum or other commands that have their own lease checks.
@@ -70,6 +76,13 @@ def main():
         end = original_delivery.index("        Input::Tick {", start)
         heartbeat = original_delivery[start:end]
         mutants = [
+            ("retry creates another delivery", admission,
+             "Ok(Decision::Replay {\n        delivery_id: receipt.delivery_id.clone(),\n    })",
+             "Ok(Decision::Create)", admission_target, ADMISSION),
+            ("changed request reuses a receipt", admission,
+             "if receipt.identity.digest != request.digest {", "if false {", admission_target, ADMISSION),
+            ("foreign principal receipt is accepted", admission,
+             "receipt.identity.principal != request.principal ||", "false ||", ["--lib"], SCOPE),
             ("duplicate progress renews stall deadline", deadline,
              "position_ms > self.position_ms", "position_ms >= self.position_ms", liveness_target, LIVENESS),
             ("late progress revives an expired execution", deadline,
@@ -97,7 +110,7 @@ def main():
             path.write_text(mutated)
             check(workspace, target, test, should_fail=True)
             print(f"Detected: {label}", flush=True)
-        print("PASS: 3 baselines; 7 compiled mutations detected by test failures", flush=True)
+        print("PASS: 5 baselines; 10 compiled mutations detected by test failures", flush=True)
 
 
 if __name__ == "__main__":

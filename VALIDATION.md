@@ -876,3 +876,44 @@ server startup, including restored-root startup; they are not counted as passes.
 Failed-boot cleanup now reaps the attempted server and reports the relevant data
 root's log. No readiness or application deadline was enlarged. Formatting and
 diff checks passed.
+
+
+## Durable delivery admission and lost acknowledgements
+
+The production core now decides create, exact replay, key conflict and foreign
+scope rejection. The SQLite adapter revalidates authority inside the same write
+transaction as receipt lookup and publication. Initial delivery state and its
+acknowledgement receipt commit together before execution dispatch. A bounded
+owned admission task survives loss of the HTTP waiter; shutdown serializes with
+admission. Retiring or recovering a transport never deletes its receipt or
+restarts execution for an exact retry. Receipts currently have no expiry.
+
+The v1 endpoint accepts an optional 16–128 byte Idempotency-Key in its existing
+legacy-admin scope. The service exposes a transactional authority callback for
+principal-specific integration. This is not the authenticated v2 plan endpoint:
+plan-token validation, wire-request identity and profile authorization remain
+integration work. Migration 0020 is a provisional A02 allocation request.
+
+The admission model exhausted 77 states and 1,078 transitions with zero skipped
+checks. Its finite domain includes two principals, two request digests, one key
+per principal, rollback, commit followed by lost dispatch/acknowledgement, normal
+dispatch, retirement and restart. Properties assert exact start/ack/conflict
+effects, at most one start per receipt, receipt preservation, and unchanged
+state on rollback/replay. This proves the modeled decisions within those bounds;
+it does not itself prove SQLite atomicity or native process behavior.
+
+`cargo check -p playscale --tests`, formatting and diff checks passed.
+`python3 scripts/check_execution_delivery_mutations.py` passed five baselines
+and detected ten compiled mutations through the expected named test failures.
+The three added regressions recreate a delivery on retry, accept changed request
+content and accept a foreign principal receipt.
+
+`cargo test -p playscale --test delivery -- --nocapture` passed all six native
+tests with real FFmpeg/FFprobe and no skips. The three new tests verify concurrent
+exact replay, conflicting keys, retired/recovered replay without execution,
+transaction rollback on receipt failure, continuation after a lost HTTP waiter,
+current-authority rejection and principal isolation. Existing before-completion
+HLS, generation switching, disk rejection and restart fencing also passed.
+The focused core admission unit test and both server delivery unit tests passed.
+These results qualify the admission increment, before the subsequent optional
+expected-duration execution policy.

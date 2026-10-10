@@ -31,6 +31,8 @@ use utoipa::ToSchema;
 
 /// Concurrent delivery sessions. Each may briefly run two encoders while overlapping.
 pub const MAX_SESSIONS: usize = 4;
+/// Bound owned admission tasks, including requests whose HTTP waiters vanished.
+pub const MAX_ADMISSIONS: usize = 32;
 /// Requested segment length; keyframes are forced on this cadence.
 pub const SEGMENT_SECONDS: u64 = 4;
 /// Pinned HLS target duration. Longer segments fail the generation.
@@ -50,6 +52,9 @@ pub struct Runtime {
     pub root: PathBuf,
     started: Instant,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    admission: tokio::sync::Mutex<()>,
+    admission_slots: Arc<tokio::sync::Semaphore>,
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -86,6 +91,9 @@ impl Runtime {
             root,
             started: Instant::now(),
             sessions: Mutex::new(HashMap::new()),
+            admission: tokio::sync::Mutex::new(()),
+            admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         }
     }
     /// Monotonic milliseconds for lease and drain deadlines.
@@ -154,8 +162,8 @@ fn persist(app: &App, session: &Session, d: &Delivery) {
 /// Monotonic snapshots cannot resurrect a session fenced by restart recovery.
 /// Await this at acknowledgement and eviction boundaries; intermediate snapshots
 /// are diagnostic and may lag the in-memory reducer.
-async fn record(
-    db: &sqlx::SqlitePool,
+async fn record<'e>(
+    db: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
     id: &str,
     file_id: &str,
     file_revision: &str,
@@ -707,6 +715,8 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = stop.cancelled() => {
+                app.processing.deliveries.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _admission = app.processing.deliveries.admission.lock().await;
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
                     if let Ok(state) = apply(&app, &session, Input::Close)
@@ -857,7 +867,7 @@ fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     Option::<T>::deserialize(d).map(Some)
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
     pub file_id: String,
@@ -895,7 +905,7 @@ pub struct HeartbeatRequest {
     pub position_ms: Option<u64>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct GenerationView {
     pub generation: String,
     /// starting, ready, active, retiring, retired, or failed.
@@ -913,7 +923,7 @@ pub struct GenerationView {
     pub audio_track: Option<u32>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeliveryView {
     pub id: String,
     pub revision: String,
@@ -1070,7 +1080,7 @@ fn validate_audio(file: &db::ItemRow, audio: Option<u32>) -> Result<(), ApiError
     Ok(())
 }
 
-#[utoipa::path(operation_id="create_delivery",post,path="/api/v1/deliveries",request_body=CreateRequest,security(("admin_token"=[])),responses((status=201,description="Delivery admitted; its first generation starts encoding",body=DeliveryView),(status=400,description="Invalid position or track",body=crate::api::ErrorBody),(status=404,description="Unknown or unavailable file",body=crate::api::ErrorBody),(status=409,description="Source revision changed",body=crate::api::ErrorBody),(status=503,description="Too many deliveries",body=crate::api::ErrorBody)))]
+#[utoipa::path(operation_id="create_delivery",post,path="/api/v1/deliveries",params(("Idempotency-Key"=Option<String>,Header,description="16–128 bytes; exact retries replay the durable acknowledgement")),request_body=CreateRequest,security(("admin_token"=[])),responses((status=201,description="Delivery admitted; its first generation starts encoding",body=DeliveryView),(status=400,description="Invalid position or track",body=crate::api::ErrorBody),(status=404,description="Unknown or unavailable file",body=crate::api::ErrorBody),(status=409,description="Source revision or idempotency conflict",body=crate::api::ErrorBody),(status=503,description="Too many deliveries",body=crate::api::ErrorBody)))]
 pub async fn create(
     State(app): State<App>,
     headers: HeaderMap,
@@ -1078,9 +1088,148 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
     admin(&app, &headers)?;
     let r = json(body)?;
+    let key = headers
+        .get("idempotency-key")
+        .map(|value| {
+            let key = value
+                .to_str()
+                .map_err(|_| ApiError::bad("Invalid Idempotency-Key"))?;
+            if !(16..=128).contains(&key.len()) {
+                return Err(ApiError::bad("Idempotency-Key must be 16–128 bytes"));
+            }
+            Ok(key.to_owned())
+        })
+        .transpose()?;
+    admit_request(app, Arc::new(LegacyAdmin), key, r).await
+}
+
+/// Authority adapters revalidate current permission and source visibility inside
+/// the same SQLite write transaction as admission/replay. This prevents a policy
+/// change between authorization and receipt publication. No encoder may be started
+/// by this callback. The returned principal is the durable receipt scope.
+pub trait AdmissionAuthority: Send + Sync + 'static {
+    fn reauthorize<'a>(
+        &'a self,
+        db: &'a mut sqlx::SqliteConnection,
+        request: &'a CreateRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ApiError>> + Send + 'a>>;
+}
+struct LegacyAdmin;
+impl AdmissionAuthority for LegacyAdmin {
+    fn reauthorize<'a>(
+        &'a self,
+        _: &'a mut sqlx::SqliteConnection,
+        _: &'a CreateRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ApiError>> + Send + 'a>>
+    {
+        // This adapter's admin token is immutable for the lifetime of App and
+        // was checked before entering admission. V2 implements current DB policy.
+        Box::pin(async { Ok("legacy-admin".into()) })
+    }
+}
+
+/// Admission survives loss of its HTTP waiter. Authority is revalidated even for
+/// an exact replay; durable admission and execution dispatch remain ordered.
+pub async fn admit_request(
+    app: App,
+    authority: Arc<dyn AdmissionAuthority>,
+    key: Option<String>,
+    r: CreateRequest,
+) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
+    if key
+        .as_ref()
+        .is_some_and(|key| !(16..=128).contains(&key.len()))
+    {
+        return Err(ApiError::bad("Invalid delivery admission identity"));
+    }
+    let slot = app
+        .processing
+        .deliveries
+        .admission_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admission_busy",
+                "Too many pending delivery admissions",
+            )
+        })?;
+    tokio::spawn(async move {
+        let _slot = slot;
+        admit_owned(&app, authority, key, r).await
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+async fn admit_owned(
+    app: &App,
+    authority: Arc<dyn AdmissionAuthority>,
+    key: Option<String>,
+    r: CreateRequest,
+) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
+    use playscale_core::delivery_admission::{self as admission, Decision, Identity, Receipt};
+    use sha2::{Digest, Sha256};
+    let runtime = &app.processing.deliveries;
+    let _admission = runtime.admission.lock().await;
+    let mut transaction = db::begin_write(&app.db).await?;
+    let principal = authority.reauthorize(&mut transaction, &r).await?;
+    if principal.is_empty() || principal.len() > 256 {
+        return Err(ApiError::bad("Invalid admission principal"));
+    }
+    let identity = key.map(|key| Identity {
+        principal,
+        key,
+        digest: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&r).expect("serializable request"))
+        ),
+    });
+    if let Some(identity) = &identity {
+        let saved: Option<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT principal,request_key,request_digest,delivery_id,acknowledgement_json FROM delivery_admissions WHERE principal=? AND request_key=?"
+        ).bind(&identity.principal).bind(&identity.key).fetch_optional(&mut *transaction).await?;
+        let receipt = saved
+            .as_ref()
+            .map(|(principal, key, digest, id, _)| Receipt {
+                identity: Identity {
+                    principal: principal.clone(),
+                    key: key.clone(),
+                    digest: digest.clone(),
+                },
+                delivery_id: id.clone(),
+            });
+        match admission::decide(identity, receipt.as_ref()) {
+            Ok(Decision::Replay { delivery_id }) => {
+                let acknowledgement: DeliveryView =
+                    serde_json::from_str(&saved.unwrap().4).map_err(ApiError::internal)?;
+                if acknowledgement.id != delivery_id {
+                    return Err(ApiError::internal("Delivery receipt identity mismatch"));
+                }
+                transaction.commit().await?;
+                return Ok((StatusCode::CREATED, Json(acknowledgement)));
+            }
+            Ok(Decision::Create) => {}
+            Err(_) => {
+                return Err(ApiError::conflict(
+                    "idempotency_conflict",
+                    "Key was already used for a different delivery request",
+                ));
+            }
+        }
+    }
+    if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_stopping",
+            "Delivery admission is closed",
+        ));
+    }
+
     let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(&r.file_id)
-        .fetch_optional(&app.db)
+        .fetch_optional(&mut *transaction)
         .await?
         .ok_or_else(ApiError::not_found)?;
     if file.revision != r.file_revision {
@@ -1098,7 +1247,7 @@ pub async fn create(
     let (root, root_identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&file.library_id)
-            .fetch_one(&app.db)
+            .fetch_one(&mut *transaction)
             .await?;
     if !cfg!(unix) {
         // Encoder input is the inherited validated descriptor (Unix only).
@@ -1108,7 +1257,6 @@ pub async fn create(
             "Live conversion is not available on this platform",
         ));
     }
-    let runtime = &app.processing.deliveries;
     let (delivery, effects) = Delivery::admit(
         // The current catalog binds one timeline per edition.
         file.edition_id.clone(),
@@ -1133,33 +1281,38 @@ pub async fn create(
             workers: HashMap::new(),
         }),
     });
-    {
-        let mut sessions = runtime.sessions.lock().unwrap();
-        if sessions.len() >= MAX_SESSIONS {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "delivery_limit",
-                "Too many live deliveries",
-            ));
-        }
-        // Register the first worker before the session becomes visible, so a
-        // Stop from a tick, close or shutdown always finds its token.
-        dispatch(&app, &session, &mut session.inner.lock().unwrap(), effects);
-        sessions.insert(session.id.clone(), session.clone());
+    if runtime.sessions.lock().unwrap().len() >= MAX_SESSIONS {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delivery_limit",
+            "Too many live deliveries",
+        ));
     }
-    if let Err(error) = record(
-        &app.db,
+    let acknowledgement = view(app, &session, &delivery);
+    record(
+        &mut *transaction,
         &session.id,
         &session.file_id,
         &session.revision,
         &delivery,
     )
     .await
-    {
-        let _ = apply(&app, &session, Input::Close);
-        return Err(ApiError::internal(error));
+    .map_err(ApiError::internal)?;
+    if let Some(identity) = identity {
+        sqlx::query("INSERT INTO delivery_admissions(principal,request_key,request_digest,delivery_id,acknowledgement_json,created_at) VALUES (?,?,?,?,?,?)")
+            .bind(identity.principal).bind(identity.key).bind(identity.digest).bind(&session.id)
+            .bind(serde_json::to_string(&acknowledgement).map_err(ApiError::internal)?)
+            .bind(crate::now()).execute(&mut *transaction).await?;
     }
-    Ok((StatusCode::CREATED, Json(view(&app, &session, &delivery))))
+    transaction.commit().await?;
+    // No await between durable admission and registration/dispatch. The owned
+    // task survives a dropped HTTP waiter; shutdown serializes on admission.
+    {
+        let mut sessions = runtime.sessions.lock().unwrap();
+        dispatch(app, &session, &mut session.inner.lock().unwrap(), effects);
+        sessions.insert(session.id.clone(), session.clone());
+    }
+    Ok((StatusCode::CREATED, Json(acknowledgement)))
 }
 
 #[utoipa::path(operation_id="get_delivery",get,path="/api/v1/deliveries/{id}",params(("id"=String,Path)),responses((status=200,description="Readiness, active and pending generations",body=DeliveryView),(status=404,description="Unknown or forgotten delivery",body=crate::api::ErrorBody)))]

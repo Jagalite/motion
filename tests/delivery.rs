@@ -157,11 +157,24 @@ impl Fixture {
 }
 
 async fn raw_on(app: &App, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
+    raw_on_key(app, method, path, body, None).await
+}
+
+async fn raw_on_key(
+    app: &App,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    key: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
     let mut request = Request::builder()
         .method(method)
         .uri(path)
         .header("host", "127.0.0.1:8787")
         .header("authorization", "Bearer test-secret-token");
+    if let Some(key) = key {
+        request = request.header("idempotency-key", key);
+    }
     if body.is_some() {
         request = request.header("content-type", "application/json");
     }
@@ -660,5 +673,341 @@ async fn restart_reports_recorded_deliveries_as_interrupted() {
     let (status, body) = json_on(&restarted, "GET", &path, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "interrupted");
+    f.stop.cancel();
+}
+
+async fn admission_fixture() -> (Fixture, Value) {
+    let f = Fixture::with_realtime(Default::default(), true).await;
+    assert!(
+        Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=12",
+                "-t",
+                "20",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(f.dir.path().join("media/clip.mkv"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.scan().await;
+    let (file, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let request = json!({"file_id":file,"file_revision":revision,"start_ms":0,"audio_track":null});
+    (f, request)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_admission_and_retired_restart_retries_replay_exact_acknowledgement() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let (f, request) = admission_fixture().await;
+    let path = "/api/v1/deliveries";
+    let key = "delivery-retry-key-0001";
+    let (first, second) = tokio::join!(
+        raw_on_key(&f.app, "POST", path, Some(request.clone()), Some(key)),
+        raw_on_key(&f.app, "POST", path, Some(request.clone()), Some(key)),
+    );
+    assert_eq!(first.0, StatusCode::CREATED);
+    assert_eq!(
+        second, first,
+        "duplicate must replay exact initial acknowledgement"
+    );
+    let acknowledgement: Value = serde_json::from_slice(&first.1).unwrap();
+    let id = acknowledgement["id"].as_str().unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_sessions")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_admissions")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let mut changed = request.clone();
+    changed["start_ms"] = json!(1);
+    let conflict = raw_on_key(&f.app, "POST", path, Some(changed), Some(key)).await;
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&conflict.1).unwrap()["code"],
+        "idempotency_conflict"
+    );
+    assert_eq!(
+        raw_on_key(&f.app, "POST", path, Some(request.clone()), Some("short"))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.raw("DELETE", &format!("{path}/{id}"), None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.deliveries.is_live(id)
+            || f.app.processing.execution.snapshot().used != 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        raw_on_key(&f.app, "POST", path, Some(request.clone()), Some(key)).await,
+        first
+    );
+    assert!(!f.app.processing.deliveries.is_live(id));
+    let mut runtime =
+        playscale::processing::Runtime::new(f.dir.path().join("cache"), Default::default());
+    runtime.supervisor = PathBuf::from(env!("CARGO_BIN_EXE_playscale"));
+    let restarted = App {
+        processing: Arc::new(runtime),
+        ..f.app.clone()
+    };
+    playscale::delivery::recover(&restarted).await.unwrap();
+    assert_eq!(
+        raw_on_key(&restarted, "POST", path, Some(request), Some(key)).await,
+        first
+    );
+    assert_eq!(restarted.processing.execution.snapshot().used, 0);
+    assert!(!restarted.processing.deliveries.is_live(id));
+    f.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receipt_failure_rolls_back_initial_state_before_any_encoder_starts() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let (f, request) = admission_fixture().await;
+    sqlx::query("CREATE TRIGGER reject_admission BEFORE INSERT ON delivery_admissions BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END")
+        .execute(&f.app.db).await.unwrap();
+    let key = "delivery-rollback-key-0001";
+    let failed = raw_on_key(
+        &f.app,
+        "POST",
+        "/api/v1/deliveries",
+        Some(request.clone()),
+        Some(key),
+    )
+    .await;
+    assert_eq!(failed.0, StatusCode::INTERNAL_SERVER_ERROR);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_sessions")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "initial state and receipt must roll back together"
+    );
+    assert_eq!(f.app.processing.execution.snapshot().used, 0);
+    assert_eq!(
+        std::fs::read_dir(&f.app.processing.deliveries.root)
+            .unwrap()
+            .count(),
+        0
+    );
+    sqlx::query("DROP TRIGGER reject_admission")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let retried = raw_on_key(
+        &f.app,
+        "POST",
+        "/api/v1/deliveries",
+        Some(request),
+        Some(key),
+    )
+    .await;
+    assert_eq!(retried.0, StatusCode::CREATED);
+    let body: Value = serde_json::from_slice(&retried.1).unwrap();
+    assert_eq!(
+        f.raw(
+            "DELETE",
+            &format!("/api/v1/deliveries/{}", body["id"].as_str().unwrap()),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.stop.cancel();
+}
+
+struct DatabaseAuthority {
+    principal: String,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    gate: std::sync::atomic::AtomicBool,
+}
+impl playscale::delivery::AdmissionAuthority for DatabaseAuthority {
+    fn reauthorize<'a>(
+        &'a self,
+        db: &'a mut sqlx::SqliteConnection,
+        _: &'a playscale::delivery::CreateRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, playscale::api::ApiError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let allowed: bool = sqlx::query_scalar("SELECT allowed FROM test_admission_authority")
+                .fetch_one(db)
+                .await?;
+            if !allowed {
+                return Err(playscale::api::ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "revoked",
+                    "Permission revoked",
+                ));
+            }
+            if self.gate.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(self.principal.clone())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_waiter_does_not_cancel_admission_and_replay_rechecks_authority() {
+    use axum::response::IntoResponse;
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let (f, request) = admission_fixture().await;
+    sqlx::query("CREATE TABLE test_admission_authority(allowed INTEGER NOT NULL)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO test_admission_authority VALUES (1)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let authority = Arc::new(DatabaseAuthority {
+        principal: "legacy-admin".into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        gate: std::sync::atomic::AtomicBool::new(true),
+    });
+    let key = "lost-delivery-waiter-key";
+    let task = tokio::spawn(playscale::delivery::admit_request(
+        f.app.clone(),
+        authority.clone(),
+        Some(key.into()),
+        serde_json::from_value(request.clone()).unwrap(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), authority.entered.notified())
+        .await
+        .unwrap();
+    task.abort(); // The HTTP consumer vanished while admission was in progress.
+    assert!(task.await.is_err());
+    authority.release.notify_one();
+    let id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let id: Option<String> = sqlx::query_scalar(
+                "SELECT delivery_id FROM delivery_admissions WHERE request_key=?",
+            )
+            .bind(key)
+            .fetch_optional(&f.app.db)
+            .await
+            .unwrap();
+            if let Some(id) = id {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let replay = raw_on_key(
+        &f.app,
+        "POST",
+        "/api/v1/deliveries",
+        Some(request.clone()),
+        Some(key),
+    )
+    .await;
+    assert_eq!(replay.0, StatusCode::CREATED);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.1).unwrap()["id"],
+        id
+    );
+    sqlx::query("UPDATE test_admission_authority SET allowed=0")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let denied = playscale::delivery::admit_request(
+        f.app.clone(),
+        authority,
+        Some(key.into()),
+        serde_json::from_value(request.clone()).unwrap(),
+    )
+    .await;
+    let error = match denied {
+        Ok(_) => panic!("revoked authority received a receipt"),
+        Err(error) => error,
+    };
+    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    sqlx::query("UPDATE test_admission_authority SET allowed=1")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let other = Arc::new(DatabaseAuthority {
+        principal: "other-principal".into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        gate: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (_, other) = playscale::delivery::admit_request(
+        f.app.clone(),
+        other,
+        Some(key.into()),
+        serde_json::from_value(request).unwrap(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("independent principal admission failed"));
+    assert_ne!(other.id, id, "idempotency keys are principal scoped");
+    assert_eq!(
+        f.raw("DELETE", &format!("/api/v1/deliveries/{}", other.id), None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.raw("DELETE", &format!("/api/v1/deliveries/{id}"), None)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     f.stop.cancel();
 }
