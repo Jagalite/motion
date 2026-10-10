@@ -28,7 +28,7 @@ def model():
     kyoto = os.environ.get('KYOTO')
     if not kyoto:
         return subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
-    job = json.loads(subprocess.run([kyoto, 'submit', '--cwd', str(ROOT), '--allow-test-run', '--', *command],
+    job = json.loads(subprocess.run([kyoto, 'submit', '--cwd', str(ROOT), '--', *command],
                                     check=True, capture_output=True, text=True).stdout)
     # `wait` exits with the job's code; a detected mutation fails the job, so
     # read its completion record instead of requiring success.

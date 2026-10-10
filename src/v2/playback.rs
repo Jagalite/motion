@@ -994,7 +994,8 @@ pub async fn plan(
         hls: input.client.transports.iter().any(|t| t == "hls"),
         explicit_streams: audio != default_audio,
         pinned_prepared,
-        tracks_pinned,
+        // With a pinned rendition, track pins index that rendition's streams.
+        tracks_pinned: tracks_pinned && !pinned_prepared,
         failed: input.failed_candidate_ids.clone(),
     };
     // A prepared plan pins the chosen rendition and plays its default streams.
@@ -1401,14 +1402,26 @@ pub async fn change_delivery(
     }
     let receipt = delivery::ChangeReceipt {
         principal: principal.id.clone(),
+        scope: "change".into(),
         key: key.clone(),
         digest: body.digest.clone(),
     };
     // An acknowledged change replays even if its plan token expired since.
     if let Some(view) = delivery::change_replay(&app, &id, &receipt).map_err(problem)? {
+        // Re-record the durable receipt: an earlier attempt may have
+        // applied the change but rolled back before committing it.
+        let ack = delivery_json(&view, &owner);
+        durable
+            .save(
+                &mut tx,
+                &body.digest,
+                StatusCode::ACCEPTED,
+                Some(&ack),
+                None,
+            )
+            .await?;
         tx.commit().await?;
-        let mut response =
-            (StatusCode::ACCEPTED, Json(delivery_json(&view, &owner))).into_response();
+        let mut response = (StatusCode::ACCEPTED, Json(ack)).into_response();
         response
             .headers_mut()
             .insert("idempotent-replayed", HeaderValue::from_static("true"));
@@ -1460,17 +1473,16 @@ pub async fn change_delivery(
             .await
             .map_err(problem)?;
     let ack = delivery_json(&view, &owner);
-    if !replayed {
-        durable
-            .save(
-                &mut tx,
-                &body.digest,
-                StatusCode::ACCEPTED,
-                Some(&ack),
-                None,
-            )
-            .await?;
-    }
+    // Saved on replays too, repairing a receipt whose first commit failed.
+    durable
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::ACCEPTED,
+            Some(&ack),
+            None,
+        )
+        .await?;
     tx.commit().await?;
     let mut response = (StatusCode::ACCEPTED, Json(ack)).into_response();
     if replayed {
@@ -1514,8 +1526,8 @@ pub async fn activate(
     }
     let receipt = delivery::ChangeReceipt {
         principal: principal.id.clone(),
-        // Activation keys are distinct from change keys on the same delivery.
-        key: format!("activate:{generation}:{key}"),
+        scope: format!("activate/{generation}"),
+        key: key.clone(),
         digest: body.digest.clone(),
     };
     let (view, replayed) = delivery::activate_live(
@@ -1527,11 +1539,10 @@ pub async fn activate(
     )
     .map_err(problem)?;
     let ack = delivery_json(&view, &owner);
-    if !replayed {
-        durable
-            .save(&mut tx, &body.digest, StatusCode::OK, Some(&ack), None)
-            .await?;
-    }
+    // Saved on replays too, repairing a receipt whose first commit failed.
+    durable
+        .save(&mut tx, &body.digest, StatusCode::OK, Some(&ack), None)
+        .await?;
     tx.commit().await?;
     let mut response = (StatusCode::OK, Json(ack)).into_response();
     if replayed {

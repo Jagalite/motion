@@ -2105,12 +2105,18 @@ pub(crate) fn activate_live(
     if let Some(view) = replayed_change(&inner, receipt)? {
         return Ok((view, true));
     }
+    let before = inner.delivery.clone();
     let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
     let acknowledged = view(app, &session, &d);
-    inner.changes.push((
-        receipt.identity(),
-        serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
-    ));
+    // Only an activation that changed the delivery is receipted, so receipts
+    // stay bounded by the generations a delivery may create; re-activating
+    // the active generation is an acknowledged no-op either way.
+    if d != before {
+        inner.changes.push((
+            receipt.identity(),
+            serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
+        ));
+    }
     Ok((acknowledged, false))
 }
 
@@ -2258,9 +2264,11 @@ pub(crate) async fn change_live(
     Ok((acknowledged, false))
 }
 
-/// Identity of a v2 change request: principal, Idempotency-Key, body digest.
+/// Identity of a v2 delivery command: principal, operation and target
+/// (`scope`, e.g. "change" or "activate/2"), Idempotency-Key, body digest.
 pub(crate) struct ChangeReceipt {
     pub principal: String,
+    pub scope: String,
     pub key: String,
     pub digest: String,
 }
@@ -2268,7 +2276,8 @@ impl ChangeReceipt {
     fn identity(&self) -> playscale_core::delivery_admission::Identity {
         playscale_core::delivery_admission::Identity {
             principal: self.principal.clone(),
-            key: self.key.clone(),
+            // Keys are visible ASCII, so NUL separates scope from key.
+            key: format!("{}\0{}", self.scope, self.key),
             digest: self.digest.clone(),
         }
     }
