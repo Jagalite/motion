@@ -5,7 +5,7 @@
 
 Each check runs in its own process with a bounded duration; its output is kept
 under --work and summarized in receipt.json. All checks use generated media and
-disposable data directories. FFmpeg/FFprobe must be on PATH.
+disposable data directories under --work/tmp. FFmpeg/FFprobe must be on PATH.
 
 Not included: scripts/test_demuxe_bundle.mjs needs an installed Demuxe bundle and
 runs in the package workflow; scripts/test_package.py needs a built archive.
@@ -107,8 +107,12 @@ def main():
             # Own session: a timed-out check's servers, supervisors and encoders
             # (in their own process groups) are terminated with it instead of
             # outliving it into later checks.
+            # Disposable data stays under --work, not the shared system temp volume.
+            temporary = work / 'tmp' / name
+            temporary.mkdir(parents=True)
             process = subprocess.Popen(command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
-                                       stdin=subprocess.DEVNULL, start_new_session=True)
+                                       stdin=subprocess.DEVNULL, start_new_session=True,
+                                       env=dict(os.environ, TMPDIR=str(temporary)))
             try:
                 code = process.wait(timeout=limit)
             except subprocess.TimeoutExpired:
