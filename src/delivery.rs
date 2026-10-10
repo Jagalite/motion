@@ -100,6 +100,10 @@ impl Runtime {
             .cloned()
             .ok_or_else(ApiError::not_found)
     }
+    /// Whether this process holds the delivery live in memory.
+    pub fn is_live(&self, id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(id)
+    }
     pub fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
@@ -120,9 +124,80 @@ impl Session {
 fn apply(app: &App, session: &Arc<Session>, input: Input) -> Result<Delivery, core::Error> {
     let mut inner = session.inner.lock().unwrap();
     let (next, effects) = core::transition(&inner.delivery, &input)?;
+    let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
+    if outline(&next) != outline(&inner.delivery) {
+        persist(app, session, &next);
+    }
     inner.delivery = next.clone();
     dispatch(app, session, &mut inner, effects);
     Ok(next)
+}
+
+/// Days a finished delivery's record is kept for diagnostics.
+const RECORD_RETENTION_SECONDS: i64 = 7 * 86_400;
+
+/// Record the delivery's state for diagnostics and restart recovery. Written
+/// when its status or generations change; a newer revision is never replaced.
+fn persist(app: &App, session: &Session, d: &Delivery) {
+    let app = app.clone();
+    let id = session.id.clone();
+    let file_id = session.file_id.clone();
+    let file_revision = session.revision.clone();
+    let d = d.clone();
+    tokio::spawn(async move {
+        if let Err(error) = record(&app.db, &id, &file_id, &file_revision, &d).await {
+            tracing::warn!(?error, "could not record delivery state");
+        }
+    });
+}
+
+/// Monotonic snapshots cannot resurrect a session fenced by restart recovery.
+/// Await this at acknowledgement and eviction boundaries; intermediate snapshots
+/// are diagnostic and may lag the in-memory reducer.
+async fn record(
+    db: &sqlx::SqlitePool,
+    id: &str,
+    file_id: &str,
+    file_revision: &str,
+    d: &Delivery,
+) -> anyhow::Result<()> {
+    let state = serde_json::to_string(d)?;
+    sqlx::query("INSERT INTO delivery_sessions(id,file_id,file_revision,revision,status,state_json,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,status=excluded.status,state_json=excluded.state_json,updated_at=excluded.updated_at WHERE excluded.revision > delivery_sessions.revision AND delivery_sessions.status != 'interrupted'")
+        .bind(id)
+        .bind(file_id)
+        .bind(file_revision)
+        .bind(i64::try_from(d.revision)?)
+        .bind(name(d.status))
+        .bind(state)
+        .bind(crate::now())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// A delivery this process no longer holds: its last recorded state.
+async fn recorded(app: &App, id: &str) -> Result<Option<(String, String, Delivery)>, ApiError> {
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT file_id,file_revision,state_json FROM delivery_sessions WHERE id=?")
+            .bind(id)
+            .fetch_optional(&app.db)
+            .await?;
+    row.map(|(file, revision, state)| {
+        serde_json::from_str(&state)
+            .map(|d| (file, revision, d))
+            .map_err(ApiError::internal)
+    })
+    .transpose()
+}
+
+/// Commands on a delivery that is no longer live: closed or interrupted (409);
+/// unknown (404).
+async fn not_live(app: &App, id: &str) -> ApiError {
+    match recorded(app, id).await {
+        Ok(Some(_)) => error(core::Error::DeliveryClosed),
+        Ok(None) => ApiError::not_found(),
+        Err(error) => error,
+    }
 }
 
 fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<Effect>) {
@@ -633,7 +708,11 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             _ = stop.cancelled() => {
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
-                    let _ = apply(&app, &session, Input::Close);
+                    if let Ok(state) = apply(&app, &session, Input::Close)
+                        && let Err(error) = record(&app.db, &session.id, &session.file_id, &session.revision, &state).await
+                    {
+                        tracing::warn!(?error, "could not record delivery shutdown");
+                    }
                 }
                 return Ok(());
             }
@@ -655,6 +734,21 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 continue;
             };
             if state.status.fenced() && state.generations.is_empty() {
+                if let Err(error) = record(
+                    &app.db,
+                    &session.id,
+                    &session.file_id,
+                    &session.revision,
+                    &state,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        ?error,
+                        "retaining delivery until its terminal state is recorded"
+                    );
+                    continue;
+                }
                 app.processing
                     .deliveries
                     .sessions
@@ -678,7 +772,38 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
 
 /// Live output never resumes after a restart. Encoders of the previous process
 /// that are still alive keep their capacity and directory until they are gone.
+/// Recorded deliveries that were live become interrupted through the core
+/// reducer's own Interrupt transition.
 pub async fn recover(app: &App) -> anyhow::Result<()> {
+    // Take SQLite's writer lock before reading snapshots, so a late old-runtime
+    // write cannot advance a revision between the read and the restart fence.
+    let mut transaction = app.db.begin().await?;
+    sqlx::query("DELETE FROM delivery_sessions WHERE updated_at < ?")
+        .bind(crate::now() - RECORD_RETENTION_SECONDS)
+        .execute(&mut *transaction)
+        .await?;
+    let live: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,state_json FROM delivery_sessions WHERE status NOT IN ('closed','failed','interrupted')",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    for (id, state) in live {
+        let delivery: Delivery = serde_json::from_str(&state)?;
+        // Workers died with the old process; their files are handled below.
+        let (interrupted, _) = core::transition(&delivery, &Input::Interrupt)
+            .map_err(|e| anyhow::anyhow!("interrupt rejected: {e:?}"))?;
+        sqlx::query(
+            "UPDATE delivery_sessions SET revision=?,status=?,state_json=?,updated_at=? WHERE id=?",
+        )
+        .bind(i64::try_from(interrupted.revision)?)
+        .bind(name(interrupted.status))
+        .bind(serde_json::to_string(&interrupted)?)
+        .bind(crate::now())
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
     let root = app.processing.deliveries.root.clone();
     let held = {
         let root = root.clone();
@@ -812,6 +937,10 @@ fn name<T: Serialize>(value: T) -> String {
 }
 
 fn view(app: &App, session: &Session, d: &Delivery) -> DeliveryView {
+    view_of(app, &session.id, &session.file_id, &session.revision, d)
+}
+
+fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery) -> DeliveryView {
     let generation = |n: Option<u64>| {
         n.and_then(|n| d.generations.get(&n).map(|g| (n, g)))
             .map(|(n, g)| GenerationView {
@@ -819,7 +948,7 @@ fn view(app: &App, session: &Session, d: &Delivery) -> DeliveryView {
                 status: name(g.status),
                 manifest_url: d
                     .serves(n, app.processing.deliveries.now_ms())
-                    .then(|| format!("/api/v1/streams/{}/{n}/index.m3u8", session.id)),
+                    .then(|| format!("/api/v1/streams/{id}/{n}/index.m3u8")),
                 media_time_origin_ms: g.media_time_origin_ms,
                 requested_start_ms: g.requested_start_ms,
                 available_start_ms: g.available_start_ms,
@@ -836,17 +965,21 @@ fn view(app: &App, session: &Session, d: &Delivery) -> DeliveryView {
             })
     };
     DeliveryView {
-        id: session.id.clone(),
+        id: id.to_owned(),
         revision: d.revision.to_string(),
         replacement_mode: name(d.replacement),
-        file_id: session.file_id.clone(),
-        file_revision: session.revision.clone(),
+        file_id: file_id.to_owned(),
+        file_revision: file_revision.to_owned(),
         status: name(d.status),
         active: generation(d.active),
         pending: generation(d.pending),
-        lease_expires_in_ms: d
-            .lease_expires_ms
-            .saturating_sub(app.processing.deliveries.now_ms()),
+        // A recorded delivery's lease belonged to another process's clock.
+        lease_expires_in_ms: if d.status.fenced() {
+            0
+        } else {
+            d.lease_expires_ms
+                .saturating_sub(app.processing.deliveries.now_ms())
+        },
         heartbeat_interval_seconds: HEARTBEAT_SECONDS,
         logical_duration_ms: d.duration_ms,
     }
@@ -1013,6 +1146,18 @@ pub async fn create(
         dispatch(&app, &session, &mut session.inner.lock().unwrap(), effects);
         sessions.insert(session.id.clone(), session.clone());
     }
+    if let Err(error) = record(
+        &app.db,
+        &session.id,
+        &session.file_id,
+        &session.revision,
+        &delivery,
+    )
+    .await
+    {
+        let _ = apply(&app, &session, Input::Close);
+        return Err(ApiError::internal(error));
+    }
     Ok((StatusCode::CREATED, Json(view(&app, &session, &delivery))))
 }
 
@@ -1021,7 +1166,10 @@ pub async fn get(
     State(app): State<App>,
     Path(id): Path<String>,
 ) -> Result<Json<DeliveryView>, ApiError> {
-    let session = app.processing.deliveries.session(&id)?;
+    let Ok(session) = app.processing.deliveries.session(&id) else {
+        let (file, revision, d) = recorded(&app, &id).await?.ok_or_else(ApiError::not_found)?;
+        return Ok(Json(view_of(&app, &id, &file, &revision, &d)));
+    };
     let d = session.inner.lock().unwrap().delivery.clone();
     Ok(Json(view(&app, &session, &d)))
 }
@@ -1033,8 +1181,23 @@ pub async fn close(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     admin(&app, &headers)?;
-    let session = app.processing.deliveries.session(&id)?;
-    apply(&app, &session, Input::Close).map_err(error)?;
+    let Ok(session) = app.processing.deliveries.session(&id) else {
+        // Closing is idempotent: a recorded (closed or interrupted) delivery is done.
+        return match recorded(&app, &id).await? {
+            Some(_) => Ok(StatusCode::NO_CONTENT),
+            None => Err(ApiError::not_found()),
+        };
+    };
+    let state = apply(&app, &session, Input::Close).map_err(error)?;
+    record(
+        &app.db,
+        &session.id,
+        &session.file_id,
+        &session.revision,
+        &state,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1047,7 +1210,9 @@ pub async fn heartbeat(
 ) -> Result<Json<DeliveryView>, ApiError> {
     admin(&app, &headers)?;
     let r = json(body)?;
-    let session = app.processing.deliveries.session(&id)?;
+    let Ok(session) = app.processing.deliveries.session(&id) else {
+        return Err(not_live(&app, &id).await);
+    };
     let d = apply(
         &app,
         &session,
@@ -1070,7 +1235,9 @@ pub async fn change(
 ) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
     admin(&app, &headers)?;
     let r = json(body)?;
-    let session = app.processing.deliveries.session(&id)?;
+    let Ok(session) = app.processing.deliveries.session(&id) else {
+        return Err(not_live(&app, &id).await);
+    };
     let replan = match r.audio_track {
         None => None,
         Some(audio) => {
@@ -1114,7 +1281,9 @@ pub async fn activate(
 ) -> Result<Json<DeliveryView>, ApiError> {
     admin(&app, &headers)?;
     let r = json(body)?;
-    let session = app.processing.deliveries.session(&id)?;
+    let Ok(session) = app.processing.deliveries.session(&id) else {
+        return Err(not_live(&app, &id).await);
+    };
     let d = apply(
         &app,
         &session,
@@ -1257,6 +1426,76 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recorded_state_is_monotonic_and_restart_fence_is_permanent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::connect(&dir.path().join("record.sqlite"))
+            .await
+            .unwrap();
+        let (initial, _) = Delivery::admit(
+            "timeline".into(),
+            Pin {
+                source_file: "file".into(),
+                source_revision: "revision".into(),
+                tracks: tracks(None),
+                operation: Operation::VideoTranscode,
+                recipe_digest: Some(RECIPE.into()),
+            },
+            0,
+            Some(60_000),
+            0,
+        )
+        .unwrap();
+        let (ready, _) = core::transition(
+            &initial,
+            &Input::Ready {
+                generation: 1,
+                media_time_origin_ms: 0,
+                first_segment_ms: 4000,
+                target_duration_s: 6,
+            },
+        )
+        .unwrap();
+        record(&db, "id", "file", "revision", &ready).await.unwrap();
+        record(&db, "id", "file", "revision", &initial)
+            .await
+            .unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT state_json FROM delivery_sessions WHERE id='id'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(serde_json::from_str::<Delivery>(&stored).unwrap(), ready);
+        let (interrupted, _) = core::transition(&ready, &Input::Interrupt).unwrap();
+        record(&db, "id", "file", "revision", &interrupted)
+            .await
+            .unwrap();
+        let mut late = ready;
+        for now_ms in 1..5 {
+            late = core::transition(
+                &late,
+                &Input::Heartbeat {
+                    active_generation: 1,
+                    position_ms: Some(now_ms),
+                    now_ms,
+                },
+            )
+            .unwrap()
+            .0;
+        }
+        assert!(late.revision > interrupted.revision);
+        record(&db, "id", "file", "revision", &late).await.unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT state_json FROM delivery_sessions WHERE id='id'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Delivery>(&stored).unwrap(),
+            interrupted
+        );
+    }
+
     use super::*;
     #[test]
     fn playlist_parser_accepts_only_owned_segment_names() {

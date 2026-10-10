@@ -103,35 +103,10 @@ impl Fixture {
         task.await.unwrap().unwrap();
     }
     async fn raw(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
-        let mut request = Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", "127.0.0.1:8787")
-            .header("authorization", "Bearer test-secret-token");
-        if body.is_some() {
-            request = request.header("content-type", "application/json");
-        }
-        let response = api::router(self.app.clone(), None)
-            .oneshot(
-                request
-                    .body(
-                        body.map(|v| Body::from(v.to_string()))
-                            .unwrap_or_else(Body::empty),
-                    )
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        (status, bytes.to_vec())
+        raw_on(&self.app, method, path, body).await
     }
     async fn json(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
-        let (status, bytes) = self.raw(method, path, body).await;
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        json_on(&self.app, method, path, body).await
     }
     /// Poll the delivery until `done` accepts it, renewing the lease like a client.
     async fn until(&self, id: &str, done: impl Fn(&Value) -> bool) -> Value {
@@ -164,6 +139,39 @@ impl Fixture {
             .collect();
         panic!("delivery condition not reached; last: {last}; files: {files:?}");
     }
+}
+
+async fn raw_on(app: &App, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Vec<u8>) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "127.0.0.1:8787")
+        .header("authorization", "Bearer test-secret-token");
+    if body.is_some() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = api::router(app.clone(), None)
+        .oneshot(
+            request
+                .body(
+                    body.map(|v| Body::from(v.to_string()))
+                        .unwrap_or_else(Body::empty),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.to_vec())
+}
+
+async fn json_on(app: &App, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let (status, bytes) = raw_on(app, method, path, body).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn probe(path: &std::path::Path) -> Value {
@@ -419,11 +427,12 @@ async fn hls_plays_before_completion_switches_generations_and_releases_workers()
     );
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let gone = f
+            // Forgotten in memory, the delivery reads back as its recorded state.
+            let (status, body) = f
                 .json("GET", &format!("/api/v1/deliveries/{id}"), None)
-                .await
-                .0
-                == StatusCode::NOT_FOUND;
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let gone = body["status"] == "closed" && !f.app.processing.deliveries.is_live(&id);
             let snapshot = f.app.processing.execution.snapshot();
             let removed = !f.app.processing.deliveries.root.join(&id).exists();
             if gone && removed && snapshot.used == 0 && snapshot.stuck.is_empty() {
@@ -512,5 +521,129 @@ async fn generation_without_disk_headroom_fails_and_releases_capacity() {
     })
     .await
     .expect("capacity was not released");
+    f.stop.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_reports_recorded_deliveries_as_interrupted() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let source = f.dir.path().join("media/clip.mkv");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=12",
+            "-t",
+            "60",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let (status, created) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(
+                json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":null}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    // Creation is durable before acknowledgement, even if readiness is still pending.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_sessions WHERE id=?")
+        .bind(&id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    f.until(&id, |d| d["active"]["status"] == "active").await;
+    // The ready state is recorded asynchronously.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM delivery_sessions WHERE id=?")
+                    .bind(&id)
+                    .fetch_optional(&f.app.db)
+                    .await
+                    .unwrap();
+            if status.as_deref() == Some("ready") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("delivery state was not recorded");
+
+    // A new process over the same database and data directory.
+    let mut processing =
+        playscale::processing::Runtime::new(f.dir.path().join("cache"), Default::default());
+    processing.supervisor = PathBuf::from(env!("CARGO_BIN_EXE_playscale"));
+    let restarted = App {
+        processing: Arc::new(processing),
+        ..f.app.clone()
+    };
+    playscale::delivery::recover(&restarted).await.unwrap();
+    let path = format!("/api/v1/deliveries/{id}");
+    let (status, body) = json_on(&restarted, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "interrupted", "{body}");
+    assert_eq!(body["active"], Value::Null);
+    assert_eq!(body["pending"], Value::Null);
+    assert_eq!(body["lease_expires_in_ms"], 0);
+    let (status, refused) = json_on(
+        &restarted,
+        "POST",
+        &format!("{path}/heartbeat"),
+        Some(json!({"active_generation":"1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "delivery_closed");
+    assert_eq!(
+        raw_on(&restarted, "DELETE", &path, None).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        raw_on(&restarted, "GET", "/api/v1/deliveries/unknown", None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    // The original process still owns its encoder; the new one counted it.
+    assert_eq!(restarted.processing.execution.snapshot().stuck.len(), 1);
+    assert_eq!(f.raw("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0
+            || restarted.processing.execution.snapshot().used != 0
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    // The old runtime's later writes must not undo the restart fence.
+    let (status, body) = json_on(&restarted, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "interrupted");
     f.stop.cancel();
 }

@@ -174,8 +174,9 @@ pub enum Replacement {
 pub struct Delivery {
     pub revision: u64,
     pub policy: Policy,
-    /// Last logical playhead reported by the client, with the generation it was
-    /// playing. A playhead never paces another generation.
+    /// Last logical playhead the client reported while playing the active
+    /// generation, with that generation. A candidate is not being watched yet: it
+    /// is paced from its requested start, and its heartbeats record no playhead.
     pub playhead: Option<(u64, u64)>,
     pub timeline: String,
     pub duration_ms: Option<u64>,
@@ -823,7 +824,9 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
                 return Err(Error::InvalidPosition);
             }
             d.lease_expires_ms = now_ms.saturating_add(LEASE_MS).max(d.lease_expires_ms);
-            if let Some(position) = position_ms {
+            if let Some(position) = position_ms
+                && d.active == Some(*active_generation)
+            {
                 d.playhead = Some((*active_generation, *position));
             }
         }
@@ -1183,6 +1186,32 @@ mod tests {
         step(&mut e, ready(1, 0)).unwrap();
         step(&mut e, segment(1, 6_500)).unwrap();
         assert_eq!(e.status, Status::Failed);
+    }
+
+    #[test]
+    fn pending_heartbeat_preserves_active_playhead_until_activation() {
+        let (mut d, _) = Delivery::admit("t".into(), pin(&["a1"]), 0, None, 0).unwrap();
+        step(&mut d, ready(1, 0)).unwrap();
+        let beat = |generation, position, now| Input::Heartbeat {
+            active_generation: generation,
+            position_ms: Some(position),
+            now_ms: now,
+        };
+        step(&mut d, beat(1, 12_000, 1)).unwrap();
+        step(&mut d, change(1, 30_000, true, 2)).unwrap();
+        step(&mut d, ready(2, 30_000)).unwrap();
+        assert_eq!(step(&mut d, beat(2, 36_000, 3)).unwrap(), []);
+        assert_eq!(d.playhead, Some((1, 12_000)));
+        assert_eq!(d.lease_expires_ms, 3 + LEASE_MS);
+        step(&mut d, activate(2, Some(1), 4)).unwrap();
+        assert_eq!(step(&mut d, beat(2, 36_000, 5)).unwrap(), []);
+        assert_eq!(d.playhead, Some((2, 36_000)));
+        let before = d.clone();
+        assert_eq!(
+            step(&mut d, beat(1, 16_000, 6)),
+            Err(Error::GenerationConflict)
+        );
+        assert_eq!(d, before);
     }
 
     #[test]
