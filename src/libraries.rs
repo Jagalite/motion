@@ -509,6 +509,10 @@ pub async fn preview_relocation(
     .bind(source)
     .fetch_all(&app.db)
     .await?;
+    let catalog: Vec<(String, String, bool)> = files
+        .iter()
+        .map(|(id, _, revision, available)| (id.clone(), revision.clone(), *available))
+        .collect();
     let (in_scope, out_of_scope): (Vec<_>, Vec<_>) = files
         .into_iter()
         .partition(|(_, path, _, _)| !core::excluded(path, &scope));
@@ -572,6 +576,7 @@ pub async fn preview_relocation(
         root_identity: identity,
         verified,
         out_of_scope: out_of_scope.into_iter().map(|(id, ..)| id).collect(),
+        catalog,
     })
 }
 
@@ -621,6 +626,12 @@ pub async fn commit_relocation(
             .bind(&plan.source)
             .fetch_one(&mut *tx)
             .await?;
+    let catalog: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT id,revision,available FROM media_files WHERE library_id=? ORDER BY id",
+    )
+    .bind(&plan.source)
+    .fetch_all(&mut *tx)
+    .await?;
     let others: Vec<String> = sqlx::query_scalar("SELECT root FROM libraries WHERE id<>?")
         .bind(&plan.source)
         .fetch_all(&mut *tx)
@@ -639,6 +650,7 @@ pub async fn commit_relocation(
             root_identity,
             fingerprints,
             overlapping_root,
+            catalog,
         },
     )
     .map_err(RelocationError::Conflict)?;

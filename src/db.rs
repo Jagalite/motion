@@ -34,6 +34,17 @@ pub struct Track {
     pub color_transfer: Option<String>,
     #[serde(default)]
     pub start_time_seconds: Option<f64>,
+    /// Container disposition flags and title, when the probe reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_track: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hearing_impaired: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commentary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Item {

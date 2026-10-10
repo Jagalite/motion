@@ -2,6 +2,7 @@ pub mod administration;
 pub mod api;
 pub mod artwork;
 pub mod catalog;
+pub mod components;
 pub mod config;
 pub mod curation;
 pub mod db;

@@ -403,6 +403,29 @@ async fn relocation_is_previewed_then_committed_against_unchanged_facts() {
     let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
         .await
         .unwrap();
+    // A publication between preview and commit changes the reviewed catalog.
+    sqlx::query("UPDATE media_files SET available=0 WHERE library_id=?")
+        .bind(&source.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        libraries::commit_relocation(&f.app, &plan).await,
+        Err(libraries::RelocationError::Conflict(
+            playscale_core::sources::RelocationConflict::SourceChanged
+        ))
+    ));
+    sqlx::query("UPDATE media_files SET available=1 WHERE library_id=?")
+        .bind(&source.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let candidate = administration::candidate_root(&f.app, moved.clone())
+        .await
+        .unwrap();
+    let plan = libraries::preview_relocation(&f.app, &source.id, candidate)
+        .await
+        .unwrap();
     let view = libraries::commit_relocation(&f.app, &plan).await.unwrap();
     assert_eq!(view.binding_revision, source.binding_revision + 1);
     assert!(

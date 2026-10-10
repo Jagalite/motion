@@ -109,6 +109,10 @@ pub(crate) async fn publish(
             {
                 return Ok(());
             }
+            // A file supplies one work: contributions it left on works it no
+            // longer belongs to (after a split) are withdrawn first, so this
+            // work can claim the identity they held.
+            withdraw(conn, file, Some(&item)).await?;
             let upsert = "INSERT INTO metadata_documents VALUES (?,?,1,?,?,?) ON CONFLICT(item_id,source) DO UPDATE SET revision=metadata_documents.revision+1,external_id=excluded.external_id,document_json=excluded.document_json,updated_at=excluded.updated_at WHERE metadata_documents.document_json IS NOT excluded.document_json OR metadata_documents.external_id IS NOT excluded.external_id";
             let result = sqlx::query(upsert)
                 .bind(&item)
@@ -135,9 +139,6 @@ pub(crate) async fn publish(
                     other?;
                 }
             }
-            // A file supplies one work: contributions it left on works it no
-            // longer belongs to (after a split) are withdrawn.
-            withdraw(conn, file, Some(&item)).await?;
             sqlx::query("INSERT INTO nfo_origins VALUES (?,?) ON CONFLICT(item_id) DO UPDATE SET file_id=excluded.file_id")
                 .bind(&item)
                 .bind(file)

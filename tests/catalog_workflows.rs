@@ -1186,9 +1186,20 @@ async fn organization_reads_and_deletes_are_profile_scoped_and_revisioned() {
     orgs::delete_collection(&f.app, "default", &smart.id, smart.revision)
         .await
         .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM change_events WHERE topic='organization'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
     orgs::delete_filter(&f.app, "default", &filter.id, filter.revision)
         .await
         .unwrap();
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM change_events WHERE topic='organization'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(after > before, "deletion emits an invalidation hint");
     orgs::delete_playlist(&f.app, "default", &playlist.id, playlist.revision)
         .await
         .unwrap();
@@ -1246,4 +1257,159 @@ async fn nfo_ownership_follows_contributions_through_merges_and_splits() {
         .await
         .unwrap();
     assert_eq!(api, "API", "the target's own contribution is untouched");
+}
+
+// ---------------------------------------------------------------------------
+// Component evidence
+
+#[tokio::test]
+async fn components_combine_embedded_tracks_and_sidecar_subtitles() {
+    let f = Fixture::new().await;
+    f.write("film.mkv", b"film bytes");
+    f.write("film.en.srt", b"1\n00:00:01,000 --> 00:00:02,000\nHi\n");
+    f.write("film.en.forced.srt", b"forced");
+    f.write("film.fr.sdh.vtt", b"WEBVTT");
+    f.write("other.en.srt", b"belongs to another file");
+    f.write("film.en.director.srt", b"unknown token: not guessed");
+    f.scan().await;
+    let (file, _, _, edition) = f.file("film.mkv").await;
+    // Embedded tracks as a probe would report them (the fixture bytes are not media).
+    sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+        .bind(
+            json!([
+                {"index":0,"kind":"video","codec":"h264","language":null},
+                {"index":1,"kind":"audio","codec":"aac","language":"eng","default_track":true},
+                {"index":2,"kind":"audio","codec":"aac","language":"eng","commentary":true,"title":"Director Commentary"}
+            ])
+            .to_string(),
+        )
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let components = playscale::components::timeline_components(&f.app.db, &edition)
+        .await
+        .unwrap();
+    let summary: Vec<(String, Option<String>, bool, bool, bool)> = components
+        .iter()
+        .map(|c| {
+            (
+                format!("{:?}", c.kind),
+                c.language.clone(),
+                c.roles.forced,
+                c.roles.hearing_impaired,
+                c.roles.commentary,
+            )
+        })
+        .collect();
+    assert_eq!(summary.len(), 5, "{summary:?}");
+    assert!(summary.contains(&("Audio".into(), Some("eng".into()), false, false, false)));
+    assert!(summary.contains(&("Audio".into(), Some("eng".into()), false, false, true)));
+    assert!(summary.contains(&("Subtitle".into(), Some("en".into()), false, false, false)));
+    assert!(summary.contains(&("Subtitle".into(), Some("en".into()), true, false, false)));
+    assert!(summary.contains(&("Subtitle".into(), Some("fr".into()), false, true, false)));
+    // Every occurrence pins the bound file's revision.
+    let revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&file)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(
+        components
+            .iter()
+            .flat_map(|c| &c.occurrences)
+            .all(|o| o.file_revision == revision)
+    );
+    // Stable identities across reads; a removed sidecar disappears on rescan.
+    let ids: Vec<String> = components.iter().map(|c| c.id.clone()).collect();
+    std::fs::remove_file(f.root.join("film.fr.sdh.vtt")).unwrap();
+    f.scan().await;
+    sqlx::query("UPDATE media_files SET tracks_json=(SELECT tracks_json FROM media_files WHERE id=?) WHERE id=?")
+        .bind(&file)
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let after = playscale::components::timeline_components(&f.app.db, &edition)
+        .await
+        .unwrap();
+    assert!(after.iter().all(|c| ids.contains(&c.id)));
+    assert!(!after.iter().any(|c| c.language.as_deref() == Some("fr")));
+}
+
+#[tokio::test]
+async fn split_hands_the_nfo_identity_to_the_files_new_work() {
+    let f = Fixture::new().await;
+    f.write("keep.mkv", b"keep bytes");
+    f.write("moved.mkv", b"moved bytes");
+    f.write(
+        "moved.nfo",
+        br#"<movie><title>Moved</title><uniqueid type="tmdb">77</uniqueid></movie>"#,
+    );
+    f.scan().await;
+    let (_, keep, ..) = f.file("keep.mkv").await;
+    let (moved_file, moved_item, ..) = f.file("moved.mkv").await;
+    // Merge so one work holds both files, then split the sidecar file out.
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in [&moved_item, &keep] {
+        let a = playscale::curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.clone(), a.work.revision);
+    }
+    drop(conn);
+    let merge = playscale::curation::preview_merge(
+        &f.app.db,
+        &playscale_core::identity::MergeRequest {
+            sources: vec![moved_item.clone()],
+            target: keep.clone(),
+            expected,
+        },
+    )
+    .await
+    .unwrap();
+    playscale::curation::commit_merge(&f.app, &merge)
+        .await
+        .unwrap();
+    let version: String =
+        sqlx::query_scalar("SELECT version_id FROM version_files WHERE file_id=?")
+            .bind(&moved_file)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let revision = playscale::curation::load_aggregate(&mut conn, &keep)
+        .await
+        .unwrap()
+        .unwrap()
+        .work
+        .revision;
+    drop(conn);
+    let split = playscale::curation::preview_split(
+        &f.app.db,
+        &playscale_core::identity::SplitRequest {
+            item: keep.clone(),
+            versions: vec![version],
+            new_title: "Moved".into(),
+            expected_revision: revision,
+        },
+    )
+    .await
+    .unwrap();
+    playscale::curation::commit_split(&f.app, &split)
+        .await
+        .unwrap();
+    f.scan().await;
+    let owners: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT item_id,external_id FROM metadata_documents WHERE source='nfo' ORDER BY item_id",
+    )
+    .fetch_all(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        owners,
+        [(split.new_item.clone(), Some("tmdb:77".to_string()))]
+    );
 }

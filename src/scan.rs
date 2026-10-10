@@ -76,6 +76,9 @@ const INCOMPLETE_REPORT_LIMIT: usize = 200;
 #[derive(Default)]
 pub struct Inventory {
     pub files: Vec<PathBuf>,
+    /// Subtitle-looking sidecar names per directory with a stat fingerprint,
+    /// matched to media stems at publication.
+    pub subtitles: BTreeMap<String, Vec<(String, String)>>,
     pub complete: BTreeSet<String>,
     pub incomplete: BTreeMap<String, &'static str>,
 }
@@ -114,6 +117,7 @@ fn device(meta: &std::fs::Metadata) -> u64 {
         0
     }
 }
+const SUBTITLES: [&str; 4] = ["srt", "vtt", "ass", "ssa"];
 const MEDIA: [&str; 14] = [
     "mp4", "m4v", "mkv", "webm", "mov", "avi", "ts", "m2ts", "mp3", "m4a", "flac", "ogg", "wav",
     "opus",
@@ -192,6 +196,18 @@ fn inventory(
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            if kind.is_file() && SUBTITLES.contains(&extension.as_str()) {
+                if let (Some(file), Ok(meta)) =
+                    (child.file_name().and_then(|n| n.to_str()), entry.metadata())
+                    && out.subtitles.values().map(Vec::len).sum::<usize>() < FILE_LIMIT
+                {
+                    out.subtitles
+                        .entry(name.clone())
+                        .or_default()
+                        .push((file.to_string(), fingerprint(&meta)));
+                }
+                continue;
+            }
             if !kind.is_file() || !MEDIA.contains(&extension.as_str()) {
                 continue;
             }
@@ -269,7 +285,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment",
             "-of",
             "json",
             "-i",
@@ -339,6 +355,16 @@ pub(crate) async fn inspect(
                 .as_str()
                 .and_then(|v| v.parse().ok())
                 .filter(|v: &f64| v.is_finite()),
+            default_track: s["disposition"]["default"].as_i64().map(|v| v == 1),
+            forced: s["disposition"]["forced"].as_i64().map(|v| v == 1),
+            hearing_impaired: s["disposition"]["hearing_impaired"]
+                .as_i64()
+                .map(|v| v == 1),
+            commentary: s["disposition"]["comment"].as_i64().map(|v| v == 1),
+            title: s["tags"]["title"]
+                .as_str()
+                .filter(|t| t.len() <= 200)
+                .map(str::to_owned),
         })
         .collect();
     Ok(Found {
@@ -645,6 +671,7 @@ async fn finish(
             };
             assigned.push(edition.clone());
             let file_id = id.clone();
+            let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
             sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
                 .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
@@ -661,6 +688,13 @@ async fn finish(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             }
             crate::nfo::publish(&mut tx, &file_id, &sidecar).await?;
+            crate::components::publish_sidecars(
+                &mut tx,
+                &file_id,
+                &file_relative,
+                &inventory.subtitles,
+            )
+            .await?;
         }
     }
     crate::matching::invalidate_changed(&mut tx).await?;

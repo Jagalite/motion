@@ -248,6 +248,7 @@ mod tests {
             root_identity: "dev:ino".into(),
             verified: vec![("f".into(), "stamp".into())],
             out_of_scope: vec![],
+            catalog: vec![("f".into(), "rev".into(), true)],
         };
         let facts = || RelocationFacts {
             revision: 2,
@@ -255,6 +256,7 @@ mod tests {
             root_identity: Some("dev:ino".into()),
             fingerprints: [("f".to_string(), Some("stamp".to_string()))].into(),
             overlapping_root: None,
+            catalog: vec![("f".into(), "rev".into(), true)],
         };
         assert_eq!(relocation_commit(&plan, &facts()), Ok(()));
         let mut f = facts();
@@ -274,6 +276,12 @@ mod tests {
         assert_eq!(
             relocation_commit(&plan, &f),
             Err(RelocationConflict::FileChanged("f".into()))
+        );
+        let mut f = facts();
+        f.catalog[0].1 = "rescanned".into();
+        assert_eq!(
+            relocation_commit(&plan, &f),
+            Err(RelocationConflict::SourceChanged)
         );
         let mut f = facts();
         f.overlapping_root = Some("/new/inner".into());
@@ -315,6 +323,8 @@ pub struct RelocationPlan {
     pub verified: Vec<(Id, String)>,
     /// Files outside the source's scope (exclusions) at preview time.
     pub out_of_scope: Vec<Id>,
+    /// The source's complete catalog at preview: `(file, revision, available)`.
+    pub catalog: Vec<(Id, String, bool)>,
 }
 
 /// Facts observed at commit, inside the writer transaction (stat only).
@@ -325,6 +335,8 @@ pub struct RelocationFacts {
     pub root_identity: Option<String>,
     pub fingerprints: std::collections::BTreeMap<Id, Option<String>>,
     pub overlapping_root: Option<String>,
+    /// The source's catalog now, in the same order as the plan's.
+    pub catalog: Vec<(Id, String, bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,7 +354,12 @@ pub fn relocation_commit(
     plan: &RelocationPlan,
     facts: &RelocationFacts,
 ) -> Result<(), RelocationConflict> {
-    if facts.revision != plan.expected_revision || facts.binding_revision != plan.binding_revision {
+    // A scan publishing in between changes revisions or availability without
+    // touching the source revision; the reviewed catalog must be unchanged.
+    if facts.revision != plan.expected_revision
+        || facts.binding_revision != plan.binding_revision
+        || facts.catalog != plan.catalog
+    {
         return Err(RelocationConflict::SourceChanged);
     }
     if facts.root_identity.as_deref() != Some(plan.root_identity.as_str()) {

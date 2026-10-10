@@ -295,8 +295,13 @@ async fn order_and_relationships_follow_moves_merges_and_splits() {
         target: "e2".into(),
         expected,
     };
+    let show_before = revision(&app, "show").await;
     let plan = curation::preview_merge(&app.db, &request).await.unwrap();
     curation::commit_merge(&app, &plan).await.unwrap();
+    assert!(
+        revision(&app, "show").await > show_before,
+        "neighbor's structure changed"
+    );
     let edges = curation::relationships(&app.db, "show").await.unwrap();
     assert_eq!(edges.len(), 1);
     assert_eq!(edges[0].source_item_id, "e2");
