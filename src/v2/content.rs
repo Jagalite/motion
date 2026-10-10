@@ -69,7 +69,7 @@ pub struct ContentAccessInput {
     ttl_seconds: i64,
 }
 
-async fn file_facts(
+pub(crate) async fn file_facts(
     conn: &mut sqlx::SqliteConnection,
     file_id: &str,
 ) -> Result<Option<FileFacts>, Problem> {

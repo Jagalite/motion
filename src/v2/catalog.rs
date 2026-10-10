@@ -329,7 +329,7 @@ fn unsupported_kind() -> Problem {
 }
 
 #[derive(sqlx::FromRow)]
-struct ItemRow {
+pub(crate) struct ItemRow {
     id: String,
     title: String,
     kind: String,
@@ -360,7 +360,7 @@ fn libraries(files: &[(String, bool)]) -> BTreeSet<String> {
 
 /// A live item readable under `scope`. A retired (merged) ID resolves to its
 /// live work. Missing and inaccessible items are indistinguishable.
-async fn load_item(
+pub(crate) async fn load_item(
     conn: &mut sqlx::SqliteConnection,
     scope: &CatalogScope,
     id: &str,
@@ -441,7 +441,7 @@ fn availability(files: &[&(String, bool)]) -> &'static str {
     }
 }
 
-async fn item_body(
+pub(crate) async fn item_body(
     conn: &mut sqlx::SqliteConnection,
     scope: &CatalogScope,
     row: ItemRow,
@@ -1581,10 +1581,10 @@ mod tests {
 // bindings are indivisible: a restricted reader must see every bound file,
 // rather than receiving an apparently complete multipart version with gaps.
 #[derive(sqlx::FromRow)]
-struct TimelineRow {
-    id: String,
+pub(crate) struct TimelineRow {
+    pub(crate) id: String,
     revision: i64,
-    item_id: String,
+    pub(crate) item_id: String,
     edition_id: String,
     duration_ms: Option<i64>,
     order_group_id: Option<String>,
@@ -1603,7 +1603,7 @@ async fn version_ids(
         .bind(timeline).bind(after).bind(all).bind(all).bind(ids).bind(limit).fetch_all(conn).await?)
 }
 
-async fn timeline_body(
+pub(crate) async fn timeline_body(
     conn: &mut sqlx::SqliteConnection,
     scope: &CatalogScope,
     row: TimelineRow,

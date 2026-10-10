@@ -12,6 +12,7 @@ pub mod jobs;
 pub mod libraries;
 pub mod metadata;
 pub mod organization;
+pub mod playback;
 pub mod system;
 
 use crate::App;
@@ -798,6 +799,7 @@ pub fn router() -> Router<App> {
         .merge(libraries::routes())
         .merge(jobs::routes())
         .merge(metadata::routes())
+        .merge(playback::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

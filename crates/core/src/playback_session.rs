@@ -235,6 +235,16 @@ pub fn may_view(owner: &Owner, principal: &Principal, file: Option<&FileFacts>) 
     may_control(owner, principal, file) && principal.allows(Permission::ViewingWrite)
 }
 
+/// Record progress into an existing viewing session (also after its delivery
+/// ended, so a durable client outbox can drain after a restart): viewing
+/// write, the session's profile, and the session's file still readable.
+/// Sessions are per profile; their unguessable identity names the session.
+pub fn may_record(principal: &Principal, profile: &str, file: Option<&FileFacts>) -> bool {
+    principal.allows(Permission::ViewingWrite)
+        && principal.may_use_profile(profile)
+        && readable(principal, file)
+}
+
 /// A viewing session's identity embeds the delivery it was created for, so the
 /// binding is durable with the session row itself and cannot drift after a
 /// restart. Both parts are server-generated identifiers.
@@ -498,6 +508,10 @@ mod tests {
         // Losing the library (or the file) ends control and viewing.
         assert!(!may_control(&owner, &viewer, Some(&facts("r1", "other"))));
         assert!(!may_view(&owner, &viewer, None));
+        assert!(may_record(&viewer, "p", f));
+        assert!(!may_record(&player, "p", f));
+        assert!(!may_record(&viewer, "q", f));
+        assert!(!may_record(&viewer, "p", Some(&facts("r1", "other"))));
         let mut c = claims();
         assert!(replan_compatible(&owner, &c));
         c.route = Route::Transcode;
