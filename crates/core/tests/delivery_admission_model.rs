@@ -14,7 +14,7 @@ struct State {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Commit {
     Rollback,
-    CrashAfterCommit,
+    CommittedThenCrashed,
     Dispatch,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -156,7 +156,11 @@ impl Enumerate for Admission {
         let mut inputs = vec![Input::Retire, Input::Restart];
         for principal in 0..2 {
             for digest in 0..2 {
-                for commit in [Commit::Rollback, Commit::CrashAfterCommit, Commit::Dispatch] {
+                for commit in [
+                    Commit::Rollback,
+                    Commit::CommittedThenCrashed,
+                    Commit::Dispatch,
+                ] {
                     inputs.push(Input::Request {
                         principal,
                         digest,
