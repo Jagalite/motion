@@ -840,27 +840,27 @@ pub async fn plan(
         None if input.source.is_some() && !pinned_prepared => {
             return Ok(Json(blocked(&input, "source_unavailable")).into_response());
         }
+        // Every original keys its readable revision-valid renditions; all of
+        // them reach the core decision, which picks the first usable one.
         None => {
-            let mut keyed = None;
-            for original in
-                originals_of(&mut conn, &input.timeline_id, version_pin, original_pin).await?
-            {
-                let renditions = readable_prepared(
-                    &mut conn,
-                    principal,
-                    &input.timeline_id,
-                    &original.file.id,
-                    rendition_pin,
-                )
-                .await?;
-                if !renditions.is_empty() {
-                    keyed = Some((original, renditions));
-                    break;
-                }
+            let originals =
+                originals_of(&mut conn, &input.timeline_id, version_pin, original_pin).await?;
+            let mut renditions = Vec::new();
+            for original in &originals {
+                renditions.extend(
+                    readable_prepared(
+                        &mut conn,
+                        principal,
+                        &input.timeline_id,
+                        &original.file.id,
+                        rendition_pin,
+                    )
+                    .await?,
+                );
             }
-            match keyed {
-                Some((original, renditions)) => (original, false, Some(renditions)),
-                None => return Ok(Json(blocked(&input, "source_unavailable")).into_response()),
+            match originals.into_iter().next() {
+                Some(original) if !renditions.is_empty() => (original, false, Some(renditions)),
+                _ => return Ok(Json(blocked(&input, "source_unavailable")).into_response()),
             }
         }
     };

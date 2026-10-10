@@ -43,16 +43,23 @@ def model():
 def main():
     original = SOURCE.read_text()
     baseline = model()
-    assert baseline.returncode == 0, baseline.stdout + baseline.stderr
+    assert baseline.returncode == 0 and 'test result: ok. 1 passed' in baseline.stdout + baseline.stderr, \
+        baseline.stdout + baseline.stderr
     results = {}
     try:
         for name, old, new in MUTATIONS:
             assert original.count(old) == 1, name
             SOURCE.write_text(original.replace(old, new))
             run = model()
-            compiled = 'error[' not in run.stderr
-            results[name] = 'detected' if compiled and run.returncode != 0 else (
-                'did_not_compile' if not compiled else 'MISSED')
+            output = run.stdout + run.stderr
+            compiled = 'error[' not in output
+            # Detection needs the model test itself to have run and failed,
+            # not merely a nonzero exit (a link or queue failure is neither).
+            ran_and_failed = ('Running tests/timeline_viewing_model.rs' in output
+                              and 'test result: FAILED' in output)
+            results[name] = ('detected' if ran_and_failed else
+                             'did_not_compile' if not compiled else
+                             'MISSED' if run.returncode == 0 else 'inconclusive')
             print(name, results[name], file=sys.stderr)
     finally:
         SOURCE.write_text(original)
