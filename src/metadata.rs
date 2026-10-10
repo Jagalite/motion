@@ -203,6 +203,9 @@ pub async fn put(
     project_title(&mut tx, &id)
         .await
         .map_err(ApiError::internal)?;
+    crate::search::refresh(&mut tx, 100)
+        .await
+        .map_err(ApiError::internal)?;
     tx.commit().await?;
     Ok(Json(load(&app.db, &id).await?))
 }

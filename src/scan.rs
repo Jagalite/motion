@@ -654,6 +654,7 @@ async fn finish(
         .execute(&mut *tx)
         .await?;
     crate::scans::after_attempt(&mut tx, &job.id).await?;
+    crate::search::refresh(&mut tx, 500).await?;
     tx.commit().await?;
     Ok(())
 }

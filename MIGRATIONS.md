@@ -18,6 +18,8 @@ applying any pending migration to an existing database.
 | 0016 | `0016_occurrence_index.sql` | A01/A02 | index for content-revision occurrence lookup |
 | 0017 | `0017_library_sources.sql` | A02/A03 | logical libraries over storage sources, exclusions, scan binding revision |
 | 0018 | `0018_scan_demands.sql` | A03 | scan requests/demands, freshness barrier, one running + one queued attempt |
+| 0019 | `0019_search.sql` | A09 | FTS5 search projection with dirty queue |
+| 0020 | `0020_scan_demand_facts.sql` | A03 | direct-request attempts; retained demand coverage |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

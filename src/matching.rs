@@ -303,6 +303,7 @@ pub async fn decide(
             .await?;
     }
     store(&mut tx, &next, false).await?;
+    crate::search::refresh(&mut tx, 100).await?;
     tx.commit().await?;
     Ok(Decided {
         proposal: next,

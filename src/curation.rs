@@ -253,6 +253,7 @@ pub(crate) async fn merge_in_transaction(
     let plan = identity::commit_merge(reviewed, &found, &aliases)?;
     let receipt = receipt(tx, "catalog:merge", &plan).await?;
     apply_merge(tx, &plan, &receipt.id).await?;
+    crate::search::refresh(tx, 100).await?;
     Ok(receipt)
 }
 
@@ -373,6 +374,7 @@ pub async fn commit_split(app: &App, reviewed: &SplitPlan) -> Result<Receipt, Cu
     let current = current.expect("commit_split requires the source");
     let receipt = receipt(&mut tx, "catalog:split", &fresh).await?;
     apply_split(&mut tx, &current, &fresh).await?;
+    crate::search::refresh(&mut tx, 100).await?;
     tx.commit().await?;
     Ok(receipt)
 }

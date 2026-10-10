@@ -299,9 +299,35 @@ pub async fn tick(app: &App) -> anyhow::Result<()> {
     clean(app).await?;
     Ok(())
 }
+/// Drain the search projection's dirty queue in bounded writer transactions.
+pub async fn refresh_search(app: &App) -> anyhow::Result<()> {
+    loop {
+        let _guard = app.jobs.lock().await;
+        let mut tx = crate::db::begin_write(&app.db).await?;
+        let processed = crate::search::refresh(&mut tx, 200).await?;
+        tx.commit().await?;
+        if processed == 0 {
+            return Ok(());
+        }
+    }
+}
+
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     loop {
-        tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(std::time::Duration::from_secs(30))=>{if let Err(error)=tick(&app).await {tracing::warn!(%error,"scheduled maintenance failed");let _=crate::storage::record(&app,"cache_and_scans",Some("maintenance_failed")).await;}else{let _=crate::storage::record(&app,"cache_and_scans",None).await;}}}
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                if let Err(error) = refresh_search(&app).await {
+                    tracing::warn!(%error, "search refresh failed");
+                }
+                if let Err(error) = tick(&app).await {
+                    tracing::warn!(%error, "scheduled maintenance failed");
+                    let _ = crate::storage::record(&app, "cache_and_scans", Some("maintenance_failed")).await;
+                } else {
+                    let _ = crate::storage::record(&app, "cache_and_scans", None).await;
+                }
+            }
+        }
     }
 }
 

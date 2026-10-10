@@ -19,6 +19,7 @@ pub mod processing;
 pub mod renditions;
 pub mod scan;
 pub mod scans;
+pub mod search;
 pub mod storage;
 pub mod upgrade;
 pub mod viewing;

@@ -15,5 +15,6 @@ pub mod ranges;
 pub mod renditions;
 pub mod revision;
 pub mod scan;
+pub mod search;
 pub mod sources;
 pub mod viewing;
