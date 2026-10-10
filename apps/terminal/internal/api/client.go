@@ -115,7 +115,12 @@ type request struct {
 
 func (c *Client) url(path string, query url.Values) string {
 	u := *c.BaseURL
+	// Call sites already escape each opaque ID. URL.Path stores decoded text;
+	// retain RawPath so an escaped slash remains inside its resource segment.
 	u.Path = path
+	if decoded, err := url.PathUnescape(path); err == nil {
+		u.Path, u.RawPath = decoded, path
+	}
 	if len(query) > 0 {
 		u.RawQuery = query.Encode()
 	}
@@ -128,11 +133,12 @@ func (r request) retrySafe() bool {
 }
 
 func backoff(attempt int) time.Duration {
-	d := 250 * time.Millisecond << attempt
-	if d > 5*time.Second {
-		d = 5 * time.Second
+	// Clamp before shifting: Follow can reconnect indefinitely, and a shift
+	// at attempt 36 otherwise overflows into a negative (immediate) delay.
+	if attempt >= 5 {
+		return 5 * time.Second
 	}
-	return d
+	return 250 * time.Millisecond << max(attempt, 0)
 }
 
 func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error) {
