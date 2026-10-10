@@ -104,7 +104,9 @@ class Server:
         self.stream = self.log.open('ab')
         self.process = subprocess.Popen(self.command, stdout=self.stream, stderr=subprocess.STDOUT)
         try:
-            wait_for(lambda: self.process.poll() is not None or request(self.port, 'GET', '/health')[0] == 200, 60)
+            # Generous: an upgrade start backs up and migrates before serving, and
+            # a shared, swapping host has taken over 50 s for that in debug builds.
+            wait_for(lambda: self.process.poll() is not None or request(self.port, 'GET', '/health')[0] == 200, 180)
             assert self.process.poll() is None, f'server exited with {self.process.returncode}; see {self.log}'
         except BaseException:
             # Keep the startup failure as the reported error: a server that is
