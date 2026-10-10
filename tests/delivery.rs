@@ -43,6 +43,15 @@ impl Fixture {
         realtime: bool,
         copy_routes: bool,
     ) -> Self {
+        Self::configured(storage, realtime, copy_routes, |_, _| {}).await
+    }
+    /// `configure` adjusts the processing runtime (in the fixture directory).
+    async fn configured(
+        storage: playscale::storage::Settings,
+        realtime: bool,
+        copy_routes: bool,
+        configure: impl FnOnce(&mut playscale::processing::Runtime, &std::path::Path),
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
             .with_env_filter("playscale=debug")
@@ -69,6 +78,7 @@ impl Fixture {
             playscale::processing::Runtime::new(dir.path().join("cache"), Default::default());
         processing.supervisor = PathBuf::from(env!("CARGO_BIN_EXE_playscale"));
         processing.settings.experimental_copy_routes = copy_routes;
+        configure(&mut processing, dir.path());
         if realtime {
             // A survivor test must own an encoder that cannot finish the entire
             // fixture before the restart assertions reach it.
@@ -1473,5 +1483,175 @@ async fn text_subtitles_are_served_as_webvtt_sidecars() {
     })
     .await
     .expect("encoder capacity was not released");
+    f.stop.cancel();
+}
+
+/// A live encoder that never publishes a segment fails its generation once the
+/// startup deadline passes, and its capacity is released after it is stopped.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn silent_live_encoder_fails_at_the_startup_deadline() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::configured(Default::default(), false, false, |processing, dir| {
+        use std::os::unix::fs::PermissionsExt;
+        let silent = dir.join("silent-ffmpeg");
+        std::fs::write(&silent, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        processing.settings.ffmpeg = silent;
+        processing.settings.startup_timeout_seconds = Some(3);
+    })
+    .await;
+    // The source is made with the real tools; only the live encoder is silent.
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=12",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(f.dir.path().join("media/clip.mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let started = std::time::Instant::now();
+    let (status, created) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(
+                json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":null}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, body) = f
+                .json("GET", &format!("/api/v1/deliveries/{id}"), None)
+                .await;
+            if status == StatusCode::NOT_FOUND || body["status"] == "failed" {
+                break;
+            }
+            assert_ne!(body["status"], "ready", "{body}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("silent encoder was not failed");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "failed before the deadline"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    f.stop.cancel();
+}
+
+/// Completion ends the progress watch: an encoder that published its final
+/// segment but is slow to exit keeps its completed generation.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_generation_survives_a_slow_encoder_exit() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let real = String::from_utf8(Command::new("which").arg("ffmpeg").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let f = Fixture::configured(Default::default(), false, false, |processing, dir| {
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = dir.join("encode-then-wait");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\n'{real}' \"$@\" || exit $?\nexec sleep 4\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        processing.settings.ffmpeg = wrapper;
+        processing.settings.no_progress_timeout_seconds = Some(1);
+    })
+    .await;
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=12",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(f.dir.path().join("media/clip.mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let (status, created) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(
+                json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":null}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    f.until(&id, |v| v["active"]["complete"] == true).await;
+    // Past the no-progress budget while the wrapper is still running, then past its exit.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            let (_, body) = f
+                .json("GET", &format!("/api/v1/deliveries/{id}"), None)
+                .await;
+            assert_eq!(
+                body["status"], "ready",
+                "completed output was discarded: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    let (_, body) = f
+        .json("GET", &format!("/api/v1/deliveries/{id}"), None)
+        .await;
+    assert_eq!(body["status"], "ready", "{body}");
+    assert_eq!(body["active"]["complete"], true, "{body}");
     f.stop.cancel();
 }

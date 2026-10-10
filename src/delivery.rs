@@ -509,6 +509,13 @@ impl CopyDetails {
     }
 }
 
+/// Default time a live encoder has to publish its first segment (generous for a
+/// first launch of the tools), and the longest it may run without publishing a
+/// further one. `processing.startup_timeout_seconds` and
+/// `no_progress_timeout_seconds` override them.
+const LIVE_STARTUP_SECONDS: u64 = 120;
+const LIVE_NO_PROGRESS_SECONDS: u64 = 30;
+
 /// Bound on one source probe.
 const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// Probe output larger than this is not trusted.
@@ -814,7 +821,8 @@ async fn segment_zero_start(app: &App, directory: &FsPath) -> Option<u64> {
         .then(|| (seconds * 1_000_000.0).round() as u64)
 }
 
-/// Report newly published segments (and completion) in order.
+/// Report newly published segments (and completion) in order. True once the
+/// generation's completion has been reported.
 async fn observe(
     app: &App,
     session: &Arc<Session>,
@@ -824,7 +832,7 @@ async fn observe(
     start_ms: u64,
     operation: Operation,
     copy_start: Option<u64>,
-) {
+) -> bool {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
     let space = {
@@ -834,10 +842,10 @@ async fn observe(
     if !matches!(space, Ok(Ok(free)) if free >= floor) {
         tracing::warn!(delivery=%session.id, generation, "live output below the free-space floor");
         let _ = apply(app, session, Input::Failed { generation });
-        return;
+        return false;
     }
     let Ok(text) = tokio::fs::read_to_string(directory.join("ffmpeg.m3u8")).await else {
-        return;
+        return false;
     };
     let (published, ended) = parse_playlist(&text);
     // FFmpeg's bounded playlist dropped segments that were never reported: the
@@ -845,22 +853,22 @@ async fn observe(
     if published.first().is_some_and(|s| s.index > *reported) {
         tracing::warn!(delivery=%session.id, generation, "segment publication gap");
         let _ = apply(app, session, Input::Failed { generation });
-        return;
+        return false;
     }
     let from = *reported;
     for segment in published.iter().filter(|s| s.index >= from) {
         if segment.index != *reported {
-            return;
+            return false;
         }
         let Ok(metadata) =
             tokio::fs::metadata(directory.join(format!("seg{}.m4s", segment.index))).await
         else {
-            return;
+            return false;
         };
         if metadata.len() > MAX_SEGMENT_BYTES {
             tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), "segment exceeds the size cap");
             let _ = apply(app, session, Input::Failed { generation });
-            return;
+            return false;
         }
         let input = if segment.index == 0 {
             if copies_video(operation) {
@@ -876,7 +884,7 @@ async fn observe(
                 else {
                     tracing::warn!(delivery=%session.id, generation, ?begin, ?copy_start, "segment 0 does not start at the source keyframe");
                     let _ = apply(app, session, Input::Failed { generation });
-                    return;
+                    return false;
                 };
                 Input::Ready {
                     generation,
@@ -915,7 +923,9 @@ async fn observe(
                 final_index: *reported - 1,
             },
         );
+        return true;
     }
+    false
 }
 
 /// Open the source beneath its validated root and check its identity. The
@@ -1120,6 +1130,28 @@ async fn run_generation(
     }
     let mut reported = 0u32;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
+    // Liveness, decided by the core deadline policy. Its clock advances only
+    // while the encoder is allowed to run: a paced (paused) encoder is not stalled.
+    let settings = &app.processing.settings;
+    let mut liveness = playscale_core::execution_deadline::Deadline::new(
+        u64::MAX,
+        Some(
+            settings
+                .startup_timeout_seconds
+                .unwrap_or(LIVE_STARTUP_SECONDS)
+                * 1000,
+        ),
+        Some(
+            settings
+                .no_progress_timeout_seconds
+                .unwrap_or(LIVE_NO_PROGRESS_SECONDS)
+                * 1000,
+        ),
+    );
+    let mut running_ms = 0u64;
+    let mut paused_now = false;
+    let mut last_tick = tokio::time::Instant::now();
+    let mut completed = false;
     let exit = loop {
         tokio::select! {
             _ = stop.cancelled() => break None,
@@ -1127,6 +1159,12 @@ async fn run_generation(
             status = child.wait() => break Some(status),
             Some(paused) = paced.recv() => {
                 use tokio::io::AsyncWriteExt;
+                let now = tokio::time::Instant::now();
+                if !paused_now {
+                    running_ms += now.duration_since(last_tick).as_millis() as u64;
+                }
+                last_tick = now;
+                paused_now = paused;
                 if let Some(control) = heartbeat.as_mut() {
                     let byte: &[u8] = if paused { b"p" } else { b"r" };
                     if control.write_all(byte).await.is_err() {
@@ -1135,6 +1173,13 @@ async fn run_generation(
                 }
             }
             _ = poll.tick() => {
+                // Progress found by this pass is dated to its start: a pass slowed
+                // by the filesystem must not push valid output past the deadline.
+                let now = tokio::time::Instant::now();
+                if !paused_now {
+                    running_ms += now.duration_since(last_tick).as_millis() as u64;
+                }
+                last_tick = now;
                 let observed = tokio::select! {
                     _ = stop.cancelled() => break None,
                     observed = tokio::time::timeout(
@@ -1151,8 +1196,25 @@ async fn run_generation(
                         ),
                     ) => observed,
                 };
-                if observed.is_err() {
+                let Ok(ended) = observed else {
                     tracing::warn!(delivery=%session.id, generation, "playlist observation stalled");
+                    let _ = apply(&app, &session, Input::Failed { generation });
+                    break None;
+                };
+                // A completed generation has nothing left to publish; its exit
+                // decides the outcome.
+                completed |= ended;
+                if completed {
+                    continue;
+                }
+                // Published segments are the progress measure.
+                liveness.observe(running_ms, u64::from(reported));
+                if let Some(expired) = liveness.expired(running_ms) {
+                    // An encoder that already exited is judged by its exit instead.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        break Some(Ok(status));
+                    }
+                    tracing::warn!(delivery=%session.id, generation, ?expired, "live encoder made no progress");
                     let _ = apply(&app, &session, Input::Failed { generation });
                     break None;
                 }

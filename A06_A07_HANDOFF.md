@@ -25,8 +25,11 @@ implementation and integration gates are listed below.
   dispatch, survives lost HTTP waiters, and rechecks transactional authority.
 - `crates/core/src/delivery.rs` owns generations, activation, leases, playheads,
   pacing and retention. It also decides live route eligibility
-  (`live_route_supported`) and lets a stream-copy generation's segment 0 start
-  at the keyframe before the request (`Ready.first_segment_start_ms`). The live adapter validates source descriptors and output,
+  (`live_route_supported`, `copy_start`, `sidecar_subtitle`) and lets a
+  stream-copy generation's segment 0 start at the keyframe before the request
+  (`Ready.first_segment_start_ms`). Live encoders use the same
+  `execution_deadline` liveness policy as processing, with a clock that excludes
+  paced (paused) time. The live adapter validates source descriptors and output,
   shares execution capacity, and persists restart fences. Pending-generation
   heartbeats cannot replace the active playhead. Restart records are diagnostic;
   they cannot revive an old transport.
@@ -40,7 +43,10 @@ implementation and integration gates are listed below.
 | Migration allocation | A02 must finalize the delivery-session migration number. This branch has provisional 0015 and admission receipts at 0020; the A08 checkout was observed preparing an uncommitted rename to 0018. Do not apply both. |
 | Windows containment | Implement and natively qualify a Job Object adapter, including descendants and parent death. The existing direct-child fallback is not whole-tree qualification; live delivery rejects non-Unix platforms. |
 | Broader execution policy | Resource estimates/limits beyond the current scalar capacity ledger remain to be integrated with agreed policy/configuration contracts. Durable processing now has an optional expected-media-duration deadline; live delivery retains its separate pacing policy. |
-| Live pipeline breadth | Remux and audio_convert copy routes are implemented behind `processing.experimental_copy_routes` (default off). Before enabling: a signed media-to-timeline mapping in core covering B-frame/AAC-priming shifts and MP4 edit lists; H.264 profile/level, rotation and interlace observations in eligibility; admission against source GOP spacing (12 s target); browser qualification of copied streams (A11). Hardware live encoding, HDR and subtitles remain unimplemented. |
+| Live copy routes | Remux and audio_convert are implemented and qualified server-side but stay behind `processing.experimental_copy_routes` (default off): source timestamps are preserved (`-avoid_negative_ts disabled`) and segment 0 must start at the probed source keyframe to the microsecond; core models the HLS cut rule against the 12 s target; eligibility requires H.264 Constrained Baseline/Baseline/Main/High, level <= 5.1, progressive, unrotated, 8-bit 4:2:0, all streams starting at zero. Before enabling: proof of closed GOPs at cut points (needs H.264 NAL inspection; sync packets can be open-GOP recovery points) and browser qualification of copied streams with negative decode times (A11). |
+| Subtitles | Text subtitles (SubRip, mov_text, WebVTT) are delivered as a WebVTT sidecar in timeline time. Not available: burn-in of text subtitles needs libass (+FreeType/FriBidi/HarfBuzz) in the packaged FFmpeg (A14); burn-in of bitmap subtitles (PGS/DVD) is unimplemented for lack of a qualifying fixture; ASS/SSA are refused because WebVTT would drop their styling; client rendering of the sidecar is A11. |
+| Hardware encoding | VideoToolbox live transcoding is implemented with its own hardware-session budget and a cached capability probe (macOS). Session limits per hardware model and HDR/10-bit hardware paths are not qualified. |
+| Catalog timeline | FFprobe's container duration includes a non-zero container start (e.g. 25 s reported for 20 s of content starting at 5 s); the scanner's catalog duration (A03) should be checked against that before it bounds positions. |
 | Client and storage matrix | A11/A12 real browser/desktop open, seek, generation activation and restart; remote/NAS and supported-platform native fault runs remain required. |
 
 The A08 checkout inspected during this pass has v2 identity, content,
