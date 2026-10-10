@@ -1,6 +1,6 @@
 """Structural checks for the reviewed OpenAPI v2 contract.
 
-    python3 -m venv /tmp/motion-contract && /tmp/motion-contract/bin/pip install -r scripts/ci/contract-requirements.txt
+    python3.13 -m venv /tmp/motion-contract && /tmp/motion-contract/bin/pip install -r scripts/ci/contract-requirements.txt
     /tmp/motion-contract/bin/python scripts/check_contract.py
 
 YAML is the source: it must parse without duplicate keys, match the served JSON
@@ -10,6 +10,7 @@ operations the server routes is checked by tests/contract.rs.
 import json
 import pathlib
 import sys
+from urllib.parse import unquote
 
 import yaml
 from openapi_spec_validator import validate
@@ -51,10 +52,16 @@ def references(value):
 def resolve(document, ref):
     if not ref.startswith('#/'):
         raise ValueError(f'external reference {ref}')
+    # A URI fragment holding a JSON Pointer (RFC 6901 section 6).
     node = document
-    for part in ref[2:].split('/'):
+    for part in unquote(ref[2:]).split('/'):
         part = part.replace('~1', '/').replace('~0', '~')
-        node = node[part]
+        if isinstance(node, list):
+            if not part.isdigit() or (len(part) > 1 and part[0] == '0'):
+                raise ValueError(f'invalid array index {part!r} in {ref}')
+            node = node[int(part)]
+        else:
+            node = node[part]
     return node
 
 

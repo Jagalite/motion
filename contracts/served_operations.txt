@@ -48,6 +48,8 @@ getQueue
 getSavedFilter
 getSource
 getTimeline
+headAssetBytes
+headMediaFileBytes
 issueApiAccessToken
 issueContentAccess
 listArtwork

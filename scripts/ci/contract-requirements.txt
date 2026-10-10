@@ -1,5 +1,6 @@
-# Exact versions for scripts/check_contract.py (resolved 2026-10-10 from
-# openapi-spec-validator==0.7.2 PyYAML==6.0.2). Install into a disposable venv.
+# Exact versions for scripts/check_contract.py, resolved 2026-10-10 from
+# openapi-spec-validator==0.7.2 and PyYAML==6.0.2. Install them into a disposable
+# venv. Requires CPython 3.11 or later (rpds-py); CI uses 3.13.
 attrs==26.1.0
 certifi==2026.7.22
 charset-normalizer==3.5.2
@@ -18,3 +19,5 @@ rfc3339-validator==0.1.4
 rpds-py==2026.9.1
 six==1.17.0
 urllib3==2.8.0
+# referencing needs this only before Python 3.13.
+typing-extensions==4.16.0 ; python_version < "3.13"

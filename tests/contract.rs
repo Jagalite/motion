@@ -24,7 +24,10 @@ use tower::ServiceExt;
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const MATCHED: &str = "x-contract-test-matched";
-const METHODS: [&str; 5] = ["get", "put", "post", "delete", "patch"];
+/// Every OpenAPI 3.1 path-item operation method.
+const METHODS: [&str; 8] = [
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
 
 fn contract() -> Value {
     serde_json::from_str(v2::system::CONTRACT_JSON).unwrap()
@@ -35,7 +38,10 @@ fn operations(contract: &Value) -> BTreeMap<(String, String), String> {
     let mut out = BTreeMap::new();
     for (path, item) in contract["paths"].as_object().unwrap() {
         for method in METHODS {
-            if let Some(id) = item[method]["operationId"].as_str() {
+            if item.get(method).is_some() {
+                let id = item[method]["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} lacks an operationId"));
                 out.insert((method.to_string(), path.clone()), id.to_string());
             }
         }
@@ -43,23 +49,29 @@ fn operations(contract: &Value) -> BTreeMap<(String, String), String> {
     out
 }
 
-/// Concrete request path for a templated contract path.
+/// Concrete request path for a templated contract path. The probe value is
+/// not a template, so a static route that happens to spell it never matches
+/// the parameterised template (`shape` keeps the braces).
 fn concrete(path: &str) -> String {
-    let mut out = String::new();
-    let mut rest = path;
-    while let Some(start) = rest.find('{') {
-        let end = rest[start..].find('}').unwrap() + start;
-        out.push_str(&rest[..start]);
-        out.push_str("contract-probe");
-        rest = &rest[end + 1..];
-    }
-    out + rest
+    replace_parameters(path, "contract-probe")
 }
 
 /// Axum route templates use the same `{name}` syntax as OpenAPI; compare
 /// templates with parameter names erased.
 fn shape(path: &str) -> String {
-    concrete(path)
+    replace_parameters(path, "{}")
+}
+
+fn replace_parameters(path: &str, with: &str) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('{') {
+        let end = rest[start..].find('}').unwrap() + start;
+        out.push_str(&rest[..start]);
+        out.push_str(with);
+        rest = &rest[end + 1..];
+    }
+    out + rest
 }
 
 async fn mark_matched(request: Request, next: Next) -> Response {
@@ -102,9 +114,21 @@ async fn app(dir: &Path) -> App {
     }
 }
 
+fn probe(method: &str, path: &str) -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method(Method::from_bytes(method.to_uppercase().as_bytes()).unwrap())
+        .uri(concrete(path))
+        .header("host", "127.0.0.1:8787")
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// Every `(method, contract path)` the production v2 router dispatches to a
-/// handler. `route_layer` runs only for matched routes, never the fallback; a
-/// matched path with an unrouted method answers 405.
+/// handler. `route_layer` runs only for matched routes, never the fallback.
+/// It also wraps a matched path's method fallback, which answers 405, so each
+/// path is first probed with a method no route registers: if that does not
+/// answer 405, method-level detection is unreliable there and the test fails
+/// instead of guessing.
 async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
     let router: Router = Router::new()
         .nest(
@@ -113,15 +137,26 @@ async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
         )
         .with_state(app);
     let mut served = BTreeSet::new();
-    for path in contract["paths"].as_object().unwrap().keys() {
+    for (path, item) in contract["paths"].as_object().unwrap() {
+        let response = router
+            .clone()
+            .oneshot(probe("CONTRACTPROBE", path))
+            .await
+            .unwrap();
+        if response.headers().contains_key(MATCHED) {
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{path}: an unregistered method did not reach the 405 method fallback"
+            );
+        }
         for method in METHODS {
-            let request = axum::http::Request::builder()
-                .method(Method::from_bytes(method.to_uppercase().as_bytes()).unwrap())
-                .uri(concrete(path))
-                .header("host", "127.0.0.1:8787")
-                .body(Body::empty())
-                .unwrap();
-            let response = router.clone().oneshot(request).await.unwrap();
+            // Axum answers HEAD from a GET handler; only an explicit HEAD
+            // operation in the contract is checked for HEAD.
+            if method == "head" && item.get("head").is_none() && item.get("get").is_some() {
+                continue;
+            }
+            let response = router.clone().oneshot(probe(method, path)).await.unwrap();
             let matched = response
                 .headers()
                 .get(MATCHED)
@@ -142,24 +177,45 @@ async fn served(app: App, contract: &Value) -> BTreeSet<(String, String)> {
     served
 }
 
-/// String literals passed to `.route(` in the v2 adapter sources.
+fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// String literals passed to `.route(` anywhere under src/v2. The scan relies
+/// on every route being registered with a literal at the v2 root, so it
+/// rejects nesting and non-literal templates rather than misreading them.
 fn route_literals() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let mut files: Vec<_> = std::fs::read_dir(Path::new(ROOT).join("src/v2"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        .collect();
+    let mut files = Vec::new();
+    sources(&Path::new(ROOT).join("src/v2"), &mut files);
     files.sort();
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();
+        for forbidden in [".nest(", ".nest_service(", ".route_service("] {
+            assert!(
+                !text.contains(forbidden),
+                "{}: {forbidden} is not understood by tests/contract.rs; extend the scan",
+                file.display()
+            );
+        }
         let mut rest = text.as_str();
         while let Some(at) = rest.find(".route(") {
             rest = rest[at + ".route(".len()..].trim_start();
-            if let Some(literal) = rest.strip_prefix('"') {
-                let end = literal.find('"').unwrap();
-                out.insert(format!("/api/v2{}", &literal[..end]));
-            }
+            let literal = rest.strip_prefix('"').unwrap_or_else(|| {
+                panic!(
+                    "{}: .route( without a string literal template",
+                    file.display()
+                )
+            });
+            let end = literal.find('"').unwrap();
+            out.insert(format!("/api/v2{}", &literal[..end]));
         }
     }
     out
