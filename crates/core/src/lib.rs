@@ -9,6 +9,7 @@ pub mod maintenance;
 pub mod matching;
 pub mod metadata;
 pub mod organization;
+pub mod offline;
 pub mod playback;
 pub mod processing;
 pub mod ranges;
