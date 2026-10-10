@@ -2147,3 +2147,41 @@ async fn presentation_retains_default_extractor_body_limit() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn ingress_capability_separates_implementation_configuration_and_qualification() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    for configured in [false, true] {
+        let settings = playscale::v2::ApiSettings {
+            trusted_ingress: configured.then(|| playscale::v2::IngressSettings {
+                socket: "/tmp/unused.sock".into(),
+                login_header: "tailscale-user-login".into(),
+                logins: Default::default(),
+            }),
+            ..Default::default()
+        };
+        f.app.access = Arc::new(
+            playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
+                .with_settings(settings),
+        );
+        let reply = f
+            .call(
+                "GET",
+                "/api/v2/system/capabilities",
+                None,
+                &[("authorization", &bearer(OPERATOR))],
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let feature = reply.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == "identity.trusted_private_ingress")
+            .unwrap();
+        assert_eq!(feature["implemented"], true);
+        assert_eq!(feature["enabled"], configured);
+        assert_eq!(feature["qualification"], "unqualified");
+        assert_eq!(feature["receipt_ids"], json!([]));
+    }
+}

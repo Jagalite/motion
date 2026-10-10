@@ -116,7 +116,11 @@ pub async fn capabilities(
         api,
         feature("identity.pairing", true, true),
         feature("identity.browser_sessions", true, true),
-        feature("identity.trusted_private_ingress", false, false),
+        feature(
+            "identity.trusted_private_ingress",
+            true,
+            app.access.settings.trusted_ingress.is_some(),
+        ),
         // Household mode leaves the legacy v1 surface open: v2 grants are
         // enforced on v2 routes but profile restrictions are not enforceable.
         feature("access.restricted_mode", true, restricted),
