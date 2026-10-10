@@ -6,6 +6,9 @@
 //! commit: the plan records each match, its evidence and the revisions it was
 //! computed against; commit applies only the reviewed plan. Ambiguous or
 //! unresolved entries are reported, never guessed.
+//!
+//! The format is unreleased; playlist entries identify timelines by ordered
+//! segments (`versions`) and earlier drafts are not accepted.
 use crate::metadata::Contribution;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,8 +54,9 @@ pub struct Segment {
 #[serde(deny_unknown_fields)]
 pub struct ExportedEntry {
     pub work: usize,
-    /// Ordered segments of one version of the timeline.
-    pub segments: Vec<Segment>,
+    /// Ordered segments of each original version of the timeline; the
+    /// importer resolves the entry by any one of them.
+    pub versions: Vec<Vec<Segment>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,13 +208,7 @@ pub fn plan_import(
         let (Some(local), Some((id, _))) = (&work.local, matched) else {
             continue;
         };
-        if !localized.insert(id.clone()) {
-            warnings.push(format!(
-                "'{}' maps to a work already receiving local metadata; skipped",
-                work.title
-            ));
-            continue;
-        }
+        // Validate first: a rejected contribution reserves nothing.
         let local = match crate::metadata::normalize_contribution(local) {
             Ok(local) => local,
             Err(reason) => {
@@ -221,6 +219,13 @@ pub fn plan_import(
                 continue;
             }
         };
+        if !localized.insert(id.clone()) {
+            warnings.push(format!(
+                "'{}' maps to a work already receiving local metadata; skipped",
+                work.title
+            ));
+            continue;
+        }
         let current = facts_by_id[id];
         if current.local.as_ref() == Some(&local) {
             continue;
@@ -289,11 +294,11 @@ pub fn plan_import(
                 continue;
             };
             // The timeline with a version whose ordered segments (content,
-            // part and interval) equal the entry's, if unique.
+            // part and interval) equal one of the entry's, if unique.
             let candidates: Vec<&Id> = facts_by_id[id]
                 .timelines
                 .iter()
-                .filter(|(_, versions)| versions.contains(&entry.segments))
+                .filter(|(_, versions)| versions.iter().any(|v| entry.versions.contains(v)))
                 .map(|(t, _)| t)
                 .collect();
             match candidates.as_slice() {
@@ -407,7 +412,7 @@ mod tests {
                 name: "Mix".into(),
                 entries: vec![ExportedEntry {
                     work: 0,
-                    segments: vec![seg("ra", 1)],
+                    versions: vec![vec![seg("ra", 1)]],
                 }],
             }],
         };
@@ -496,7 +501,7 @@ mod review_tests {
                 name: "P".into(),
                 entries: vec![ExportedEntry {
                     work: 0,
-                    segments: vec![segment(0, 1000)],
+                    versions: vec![vec![segment(0, 1000)]],
                 }],
             }],
         };
@@ -516,7 +521,9 @@ mod review_tests {
         );
         assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
         let mut exact = export.clone();
-        exact.playlists[0].entries[0].segments = vec![segment(1000, 2000)];
+        // Any one of the entry's versions may resolve it.
+        exact.playlists[0].entries[0].versions =
+            vec![vec![segment(0, 1000)], vec![segment(1000, 2000)]];
         let plan = plan_import(&exact, &facts, "default", &BTreeSet::new()).unwrap();
         assert!(plan.actions.contains(&Action::CreatePlaylist {
             name: "P".into(),
@@ -526,7 +533,7 @@ mod review_tests {
         big.playlists[0].entries = vec![
             ExportedEntry {
                 work: 0,
-                segments: vec![segment(1000, 2000)],
+                versions: vec![vec![segment(1000, 2000)]],
             };
             crate::organization::MAX_MEMBERS + 1
         ];
@@ -544,6 +551,42 @@ mod review_tests {
                 .unwrap()
                 .tags,
             ["sci fi".to_string()].into()
+        );
+    }
+    #[test]
+    fn rejected_contribution_does_not_reserve_its_work() {
+        let facts = vec![WorkFacts {
+            id: "w".into(),
+            external_ids: BTreeSet::new(),
+            content_revisions: ["r".to_string()].into(),
+            local_revision: 0,
+            local: None,
+            timelines: vec![],
+        }];
+        let mut bad = Contribution::default();
+        bad.values.insert("title".into(), serde_json::Value::Null);
+        let mut good = Contribution::default();
+        good.tags.insert("kept".into());
+        let exported = |local| ExportedWork {
+            title: "W".into(),
+            external_ids: vec![],
+            content_revisions: vec!["r".into()],
+            local: Some(local),
+        };
+        let export = Export {
+            format: FORMAT.into(),
+            works: vec![exported(bad), exported(good.clone())],
+            collections: vec![],
+            playlists: vec![],
+        };
+        let plan = plan_import(&export, &facts, "default", &BTreeSet::new()).unwrap();
+        assert_eq!(
+            plan.actions,
+            vec![Action::SetLocal {
+                work: "w".into(),
+                expected_revision: 0,
+                contribution: good
+            }]
         );
     }
 }

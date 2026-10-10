@@ -1832,8 +1832,8 @@ async fn export_resolves_retired_collection_members_and_exact_segments() {
     let survivor = &exported.works[exported.collections[0].members[0]];
     assert_eq!(survivor.content_revisions.len(), 2, "the surviving work");
     let entry = &exported.playlists[0].entries[0];
-    assert_eq!(entry.segments.len(), 1);
-    assert_eq!(entry.segments[0].part, 1);
+    assert_eq!(entry.versions.len(), 1);
+    assert_eq!(entry.versions[0][0].part, 1);
     // Round-trips onto the same server by exact segment identity.
     let plan = playscale::interchange::preview_import(&f.app.db, "other", &exported)
         .await

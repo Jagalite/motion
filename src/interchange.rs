@@ -176,16 +176,14 @@ pub async fn export(db: &SqlitePool, profile: &str) -> anyhow::Result<Export> {
             let Some(work) = add(&item, &mut works) else {
                 continue;
             };
-            // The first original version's ordered segments identify the
-            // timeline; one without an original version cannot be matched.
-            let Some(segments) = by_id
+            // Every original version's ordered segments identify the
+            // timeline; the importer matches any one of them exactly.
+            let versions = by_id
                 .get(item.as_str())
                 .and_then(|f| f.timelines.iter().find(|(t, _)| *t == timeline))
-                .and_then(|(_, versions)| versions.first().cloned())
-            else {
-                continue;
-            };
-            out.push(ExportedEntry { work, segments });
+                .map(|(_, versions)| versions.clone())
+                .unwrap_or_default();
+            out.push(ExportedEntry { work, versions });
         }
         exported_playlists.push(ExportedPlaylist { name, entries: out });
     }
