@@ -89,7 +89,7 @@ try {
   const electronEnv = {...process.env};
   delete electronEnv.ELECTRON_RUN_AS_NODE;
   await new Promise((resolve, reject) => {
-    electronChild = spawn(electron, [launchMain], {
+    electronChild = spawn(process.env.MOTION_ELECTRON_BINARY || electron, [launchMain], {
       stdio: 'inherit',
       // Private child environment for this proof; packaged host will use a pipe.
       env: {...electronEnv, MOTION_PROOF_ORIGIN: announced.listening, MOTION_PROOF_BOOTSTRAP: announced.bootstrap, MOTION_PROOF_OUT: output},
@@ -154,7 +154,7 @@ const results = {
     && c.generationSwitch.logicalTime >= 4.8 && c.generationSwitch.logicalTime < 8 && c.generationSwitch.muted === true
     && commands.some(cmd => cmd.operation === 'activateGeneration' && cmd.generation === '2' && cmd.body?.expected_active_generation === '1'),
   demuxe_bytes_match_install_receipt: demuxeMismatches.length === 0,
-  no_permission_granted_beyond_fullscreen: observed.permissionsGranted.every(p => p === 'fullscreen'),
+  no_permission_granted_beyond_fullscreen: Array.isArray(observed.permissionsGranted) && observed.permissionsGranted.every(p => p === 'fullscreen'),
 };
 const passed = Object.values(results).every(Boolean) && !c.exception && !failure;
 const demuxePkg = JSON.parse(readFileSync(join(demuxe, 'package.json'), 'utf8'));
