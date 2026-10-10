@@ -35,6 +35,12 @@ pub const MAX_SESSIONS: usize = 4;
 pub const SEGMENT_SECONDS: u64 = 4;
 /// Pinned HLS target duration. Longer segments fail the generation.
 pub const TARGET_SECONDS: u64 = 6;
+/// Free space a generation needs beyond the configured floor before it starts.
+/// Pacing and retention bound the segments it keeps; this covers them at the
+/// recipe's peak rate with margin.
+pub const GENERATION_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+/// A published segment larger than this fails its generation.
+pub const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 /// Recipe identity bound into every generation pin.
 pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 const HEARTBEAT_SECONDS: u64 = 10;
@@ -316,6 +322,17 @@ async fn observe(
     reported: &mut u32,
     start_ms: u64,
 ) {
+    // Stop writing before the volume drops below the configured free-space floor.
+    let floor = app.storage.settings.min_free_bytes;
+    let space = {
+        let directory = directory.to_owned();
+        tokio::task::spawn_blocking(move || fs2::available_space(directory)).await
+    };
+    if !matches!(space, Ok(Ok(free)) if free >= floor) {
+        tracing::warn!(delivery=%session.id, generation, "live output below the free-space floor");
+        let _ = apply(app, session, Input::Failed { generation });
+        return;
+    }
     let Ok(text) = tokio::fs::read_to_string(directory.join("ffmpeg.m3u8")).await else {
         return;
     };
@@ -329,11 +346,17 @@ async fn observe(
     }
     let from = *reported;
     for segment in published.iter().filter(|s| s.index >= from) {
-        if segment.index != *reported
-            || !tokio::fs::try_exists(directory.join(format!("seg{}.m4s", segment.index)))
-                .await
-                .unwrap_or(false)
-        {
+        if segment.index != *reported {
+            return;
+        }
+        let Ok(metadata) =
+            tokio::fs::metadata(directory.join(format!("seg{}.m4s", segment.index))).await
+        else {
+            return;
+        };
+        if metadata.len() > MAX_SEGMENT_BYTES {
+            tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), "segment exceeds the size cap");
+            let _ = apply(app, session, Input::Failed { generation });
             return;
         }
         let input = if segment.index == 0 {
@@ -430,8 +453,10 @@ async fn run_generation(
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
+        let floor = app.storage.settings.min_free_bytes;
         let preparation = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
+            crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
             let input = source_valid(&source)?;
             let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
             anyhow::Ok((input, witness, held))
@@ -443,8 +468,12 @@ async fn run_generation(
     };
     let (input, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,
-        result => {
-            tracing::warn!(delivery=%session.id, generation, error=?result.err(), "delivery source rejected");
+        Ok(Err(error)) => {
+            tracing::warn!(delivery=%session.id, generation, %error, "delivery generation not started");
+            return fail(&app, &session);
+        }
+        Err(error) => {
+            tracing::warn!(delivery=%session.id, generation, %error, "delivery preparation panicked");
             return fail(&app, &session);
         }
     };
