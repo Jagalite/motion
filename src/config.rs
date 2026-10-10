@@ -32,6 +32,19 @@ pub struct Args {
     pub ffprobe: Option<PathBuf>,
     #[arg(long)]
     pub ffmpeg: Option<PathBuf>,
+    /// Inherited file descriptor carrying a one-use desktop bootstrap secret
+    /// (read once at startup; never place the secret in argv).
+    #[arg(long)]
+    pub bootstrap_fd: Option<i32>,
+    /// `trusted_household` keeps the unauthenticated legacy v1 surface;
+    /// `restricted` requires paired credentials (v1 is operator-only).
+    #[arg(long, value_parser = parse_access_mode)]
+    pub access_mode: Option<playscale_core::access::AccessMode>,
+}
+
+fn parse_access_mode(value: &str) -> Result<playscale_core::access::AccessMode, String> {
+    serde_json::from_value(serde_json::Value::String(value.into()))
+        .map_err(|_| "expected trusted_household or restricted".into())
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -44,6 +57,8 @@ pub struct Settings {
     pub ffprobe: PathBuf,
     pub processing: crate::processing::Settings,
     pub storage: crate::storage::Settings,
+    pub access_mode: playscale_core::access::AccessMode,
+    pub api: crate::v2::ApiSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -56,6 +71,9 @@ impl Default for Settings {
             ffprobe: "ffprobe".into(),
             processing: Default::default(),
             storage: Default::default(),
+            // Household mode (anonymous legacy v1) is only an explicit choice.
+            access_mode: playscale_core::access::AccessMode::Restricted,
+            api: Default::default(),
         }
     }
 }
@@ -158,6 +176,9 @@ impl Args {
         if let Some(v) = &self.ffmpeg {
             settings.processing.ffmpeg = v.clone();
         }
+        if let Some(v) = self.access_mode {
+            settings.access_mode = v;
+        }
         if let Some(v) = &self.public_origin {
             settings.public_origin = Some(v.clone());
         }
@@ -171,6 +192,7 @@ impl Args {
         if let Some(origin) = &settings.public_origin {
             settings.public_origin = Some(canonical_origin(origin)?);
         }
+        settings.api.validate()?;
         settings.processing.validate()?;
         settings.storage.validate()?;
         Ok(settings)

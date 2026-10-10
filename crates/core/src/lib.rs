@@ -1,10 +1,14 @@
 //! Deterministic decisions. No clocks, database connections, tasks, or file handles.
+pub mod access;
 pub mod artwork;
 pub mod catalog;
 pub mod events;
+pub mod identity;
 pub mod jobs;
 pub mod maintenance;
+pub mod matching;
 pub mod metadata;
+pub mod organization;
 pub mod playback;
 pub mod processing;
 pub mod ranges;

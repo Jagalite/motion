@@ -86,6 +86,10 @@ async fn run() -> anyhow::Result<()> {
         )
         .init();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let ingress = match &args.api.trusted_ingress {
+        Some(settings) => Some(playscale::v2::ingress_listener(&settings.socket)?),
+        None => None,
+    };
     let address = listener.local_addr()?;
     let origin = playscale::config::canonical_origin(
         &args
@@ -126,7 +130,17 @@ async fn run() -> anyhow::Result<()> {
                 .join("generated"),
             args.processing,
         )),
+        access: Arc::new(
+            playscale::v2::Runtime::new(
+                args.access_mode,
+                playscale::v2::auth::load_or_create_key(&args.data_dir.join("credential-key"))?,
+            )
+            .with_settings(args.api.clone()),
+        ),
     };
+    if let Some(fd) = cli.bootstrap_fd {
+        app.access.set_bootstrap(&read_bootstrap(fd)?)?;
+    }
     playscale::processing::recover(&app).await?;
     if assets.is_none() {
         tracing::warn!(
@@ -155,6 +169,21 @@ async fn run() -> anyhow::Result<()> {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         result
     });
+    if let Some(socket) = ingress {
+        // Identity headers are trusted only on this listener.
+        let router = router
+            .clone()
+            .layer(axum::Extension(playscale::v2::auth::TrustedIngress));
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(socket, router)
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+            {
+                tracing::error!(%error, "trusted ingress listener stopped");
+            }
+        });
+    }
     let stop_http = shutdown.clone();
     let mut http = tokio::spawn(async move {
         axum::serve(listener, router)
@@ -201,6 +230,29 @@ async fn run() -> anyhow::Result<()> {
     app.db.close().await;
     drop(lock);
     outcome
+}
+
+/// Read the bootstrap secret from an inherited descriptor and close it.
+#[cfg(unix)]
+fn read_bootstrap(fd: i32) -> anyhow::Result<String> {
+    use std::{io::Read, os::fd::FromRawFd};
+    anyhow::ensure!(
+        fd > 2,
+        "bootstrap descriptor must not be stdin/stdout/stderr"
+    );
+    // SAFETY: the launcher passes this descriptor to us for exclusive use;
+    // it is consumed and closed here exactly once.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut secret = String::new();
+    Read::by_ref(&mut file)
+        .take(256)
+        .read_to_string(&mut secret)?;
+    Ok(secret.trim().to_owned())
+}
+
+#[cfg(not(unix))]
+fn read_bootstrap(_fd: i32) -> anyhow::Result<String> {
+    anyhow::bail!("bootstrap descriptors are supported on Unix only")
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {

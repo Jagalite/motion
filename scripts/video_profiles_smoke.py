@@ -11,7 +11,7 @@ def main():
         source_path=media/'source.mp4';ffmpeg=shutil.which('ffmpeg');assert ffmpeg
         subprocess.run([ffmpeg,'-v','error','-f','lavfi','-i','testsrc2=size=640x360:rate=60','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','4.7','-c:v','libx264','-threads','2','-pix_fmt','yuv420p','-c:a','aac',str(source_path)],check=True)
         source_sha=hashlib.sha256(source_path.read_bytes()).hexdigest()
-        config=root/'config.json';config.write_text(json.dumps({'listen':f'127.0.0.1:{port}','data_dir':str(state),'libraries':[str(media)],'processing':{'ffmpeg':ffmpeg,'cache_bytes':128*1024*1024,'max_output_bytes':16*1024*1024,'timeout_seconds':60}}))
+        config=root/'config.json';config.write_text(json.dumps({'access_mode':'trusted_household','listen':f'127.0.0.1:{port}','data_dir':str(state),'libraries':[str(media)],'processing':{'ffmpeg':ffmpeg,'cache_bytes':128*1024*1024,'max_output_bytes':16*1024*1024,'timeout_seconds':60}}))
         log=(root/'server.log').open('wb');process=subprocess.Popen([str(args.binary.resolve()),'--config',str(config)],stdout=log,stderr=log)
         try:
             wait_for(lambda:request(port,'GET','/ready')[0]==200);auth={'Authorization':'Bearer '+(state/'admin-token').read_text().strip()}

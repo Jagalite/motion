@@ -902,7 +902,7 @@ mod publication_tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
         let library = db::add_library(&pool, "fixture", dir.path()).await.unwrap();
-        sqlx::query("INSERT INTO items VALUES ('item','Fixture','video')")
+        sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
             .execute(&pool)
             .await
             .unwrap();
@@ -927,6 +927,10 @@ mod publication_tests {
                 Default::default(),
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
         };
         let output = || {
             Some((

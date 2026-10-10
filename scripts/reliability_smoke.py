@@ -26,7 +26,7 @@ def main():
         port = free_port()
         state = root / 'state'
         config = root / 'config.json'
-        config.write_text(json.dumps({'listen': f'127.0.0.1:{port}', 'data_dir': str(state),
+        config.write_text(json.dumps({'access_mode': 'trusted_household', 'listen': f'127.0.0.1:{port}', 'data_dir': str(state),
             'ffprobe': str(probe), 'libraries': [str(root / 'unavailable')],
             'storage': {'backup_interval_seconds': 60, 'backups_keep': 2, 'min_free_bytes': 0}}))
         command = [str(BINARY), '--config', str(config)]
