@@ -60,7 +60,7 @@ from a restored online outbox or an offline log.
 
 ## Current evidence
 
-- Focused JavaScript: 59 passing tests covering production playback/bridge/native
+- Focused JavaScript: 62 passing tests covering production playback/bridge/native
   adapters and crash-recovery ordering.
 - Rust presentation: 16 composition tests; offline cache: five integration tests plus an anonymous-snapshot/concurrent-range test;
   offline core: two unit tests and two Stateless/mutation tests.
@@ -133,3 +133,21 @@ installed player, `MOTION_SERVER_BINARY` to the built server, and optionally
 `MOTION_CARGO_BINARY`. `CARGO_HOME`/`CARGO_TARGET_DIR` can isolate build locks;
 `scripts/run-rust-test-local.py` is an opt-in Cargo target runner for stalled
 external-volume executables. These overrides are development verification aids.
+
+## PR review follow-up (2026-10-10)
+
+Review fixed a viewing retry that could bypass failed local persistence, enforced
+full decimal-u64 bounds, refreshed offline playback after history restoration, and
+kept the snapshot admission lock owned by the blocking worker after HTTP cancellation.
+These are adapter durability/resource-lifetime rules; canonical viewing authority
+and offline event admission remain production core policies. Regression tests cover
+repeated persistence failures, stable retry identity, exhausted sequences and restored
+documents. The existing cache tests exercise snapshots, ranges and durable events;
+HTTP cancellation during a large snapshot is not separately fault-injected.
+
+Fresh checks on the fix commit: 62 JavaScript tests, 16 presentation tests and six
+helper tests, presentation/helper doctests, formatting, and warnings-denied Clippy
+for both affected Rust packages pass. Native offline cold-start qualification was
+rerun successfully (nine checks). Earlier online/native receipts remain historical;
+this follow-up does not claim a fresh whole-workspace or physical-device campaign.
+See `review-verification.json` for source and log hashes. Remaining gates above apply.
