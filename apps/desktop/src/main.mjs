@@ -1,0 +1,175 @@
+import {app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage} from 'electron';
+import {readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs';
+import {createHash} from 'node:crypto';
+import {fileURLToPath} from 'node:url';
+import {join} from 'node:path';
+import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities} from './policy.mjs';
+
+const chromeUrl = new URL('./chrome.html', import.meta.url).href;
+const contractDigest = `sha256:${createHash('sha256').update(readFileSync(new URL('../../../contracts/Motion_Server_API_v2.yaml', import.meta.url))).digest('hex')}`;
+let window;
+let content;
+let selectedSession;
+let monitor;
+let epoch = 0;
+let transition = Promise.resolve();
+function serialize(work) {
+  const owner = ++epoch; // Invalidate the previous operation before any await.
+  const result = transition.catch(() => {}).then(() => work(owner));
+  transition = result;
+  return result;
+}
+
+function authorize(event) {
+  if (!window || event.sender !== window.webContents || event.senderFrame !== window.webContents.mainFrame
+    || event.senderFrame.url !== chromeUrl) throw new Error('Untrusted native request');
+}
+
+function credentialFile(selected) { return join(app.getPath('userData'), 'credentials', `${partitionFor(selected).slice(8)}.bin`); }
+function readCredential(selected) {
+  if (!safeStorage.isEncryptionAvailable() || (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')) throw new Error('OS credential encryption is unavailable');
+  const path = credentialFile(selected);
+  return existsSync(path) ? safeStorage.decryptString(readFileSync(path)) : '';
+}
+function saveCredential(selected, value) {
+  if (!safeStorage.isEncryptionAvailable() || (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')) throw new Error('OS credential encryption is unavailable');
+  const directory = join(app.getPath('userData'), 'credentials');
+  mkdirSync(directory, {recursive: true, mode: 0o700});
+  writeFileSync(credentialFile(selected), safeStorage.encryptString(value), {mode: 0o600});
+}
+
+async function detach() {
+  clearTimeout(monitor);
+  monitor = null;
+  const previous = content;
+  const previousSession = selectedSession;
+  content = null;
+  selectedSession = null;
+  if (previous) {
+    if (!previous.webContents.isDestroyed()) {
+      // The unprivileged page can only acknowledge its own bounded teardown.
+      await Promise.race([
+        previous.webContents.executeJavaScript(`new Promise(resolve => {
+          document.addEventListener('motion:closed', () => resolve(true), {once: true});
+          document.dispatchEvent(new Event('motion:prepare-close'));
+          setTimeout(() => resolve(false), 2500);
+        })`).catch(() => false),
+        new Promise(resolve => setTimeout(resolve, 3000)),
+      ]);
+    }
+    window?.contentView.removeChildView(previous);
+    if (!previous.webContents.isDestroyed()) previous.webContents.close();
+  }
+  // Partitions remain isolated by server; explicitly remove browser credentials
+  // and renderer storage when the user changes connection/auth context.
+  if (previousSession) await previousSession.clearStorageData();
+}
+
+function secureSession(ses, origin) {
+  ses.setPermissionRequestHandler((_wc, permission, callback) => callback(permission === 'fullscreen'));
+  ses.setPermissionCheckHandler((_wc, permission) => permission === 'fullscreen');
+  ses.on('will-download', event => event.preventDefault());
+  // The session is dedicated to this server. This also prevents cross-origin
+  // redirects/subresources from forwarding credentials outside the selection.
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    callback({cancel: !sameOrigin(details.url, origin) && !details.url.startsWith(`blob:${origin}/`)});
+  });
+}
+
+async function connectOwned(input, owner) {
+  const selected = connection(input);
+  if (typeof input.credential !== 'string' || input.credential.length > 4096) throw new Error('Invalid credential');
+  await detach();
+  if (owner !== epoch) throw new Error('Connection changed');
+  const current = () => owner === epoch && window && !window.isDestroyed();
+  const ses = session.fromPartition(partitionFor(selected), {cache: false});
+  selectedSession = ses;
+  await ses.clearStorageData();
+  secureSession(ses, selected.origin);
+  const request = async (path, options = {}) => {
+    const response = await ses.fetch(`${selected.origin}${path}`, {redirect: 'error', cache: 'no-store',
+      signal: AbortSignal.timeout(10000), ...options});
+    if (!current()) throw new Error('Connection changed');
+    if (!response.ok) throw new Error(`Server request failed (${response.status})`);
+    return response.json();
+  };
+  try {
+    const health = await request('/api/v2/system/health');
+    const serverEpoch = verifyHealth(health, selected);
+    const credential = input.credential || readCredential(selected);
+    if (credential.length < 32) throw new Error('A paired device credential is required');
+    const browserSession = await request('/api/v2/auth/session', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: 'credential', credential})});
+    if (!browserSession?.principal?.id || !browserSession.csrf_token) throw new Error('Invalid browser session');
+    verifyCapabilities(await request('/api/v2/system/capabilities'), selected, serverEpoch, contractDigest);
+    if (!current()) throw new Error('Connection changed');
+    if (input.remember === true) saveCredential(selected, credential);
+    const view = new WebContentsView({webPreferences: {session: ses, sandbox: true, contextIsolation: true,
+      nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true,
+      allowRunningInsecureContent: false, webviewTag: false}});
+    view.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
+    view.webContents.on('will-navigate', (event, url) => { if (!sameOrigin(url, selected.origin)) event.preventDefault(); });
+    view.webContents.on('will-redirect', (event, url) => { if (!sameOrigin(url, selected.origin)) event.preventDefault(); });
+    view.webContents.on('will-frame-navigate', event => { if (!sameOrigin(event.url, selected.origin)) event.preventDefault(); });
+    view.webContents.on('will-attach-webview', event => event.preventDefault());
+    content = view;
+    window.contentView.addChildView(view);
+    resize();
+    await view.webContents.loadURL(selected.origin);
+    if (!current()) throw new Error('Connection changed');
+    const inspect = async () => {
+      if (!current()) return;
+      try {
+        const health = await request('/api/v2/system/health');
+        if (health.server_id !== selected.serverId || health.server_epoch !== serverEpoch) {
+          window.webContents.send('motion:status', 'The server identity or runtime changed. Reconnect to continue.');
+          await disconnect();
+          return;
+        }
+      } catch {
+        if (current()) window.webContents.send('motion:status', 'The server is temporarily unreachable. Existing playback remains subject to its delivery lease.');
+      }
+      if (current()) monitor = setTimeout(inspect, 10000);
+    };
+    monitor = setTimeout(inspect, 10000);
+    return selected;
+  } catch (error) {
+    if (current()) await detach();
+    throw error;
+  }
+}
+
+const connect = input => serialize(owner => connectOwned(input, owner));
+const disconnect = () => serialize(() => detach());
+
+function resize() {
+  if (!content || !window) return;
+  const [width, height] = window.getContentSize();
+  content.setBounds({x: 0, y: 190, width, height: Math.max(0, height - 190)});
+}
+
+if (!app.requestSingleInstanceLock()) app.quit();
+else {
+  app.on('second-instance', () => { window?.show(); window?.focus(); });
+  app.whenReady().then(async () => {
+    window = new BrowserWindow({width: 1200, height: 850, minWidth: 1000, minHeight: 600,
+      webPreferences: {preload: fileURLToPath(new URL('./preload.cjs', import.meta.url)), sandbox: true,
+        contextIsolation: true, nodeIntegration: false, webSecurity: true, webviewTag: false}});
+    window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
+    window.webContents.on('will-navigate', event => event.preventDefault());
+    window.webContents.on('will-attach-webview', event => event.preventDefault());
+    window.on('resize', resize);
+    let closing = false;
+    window.on('close', event => {
+      if (closing) return;
+      event.preventDefault();
+      closing = true;
+      void disconnect().finally(() => window?.close());
+    });
+    window.on('closed', () => { window = null; });
+    ipcMain.handle('motion:connect', (event, input) => { authorize(event); return connect(input); });
+    ipcMain.handle('motion:disconnect', event => { authorize(event); return disconnect(); });
+    await window.loadURL(chromeUrl);
+  }).catch(error => { console.error('Desktop startup failed:', error.message); app.exit(1); });
+  app.on('window-all-closed', () => app.quit());
+}

@@ -4,11 +4,15 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Motion Electron host (A12). Wave 0: local-origin Topcoat/CSP/Demuxe proof.",
+  "description": "Motion Electron host: isolated server connections and local-origin qualification",
   "scripts": {
-    "proof": "node proof/run.mjs"
+    "proof": "node proof/run.mjs",
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "test:shell": "node test/run-shell.mjs"
   },
   "devDependencies": {
     "electron": "44.7.0"
-  }
+  },
+  "main": "src/main.mjs"
 }
