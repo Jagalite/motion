@@ -2,9 +2,9 @@
   "kind": "topcoat-electron-local-origin-smoke-proof",
   "scope": "Limited Wave 0 smoke proof of local rendering/playback under the strict CSP. Not qualification of plan sections 12.2-12.3, 14.4 or 15.2-15.3: services are mocked, attachment/ownership/locking are not exercised.",
   "wave": 0,
-  "passed": true,
-  "recorded_at": "2026-10-10T01:58:03.907Z",
-  "motion_commit": "8896df3f114f3b85897831a909064379ba07ad57",
+  "passed": false,
+  "recorded_at": "2026-10-10T04:14:10.950Z",
+  "motion_commit": "b9db52f6589afc8ca6f753b83aa7027cc4550615",
   "worktree_dirty": true,
   "environment": {
     "electron": "44.7.0",
@@ -18,10 +18,11 @@
     "source": "git+https://github.com/tokio-rs/topcoat?rev=341f3ff2fe16a73af5469685cf597693af5acb25#341f3ff2fe16a73af5469685cf597693af5acb25",
     "features": "router, view, tower, discover (no runtime)"
   },
-  "proof_server_sha256": "325c8e0fa495edd7ef188625249c851dd1ae53c94abe143962ab4fbf3f81b907",
+  "proof_server_sha256": "9bbb4d2bc4bc108d3724e4f7be8f31f083b8448551fcf55a7b362706cf5861cf",
+  "proof_driver_sha256": "c51c7886feaa4fe1befe424119d96be8a61b5036263c6e2d8e8829349661a0bb",
   "proof_server_launch": {
     "location": "host-temporary-directory",
-    "sha256": "325c8e0fa495edd7ef188625249c851dd1ae53c94abe143962ab4fbf3f81b907",
+    "sha256": "9bbb4d2bc4bc108d3724e4f7be8f31f083b8448551fcf55a7b362706cf5861cf",
     "matches_build": true
   },
   "rust_toolchain": "1.98.0",
@@ -46,6 +47,8 @@
     "eval_blocked_by_csp": true,
     "inline_script_blocked": true,
     "player_ready": true,
+    "keyboard_skip_link_preserves_player": true,
+    "narrow_player_layout_and_labels": true,
     "played_past_2_5s": true,
     "seek_landed_and_continued": true,
     "range_requests": true,
@@ -59,7 +62,10 @@
     "if_match_conflict_surfaced": true,
     "generation_replacement_activated": true,
     "demuxe_bytes_match_install_receipt": true,
-    "no_permission_granted_beyond_fullscreen": true
+    "no_permission_granted_beyond_fullscreen": true,
+    "screen_semantics_and_responsive_layout": false,
+    "reduced_motion_respected": true,
+    "concurrent_html_and_range_responses_preserved": true
   },
   "observations": {
     "sessionExchangeStatus": 200,
@@ -83,14 +89,24 @@
       "state": "ready",
       "text": ""
     },
+    "skipLink": {
+      "focused": true,
+      "retained": true,
+      "players": 1
+    },
+    "narrowLayout": {
+      "width": 390,
+      "scrollWidth": 390,
+      "labelled": true
+    },
     "playback": {
       "played": true,
-      "before": 2.525358,
-      "afterSeek": 7.001897,
-      "seekElapsedMs": 163,
+      "before": 2.605448,
+      "afterSeek": 7.001353,
+      "seekElapsedMs": 46,
       "landed": true,
       "advancing": true,
-      "finalTime": 7.755141,
+      "finalTime": 7.741244,
       "mode": "native",
       "duration": 12,
       "audioTracks": 0,
@@ -99,7 +115,7 @@
     },
     "generationSwitch": {
       "replaced": true,
-      "logicalTime": 5.01618,
+      "logicalTime": 5.004921,
       "muted": true,
       "players": 1
     },
@@ -111,11 +127,201 @@
     },
     "afterBackPlayback": {
       "advancing": true,
-      "start": 0.006887,
-      "now": 1.021252
+      "start": 0.003576,
+      "now": 1.0155
     },
     "afterScanTitle": "Sources and scans",
-    "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again."
+    "staleDecisionMessage": "This changed somewhere else. Reload the page to see the latest version, then try again.",
+    "screenMatrix": [
+      {
+        "path": "/",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/library/lib1",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/item/item2",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/search?q=sample",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/profiles",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/sources",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/matches",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/processing",
+        "width": 320,
+        "scrollWidth": 372,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/diagnostics",
+        "width": 320,
+        "scrollWidth": 320,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/library/lib1",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/item/item2",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/search?q=sample",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/profiles",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/sources",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/matches",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/processing",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      },
+      {
+        "path": "/diagnostics",
+        "width": 1280,
+        "scrollWidth": 1280,
+        "main": 1,
+        "headings": 1,
+        "labelled": true,
+        "reducedMotion": true,
+        "accessibleControlNames": true
+      }
+    ],
+    "renderLoad": {
+      "requests": 24,
+      "simultaneousRangeRead": true,
+      "allSucceeded": true,
+      "elapsedMs": 17,
+      "p50Ms": 9,
+      "p95Ms": 15
+    }
   },
   "csp_console": [
     "error: Executing inline script violates the following Content Security Policy directive 'script-src 'self' 'wasm-unsafe-eval''. Either the 'unsafe-inline' keyword, a hash ('sha256-3ESihh3MurRVVlneQHpXxx54JMAaWXY5YvlFn21oZjw='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked."
@@ -147,7 +353,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "30ac9bc1fecb4518802dd9b311567b68",
+        "event_id": "dbd2e47a56cb487f91754dfbd3cb2fb5",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -165,10 +371,21 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "6ec2f6176f074c8d9f76e27a04909dec",
+        "event_id": "0299fdbd00f742b3b8e4d6a58cdc3b37",
         "position_ms": 0,
         "sequence": "2",
         "status": "paused"
+      },
+      "operation": "recordViewingEvent",
+      "session": "view1"
+    },
+    {
+      "body": {
+        "delivery_generation": "1",
+        "event_id": "54ed6b1b33a441fdb5b210954fa8106d",
+        "position_ms": 5,
+        "sequence": "3",
+        "status": "playing"
       },
       "operation": "recordViewingEvent",
       "session": "view1"
@@ -183,19 +400,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "325bbd4c343c4e4dba3ae7e81bc0d466",
-        "position_ms": 656,
-        "sequence": "3",
-        "status": "playing"
-      },
-      "operation": "recordViewingEvent",
-      "session": "view1"
-    },
-    {
-      "body": {
-        "delivery_generation": "1",
-        "event_id": "34efcbb36a994ed684f7f3688d27ad73",
-        "position_ms": 7755,
+        "event_id": "696df846ccd54641bb9540586e634d4c",
+        "position_ms": 7741,
         "sequence": "4",
         "status": "playing"
       },
@@ -214,8 +420,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "f6c15f752cb14568ba3cf9c830e0b96a",
-        "position_ms": 9136,
+        "event_id": "f6e6f265a5304ccda2fab5745aaddd15",
+        "position_ms": 7875,
         "sequence": "5",
         "status": "paused"
       },
@@ -233,7 +439,7 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "7f270b7f4b7d44629e73320017f8e7cf",
+        "event_id": "ed2e05dd13c3404e82553a0cc6525eb9",
         "position_ms": 5000,
         "sequence": "6",
         "status": "paused"
@@ -244,8 +450,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "228eb99ab470441c9986694f16be1644",
-        "position_ms": 5015,
+        "event_id": "820e426d5e3d470383df0f552aa7043b",
+        "position_ms": 5003,
         "sequence": "7",
         "status": "playing"
       },
@@ -255,8 +461,8 @@
     {
       "body": {
         "delivery_generation": "2",
-        "event_id": "dcfc165bdefc4072afed0353487300cb",
-        "position_ms": 5623,
+        "event_id": "581be4bb07cf46809fab12c9b6c2a29d",
+        "position_ms": 5005,
         "sequence": "8",
         "status": "stopped"
       },
@@ -284,7 +490,7 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "532d40973a044101bd07475e4ee0068b",
+        "event_id": "363a586567b24aafb6afe1b58fe554cb",
         "position_ms": 0,
         "sequence": "1",
         "status": "paused"
@@ -295,8 +501,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "4f6be15372064d538ab22ffac79428f6",
-        "position_ms": 4,
+        "event_id": "40f26ea6476949e29318d1dd309ba08e",
+        "position_ms": 0,
         "sequence": "2",
         "status": "playing"
       },
@@ -306,8 +512,8 @@
     {
       "body": {
         "delivery_generation": "1",
-        "event_id": "f0e116a77e7c48628cfa2ec472378b77",
-        "position_ms": 1021,
+        "event_id": "5b9c7d4abd3a4427bf797d028f00fc85",
+        "position_ms": 1016,
         "sequence": "3",
         "status": "stopped"
       },
@@ -319,7 +525,7 @@
         "mode": "incremental",
         "require_complete": false
       },
-      "key": "4587e340ae3e4c05a6694f1edf7ac312",
+      "key": "15a5f11444bc4ea8816f0c5cbf6ee5f1",
       "library": "lib1",
       "operation": "createScan",
       "replay": false
@@ -344,7 +550,7 @@
     }
   ],
   "http": {
-    "requests": 185,
+    "requests": 228,
     "deliveries_admitted": [
       "del1",
       "del2"
