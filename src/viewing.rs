@@ -510,8 +510,13 @@ pub async fn put_preferences(
     if playscale_core::revision::advance(current.revision, body.expected_revision).is_err() {
         return Err(conflict("preferences_revision_conflict"));
     }
-    sqlx::query("INSERT INTO playback_preferences VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
-        .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).execute(&app.db).await?;
+    // Compare-and-set on the revision read above: v2 writers do not take
+    // `app.jobs`, so a concurrent write must turn this into a conflict.
+    let written = sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json WHERE playback_preferences.revision=?")
+        .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).bind(current.revision).execute(&app.db).await?;
+    if written.rows_affected() != 1 {
+        return Err(conflict("preferences_revision_conflict"));
+    }
     Ok(Json(prefs(&app, &p).await?))
 }
 

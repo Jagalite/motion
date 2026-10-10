@@ -36,8 +36,6 @@ pub const MAX_SESSIONS: usize = 4;
 /// Concurrent byte-route (original) deliveries. They run no encoder; the bound
 /// only limits the memory and lease bookkeeping this process holds.
 pub const MAX_BYTE_SESSIONS: usize = 64;
-/// Change acknowledgements a delivery keeps for exact retries.
-const MAX_CHANGE_RECEIPTS: usize = 64;
 /// Bound owned admission tasks, including requests whose HTTP waiters vanished.
 pub const MAX_ADMISSIONS: usize = 32;
 /// Requested segment length; keyframes are forced on this cadence.
@@ -118,11 +116,16 @@ struct Inner {
     delivery: Delivery,
     /// Cancellation for each generation worker that may still be running.
     workers: HashMap<u64, WorkerControl>,
-    /// Acknowledged v2 changes by (principal, idempotency key): request digest
-    /// and acknowledged view, recorded under this lock with the transition
-    /// they acknowledge. They are exactly as durable as the staged generation
-    /// (a restart interrupts the delivery and both). Oldest first.
-    changes: std::collections::VecDeque<((String, String), String, serde_json::Value)>,
+    /// Acknowledged v2 changes: request identity and acknowledged view,
+    /// recorded under this lock with the transition they acknowledge. They are
+    /// exactly as durable as the staged generation (a restart interrupts the
+    /// delivery and both). Every accepted change stages a generation, so the
+    /// reducer's generation limit bounds them; none is evicted while the
+    /// delivery is live.
+    changes: Vec<(
+        playscale_core::delivery_admission::Identity,
+        serde_json::Value,
+    )>,
 }
 
 /// Control of one generation worker: cancellation and pacing (true = paused).
@@ -2215,12 +2218,8 @@ pub(crate) async fn change_live(
     }
     let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
     let acknowledged = view(app, &session, &d);
-    if inner.changes.len() >= MAX_CHANGE_RECEIPTS {
-        inner.changes.pop_front();
-    }
-    inner.changes.push_back((
-        (receipt.principal.clone(), receipt.key.clone()),
-        receipt.digest.clone(),
+    inner.changes.push((
+        receipt.identity(),
         serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
     ));
     Ok((acknowledged, false))
@@ -2232,26 +2231,53 @@ pub(crate) struct ChangeReceipt {
     pub key: String,
     pub digest: String,
 }
+impl ChangeReceipt {
+    fn identity(&self) -> playscale_core::delivery_admission::Identity {
+        playscale_core::delivery_admission::Identity {
+            principal: self.principal.clone(),
+            key: self.key.clone(),
+            digest: self.digest.clone(),
+        }
+    }
+}
 
-/// The acknowledgement of an exact retry; a conflict when the key named a
-/// different request.
+/// The acknowledgement of an exact retry (core `delivery_admission::decide`);
+/// a conflict when the key named a different request.
 fn replayed_change(inner: &Inner, r: &ChangeReceipt) -> Result<Option<DeliveryView>, ApiError> {
-    let Some((_, digest, view)) = inner
+    use playscale_core::delivery_admission::{self as admission, Decision, Receipt};
+    let request = r.identity();
+    let Some((identity, view)) = inner
         .changes
         .iter()
-        .find(|((p, k), _, _)| *p == r.principal && *k == r.key)
+        .find(|(i, _)| i.principal == request.principal && i.key == request.key)
     else {
         return Ok(None);
     };
-    if *digest != r.digest {
-        return Err(ApiError::conflict(
+    let receipt = Receipt {
+        identity: identity.clone(),
+        delivery_id: String::new(),
+    };
+    match admission::decide(&request, Some(&receipt)) {
+        Ok(Decision::Replay { .. }) => serde_json::from_value(view.clone())
+            .map(Some)
+            .map_err(ApiError::internal),
+        Ok(Decision::Create) => Ok(None),
+        Err(_) => Err(ApiError::conflict(
             "idempotency_conflict",
             "The Idempotency-Key was used with a different request",
-        ));
+        )),
     }
-    serde_json::from_value(view.clone())
-        .map(Some)
-        .map_err(ApiError::internal)
+}
+
+/// An exact retry of an acknowledged change, checked before the request's
+/// plan token is admitted again (it may have expired since).
+pub(crate) fn change_replay(
+    app: &App,
+    id: &str,
+    receipt: &ChangeReceipt,
+) -> Result<Option<DeliveryView>, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    replayed_change(&session.inner.lock().unwrap(), receipt)
 }
 
 /// The v2 owner of a delivery: held live, or recorded at its admission.

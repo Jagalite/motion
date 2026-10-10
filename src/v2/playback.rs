@@ -468,6 +468,37 @@ async fn original_of(
     Ok(None)
 }
 
+/// The first original bound to the timeline regardless of availability or
+/// scope: only a key for its renditions, never itself delivered.
+async fn any_original_of(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+    version: Option<&str>,
+    file: Option<&str>,
+) -> Result<Option<Bound>, Problem> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+         JOIN media_files f ON f.id=b.file_id \
+         WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 \
+         AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) ORDER BY v.id,b.file_id LIMIT 1",
+    )
+    .bind(timeline)
+    .bind(version)
+    .bind(version)
+    .bind(file)
+    .bind(file)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((version, file)) = row else {
+        return Ok(None);
+    };
+    let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=?")
+        .bind(file)
+        .fetch_one(conn)
+        .await?;
+    Ok(Some(Bound { version, file }))
+}
+
 /// Whether the version still binds the file to the timeline.
 async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
     let bound: Option<i64> = sqlx::query_scalar(
@@ -498,15 +529,16 @@ async fn pinned_rendition_source(
     .await?)
 }
 
-/// The newest generated rendition of `original` bound to the timeline (or
-/// to the pinned `version`) whose output and source revisions are still the
-/// registered ones (core `renditions::available`).
+/// Generated renditions of `original` bound to the timeline (or to the
+/// pinned `version`) whose output and source revisions are still the
+/// registered ones (core `renditions::available`), newest first. Each reaches
+/// the planning decision, which picks the first one the client can use.
 async fn prepared_of(
     conn: &mut sqlx::SqliteConnection,
     timeline: &str,
     original: &str,
     version: Option<&str>,
-) -> Result<Option<Bound>, Problem> {
+) -> Result<Vec<Bound>, Problem> {
     let rows: Vec<(String, String, bool, String, String, String, String)> = sqlx::query_as(
         "SELECT v.id,f.id,f.available,f.revision,r.file_revision,s.revision,r.source_revision \
          FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
@@ -522,6 +554,7 @@ async fn prepared_of(
     .bind(version)
     .fetch_all(&mut *conn)
     .await?;
+    let mut found = Vec::new();
     for (version, file, available, revision, registered, source, registered_source) in rows {
         if playscale_core::renditions::available(
             available,
@@ -534,10 +567,10 @@ async fn prepared_of(
                 .bind(file)
                 .fetch_one(&mut *conn)
                 .await?;
-            return Ok(Some(Bound { version, file }));
+            found.push(Bound { version, file });
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Within the client's height and bitrate limits, by probed facts.
@@ -761,27 +794,38 @@ pub async fn plan(
         None => None,
     };
     let pinned_prepared = pinned_source.is_some();
-    let Some(bound) = original_of(
+    // With a pinned rendition, a source pin names that rendition, not the
+    // original it renders.
+    let original_pin = pinned_source.as_deref().or(input
+        .source
+        .as_ref()
+        .filter(|_| !pinned_prepared)
+        .map(|s| s.file_id.as_str()));
+    let version_pin = input.version_id.as_deref().filter(|_| !pinned_prepared);
+    // Without an available original in scope, its revision-valid renditions
+    // may still serve; the original then only keys them.
+    let (bound, original_available) = match original_of(
         &mut conn,
         principal,
         &input.timeline_id,
-        input.version_id.as_deref().filter(|_| !pinned_prepared),
-        pinned_source
-            .as_deref()
-            .or(input.source.as_ref().map(|s| s.file_id.as_str())),
+        version_pin,
+        original_pin,
     )
     .await?
-    else {
-        return Ok(Json(blocked(&input, "source_unavailable")).into_response());
+    {
+        Some(bound) => (bound, true),
+        None => {
+            match any_original_of(&mut conn, &input.timeline_id, version_pin, original_pin).await? {
+                Some(bound) => (bound, false),
+                None => return Ok(Json(blocked(&input, "source_unavailable")).into_response()),
+            }
+        }
     };
-    let facts = file_facts(&mut conn, &bound.file.id).await?;
-    if !core::readable(principal, facts.as_ref()) {
-        return Err(Problem::not_found());
-    }
-    if input
-        .source
-        .as_ref()
-        .is_some_and(|s| s.file_revision != bound.file.revision)
+    if !pinned_prepared
+        && input
+            .source
+            .as_ref()
+            .is_some_and(|s| s.file_revision != bound.file.revision)
     {
         return Err(Problem::new(
             StatusCode::CONFLICT,
@@ -807,7 +851,8 @@ pub async fn plan(
         .into_iter()
         .flatten()
         .min();
-    let prepared = match prepared_of(
+    let mut prepared = Vec::new();
+    for p in prepared_of(
         &mut conn,
         &input.timeline_id,
         &bound.file.id,
@@ -816,20 +861,35 @@ pub async fn plan(
     .await?
     {
         // A rendition outside the caller's scope is not a candidate.
-        Some(p) if core::readable(principal, file_facts(&mut conn, &p.file.id).await?.as_ref()) => {
-            Some(p)
+        if core::readable(principal, file_facts(&mut conn, &p.file.id).await?.as_ref()) {
+            prepared.push(p);
         }
-        _ => None,
-    };
+    }
+    if let Some(pin) = input.source.as_ref().filter(|_| pinned_prepared) {
+        prepared.retain(|p| p.file.id == pin.file_id);
+        if prepared
+            .iter()
+            .any(|p| p.file.revision != pin.file_revision)
+        {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "source_revision_changed",
+                "The file changed; read the timeline again",
+            ));
+        }
+    }
     let source = core::SourceFacts {
-        available: bound.file.available,
+        available: original_available && bound.file.available,
         client_support: client_support(&bound.file, &input.client, audio),
         within_budget: fits_budget(&bound.file, limit, max_bitrate),
-        prepared: prepared.as_ref().map(|p| core::PreparedFacts {
-            file: p.file.id.clone(),
-            client_support: client_support(&p.file, &input.client, first_audio(&p.file)),
-            within_budget: fits_budget(&p.file, limit, max_bitrate),
-        }),
+        prepared: prepared
+            .iter()
+            .map(|p| core::PreparedFacts {
+                file: p.file.id.clone(),
+                client_support: client_support(&p.file, &input.client, first_audio(&p.file)),
+                within_budget: fits_budget(&p.file, limit, max_bitrate),
+            })
+            .collect(),
         transcodable: input.quality.hdr_policy != "reject_conversion"
             && delivery::live_transcodable(&bound.file, audio),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
@@ -849,20 +909,18 @@ pub async fn plan(
         pinned_prepared,
         failed: input.failed_candidate_ids.clone(),
     };
-    let route = match core::plan(&bound.file.id, &source, &request) {
-        core::Plan::Ready(route) => route,
-        core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
-    };
-    // A prepared plan pins the rendition and plays its default streams.
-    let (chosen, audio) = match (route, prepared) {
-        (Route::Prepared, Some(p)) => {
+    // A prepared plan pins the chosen rendition and plays its default streams.
+    let (route, chosen, audio) = match core::plan(&bound.file.id, &source, &request) {
+        core::Plan::Ready(route) => (route, bound, audio),
+        core::Plan::Prepared(i) => {
+            let p = prepared
+                .into_iter()
+                .nth(i)
+                .ok_or_else(|| Problem::internal("prepared plan without rendition"))?;
             let audio = first_audio(&p.file);
-            (p, audio)
+            (Route::Prepared, p, audio)
         }
-        (Route::Prepared, None) => {
-            return Err(Problem::internal("prepared plan without rendition"));
-        }
-        _ => (bound, audio),
+        core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
@@ -1221,6 +1279,16 @@ pub async fn change_delivery(
         key,
         digest: body.digest,
     };
+    // An acknowledged change replays even if its plan token expired since.
+    if let Some(view) = delivery::change_replay(&app, &id, &receipt).map_err(problem)? {
+        tx.commit().await?;
+        let mut response =
+            (StatusCode::ACCEPTED, Json(delivery_json(&view, &owner))).into_response();
+        response
+            .headers_mut()
+            .insert("idempotent-replayed", HeaderValue::from_static("true"));
+        return Ok(response);
+    }
     let (expected, position, selection) = match body.value {
         DeliveryChange::Seek {
             expected_generation,

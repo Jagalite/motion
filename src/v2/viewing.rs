@@ -493,6 +493,9 @@ pub async fn next_timeline(
     let mut values = Vec::new();
     if let Some((Some(group), Some(position))) = placed {
         let candidates: Vec<String> = sqlx::query_scalar(
+            // The group is one release (PR #4: order_groups.edition_id is the
+            // series release); its members are episode timelines of other
+            // works, so they are not constrained to the current edition row.
             "SELECT id FROM timelines WHERE order_group_id=? AND order_position>? ORDER BY order_position,id LIMIT 50",
         )
         .bind(&group)
@@ -574,7 +577,17 @@ pub async fn create_viewing(
     if access::idempotency(stored.as_ref().map(|s| &s.record), &body.digest, now())?
         == Idempotent::Replay
     {
-        return Ok(replayed(stored.expect("replay has a record")));
+        // The acknowledgement names a session: replay it only while the
+        // caller may still read and record into that session.
+        let stored = stored.expect("replay has a record");
+        let id = stored
+            .body
+            .as_ref()
+            .and_then(|b| b["id"].as_str())
+            .ok_or_else(|| Problem::internal("viewing receipt without a session"))?
+            .to_owned();
+        recordable(&mut tx, &principal, &id).await?;
+        return Ok(replayed(stored));
     }
     let (owner, duration) =
         open_delivery(&app, &input.delivery_id).ok_or_else(Problem::not_found)?;

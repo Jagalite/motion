@@ -75,9 +75,10 @@ pub struct SourceFacts {
     /// The conversion's output honors the client's height and bitrate limits
     /// (`conversion_fits`). A conversion never silently exceeds them.
     pub conversion_within_budget: bool,
-    /// A stored rendition of this original whose output and source revisions
-    /// are both still the registered ones (`renditions::available`).
-    pub prepared: Option<PreparedFacts>,
+    /// Stored renditions of this original whose output and source revisions
+    /// are both still the registered ones (`renditions::available`), in the
+    /// adapter's preference order (newest first).
+    pub prepared: Vec<PreparedFacts>,
 }
 
 /// Facts about one revision-valid prepared rendition.
@@ -118,7 +119,10 @@ pub struct Request {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan {
+    /// The original (byte ranges) or a live conversion of it.
     Ready(Route),
+    /// The prepared rendition at this index of `SourceFacts::prepared`.
+    Prepared(usize),
     Blocked(&'static str),
 }
 
@@ -130,42 +134,36 @@ pub enum Plan {
 /// Nothing here starts processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
-    if !source.available {
-        return Plan::Blocked("source_unavailable");
-    }
     let byte = request.range && !request.explicit_streams;
-    let candidates = [
-        Candidate {
-            original: true,
-            available: byte && !request.pinned_prepared && !failed(Route::Original, file_id),
-            support: source.client_support,
-            matches_recipe: false,
-            within_budget: source.within_budget,
-            can_process: source.transcodable,
-        },
-        Candidate {
-            original: false,
-            available: byte
-                && source
-                    .prepared
-                    .as_ref()
-                    .is_some_and(|p| !failed(Route::Prepared, &p.file)),
-            support: source
-                .prepared
-                .as_ref()
-                .map_or(Support::Unknown, |p| p.client_support),
-            matches_recipe: true,
-            within_budget: source.prepared.as_ref().is_some_and(|p| p.within_budget),
-            can_process: false,
-        },
-    ];
+    // An unavailable original rules out its own byte route and any live
+    // conversion of it, not a stored rendition that is still revision-valid.
+    let mut candidates = vec![Candidate {
+        original: true,
+        available: source.available
+            && byte
+            && !request.pinned_prepared
+            && !failed(Route::Original, file_id),
+        support: source.client_support,
+        matches_recipe: false,
+        within_budget: source.within_budget,
+        can_process: source.transcodable,
+    }];
+    candidates.extend(source.prepared.iter().map(|p| Candidate {
+        original: false,
+        available: byte && !failed(Route::Prepared, &p.file),
+        support: p.client_support,
+        matches_recipe: true,
+        within_budget: p.within_budget,
+        can_process: false,
+    }));
     match playback::decide(request.mode, &candidates, None) {
         playback::Decision::Play(0) => return Plan::Ready(Route::Original),
-        playback::Decision::Play(_) => return Plan::Ready(Route::Prepared),
+        playback::Decision::Play(i) => return Plan::Prepared(i - 1),
         _ => {}
     }
     match () {
         _ if request.pinned_prepared => Plan::Blocked("selected_version_unavailable"),
+        _ if !source.available => Plan::Blocked("source_unavailable"),
         _ if request.mode == Mode::Original => Plan::Blocked(if request.explicit_streams {
             "stream_selection_requires_conversion"
         } else {
@@ -338,7 +336,15 @@ mod tests {
             within_budget: true,
             transcodable: true,
             conversion_within_budget: true,
-            prepared: None,
+            prepared: vec![],
+        }
+    }
+    impl SourceFacts {
+        fn clone_offline(&self) -> Self {
+            Self {
+                available: false,
+                ..self.clone()
+            }
         }
     }
     fn request(mode: Mode) -> Request {
@@ -598,14 +604,14 @@ mod tests {
             within_budget: true,
         };
         let with = |original, p: Option<PreparedFacts>| SourceFacts {
-            prepared: p,
+            prepared: p.into_iter().collect(),
             ..source(original)
         };
         // Convert: a usable rendition beats a live conversion.
         let ready = with(Support::Supported, Some(prepared(Support::Unknown)));
         assert_eq!(
             plan("f", &ready, &request(Mode::Convert)),
-            Plan::Ready(Route::Prepared)
+            Plan::Prepared(0)
         );
         // Auto: the original first, then the rendition, then live.
         assert_eq!(
@@ -615,7 +621,7 @@ mod tests {
         let unsupported = with(Support::Unsupported, Some(prepared(Support::Supported)));
         assert_eq!(
             plan("f", &unsupported, &request(Mode::Auto)),
-            Plan::Ready(Route::Prepared)
+            Plan::Prepared(0)
         );
         // Strict Original never uses it.
         assert_eq!(
@@ -644,7 +650,7 @@ mod tests {
             pinned_prepared: true,
             ..request(Mode::Auto)
         };
-        assert_eq!(plan("f", &ready, &pinned), Plan::Ready(Route::Prepared));
+        assert_eq!(plan("f", &ready, &pinned), Plan::Prepared(0));
         assert_eq!(
             plan("f", &bad, &pinned),
             Plan::Blocked("selected_version_unavailable")
@@ -653,6 +659,37 @@ mod tests {
             plan("f", &with(Support::Supported, None), &pinned),
             Plan::Blocked("selected_version_unavailable")
         );
+        // An offline original does not hide a revision-valid rendition, but
+        // rules out its own byte route and any live conversion.
+        let offline = SourceFacts {
+            available: false,
+            ..ready.clone()
+        };
+        assert_eq!(plan("f", &offline, &request(Mode::Auto)), Plan::Prepared(0));
+        assert_eq!(
+            plan(
+                "f",
+                &with(Support::Supported, None).clone_offline(),
+                &request(Mode::Auto)
+            ),
+            Plan::Blocked("source_unavailable")
+        );
+        // Every revision-valid rendition reaches the decision: a newer one
+        // beyond the client's limit does not hide an older one within it.
+        let two = SourceFacts {
+            prepared: vec![
+                PreparedFacts {
+                    within_budget: false,
+                    ..prepared(Support::Supported)
+                },
+                PreparedFacts {
+                    file: "h".into(),
+                    ..prepared(Support::Supported)
+                },
+            ],
+            ..source(Support::Unsupported)
+        };
+        assert_eq!(plan("f", &two, &request(Mode::Convert)), Plan::Prepared(1));
     }
 
     #[test]

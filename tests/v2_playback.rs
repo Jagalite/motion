@@ -1151,9 +1151,31 @@ async fn revocation_and_source_changes_end_control_immediately() {
         d.body["id"].as_str().unwrap()
     );
     assert_eq!(f.get(&path, &auth).await.status, StatusCode::OK);
+    let create = json!({"delivery_id": d.body["id"], "expected_viewing_revision": "0"});
+    let session = f
+        .post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("revocation-viewing-01"),
+            create.clone(),
+        )
+        .await;
+    assert_eq!(session.status, StatusCode::CREATED, "{:?}", session.body);
 
     // Removing the library from the device's policy ends control and admission.
     f.policy(&device, &[], PLAYER, "\"r-2\"").await;
+    // An acknowledged creation no longer replays the session to this caller.
+    problem(
+        &f.post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("revocation-viewing-01"),
+            create,
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
     problem(
         &f.get(&path, &auth).await,
         StatusCode::NOT_FOUND,
