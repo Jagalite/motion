@@ -78,8 +78,11 @@ via the kyoto queue with rustup's pinned toolchains, because Homebrew's cargo
 1.99 earlier on PATH ignores `rust-toolchain.toml`): see the PR description
 for exact results. These checks have not yet run on GitHub-hosted runners.
 
-Correctness boundary: no production state, transition or adapter behavior
-changed. Upgrade ordering (verified backup before migration, refusal of unknown
+Correctness boundary: no production state or transition changed. The one
+adapter behavior change is the shutdown-signal registration above: a signal
+after serving starts now requests graceful shutdown instead of killing the
+process. That is OS-signal handling with no domain state, so it stays in
+`src/main.rs`, covered by its regression test. Upgrade ordering (verified backup before migration, refusal of unknown
 schema, receipts recorded once, restore-epoch rotation) stays in `src/db.rs`,
 `src/upgrade.rs` and `scripts/backup.py`; these checks exercise it end to end
 against a real released database rather than re-implementing it.
