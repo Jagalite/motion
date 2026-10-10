@@ -501,7 +501,6 @@ fn bounded_work_graph_checks_production_reducer() {
 }
 
 #[test]
-#[ignore = "fuzzing deferred; see the A06/A07 TODO doc"]
 fn seeded_work_sequences_cover_wider_units_and_owners() {
     let report = stateless::explore::fuzz(
         &Work {
@@ -526,7 +525,16 @@ fn seeded_work_sequences_cover_wider_units_and_owners() {
     .unwrap();
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
-    assert!(report.transitions > 100_000);
+    assert_eq!(
+        report.termination,
+        stateless::explore::FuzzTermination::CasesCompleted
+    );
+    assert_eq!(report.cases, 2000);
+    assert_eq!(report.transitions, 200000);
+    println!(
+        "Stateless work seeded sequences: seed {}; {} cases, {} transitions; {:?}",
+        report.seed, report.cases, report.transitions, report.termination
+    );
 }
 
 #[test]
