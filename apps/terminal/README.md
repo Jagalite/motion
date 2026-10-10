@@ -71,7 +71,7 @@ is not evidence that every operation is routed. This audit inspects
 | --- | --- | --- |
 | A08 identity/system | Health, capabilities, pairing, sessions, access tokens, devices/policies, profiles, scoped SSE; restricted legacy boundary, approved-origin CORS, per-principal limits, trusted ingress and desktop bootstrap. | Ingress capabilities distinguish implementation, configured enablement and unqualified deployment status. Qualify real ingress deployment separately. |
 | A08 content | Content-access issue/revoke and original-file GET/HEAD. | Delivery-generation and managed-download ticket integration depends on those resource services; original-file tests do not qualify HLS or delivery lifecycles. |
-| A08 presentation | Actual pinned Topcoat Tower service at the composition root; request-scoped facade traverses authorized v2 reads, preserves the original URI and genuine peer metadata, and bounds renders to eight concurrent requests and 15 seconds. Home, libraries, search, matches, jobs and diagnostics have real reads. | Timeline viewing/player, profile preferences, scan-backed sources still need their complete service bridges. Missing services render unavailable; continue-watching explicitly says unavailable. Qualify the real browser independently of router tests. |
+| A08 presentation | Actual pinned Topcoat Tower service at the composition root; request-scoped facade traverses authorized v2 reads, preserves the original URI and genuine peer metadata, and bounds renders to eight concurrent requests and 15 seconds. Home, libraries, search, item details (children, editions, timelines and versions), matches, jobs and diagnostics have real reads. | Timeline viewing/player, profile preferences, scan-backed sources still need their complete service bridges. Missing services render unavailable; continue-watching and item viewing history explicitly say unavailable, and item pages offer no Play link until the playback service is connected. Qualify the real browser independently of router tests. |
 | A08 other domains | Logical libraries/source registration; catalog item CRUD/search, editions, reviewed merge/split, timeline/version reads; metadata contributions, matching and artwork reads; collections/filters/playlists/queues; owned jobs and cancellation/retry; diagnostics. | Source relocation and scan demands, relationships and timeline/version creation, full file-track evidence, metadata refresh/upload/selection/markers, v2 viewing/delivery, preparation/schedules, offline/downloads, durable backup/import jobs. The reviewed contract remains the target, not a claim that every operation is routed. |
 | A10 CLI | Identity/device/profile commands, event tail, Rust `serve`, library/source creation, catalog search/show, jobs list/show/cancel/retry, diagnostics, typed scan requests and capability-gated token-free browser-player launch. | Real source-scan and playback workflows depend on v2 domain services. `server stop` has no reviewed lifecycle operation yet; no PID guessing or unrelated-process termination is used. |
 | A10 TUI | Overview, profiles, devices, events, libraries, catalog/search, scans, jobs/cancellation and diagnostics; selected browser-player launch is capability-gated. Unicode input focus, narrow-screen navigation, cancellation, bounded paging, event reset/re-query and stale-load rejection are tested. | An isolated real-server PTY check exercised overview, libraries, catalog, search, jobs and diagnostics; scans correctly returned the missing-endpoint error. Scan and playback completion require the services above; a typed command or screen is not backend completion. |
@@ -96,3 +96,54 @@ This remains a partial A08/A10 integration until the listed dependencies and qua
 At the requested stop/review/commit checkpoint, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, `go test -race ./...`, and all 23 UI bridge/playback JavaScript tests passed. The earlier focused Rust integration run passed 49 tests. A later workspace run passed 15 presentation tests, 26 server library tests, one shutdown test, 28 access tests nine catalog persistence tests and 14 catalog workflow tests before being stopped during further executable launches.
 
 The final focused Rust rerun (including the newly added replay/shared-metadata regressions) and extended real-server Go E2E test are **not qualified** at this checkpoint. The browser check reached real pairing and exposed the cookie-path bug; corrected cookie behavior still requires the extended E2E gate. No full-workstream or release-completion claim is made. Commands used Homebrew Rust/Cargo 1.99.0, Go 1.24.2 and Node 23.5.0; the repository's Rust 1.98 toolchain pin was not separately qualified. Owned test/discovery processes and the isolated fixture server were stopped; live settings and media were untouched.
+
+
+### Follow-up review
+
+The previously unqualified focused Rust checkpoint now passes all 53 tests:
+28 access, four libraries, eight catalog, seven metadata/matching and six
+organization tests. This includes the replay/shared-metadata regressions named
+above. `motion jobs retry JOB_ID` is implemented; Go race tests verify stable
+keys across transport retries, fresh keys for separate invocations, escaped IDs,
+and conflict reporting.
+
+Item detail pages now compose authorized item, child, edition, timeline and
+version reads. They distinguish unavailable viewing history from an unstarted
+title and suppress playback links until the player service exists. Each render
+is bounded to 200 children, 200 editions, 20 timelines and the API-bounded version
+sets; an additional page returns unavailable rather than silently truncating an
+aggregate. The existing 15-second render deadline also applies. Core access and
+identity policies still decide visibility and version availability. Presentation
+only maps their results; it neither writes viewing state nor substitutes default
+progress for missing service evidence.
+
+Final follow-up validation (2026-10-10):
+
+- `cargo test --locked --workspace --test access_api --test compose -j 2`:
+  30 real-router/SQLite tests and 15 presentation composition tests passed.
+  The new item regression checks hidden titles, children and versions, escaped
+  titles, missing-resource parity, read-only rendering and the timeline bound.
+  The retry regression asserts exact acknowledgements, revisions and receipt
+  counts after later worker progress, plus ownership and revocation enforcement.
+- `cargo clippy --locked --workspace --all-targets -j 2 -- -D warnings`,
+  `cargo fmt --all --check` and `git diff --check` passed.
+- `go test -race ./...` passed. The separately enabled real-server gate,
+  `MOTION_E2E_SERVER_BIN=$PWD/../../target/debug/playscale go test -race -count=1 -timeout 15m -run E2E -v .`,
+  also passed after the final rebuild. It checks pairing, real cookie-jar paths
+  for SSR and API access, profile denial, scoped events, conditional updates,
+  source/library operations, diagnostics and revocation. The qualified debug
+  executable SHA-256 is
+  `14e33fe7de657e29f13119ab3436a11a7819e3bb2d24f50286a2ed34817f4845`.
+- T3 browser DOM checks on an isolated generated-media fixture completed
+  browser pairing (operator approval via the API), library navigation and the
+  real item page. CSS loaded, the desktop page had no horizontal overflow, and
+  unavailable history/playback text appeared with no Play link. This browser
+  check preceded the final rebuild; final-source markup is covered by the
+  router tests above. Snapshot capture failed, and the preview host disconnected
+  during the mobile resize: no screenshot or mobile-layout qualification.
+
+The disposable servers were stopped. Existing settings, media and the original
+adapter worktrees were not changed. Validation used Homebrew Rust/Cargo 1.99.0;
+the repository's 1.98 pin and the remaining domain/deployment gaps still require
+separate qualification. No new Stateless exploration bound is claimed: core
+policies were unchanged and the new tests check their adapter enforcement.

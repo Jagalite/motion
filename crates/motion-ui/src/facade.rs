@@ -106,17 +106,25 @@ pub struct VersionView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineViewing {
+    pub position_ms: u64,
+    pub watched: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimelineView {
     pub id: String,
     pub edition: String,
     pub duration_ms: Option<u64>,
-    pub position_ms: u64,
-    pub watched: bool,
+    /// None means the viewing service is unavailable, not an unstarted title.
+    pub viewing: Option<TimelineViewing>,
     pub versions: Vec<VersionView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemView {
+    /// Service readiness, in addition to the caller's playback permission.
+    pub playback_available: bool,
     pub item: ItemCard,
     pub children: Vec<ItemCard>,
     pub timelines: Vec<TimelineView>,

@@ -2618,3 +2618,125 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
     let revoked = f.call("POST", path, None, &headers).await;
     assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let other_root = f._dir.path().join("private");
+    std::fs::create_dir(&other_root).unwrap();
+    let other = db::add_library(&f.app.db, "Private", &other_root)
+        .await
+        .unwrap()
+        .id;
+    for (id, title, library) in [
+        ("visible", "Film <script>alert(1)</script>", &f.library),
+        ("hidden", "Secret title", &other),
+        ("public-child", "Public season", &f.library),
+    ] {
+        sqlx::query("INSERT INTO items(id,title,kind) VALUES (?,?,'video')")
+            .bind(id)
+            .bind(title)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_origins(item_id,title) VALUES (?,?)")
+            .bind(id)
+            .bind(title)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES (?,?,'Original')")
+            .bind(id)
+            .bind(id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO timelines(id,edition_id,duration_ms) VALUES (?,?,90000)")
+            .bind(id)
+            .bind(id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES (?,?,?,?,'hash','fp',1)").bind(id).bind(id).bind(library).bind(format!("{id}.mp4")).execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES (?,?,'Visible original','original','declared')").bind(id).bind(id).execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,1,?,'hash')").bind(id).bind(id).execute(&f.app.db).await.unwrap();
+    }
+    sqlx::query("INSERT INTO item_structure(item_id,media_type,parent_id,number) VALUES ('visible','series',NULL,NULL),('public-child','season','visible',1),('hidden','season','visible',2)")
+        .execute(&f.app.db).await.unwrap();
+    // Same title, private occurrence: the aggregate must not expose its version.
+    sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES ('private-file','visible',?,'private.mp4','private-hash','fp',1)").bind(&other).execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES ('private-version','visible','Secret version','original','declared')").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES ('private-version',1,'private-file','private-hash')").execute(&f.app.db).await.unwrap();
+    let (device, token) = f
+        .pair(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    f.grant_library(&device, &["catalog:read", "playback:request"])
+        .await;
+    let auth = bearer(&token);
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    for (path, expected) in [
+        ("/item/visible", StatusCode::OK),
+        ("/item/hidden", StatusCode::NOT_FOUND),
+        ("/item/missing", StatusCode::NOT_FOUND),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(f.request("GET", path, None, &[("authorization", &auth)]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !html.contains("Secret title") && !html.contains("Secret version"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(!html.contains(&token));
+        assert!(!html.contains(other_root.to_str().unwrap()));
+        if expected == StatusCode::OK {
+            assert!(html.contains("Film &lt;script&gt;"), "{html}");
+            assert!(html.contains("Visible original"), "{html}");
+            assert!(html.contains("Public season"), "{html}");
+            assert!(html.contains("Viewing history is unavailable."), "{html}");
+            assert!(html.contains("Playback is unavailable."), "{html}");
+            assert!(!html.contains("Not started."));
+            assert!(!html.contains("href=\"/play/"));
+        }
+    }
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "rendering must not write domain state");
+    // Bounded aggregate reads fail explicitly instead of displaying an
+    // incomplete timeline set as if it were complete.
+    for n in 0..20 {
+        sqlx::query("INSERT INTO timelines(id,edition_id) VALUES (?,'visible')")
+            .bind(format!("extra-{n:02}"))
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let response = app
+        .oneshot(f.request("GET", "/item/visible", None, &[("authorization", &auth)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

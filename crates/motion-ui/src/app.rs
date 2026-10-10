@@ -283,7 +283,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let id = path_param::<ItemId>(cx);
     let view_model = facade(cx).0.item(who, id).await.map_err(ui_error)?;
-    let can_play = who.can("playback:request");
+    let can_play = who.can("playback:request") && view_model.playback_available;
     Ok(view! {
         <h1>(view_model.item.title.as_str())</h1>
         <p class="item-meta">
@@ -293,22 +293,29 @@ async fn item(cx: &Cx) -> Result<impl View> {
         if !view_model.children.is_empty() {
             item_grid(items: view_model.children, label: "Entries")
         }
+        if !view_model.playback_available {
+            <p class="muted">"Playback is unavailable."</p>
+        }
         for timeline in view_model.timelines {
             <section class="timeline" aria-labelledby=(format!("tl-{}", timeline.id))>
                 <h2 id=(format!("tl-{}", timeline.id))>
                     (timeline.edition.as_str())
                     if let Some(duration) = timeline.duration_ms { " · " (clock(duration)) }
                 </h2>
-                if timeline.watched {
-                    <p>"Watched."</p>
-                } else if timeline.position_ms > 0 {
-                    <p>"Stopped at " (clock(timeline.position_ms)) "."</p>
+                if let Some(viewing) = &timeline.viewing {
+                    if viewing.watched {
+                        <p>"Watched."</p>
+                    } else if viewing.position_ms > 0 {
+                        <p>"Stopped at " (clock(viewing.position_ms)) "."</p>
+                    } else {
+                        <p>"Not started."</p>
+                    }
                 } else {
-                    <p>"Not started."</p>
+                    <p>"Viewing history is unavailable."</p>
                 }
                 if can_play {
                     <p><a class="button primary" href=(href!(play, TimelineId(timeline.id.as_str())))>
-                        if timeline.position_ms > 0 && !timeline.watched { "Resume" } else { "Play" }
+                        if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) { "Resume" } else { "Play" }
                     </a></p>
                 }
                 <h3>"Versions"</h3>
