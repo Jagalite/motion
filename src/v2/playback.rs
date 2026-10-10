@@ -468,35 +468,55 @@ async fn original_of(
     Ok(None)
 }
 
-/// The first original bound to the timeline regardless of availability or
-/// scope: only a key for its renditions, never itself delivered.
-async fn any_original_of(
+/// Every original bound to the timeline regardless of availability or
+/// scope, in version order: only keys for their renditions, never delivered
+/// or disclosed themselves.
+async fn originals_of(
     conn: &mut sqlx::SqliteConnection,
     timeline: &str,
     version: Option<&str>,
     file: Option<&str>,
-) -> Result<Option<Bound>, Problem> {
-    let row: Option<(String, String)> = sqlx::query_as(
+) -> Result<Vec<Bound>, Problem> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 \
-         AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) ORDER BY v.id,b.file_id LIMIT 1",
+         AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) ORDER BY v.id,b.file_id",
     )
     .bind(timeline)
     .bind(version)
     .bind(version)
     .bind(file)
     .bind(file)
-    .fetch_optional(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
-    let Some((version, file)) = row else {
-        return Ok(None);
-    };
-    let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=?")
-        .bind(file)
-        .fetch_one(conn)
-        .await?;
-    Ok(Some(Bound { version, file }))
+    let mut found = Vec::with_capacity(rows.len());
+    for (version, file) in rows {
+        let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=?")
+            .bind(file)
+            .fetch_one(&mut *conn)
+            .await?;
+        found.push(Bound { version, file });
+    }
+    Ok(found)
+}
+
+/// Revision-valid renditions of `original` the principal may read, newest first.
+async fn readable_prepared(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    timeline: &str,
+    original: &str,
+    version: Option<&str>,
+) -> Result<Vec<Bound>, Problem> {
+    let mut readable = Vec::new();
+    for p in prepared_of(conn, timeline, original, version).await? {
+        // A rendition outside the caller's scope is not a candidate.
+        if core::readable(principal, file_facts(conn, &p.file.id).await?.as_ref()) {
+            readable.push(p);
+        }
+    }
+    Ok(readable)
 }
 
 /// Whether the version still binds the file to the timeline.
@@ -546,7 +566,7 @@ async fn prepared_of(
          JOIN media_files s ON s.id=r.source_file_id \
          WHERE v.timeline_id=? AND v.origin='generated' AND f.generated=1 AND r.source_file_id=? \
          AND (? IS NULL OR v.id=?) AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) \
-         ORDER BY r.updated_at DESC,v.id LIMIT 16",
+         ORDER BY r.updated_at DESC,v.id",
     )
     .bind(timeline)
     .bind(original)
@@ -804,7 +824,8 @@ pub async fn plan(
     let version_pin = input.version_id.as_deref().filter(|_| !pinned_prepared);
     // Without an available original in scope, its revision-valid renditions
     // may still serve; the original then only keys them.
-    let (bound, original_available) = match original_of(
+    let rendition_pin = input.version_id.as_deref().filter(|_| pinned_prepared);
+    let (bound, original_available, found) = match original_of(
         &mut conn,
         principal,
         &input.timeline_id,
@@ -813,15 +834,38 @@ pub async fn plan(
     )
     .await?
     {
-        Some(bound) => (bound, true),
+        Some(bound) => (bound, true, None),
+        // A client pin to an original that is not available in scope is never
+        // compared or disclosed: it is simply unavailable.
+        None if input.source.is_some() && !pinned_prepared => {
+            return Ok(Json(blocked(&input, "source_unavailable")).into_response());
+        }
         None => {
-            match any_original_of(&mut conn, &input.timeline_id, version_pin, original_pin).await? {
-                Some(bound) => (bound, false),
+            let mut keyed = None;
+            for original in
+                originals_of(&mut conn, &input.timeline_id, version_pin, original_pin).await?
+            {
+                let renditions = readable_prepared(
+                    &mut conn,
+                    principal,
+                    &input.timeline_id,
+                    &original.file.id,
+                    rendition_pin,
+                )
+                .await?;
+                if !renditions.is_empty() {
+                    keyed = Some((original, renditions));
+                    break;
+                }
+            }
+            match keyed {
+                Some((original, renditions)) => (original, false, Some(renditions)),
                 None => return Ok(Json(blocked(&input, "source_unavailable")).into_response()),
             }
         }
     };
-    if !pinned_prepared
+    if original_available
+        && !pinned_prepared
         && input
             .source
             .as_ref()
@@ -851,20 +895,19 @@ pub async fn plan(
         .into_iter()
         .flatten()
         .min();
-    let mut prepared = Vec::new();
-    for p in prepared_of(
-        &mut conn,
-        &input.timeline_id,
-        &bound.file.id,
-        input.version_id.as_deref().filter(|_| pinned_prepared),
-    )
-    .await?
-    {
-        // A rendition outside the caller's scope is not a candidate.
-        if core::readable(principal, file_facts(&mut conn, &p.file.id).await?.as_ref()) {
-            prepared.push(p);
+    let mut prepared = match found {
+        Some(renditions) => renditions,
+        None => {
+            readable_prepared(
+                &mut conn,
+                principal,
+                &input.timeline_id,
+                &bound.file.id,
+                rendition_pin,
+            )
+            .await?
         }
-    }
+    };
     if let Some(pin) = input.source.as_ref().filter(|_| pinned_prepared) {
         prepared.retain(|p| p.file.id == pin.file_id);
         if prepared
