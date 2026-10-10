@@ -782,6 +782,51 @@ async fn copy_keyframe(
     keyframes_us.into_iter().find(|us| us / 1000 == start)
 }
 
+/// Largest init segment read for its video track.
+const MAX_INIT_BYTES: u64 = 1024 * 1024;
+
+/// Whether a published segment's first video sample is an IDR access unit.
+/// Unreadable or unexpected output is not independent. The video track is read
+/// from the generation's init segment once.
+async fn segment_independent(
+    directory: &FsPath,
+    index: u32,
+    video: &mut Option<crate::fmp4::VideoTrack>,
+) -> bool {
+    let directory = directory.to_owned();
+    let known = *video;
+    let checked = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let track = match known {
+            Some(track) => track,
+            None => {
+                let mut init = Vec::new();
+                std::fs::File::open(directory.join("init.mp4"))
+                    .ok()?
+                    .take(MAX_INIT_BYTES + 1)
+                    .read_to_end(&mut init)
+                    .ok()?;
+                if init.len() as u64 > MAX_INIT_BYTES {
+                    return None;
+                }
+                crate::fmp4::video_track(&init)?
+            }
+        };
+        let mut segment = std::fs::File::open(directory.join(format!("seg{index}.m4s"))).ok()?;
+        Some((track, crate::fmp4::starts_with_idr(track, &mut segment)?))
+    })
+    .await
+    .ok()
+    .flatten();
+    match checked {
+        Some((track, independent)) => {
+            *video = Some(track);
+            independent
+        }
+        None => false,
+    }
+}
+
 /// Video start time of segment 0, in microseconds. The init fragment and
 /// segment are piped to FFprobe, so no path is interpreted by it.
 async fn segment_zero_start(app: &App, directory: &FsPath) -> Option<u64> {
@@ -829,6 +874,7 @@ async fn observe(
     generation: u64,
     directory: &FsPath,
     reported: &mut u32,
+    video: &mut Option<crate::fmp4::VideoTrack>,
     start_ms: u64,
     operation: Operation,
     copy_start: Option<u64>,
@@ -867,6 +913,13 @@ async fn observe(
         };
         if metadata.len() > MAX_SEGMENT_BYTES {
             tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), "segment exceeds the size cap");
+            let _ = apply(app, session, Input::Failed { generation });
+            return false;
+        }
+        // The playlist declares independent segments: each must begin with an
+        // IDR. A copied source's keyframe may be an open-GOP recovery point.
+        if !segment_independent(directory, segment.index, video).await {
+            tracing::warn!(delivery=%session.id, generation, index = segment.index, "segment does not begin with an IDR");
             let _ = apply(app, session, Input::Failed { generation });
             return false;
         }
@@ -1129,6 +1182,7 @@ async fn run_generation(
         });
     }
     let mut reported = 0u32;
+    let mut video = None;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     // Liveness, decided by the core deadline policy. Its clock advances only
     // while the encoder is allowed to run: a paced (paused) encoder is not stalled.
@@ -1190,6 +1244,7 @@ async fn run_generation(
                             generation,
                             &directory,
                             &mut reported,
+                            &mut video,
                             start_ms,
                             operation,
                             copy_start,
@@ -1234,6 +1289,7 @@ async fn run_generation(
                     generation,
                     &directory,
                     &mut reported,
+                    &mut video,
                     start_ms,
                     operation,
                     copy_start,

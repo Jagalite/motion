@@ -1655,3 +1655,93 @@ async fn completed_generation_survives_a_slow_encoder_exit() {
     assert_eq!(body["active"]["complete"], true, "{body}");
     f.stop.cancel();
 }
+
+/// An open-GOP source's later keyframes are recovery points, not IDRs: a copied
+/// segment cut there is not independent, so the generation fails rather than
+/// publishing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_route_refuses_open_gop_segments() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_options(Default::default(), false, true).await;
+    // The same encode with closed and open GOPs: the closed one is the control
+    // that the fixture can publish every copied segment.
+    for (name, gop) in [("closed.mkv", "open-gop=0"), ("open.mkv", "open-gop=1")] {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "40",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-profile:v",
+                "main",
+                "-g",
+                "48",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+                "-x264-params",
+                gop,
+                "-c:a",
+                "aac",
+            ])
+            .arg(f.dir.path().join("media").join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    f.scan().await;
+    let mut ids = Vec::new();
+    for name in ["closed.mkv", "open.mkv"] {
+        let (file_id, revision): (String, String) =
+            sqlx::query_as("SELECT id,revision FROM media_files WHERE relative_path=?")
+                .bind(name)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap();
+        let (status, created) = f
+            .json(
+                "POST",
+                "/api/v1/deliveries",
+                Some(json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":0,"operation":"remux"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        ids.push(created["id"].as_str().unwrap().to_owned());
+    }
+    // Every closed-GOP segment is published, through completion.
+    let closed = f
+        .until(&ids[0], |v| {
+            v["active"]["complete"] == true || v["status"] == "failed"
+        })
+        .await;
+    assert_eq!(closed["status"], "ready", "{closed}");
+    assert_eq!(closed["active"]["complete"], true, "{closed}");
+    // The open-GOP source's segment 0 begins at its first frame, an IDR; its
+    // later cuts are recovery points, so the generation fails.
+    let failed = f.until(&ids[1], |v| v["status"] == "failed").await;
+    assert!(failed["active"].is_null(), "{failed}");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    f.stop.cancel();
+}
