@@ -38,7 +38,7 @@ func scanCmd(env *Env) *cobra.Command {
 	return cmd
 }
 func jobsCmd(env *Env) *cobra.Command {
-	cmd := &cobra.Command{Use: "jobs", Short: "Inspect and cancel authorized durable jobs"}
+	cmd := &cobra.Command{Use: "jobs", Short: "Inspect, cancel and retry authorized durable jobs"}
 	var cursor string
 	var limit int
 	printJob := func(j api.Job) error {
@@ -79,7 +79,17 @@ func jobsCmd(env *Env) *cobra.Command {
 			return printJob(r.Value)
 		})(cmd, args)
 	}}
-	cmd.AddCommand(list, show, cancel)
+	retry := &cobra.Command{Use: "retry JOB_ID", Short: "Retry a failed or cancelled job", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		key := api.NewIdempotencyKey()
+		return run(env, func(ctx context.Context, c *Conn) error {
+			r, err := c.RetryJob(ctx, args[0], key)
+			if err != nil {
+				return err
+			}
+			return printJob(r.Value)
+		})(cmd, args)
+	}}
+	cmd.AddCommand(list, show, cancel, retry)
 	return cmd
 }
 func diagnosticsCmd(env *Env) *cobra.Command {

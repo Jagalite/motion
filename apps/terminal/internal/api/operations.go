@@ -82,6 +82,11 @@ func (c *Client) CancelJob(ctx context.Context, id, key string) (Tagged[Job], er
 	h, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/jobs/" + esc(id) + "/cancel", auth: true, idempotencyKey: key}, &v)
 	return Tagged[Job]{Value: v, ETag: h.Get("ETag")}, err
 }
+func (c *Client) RetryJob(ctx context.Context, id, key string) (Tagged[Job], error) {
+	var v Job
+	h, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/jobs/" + esc(id) + "/retry", auth: true, idempotencyKey: key}, &v)
+	return Tagged[Job]{Value: v, ETag: h.Get("ETag")}, err
+}
 func (c *Client) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	var v Diagnostics
 	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/diagnostics", auth: true}, &v)
