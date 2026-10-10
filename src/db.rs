@@ -105,6 +105,8 @@ pub struct JobRow {
     pub incomplete_directories: i64,
     /// Source binding revision observed by the running attempt.
     pub binding_revision: Option<i64>,
+    /// Freshness barrier observed when traversal started.
+    pub started_barrier: Option<i64>,
 }
 impl JobRow {
     pub fn state(&self) -> anyhow::Result<Job> {
@@ -410,19 +412,41 @@ pub async fn cancel(app: &App, id: &str) -> anyhow::Result<JobRow> {
     get_job(&app.db, id).await
 }
 pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
-    let rows: Vec<JobRow> =
-        sqlx::query_as("SELECT * FROM jobs WHERE phase IN ('running','cancelling')")
-            .fetch_all(db)
-            .await?;
-    let mut tx = db.begin().await?;
+    let rows: Vec<JobRow> = sqlx::query_as(
+        "SELECT * FROM jobs WHERE phase IN ('running','cancelling') ORDER BY created_at,id",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut tx = begin_write(db).await?;
     for row in rows {
-        let (next, _) = transition(&row.state()?, Input::Recover);
-        sqlx::query("UPDATE jobs SET phase=? WHERE id=?")
+        let (mut next, _) = transition(&row.state()?, Input::Recover);
+        if next.phase == Phase::Queued {
+            // A queued follow-up already exists: it absorbs the interrupted
+            // attempt's mode, and the interrupted attempt is cancelled rather
+            // than becoming a second queued attempt for the source.
+            let queued: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE library_id=? AND phase='queued' AND id<>?",
+            )
+            .bind(&row.library_id)
+            .bind(&row.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(queued) = queued {
+                sqlx::query("UPDATE jobs SET full_scan=max(full_scan,?) WHERE id=?")
+                    .bind(row.full_scan)
+                    .bind(&queued)
+                    .execute(&mut *tx)
+                    .await?;
+                next = transition(&next, Input::Cancel).0;
+            }
+        }
+        sqlx::query("UPDATE jobs SET phase=?,started_barrier=NULL WHERE id=?")
             .bind(phase_name(next.phase))
             .bind(row.id)
             .execute(&mut *tx)
             .await?;
     }
+    crate::scans::reconcile_all(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }

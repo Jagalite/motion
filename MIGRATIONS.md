@@ -17,6 +17,7 @@ applying any pending migration to an existing database.
 | 0015 | `0015_timelines_versions.sql` | A01/A02 | timelines, media versions, version bindings; timeline FKs |
 | 0016 | `0016_occurrence_index.sql` | A01/A02 | index for content-revision occurrence lookup |
 | 0017 | `0017_library_sources.sql` | A02/A03 | logical libraries over storage sources, exclusions, scan binding revision |
+| 0018 | `0018_scan_demands.sql` | A03 | scan requests/demands, freshness barrier, one running + one queued attempt |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

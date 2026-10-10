@@ -653,6 +653,7 @@ async fn finish(
         .bind(&job.id)
         .execute(&mut *tx)
         .await?;
+    crate::scans::after_attempt(&mut tx, &job.id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -674,7 +675,7 @@ pub async fn worker(app: App, shutdown: CancellationToken) -> anyhow::Result<()>
                 let runs = matches!(effects.as_slice(), [Effect::Run { .. }]);
                 // The attempt records the source binding it observes; a rebind
                 // before publication fences it.
-                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=?,binding_revision=(SELECT binding_revision FROM libraries WHERE id=jobs.library_id) WHERE id=?")
+                sqlx::query("UPDATE jobs SET phase=?,attempt=?,error=?,binding_revision=(SELECT binding_revision FROM libraries WHERE id=jobs.library_id),started_barrier=(SELECT scan_barrier FROM libraries WHERE id=jobs.library_id) WHERE id=?")
                     .bind(db::phase_name(next.phase))
                     .bind(next.attempt)
                     .bind((!runs).then_some("job attempt limit reached"))
