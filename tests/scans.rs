@@ -350,3 +350,50 @@ async fn recovery_keeps_direct_ownership_when_merging_attempts() {
         ["cancelled", "queued"]
     );
 }
+
+#[tokio::test]
+async fn a_filesystem_change_requests_a_scan_that_publishes_it() {
+    let f = Fixture::new().await;
+    let source = f.source("watched").await;
+    f.library(std::slice::from_ref(&source)).await;
+    let stop = CancellationToken::new();
+    let scanner = tokio::spawn(scan::worker(f.app.clone(), stop.clone()));
+    let watcher = tokio::spawn(playscale::watch::worker(
+        f.app.clone(),
+        stop.clone(),
+        playscale_core::watch::Debounce {
+            quiet_ms: 300,
+            max_delay_ms: 3_000,
+        },
+    ));
+    // Native watchers start asynchronously; give the first sync a moment.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let root = f.root("watched");
+    std::fs::write(root.join(".DS_Store"), b"ignored").unwrap();
+    std::fs::write(root.join("new.mkv"), b"new film").unwrap();
+    let db = f.app.db.clone();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let published: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_files WHERE relative_path='new.mkv'",
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if published == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the change was scanned and published");
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(requests >= 1, "the watcher went through the demand rules");
+    stop.cancel();
+    scanner.await.unwrap().unwrap();
+    watcher.await.unwrap().unwrap();
+}

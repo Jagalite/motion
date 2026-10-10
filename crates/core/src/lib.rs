@@ -27,4 +27,5 @@ pub mod scan;
 pub mod search;
 pub mod sources;
 pub mod viewing;
+pub mod watch;
 pub mod work;

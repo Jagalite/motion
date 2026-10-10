@@ -183,6 +183,7 @@ async fn run() -> anyhow::Result<()> {
             playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
             playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
             playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
+            playscale::watch::worker(worker_app.clone(), worker_stop.clone(), Default::default()),
             playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
         )
         .map(|_| ());
