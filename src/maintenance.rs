@@ -353,6 +353,10 @@ mod tests {
                 dir.path().join("cache"),
                 Default::default(),
             )),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
         };
         let (entered, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let (release, blocked) = std::sync::mpsc::channel();

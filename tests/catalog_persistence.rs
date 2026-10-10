@@ -28,6 +28,10 @@ fn app(dir: &Path, db: SqlitePool) -> App {
             dir.join("cache"),
             Default::default(),
         )),
+        access: Arc::new(playscale::v2::Runtime::new(
+            playscale_core::access::AccessMode::TrustedHousehold,
+            playscale::v2::auth::random_key(),
+        )),
     }
 }
 
@@ -148,6 +152,23 @@ async fn upgrade_backs_up_preserves_ids_and_attributes_progress_without_guessing
             ),
         ]
     );
+    // 0015 backfill: one timeline per edition (same ID), one declared version
+    // per (edition, revision), every binding inside its file's edition.
+    let structure: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM timelines WHERE id=edition_id),(SELECT count(*) FROM editions),(SELECT count(*) FROM media_versions WHERE equivalence='declared'),(SELECT count(*) FROM version_edition_mismatch)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(structure, (3, 3, 3, 0));
+    // 0017: each legacy root is one source and one mixed library, same ID.
+    let paired: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM catalog_libraries c JOIN library_sources s ON s.library_id=c.id AND s.source_id=c.id WHERE c.id='lib' AND c.kind='mixed'),(SELECT count(*) FROM sources)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(paired, (1, 1));
     let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM progress")
         .fetch_one(&pool)
         .await
@@ -267,8 +288,43 @@ async fn catalog_fixture() -> (tempfile::TempDir, App) {
     ] {
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
+    backfill_structure(&pool).await;
     let app = app(dir.path(), pool);
     (dir, app)
+}
+
+/// Raw-SQL fixtures bypass the catalog writers; give them the same default
+/// timelines and per-(edition, revision) versions migration 0015 creates.
+async fn backfill_structure(db: &SqlitePool) {
+    for sql in [
+        "INSERT INTO timelines (id,edition_id) SELECT id,id FROM editions WHERE id NOT IN (SELECT id FROM timelines)",
+        "INSERT INTO media_versions (id,timeline_id,origin,equivalence) SELECT min(f.id),f.edition_id,'original','declared' FROM media_files f WHERE NOT EXISTS (SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id WHERE v.timeline_id=f.edition_id AND b.file_revision=f.revision) GROUP BY f.edition_id,f.revision",
+        "INSERT INTO version_files (version_id,part,file_id,file_revision) SELECT v.id,1,f.id,f.revision FROM media_versions v JOIN media_files f ON f.id=v.id WHERE v.id NOT IN (SELECT version_id FROM version_files)",
+    ] {
+        sqlx::query(sql).execute(db).await.unwrap();
+    }
+}
+
+/// Aggregates compare as structure, not storage order.
+fn normalized(mut catalog: BTreeMap<String, Aggregate>) -> BTreeMap<String, Aggregate> {
+    for aggregate in catalog.values_mut() {
+        aggregate.editions.sort_by(|a, b| a.id.cmp(&b.id));
+        for edition in &mut aggregate.editions {
+            edition.timelines.sort_by(|a, b| a.id.cmp(&b.id));
+            for timeline in &mut edition.timelines {
+                timeline.versions.sort_by(|a, b| a.id.cmp(&b.id));
+            }
+        }
+    }
+    catalog
+}
+
+async fn assert_consistent(db: &SqlitePool) {
+    let mismatched: i64 = sqlx::query_scalar("SELECT count(*) FROM version_edition_mismatch")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    assert_eq!(mismatched, 0);
 }
 
 fn expected(snapshot: &BTreeMap<String, Aggregate>) -> BTreeMap<String, u64> {
@@ -296,7 +352,12 @@ async fn merge_sql_matches_core_application_and_is_fenced() {
     let mut reference = before.clone();
     identity::apply_merge(&mut reference, &plan);
     let after = snapshot(&app.db, &["film", "dup"]).await;
-    assert_eq!(after, reference, "SQL application equals core reference");
+    assert_eq!(
+        normalized(after.clone()),
+        normalized(reference),
+        "SQL application equals core reference"
+    );
+    assert_consistent(&app.db).await;
     assert_eq!(
         after["film"].work.revision,
         before["film"].work.revision + 1
@@ -431,7 +492,12 @@ async fn split_sql_matches_core_application_and_replay_is_rejected() {
     let mut reference = before.clone();
     identity::apply_split(&mut reference, &plan);
     let after = snapshot(&app.db, &["dup", plan.new_item.as_str()]).await;
-    assert_eq!(after, reference, "SQL application equals core reference");
+    assert_eq!(
+        normalized(after.clone()),
+        normalized(reference),
+        "SQL application equals core reference"
+    );
+    assert_consistent(&app.db).await;
     let (moved, rendition_item): (String, String) = sqlx::query_as(
         "SELECT (SELECT e.item_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE f.id='fd3'),(SELECT item_id FROM renditions WHERE id='rend')",
     )
@@ -458,7 +524,7 @@ async fn split_sql_matches_core_application_and_replay_is_rejected() {
 async fn concurrent_commits_over_one_target_apply_exactly_once() {
     let (_dir, app) = catalog_fixture().await;
     let before = snapshot(&app.db, &["film", "dup", "single"]).await;
-    let mut tasks = Vec::new();
+    let mut plans = Vec::new();
     for source in ["dup", "single"] {
         let plan = curation::preview_merge(
             &app.db,
@@ -473,14 +539,86 @@ async fn concurrent_commits_over_one_target_apply_exactly_once() {
         )
         .await
         .unwrap();
-        let app = app.clone();
-        tasks.push(tokio::spawn(async move {
-            curation::commit_merge(&app, &plan).await.is_ok()
-        }));
+        plans.push(plan);
     }
+    // Both previews must observe the same revision before either writer starts.
+    // Otherwise the first task can finish while the second preview is reading.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(plans.len()));
+    let tasks: Vec<_> = plans
+        .into_iter()
+        .map(|plan| {
+            let app = app.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                curation::commit_merge(&app, &plan).await
+            })
+        })
+        .collect();
     let mut outcomes = Vec::new();
     for task in tasks {
         outcomes.push(task.await.unwrap());
     }
-    assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{outcomes:?}");
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(|error| matches!(
+                error,
+                curation::CurationError::Rejected(IdentityError::StaleRevision(_))
+            )),
+        "losing writer must be fenced by revision: {outcomes:?}"
+    );
+    assert_consistent(&app.db).await;
+}
+
+#[tokio::test]
+async fn whole_timeline_split_matches_core_application() {
+    let (_dir, app) = catalog_fixture().await;
+    // A second timeline (e.g. an alternate ordering) in film's Theatrical edition.
+    for sql in [
+        "INSERT INTO timelines (id,edition_id) VALUES ('cut-a-alt','cut-a')",
+        "INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json) VALUES ('fx','cut-a','lib','alt.mkv','rx','s',1,'[]'),('fx-copy','cut-a','lib','copy/alt.mkv','rx','s',1,'[]')",
+        "INSERT INTO media_versions (id,timeline_id,origin,equivalence) VALUES ('fx','cut-a-alt','original','declared')",
+        "INSERT INTO version_files (version_id,part,file_id,file_revision) VALUES ('fx',1,'fx','rx')",
+    ] {
+        sqlx::query(sql).execute(&app.db).await.unwrap();
+    }
+    let before = snapshot(&app.db, &["film"]).await;
+    let plan = curation::preview_split(
+        &app.db,
+        &SplitRequest {
+            item: "film".into(),
+            versions: vec!["fx".into()],
+            new_title: "Alternate".into(),
+            expected_revision: before["film"].work.revision,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        plan.moves.as_slice(),
+        [identity::SplitMove::Timelines { timelines, .. }] if timelines == &["cut-a-alt".to_string()]
+    ));
+    curation::commit_split(&app, &plan).await.unwrap();
+    let mut reference = before.clone();
+    identity::apply_split(&mut reference, &plan);
+    let after = snapshot(&app.db, &["film", plan.new_item.as_str()]).await;
+    assert_eq!(normalized(after), normalized(reference));
+    assert_consistent(&app.db).await;
+    // The copy of the moved content follows it; the other cut's files stay.
+    let editions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,edition_id FROM media_files WHERE id IN ('fa','fx','fx-copy') ORDER BY id",
+    )
+    .fetch_all(&app.db)
+    .await
+    .unwrap();
+    assert_eq!(editions[0].1, "cut-a");
+    assert_ne!(editions[1].1, "cut-a");
+    assert_eq!(editions[1].1, editions[2].1);
 }

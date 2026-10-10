@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "recorded_at": "2026-10-10T04:25:56.482Z",
+  "binary_sha256": "336076b9b929ed08c6dcb4325d9658abeaad11e111cc05502f8043e03a97be45",
+  "contract_digest": "sha256:cd4100be3f80c4172e9b6af729b8d3211c363ee5cdae3949b0e4fe7e15a3cfa0",
+  "checks": {
+    "private_readiness_matches_live_identity": true,
+    "real_bootstrap_is_one_use": true,
+    "real_topcoat_and_hashed_assets_preserve_api_boundary": true,
+    "exclusive_lock_preserves_existing_server": true,
+    "shutdown_releases_lock_and_restart_changes_epoch": true
+  },
+  "scope": "Real server bootstrap, exclusive data lock and child ownership in a disposable data directory",
+  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-owned-server-Nj60tr"
+}

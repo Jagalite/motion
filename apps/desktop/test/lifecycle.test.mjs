@@ -1,0 +1,50 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {closeGate, attachOwnedServer} from '../src/lifecycle.mjs';
+const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; };
+test('repeated close requests cannot bypass pending persistence', async () => {
+  const saved = deferred();
+  let blocked = 0, preparations = 0, finished = 0;
+  const event = {preventDefault() { blocked++; }};
+  const close = closeGate({prepare: () => { preparations++; return saved.promise; }, finish: () => { finished++; close(event); }, failed: assert.fail});
+  const pending = close(event);
+  assert.equal(close(event), pending);
+  await Promise.resolve();
+  assert.equal(blocked, 2);
+  assert.equal(preparations, 1);
+  assert.equal(finished, 0);
+  saved.resolve();
+  await pending;
+  assert.equal(finished, 1);
+  assert.equal(blocked, 2);
+});
+test('failed persistence keeps closing blocked and permits a successful retry', async () => {
+  let attempts = 0, blocked = 0, finished = 0;
+  const errors = [];
+  const close = closeGate({prepare: () => { if (++attempts === 1) throw new Error('disk full'); }, finish: () => finished++, failed: error => errors.push(error.message)});
+  const event = {preventDefault() { blocked++; }};
+  await close(event);
+  assert.equal(finished, 0);
+  assert.deepEqual(errors, ['disk full']);
+  await close(event);
+  assert.equal(blocked, 2);
+  assert.equal(finished, 1);
+});
+test('cancelled startup retires the ready child without attaching it', async () => {
+  const ready = deferred();
+  let current = true, stops = 0, attachments = 0;
+  const result = attachOwnedServer({start: () => ready.promise, stop: async () => { stops++; }}, () => current, () => { attachments++; });
+  current = false;
+  ready.resolve({serverId: 'owned'});
+  await assert.rejects(result, /cancelled/);
+  assert.equal(stops, 1);
+  assert.equal(attachments, 0);
+});
+test('attachment failure stops the child; successful attachment retains it', async () => {
+  let stops = 0;
+  const server = {start: async () => ({serverId: 'owned'}), stop: async () => { stops++; }};
+  await assert.rejects(attachOwnedServer(server, () => true, async () => { throw new Error('auth failed'); }), /auth failed/);
+  assert.equal(stops, 1);
+  assert.equal(await attachOwnedServer(server, () => true, async local => local.serverId), 'owned');
+  assert.equal(stops, 1);
+});

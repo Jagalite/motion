@@ -8,7 +8,7 @@ renditions, live events, scheduled scans, automatic snapshots, and library admin
 ## Build a complete application package
 
 The first package target is **macOS Apple Silicon (arm64)**. Building requires
-Rust 1.95 or newer, Python 3.12 or newer, Node/npm, Xcode command-line tools,
+Rust 1.98 or newer, Python 3.12 or newer, Node/npm, Xcode command-line tools,
 `make`, and `pkg-config`. These tools are not needed to run the finished package.
 
 ```sh

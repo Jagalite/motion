@@ -43,6 +43,10 @@ impl Fixture {
                 dir.path().join("cache"),
                 Default::default(),
             )),
+            access: Arc::new(playscale::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale::v2::auth::random_key(),
+            )),
         };
         Self {
             dir,
@@ -2274,22 +2278,9 @@ async fn snapshots_are_validated_retained_and_disk_pressure_is_reported() {
         let (status, manifest) = f.json("POST", "/api/v1/admin/storage", None, true).await;
         assert_eq!(status, 201, "{manifest}");
         assert_eq!(manifest["format"], 1);
-        // The newest migration on disk, so renumbering by A02 needs no edit here.
-        let latest = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-            .unwrap()
-            .filter_map(|e| {
-                e.unwrap()
-                    .file_name()
-                    .to_str()?
-                    .split('_')
-                    .next()?
-                    .parse::<i64>()
-                    .ok()
-            })
-            .max();
         assert_eq!(
             manifest["schema_versions"].as_array().unwrap().last(),
-            latest.map(|v| json!(v)).as_ref()
+            Some(&json!(latest_migration()))
         );
     }
     let snapshots: Vec<_> = std::fs::read_dir(&root)
@@ -2770,4 +2761,13 @@ async fn exhausted_jobs_do_not_stop_workers_or_block_following_work() {
         .0,
         StatusCode::CONFLICT
     );
+}
+
+/// Highest migration version shipped in `migrations/`.
+fn latest_migration() -> i64 {
+    std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .filter_map(|e| e.unwrap().file_name().to_str()?.get(..4)?.parse().ok())
+        .max()
+        .unwrap()
 }

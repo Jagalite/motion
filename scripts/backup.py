@@ -80,6 +80,15 @@ def backup(data, output):
     return manifest
 
 
+def rotate_restore_epoch(database):
+    """A restored database has a different history: event cursors issued
+    against the original must reset rather than resume overlapping positions."""
+    with sqlite3.connect(database) as db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_identity'").fetchone():
+            db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
+    db.close()
+
+
 def restore(source, data):
     if data.exists():
         raise ValueError('Restore requires a new, nonexistent data directory')
@@ -99,6 +108,7 @@ def restore(source, data):
     if digest(temporary) != manifest['sha256']:
         raise ValueError('Backup changed during restore; incomplete directory retained')
     validate(temporary)
+    rotate_restore_epoch(temporary)
     sync_file(temporary)
     temporary.rename(data / 'playscale.sqlite3')
     sync_directory(data)

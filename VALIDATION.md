@@ -704,7 +704,7 @@ snapshot is saved; a failed write leaves them available for retry. Intermediate
 snapshots are asynchronous and may lag. Restart applies the production core's
 `Interrupt` transition to recorded live sessions: it does not resume encoders or
 serve the previous process's manifests. Records expire after seven days at
-startup. Migration `0027` is provisional pending A02's numbering coordination.
+startup. The migration is registered as `0018` in `MIGRATIONS.md`.
 
 The production core owns generation identity, active-playhead acceptance,
 lease renewal, and lifecycle fencing. A pending generation's heartbeat renews

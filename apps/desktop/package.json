@@ -1,0 +1,18 @@
+{
+  "name": "motion-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Motion Electron host: isolated server connections and local-origin qualification",
+  "scripts": {
+    "proof": "node proof/run.mjs",
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "test:shell": "node test/run-shell.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.7.0"
+  },
+  "main": "src/main.mjs"
+}

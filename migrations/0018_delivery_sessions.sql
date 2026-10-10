@@ -1,5 +1,5 @@
--- CHANGE REQUEST from A07 for A02: the number 0027 is provisional (0010-0026
--- are taken on main or open branches); A02 owns migration numbering and may renumber.
+-- CHANGE REQUEST from A07 for A02: the number 0015 is provisional (0010-0014
+-- are taken on other branches); A02 owns migration numbering and may renumber.
 -- Delivery sessions are retained as diagnostic/recovery intent (plan 10.1):
 -- after a restart they read as interrupted; live transports never resume.
 CREATE TABLE delivery_sessions (

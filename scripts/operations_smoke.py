@@ -15,7 +15,7 @@ def main():
         root = pathlib.Path(directory)
         config = root / 'config.json'
         port = free_port()
-        config.write_text(json.dumps({'listen': f'127.0.0.1:{port}', 'data_dir': 'state', 'libraries': [], 'demuxe_dir': 'missing-assets', 'ffprobe': shutil.which('ffprobe')}))
+        config.write_text(json.dumps({'access_mode': 'trusted_household', 'listen': f'127.0.0.1:{port}', 'data_dir': 'state', 'libraries': [], 'demuxe_dir': 'missing-assets', 'ffprobe': shutil.which('ffprobe')}))
         effective = json.loads(subprocess.check_output([str(BINARY), '--config', str(config), '--check-config'], text=True))
         assert pathlib.Path(effective['data_dir']).name == 'state' and pathlib.Path(effective['data_dir']).is_absolute()
         assert not (root / 'state').exists()

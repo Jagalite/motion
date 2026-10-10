@@ -905,6 +905,50 @@ async fn finish(
             .fetch_one(&mut *tx)
             .await?;
         sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,generated) VALUES (?,?,?,?,?,?,?,?,?,1,1)").bind(&file).bind(edition).bind(library).bind(found.relative).bind(&found.revision).bind(found.fingerprint).bind(found.bytes).bind(found.duration).bind(serde_json::to_string(&found.tracks)?).execute(&mut *tx).await?;
+        // A derived rendition joins a timeline only if one of the edition's
+        // versions pins exactly the source content this job read. Content, not
+        // file identity: the source may be a byte-identical copy (occurrence)
+        // of the bound file.
+        let pinned: Vec<(String, i64, bool)> = sqlx::query_as(
+            "SELECT v.timeline_id,(SELECT count(*) FROM version_files p WHERE p.version_id=v.id),b.start_ms IS NOT NULL OR b.end_ms IS NOT NULL FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id WHERE b.file_revision=? AND t.edition_id=? AND v.origin='original'",
+        )
+        .bind(&job.source_revision)
+        .bind(edition)
+        .fetch_all(&mut *tx)
+        .await?;
+        let pinned: Vec<playscale_core::identity::PinnedSource> = pinned
+            .into_iter()
+            .map(
+                |(timeline, parts, interval)| playscale_core::identity::PinnedSource {
+                    timeline,
+                    parts: usize::try_from(parts).unwrap_or(usize::MAX),
+                    interval,
+                },
+            )
+            .collect();
+        let (timeline, equivalence) = match playscale_core::identity::rendition_placement(&pinned) {
+            playscale_core::identity::RenditionPlacement::Join { timeline } => {
+                (timeline, playscale_core::identity::Equivalence::Declared)
+            }
+            playscale_core::identity::RenditionPlacement::OwnTimeline => {
+                let timeline = new_id();
+                sqlx::query("INSERT INTO timelines (id,edition_id) VALUES (?,?)")
+                    .bind(&timeline)
+                    .bind(edition)
+                    .execute(&mut *tx)
+                    .await?;
+                (timeline, playscale_core::identity::Equivalence::Unknown)
+            }
+        };
+        crate::curation::create_version(
+            &mut tx,
+            &timeline,
+            &file,
+            playscale_core::identity::Origin::Generated,
+            equivalence,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
         let recipe = serde_json::json!({"version":1,"recipe":job.recipe,"backend":job.backend,"job_id":job.id,"attempt":job.attempt,"video_profile":job.video_profile});
         sqlx::query("INSERT INTO renditions VALUES (?,?,?,?,?,?,?,?,?,?,?)")
             .bind(new_id())
@@ -1407,6 +1451,10 @@ mod publication_tests {
                 Default::default(),
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
         };
         let output = || {
             Some((

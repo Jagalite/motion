@@ -32,7 +32,7 @@ async fn admitted_io<T: Send + 'static>(
 
 #[derive(Deserialize)]
 pub struct MediaQuery {
-    revision: Option<String>,
+    pub revision: Option<String>,
 }
 
 fn matches_etag(value: &str, etag: &str, weak: bool) -> bool {
