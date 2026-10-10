@@ -1917,3 +1917,233 @@ async fn desktop_bootstrap_is_one_use_and_never_exposed() {
         "device credential exposed"
     );
 }
+
+/// A stand-in presentation router (A11's Topcoat mount plugs in here): it
+/// echoes the identity A08 resolved for it.
+fn presentation() -> axum::Router {
+    axum::Router::new().fallback(|request: Request<Body>| async move {
+        let who = request
+            .extensions()
+            .get::<api::PresentationIdentity>()
+            .and_then(|i| i.0.as_ref())
+            .map(|c| c.principal.id.clone())
+            .unwrap_or_else(|| "anonymous".into());
+        (
+            [("content-type", "text/html; charset=utf-8")],
+            format!("<p>page {} for {who}</p>", request.uri()),
+        )
+    })
+}
+
+#[tokio::test]
+async fn presentation_mount_keeps_api_json_and_sees_only_verified_identity() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device_id, token) = f.pair(&["default"], &["catalog:read"]).await;
+    let session = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":token})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    let cookie = session.headers["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let call = |path: &'static str, headers: Vec<(&'static str, String)>| {
+        let mut request = Request::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:8787");
+        for (k, v) in headers {
+            request = request.header(k, v);
+        }
+        let router = api::router_with(f.app.clone(), None, Some(presentation()));
+        async move {
+            let response = router
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, headers, String::from_utf8_lossy(&body).into_owned())
+        }
+    };
+    let (status, headers, body) = call("/library/movies", vec![("cookie", cookie.clone())]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("page /library/movies for "), "{body}");
+    assert!(!body.contains("anonymous"));
+    assert_eq!(headers["cache-control"], "private, no-store");
+    assert!(body.contains(&device_id), "{body}");
+    let (_, _, body) = call("/library?sort=title", vec![("cookie", cookie.clone())]).await;
+    assert!(
+        body.contains("/library?sort=title"),
+        "full URI lost: {body}"
+    );
+    let (_, headers, body) = call("/", vec![("cookie", "motion_session=forged".into())]).await;
+    assert_eq!(headers["cache-control"], "private, no-store");
+    assert!(body.contains("for anonymous"), "{body}");
+    // API, legacy API and media paths never fall through to HTML.
+    for path in [
+        "/api/v2/unknown",
+        "/api/v1/unknown",
+        "/media/unknown",
+        "/media",
+        "/api",
+        "/api/v2",
+    ] {
+        let (status, headers, _) = call(path, vec![]).await;
+        assert_ne!(status, StatusCode::OK, "{path}");
+        assert!(
+            headers["content-type"].to_str().unwrap().contains("json"),
+            "{path}: {headers:?}"
+        );
+    }
+    let (status, _, body) = call("/api/v2/system/health", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("server_id"));
+    // Unsafe requests with a valid ambient session must not degrade to anonymous.
+    let csrf_denied = api::router_with(f.app.clone(), None, Some(presentation()))
+        .oneshot(f.request(
+            "POST",
+            "/library",
+            None,
+            &[("cookie", &cookie), ("origin", ORIGIN)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(csrf_denied.status(), StatusCode::FORBIDDEN);
+    let wrong_origin = api::router_with(f.app.clone(), None, Some(presentation()))
+        .oneshot(f.request(
+            "POST",
+            "/library",
+            None,
+            &[
+                ("cookie", &cookie),
+                ("x-csrf-token", session.body["csrf_token"].as_str().unwrap()),
+                ("origin", "https://evil.example"),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+    sqlx::query("UPDATE devices SET revoked=1 WHERE id=?")
+        .bind(&device_id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let (_, _, body) = call("/library", vec![("cookie", cookie)]).await;
+    assert!(
+        body.contains("for anonymous"),
+        "revoked identity rendered: {body}"
+    );
+    // The host boundary applies before presentation.
+    let wrong_host = api::router_with(f.app.clone(), None, Some(presentation()))
+        .oneshot(
+            Request::builder()
+                .uri("/library")
+                .header("host", "evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_host.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn presentation_identity_honors_only_verified_ingress() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    let (device_id, _) = f.pair(&["default"], &["catalog:read"]).await;
+    let settings = playscale::v2::ApiSettings {
+        trusted_ingress: Some(playscale::v2::IngressSettings {
+            socket: "/tmp/unused.sock".into(),
+            login_header: "tailscale-user-login".into(),
+            logins: [("alice@example.com".to_string(), device_id.clone())].into(),
+        }),
+        ..Default::default()
+    };
+    f.app.access = Arc::new(
+        playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
+            .with_settings(settings),
+    );
+    for trusted in [false, true] {
+        let mut request = f.request(
+            "GET",
+            "/library",
+            None,
+            &[("tailscale-user-login", "alice@example.com")],
+        );
+        if trusted {
+            request
+                .extensions_mut()
+                .insert(playscale::v2::auth::TrustedIngress);
+        }
+        let response = api::router_with(f.app.clone(), None, Some(presentation()))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(if trusted { &device_id } else { "anonymous" }),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn presentation_shares_admission_limits_and_propagates_storage_failure() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    f.app.access = Arc::new(
+        playscale::v2::Runtime::new(AccessMode::Restricted, playscale::v2::auth::random_key())
+            .with_settings(playscale::v2::ApiSettings {
+                requests_per_minute: 1,
+                ..Default::default()
+            }),
+    );
+    for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+        let response = api::router_with(f.app.clone(), None, Some(presentation()))
+            .oneshot(f.request(
+                "GET",
+                "/library",
+                None,
+                &[("authorization", &bearer(OPERATOR))],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    f.app.db.close().await;
+    let response = api::router_with(f.app.clone(), None, Some(presentation()))
+        .oneshot(f.request("GET", "/library", None, &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn presentation_retains_default_extractor_body_limit() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let pages = axum::Router::new().route(
+        "/render",
+        axum::routing::post(|body: String| async move { body }),
+    );
+    let response = api::router_with(f.app.clone(), None, Some(pages))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/render")
+                .header("host", "127.0.0.1:8787")
+                .body(Body::from("x".repeat(16 * 1024 + 1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
