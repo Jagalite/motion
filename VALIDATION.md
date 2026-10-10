@@ -695,3 +695,52 @@ publication. It requires the new portable media-tools receipt, remaps Rust paths
 and removes local archive owner metadata. The extracted-package smoke test also
 checks archive and binary privacy before exercising bundled runtime dependencies.
 Release build receipts and smoke results are kept outside tracked source.
+
+## Delivery restart records and generation playheads (A06/A07, 2026-10-09)
+
+Delivery creation and close acknowledge only after their diagnostic/recovery
+snapshot is saved. Terminal sessions are evicted from memory only after a final
+snapshot is saved; a failed write leaves them available for retry. Intermediate
+snapshots are asynchronous and may lag. Restart applies the production core's
+`Interrupt` transition to recorded live sessions: it does not resume encoders or
+serve the previous process's manifests. Records expire after seven days at
+startup. Migration `0015` is provisional pending A02's numbering coordination.
+
+The production core owns generation identity, active-playhead acceptance,
+lease renewal, and lifecycle fencing. A pending generation's heartbeat renews
+the lease without replacing the active generation's playhead. SQLite remains
+an adapter: its conditional upsert rejects older revisions and any write over
+an interrupted record, including a late higher-revision snapshot from the old
+runtime. Recovery reads and fences snapshots in one write transaction, preventing
+an old-runtime write between those steps. Creation failure stops the admitted worker; persistence is not an
+atomic transaction with process launch.
+
+Regression coverage includes exact core playhead/lease/effect assertions,
+bounded Stateless exploration of the production reducer, SQLite snapshot
+ordering and restart fencing, and HTTP/FFmpeg integration for restart reads,
+command refusal, old-worker capacity accounting, and readable closed records
+after memory eviction. This does not qualify multi-server database sharing,
+power-loss durability, browser playback, or remote/NAS behavior. Seeded delivery
+fuzzing remains explicitly ignored as previously deferred.
+
+`cargo test -p playscale-core --test delivery_model -- --nocapture` passed
+four tests with one explicitly ignored fuzz test. All three enumerations reached
+`GraphExhausted` with zero skipped checks (configured ceilings: 3,000,000 states,
+300,000,000 transitions, depth 200):
+
+| Model bounds | States | Transitions |
+| --- | ---: | ---: |
+| Playhead: two generations, report at 6 s, pause/resume at 8/4 s | 2,611 | 107,505 |
+| Window: one generation, eight segment indices, 1/6 s segments, clock through 48 s | 329,040 | 9,193,372 |
+| Lifecycle: up to three generations, byte/HLS routes, clock through lease expiry | 133,948 | 6,732,222 |
+
+These are finite model bounds, not exhaustive real-world scheduling coverage.
+
+Native results: `cargo test --lib delivery -- --nocapture` passed two adapter
+and eight core unit tests. On the final recovery-transaction source,
+`cargo test -p playscale --test delivery -- --nocapture` passed all three real
+FFmpeg/FFprobe tests with no skips, and
+`cargo test -p playscale --test server snapshots_are_validated_retained_and_disk_pressure_is_reported -- --nocapture`
+passed. Tests used temporary databases/media/cache roots. Fresh executable
+linking and macOS loader startup were slow; superseded native runs were stopped
+and the affected integration checks were rerun on the final source.

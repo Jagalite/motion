@@ -2274,9 +2274,22 @@ async fn snapshots_are_validated_retained_and_disk_pressure_is_reported() {
         let (status, manifest) = f.json("POST", "/api/v1/admin/storage", None, true).await;
         assert_eq!(status, 201, "{manifest}");
         assert_eq!(manifest["format"], 1);
+        // The newest migration on disk, so renumbering by A02 needs no edit here.
+        let latest = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+            .unwrap()
+            .filter_map(|e| {
+                e.unwrap()
+                    .file_name()
+                    .to_str()?
+                    .split('_')
+                    .next()?
+                    .parse::<i64>()
+                    .ok()
+            })
+            .max();
         assert_eq!(
             manifest["schema_versions"].as_array().unwrap().last(),
-            Some(&json!(9))
+            latest.map(|v| json!(v)).as_ref()
         );
     }
     let snapshots: Vec<_> = std::fs::read_dir(&root)
