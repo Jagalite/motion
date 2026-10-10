@@ -41,12 +41,21 @@ pub struct Metadata {
     pub sources: Vec<Source>,
 }
 type Row = (String, i64, Option<String>, String, i64);
-pub async fn load(db: &sqlx::SqlitePool, id: &str) -> Result<Metadata, ApiError> {
+/// The stored inputs of an item's metadata: every source document, including
+/// the scanned origin under the reserved `scan` source, and the stored rows.
+pub(crate) struct Documents {
+    pub docs: BTreeMap<String, Contribution>,
+    pub sources: Vec<Source>,
+}
+pub(crate) async fn documents(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> anyhow::Result<Documents> {
     let title: String = sqlx::query_scalar("SELECT title FROM item_origins WHERE item_id=?")
         .bind(id)
-        .fetch_one(db)
+        .fetch_one(&mut *conn)
         .await?;
-    let rows:Vec<Row>=sqlx::query_as("SELECT source,revision,external_id,document_json,updated_at FROM metadata_documents WHERE item_id=? ORDER BY source").bind(id).fetch_all(db).await?;
+    let rows:Vec<Row>=sqlx::query_as("SELECT source,revision,external_id,document_json,updated_at FROM metadata_documents WHERE item_id=? ORDER BY source").bind(id).fetch_all(&mut *conn).await?;
     let mut docs = BTreeMap::from([(
         "scan".into(),
         Contribution {
@@ -56,7 +65,7 @@ pub async fn load(db: &sqlx::SqlitePool, id: &str) -> Result<Metadata, ApiError>
     )]);
     let mut sources = Vec::new();
     for (source, revision, external_id, text, updated_at) in rows {
-        let doc: Contribution = serde_json::from_str(&text).map_err(ApiError::internal)?;
+        let doc: Contribution = serde_json::from_str(&text)?;
         sources.push(Source {
             source: source.clone(),
             revision,
@@ -68,6 +77,16 @@ pub async fn load(db: &sqlx::SqlitePool, id: &str) -> Result<Metadata, ApiError>
         });
         docs.insert(source, doc);
     }
+    Ok(Documents { docs, sources })
+}
+pub async fn load(db: &sqlx::SqlitePool, id: &str) -> Result<Metadata, ApiError> {
+    let mut conn = db.acquire().await?;
+    let Documents { docs, sources } = documents(&mut conn, id).await.map_err(|e| match e
+        .downcast_ref::<sqlx::Error>()
+    {
+        Some(sqlx::Error::RowNotFound) => ApiError::not_found(),
+        _ => ApiError::internal(e),
+    })?;
     let resolved = resolve(&docs);
     Ok(Metadata {
         values: resolved.values,
@@ -95,21 +114,11 @@ pub async fn put(
 ) -> Result<Json<Metadata>, ApiError> {
     crate::api::admin(&app, &headers)?;
     let body = crate::api::json(body)?;
-    if source == "scan"
-        || source.is_empty()
-        || source.len() > 64
-        || !source
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    if !valid_source(&source) {
         return Err(ApiError::bad("Invalid metadata source; scan is reserved"));
     }
     if body.expected_revision < 0
         || body.expected_revision == i64::MAX
-        || body.values.len() > 100
-        || body.tags.len() > 100
-        || body.excluded_tags.len() > 100
-        || (source != "local" && !body.excluded_tags.is_empty())
         || body
             .external_id
             .as_ref()
@@ -119,19 +128,76 @@ pub async fn put(
             "Invalid contribution bounds or local tag exclusions",
         ));
     }
-    for (key, value) in &body.values {
+    let contribution =
+        validate(&source, body.values, body.tags, body.excluded_tags).map_err(ApiError::bad)?;
+    let _guard = app.jobs.lock().await; // Metadata projection and scan publication share the writer boundary.
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    replace(
+        &mut tx,
+        &id,
+        &source,
+        &contribution,
+        body.external_id.as_deref(),
+        body.expected_revision,
+    )
+    .await
+    .map_err(|e| match e {
+        ContributionError::NotFound => ApiError::not_found(),
+        ContributionError::IdentityPinned => ApiError::conflict(
+            "manual_identity_pinned",
+            "A manual identification pins this source's external identity",
+        ),
+        ContributionError::RevisionConflict => ApiError::conflict(
+            "metadata_revision_conflict",
+            "Read the current source revision before updating",
+        ),
+        ContributionError::IdentityConflict => ApiError::conflict(
+            "external_identity_conflict",
+            "External identity already belongs to another item",
+        ),
+        ContributionError::Storage(e) => ApiError::internal(e),
+    })?;
+    tx.commit().await?;
+    Ok(Json(load(&app.db, &id).await?))
+}
+
+/// Source names are lowercase slugs; `scan` is reserved for the scanned origin.
+pub fn valid_source(source: &str) -> bool {
+    source != "scan"
+        && !source.is_empty()
+        && source.len() <= 64
+        && source
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validate and normalize one source's contribution. Err carries the reason.
+pub fn validate(
+    source: &str,
+    values: BTreeMap<String, Value>,
+    tags: BTreeSet<String>,
+    excluded_tags: BTreeSet<String>,
+) -> Result<Contribution, &'static str> {
+    if values.len() > 100
+        || tags.len() > 100
+        || excluded_tags.len() > 100
+        || (source != "local" && !excluded_tags.is_empty())
+    {
+        return Err("Invalid contribution bounds or local tag exclusions");
+    }
+    for (key, value) in &values {
         if key.is_empty() || key.len() > 100 || value.is_null() {
-            return Err(ApiError::bad(
+            return Err(
                 "Fields require names and non-null values; omit a field to remove this source's contribution",
-            ));
+            );
         }
         if !playscale_core::metadata::valid_field(key, value) {
-            return Err(ApiError::bad(
+            return Err(
                 "Invalid conventional metadata field: title, description, release_year, release_date or cast",
-            ));
+            );
         }
     }
-    fn tags(values: BTreeSet<String>) -> Result<BTreeSet<String>, ApiError> {
+    fn normalize(values: BTreeSet<String>) -> Result<BTreeSet<String>, &'static str> {
         values
             .into_iter()
             .map(|tag| {
@@ -141,70 +207,85 @@ pub async fn put(
                     .join(" ")
                     .to_lowercase();
                 if tag.is_empty() || tag.len() > 100 {
-                    Err(ApiError::bad("Tags must contain 1–100 bytes"))
+                    Err("Tags must contain 1–100 bytes")
                 } else {
                     Ok(tag)
                 }
             })
             .collect()
     }
-    let contribution = Contribution {
-        values: body.values,
-        tags: tags(body.tags)?,
-        excluded_tags: tags(body.excluded_tags)?,
-    };
-    let _guard = app.jobs.lock().await; // Metadata projection and scan publication share the writer boundary.
-    let mut tx = crate::db::begin_write(&app.db).await?;
+    Ok(Contribution {
+        values,
+        tags: normalize(tags)?,
+        excluded_tags: normalize(excluded_tags)?,
+    })
+}
+
+#[derive(Debug)]
+pub enum ContributionError {
+    /// Unknown item, or a work retired by a merge.
+    NotFound,
+    IdentityPinned,
+    RevisionConflict,
+    IdentityConflict,
+    Storage(anyhow::Error),
+}
+impl From<sqlx::Error> for ContributionError {
+    fn from(e: sqlx::Error) -> Self {
+        match e {
+            sqlx::Error::RowNotFound => Self::NotFound,
+            e => Self::Storage(e.into()),
+        }
+    }
+}
+
+/// Replace one source's contribution against its current revision (zero
+/// creates it) and reproject the title. The caller holds `App.jobs` and the
+/// writer transaction, and commits.
+pub(crate) async fn replace(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    source: &str,
+    contribution: &Contribution,
+    external_id: Option<&str>,
+    expected_revision: i64,
+) -> Result<(), ContributionError> {
     // Existence check; retired (merged) works take no new contributions.
     let _origin: String = sqlx::query_scalar(
         "SELECT title FROM item_origins WHERE item_id=? AND item_id NOT IN (SELECT alias_id FROM item_aliases)",
     )
-    .bind(&id)
-    .fetch_one(&mut *tx)
+    .bind(id)
+    .fetch_one(&mut *conn)
     .await?;
     let existing: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM metadata_documents WHERE item_id=? AND source=?")
-            .bind(&id)
-            .bind(&source)
-            .fetch_optional(&mut *tx)
+            .bind(id)
+            .bind(source)
+            .fetch_optional(&mut *conn)
             .await?;
-    if !crate::matching::provider_identity_allowed(
-        &mut tx,
-        &id,
-        &source,
-        body.external_id.as_deref(),
-    )
-    .await
-    .map_err(ApiError::internal)?
+    if !crate::matching::provider_identity_allowed(&mut *conn, id, source, external_id)
+        .await
+        .map_err(ContributionError::Storage)?
     {
-        return Err(ApiError::conflict(
-            "manual_identity_pinned",
-            "A manual identification pins this source's external identity",
-        ));
+        return Err(ContributionError::IdentityPinned);
     }
-    if playscale_core::revision::advance(existing.unwrap_or(0), body.expected_revision).is_err() {
-        return Err(ApiError::conflict(
-            "metadata_revision_conflict",
-            "Read the current source revision before updating",
-        ));
+    if playscale_core::revision::advance(existing.unwrap_or(0), expected_revision).is_err() {
+        return Err(ContributionError::RevisionConflict);
     }
-    let text = serde_json::to_string(&contribution).map_err(ApiError::internal)?;
+    let text =
+        serde_json::to_string(contribution).map_err(|e| ContributionError::Storage(e.into()))?;
     let changed=sqlx::query("INSERT INTO metadata_documents VALUES (?,?,?,?,?,?) ON CONFLICT(item_id,source) DO UPDATE SET revision=excluded.revision,external_id=excluded.external_id,document_json=excluded.document_json,updated_at=excluded.updated_at")
-        .bind(&id).bind(&source).bind(body.expected_revision+1).bind(body.external_id).bind(text).bind(now()).execute(&mut *tx).await;
+        .bind(id).bind(source).bind(expected_revision+1).bind(external_id).bind(text).bind(now()).execute(&mut *conn).await;
     if let Err(error) = changed {
         if matches!(&error,sqlx::Error::Database(e) if e.is_unique_violation()) {
-            return Err(ApiError::conflict(
-                "external_identity_conflict",
-                "External identity already belongs to another item",
-            ));
+            return Err(ContributionError::IdentityConflict);
         }
         return Err(error.into());
     }
-    project_title(&mut tx, &id)
+    project_title(conn, id)
         .await
-        .map_err(ApiError::internal)?;
-    tx.commit().await?;
-    Ok(Json(load(&app.db, &id).await?))
+        .map_err(ContributionError::Storage)?;
+    Ok(())
 }
 
 /// Recompute the stored title projection from every contribution, falling

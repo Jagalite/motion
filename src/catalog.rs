@@ -305,13 +305,11 @@ pub async fn add_edition(
         label: body.label.trim().into(),
         revision: 1,
     };
-    sqlx::query("INSERT INTO editions (id,item_id,label,revision) VALUES (?,?,?,?)")
-        .bind(&edition.id)
-        .bind(&edition.item_id)
-        .bind(&edition.label)
-        .bind(edition.revision)
-        .execute(&app.db)
-        .await?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    crate::curation::create_edition(&mut tx, &edition.id, &edition.item_id, &edition.label)
+        .await
+        .map_err(ApiError::internal)?;
+    tx.commit().await?;
     Ok((StatusCode::CREATED, Json(edition)))
 }
 #[derive(Deserialize, ToSchema)]
@@ -346,11 +344,15 @@ pub async fn assign(
     if target.item_id != item {
         return Err(ApiError::bad("Cross-item reassignment is not supported"));
     }
-    sqlx::query("UPDATE media_files SET edition_id=? WHERE id=?")
-        .bind(&target.id)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    crate::curation::reassign_file(&mut tx, &id, &target.id)
+        .await
+        .map_err(|e| match e {
+            crate::curation::CurationError::Rejected(_) => ApiError::conflict(
+                "version_conflict",
+                "The file's version cannot move without its other parts",
+            ),
+            crate::curation::CurationError::Storage(e) => ApiError::internal(e),
+        })?;
     tx.commit().await?;
     Ok(Json(target))
 }

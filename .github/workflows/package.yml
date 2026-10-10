@@ -20,8 +20,8 @@ jobs:
           python-version: '3.13'
       - name: Install build tools
         run: |
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup override set 1.95.0
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup override set 1.98.0
           brew install pkg-config
       - name: Test integration adapters
         run: |

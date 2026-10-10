@@ -1,0 +1,10 @@
+{
+  "passed": false,
+  "recorded_at": "2026-10-10T02:37:58.643383+00:00",
+  "failure": "Electron proof exceeded 180 seconds before its first observation checkpoint",
+  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-desktop-proof-gSUgZd",
+  "proof_server_sha256": "a33f18f904c9f40935e8752040d5b1b98e8959aeed6c3df2691bcefc2975bc25",
+  "proof_main_sha256": "d0372636ed71aa5580350b98cad5bb92aa97baf276ec076a1278704c4b37558c",
+  "observations_written": false,
+  "scope": "Latest playback qualification attempt; older successful receipt does not qualify current sources"
+}

@@ -1,0 +1,79 @@
+{
+  "electron": "44.7.0",
+  "chromium": "152.0.7977.130",
+  "screenshot": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-native-shell-1ny0ye/shell.png",
+  "passed": true,
+  "scope": "Production shell with mock HTTP services; no packaging or real backend qualification",
+  "checks": {
+    "connection_verified": true,
+    "unprivileged_remote": true,
+    "http_only_session": true,
+    "stop_local_preserves_unrelated_connection": true,
+    "cross_origin_navigation_blocked": true,
+    "encrypted_pending_progress_survives_reconnect": true,
+    "runtime_epoch_change_disconnects": true,
+    "identity_checked_before_secret": true,
+    "disconnect_leaves_server_running": true
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/api/v2/system/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v2/auth/session"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/health"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v2/auth/session"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/health"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v2/system/health"
+    }
+  ],
+  "source_sha256": {
+    "apps/desktop/src/chrome.css": "f2ec343a2f6d564e57524ba53ec6e42eea118b2f304a1d49f0517436a1a527da",
+    "apps/desktop/src/chrome.html": "6464b728cf8e1722541be85a84612acb4530038e2aa16f7ca2432eaa89df2441",
+    "apps/desktop/src/chrome.js": "7742b8b6f12e6a46bdeced2c1d90d74248551cca51e9e72327cfc9acb6bdb360",
+    "apps/desktop/src/lifecycle.mjs": "a5b4b0078d23a7d5de9ace65a14ea645f519b99ea17cd41a5e5f840bd8259e9a",
+    "apps/desktop/src/main.mjs": "548719e1a049a626aba1df589b7fe87b9124b3648bc2d29522b5c795efcc5cfb",
+    "apps/desktop/src/outbox.mjs": "6e3744ea714577c6aad5a992127551ec9ed9a8d8d899bc7df6d370c6b4efd9dd",
+    "apps/desktop/src/owned.mjs": "c54251c1449fc4b8bdbbda50b576c570bbc8615b729850f7f180039c2f8b4297",
+    "apps/desktop/src/policy.mjs": "fd1ff924b397eeca4ebf5f712d2707d05d2c6f0352e00aec140348da5f5d0af3",
+    "apps/desktop/src/preload.cjs": "1baa6ba3261c1eeede9d9eb021a94222a8ef6cdfdc6e0d3d8020612d751e7ae1",
+    "apps/desktop/src/recovery.mjs": "a06fe121e7413e095c23723fd045313476fd7cb43b0caf6b654bf474adce301f",
+    "apps/desktop/test/shell-smoke.mjs": "0fcab41c3282a0d0dbeac284f5e954999fa1ab53983557e8c62fbe7cb4803f92",
+    "contracts/Motion_Server_API_v2.yaml": "cd4100be3f80c4172e9b6af729b8d3211c363ee5cdae3949b0e4fe7e15a3cfa0"
+  },
+  "source_location": "byte-identical temporary copy"
+}

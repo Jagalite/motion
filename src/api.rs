@@ -28,6 +28,10 @@ pub struct ApiError {
     body: ErrorBody,
 }
 impl ApiError {
+    /// Status and stable code, for adapters that re-express legacy errors.
+    pub fn parts(&self) -> (StatusCode, &str, &str) {
+        (self.status, &self.body.code, &self.body.message)
+    }
     pub fn new(status: StatusCode, code: &str, message: &str) -> Self {
         Self {
             status,
@@ -362,13 +366,31 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok());
+    let v2 = request.uri().path() == "/api/v2" || request.uri().path().starts_with("/api/v2/");
+    let reject = |status, code: &'static str, message: &str| {
+        if v2 {
+            crate::v2::boundary_problem(status, Some(code), message)
+        } else {
+            ApiError::new(status, code, message).into_response()
+        }
+    };
     if host != Some(app.authority.as_str()) {
-        return ApiError::new(
+        return reject(
             StatusCode::FORBIDDEN,
             "invalid_host",
             "Unexpected Host header",
-        )
-        .into_response();
+        );
+    }
+    let cors_origin = v2
+        .then(|| {
+            crate::v2::cors::approved(&app.access.settings.approved_origins, request.headers())
+                .map(str::to_owned)
+        })
+        .flatten();
+    if let Some(origin) = &cors_origin
+        && crate::v2::cors::is_preflight(request.method(), request.headers())
+    {
+        return crate::v2::cors::preflight(origin);
     }
     if !matches!(
         *request.method(),
@@ -382,23 +404,64 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             .headers()
             .get("sec-fetch-site")
             .is_some_and(|v| v == "cross-site");
-        if cross_site || origin.is_some_and(|v| v != app.origin.as_str()) {
-            return ApiError::new(
+        // Approved third-party origins may mutate only with a bearer token.
+        let approved = v2
+            && crate::v2::cors::approved(&app.access.settings.approved_origins, request.headers())
+                .is_some()
+            && crate::v2::cors::bearer_only(request.headers());
+        if !approved && (cross_site || origin.is_some_and(|v| v != app.origin.as_str())) {
+            return reject(
                 StatusCode::FORBIDDEN,
                 "invalid_origin",
                 "Cross-origin mutations are not allowed",
-            )
-            .into_response();
+            );
         }
     }
-    let is_api = request.uri().path().starts_with("/api/");
+    let legacy = {
+        let path = request.uri().path();
+        path.starts_with("/api/v1/") || path.starts_with("/media/")
+    };
+    // v1 responses are not library-scoped, so in restricted mode only a
+    // principal whose v2 scope is the whole catalog (an administrator) may
+    // read them; v1 mutations still require the operator token.
+    let admin = legacy
+        && app.access.mode == playscale_core::access::AccessMode::Restricted
+        && crate::v2::auth::resolve(&app, request.method(), request.headers())
+            .await
+            .is_ok_and(|caller| caller.principal.is_admin());
+    let path = request.uri().path();
+    if legacy && !playscale_core::access::legacy_allowed(app.access.mode, admin) {
+        // Restricted mode: the legacy surface cannot bypass v2 grants.
+        return ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "restricted_mode",
+            "This server requires the v2 API with paired credentials",
+        )
+        .into_response();
+    }
+    let is_api = path.starts_with("/api/");
+    // Byte routes answer 412/416 with protocol headers and no problem body.
+    let bytes = path.starts_with("/api/v2/media/");
     let mut response = next.run(request).await;
-    if is_api
-        && (response.status().is_client_error() || response.status().is_server_error())
+    let failed = response.status().is_client_error() || response.status().is_server_error();
+    let protocol = matches!(
+        response.status(),
+        StatusCode::PRECONDITION_FAILED | StatusCode::RANGE_NOT_SATISFIABLE
+    ) && bytes;
+    if v2 && failed && !protocol && !crate::v2::is_problem_response(&response) {
+        // Router-level fallbacks (e.g. 405) run outside the v2 layer.
+        response = crate::v2::boundary_problem(
+            response.status(),
+            None,
+            "The request could not be accepted",
+        );
+    } else if is_api
+        && failed
+        && !protocol
         && response
             .headers()
             .get(header::CONTENT_TYPE)
-            .is_none_or(|v| v != "application/json")
+            .is_none_or(|v| v != "application/json" && v != "application/problem+json")
     {
         response = ApiError::new(
             response.status(),
@@ -406,6 +469,9 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
             "Request could not be accepted",
         )
         .into_response();
+    }
+    if let Some(origin) = &cors_origin {
+        crate::v2::cors::decorate(&mut response, origin);
     }
     if is_api {
         response.headers_mut().insert(
@@ -429,6 +495,78 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
 }
 
 pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
+    router_with(app, assets, None)
+}
+
+/// The request identity offered to presentation (Topcoat) renders: the
+/// verified session, bearer or trusted-ingress caller, or `None` for anonymous
+/// requests and invalid credentials. Protected views must authorize this caller.
+#[derive(Clone)]
+pub struct PresentationIdentity(pub Option<crate::v2::auth::Caller>);
+
+async fn presentation_identity(
+    axum::extract::State(app): axum::extract::State<App>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let ingress = request
+        .extensions()
+        .get::<crate::v2::auth::TrustedIngress>()
+        .copied();
+    let caller =
+        match crate::v2::auth::resolve_with(&app, request.method(), request.headers(), ingress)
+            .await
+        {
+            Ok(caller) => {
+                if let Err(error) = app.access.admit_request(&caller.principal.id) {
+                    return error.into_response();
+                }
+                Some(caller)
+            }
+            Err(error) if error.status == StatusCode::UNAUTHORIZED => None,
+            // CSRF rejection and storage failures must not become anonymous renders.
+            Err(error) => return error.into_response(),
+        };
+    request
+        .extensions_mut()
+        .insert(PresentationIdentity(caller));
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    // Even anonymous output varies with current credential/revocation state.
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    headers.append(
+        header::VARY,
+        axum::http::HeaderValue::from_static("cookie, authorization"),
+    );
+    response
+}
+
+/// Unknown API and media paths are JSON errors, never presentation HTML.
+async fn api_paths_stay_json(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if path == "/api"
+        || path.starts_with("/api/")
+        || path == "/media"
+        || path.starts_with("/media/")
+    {
+        return ApiError::not_found().into_response();
+    }
+    next.run(request).await
+}
+
+/// Compose the API with an optional presentation router (plan §11.7). The
+/// host/origin boundary and default extractor body limit wrap everything, presentation
+/// included. API, media and SSE paths keep their JSON errors and are never
+/// answered by presentation; only otherwise-unrouted paths reach it, with
+/// the request's verified identity in `PresentationIdentity`.
+pub fn router_with(
+    app: App,
+    assets: Option<std::path::PathBuf>,
+    presentation: Option<Router>,
+) -> Router {
     let (router, mut spec) = OpenApiRouter::<App>::new()
         .routes(routes!(libraries, add_library))
         .routes(routes!(crate::operations::ready))
@@ -490,6 +628,11 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
         ))
         .routes(routes!(crate::viewing::continue_watching))
         .routes(routes!(crate::viewing::next_episode))
+        .routes(routes!(crate::delivery::create))
+        .routes(routes!(crate::delivery::get, crate::delivery::close))
+        .routes(routes!(crate::delivery::heartbeat))
+        .routes(routes!(crate::delivery::change))
+        .routes(routes!(crate::delivery::activate))
         .split_for_parts();
     spec.info.title = "Playscale core API".into();
     spec.info.version = "1".into();
@@ -561,6 +704,7 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
         response["headers"] = serde_json::json!({"ETag":{"schema":{"type":"string"}},"Content-Range":{"schema":{"type":"string"}},"Content-Length":{"schema":{"type":"integer","format":"int64"}},"Accept-Ranges":{"schema":{"type":"string"}}});
     }
     let mut router = router
+        .nest("/api/v2", crate::v2::router())
         .route(
             "/api/v1/openapi.json",
             get(move || async move { Json(spec) }),
@@ -571,8 +715,16 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
         )
         .route("/media/{id}", get(media::serve).head(media::serve))
         .route(
-            "/",
-            get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
+            "/api/v1/streams/{id}/{generation}/index.m3u8",
+            get(crate::delivery::playlist),
+        )
+        .route(
+            "/api/v1/streams/{id}/{generation}/init.mp4",
+            get(crate::delivery::init),
+        )
+        .route(
+            "/api/v1/streams/{id}/{generation}/segments/{segment}",
+            get(crate::delivery::segment),
         )
         .route(
             "/app.js",
@@ -619,14 +771,33 @@ pub fn router(app: App, assets: Option<std::path::PathBuf>) -> Router {
                 )
             }),
         );
+    if presentation.is_some() {
+        router = router.merge(motion_ui::asset_router());
+    }
+    if presentation.is_none() {
+        router = router.route(
+            "/",
+            get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
+        );
+    }
     if let Some(assets) = assets {
         router = router.nest_service(
             "/assets/demuxe",
             tower_http::services::ServeDir::new(assets),
         );
     }
+    let router = match presentation {
+        None => router.fallback(|| async { ApiError::not_found() }),
+        Some(presentation) => router.fallback_service(
+            presentation
+                .layer(middleware::from_fn_with_state(
+                    app.clone(),
+                    presentation_identity,
+                ))
+                .layer(middleware::from_fn(api_paths_stay_json)),
+        ),
+    };
     router
-        .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async {
             ApiError::new(
                 StatusCode::METHOD_NOT_ALLOWED,

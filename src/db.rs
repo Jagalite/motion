@@ -103,6 +103,8 @@ pub struct JobRow {
     pub outcome: Option<String>,
     pub complete_directories: i64,
     pub incomplete_directories: i64,
+    /// Source binding revision observed by the running attempt.
+    pub binding_revision: Option<i64>,
 }
 impl JobRow {
     pub fn state(&self) -> anyhow::Result<Job> {
@@ -296,21 +298,35 @@ pub(crate) async fn add_verified_library(
         !name.trim().is_empty() && name.len() <= 200,
         "invalid library name"
     );
+    let mut tx = begin_write(db).await?;
     let existing: Option<String> =
         sqlx::query_scalar("SELECT root_identity FROM libraries WHERE root=?")
             .bind(root)
-            .fetch_optional(db)
+            .fetch_optional(&mut *tx)
             .await?;
     anyhow::ensure!(
         existing.as_ref().is_none_or(|v| v == identity),
         "library root identity changed"
     );
     sqlx::query("INSERT INTO libraries (id,name,root,root_identity) VALUES (?,?,?,?) ON CONFLICT(root) DO NOTHING")
-        .bind(new_id()).bind(name.trim()).bind(root).bind(identity).execute(db).await?;
-    Ok(sqlx::query_as("SELECT id,name FROM libraries WHERE root=?")
+        .bind(new_id()).bind(name.trim()).bind(root).bind(identity).execute(&mut *tx).await?;
+    let library: Library = sqlx::query_as("SELECT id,name FROM libraries WHERE root=?")
         .bind(root)
-        .fetch_one(db)
-        .await?)
+        .fetch_one(&mut *tx)
+        .await?;
+    // Legacy configuration declares a library and root together. Preserve its
+    // stable ID while registering both parts atomically in the new model.
+    sqlx::query("INSERT INTO catalog_libraries(id,name,kind) VALUES (?,?,'mixed') ON CONFLICT(id) DO NOTHING")
+        .bind(&library.id).bind(&library.name).execute(&mut *tx).await?;
+    sqlx::query(
+        "INSERT INTO library_sources(library_id,source_id) VALUES (?,?) ON CONFLICT DO NOTHING",
+    )
+    .bind(&library.id)
+    .bind(&library.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(library)
 }
 
 pub fn root_identity(meta: &std::fs::Metadata) -> String {
@@ -328,7 +344,7 @@ pub fn root_identity(meta: &std::fs::Metadata) -> String {
 /// Reserve SQLite's writer before observing state that this transaction changes.
 /// App.jobs serializes domain writers; background diagnostic writes can otherwise
 /// invalidate a deferred read snapshot before its first write (SQLITE_BUSY_SNAPSHOT).
-pub(crate) async fn begin_write(
+pub async fn begin_write(
     db: &SqlitePool,
 ) -> Result<sqlx::Transaction<'_, sqlx::Sqlite>, sqlx::Error> {
     db.begin_with("BEGIN IMMEDIATE").await
