@@ -30,7 +30,6 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 
 const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
@@ -205,18 +204,26 @@ impl Cache {
                     &name,
                     cap_std::fs::OpenOptions::new().write(true).create_new(true),
                 )?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(cap_std::fs::Permissions::from_std(
-                        std::fs::Permissions::from_mode(0o600),
-                    ))?;
+                let published = (|| -> anyhow::Result<()> {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(cap_std::fs::Permissions::from_std(
+                            std::fs::Permissions::from_mode(0o600),
+                        ))?;
+                    }
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                    self.directory
+                        .rename(&name, &self.directory, "events.json")?;
+                    self.directory.try_clone()?.into_std_file().sync_all()?;
+                    Ok(())
+                })();
+                if published.is_err() {
+                    // Only our newly created temporary file; never the prior log.
+                    let _ = self.directory.remove_file(&name);
                 }
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                self.directory
-                    .rename(&name, &self.directory, "events.json")?;
-                self.directory.try_clone()?.into_std_file().sync_all()?;
+                published?;
                 *history = next; // Publish in memory only after the durable rename.
             }
             Admission::Duplicate => {}
@@ -226,18 +233,14 @@ impl Cache {
             json!({"event_id":event.event_id,"device_sequence":event.device_sequence,"next_sequence":offline::next_sequence(&history).map(|n|n.to_string())}),
         )
     }
-    fn snapshot(&self, id: &str) -> anyhow::Result<(CachedDownload, tempfile::NamedTempFile)> {
+    fn snapshot(&self, id: &str) -> anyhow::Result<(CachedDownload, std::fs::File)> {
         let item = self.item(id).context("download is unavailable")?.clone();
         let mut source = self.directory.open(format!("blobs/{}", item.sha256))?;
         ensure!(
             source.metadata()?.is_file() && source.metadata()?.len() == item.size,
             "download size changed"
         );
-        let mut copy = tempfile::NamedTempFile::new()?;
-        ensure!(
-            item.size <= fs2::available_space(copy.path())?.saturating_sub(512 * 1024 * 1024),
-            "insufficient space for verified playback snapshot"
-        );
+        let mut copy = new_snapshot(item.size)?;
         let mut hash = Sha256::new();
         let mut size = 0;
         let mut buffer = [0u8; 64 * 1024];
@@ -272,7 +275,7 @@ impl OfflinePresentationReader for Cache {
 struct Media {
     ticket: String,
     item: CachedDownload,
-    file: tempfile::NamedTempFile,
+    file: Arc<Mutex<std::fs::File>>,
 }
 #[derive(Clone)]
 pub struct Host {
@@ -459,7 +462,11 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     let ticket = Uuid::new_v4().simple().to_string();
     let result = json!({"scope":host.cache.manifest.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
         "next_sequence":offline::next_sequence(&history).map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
-    *host.media.lock().unwrap() = Some(Media { ticket, item, file });
+    *host.media.lock().unwrap() = Some(Media {
+        ticket,
+        item,
+        file: Arc::new(Mutex::new(file)),
+    });
     Json(result).into_response()
 }
 async fn record(State(host): State<Host>, Json(event): Json<OfflineEvent>) -> Response {
@@ -478,7 +485,7 @@ async fn media(
         active
             .as_ref()
             .filter(|m| m.ticket == ticket)
-            .and_then(|m| m.file.reopen().ok().map(|f| (f, m.item.clone())))
+            .map(|m| (m.file.clone(), m.item.clone()))
     };
     let Some((file, item)) = opened else {
         return StatusCode::NOT_FOUND.into_response();
@@ -510,10 +517,6 @@ async fn media(
                 .into_response();
         }
     };
-    let mut file = tokio::fs::File::from_std(file);
-    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
     let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, item.content_type)
@@ -527,8 +530,75 @@ async fn media(
         );
     }
     response
-        .body(Body::from_stream(tokio_util::io::ReaderStream::new(
-            file.take(end - start + 1),
-        )))
+        .body(Body::from_stream(snapshot_stream(file, start, end)))
         .unwrap()
+}
+
+fn new_snapshot(size: u64) -> anyhow::Result<std::fs::File> {
+    let copy = tempfile::NamedTempFile::new()?;
+    ensure!(
+        size <= fs2::available_space(copy.path())?.saturating_sub(512 * 1024 * 1024),
+        "insufficient space for verified playback snapshot"
+    );
+    // Unlink immediately: process::exit/SIGKILL need no Rust destructors to
+    // reclaim the potentially large snapshot when its last descriptor closes.
+    Ok(copy.into_file())
+}
+
+// An anonymous file cannot be reopened by path. Cloned descriptors share their
+// seek offset, so each bounded read serializes seek+read and keeps its own cursor.
+// Blocking filesystem work stays off the async executor; a cancelled body retains
+// at most its current 64 KiB read and releases the descriptor afterwards.
+fn snapshot_stream(
+    file: Arc<Mutex<std::fs::File>>,
+    start: u64,
+    end: u64,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> {
+    futures_util::stream::try_unfold((file, start), move |(file, offset)| async move {
+        if offset > end {
+            return Ok(None);
+        }
+        let reader = file.clone();
+        let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            let mut file = reader
+                .lock()
+                .map_err(|_| std::io::Error::other("snapshot reader failed"))?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            let mut bytes = vec![0; (end - offset + 1).min(64 * 1024) as usize];
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let next = offset + bytes.len() as u64;
+        Ok(Some((bytes, (file, next))))
+    })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use futures_util::TryStreamExt;
+    #[tokio::test]
+    async fn anonymous_snapshot_reclaims_on_exit_and_concurrent_ranges_keep_offsets() {
+        let mut file = new_snapshot(200_000).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                file.metadata().unwrap().nlink(),
+                0,
+                "production snapshot must not depend on Drop for unlink"
+            );
+        }
+        let bytes: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        file.write_all(&bytes).unwrap();
+        let shared = Arc::new(Mutex::new(file));
+        let (a, b) = tokio::join!(
+            snapshot_stream(shared.clone(), 0, 130_000).try_collect::<Vec<_>>(),
+            snapshot_stream(shared, 47_321, 199_999).try_collect::<Vec<_>>(),
+        );
+        assert_eq!(a.unwrap().concat(), bytes[..=130_000]);
+        assert_eq!(b.unwrap().concat(), bytes[47_321..]);
+    }
 }

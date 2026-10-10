@@ -42,7 +42,9 @@ The manifest is the serialized `CacheManifest` in `src/lib.rs`:
 Paths never come from URLs or manifest filenames. Capability-relative reads
 confine blobs and metadata to the cache. Before serving media, the helper copies
 and hashes it into a private snapshot; later cache mutation cannot change an
-admitted stream. A random process-local ticket and HttpOnly session protect
+admitted stream. Snapshots are unlinked immediately and reclaimed by the OS even
+on abrupt process exit. Concurrent range bodies keep independent cursors through
+bounded, serialized seek/read operations off the async executor. A random process-local ticket and HttpOnly session protect
 range reads. Only receipt-listed, checksum-verified player assets are served.
 The host rejects public catalog routes, wrong Host/Origin, unauthenticated reads,
 bootstrap replay, foreign event scopes and altered duplicate event identities.
