@@ -1363,10 +1363,18 @@ async fn durable_replay(
     digest: &str,
 ) -> Result<Option<Response>, Problem> {
     let stored = scope.load(tx).await?;
-    if access::idempotency(stored.as_ref().map(|s| &s.record), digest, now())?
-        != access::Idempotent::Replay
-    {
-        return Ok(None);
+    // The delivery family reports a reused key as idempotency_conflict.
+    match access::idempotency(stored.as_ref().map(|s| &s.record), digest, now()) {
+        Ok(access::Idempotent::Replay) => {}
+        Ok(_) => return Ok(None),
+        Err(access::AccessError::IdempotencyMismatch) => {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "The Idempotency-Key was used with a different request",
+            ));
+        }
+        Err(e) => return Err(e.into()),
     }
     let stored = stored.expect("replay has a record");
     let mut response = (stored.status, Json(stored.body.unwrap_or_default())).into_response();
@@ -1394,12 +1402,12 @@ pub async fn change_delivery(
         target: &id,
         key: &key,
     };
-    if !app.processing.deliveries.is_live(&id) {
-        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
-            return Ok(replay);
-        }
-        require_live(&app, &id)?;
+    // The durable receipt is consulted first, live or not: it also records
+    // acknowledged no-op activations, which keep no in-memory receipt.
+    if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+        return Ok(replay);
     }
+    require_live(&app, &id)?;
     let receipt = delivery::ChangeReceipt {
         principal: principal.id.clone(),
         scope: "change".into(),
@@ -1518,12 +1526,12 @@ pub async fn activate(
         target: &target,
         key: &key,
     };
-    if !app.processing.deliveries.is_live(&id) {
-        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
-            return Ok(replay);
-        }
-        require_live(&app, &id)?;
+    // The durable receipt is consulted first, live or not: it also records
+    // acknowledged no-op activations, which keep no in-memory receipt.
+    if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+        return Ok(replay);
     }
+    require_live(&app, &id)?;
     let receipt = delivery::ChangeReceipt {
         principal: principal.id.clone(),
         scope: format!("activate/{generation}"),

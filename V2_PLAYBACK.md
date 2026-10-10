@@ -61,7 +61,10 @@ Adapters supply the facts and commit the decided records:
   revision is still current; timeline reads check the work and the edition,
   like catalog timeline reads.
 - Accepted viewing events report the logical playhead to the bound delivery,
-  which paces its encoder.
+  which paces its encoder, only while the caller may control that delivery,
+  and before the event commits so reports follow commit order. Pacing is an
+  advisory bound, not an acknowledged fact: if that commit then fails, the
+  encoder may run ahead within its normal pacing window.
 - Admission refusals keep their v2 problem code (for example `plan_expired`)
   instead of being re-mapped through the v1 error type.
 
