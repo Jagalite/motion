@@ -88,6 +88,19 @@ impl Queries {
             .map_err(|_| UiError::Unavailable)?;
         serde_json::from_slice(&bytes).map_err(|_| UiError::Unavailable)
     }
+    /// An item aggregate must not present a truncated edition/version set as
+    /// complete. Bound the work and report unavailable when paging is needed.
+    async fn complete_list(&self, path: &str) -> UiResult<Vec<Value>> {
+        let page = self.read(path).await?;
+        if !page["next_cursor"].is_null() {
+            return Err(UiError::Unavailable);
+        }
+        page["items"]
+            .as_array()
+            .cloned()
+            .ok_or(UiError::Unavailable)
+    }
+
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
         // Presentation is deliberately bounded; it never drains an unbounded
         // catalog. Dedicated library/search pages provide narrower reads.
@@ -252,8 +265,69 @@ impl UiQueryFacade for Queries {
             })
         })
     }
-    fn item<'a>(&'a self, _: &'a UiPrincipal, _: &'a str) -> BoxFuture<'a, UiResult<ItemView>> {
-        Box::pin(async { Err(UiError::Unavailable) })
+    fn item<'a>(&'a self, _: &'a UiPrincipal, id: &'a str) -> BoxFuture<'a, UiResult<ItemView>> {
+        Box::pin(async move {
+            let path = format!("/catalog/items/{}", segment(id));
+            let value = self.read(&path).await?;
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("parent_id", id)
+                .append_pair("limit", "200")
+                .finish();
+            let children = self
+                .complete_list(&format!("/catalog/items?{query}"))
+                .await?
+                .iter()
+                .map(item)
+                .collect();
+            let editions = self
+                .complete_list(&format!("{path}/editions?limit=200"))
+                .await?;
+            let rows = self
+                .complete_list(&format!("{path}/timelines?limit=20"))
+                .await?;
+            let mut timelines = Vec::new();
+            for row in rows {
+                let timeline = text(&row, "id");
+                let edition = editions
+                    .iter()
+                    .find(|e| e["id"] == row["edition_id"])
+                    .ok_or(UiError::Unavailable)?;
+                let versions = self
+                    .complete_list(&format!(
+                        "/catalog/timelines/{}/versions?limit=200",
+                        segment(&timeline)
+                    ))
+                    .await?
+                    .iter()
+                    .map(|v| {
+                        let label = text(v, "label");
+                        VersionView {
+                            id: text(v, "id"),
+                            label: if label.trim().is_empty() {
+                                "Unnamed version".into()
+                            } else {
+                                label
+                            },
+                            availability: availability(v),
+                            summary: text(v, "origin"),
+                        }
+                    })
+                    .collect();
+                timelines.push(TimelineView {
+                    id: timeline,
+                    edition: text(edition, "label"),
+                    duration_ms: row["duration_ms"].as_u64(),
+                    viewing: None,
+                    versions,
+                });
+            }
+            Ok(ItemView {
+                item: item(&value),
+                children,
+                timelines,
+                playback_available: false,
+            })
+        })
     }
     fn player<'a>(&'a self, _: &'a UiPrincipal, _: &'a str) -> BoxFuture<'a, UiResult<PlayerView>> {
         Box::pin(async { Err(UiError::Unavailable) })

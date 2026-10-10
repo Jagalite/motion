@@ -222,8 +222,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                         id: timeline.into(),
                         edition: "Theatrical".into(),
                         duration_ms: Some(title.duration_ms),
-                        position_ms: position,
-                        watched: false,
+                        viewing: Some(TimelineViewing { position_ms: position, watched: false }),
                         versions: vec![VersionView {
                             id: format!("ver-{timeline}"),
                             label: "1080p original".into(),
@@ -234,6 +233,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 })
                 .unwrap_or_default();
             Ok(ItemView {
+                playback_available: true,
                 item: card(title),
                 children,
                 timelines,
