@@ -44,6 +44,8 @@ pub struct Marker {
     pub end_ms: Option<u64>,
     pub label: Option<String>,
     pub provenance: Provenance,
+    /// Timeline revision the marker was validated against.
+    pub timeline_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,11 +86,18 @@ pub fn validate(
     Ok(())
 }
 
-/// Effective markers: for intro, credits and recap the single marker of the
-/// highest provenance (earliest start, then ID, on ties); for chapters, the
-/// complete set from the highest provenance present, in start order. Lower
-/// provenance markers are retained, just not effective.
-pub fn effective(markers: &[Marker]) -> Vec<Marker> {
+/// Effective markers for the timeline's current revision: markers validated
+/// against an older revision are not effective (they stay listed). Then for
+/// intro, credits and recap the single marker of the highest provenance
+/// (earliest start, then ID, on ties); for chapters, the complete set from
+/// the highest provenance present, in start order.
+pub fn effective(markers: &[Marker], timeline_revision: u64) -> Vec<Marker> {
+    let current: Vec<Marker> = markers
+        .iter()
+        .filter(|m| m.timeline_revision == timeline_revision)
+        .cloned()
+        .collect();
+    let markers = current.as_slice();
     let mut out = Vec::new();
     for kind in [Kind::Intro, Kind::Recap, Kind::Credits] {
         if let Some(best) = markers.iter().filter(|m| m.kind == kind).min_by(|a, b| {
@@ -131,6 +140,7 @@ mod tests {
             end_ms: end,
             label: None,
             provenance: p,
+            timeline_revision: 1,
         }
     }
     #[test]
@@ -177,7 +187,21 @@ mod tests {
                 Provenance::Detected,
             ),
         ];
-        let ids: Vec<String> = effective(&markers).into_iter().map(|m| m.id).collect();
+        let ids: Vec<String> = effective(&markers, 1).into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["e1", "x", "e2", "c"]);
+        // After the timeline changes, old markers are not effective.
+        let mut stale = markers.clone();
+        stale.push(Marker {
+            timeline_revision: 2,
+            ..m(
+                "new",
+                Kind::Intro,
+                1_000,
+                Some(30_000),
+                Provenance::Detected,
+            )
+        });
+        let ids: Vec<String> = effective(&stale, 2).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["new"]);
     }
 }

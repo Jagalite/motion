@@ -411,6 +411,14 @@ pub async fn reopen(
     if open > 0 {
         return Err(MatchingError::Rejected(MatchError::StaleProposal));
     }
+    // The replaced decision is preserved as an immutable receipt.
+    sqlx::query("INSERT INTO catalog_receipts VALUES (?,?,?,?)")
+        .bind(new_id())
+        .bind("match:reopen")
+        .bind(now())
+        .bind(serde_json::to_string(&proposal)?)
+        .execute(&mut *tx)
+        .await?;
     store(&mut tx, &next, false).await?;
     tx.commit().await?;
     Ok(next)
@@ -452,6 +460,16 @@ pub async fn identify_manually(
     }
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM items WHERE id=? AND id NOT IN (SELECT alias_id FROM item_aliases)",
+    )
+    .bind(item)
+    .fetch_one(&mut *tx)
+    .await?;
+    if live == 0 {
+        // Retired (merged) works take no new identity; identify the live work.
+        return Err(MatchingError::NotFound);
+    }
     if !provider_identity_allowed(&mut tx, item, source, Some(value)).await? {
         return Err(MatchingError::IdentityTaken);
     }

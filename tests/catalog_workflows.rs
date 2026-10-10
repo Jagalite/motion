@@ -1442,6 +1442,15 @@ async fn fix_match_unmatch_and_manual_identification() {
         .await
         .unwrap();
     assert_eq!(reopened.status, Status::Pending);
+    let history: String =
+        sqlx::query_scalar("SELECT document_json FROM catalog_receipts WHERE kind='match:reopen'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(
+        history.contains("\"rejected\""),
+        "prior decision preserved: {history}"
+    );
     let candidate = reopened.candidates[0].id.clone();
     let decided = matching::decide(
         &f.app,
@@ -1468,6 +1477,15 @@ async fn fix_match_unmatch_and_manual_identification() {
         .await
         .unwrap();
     assert_eq!(state, "unmatched");
+    // A retired work takes no new identity.
+    let retired: String = sqlx::query_scalar("SELECT alias_id FROM item_aliases LIMIT 1")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(matches!(
+        matching::identify_manually(&f.app, &retired, "tmdb:movie", "5").await,
+        Err(matching::MatchingError::NotFound)
+    ));
     matching::identify_manually(&f.app, "heat", "tmdb:movie", "1")
         .await
         .unwrap();
@@ -1575,6 +1593,24 @@ async fn markers_are_fenced_on_the_timeline_and_resolved_by_provenance() {
         effective[0].id, detected,
         "the detected marker becomes effective"
     );
+    // Changing the timeline makes older markers ineffective.
+    sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id='film-ed'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(
+        playscale::markers::list(&f.app.db, "film-ed", true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        playscale::markers::list(&f.app.db, "film-ed", false)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1605,4 +1641,58 @@ async fn replaced_files_do_not_supply_component_evidence() {
         .await
         .unwrap();
     assert!(components.is_empty(), "{components:?}");
+}
+
+#[tokio::test]
+async fn reconciliation_plans_round_trip_and_metadata_refreshes_on_demand() {
+    let f = Fixture::new().await;
+    f.write("one.mkv", b"one");
+    f.write("two.mkv", b"two");
+    f.scan().await;
+    let (_, one, ..) = f.file("one.mkv").await;
+    let (_, two, ..) = f.file("two.mkv").await;
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in [&one, &two] {
+        let a = playscale::curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.clone(), a.work.revision);
+    }
+    drop(conn);
+    let merge = playscale::curation::preview_merge(
+        &f.app.db,
+        &playscale_core::identity::MergeRequest {
+            sources: vec![one.clone()],
+            target: two.clone(),
+            expected,
+        },
+    )
+    .await
+    .unwrap();
+    // The plan survives a serialization round trip (the token payload).
+    let token = serde_json::to_string(&playscale::curation::CatalogPlan::Merge(merge)).unwrap();
+    let plan: playscale::curation::CatalogPlan = serde_json::from_str(&token).unwrap();
+    let (survivor, receipt) = playscale::curation::commit_reconciliation(&f.app, &plan)
+        .await
+        .unwrap();
+    assert_eq!(survivor, two);
+    assert_eq!(receipt.kind, "catalog:merge");
+    assert!(
+        playscale::curation::commit_reconciliation(&f.app, &plan)
+            .await
+            .is_err(),
+        "no replay"
+    );
+
+    // A sidecar added later is picked up by an on-demand refresh, no scan.
+    f.write("two.nfo", b"<movie><title>Refreshed</title></movie>");
+    assert_eq!(playscale::nfo::refresh_item(&f.app, &two).await.unwrap(), 2);
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id=?")
+        .bind(&two)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(title, "Refreshed");
 }

@@ -106,32 +106,49 @@ pub async fn delete(app: &App, id: &str, expected_revision: u64) -> Result<(), M
     Ok(())
 }
 
-/// All markers of a timeline (`effective = false`) or the effective view.
+/// All markers of a timeline (`effective = false`) or the effective view for
+/// the timeline's current revision. One read snapshot.
 pub async fn list(
     db: &SqlitePool,
     timeline: &str,
     effective: bool,
 ) -> Result<Vec<Marker>, MarkersError> {
-    type Row = (String, String, i64, Option<i64>, Option<String>, String);
+    let storage = |e: std::num::TryFromIntError| MarkersError::Storage(e.into());
+    let mut tx = db.begin().await?;
+    let current: i64 = sqlx::query_scalar("SELECT revision FROM timelines WHERE id=?")
+        .bind(timeline)
+        .fetch_one(&mut *tx)
+        .await?;
+    type Row = (
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        String,
+        i64,
+    );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id,kind,start_ms,end_ms,label,provenance FROM markers WHERE timeline_id=? ORDER BY start_ms,id",
+        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision FROM markers WHERE timeline_id=? ORDER BY start_ms,id",
     )
     .bind(timeline)
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut markers = Vec::with_capacity(rows.len());
-    for (id, kind, start, end, label, provenance) in rows {
+    for (id, kind, start, end, label, provenance, recorded) in rows {
         markers.push(Marker {
             id,
             kind: value(&kind)?,
-            start_ms: u64::try_from(start).map_err(|e| MarkersError::Storage(e.into()))?,
+            start_ms: u64::try_from(start).map_err(storage)?,
             end_ms: end.and_then(|e| u64::try_from(e).ok()),
             label,
             provenance: value(&provenance)?,
+            timeline_revision: u64::try_from(recorded).map_err(storage)?,
         });
     }
     Ok(if effective {
-        core::effective(&markers)
+        core::effective(&markers, u64::try_from(current).map_err(storage)?)
     } else {
         markers
     })

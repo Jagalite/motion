@@ -1452,3 +1452,25 @@ async fn timelines_of_editions(
     }
     Ok(out)
 }
+
+/// A reviewed catalog change plan (the payload behind a public plan token;
+/// signing and expiry belong to the HTTP layer, and commit rechecks every
+/// recorded revision regardless).
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogPlan {
+    Merge(MergePlan),
+    Split(SplitPlan),
+}
+
+/// Commit a reviewed merge or split plan; returns the surviving or original
+/// work ID and the receipt.
+pub async fn commit_reconciliation(
+    app: &App,
+    plan: &CatalogPlan,
+) -> Result<(String, Receipt), CurationError> {
+    match plan {
+        CatalogPlan::Merge(merge) => Ok((merge.target.clone(), commit_merge(app, merge).await?)),
+        CatalogPlan::Split(split) => Ok((split.item.clone(), commit_split(app, split).await?)),
+    }
+}

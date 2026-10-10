@@ -178,3 +178,36 @@ async fn withdraw(
     }
     Ok(())
 }
+
+/// On-demand metadata refresh for one work without a full scan: re-observe
+/// the sidecars beside its available files (outside the writer) and publish
+/// them in one writer transaction. Returns how many files were observed.
+pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize> {
+    let files: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT f.id,f.relative_path,l.root FROM media_files f JOIN editions e ON e.id=f.edition_id JOIN libraries l ON l.id=f.library_id WHERE e.item_id=? AND f.available=1 AND f.generated=0 AND l.enabled=1 ORDER BY f.id",
+    )
+    .bind(item)
+    .fetch_all(&app.db)
+    .await?;
+    let observed = tokio::task::spawn_blocking(move || {
+        let mut budget = SCAN_BUDGET;
+        files
+            .into_iter()
+            .map(|(id, relative, root)| {
+                let sidecar = read(Path::new(&root), &relative, &mut budget);
+                (id, sidecar)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    for (file, sidecar) in &observed {
+        // A file may have changed works since it was read; publish against
+        // its current work (publish looks it up inside this transaction).
+        publish(&mut tx, file, sidecar).await?;
+    }
+    crate::search::refresh(&mut tx, 100).await?;
+    tx.commit().await?;
+    Ok(observed.len())
+}
