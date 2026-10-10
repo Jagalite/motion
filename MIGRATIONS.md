@@ -31,5 +31,7 @@ applying any pending migration to an existing database.
 | 0030 | `0030_markers.sql` | A04 | timeline markers |
 | 0031 | `0031_search_origin_titles.sql` | A09 | reindex when an origin title is replaced |
 
+The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
+
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.

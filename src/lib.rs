@@ -31,6 +31,7 @@ pub mod storage;
 pub mod upgrade;
 pub mod v2;
 pub mod viewing;
+pub mod watch;
 
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, Semaphore};

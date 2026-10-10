@@ -142,9 +142,22 @@ fn inventory(
     exclusions: &[String],
     stop: &CancellationToken,
 ) -> anyhow::Result<Inventory> {
+    inventory_with(root, exclusions, stop, FILE_LIMIT, &|_, meta| device(meta))
+}
+
+/// `inventory` with an explicit file limit and device observation (given the
+/// relative path and its metadata), so real-filesystem tests can exercise the
+/// file cap and mount boundaries without 100k files or a mounted volume.
+fn inventory_with(
+    root: &Path,
+    exclusions: &[String],
+    stop: &CancellationToken,
+    file_limit: usize,
+    device_of: &dyn Fn(&Path, &std::fs::Metadata) -> u64,
+) -> anyhow::Result<Inventory> {
     let out_of_scope =
         |path: &Path| key(path).is_some_and(|k| playscale_core::sources::excluded(&k, exclusions));
-    let root_device = device(&std::fs::symlink_metadata(root)?);
+    let root_device = device_of(Path::new(""), &std::fs::symlink_metadata(root)?);
     let mut out = Inventory::default();
     let mut pending = vec![PathBuf::new()];
     let mut first = true;
@@ -182,7 +195,7 @@ fn inventory(
             };
             if kind.is_dir() {
                 match entry.metadata() {
-                    Ok(meta) if device(&meta) == root_device => pending.push(child),
+                    Ok(meta) if device_of(&child, &meta) == root_device => pending.push(child),
                     Ok(_) => {
                         if let Some(dir) = key(&child) {
                             out.incomplete.insert(dir, "mount_boundary");
@@ -201,7 +214,7 @@ fn inventory(
                 // An unobservable sidecar leaves its directory unproven, so
                 // previously recorded sidecars there are retained.
                 match (child.file_name().and_then(|n| n.to_str()), entry.metadata()) {
-                    _ if subtitle_count >= FILE_LIMIT => reason = Some("file_limit"),
+                    _ if subtitle_count >= file_limit => reason = Some("file_limit"),
                     (Some(file), Ok(meta)) => {
                         subtitle_count += 1;
                         out.subtitles
@@ -218,7 +231,7 @@ fn inventory(
             }
             if key(&child).is_none() {
                 reason = Some("non_utf8_path");
-            } else if out.files.len() >= FILE_LIMIT {
+            } else if out.files.len() >= file_limit {
                 reason = Some("file_limit");
             } else {
                 out.files.push(child);
@@ -805,4 +818,81 @@ pub async fn configure(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn tree(paths: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for path in paths {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        dir
+    }
+    fn real_device(_: &Path, meta: &std::fs::Metadata) -> u64 {
+        device(meta)
+    }
+
+    #[test]
+    fn the_file_limit_leaves_overflow_and_unvisited_directories_unproven() {
+        let dir = tree(&[
+            "a/1.mkv", "a/2.mkv", "b/3.mkv", "b/4.mkv", "c/5.mkv", "top.mkv",
+        ]);
+        let stop = CancellationToken::new();
+        let found = inventory_with(dir.path(), &[], &stop, 3, &real_device).unwrap();
+        assert_eq!(found.files.len(), 3, "{:?}", found.files);
+        let incomplete: Vec<(&str, &str)> = found
+            .incomplete
+            .iter()
+            .map(|(d, r)| (d.as_str(), *r))
+            .collect();
+        assert!(
+            incomplete.iter().any(|(_, r)| *r == "file_limit"),
+            "{incomplete:?}"
+        );
+        // Every listed media file is either collected or in an unproven
+        // directory: nothing over the cap is presented as absent.
+        for file in [
+            "a/1.mkv", "a/2.mkv", "b/3.mkv", "b/4.mkv", "c/5.mkv", "top.mkv",
+        ] {
+            let parent = playscale_core::scan::parent(file);
+            assert!(
+                found.files.iter().any(|f| f.to_str() == Some(file))
+                    || found.incomplete.contains_key(parent),
+                "{file} neither collected nor unproven: {incomplete:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subtitles_are_capped_separately_and_leave_their_directory_unproven() {
+        let dir = tree(&["d/a.srt", "d/b.srt", "d/c.srt", "d/film.mkv"]);
+        let stop = CancellationToken::new();
+        let found = inventory_with(dir.path(), &[], &stop, 2, &real_device).unwrap();
+        assert_eq!(found.subtitles["d"].len(), 2);
+        assert_eq!(found.incomplete.get("d"), Some(&"file_limit"));
+        assert!(!found.complete.contains("d"));
+    }
+
+    #[test]
+    fn a_nested_mount_is_a_boundary_not_an_empty_directory() {
+        let dir = tree(&["film.mkv", "Mounted/inside.mkv", "Mounted/deeper/more.mkv"]);
+        let stop = CancellationToken::new();
+        let mounted = |path: &Path, meta: &std::fs::Metadata| {
+            if path.starts_with("Mounted") {
+                device(meta) + 1
+            } else {
+                device(meta)
+            }
+        };
+        let found = inventory_with(dir.path(), &[], &stop, FILE_LIMIT, &mounted).unwrap();
+        assert_eq!(found.files, [PathBuf::from("film.mkv")]);
+        assert_eq!(found.incomplete.get("Mounted"), Some(&"mount_boundary"));
+        assert!(found.complete.contains(""));
+        assert!(!found.complete.contains("Mounted") && !found.complete.contains("Mounted/deeper"));
+    }
 }

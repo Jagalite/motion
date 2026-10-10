@@ -493,3 +493,102 @@ async fn pre_split_database_backfills_stable_logical_library_ids() {
     assert_eq!(source.root_path, "/fixture/source");
     assert_eq!(source.volume_identity, "fixture-volume");
 }
+
+/// A real volume mounted over a scanned directory hides its files. The scan
+/// must treat the mount point as a boundary and keep the hidden files rather
+/// than withdrawing them (plan 7.5 "hidden mount"). macOS only: needs
+/// `hdiutil`, and skips (with a note) where a disk image cannot be attached.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_volume_mounted_over_a_scanned_directory_does_not_withdraw_its_files() {
+    use std::process::Command;
+    let f = Fixture::new().await;
+    let source = f.source("media", &[]).await;
+    let root = f.root("media");
+    std::fs::create_dir_all(root.join("Shows")).unwrap();
+    std::fs::write(root.join("film.mp4"), b"film").unwrap();
+    std::fs::write(root.join("Shows/episode.mp4"), b"episode").unwrap();
+    let first = f.scan(&source.id).await;
+    assert_eq!(first.phase, "completed");
+    let image = f.dir.path().join("empty.dmg");
+    let created = Command::new("hdiutil")
+        .args([
+            "create", "-quiet", "-size", "2m", "-fs", "HFS+", "-volname", "Empty",
+        ])
+        .arg(&image)
+        .status();
+    if !created.is_ok_and(|s| s.success()) {
+        eprintln!("skipping: hdiutil create unavailable");
+        return;
+    }
+    let attached = Command::new("hdiutil")
+        .args(["attach", "-quiet", "-nobrowse", "-mountpoint"])
+        .arg(root.join("Shows"))
+        .arg(&image)
+        .status();
+    if !attached.is_ok_and(|s| s.success()) {
+        eprintln!("skipping: hdiutil attach unavailable");
+        return;
+    }
+    struct Detach(PathBuf);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let _ = Command::new("hdiutil")
+                .args(["detach", "-quiet", "-force"])
+                .arg(&self.0)
+                .status();
+        }
+    }
+    let _detach = Detach(root.join("Shows"));
+    assert!(
+        !root.join("Shows/episode.mp4").exists(),
+        "the mount hides it"
+    );
+
+    let second = f.scan(&source.id).await;
+    assert!(second.incomplete_directories >= 1, "{second:?}");
+    let rows: Vec<(String, bool)> =
+        sqlx::query_as("SELECT relative_path,available FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("Shows/episode.mp4".to_string(), true),
+            ("film.mp4".to_string(), true)
+        ],
+        "the hidden file is retained, not withdrawn"
+    );
+}
+
+#[tokio::test]
+async fn a_source_with_active_processing_cannot_be_removed() {
+    let f = Fixture::new().await;
+    let source = f.source("busy", &[]).await;
+    std::fs::write(f.root("busy").join("film.mp4"), b"film").unwrap();
+    f.scan(&source.id).await;
+    let (file, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files WHERE library_id=?")
+            .bind(&source.id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO processing_jobs (id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) VALUES ('conv',?,?,'r','software','k','queued',1,1)")
+        .bind(&file)
+        .bind(&revision)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let view = libraries::get_source(&f.app.db, &source.id).await.unwrap();
+    assert!(matches!(
+        libraries::delete_source(&f.app, &source.id, view.revision).await,
+        Err(libraries::LibraryError::Busy)
+    ));
+    let available: bool = sqlx::query_scalar("SELECT available FROM media_files WHERE id=?")
+        .bind(&file)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(available, "the conversion's source stays available");
+}

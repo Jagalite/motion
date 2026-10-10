@@ -471,7 +471,9 @@ pub(crate) async fn delete_source_in(
     let next = core::advance(revision(current)?, expected_revision)?;
     let (members, active, files, demands): (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM library_sources WHERE source_id=?1),\
-                (SELECT count(*) FROM jobs WHERE library_id=?1 AND phase IN ('queued','running','cancelling')),\
+                (SELECT count(*) FROM jobs WHERE library_id=?1 AND phase IN ('queued','running','cancelling'))\
+                 +(SELECT count(*) FROM processing_jobs p JOIN media_files f ON f.id=p.source_file_id \
+                   WHERE f.library_id=?1 AND p.phase IN ('queued','running','cancelling')),\
                 (SELECT count(*) FROM media_files WHERE library_id=?1),\
                 (SELECT count(*) FROM scan_demands WHERE source_id=?1)",
     )
