@@ -744,3 +744,27 @@ FFmpeg/FFprobe tests with no skips, and
 passed. Tests used temporary databases/media/cache roots. Fresh executable
 linking and macOS loader startup were slow; superseded native runs were stopped
 and the affected integration checks were rerun on the final source.
+
+## A06/A07 seeded and mutation verification (2026-10-09)
+
+This closes the seeded-fuzz deferral above. Both seeded tests now run by default
+and require `CasesCompleted`, their exact case/transition counts, and zero
+skipped checks. Delivery's former 400,000-transition cap could stop its
+3,000-by-150 run early; it now permits and verifies all 450,000 transitions.
+Seed `20261009` passed 3,000 delivery cases / 450,000 transitions and 2,000 work
+cases / 200,000 transitions. These generated sequences found no violation;
+they do not exhaust the wider state space.
+
+The deterministic heartbeat boundary test passed for active and pending
+identities, positions 0, 60,000, 61,000, 61,001 and `u64::MAX` against a 60-second
+duration, exact lease expiry, and generation/lease rejection precedence. It
+asserts accepted lease/revision/playhead values and exact absence of effects.
+The production reducer is unchanged by this verification increment.
+
+`python3 scripts/check_execution_delivery_mutations.py` passed two baseline
+checks and detected four compiled regressions through the expected test failures:
+pending heartbeats replacing the active playhead, accepting out-of-range
+positions, renewing an expired lease, and releasing capacity on cancellation
+before worker exit. The script uses a temporary core-only workspace and isolated
+Cargo target; it rejects compile failures, missing tests, and timeouts as mutation
+evidence. This is a four-mutation sensitivity check, not a general mutation score.
