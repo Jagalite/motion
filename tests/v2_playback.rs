@@ -176,8 +176,12 @@ impl Fixture {
     }
 
     async fn scan(&self) {
+        self.scan_library(&self.library).await;
+    }
+
+    async fn scan_library(&self, library: &str) {
         let app = &self.server.app;
-        let row = db::enqueue_mode(app, &self.library, false).await.unwrap();
+        let row = db::enqueue_mode(app, library, false).await.unwrap();
         let stop = CancellationToken::new();
         let task = tokio::spawn(scan::worker(app.clone(), stop.clone()));
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -552,7 +556,6 @@ async fn original_playback_seek_resume_and_ordered_viewing() {
         .await;
     assert_eq!(session.status, StatusCode::CREATED, "{:?}", session.body);
     let sid = session.body["id"].as_str().unwrap().to_owned();
-    assert!(sid.ends_with(&format!("_{id}")), "{sid}");
     assert_eq!(session.body["delivery_id"], id);
     assert_eq!(session.body["timeline_id"], timeline);
     assert_eq!(session.body["sequence"], "0");
@@ -586,11 +589,18 @@ async fn original_playback_seek_resume_and_ordered_viewing() {
         .await;
     assert_eq!(dup.status, StatusCode::OK);
     assert_eq!(dup.body["duplicate"], true);
+    // The same sequence with other content, or a skipped sequence, is refused.
     problem(
         &f.post(&events, &auth, None, event("1", 7000, "playing", "1"))
             .await,
         StatusCode::CONFLICT,
-        "stale_sequence",
+        "event_conflict",
+    );
+    problem(
+        &f.post(&events, &auth, None, event("3", 7000, "playing", "1"))
+            .await,
+        StatusCode::CONFLICT,
+        "sequence_gap",
     );
     // A principal without the profile cannot write progress.
     let (_, kids_only) = f.device(&["kids"], PLAYER).await;
@@ -1040,13 +1050,32 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
 
     f.restart().await;
 
-    // The transport does not survive; the client must plan again.
-    problem(
-        &f.get(&format!("/api/v2/playback/delivery-sessions/{id}"), &auth)
-            .await,
-        StatusCode::NOT_FOUND,
-        "not_found",
+    // The transport does not survive; its owner reads the fenced state and
+    // must plan again. Closing it again is an acknowledged no-op.
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    let fenced = f.get(&path, &auth).await;
+    assert_eq!(fenced.status, StatusCode::OK, "{:?}", fenced.body);
+    assert!(
+        ["closed", "interrupted"].contains(&fenced.body["status"].as_str().unwrap()),
+        "{:?}",
+        fenced.body
     );
+    assert_eq!(fenced.body["timeline_id"], timeline);
+    problem(
+        &f.post(
+            &format!("{path}/heartbeat"),
+            &auth,
+            None,
+            json!({"active_generation":"1"}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "delivery_closed",
+    );
+    let closed = f
+        .call("DELETE", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.body);
     // A queued event from before the restart still drains with its binding.
     let drained = f
         .post(&events, &auth, None,
@@ -1171,4 +1200,536 @@ async fn revocation_and_source_changes_end_control_immediately() {
         StatusCode::FORBIDDEN,
         "permission_denied",
     );
+}
+
+/// Admit a fresh original delivery of `timeline` for `auth`.
+async fn admit_original(
+    f: &Fixture,
+    auth: &str,
+    timeline: &str,
+    key: &str,
+    start_ms: u64,
+) -> Value {
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            auth,
+            None,
+            plan_input("default", timeline, "auto", None, &["http_range"]),
+        )
+        .await;
+    assert_eq!(plan.body["status"], "ready", "{:?}", plan.body);
+    let d = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            auth,
+            Some(key),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": start_ms}),
+        )
+        .await;
+    assert_eq!(d.status, StatusCode::CREATED, "{:?}", d.body);
+    d.body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "30");
+    f.media(
+        "sequel.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-movflags",
+            "+faststart",
+        ],
+    );
+    f.scan().await;
+    let timelines: Vec<(String, String)> = sqlx::query_as(
+        "SELECT t.id,f.relative_path FROM timelines t JOIN media_files f ON f.edition_id=t.edition_id ORDER BY f.relative_path",
+    )
+    .fetch_all(&f.server.app.db)
+    .await
+    .unwrap();
+    let film = timelines
+        .iter()
+        .find(|t| t.1 == "film.mp4")
+        .unwrap()
+        .0
+        .clone();
+    let sequel = timelines
+        .iter()
+        .find(|t| t.1 == "sequel.mp4")
+        .unwrap()
+        .0
+        .clone();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let view_path = format!("/api/v2/profiles/default/timelines/{film}/viewing");
+
+    let first = admit_original(&f, &auth, &film, "rebind-admit-0001", 0).await;
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let session = f
+        .post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("rebind-viewing-0001"),
+            json!({"delivery_id": first_id, "expected_viewing_revision": "0"}),
+        )
+        .await;
+    assert_eq!(session.status, StatusCode::CREATED, "{:?}", session.body);
+    assert_eq!(session.body["manual_epoch"], "0");
+    assert_eq!(session.headers["etag"], "\"r-1\"");
+    let sid = session.body["id"].as_str().unwrap().to_owned();
+    let events = format!("/api/v2/playback/viewing-sessions/{sid}/events");
+    let event = |id: &str, seq: &str, position: u64, status: &str| {
+        json!({"event_id": id, "sequence": seq, "delivery_generation": "1",
+            "position_ms": position, "status": status})
+    };
+    let one = f
+        .post(&events, &auth, None, event("e1", "1", 5000, "playing"))
+        .await;
+    assert_eq!(one.status, StatusCode::OK, "{:?}", one.body);
+    // An event identity is used once per session.
+    problem(
+        &f.post(&events, &auth, None, event("e1", "2", 6000, "playing"))
+            .await,
+        StatusCode::CONFLICT,
+        "event_conflict",
+    );
+
+    // Rebind to a second delivery of the same timeline: same session identity,
+    // sequence and progress; the session revision is the precondition.
+    let second = admit_original(&f, &auth, &film, "rebind-admit-0002", 5000).await;
+    let second_id = second["id"].as_str().unwrap().to_owned();
+    let rebind = format!("/api/v2/playback/viewing-sessions/{sid}/delivery");
+    let body = json!({"delivery_id": second_id});
+    let missing = f
+        .call(
+            "PUT",
+            &rebind,
+            Some(body.clone()),
+            &[("authorization", &auth)],
+        )
+        .await;
+    problem(
+        &missing,
+        StatusCode::PRECONDITION_REQUIRED,
+        "precondition_required",
+    );
+    let stale = f
+        .call(
+            "PUT",
+            &rebind,
+            Some(body.clone()),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    problem(
+        &stale,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let tag = one.headers["etag"].to_str().unwrap().to_owned();
+    let moved = f
+        .call(
+            "PUT",
+            &rebind,
+            Some(body.clone()),
+            &[("authorization", &auth), ("if-match", &tag)],
+        )
+        .await;
+    assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
+    assert_eq!(moved.body["id"], sid);
+    assert_eq!(moved.body["delivery_id"], second_id);
+    assert_eq!(moved.body["sequence"], "1");
+    assert_eq!(moved.body["position_ms"], 5000);
+    let two = f
+        .post(&events, &auth, None, event("e2", "2", 6000, "playing"))
+        .await;
+    assert_eq!(two.status, StatusCode::OK, "{:?}", two.body);
+    assert_eq!(two.body["session"]["delivery_id"], second_id);
+
+    // A change key names one request: a different body under it is refused.
+    let changes = format!("/api/v2/playback/delivery-sessions/{second_id}/changes");
+    let seek = f
+        .post(
+            &changes,
+            &auth,
+            Some("rebind-change-0001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":8000}),
+        )
+        .await;
+    assert_eq!(seek.status, StatusCode::ACCEPTED, "{:?}", seek.body);
+    problem(
+        &f.post(
+            &changes,
+            &auth,
+            Some("rebind-change-0001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":9000}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
+
+    // A manual override advances the epoch and fences the session; an exact
+    // retry of an acknowledged event still replays.
+    let current = f.get(&view_path, &auth).await;
+    assert_eq!(current.body["revision"], two.body["viewing"]["revision"]);
+    let tag = current.headers["etag"].to_str().unwrap().to_owned();
+    let watched = f
+        .call(
+            "PUT",
+            &view_path,
+            Some(json!({"manual_watched": true, "reset_position": false})),
+            &[("authorization", &auth), ("if-match", &tag)],
+        )
+        .await;
+    assert_eq!(watched.status, StatusCode::OK, "{:?}", watched.body);
+    assert_eq!(watched.body["manual_epoch"], "1");
+    assert_eq!(watched.body["watched"], true);
+    assert_eq!(watched.body["session_id"], Value::Null);
+    assert_eq!(watched.body["position_ms"], 6000);
+    problem(
+        &f.post(&events, &auth, None, event("e3", "3", 7000, "playing"))
+            .await,
+        StatusCode::CONFLICT,
+        "superseded_session",
+    );
+    let retry = f
+        .post(&events, &auth, None, event("e2", "2", 6000, "playing"))
+        .await;
+    assert_eq!(retry.status, StatusCode::OK, "{:?}", retry.body);
+    assert_eq!(retry.body["duplicate"], true);
+    let fenced = f
+        .get(&format!("/api/v2/playback/viewing-sessions/{sid}"), &auth)
+        .await;
+    assert_eq!(fenced.body["status"], "superseded");
+    problem(
+        &f.call(
+            "PUT",
+            &rebind,
+            Some(body),
+            &[
+                ("authorization", &auth),
+                ("if-match", fenced.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "superseded_session",
+    );
+    let cont = f
+        .get("/api/v2/profiles/default/continue-watching", &auth)
+        .await;
+    assert_eq!(cont.body["items"], json!([]), "watched is not resumable");
+
+    // Clearing the override and the position is another epoch; a stale
+    // expected revision cannot start a session.
+    let tag = watched.headers["etag"].to_str().unwrap().to_owned();
+    let cleared = f
+        .call(
+            "PUT",
+            &view_path,
+            Some(json!({"manual_watched": null, "reset_position": true})),
+            &[("authorization", &auth), ("if-match", &tag)],
+        )
+        .await;
+    assert_eq!(cleared.status, StatusCode::OK, "{:?}", cleared.body);
+    assert_eq!(cleared.body["manual_epoch"], "2");
+    assert_eq!(cleared.body["position_ms"], 0);
+    assert_eq!(cleared.body["watched"], false);
+    problem(
+        &f.post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("rebind-viewing-0002"),
+            json!({"delivery_id": second_id, "expected_viewing_revision": "1"}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "viewing_revision_conflict",
+    );
+
+    // The profile's completion threshold drives automatic, sticky completion.
+    let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    let mut document = prefs.body.clone();
+    document["completion_percent"] = json!(50);
+    let replaced = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document.clone()),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    problem(
+        &f.call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await,
+        StatusCode::PRECONDITION_FAILED,
+        "precondition_failed",
+    );
+    let fresh = f
+        .post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("rebind-viewing-0003"),
+            json!({"delivery_id": second_id, "expected_viewing_revision": cleared.body["revision"]}),
+        )
+        .await;
+    assert_eq!(fresh.status, StatusCode::CREATED, "{:?}", fresh.body);
+    assert_eq!(fresh.body["manual_epoch"], "2");
+    let fresh_events = format!(
+        "/api/v2/playback/viewing-sessions/{}/events",
+        fresh.body["id"].as_str().unwrap()
+    );
+    let half = f
+        .post(
+            &fresh_events,
+            &auth,
+            None,
+            event("f1", "1", 16_000, "playing"),
+        )
+        .await;
+    assert_eq!(half.status, StatusCode::OK, "{:?}", half.body);
+    assert_eq!(half.body["viewing"]["watched"], true);
+    let back = f
+        .post(
+            &fresh_events,
+            &auth,
+            None,
+            event("f2", "2", 1_000, "paused"),
+        )
+        .await;
+    assert_eq!(
+        back.body["viewing"]["watched"], true,
+        "completion is sticky"
+    );
+
+    // Release order (fixture: timelines placed by direct SQL until a catalog
+    // placement writer is merged). Unplaced timelines have no next.
+    let next = |t: &str| format!("/api/v2/profiles/default/timelines/{t}/next");
+    let none = f.get(&next(&film), &auth).await;
+    assert_eq!(none.status, StatusCode::OK, "{:?}", none.body);
+    assert_eq!(none.body["items"], json!([]));
+    for (timeline, position) in [(&film, 3), (&sequel, 7)] {
+        sqlx::query(
+            "UPDATE timelines SET order_group_id='fixture-aired',order_position=? WHERE id=?",
+        )
+        .bind(position)
+        .bind(timeline)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    }
+    let ordered = f.get(&next(&film), &auth).await;
+    assert_eq!(ordered.body["items"][0]["id"], sequel, "{:?}", ordered.body);
+    assert_eq!(ordered.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(f.get(&next(&sequel), &auth).await.body["items"], json!([]));
+
+    // Conversions never exceed client limits; blocked plans pin nothing.
+    let mut limited = plan_input("default", &film, "convert", None, &["hls"]);
+    limited["quality"]["max_height"] = json!(120);
+    let blocked = f.post("/api/v2/playback/plans", &auth, None, limited).await;
+    assert_eq!(blocked.status, StatusCode::OK, "{:?}", blocked.body);
+    assert_eq!(blocked.body["status"], "blocked");
+    assert_eq!(
+        blocked.body["reason_codes"],
+        json!(["conversion_exceeds_quality_limit"])
+    );
+    for field in [
+        "plan_token",
+        "candidate_id",
+        "version_id",
+        "source",
+        "transport",
+        "operation",
+    ] {
+        assert_eq!(blocked.body[field], Value::Null, "{field}");
+    }
+    let mut capped = plan_input("default", &film, "convert", None, &["hls"]);
+    capped["quality"]["max_bitrate_bps"] = json!("50000000");
+    let capped = f.post("/api/v2/playback/plans", &auth, None, capped).await;
+    assert_eq!(
+        capped.body["reason_codes"],
+        json!(["conversion_exceeds_quality_limit"]),
+        "an uncapped encoder cannot promise a bitrate"
+    );
+}
+
+/// Migration 0032 attributes legacy work-keyed progress only where the
+/// timeline is certain: an exact legacy attribution, or a work with exactly
+/// one timeline. Ambiguous progress stays unattributed; legacy rows remain.
+#[tokio::test]
+async fn timeline_viewing_backfill_attributes_only_certain_progress() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(dir.path().join("db.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    let all = sqlx::migrate!("./migrations");
+    let mut before = sqlx::migrate!("./migrations");
+    before.migrations = all
+        .migrations
+        .iter()
+        .filter(|m| m.version < 32)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    before.run(&pool).await.unwrap();
+    for statement in [
+        // single: one timeline; split: two timelines (ambiguous); exact: two
+        // timelines with an exact legacy attribution to the second.
+        "INSERT INTO items(id,title,kind) VALUES ('single','S','video'),('split','P','video'),('exact','E','video')",
+        "INSERT INTO editions(id,item_id,label) VALUES ('single-e','single',''),('split-a','split',''),('split-b','split',''),('exact-a','exact',''),('exact-b','exact','')",
+        "INSERT INTO timelines(id,edition_id) VALUES ('single-t','single-e'),('split-ta','split-a'),('split-tb','split-b'),('exact-ta','exact-a'),('exact-tb','exact-b')",
+        "INSERT INTO progress(profile_id,item_id,position_seconds,updated_at) VALUES ('default','single',12.3456,100),('default','split',40,200),('default','exact',7.5,300)",
+        "INSERT INTO viewing_state(profile_id,item_id,automatic_watched,manual_watched) VALUES ('default','single',1,0)",
+        "INSERT INTO catalog_receipts(id,kind,created_at,document_json) VALUES ('r','legacy',0,'{}')",
+        "INSERT INTO legacy_progress_attribution(profile_id,item_id,outcome,timeline_id,candidates_json,receipt_id) VALUES ('default','exact','exact','exact-tb','[]','r'),('default','split','ambiguous',NULL,'[]','r')",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    all.run(&pool).await.unwrap();
+    let rows: Vec<(String, i64, bool, Option<bool>, i64, i64)> = sqlx::query_as(
+        "SELECT timeline_id,position_ms,automatic_watched,manual_watched,revision,updated_at FROM timeline_viewing ORDER BY timeline_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("exact-tb".into(), 7500, false, None, 0, 300),
+            ("single-t".into(), 12346, true, Some(false), 0, 100),
+        ]
+    );
+    let legacy: i64 = sqlx::query_scalar("SELECT count(*) FROM progress")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy, 3, "legacy rows are retained");
+}
+
+/// A timeline whose original versions sit in two libraries plays for a
+/// principal granted either library: an unreadable first copy is skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn planning_skips_originals_outside_the_callers_scope() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    f.scan().await;
+    let other_root = f.dir.path().join("other");
+    std::fs::create_dir(&other_root).unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-t",
+            "8",
+        ])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(other_root.join("cut.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let other = db::add_library(&f.server.app.db, "Other", &other_root)
+        .await
+        .unwrap()
+        .id;
+    f.scan_library(&other).await;
+    // Fixture: make the second library's file another original version of
+    // the first library's timeline (an operator edition reassignment).
+    let db = &f.server.app.db;
+    let (timeline, edition): (String, String) = sqlx::query_as(
+        "SELECT t.id,t.edition_id FROM timelines t JOIN media_files f ON f.edition_id=t.edition_id WHERE f.relative_path='film.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let (file, version): (String, String) = sqlx::query_as(
+        "SELECT f.id,b.version_id FROM media_files f JOIN version_files b ON b.file_id=f.id WHERE f.relative_path='cut.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media_files SET edition_id=? WHERE id=?")
+        .bind(&edition)
+        .bind(&file)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_versions SET timeline_id=? WHERE id=?")
+        .bind(&timeline)
+        .bind(&version)
+        .execute(db)
+        .await
+        .unwrap();
+    for (library, expected) in [(f.library.clone(), "film.mp4"), (other.clone(), "cut.mp4")] {
+        let (device, auth) = f.device(&["default"], PLAYER).await;
+        f.policy(&device, &[library.as_str()], PLAYER, "\"r-2\"")
+            .await;
+        let plan = f
+            .post(
+                "/api/v2/playback/plans",
+                &auth,
+                None,
+                plan_input("default", &timeline, "auto", None, &["http_range"]),
+            )
+            .await;
+        assert_eq!(plan.status, StatusCode::OK, "{:?}", plan.body);
+        assert_eq!(plan.body["status"], "ready", "{:?}", plan.body);
+        let path: String = sqlx::query_scalar("SELECT relative_path FROM media_files WHERE id=?")
+            .bind(plan.body["source"]["file_id"].as_str().unwrap())
+            .fetch_one(db)
+            .await
+            .unwrap();
+        assert_eq!(path, expected);
+    }
 }

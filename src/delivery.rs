@@ -30,8 +30,14 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
-/// Concurrent delivery sessions. Each may briefly run two encoders while overlapping.
+/// Concurrent encoding delivery sessions. Each may briefly run two encoders
+/// while overlapping.
 pub const MAX_SESSIONS: usize = 4;
+/// Concurrent byte-route (original) deliveries. They run no encoder; the bound
+/// only limits the memory and lease bookkeeping this process holds.
+pub const MAX_BYTE_SESSIONS: usize = 64;
+/// Change acknowledgements a delivery keeps for exact retries.
+const MAX_CHANGE_RECEIPTS: usize = 64;
 /// Bound owned admission tasks, including requests whose HTTP waiters vanished.
 pub const MAX_ADMISSIONS: usize = 32;
 /// Requested segment length; keyframes are forced on this cadence.
@@ -52,6 +58,8 @@ pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
+/// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
+pub const LIVE_MAX_HEIGHT: u32 = 720;
 /// Copied segments end at source keyframes; GOPs up to this long are served.
 pub const COPY_TARGET_SECONDS: u64 = 12;
 
@@ -110,6 +118,11 @@ struct Inner {
     delivery: Delivery,
     /// Cancellation for each generation worker that may still be running.
     workers: HashMap<u64, WorkerControl>,
+    /// Acknowledged v2 changes by (principal, idempotency key): request digest
+    /// and acknowledged view, recorded under this lock with the transition
+    /// they acknowledge. They are exactly as durable as the staged generation
+    /// (a restart interrupts the delivery and both). Oldest first.
+    changes: std::collections::VecDeque<((String, String), String, serde_json::Value)>,
 }
 
 /// Control of one generation worker: cancellation and pacing (true = paused).
@@ -162,6 +175,24 @@ impl Runtime {
     pub fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
+    /// Live (encoding, byte-route) deliveries. A delivery whose generations
+    /// include a segmented one counts as encoding.
+    fn counts(&self) -> (usize, usize) {
+        let sessions = self.sessions.lock().unwrap();
+        let encoding = sessions
+            .values()
+            .filter(|s| {
+                s.inner
+                    .lock()
+                    .unwrap()
+                    .delivery
+                    .generations
+                    .values()
+                    .any(|g| g.pin.operation.segmented())
+            })
+            .count();
+        (encoding, sessions.len() - encoding)
+    }
 }
 
 impl Session {
@@ -192,13 +223,23 @@ fn apply_if(
     if !current(&inner.delivery) {
         return Err(core::Error::GenerationConflict);
     }
-    let (next, effects) = core::transition(&inner.delivery, &input)?;
+    transition_locked(app, session, &mut inner, &input)
+}
+
+/// One reducer step with the session lock held by the caller.
+fn transition_locked(
+    app: &App,
+    session: &Arc<Session>,
+    inner: &mut Inner,
+    input: &Input,
+) -> Result<Delivery, core::Error> {
+    let (next, effects) = core::transition(&inner.delivery, input)?;
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
         persist(app, session, &next);
     }
     inner.delivery = next.clone();
-    dispatch(app, session, &mut inner, effects);
+    dispatch(app, session, inner, effects);
     Ok(next)
 }
 
@@ -1801,14 +1842,15 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
         && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
 }
 
-/// A stored original served by byte ranges: no recipe and no encoder. The
-/// browser presents the file's default streams; the pin records that choice.
-fn original_pin(file: &db::ItemRow, audio: Option<u32>) -> Pin {
+/// A stored representation (original or prepared rendition) served by byte
+/// ranges: no recipe and no encoder. The browser presents the file's default
+/// streams; the pin records that choice.
+fn byte_pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
     Pin {
         source_file: file.id.clone(),
         source_revision: file.revision.clone(),
         tracks: tracks(audio, None),
-        operation: Operation::Original,
+        operation,
         recipe_digest: None,
     }
 }
@@ -1962,6 +2004,7 @@ impl AdmissionAuthority for LegacyAdmin {
 /// the plan (`playback_session::admit`) inside the admission transaction.
 pub(crate) struct Planned {
     pub owner: Owner,
+    pub version: String,
     pub route: Route,
 }
 
@@ -2053,11 +2096,17 @@ pub(crate) fn activate_live(
     Ok(view(app, &session, &d))
 }
 
-pub(crate) async fn close_live(app: &App, id: &str) -> Result<(), ApiError> {
+/// Close a live delivery and record the fenced state through `conn` (the
+/// caller's write transaction, which holds the writer lock).
+pub(crate) async fn close_live(
+    app: &App,
+    id: &str,
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), ApiError> {
     let session = app.processing.deliveries.session(id)?;
     let state = apply(app, &session, Input::Close).map_err(error)?;
     record(
-        &app.db,
+        conn,
         &session.id,
         &session.file_id,
         &session.revision,
@@ -2083,8 +2132,13 @@ pub(crate) async fn change_live(
     expected_generation: &str,
     position_ms: u64,
     selection: Option<Selection>,
-) -> Result<DeliveryView, ApiError> {
+    receipt: &ChangeReceipt,
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(DeliveryView, bool), ApiError> {
     let session = app.processing.deliveries.session(id)?;
+    if let Some(view) = replayed_change(&session.inner.lock().unwrap(), receipt)? {
+        return Ok((view, true));
+    }
     let expected_generation = generation_number(expected_generation)?;
     let (basis, replan) = match selection {
         None => (None, None),
@@ -2100,7 +2154,7 @@ pub(crate) async fn change_live(
             let (basis, timeline) = basis.ok_or_else(|| error(core::Error::GenerationConflict))?;
             let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
                 .bind(&session.file_id)
-                .fetch_optional(&app.db)
+                .fetch_optional(&mut *conn)
                 .await?
                 .ok_or_else(ApiError::not_found)?;
             if file.revision != session.revision {
@@ -2110,7 +2164,8 @@ pub(crate) async fn change_live(
                 ));
             }
             let pin = match selection.route {
-                Route::Original => original_pin(&file, selection.audio),
+                Route::Original => byte_pin(&file, selection.audio, Operation::Original),
+                Route::Prepared => byte_pin(&file, selection.audio, Operation::Prepared),
                 Route::Transcode => {
                     validate_route(
                         &file,
@@ -2132,29 +2187,107 @@ pub(crate) async fn change_live(
             (Some(basis), Some((timeline, pin)))
         }
     };
-    let d = apply_if(
-        app,
-        &session,
-        |d| {
-            basis.as_ref().is_none_or(|basis| {
-                d.pending
-                    .or(d.active)
-                    .and_then(|n| d.generations.get(&n))
-                    .is_some_and(|g| &g.pin == basis)
-            })
-        },
-        Input::Change {
-            expected_generation,
-            position_ms,
-            replan,
-            // A byte route has no worker; a software transcode overlaps when
-            // another interactive worker is admissible now.
-            overlap: app.processing.execution.fits_now(Class::Interactive, 1),
-            now_ms: app.processing.deliveries.now_ms(),
-        },
+    let input = Input::Change {
+        expected_generation,
+        position_ms,
+        replan,
+        // A byte route has no worker; a software transcode overlaps when
+        // another interactive worker is admissible now.
+        overlap: app.processing.execution.fits_now(Class::Interactive, 1),
+        now_ms: app.processing.deliveries.now_ms(),
+    };
+    // The receipt is checked again and recorded under the same lock as the
+    // transition: a retry either replays this acknowledgement or, if the first
+    // attempt never reached the reducer, applies the change once.
+    let mut inner = session.inner.lock().unwrap();
+    if let Some(view) = replayed_change(&inner, receipt)? {
+        return Ok((view, true));
+    }
+    let d = &inner.delivery;
+    let current = basis.as_ref().is_none_or(|basis| {
+        d.pending
+            .or(d.active)
+            .and_then(|n| d.generations.get(&n))
+            .is_some_and(|g| &g.pin == basis)
+    });
+    if !current {
+        return Err(error(core::Error::GenerationConflict));
+    }
+    let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
+    let acknowledged = view(app, &session, &d);
+    if inner.changes.len() >= MAX_CHANGE_RECEIPTS {
+        inner.changes.pop_front();
+    }
+    inner.changes.push_back((
+        (receipt.principal.clone(), receipt.key.clone()),
+        receipt.digest.clone(),
+        serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
+    ));
+    Ok((acknowledged, false))
+}
+
+/// Identity of a v2 change request: principal, Idempotency-Key, body digest.
+pub(crate) struct ChangeReceipt {
+    pub principal: String,
+    pub key: String,
+    pub digest: String,
+}
+
+/// The acknowledgement of an exact retry; a conflict when the key named a
+/// different request.
+fn replayed_change(inner: &Inner, r: &ChangeReceipt) -> Result<Option<DeliveryView>, ApiError> {
+    let Some((_, digest, view)) = inner
+        .changes
+        .iter()
+        .find(|((p, k), _, _)| *p == r.principal && *k == r.key)
+    else {
+        return Ok(None);
+    };
+    if *digest != r.digest {
+        return Err(ApiError::conflict(
+            "idempotency_conflict",
+            "The Idempotency-Key was used with a different request",
+        ));
+    }
+    serde_json::from_value(view.clone())
+        .map(Some)
+        .map_err(ApiError::internal)
+}
+
+/// The v2 owner of a delivery: held live, or recorded at its admission.
+pub(crate) async fn owner(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<Owner>, ApiError> {
+    if let Some(owner) = live_owner(app, id) {
+        return Ok(Some(owner));
+    }
+    let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT principal_id,profile_id,timeline_id,file_id,file_revision FROM delivery_owners WHERE delivery_id=?",
     )
-    .map_err(error)?;
-    Ok(view(app, &session, &d))
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(
+        |(principal, profile, timeline, file, file_revision)| Owner {
+            principal,
+            profile,
+            timeline,
+            file,
+            file_revision,
+        },
+    ))
+}
+
+/// Current view of a delivery: live, or its last recorded (fenced) state.
+pub(crate) async fn any_view(app: &App, id: &str) -> Result<Option<DeliveryView>, ApiError> {
+    if let Some(view) = live_view(app, id) {
+        return Ok(Some(view));
+    }
+    Ok(recorded(app, id)
+        .await?
+        .map(|(file, revision, d)| view_of(app, id, &file, &revision, &d)))
 }
 
 /// Admission survives loss of its HTTP waiter. Authority is revalidated even for
@@ -2199,7 +2332,11 @@ async fn admit_owned(
     r: CreateRequest,
     planned: Option<Planned>,
 ) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
-    let original = planned.as_ref().is_some_and(|p| p.route == Route::Original);
+    // Byte routes (original or prepared) run no encoder.
+    let original = planned
+        .as_ref()
+        .is_some_and(|p| matches!(p.route, Route::Original | Route::Prepared));
+    let version = planned.as_ref().map(|p| p.version.clone());
     use playscale_core::delivery_admission::{self as admission, Decision, Identity, Receipt};
     use sha2::{Digest, Sha256};
     let runtime = &app.processing.deliveries;
@@ -2236,7 +2373,7 @@ async fn admit_owned(
             Sha256::digest(
                 match &planned {
                     None => serde_json::to_vec(&r),
-                    Some(p) => serde_json::to_vec(&(&r, &p.owner, p.route)),
+                    Some(p) => serde_json::to_vec(&(&r, &p.owner, &p.version, p.route)),
                 }
                 .expect("serializable request")
             )
@@ -2302,8 +2439,8 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    let operation = if original {
-        Operation::Original
+    let operation = if let Some(p) = planned.as_ref().filter(|_| original) {
+        p.route.operation()
     } else {
         r.operation
             .unwrap_or(LiveOperation::VideoTranscode)
@@ -2364,7 +2501,7 @@ async fn admit_owned(
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
         if original {
-            original_pin(&file, r.audio_track)
+            byte_pin(&file, r.audio_track, operation)
         } else {
             pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
         },
@@ -2377,7 +2514,7 @@ async fn admit_owned(
         id: new_id(),
         file_id: file.id.clone(),
         revision: file.revision.clone(),
-        owner: planned.map(|p| p.owner),
+        owner: planned.as_ref().map(|p| p.owner.clone()),
         source: Source {
             root: root.into(),
             relative: file.relative_path.clone().into(),
@@ -2387,10 +2524,13 @@ async fn admit_owned(
         inner: Mutex::new(Inner {
             delivery: delivery.clone(),
             workers: HashMap::new(),
+            changes: Default::default(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
     });
-    if runtime.sessions.lock().unwrap().len() >= MAX_SESSIONS {
+    // Byte routes run no encoder and do not consume encoding delivery slots.
+    let (encoding, bytes) = runtime.counts();
+    if (!original && encoding >= MAX_SESSIONS) || (original && bytes >= MAX_BYTE_SESSIONS) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "delivery_limit",
@@ -2407,6 +2547,19 @@ async fn admit_owned(
     )
     .await
     .map_err(ApiError::internal)?;
+    if let (Some(owner), Some(version)) = (&session.owner, &version) {
+        sqlx::query("INSERT INTO delivery_owners(delivery_id,principal_id,profile_id,timeline_id,version_id,file_id,file_revision,created_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(&session.id)
+            .bind(&owner.principal)
+            .bind(&owner.profile)
+            .bind(&owner.timeline)
+            .bind(version)
+            .bind(&owner.file)
+            .bind(&owner.file_revision)
+            .bind(crate::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     if let Some(identity) = identity {
         sqlx::query("INSERT INTO delivery_admissions(principal,request_key,request_digest,delivery_id,acknowledgement_json,created_at) VALUES (?,?,?,?,?,?)")
             .bind(identity.principal).bind(identity.key).bind(identity.digest).bind(&session.id)

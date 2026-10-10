@@ -140,13 +140,6 @@ async fn session(app: &App, p: &str, id: &str) -> Result<Session, ApiError> {
             .await?,
     )
 }
-/// A session by identity alone, for callers that authorize its profile.
-pub(crate) async fn session_by_id(app: &App, id: &str) -> Result<Option<Session>, ApiError> {
-    Ok(sqlx::query_as("SELECT * FROM playback_sessions WHERE id=?")
-        .bind(id)
-        .fetch_optional(&app.db)
-        .await?)
-}
 async fn file_state(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
@@ -520,23 +513,6 @@ pub async fn put_preferences(
     sqlx::query("INSERT INTO playback_preferences VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
         .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).execute(&app.db).await?;
     Ok(Json(prefs(&app, &p).await?))
-}
-
-/// Replace a profile's preferences at `expected_revision` (already validated).
-pub(crate) async fn store_preferences(
-    app: &App,
-    p: &str,
-    expected_revision: i64,
-    preferences: &Preferences,
-) -> Result<PreferenceState, ApiError> {
-    let _guard = app.jobs.lock().await;
-    let current = prefs(app, p).await?;
-    if playscale_core::revision::advance(current.revision, expected_revision).is_err() {
-        return Err(conflict("preferences_revision_conflict"));
-    }
-    sqlx::query("INSERT INTO playback_preferences VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
-        .bind(p).bind(current.revision+1).bind(serde_json::to_string(preferences).map_err(ApiError::internal)?).execute(&app.db).await?;
-    prefs(app, p).await
 }
 
 const AVAILABLE: &str = "(EXISTS(SELECT 1 FROM catalog_files f WHERE f.item_id=i.id AND f.available=1 AND f.generated=0) OR EXISTS(SELECT 1 FROM renditions r JOIN media_files f ON f.id=r.file_id JOIN media_files s ON s.id=r.source_file_id WHERE r.item_id=i.id AND f.available=1 AND f.revision=r.file_revision AND s.revision=r.source_revision))";

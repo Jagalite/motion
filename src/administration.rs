@@ -307,6 +307,9 @@ pub async fn remove_profile(
             .execute(&mut *tx)
             .await?;
     }
+    crate::v2::viewing::delete_profile(&mut tx, &id)
+        .await
+        .map_err(|p| ApiError::new(p.status, p.code, &p.detail))?;
     sqlx::query("DELETE FROM profiles WHERE id=?")
         .bind(id)
         .execute(&mut *tx)

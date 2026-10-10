@@ -81,9 +81,16 @@ pub(crate) async fn file_facts(
     let Some(revision) = revision else {
         return Ok(None);
     };
+    // A generated rendition lives in the managed output store, which is no
+    // logical library: it is in the libraries of the source it renders, while
+    // its registration still matches both current revisions. A stale or
+    // orphaned rendition is in no library and so readable by no grant.
     let library_ids = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id=?"
-    ).bind(file_id).fetch_all(conn).await?.into_iter().collect();
+        "SELECT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id=? AND f.generated=0 \
+         UNION SELECT ls.library_id FROM renditions r JOIN media_files g ON g.id=r.file_id AND g.revision=r.file_revision \
+         JOIN media_files s ON s.id=r.source_file_id AND s.revision=r.source_revision AND s.generated=0 \
+         JOIN library_sources ls ON ls.source_id=s.library_id WHERE r.file_id=? AND g.generated=1"
+    ).bind(file_id).bind(file_id).fetch_all(conn).await?.into_iter().collect();
     Ok(Some(FileFacts {
         library_ids,
         revision,

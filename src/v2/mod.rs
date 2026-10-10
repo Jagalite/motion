@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod organization;
 pub mod playback;
 pub mod system;
+pub mod viewing;
 
 use crate::App;
 use axum::{

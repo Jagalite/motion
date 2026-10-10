@@ -1144,6 +1144,7 @@ pub async fn delete_profile(
             .execute(&mut *tx)
             .await?;
     }
+    super::viewing::delete_profile(&mut tx, &id).await?;
     sqlx::query("DELETE FROM profiles WHERE id=?")
         .bind(&id)
         .execute(&mut *tx)

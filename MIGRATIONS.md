@@ -20,6 +20,8 @@ applying any pending migration to an existing database.
 | 0018 | `0018_delivery_sessions.sql` | A07 integration | delivery restart fencing; resolves the provisional 0015 collision before applying it in this integration |
 | 0019 | `0019_job_api_identity.sql` | A08 integration | persisted job requester and revisions; legacy requester stays unknown |
 | 0028 | `0028_delivery_admissions.sql` | A06/A07 | requested: idempotent delivery admission receipts (0020–0026 are claimed by open PR #4) |
+| 0032 | `0032_timeline_viewing.sql` | A07 | v2 timeline-keyed viewing state, viewing sessions and acknowledged events; backfill only from exact attributions or single-timeline works (allocated by the PR #4 owner; 0029–0031 are PR #4's) |
+| 0033 | `0033_delivery_owners.sql` | A07 | durable v2 delivery owner (principal, profile, timeline, version, source) |
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.
