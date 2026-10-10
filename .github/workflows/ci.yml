@@ -27,6 +27,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Install project Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy
+      - name: Install FFmpeg
+        # tests/server.rs requires ffprobe, and the delivery tests skip their
+        # media checks without these tools; the runner image has neither.
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
       - uses: actions/cache@v4
         with:
           path: |
@@ -84,7 +91,10 @@ jobs:
         with:
           node-version: '22'
       - name: Install FFmpeg
-        run: brew install ffmpeg
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
       - name: Install toolchains
         run: |
           rustup toolchain install 1.98.0 --profile minimal
