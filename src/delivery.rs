@@ -49,6 +49,8 @@ pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 /// Stream copy of H.264 with audio converted to stereo AAC.
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
+/// Hardware (VideoToolbox) transcode; never falls back to software encoding.
+pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
 /// Copied segments end at source keyframes; GOPs up to this long are served.
 pub const COPY_TARGET_SECONDS: u64 = 12;
 
@@ -368,6 +370,7 @@ const FFMPEG_LIST_SIZE: &str = "30";
 
 fn arguments(
     operation: Operation,
+    hardware: bool,
     start_ms: u64,
     audio: Option<u32>,
     directory: &FsPath,
@@ -413,18 +416,37 @@ fn arguments(
                 "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
                 "-pix_fmt",
                 "yuv420p",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-threads",
-                "2",
-                "-force_key_frames",
             ]
             .map(str::to_owned),
         );
+        if hardware {
+            // -allow_sw 0: fail rather than silently encode in software.
+            args.extend(
+                [
+                    "-c:v",
+                    "h264_videotoolbox",
+                    "-allow_sw",
+                    "0",
+                    "-realtime",
+                    "1",
+                    "-b:v",
+                    "2500k",
+                    "-maxrate",
+                    "2500k",
+                    "-bufsize",
+                    "5000k",
+                ]
+                .map(str::to_owned),
+            );
+        } else {
+            args.extend(
+                [
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", "2",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        args.push("-force_key_frames".into());
         args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
     }
     if copy {
@@ -926,6 +948,24 @@ async fn run_generation(
         }
     };
     let operation = pin.operation;
+    // A hardware encode also needs a hardware session, held exactly as long as
+    // the CPU reservation: released only after the encoder's exit is confirmed.
+    let hardware_lease = if pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE) {
+        let reserved = tokio::select! {
+            _ = stop.cancelled() => return stopped(&app, &session),
+            reserved = app.processing.hardware.reserve(
+                format!("delivery-hw:{}:{generation}", session.id),
+                Class::Interactive,
+                1,
+            ) => reserved,
+        };
+        match reserved {
+            Ok(lease) => Some(lease),
+            Err(_) => return fail(&app, &session),
+        }
+    } else {
+        None
+    };
     let directory = session.directory(&app, generation);
     let audio = pin
         .tracks
@@ -994,7 +1034,13 @@ async fn run_generation(
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(&app.processing.settings.ffmpeg)
-        .args(arguments(operation, start_ms, audio, &directory))
+        .args(arguments(
+            operation,
+            pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+            start_ms,
+            audio,
+            &directory,
+        ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1005,7 +1051,11 @@ async fn run_generation(
     if stop.is_cancelled() {
         return stopped(&app, &session);
     }
-    if let Err(error) = lease.started(&directory.join(".owner")) {
+    if let Err(error) = lease.started(&directory.join(".owner")).and_then(|()| {
+        hardware_lease.as_ref().map_or(Ok(()), |hardware| {
+            hardware.started(&directory.join(".owner"))
+        })
+    }) {
         tracing::warn!(%error, "delivery witness unreadable; refusing to spawn");
         return fail(&app, &session);
     }
@@ -1104,7 +1154,7 @@ async fn run_generation(
                 let _ = apply(&app, &session, Input::Failed { generation });
             }
             // Stopped only once every inheritor of the witness is gone.
-            execution::confirm_exit(
+            let confirmed = execution::confirm_exit(
                 &lease,
                 None,
                 Some(witness),
@@ -1112,10 +1162,14 @@ async fn run_generation(
                 move || stopped(&app2, &session2),
             )
             .await;
+            // The hardware session ends with the same, now confirmed, execution.
+            if confirmed && let Some(hardware) = &hardware_lease {
+                hardware.settled();
+            }
         }
         None => {
             // Closing the control pipe makes the supervisor terminate the group.
-            execution::confirm_exit(
+            let confirmed = execution::confirm_exit(
                 &lease,
                 Some(child),
                 Some(witness),
@@ -1123,6 +1177,10 @@ async fn run_generation(
                 move || stopped(&app2, &session2),
             )
             .await;
+            // The hardware session ends with the same, now confirmed, execution.
+            if confirmed && let Some(hardware) = &hardware_lease {
+                hardware.settled();
+            }
         }
     }
 }
@@ -1320,6 +1378,10 @@ pub struct CreateRequest {
     /// starting at zero (remux: AAC or no audio; audio_convert: non-AAC audio).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<LiveOperation>,
+    /// Encoder for video_transcode; omitted means software. videotoolbox is
+    /// macOS hardware encoding and fails rather than falling back to software.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<crate::processing::Backend>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1335,6 +1397,9 @@ pub struct ChangeRequest {
     /// Replace the live route; omitted keeps the current one.
     #[serde(default)]
     pub operation: Option<LiveOperation>,
+    /// Replace the transcode encoder; omitted keeps the current one.
+    #[serde(default)]
+    pub backend: Option<crate::processing::Backend>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1369,6 +1434,8 @@ pub struct GenerationView {
     /// The encoder is paused because its output is far enough ahead of the playhead.
     pub paused: bool,
     pub audio_track: Option<u32>,
+    /// software or videotoolbox for a transcode; null for stream copy.
+    pub backend: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1416,6 +1483,13 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                 operation: name(g.pin.operation),
                 complete: g.complete,
                 paused: g.paused,
+                backend: (g.pin.operation == Operation::VideoTranscode).then(|| {
+                    if g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE) {
+                        "videotoolbox".to_owned()
+                    } else {
+                        "software".to_owned()
+                    }
+                }),
                 audio_track: g
                     .pin
                     .tracks
@@ -1495,10 +1569,11 @@ fn tracks(audio: Option<u32>) -> Vec<String> {
     tracks
 }
 
-fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
+fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation, hardware: bool) -> Pin {
     let recipe = match operation {
         Operation::Remux => REMUX_RECIPE,
         Operation::AudioConvert => AUDIO_RECIPE,
+        _ if hardware => VIDEOTOOLBOX_RECIPE,
         _ => RECIPE,
     };
     Pin {
@@ -1508,6 +1583,31 @@ fn pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
         operation,
         recipe_digest: Some(recipe.into()),
     }
+}
+
+/// Whether a backend can run `operation` here. Hardware encoding is a transcode
+/// choice and only exists on macOS.
+fn validate_backend(
+    operation: Operation,
+    backend: &crate::processing::Backend,
+) -> Result<bool, ApiError> {
+    let hardware = *backend == crate::processing::Backend::Videotoolbox;
+    if hardware && (operation != Operation::VideoTranscode || !cfg!(target_os = "macos")) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "backend_unsupported",
+            "Hardware encoding is only available for video_transcode on macOS",
+        ));
+    }
+    Ok(hardware)
+}
+
+fn backend_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "backend_unavailable",
+        "This server cannot open a hardware encoder session",
+    )
 }
 
 fn pinned_audio(pin: &Pin) -> Option<u32> {
@@ -1686,6 +1786,9 @@ async fn admit_owned(
         }
         _ => None,
     };
+    // Probed once per process; outside the admission lock and the writer.
+    let hardware_ready = r.backend != Some(crate::processing::Backend::Videotoolbox)
+        || crate::processing::videotoolbox_available(app).await;
     let _admission = runtime.admission.lock().await;
     let mut transaction = db::begin_write(&app.db).await?;
     let principal = authority.reauthorize(&mut transaction, &r).await?;
@@ -1757,6 +1860,15 @@ async fn admit_owned(
         .unwrap_or(LiveOperation::VideoTranscode)
         .operation();
     let copy_details = copy_probe.transpose()?;
+    if !hardware_ready {
+        return Err(backend_unavailable());
+    }
+    let hardware = validate_backend(
+        operation,
+        r.backend
+            .as_ref()
+            .unwrap_or(&crate::processing::Backend::Software),
+    )?;
     if copy_details
         .as_ref()
         .is_some_and(|d| d.revision != file.revision)
@@ -1794,7 +1906,7 @@ async fn admit_owned(
     let (delivery, effects) = Delivery::admit(
         // The current catalog binds one timeline per edition.
         file.edition_id.clone(),
-        pin(&file, r.audio_track, operation),
+        pin(&file, r.audio_track, operation, hardware),
         r.start_ms,
         Some(duration_ms),
         runtime.now_ms(),
@@ -1926,9 +2038,9 @@ pub async fn change(
     let Ok(session) = app.processing.deliveries.session(&id) else {
         return Err(not_live(&app, &id).await);
     };
-    let replan = match (r.audio_track, r.operation) {
-        (None, None) => None,
-        (audio, operation) => {
+    let replan = match (r.audio_track, r.operation, r.backend.as_ref()) {
+        (None, None, None) => None,
+        (audio, operation, backend) => {
             // Unchanged parts of the newest selection carry over.
             let current = {
                 let inner = session.inner.lock().unwrap();
@@ -1941,6 +2053,20 @@ pub async fn change(
             let current = current.ok_or_else(|| error(core::Error::GenerationConflict))?;
             let audio = audio.unwrap_or_else(|| pinned_audio(&current));
             let operation = operation.map_or(current.operation, LiveOperation::operation);
+            let hardware = match backend {
+                Some(backend) => {
+                    let hardware = validate_backend(operation, backend)?;
+                    if hardware && !crate::processing::videotoolbox_available(&app).await {
+                        return Err(backend_unavailable());
+                    }
+                    hardware
+                }
+                // Keep the hardware choice only while transcoding.
+                None => {
+                    operation == Operation::VideoTranscode
+                        && current.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE)
+                }
+            };
             let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
                 .bind(&session.file_id)
                 .fetch_optional(&app.db)
@@ -1976,7 +2102,10 @@ pub async fn change(
             )?;
             Some((
                 current,
-                (file.edition_id.clone(), pin(&file, audio, operation)),
+                (
+                    file.edition_id.clone(),
+                    pin(&file, audio, operation, hardware),
+                ),
             ))
         }
     };
@@ -1986,6 +2115,18 @@ pub async fn change(
     let (basis, replan) = match replan {
         Some((basis, replan)) => (Some(basis), Some(replan)),
         None => (None, None),
+    };
+    // Whether the staged generation will need a hardware session.
+    let replan_hardware = match &replan {
+        Some((_, pin)) => pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+        None => {
+            let inner = session.inner.lock().unwrap();
+            let d = &inner.delivery;
+            d.pending
+                .or(d.active)
+                .and_then(|n| d.generations.get(&n))
+                .is_some_and(|g| g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE))
+        }
     };
     let d = apply_if(
         &app,
@@ -2002,8 +2143,10 @@ pub async fn change(
             expected_generation: generation_number(&r.expected_generation)?,
             position_ms: r.position_ms,
             replan,
-            // Overlap only when another interactive worker is admissible now.
-            overlap: app.processing.execution.fits_now(Class::Interactive, 1),
+            // Overlap only when another interactive worker (and, for a hardware
+            // encode, another hardware session) is admissible now.
+            overlap: app.processing.execution.fits_now(Class::Interactive, 1)
+                && (!replan_hardware || app.processing.hardware.fits_now(Class::Interactive, 1)),
             now_ms: app.processing.deliveries.now_ms(),
         },
     )

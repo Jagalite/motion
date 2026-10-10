@@ -97,6 +97,10 @@ pub struct Runtime {
     pub maintenance: tokio::sync::Mutex<()>,
     /// Shared encoder capacity; released only after confirmed worker termination.
     pub execution: Arc<crate::execution::Coordinator>,
+    /// Hardware encoder sessions, accounted like CPU capacity.
+    pub hardware: Arc<crate::execution::Coordinator>,
+    /// Whether this machine can open a VideoToolbox encoder session (probed once).
+    pub videotoolbox: tokio::sync::OnceCell<bool>,
     /// Executable that accepts `--internal-ffmpeg-supervisor`.
     pub supervisor: PathBuf,
     /// Live delivery sessions share the execution infrastructure.
@@ -110,6 +114,8 @@ impl Runtime {
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
             execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
+            hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
+            videotoolbox: tokio::sync::OnceCell::new(),
             supervisor: std::env::current_exe().unwrap_or_default(),
             deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
             root,
@@ -920,19 +926,75 @@ async fn finish(
     tx.commit().await?;
     Ok(())
 }
+/// Whether VideoToolbox can encode here: one tiny hardware-only encode, cached.
+/// macOS alone is not enough (virtual machines and some hosts lack sessions).
+pub async fn videotoolbox_available(app: &App) -> bool {
+    *app.processing
+        .videotoolbox
+        .get_or_init(|| async {
+            if !cfg!(target_os = "macos") {
+                return false;
+            }
+            let probe = Command::new(&app.processing.settings.ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=64x64:d=0.2",
+                    "-c:v",
+                    "h264_videotoolbox",
+                    "-allow_sw",
+                    "0",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status();
+            matches!(
+                tokio::time::timeout(Duration::from_secs(20), probe).await,
+                Ok(Ok(status)) if status.success()
+            )
+        })
+        .await
+}
+
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     loop {
         if stop.is_cancelled() {
             return Ok(());
         }
         // Hold no capacity while idle: only reserve when work is queued.
-        let queued: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM processing_jobs WHERE phase='queued' LIMIT 1")
-                .fetch_optional(&app.db)
-                .await?;
-        if queued.is_none() {
+        let queued: Option<String> = sqlx::query_scalar(
+            "SELECT backend FROM processing_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1",
+        )
+        .fetch_optional(&app.db)
+        .await?;
+        let Some(next_backend) = queued else {
             tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(500))=>{}}
             continue;
+        };
+        // A hardware session is reserved before the I/O permit too, so waiting for
+        // one never blocks maintenance.
+        let reserve_hardware = || {
+            app.processing.hardware.reserve(
+                format!("processing-hw:{}", new_id()),
+                playscale_core::work::Class::Preparation,
+                1,
+            )
+        };
+        let mut hardware = None;
+        if next_backend == "videotoolbox" {
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
         }
         // Reserve encoder capacity before any I/O permit, so a stuck previous worker
         // blocks replacement here without holding up maintenance.
@@ -961,6 +1023,16 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 None
             }
         };
+        if let Some(job) = job.as_ref().filter(|j| j.backend == "videotoolbox")
+            && hardware.is_none()
+        {
+            // The queue head changed since the peek; reserve now.
+            tracing::debug!(job_id=%job.id, "reserving hardware after selection");
+            hardware = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                lease = reserve_hardware() => Some(lease.map_err(|e| anyhow::anyhow!("hardware reservation rejected: {e:?}"))?),
+            };
+        }
         if let Some(job) = job {
             // Do not detach a blocked snapshot and start another job. The permit and this
             // waiter both remain until it finishes; cancellation is checked before FFmpeg.
@@ -972,6 +1044,16 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 tracing::warn!(job_id=%job.id,%error,"processing failed");
             }
             finish(&app, &job, result.ok()).await?;
+            // A stuck encoder keeps its hardware session too, until its witness frees.
+            if lease.is_stuck()
+                && let Some(hardware) = &hardware
+            {
+                let owner = app.processing.root.join(job.relative()).join(".owner");
+                match crate::execution::Witness::open(&owner) {
+                    Ok(witness) => hardware.stuck(witness.wait()),
+                    Err(_) => hardware.stuck(std::future::pending()),
+                }
+            }
             // A stuck attempt's directory holds its live witness: keep it for recovery.
             if load(&app, &job.id).await?.phase != "completed" && !lease.is_stuck() {
                 let directory = app.processing.root.join(job.relative());
@@ -985,6 +1067,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             }
         }
         drop(permit);
+        drop(hardware);
         drop(lease);
         tokio::select! {_=stop.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }

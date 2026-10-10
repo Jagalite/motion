@@ -1170,3 +1170,147 @@ async fn copy_routes_start_at_keyframes_and_keep_source_video() {
     .expect("copy route capacity was not released");
     f.stop.cancel();
 }
+
+/// Hardware live transcoding: the VideoToolbox recipe runs Apple's encoder (no
+/// libx264 signature in the bitstream), with forced segment keyframes.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn videotoolbox_live_transcode_uses_the_hardware_encoder() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "60",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+        ])
+        .arg(f.dir.path().join("media/clip.mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    f.scan().await;
+    let (file_id, revision): (String, String) =
+        sqlx::query_as("SELECT id,revision FROM media_files LIMIT 1")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    // Hardware encoding is a transcode choice only.
+    let (status, refused) = f
+        .json(
+            "POST",
+            "/api/v1/deliveries",
+            Some(json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":0,"operation":"remux","backend":"videotoolbox"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["code"], "backend_unsupported");
+    let mut signatures = Vec::new();
+    for backend in ["videotoolbox", "software"] {
+        let (status, created) = f
+            .json(
+                "POST",
+                "/api/v1/deliveries",
+                Some(json!({"file_id":file_id,"file_revision":revision,"start_ms":0,"audio_track":0,"backend":backend})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_str().unwrap().to_owned();
+        let ready = f.until(&id, |d| d["active"]["status"] == "active").await;
+        assert_eq!(ready["active"]["backend"], backend);
+        let base = format!("/api/v1/streams/{id}/1");
+        let playlist =
+            String::from_utf8(f.raw("GET", &format!("{base}/index.m3u8"), None).await.1).unwrap();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:6\n"), "{playlist}");
+        // Forced keyframes: wait for four segments, then check every one is about
+        // 4 s, bounded in size, and starts on a keyframe (independently decodable).
+        f.until(&id, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 16_000
+        })
+        .await;
+        let playlist =
+            String::from_utf8(f.raw("GET", &format!("{base}/index.m3u8"), None).await.1).unwrap();
+        let durations: Vec<f64> = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .filter_map(|l| l.trim_end_matches(',').parse().ok())
+            .collect();
+        assert!(durations.len() >= 4, "{playlist}");
+        assert!(
+            durations[..4].iter().all(|d| (3.9..=4.1).contains(d)),
+            "segments are not cut on the forced 4 s keyframes: {durations:?}"
+        );
+        let (_, init) = f.raw("GET", &format!("{base}/init.mp4"), None).await;
+        let mut bytes = init.clone();
+        for index in 0..4 {
+            let (status, segment) = f
+                .raw("GET", &format!("{base}/segments/{index}.m4s"), None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(segment.len() < 8 * 1024 * 1024, "segment {index} too large");
+            let fragment = f.dir.path().join(format!("{backend}-{index}.mp4"));
+            std::fs::write(&fragment, [init.clone(), segment.clone()].concat()).unwrap();
+            let first = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "packet=flags",
+                    "-of",
+                    "csv=p=0",
+                    "-read_intervals",
+                    "%+#1",
+                ])
+                .arg(&fragment)
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&first.stdout).starts_with('K'),
+                "segment {index} does not start on a keyframe"
+            );
+            if index == 0 {
+                bytes.extend(segment);
+            }
+        }
+        signatures.push(bytes.windows(4).any(|w| w == b"x264"));
+        let fragment = f.dir.path().join(format!("{backend}.mp4"));
+        std::fs::write(&fragment, &bytes).unwrap();
+        let streams = probe(&fragment)["streams"].as_array().unwrap().clone();
+        assert!(streams.iter().any(|s| s["codec_name"] == "h264"));
+        assert_eq!(
+            f.raw("DELETE", &format!("/api/v1/deliveries/{id}"), None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    // libx264 writes its signature into the bitstream; Apple's encoder does not.
+    assert_eq!(signatures, [false, true]);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("encoder capacity was not released");
+    f.stop.cancel();
+}

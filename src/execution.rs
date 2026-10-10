@@ -20,6 +20,12 @@ pub const BUDGET: Budget = Budget {
     units: 2,
     interactive_reserve: 1,
 };
+/// Concurrent hardware (VideoToolbox) encoder sessions, separate from CPU
+/// capacity: live delivery may use both, background encoding one.
+pub const HARDWARE_BUDGET: Budget = Budget {
+    units: 2,
+    interactive_reserve: 1,
+};
 /// How long the server waits for a supervisor to confirm termination before the
 /// reservation is classified as stuck. The supervisor's own SIGTERM grace is shorter.
 pub const TERMINATION_DEADLINE: Duration = Duration::from_secs(10);
@@ -252,7 +258,8 @@ impl Lease {
         *self.running.lock().unwrap() = Some(Witness::open(path)?);
         Ok(())
     }
-    fn settled(&self) {
+    /// The execution this lease covered has ended (confirmed by the caller).
+    pub fn settled(&self) {
         self.running.lock().unwrap().take();
     }
     /// Whether termination was not confirmed; a reaper now owns the release.
