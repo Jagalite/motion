@@ -1,0 +1,25 @@
+[package]
+name = "motion-ui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+description = "Motion Topcoat presentation: server-rendered pages over UiQueryFacade (A11)"
+
+[dependencies]
+# Pinned to the inspected source (research/TOPCOAT_RESEARCH.md [T0]). Explicit
+# minimum features: no reactive runtime, sessions, cookies, compression,
+# remote fonts/icons or asset downloads (plan sections 12.5, 14.3, 14.5).
+topcoat = { git = "https://github.com/tokio-rs/topcoat", rev = "341f3ff2fe16a73af5469685cf597693af5acb25", default-features = false, features = ["router", "view", "tower", "discover"] }
+axum = "=0.8.9"
+http = "1"
+tower-http = { version = "=0.7.1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

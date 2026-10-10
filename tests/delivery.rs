@@ -70,6 +70,10 @@ impl Fixture {
             event_streams: Arc::new(Semaphore::new(2)),
             storage: Arc::new(playscale::storage::Runtime::new(state, storage)),
             processing: Arc::new(processing),
+            access: Arc::new(playscale::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale::v2::auth::random_key(),
+            )),
         };
         playscale::delivery::recover(&app).await.unwrap();
         let stop = CancellationToken::new();

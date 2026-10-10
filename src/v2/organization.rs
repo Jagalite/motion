@@ -237,7 +237,7 @@ async fn visible_timelines(
     }
     let (clause, all, libraries) = scope_clause(scope, "f.library_id");
     Ok(sqlx::query_scalar(&format!(
-        "SELECT t.id FROM editions t WHERE t.id IN (SELECT value FROM json_each(?)) AND (? OR EXISTS(SELECT 1 FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE e.item_id=t.item_id AND {clause}))"
+        "SELECT t.id FROM timelines t JOIN editions owner ON owner.id=t.edition_id WHERE t.id IN (SELECT value FROM json_each(?)) AND (? OR EXISTS(SELECT 1 FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE e.item_id=owner.item_id AND {clause}))"
     ))
     .bind(serde_json::to_string(ids).map_err(Problem::internal)?)
     .bind(all)

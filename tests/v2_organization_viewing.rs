@@ -175,6 +175,7 @@ impl Fixture {
             "INSERT INTO items(id,title,kind) VALUES ('bare','C Bare','video')",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-film','film','Original')",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-show','show','Original')",
+            "INSERT INTO timelines(id,edition_id) VALUES ('t-film','t-film'), ('t-show','t-show')",
             "INSERT INTO profiles(id,name) VALUES ('kids','Kids')",
         ] {
             sqlx::query(sql).execute(&self.app.db).await.unwrap();

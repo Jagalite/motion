@@ -73,13 +73,19 @@ async fn file_facts(
     conn: &mut sqlx::SqliteConnection,
     file_id: &str,
 ) -> Result<Option<FileFacts>, Problem> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT library_id,revision FROM media_files WHERE id=? AND available=1")
+    let revision: Option<String> =
+        sqlx::query_scalar("SELECT revision FROM media_files WHERE id=? AND available=1")
             .bind(file_id)
-            .fetch_optional(conn)
+            .fetch_optional(&mut *conn)
             .await?;
-    Ok(row.map(|(library_id, revision)| FileFacts {
-        library_id,
+    let Some(revision) = revision else {
+        return Ok(None);
+    };
+    let library_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT ls.library_id FROM library_sources ls JOIN media_files f ON f.library_id=ls.source_id WHERE f.id=?"
+    ).bind(file_id).fetch_all(conn).await?.into_iter().collect();
+    Ok(Some(FileFacts {
+        library_ids,
         revision,
     }))
 }

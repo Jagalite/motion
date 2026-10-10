@@ -1,0 +1,44 @@
+{
+  "description": "Input snapshots used for the A08/A10 integration. Hashes describe input bytes, not the subsequently adapted files or a qualification receipt. Original worktrees were read only.",
+  "inputs": {
+    "sources": {
+      "head": "3c9c7a3ac9b53d93fee3751b3c1fa72b8a2c0ad0",
+      "patch_sha256": "2d052910e36c27bb76830d4f62e29c057582ac391b3c31a62f6468f250f3aeb3",
+      "files": {
+        "crates/core/src/sources.rs": "a975ca22a6f47ae778e7591dec05028ff19f98cb9fd52bdaa3e6b7deaf78b7a7",
+        "migrations/0017_library_sources.sql": "4f0237ac57eea865b653ee233f6b7264039f6cb9066e5d62eb8006c17c903552",
+        "src/libraries.rs": "c466549d905303bb9e5b60c8fe95c9fe5c1e2c5301f7b20e8d23b5e12bb5779a",
+        "tests/libraries.rs": "8349a13bb7c4ba9d2c12ef5b7b02fa7c14a7c74d0d5fa1f2b3eac1197cc1d54f"
+      },
+      "worktree": "playscale-a01-a04-a09"
+    },
+    "catalog": {
+      "head": "267a1731b1959333136e486db33d1473c4a14295",
+      "patch_sha256": "b675b41e6b482174394e541ce9ddae25dbfa3befa06c2d10deabb5e97e45de5d",
+      "files": {
+        "src/v2/catalog.rs": "a668ed0ab1f14247ab71b4a78041e88f146ab46df658344eb463171bd5fd2015",
+        "tests/v2_catalog.rs": "af0da81b873788d864aef0990ccccd5b71aff698bcdcf65a4ba3993bcd76db28"
+      },
+      "worktree": "playscale-a08-catalog"
+    },
+    "metadata": {
+      "head": "267a1731b1959333136e486db33d1473c4a14295",
+      "patch_sha256": "0a4e3b1064a6feeebe3655c74910ff0e49b29697f9ee90c636eee583ee10a54e",
+      "files": {
+        "src/v2/metadata.rs": "fca7ca16f5d32f4474cae209b706e8cce599d1df746cd94b43885552781954f9",
+        "tests/v2_metadata_processing.rs": "f56041bed16e1cec3909034ae730929a169e2d53382beb2092fe5f4c4c36696d"
+      },
+      "worktree": "playscale-a08-metadata-processing"
+    }
+  },
+  "topcoat": {
+    "branch": "web-desktop-a11-a12",
+    "base_commit": "3e9537d",
+    "note": "Imported motion-ui and UI bridge/assets; adapted the request-scoped facade and unavailable-state rendering locally.",
+    "viewing_snapshot_files": {
+      "packages/playback/viewing.mjs": "e323512dc6f7b891aad061ee2bf5494c0aeaf929b046d6010e8bc4cc50521228",
+      "packages/playback/viewing.test.mjs": "bd4540df260d989de56df67c2428a3a3eeb87a069650aab4bf5b35c3cd8f0580"
+    },
+    "viewing_snapshot_note": "These two unchanged files were copied from the A11/A12 working tree, not from base_commit."
+  }
+}
