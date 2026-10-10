@@ -105,11 +105,18 @@ python3 scripts/client.py http://127.0.0.1:8787
 ## Next architecture and API v2
 
 The [Motion architecture and implementation plan](Motion_Final_Architecture_and_Implementation_Plan.md)
-and [API v2 contract](contracts/Motion_Server_API_v2.yaml) describe the next
-implementation target. See the [implementation readiness review](MOTION_IMPLEMENTATION_READINESS.md)
-for checks performed, missing handoff artifacts, and the recommended first work.
-The supplied documents are preserved unchanged. Their referenced companion bundle
-was not included in this import.
+(design version 1.1.0, Topcoat revision) is the main design document. It and the
+[API v2 contract](contracts/Motion_Server_API_v2.yaml) describe the next
+implementation target; [Topcoat research](research/TOPCOAT_RESEARCH.md) records
+the frontend selection evidence. Version 1.1.0 replaces the React/Vite frontend
+decision with Topcoat; the Motion-owned catalog and native desktop host are
+unchanged. The [implementation readiness review](MOTION_IMPLEMENTATION_READINESS.md)
+was written against version 1.0.0 and lists checks performed, missing handoff
+artifacts, and the recommended first work. The supplied documents are preserved
+unchanged. Their referenced companion bundle (`CHANGELOG_TOPCOAT.md`,
+`contracts/TOPCOAT_PRESENTATION_CONTRACT.md`, `qualification/TOPCOAT_ACCEPTANCE.md`,
+`agents/`, `contracts/API_ENDPOINTS.md`, `qualification/PARITY_LEDGER.md`) was
+not included in this import.
 
 For the new implementation, use these documents for target architecture decisions;
 `DESIGN.md`, `IMPLEMENTATION_PLAN.md`, and `ROADMAP.md` retain earlier decisions and

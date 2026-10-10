@@ -704,7 +704,7 @@ snapshot is saved; a failed write leaves them available for retry. Intermediate
 snapshots are asynchronous and may lag. Restart applies the production core's
 `Interrupt` transition to recorded live sessions: it does not resume encoders or
 serve the previous process's manifests. Records expire after seven days at
-startup. Migration `0015` is provisional pending A02's numbering coordination.
+startup. Migration `0027` is provisional pending A02's numbering coordination.
 
 The production core owns generation identity, active-playhead acceptance,
 lease renewal, and lifecycle fencing. A pending generation's heartbeat renews
@@ -892,7 +892,7 @@ The v1 endpoint accepts an optional 16–128 byte Idempotency-Key in its existin
 legacy-admin scope. The service exposes a transactional authority callback for
 principal-specific integration. This is not the authenticated v2 plan endpoint:
 plan-token validation, wire-request identity and profile authorization remain
-integration work. Migration 0020 is a provisional A02 allocation request.
+integration work. Migration 0028 is a provisional A02 allocation request.
 
 The admission model exhausted 77 states and 1,078 transitions with zero skipped
 checks. Its finite domain includes two principals, two request digests, one key

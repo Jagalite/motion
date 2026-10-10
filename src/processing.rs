@@ -1382,7 +1382,7 @@ mod publication_tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
         let library = db::add_library(&pool, "fixture", dir.path()).await.unwrap();
-        sqlx::query("INSERT INTO items VALUES ('item','Fixture','video')")
+        sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
             .execute(&pool)
             .await
             .unwrap();

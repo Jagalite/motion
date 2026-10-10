@@ -1,0 +1,103 @@
+{
+  "description": "Hand-authored Motion catalog identity fixtures. Expected outcomes are written independently of the production decisions in crates/core/src/identity.rs; they are not upstream Catabolic evidence.",
+  "works": {
+    "film": {
+      "work": {"id": "film", "revision": 3, "external_ids": [["tmdb:movie", "603"]]},
+      "editions": [
+        {"id": "theatrical", "label": "Theatrical", "timelines": [
+          {"id": "theatrical-tl", "versions": [
+            {"id": "bluray-1080", "origin": "original", "equivalence": "declared", "bindings": [{"file_id": "f-1080", "revision": "sha-a", "part": 1, "start_ms": null, "end_ms": null}]},
+            {"id": "web-720", "origin": "original", "equivalence": "declared", "bindings": [{"file_id": "f-720", "revision": "sha-b", "part": 1, "start_ms": null, "end_ms": null}]}
+          ]}
+        ]},
+        {"id": "extended", "label": "Extended", "timelines": [
+          {"id": "extended-tl", "versions": [
+            {"id": "extended-v", "origin": "original", "equivalence": "declared", "bindings": [{"file_id": "f-ext", "revision": "sha-c", "part": 1, "start_ms": null, "end_ms": null}]}
+          ]}
+        ]}
+      ]
+    },
+    "film-duplicate": {
+      "work": {"id": "film-duplicate", "revision": 1, "external_ids": [["tmdb:movie", "603"], ["imdb:movie", "tt0133093"]]},
+      "editions": [
+        {"id": "dup-ed", "label": "Original", "timelines": [
+          {"id": "dup-tl", "versions": [
+            {"id": "dup-v", "origin": "original", "equivalence": "unknown", "bindings": [{"file_id": "f-dup", "revision": "sha-d", "part": 1, "start_ms": null, "end_ms": null}]}
+          ]}
+        ]}
+      ]
+    },
+    "other-film": {
+      "work": {"id": "other-film", "revision": 7, "external_ids": [["tmdb:movie", "604"]]},
+      "editions": []
+    }
+  },
+  "merge": [
+    {
+      "name": "duplicate work merges without merging cuts",
+      "request": {"sources": ["film-duplicate"], "target": "film", "expected": {"film": 3, "film-duplicate": 1}},
+      "aliases": {"older-id": "film-duplicate"},
+      "expected": {"ok": {
+        "target": "film",
+        "expected": {"film": 3, "film-duplicate": 1},
+        "moved_editions": [["dup-ed", "film-duplicate"]],
+        "retired": ["film-duplicate"],
+        "repointed_aliases": ["older-id"],
+        "external_ids": [["imdb:movie", "tt0133093"], ["tmdb:movie", "603"]],
+        "target_revision": 4,
+        "warnings": ["edition dup-ed keeps its own timelines and viewing history"]
+      }}
+    },
+    {
+      "name": "conflicting provider identity blocks the merge",
+      "request": {"sources": ["other-film"], "target": "film", "expected": {"film": 3, "other-film": 7}},
+      "aliases": {},
+      "expected": {"err": {"ExternalIdentityConflict": "tmdb:movie"}}
+    },
+    {
+      "name": "stale reviewed revision is a conflict",
+      "request": {"sources": ["film-duplicate"], "target": "film", "expected": {"film": 2, "film-duplicate": 1}},
+      "aliases": {},
+      "expected": {"err": {"StaleRevision": "film"}}
+    },
+    {
+      "name": "every participant revision is required",
+      "request": {"sources": ["film-duplicate"], "target": "film", "expected": {"film": 3}},
+      "aliases": {},
+      "expected": {"err": {"MissingExpectedRevision": "film-duplicate"}}
+    }
+  ],
+  "split": [
+    {
+      "name": "one encode leaves a shared timeline; history stays behind",
+      "item": "film",
+      "request": {"item": "film", "versions": ["web-720"], "new_title": " Mislabeled ", "expected_revision": 3},
+      "expected": {"ok": {
+        "item": "film", "expected_revision": 3, "new_item": "id-1", "new_title": "Mislabeled",
+        "moves": [{"Versions": {"from_timeline": "theatrical-tl", "new_edition": "id-2", "new_timeline": "id-3", "versions": ["web-720"]}}],
+        "warnings": ["viewing history remains on timeline theatrical-tl; the new timeline starts unwatched"]
+      }}
+    },
+    {
+      "name": "a whole cut moves as its own edition",
+      "item": "film",
+      "request": {"item": "film", "versions": ["extended-v"], "new_title": "Extended", "expected_revision": 3},
+      "expected": {"ok": {
+        "item": "film", "expected_revision": 3, "new_item": "id-1", "new_title": "Extended",
+        "moves": [{"Edition": {"edition": "extended"}}],
+        "warnings": []
+      }}
+    },
+    {
+      "name": "splitting every version is not a split",
+      "item": "film",
+      "request": {"item": "film", "versions": ["bluray-1080", "web-720", "extended-v"], "new_title": "All", "expected_revision": 3},
+      "expected": {"err": "SplitWouldEmptySource"}
+    }
+  ],
+  "legacy_progress": [
+    {"name": "one playable cut", "timelines": [["a", 1], ["b", 0]], "expected": {"outcome": "exact", "timeline": "a"}},
+    {"name": "two playable cuts", "timelines": [["a", 1], ["b", 2]], "expected": {"outcome": "ambiguous", "timelines": ["a", "b"]}},
+    {"name": "nothing playable", "timelines": [["a", 0]], "expected": {"outcome": "orphaned"}}
+  ]
+}

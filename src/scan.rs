@@ -7,6 +7,7 @@ use anyhow::Context;
 use playscale_core::jobs::{Effect, Input, Phase, transition};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Duration,
@@ -64,33 +65,138 @@ pub fn open_file(root: &Path, relative: &Path) -> anyhow::Result<std::fs::File> 
     Ok(file)
 }
 
-fn inventory(root: &Path, stop: &CancellationToken) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for entry in walkdir::WalkDir::new(root).follow_links(false).max_open(16) {
-        anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
-        let entry = entry?; // Any traversal failure aborts reconciliation; never mark an unreadable tree missing.
-        if !entry.file_type().is_file() {
-            continue;
+/// Media files beyond this count are not inspected; the attempt reports partial
+/// coverage instead of an apparently complete inventory.
+pub const FILE_LIMIT: usize = 100_000;
+/// Incomplete directories retained per attempt for diagnostics.
+const INCOMPLETE_REPORT_LIMIT: usize = 200;
+
+#[derive(Default)]
+pub struct Inventory {
+    pub files: Vec<PathBuf>,
+    pub complete: BTreeSet<String>,
+    pub incomplete: BTreeMap<String, &'static str>,
+}
+impl Inventory {
+    fn coverage(&self) -> playscale_core::scan::Coverage {
+        playscale_core::scan::Coverage::Listed {
+            complete: self.complete.clone(),
+            incomplete: self.incomplete.keys().cloned().collect(),
         }
-        let extension = entry
-            .path()
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ![
-            "mp4", "m4v", "mkv", "webm", "mov", "avi", "ts", "m2ts", "mp3", "m4a", "flac", "ogg",
-            "wav", "opus",
-        ]
-        .contains(&extension.as_str())
-        {
-            continue;
-        }
-        files.push(entry.path().strip_prefix(root)?.to_path_buf());
-        anyhow::ensure!(files.len() <= 100_000, "core scan limit exceeded");
     }
-    files.sort();
-    Ok(files)
+    /// A file that could not be inspected leaves its directory unproven.
+    fn uninspected(&mut self, relative: &Path) {
+        let file = relative.to_str().unwrap_or_default();
+        let dir = playscale_core::scan::parent(file).to_owned();
+        self.complete.remove(&dir);
+        self.incomplete.entry(dir).or_insert("inspection_failed");
+    }
+}
+
+fn key(relative: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = relative
+        .components()
+        .map(|c| c.as_os_str().to_str())
+        .collect();
+    parts.map(|p| p.join("/"))
+}
+fn device(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.dev()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+const MEDIA: [&str; 14] = [
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "ts", "m2ts", "mp3", "m4a", "flac", "ogg", "wav",
+    "opus",
+];
+
+/// Enumerate directories one complete listing at a time. Only the root listing is
+/// mandatory; any other failure leaves that directory (and what it would have
+/// proven) incomplete rather than aborting or implying absence. Symlinks are not
+/// followed and nested mounts are boundaries: an unmounted volume's empty mount
+/// point must never prove that its files disappeared.
+fn inventory(root: &Path, stop: &CancellationToken) -> anyhow::Result<Inventory> {
+    let root_device = device(&std::fs::symlink_metadata(root)?);
+    let mut out = Inventory::default();
+    let mut pending = vec![PathBuf::new()];
+    let mut first = true;
+    while let Some(relative) = pending.pop() {
+        anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
+        let Some(name) = key(&relative) else {
+            continue; // Non-UTF-8 directories hold no catalogable paths.
+        };
+        let listing = std::fs::read_dir(root.join(&relative))
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
+        let mut entries = match listing {
+            Ok(entries) => entries,
+            Err(error) if first => {
+                return Err(error).context("source root could not be listed");
+            }
+            Err(_) => {
+                out.incomplete.insert(name, "unreadable");
+                continue;
+            }
+        };
+        first = false;
+        entries.sort_by_key(|e| e.file_name());
+        let mut reason = None;
+        for entry in entries {
+            let child = relative.join(entry.file_name());
+            let Ok(kind) = entry.file_type() else {
+                reason = Some("unreadable_entry");
+                continue;
+            };
+            if kind.is_dir() {
+                match entry.metadata() {
+                    Ok(meta) if device(&meta) == root_device => pending.push(child),
+                    Ok(_) => {
+                        if let Some(dir) = key(&child) {
+                            out.incomplete.insert(dir, "mount_boundary");
+                        }
+                    }
+                    Err(_) => reason = Some("unreadable_entry"),
+                }
+                continue;
+            }
+            let extension = child
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !kind.is_file() || !MEDIA.contains(&extension.as_str()) {
+                continue;
+            }
+            if key(&child).is_none() {
+                reason = Some("non_utf8_path");
+            } else if out.files.len() >= FILE_LIMIT {
+                reason = Some("file_limit");
+            } else {
+                out.files.push(child);
+            }
+        }
+        match reason {
+            None => {
+                out.complete.insert(name);
+            }
+            Some(reason) => {
+                out.incomplete.insert(name, reason);
+            }
+        }
+        if reason == Some("file_limit") {
+            for dir in pending.drain(..).filter_map(|d| key(&d)) {
+                out.incomplete.insert(dir, "file_limit");
+            }
+        }
+    }
+    out.files.sort();
+    Ok(out)
 }
 
 pub(crate) async fn inspect(
@@ -249,7 +355,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         let _hold = hold;
         inventory(&inventory_path, &inventory_stop)
     });
-    let files = loop {
+    let mut inventory = loop {
         tokio::select! {
             result = &mut traversal => break result??,
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -272,7 +378,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         }
     }
     let mut found = Vec::new();
-    for relative in files {
+    for relative in std::mem::take(&mut inventory.files) {
         let current = db::get_job(&app.db, &job.id).await?;
         if shutdown.is_cancelled() || !current.state()?.executing(job.attempt.try_into()?) {
             stop.cancel();
@@ -282,25 +388,34 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
             let root = path.clone();
             let rel = relative.clone();
             let hold = permit.clone();
-            let reused = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Found>> {
-                let _hold = hold;
-                let file = open_file(&root, &rel)?;
-                let stamp = fingerprint(&file.metadata()?);
-                if stamp != row.fingerprint {
-                    return Ok(None);
-                }
-                Ok(Some(Found {
-                    relative: row.relative_path,
-                    title: row.title,
-                    revision: row.revision,
-                    fingerprint: stamp,
-                    bytes: row.bytes,
-                    duration: row.duration_seconds,
-                    tracks: serde_json::from_str(&row.tracks_json)?,
-                    reused: true,
-                }))
-            })
-            .await??;
+            let reused =
+                match tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Found>> {
+                    let _hold = hold;
+                    let file = open_file(&root, &rel)?;
+                    let stamp = fingerprint(&file.metadata()?);
+                    if stamp != row.fingerprint {
+                        return Ok(None);
+                    }
+                    Ok(Some(Found {
+                        relative: row.relative_path,
+                        title: row.title,
+                        revision: row.revision,
+                        fingerprint: stamp,
+                        bytes: row.bytes,
+                        duration: row.duration_seconds,
+                        tracks: serde_json::from_str(&row.tracks_json)?,
+                        reused: true,
+                    }))
+                })
+                .await?
+                {
+                    Ok(reused) => reused,
+                    Err(error) => {
+                        tracing::debug!(%error, "file could not be revalidated");
+                        inventory.uninspected(&relative);
+                        continue;
+                    }
+                };
             if let Some(file) = reused {
                 found.push(file);
                 continue;
@@ -308,7 +423,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         }
         let inspect = inspect(
             path.clone(),
-            relative,
+            relative.clone(),
             &app.ffprobe,
             stop.clone(),
             permit.clone(),
@@ -316,7 +431,18 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
         tokio::pin!(inspect);
         loop {
             tokio::select! {
-                result = &mut inspect => { found.push(result?); break; }
+                result = &mut inspect => {
+                    match result {
+                        Ok(file) => found.push(file),
+                        Err(error) if stop.is_cancelled() || shutdown.is_cancelled() => return Err(error),
+                        // One unreadable or changing file leaves only its directory unproven.
+                        Err(error) => {
+                            tracing::debug!(%error, "file could not be inspected");
+                            inventory.uninspected(&relative);
+                        }
+                    }
+                    break;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let current = db::get_job(&app.db, &job.id).await?;
                     if shutdown.is_cancelled() || !current.state()?.executing(job.attempt.try_into()?) {
@@ -334,13 +460,13 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
     })
     .await??;
     let complete_root = Some((identity, final_identity));
-    finish(app, job, Some(found), complete_root).await
+    finish(app, job, Some((found, inventory)), complete_root).await
 }
 
 async fn finish(
     app: &App,
     job: &JobRow,
-    found: Option<Vec<Found>>,
+    found: Option<(Vec<Found>, Inventory)>,
     complete_root: Option<(String, String)>,
 ) -> anyhow::Result<()> {
     let _guard = app.jobs.lock().await;
@@ -364,15 +490,17 @@ async fn finish(
         return Ok(());
     }
     let mut tx = crate::db::begin_write(&app.db).await?;
-    if effects.iter().any(|e| matches!(e, Effect::Publish { .. })) {
-        let files = found.unwrap_or_default();
+    if effects.iter().any(|e| matches!(e, Effect::Publish { .. }))
+        && let Some((files, inventory)) = found
+    {
+        let coverage = inventory.coverage();
         let old: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT id,edition_id,relative_path,revision FROM media_files WHERE library_id=?",
         )
         .bind(&job.library_id)
         .fetch_all(&mut *tx)
         .await?;
-        let plan = playscale_core::scan::reconcile(
+        let plan = playscale_core::scan::reconcile_covered(
             &old.iter()
                 .map(|r| playscale_core::scan::Existing {
                     id: r.0.clone(),
@@ -388,6 +516,7 @@ async fn finish(
                     revision: f.revision.clone(),
                 })
                 .collect::<Vec<_>>(),
+            &coverage,
         );
         for id in &plan.unavailable {
             sqlx::query("UPDATE media_files SET available=0 WHERE id=? AND available=1")
@@ -396,47 +525,77 @@ async fn finish(
                 .await?;
         }
         let reused = files.iter().filter(|f| f.reused).count() as i64;
-        sqlx::query("UPDATE jobs SET reused_files=?,inspected_files=? WHERE id=?")
+        let outcome = match playscale_core::scan::outcome(true, inventory.incomplete.len()) {
+            Some(playscale_core::scan::Outcome::Partial) => "partial",
+            _ => "complete",
+        };
+        sqlx::query("UPDATE jobs SET reused_files=?,inspected_files=?,outcome=?,complete_directories=?,incomplete_directories=? WHERE id=?")
             .bind(reused)
             .bind(files.len() as i64 - reused)
+            .bind(outcome)
+            .bind(i64::try_from(inventory.complete.len())?)
+            .bind(i64::try_from(inventory.incomplete.len())?)
             .bind(&job.id)
             .execute(&mut *tx)
             .await?;
-        for (file, identity) in files.into_iter().zip(plan.identities) {
-            let (id, edition) = if let Some(identity) = identity {
-                identity
-            } else {
-                let item = new_id();
-                let edition = new_id();
-                let kind = if file.tracks.iter().any(|t| t.kind == "video") {
-                    "video"
-                } else if file.tracks.iter().any(|t| t.kind == "audio") {
-                    "audio"
-                } else {
-                    "video"
-                };
-                sqlx::query("INSERT INTO items VALUES (?,?,?)")
-                    .bind(&item)
-                    .bind(&file.title)
-                    .bind(kind)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO item_origins VALUES (?,?)")
-                    .bind(&item)
-                    .bind(&file.title)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("INSERT INTO editions (id,item_id,label) VALUES (?,?,'Original')")
-                    .bind(&edition)
-                    .bind(item)
-                    .execute(&mut *tx)
-                    .await?;
-                (new_id(), edition)
+        for (directory, reason) in inventory.incomplete.iter().take(INCOMPLETE_REPORT_LIMIT) {
+            sqlx::query("INSERT OR REPLACE INTO scan_incomplete_directories VALUES (?,?,?)")
+                .bind(&job.id)
+                .bind(directory)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut assigned: Vec<String> = Vec::with_capacity(files.len());
+        for (file, assignment) in files.into_iter().zip(plan.assignments) {
+            use playscale_core::scan::Assignment;
+            let (id, edition) = match assignment {
+                Assignment::CopyOf { observation } => (
+                    new_id(),
+                    assigned
+                        .get(observation)
+                        .cloned()
+                        .context("copy refers to a later observation")?,
+                ),
+                Assignment::Existing { id, edition } => (id, edition),
+                // A verified copy of content one edition already holds is another
+                // occurrence of that edition, not a new work.
+                Assignment::Copy { edition } => (new_id(), edition),
+                Assignment::New => {
+                    let item = new_id();
+                    let edition = new_id();
+                    let kind = if file.tracks.iter().any(|t| t.kind == "video") {
+                        "video"
+                    } else if file.tracks.iter().any(|t| t.kind == "audio") {
+                        "audio"
+                    } else {
+                        "video"
+                    };
+                    sqlx::query("INSERT INTO items (id,title,kind) VALUES (?,?,?)")
+                        .bind(&item)
+                        .bind(&file.title)
+                        .bind(kind)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("INSERT INTO item_origins VALUES (?,?)")
+                        .bind(&item)
+                        .bind(&file.title)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("INSERT INTO editions (id,item_id,label) VALUES (?,?,'Original')")
+                        .bind(&edition)
+                        .bind(item)
+                        .execute(&mut *tx)
+                        .await?;
+                    (new_id(), edition)
+                }
             };
+            assigned.push(edition.clone());
             sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
                 .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
         }
     }
+    crate::matching::invalidate_changed(&mut tx).await?;
     sqlx::query("UPDATE jobs SET phase=?, error=? WHERE id=?")
         .bind(db::phase_name(next.phase))
         .bind(if next.phase == Phase::Failed {

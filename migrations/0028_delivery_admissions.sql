@@ -1,4 +1,5 @@
--- A07 migration allocation request for A02: 0019 is already in use by A08.
+-- A07 migration allocation request for A02: 0028 is provisional, after 0027
+-- (delivery sessions); A02 owns migration numbering and may renumber.
 -- Keep receipts independent of diagnostic retention. A retired delivery's exact
 -- acknowledgement must replay without recreating execution. No receipt expiry
 -- is applied until a policy can prove termination plus the required retention.
