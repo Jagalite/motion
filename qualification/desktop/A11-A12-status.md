@@ -100,15 +100,17 @@ when external-volume launches stalled; no installed application was replaced.
 
 ## Remaining integration and release gates
 
-1. Production v2 preferences, viewing, continue/next, planning and delivery are now
-   integrated and exercised against the real server, in
+1. Production v2 preferences, viewing, continue watching, planning and delivery
+   are now integrated and exercised against the real server, in
    `qualification/client-playback/README.md`. Still open:
+   - next-title qualification: resolved title, navigation, progress flush and
+     old-delivery retirement through the player's Next action
    - live HLS in the Motion player (needs the Demuxe Shaka backend)
    - subtitles
    - prepared renditions
    - cross-runtime outbox replay
    - scans
-   - queue/next qualification
+   - queues
 2. A13 production download/cache publishing, multipart/sidecar assets, transfer
    resume/quotas, acknowledged log compaction and causal server reconciliation.
    The current cache protocol and its bounds are in `crates/motion-ui-host/README.md`.

@@ -118,5 +118,7 @@ the media hashes, every check with its detail, and `result`, which is one of
   - ticket auth on stream routes
   - the transactional and authorization review findings recorded in that
     workstream's PR
+- **Next title:** the player's Next action and the `/timelines/{t}/next` resolver
+  are not exercised by this harness.
 - **Other platforms:** Windows, Linux, physical devices, installed/signed packages
   and long-run load have not been run.
