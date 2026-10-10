@@ -197,6 +197,36 @@ app.whenReady().then(async () => {
     // The page still shows revision r1 (mock facade); the server is now at r2.
     await submitAndWait('form[data-command="PUT /api/v2/catalog/matches/m1/decision"]', false);
     note('staleDecisionMessage', await evaluate(`document.querySelector('form[data-command="PUT /api/v2/catalog/matches/m1/decision"] .command-status')?.textContent ?? null`));
+    const screens = [];
+    contents.debugger.attach('1.3');
+    await contents.debugger.sendCommand('Emulation.setEmulatedMedia', {features: [{name: 'prefers-reduced-motion', value: 'reduce'}]});
+    for (const width of [320, 1280]) {
+      window.setContentSize(width, 900);
+      for (const path of ['/', '/library/lib1', '/item/item2', '/search?q=sample', '/profiles', '/sources', '/matches', '/processing', '/diagnostics']) {
+        await window.loadURL(`${origin}${path}`);
+        const dom = await evaluate(`({width: innerWidth, scrollWidth: document.documentElement.scrollWidth,
+          main: document.querySelectorAll('main').length, headings: document.querySelectorAll('h1').length,
+          labelled: [...document.querySelectorAll('input:not([type=hidden]),select,textarea')].every(e => e.labels?.length || e.getAttribute('aria-label')),
+          reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches && [...document.querySelectorAll('.card a')].every(e => getComputedStyle(e).transitionDuration === '0s')})`);
+        const tree = await contents.debugger.sendCommand('Accessibility.getFullAXTree');
+        const controls = tree.nodes.filter(node => !node.ignored && ['button', 'textbox', 'combobox', 'checkbox', 'radio', 'link'].includes(node.role?.value));
+        screens.push({path, ...dom, accessibleControlNames: controls.every(node => Boolean(node.name?.value))});
+      }
+    }
+    contents.debugger.detach();
+    note('screenMatrix', screens);
+    note('renderLoad', await evaluate(`(async () => {
+      const durations = [];
+      const start = performance.now();
+      const results = await Promise.all(Array.from({length: 24}, async (_, index) => {
+        const begin = performance.now();
+        const response = await fetch(index % 2 ? '/library/lib1' : '/profiles', {cache: 'no-store'});
+        const body = await response.text(); durations.push(performance.now() - begin);
+        return response.ok && body.includes('<main');
+      }).concat([fetch('/api/v2/media/files/proof/content', {headers: {Range: 'bytes=0-63'}}).then(async response => response.status === 206 && (await response.arrayBuffer()).byteLength === 64)]));
+      durations.sort((a,b) => a-b);
+      return {requests: 24, simultaneousRangeRead: true, allSucceeded: results.every(Boolean), elapsedMs: Math.round(performance.now()-start), p50Ms: Math.round(durations[11]), p95Ms: Math.round(durations[22])};
+    })()`));
   } catch (error) {
     note('exception', String(error?.stack ?? error));
   }

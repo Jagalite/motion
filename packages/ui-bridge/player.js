@@ -95,7 +95,7 @@ async function playNext(current = () => true) {
     const finishing = close();
     const closedEpoch = state.epoch;
     await finishing;
-    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}`);
+    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}?play=1`);
   } catch (error) { if (current()) status(`Next title could not start: ${error.message}`, 'alert'); }
   finally { advancing = false; }
 }
@@ -520,6 +520,10 @@ async function start() {
     state.replace = makeSwitcher(current);
     status('');
     host.dataset.state = 'ready';
+    if (new URLSearchParams(location.search).get('play') === '1') {
+      try { await element.play(); }
+      catch { if (current()) status('Press Play to continue.'); }
+    }
   } catch (error) {
     if (!current()) return;
     status(error.status === 401 || error.status === 403 ? 'You are not allowed to play this here.' : `Playback could not start: ${error.message}`, 'alert');

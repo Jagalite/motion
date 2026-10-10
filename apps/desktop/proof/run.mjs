@@ -155,6 +155,9 @@ const results = {
     && commands.some(cmd => cmd.operation === 'activateGeneration' && cmd.generation === '2' && cmd.body?.expected_active_generation === '1'),
   demuxe_bytes_match_install_receipt: demuxeMismatches.length === 0,
   no_permission_granted_beyond_fullscreen: Array.isArray(observed.permissionsGranted) && observed.permissionsGranted.every(p => p === 'fullscreen'),
+  screen_semantics_and_responsive_layout: c.screenMatrix?.length === 18 && c.screenMatrix.every(s => s.scrollWidth <= s.width + 1 && s.main === 1 && s.headings === 1 && s.labelled && s.accessibleControlNames),
+  reduced_motion_respected: c.screenMatrix?.length === 18 && c.screenMatrix.every(s => s.reducedMotion),
+  concurrent_html_and_range_responses_preserved: c.renderLoad?.allSucceeded === true,
 };
 const passed = Object.values(results).every(Boolean) && !c.exception && !failure;
 const demuxePkg = JSON.parse(readFileSync(join(demuxe, 'package.json'), 'utf8'));
@@ -171,6 +174,7 @@ const receipt = {
   environment: {electron: observed.electron, chromium: observed.chromium, node: observed.node, os: `${process.platform} ${release()}`, arch: observed.arch},
   topcoat: topcoatSource ? {version: topcoatSource[1], source: topcoatSource[2], features: 'router, view, tower, discover (no runtime)'} : null,
   proof_server_sha256: serverSha,
+  proof_driver_sha256: sha256(readFileSync(launchMain)),
   proof_server_launch: {location: 'host-temporary-directory', sha256: launchServerSha, matches_build: launchServerSha === serverSha},
   rust_toolchain: '1.98.0',
   origin: 'single loopback origin serving Topcoat HTML, /ui assets, /assets/demuxe, mock /api/v2 and media',
