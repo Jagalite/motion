@@ -28,13 +28,13 @@
     "apps/desktop/test/offline-smoke.mjs": "8c7c4cebf35f0fad779ab346f46078248b37162236e768174efec2dd302c8157",
     "contracts/Motion_Server_API_v2.yaml": "cd4100be3f80c4172e9b6af729b8d3211c363ee5cdae3949b0e4fe7e15a3cfa0"
   },
-  "helper_sha256": "bbc7d1fff860ffade1144f13b134088968d6759a7d13061aab8c3cdf8a07bdd6",
+  "helper_sha256": "092215324bdae32cbc665bac59eb768e3f46e45476d6a0acc44a6d2f2ce2475f",
   "runtime_binary_sha256": "6c7bfa625e72ad31e564b262c916aa6a9d5b88f570dea195dec52255e9c6305d",
   "media_sha256": "f64199fc00b7e006ee31c50ae92341f74cc0fba280d0ac55cbc72ca936a90bcb",
   "cache_protocol": 1,
-  "commit": "b9db52f6589afc8ca6f753b83aa7027cc4550615",
-  "recorded_at": "2026-10-10T04:14:11.925Z",
-  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-offline-proof-HfqxcW",
+  "commit": "a9ea89558e81344b0c7f8a023d2e7fe0d6402025",
+  "recorded_at": "2026-10-10T04:20:00.966Z",
+  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-offline-proof-8r3HEF",
   "limitations": [
     "Synthetic A13 cache manifest; download transfer and remote reconciliation are not exercised.",
     "macOS arm64 unpackaged Electron only; audio muted; no screen-reader or physical A/V observations."

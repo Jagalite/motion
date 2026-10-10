@@ -60,6 +60,10 @@ pub enum OrganizationError {
     StaleRevision,
     RevisionExhausted,
     UnknownEntry(Id),
+    /// A replacement names a different owning profile than the stored one.
+    OwnerChanged,
+    /// The saved filter still defines a smart collection.
+    FilterInUse,
 }
 
 pub fn valid_name(name: &str) -> Result<(), OrganizationError> {
@@ -153,6 +157,81 @@ pub fn advance(current: u64, expected: u64) -> Result<u64, OrganizationError> {
             .checked_add(1)
             .ok_or(OrganizationError::RevisionExhausted)
     }
+}
+
+/// Removal of an aggregate under its revision check. A saved filter that still
+/// defines `dependants` smart collections cannot be removed.
+pub fn removable(current: u64, expected: u64, dependants: usize) -> Result<(), OrganizationError> {
+    if current != expected {
+        Err(OrganizationError::StaleRevision)
+    } else if dependants > 0 {
+        Err(OrganizationError::FilterInUse)
+    } else {
+        Ok(())
+    }
+}
+
+/// Every aggregate keeps the profile that created it; a replacement cannot
+/// move it to another profile.
+pub fn same_owner(stored: &str, requested: &str) -> Result<(), OrganizationError> {
+    if stored == requested {
+        Ok(())
+    } else {
+        Err(OrganizationError::OwnerChanged)
+    }
+}
+
+/// A replacement written by a viewer whose catalog policy hides some stored
+/// members keeps those members: membership is shared by every viewer of the
+/// profile, and a member a viewer cannot see is neither disclosed to nor
+/// removable by that viewer. `hidden` holds the stored members the writer
+/// cannot see; the requested members follow, then the hidden ones in stored
+/// order.
+pub fn keep_hidden_members(requested: Vec<Id>, stored: &[Id], hidden: &BTreeSet<Id>) -> Vec<Id> {
+    let mut out = requested;
+    for id in stored {
+        if hidden.contains(id) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// The ordered counterpart of [`keep_hidden_members`] for playlist and queue
+/// entries. `hidden` holds the entry IDs the writer cannot see. Each hidden
+/// entry stays directly after the nearest preceding stored entry that the
+/// writer could see and kept (or at the front when there is none), so the
+/// writer's reordering of what it sees never moves what it cannot. A requested
+/// entry ID equal to a hidden entry's is a duplicate.
+pub fn keep_hidden_entries(
+    requested: Vec<Entry>,
+    stored: &[Entry],
+    hidden: &BTreeSet<Id>,
+) -> Result<Vec<Entry>, OrganizationError> {
+    if let Some(clash) = requested.iter().find(|e| hidden.contains(&e.entry_id)) {
+        return Err(OrganizationError::DuplicateMember(clash.entry_id.clone()));
+    }
+    let kept: BTreeSet<&Id> = requested.iter().map(|e| &e.entry_id).collect();
+    let mut front = Vec::new();
+    let mut after: std::collections::BTreeMap<&Id, Vec<Entry>> = Default::default();
+    let mut anchor: Option<&Id> = None;
+    for entry in stored {
+        if hidden.contains(&entry.entry_id) {
+            match anchor {
+                Some(a) => after.entry(a).or_default().push(entry.clone()),
+                None => front.push(entry.clone()),
+            }
+        } else if kept.contains(&entry.entry_id) {
+            anchor = Some(&entry.entry_id);
+        }
+    }
+    let mut out = front;
+    for entry in requested {
+        let tail = after.remove(&entry.entry_id);
+        out.push(entry);
+        out.extend(tail.into_iter().flatten());
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -380,4 +459,137 @@ pub fn matches(terms: &[Term], facts: &Facts) -> bool {
         (Field::Watched, Value::Boolean(b)) => facts.watched == *b,
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(id: &str) -> Entry {
+        Entry {
+            entry_id: id.into(),
+            timeline_id: format!("t-{id}"),
+        }
+    }
+    fn ids(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(|e| e.entry_id.as_str()).collect()
+    }
+    fn set(ids: &[&str]) -> BTreeSet<Id> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn removal_checks_revision_then_dependants() {
+        assert_eq!(removable(3, 3, 0), Ok(()));
+        assert_eq!(removable(3, 2, 0), Err(OrganizationError::StaleRevision));
+        assert_eq!(removable(3, 2, 1), Err(OrganizationError::StaleRevision));
+        assert_eq!(removable(3, 3, 1), Err(OrganizationError::FilterInUse));
+        assert_eq!(removable(u64::MAX, u64::MAX, 0), Ok(()));
+    }
+
+    #[test]
+    fn owner_is_immutable() {
+        assert_eq!(same_owner("p", "p"), Ok(()));
+        assert_eq!(same_owner("p", "q"), Err(OrganizationError::OwnerChanged));
+    }
+
+    #[test]
+    fn hidden_members_survive_a_restricted_replacement() {
+        let stored: Vec<Id> = ["a", "h", "b"].map(String::from).to_vec();
+        let kept = keep_hidden_members(vec!["b".into(), "c".into()], &stored, &set(&["h"]));
+        assert_eq!(kept, ["b", "c", "h"]);
+        // Nothing hidden: the request is the result.
+        assert_eq!(
+            keep_hidden_members(vec!["x".into()], &stored, &BTreeSet::new()),
+            ["x"]
+        );
+    }
+
+    #[test]
+    fn hidden_entries_keep_their_anchor() {
+        let stored = [e("h0"), e("a"), e("h1"), e("h2"), e("b"), e("c"), e("h3")];
+        let hidden = set(&["h0", "h1", "h2", "h3"]);
+        // Reorder visible entries: hidden ones follow their anchors.
+        let out = keep_hidden_entries(vec![e("c"), e("a"), e("b")], &stored, &hidden).unwrap();
+        assert_eq!(ids(&out), ["h0", "c", "h3", "a", "h1", "h2", "b"]);
+        // Removing an anchor reattaches to the previous kept visible entry.
+        let out = keep_hidden_entries(vec![e("b"), e("c")], &stored, &hidden).unwrap();
+        assert_eq!(ids(&out), ["h0", "h1", "h2", "b", "c", "h3"]);
+        // A requested ID may not reuse a hidden entry's ID.
+        assert_eq!(
+            keep_hidden_entries(vec![e("h1")], &stored, &hidden),
+            Err(OrganizationError::DuplicateMember("h1".into()))
+        );
+    }
+
+    /// Exhaustive over 4 stored entries, every hidden mask and every ordered
+    /// selection of the visible ones: the result is the request with exactly
+    /// the hidden entries inserted once each, the request's relative order is
+    /// preserved, and an order-preserving request leaves the stored order.
+    #[test]
+    fn hidden_entries_exhaustive() {
+        let all = ["a", "b", "c", "d"];
+        let stored: Vec<Entry> = all.iter().map(|i| e(i)).collect();
+        fn arrangements(pool: &[&'static str]) -> Vec<Vec<&'static str>> {
+            let mut out = vec![vec![]];
+            for (i, x) in pool.iter().enumerate() {
+                let mut rest = pool.to_vec();
+                rest.remove(i);
+                for mut tail in arrangements(&rest) {
+                    tail.insert(0, x);
+                    out.push(tail);
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+        for mask in 0u8..16 {
+            let hidden: BTreeSet<Id> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, s)| s.to_string())
+                .collect();
+            let visible: Vec<&str> = all
+                .iter()
+                .copied()
+                .filter(|s| !hidden.contains(*s))
+                .collect();
+            for request in arrangements(&visible) {
+                let requested: Vec<Entry> = request.iter().map(|i| e(i)).collect();
+                let out = keep_hidden_entries(requested, &stored, &hidden).unwrap();
+                let out_ids = ids(&out);
+                let seen_visible: Vec<&str> = out_ids
+                    .iter()
+                    .copied()
+                    .filter(|s| !hidden.contains(*s))
+                    .collect();
+                let seen_hidden: Vec<&str> = out_ids
+                    .iter()
+                    .copied()
+                    .filter(|s| hidden.contains(*s))
+                    .collect();
+                let mut sorted_hidden = seen_hidden.clone();
+                sorted_hidden.sort();
+                let stored_hidden: Vec<&str> = all
+                    .iter()
+                    .copied()
+                    .filter(|s| hidden.contains(*s))
+                    .collect();
+                assert_eq!(seen_visible, request, "mask {mask}");
+                assert_eq!(sorted_hidden, stored_hidden, "mask {mask} {request:?}");
+                assert!(validate_entries(&out).is_ok());
+                // A request that keeps the stored order changes nothing else.
+                if request.windows(2).all(|w| w[0] < w[1]) {
+                    let expected: Vec<&str> = all
+                        .iter()
+                        .copied()
+                        .filter(|s| hidden.contains(*s) || request.contains(s))
+                        .collect();
+                    assert_eq!(out_ids, expected, "mask {mask} {request:?}");
+                }
+            }
+        }
+    }
 }

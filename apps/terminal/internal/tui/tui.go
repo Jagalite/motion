@@ -24,10 +24,19 @@ import (
 
 // Backend is the subset of the API the interface uses; tests substitute it.
 type Backend interface {
+	GetTimeline(context.Context, string) (api.Tagged[api.Timeline], error)
+	GetProfile(context.Context, string) (api.Tagged[api.Profile], error)
 	Me(context.Context) (api.Principal, error)
 	Capabilities(context.Context) (api.Capabilities, error)
 	ListProfiles(context.Context, string, int) (api.Page[api.Profile], error)
 	ListDevices(context.Context, string, int) (api.Page[api.Device], error)
+	ListLibraries(context.Context, string, int) (api.Page[api.Library], error)
+	ListCatalog(context.Context, string, int, string) (api.Page[api.CatalogItem], error)
+	SearchCatalog(context.Context, string, string, int) (api.Page[api.CatalogItem], error)
+	ListScans(context.Context, string, int) (api.Page[api.Scan], error)
+	ListJobs(context.Context, string, int) (api.Page[api.Job], error)
+	CancelJob(context.Context, string, string) (api.Tagged[api.Job], error)
+	Diagnostics(context.Context) (api.Diagnostics, error)
 }
 
 type screen int
@@ -37,10 +46,16 @@ const (
 	profiles
 	devices
 	events
+	libraries
+	catalog
+	search
+	scans
+	jobs
+	diagnostics
 	screens
 )
 
-var titles = [...]string{"Overview", "Profiles", "Devices", "Events"}
+var titles = [...]string{"Overview", "Profiles", "Devices", "Events", "Libraries", "Catalog", "Search", "Scans", "Jobs", "Diagnostics"}
 
 const (
 	eventBuffer = 256
@@ -59,6 +74,11 @@ type loaded struct {
 
 type eventMsg api.Event
 type resyncMsg struct{}
+type launchDone struct {
+	screen screen
+	err    error
+}
+type actionDone struct{ err error }
 type streamMsg struct {
 	state string
 	err   error
@@ -66,29 +86,40 @@ type streamMsg struct {
 
 // Model is the interface state.
 type Model struct {
-	ctx       context.Context
-	backend   Backend
-	server    string
-	tab       screen
-	width     int
-	height    int
-	me        *api.Principal
-	caps      *api.Capabilities
-	profiles  []api.Profile
-	devices   []api.Device
-	truncated map[screen]bool
-	log       []string
-	errs      map[screen]error
-	requests  map[screen]int
-	loading   map[screen]bool
-	selected  map[screen]int
-	stream    string
-	incoming  <-chan tea.Msg
+	profile     string
+	openBrowser func(context.Context, string) error
+	ctx         context.Context
+	backend     Backend
+	server      string
+	tab         screen
+	width       int
+	height      int
+	me          *api.Principal
+	caps        *api.Capabilities
+	profiles    []api.Profile
+	libraries   []api.Library
+	catalog     []api.CatalogItem
+	results     []api.CatalogItem
+	scans       []api.Scan
+	jobs        []api.Job
+	diagnostics *api.Diagnostics
+	cancelling  bool
+	query       string
+	editing     bool
+	devices     []api.Device
+	truncated   map[screen]bool
+	log         []string
+	errs        map[screen]error
+	requests    map[screen]int
+	loading     map[screen]bool
+	selected    map[screen]int
+	stream      string
+	incoming    <-chan tea.Msg
 }
 
 func New(ctx context.Context, backend Backend, server string, incoming <-chan tea.Msg) Model {
 	return Model{
-		ctx: ctx, backend: backend, server: server, incoming: incoming,
+		ctx: ctx, backend: backend, server: server, incoming: incoming, openBrowser: cli.OpenBrowser,
 		errs: map[screen]error{}, loading: map[screen]bool{}, selected: map[screen]int{},
 		requests: map[screen]int{}, truncated: map[screen]bool{}, stream: "connecting",
 	}
@@ -118,13 +149,21 @@ func (m Model) wait() tea.Cmd {
 }
 
 func (m *Model) reloadAll() tea.Cmd {
-	return tea.Batch(m.load(overview), m.load(profiles), m.load(devices))
+	return tea.Batch(m.load(overview), m.load(profiles), m.load(devices), m.load(libraries), m.load(catalog), m.load(search), m.load(scans), m.load(jobs), m.load(diagnostics))
 }
 
 func all[T any](ctx context.Context, list func(context.Context, string, int) (api.Page[T], error)) ([]T, bool, error) {
 	var items []T
 	cursor := ""
+	seen := map[string]bool{}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		if seen[cursor] {
+			return nil, false, fmt.Errorf("server returned a repeated pagination cursor")
+		}
+		seen[cursor] = true
 		page, err := list(ctx, cursor, 200)
 		if err != nil {
 			return nil, false, err
@@ -143,7 +182,7 @@ func all[T any](ctx context.Context, list func(context.Context, string, int) (ap
 func (m *Model) load(s screen) tea.Cmd {
 	m.requests[s]++
 	m.loading[s] = true
-	ctx, backend, request := m.ctx, m.backend, m.requests[s]
+	ctx, backend, request, query := m.ctx, m.backend, m.requests[s], m.query
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
@@ -155,6 +194,32 @@ func (m *Model) load(s screen) tea.Cmd {
 			}
 			caps, err := backend.Capabilities(ctx)
 			return loaded{screen: s, request: request, data: [2]any{me, caps}, err: err}
+		case scans:
+			items, truncated, err := all(ctx, backend.ListScans)
+			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
+		case jobs:
+			items, truncated, err := all(ctx, backend.ListJobs)
+			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
+		case diagnostics:
+			value, err := backend.Diagnostics(ctx)
+			return loaded{screen: s, request: request, data: value, err: err}
+		case libraries:
+			items, truncated, err := all(ctx, backend.ListLibraries)
+			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
+		case catalog, search:
+			var items []api.CatalogItem
+			var truncated bool
+			var err error
+			if s == catalog {
+				items, truncated, err = all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
+					return backend.ListCatalog(ctx, cursor, limit, "")
+				})
+			} else if strings.TrimSpace(query) != "" {
+				items, truncated, err = all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
+					return backend.SearchCatalog(ctx, query, cursor, limit)
+				})
+			}
+			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
 		case profiles:
 			items, truncated, err := all(ctx, backend.ListProfiles)
 			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
@@ -168,6 +233,16 @@ func (m *Model) load(s screen) tea.Cmd {
 
 func (m *Model) rows(s screen) int {
 	switch s {
+	case scans:
+		return len(m.scans)
+	case jobs:
+		return len(m.jobs)
+	case libraries:
+		return len(m.libraries)
+	case catalog:
+		return len(m.catalog)
+	case search:
+		return len(m.results)
 	case profiles:
 		return len(m.profiles)
 	case devices:
@@ -183,6 +258,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case tea.KeyMsg:
+		if m.editing && msg.String() != "ctrl+c" {
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.editing = false
+			case tea.KeyEnter:
+				m.editing = false
+				m.results = nil
+				return m, m.load(search)
+			case tea.KeyBackspace, tea.KeyCtrlH:
+				r := []rune(m.query)
+				if len(r) > 0 {
+					m.query = string(r[:len(r)-1])
+				}
+			case tea.KeyRunes:
+				r := []rune(m.query + string(msg.Runes))
+				if len(r) <= 500 {
+					m.query = string(r)
+				}
+			case tea.KeySpace:
+				if len([]rune(m.query)) < 500 {
+					m.query += " "
+				}
+			}
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -190,15 +290,90 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tab = (m.tab + 1) % screens
 		case "shift+tab", "left", "h":
 			m.tab = (m.tab + screens - 1) % screens
-		case "1", "2", "3", "4":
+		case "/":
+			m.tab = search
+			m.editing = true
+		case "0":
+			m.tab = diagnostics
+		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 			m.tab = screen(msg.String()[0] - '1')
 		case "up", "k":
 			m.selected[m.tab] = max(m.selected[m.tab]-1, 0)
 		case "down", "j":
 			m.selected[m.tab] = min(m.selected[m.tab]+1, max(m.rows(m.tab)-1, 0))
+		case "enter":
+			if m.tab == profiles && len(m.profiles) > 0 {
+				m.profile = m.profiles[min(m.selected[profiles], len(m.profiles)-1)].ID
+			}
+		case "p":
+			if m.tab == catalog || m.tab == search {
+				items := m.catalog
+				if m.tab == search {
+					items = m.results
+				}
+				if len(items) == 0 {
+					return m, nil
+				}
+				selected := items[min(m.selected[m.tab], len(items)-1)]
+				ready := false
+				if m.caps != nil {
+					for _, f := range m.caps.Features {
+						if f.ID == "playback.v2" && f.Implemented && f.Enabled {
+							ready = true
+						}
+					}
+				}
+				if !ready || m.me == nil || !m.me.Allows(api.PermPlaybackRequest) {
+					m.errs[m.tab] = fmt.Errorf("player unavailable or playback permission missing; press r to refresh")
+					return m, nil
+				}
+				if selected.DefaultTimelineID == nil {
+					m.errs[m.tab] = fmt.Errorf("choose a timeline on the item's web page; press r to refresh")
+					return m, nil
+				}
+				ctx, backend, server, profile, id, tab, open := m.ctx, m.backend, m.server, m.profile, *selected.DefaultTimelineID, m.tab, m.openBrowser
+				return m, func() tea.Msg {
+					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+					timeline, err := backend.GetTimeline(ctx, id)
+					if err == nil && profile != "" {
+						_, err = backend.GetProfile(ctx, profile)
+					}
+					if err == nil {
+						var target string
+						target, err = cli.PlayerURL(server, timeline.Value.ID, profile)
+						if err == nil {
+							err = open(ctx, target)
+						}
+					}
+					return launchDone{screen: tab, err: err}
+				}
+			}
+		case "c":
+			if m.tab == jobs && !m.cancelling && len(m.jobs) > 0 {
+				id := m.jobs[min(m.selected[jobs], len(m.jobs)-1)].ID
+				backend, ctx, key := m.backend, m.ctx, api.NewIdempotencyKey()
+				m.cancelling = true
+				return m, func() tea.Msg {
+					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+					_, err := backend.CancelJob(ctx, id, key)
+					return actionDone{err: err}
+				}
+			}
 		case "r":
 			return m, m.reloadAll()
 		}
+	case launchDone:
+		m.errs[msg.screen] = msg.err
+		return m, nil
+	case actionDone:
+		m.cancelling = false
+		m.errs[jobs] = msg.err
+		if msg.err == nil {
+			return m, m.load(jobs)
+		}
+		return m, nil
 	case loaded:
 		if msg.request != m.requests[msg.screen] {
 			return m, nil // superseded by a newer query or a reset
@@ -214,6 +389,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			pair := msg.data.([2]any)
 			me, caps := pair[0].(api.Principal), pair[1].(api.Capabilities)
 			m.me, m.caps = &me, &caps
+		case scans:
+			m.scans = msg.data.([]api.Scan)
+		case jobs:
+			m.jobs = msg.data.([]api.Job)
+		case diagnostics:
+			d := msg.data.(api.Diagnostics)
+			m.diagnostics = &d
+		case libraries:
+			m.libraries = msg.data.([]api.Library)
+		case catalog:
+			m.catalog = msg.data.([]api.CatalogItem)
+		case search:
+			m.results = msg.data.([]api.CatalogItem)
 		case profiles:
 			m.profiles = msg.data.([]api.Profile)
 		case devices:
@@ -228,6 +416,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmd := m.wait()
 		switch msg.ResourceType {
+		case "library", "source":
+			return m, tea.Batch(cmd, m.load(libraries), m.load(catalog), m.load(search))
+		case "item", "catalog", "catalog_item", "item_metadata", "item_artwork", "timeline", "version":
+			return m, tea.Batch(cmd, m.load(catalog), m.load(search))
+		case "scan":
+			return m, tea.Batch(cmd, m.load(scans), m.load(jobs), m.load(diagnostics))
+		case "job", "processing":
+			return m, tea.Batch(cmd, m.load(jobs), m.load(diagnostics))
 		case "profile":
 			return m, tea.Batch(cmd, m.load(profiles))
 		case "device":
@@ -253,6 +449,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // resync discards cached views and rebuilds them from fresh queries.
 func (m *Model) resync() tea.Cmd {
 	m.profiles, m.devices, m.me, m.caps = nil, nil, nil, nil
+	m.libraries, m.catalog, m.results = nil, nil, nil
+	m.scans, m.jobs, m.diagnostics = nil, nil, nil
 	return m.reloadAll()
 }
 
@@ -309,7 +507,11 @@ func (m Model) View() string {
 		}
 		tabs = append(tabs, style.Render(fmt.Sprintf("%d %s", i+1, titles[i])))
 	}
-	b.WriteString(fit(lipgloss.JoinHorizontal(lipgloss.Top, tabs...), m.width))
+	tabLine := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
+	if m.width > 0 && lipgloss.Width(tabLine) > m.width {
+		tabLine = activeStyle.Render(titles[m.tab]) + dimStyle.Render(" · tab switches screens")
+	}
+	b.WriteString(fit(tabLine, m.width))
 	b.WriteString("\n")
 	b.WriteString(fit(dimStyle.Render(clean(fmt.Sprintf("%s · events %s", m.server, m.stream))), m.width))
 	b.WriteString("\n\n")
@@ -321,11 +523,23 @@ func (m Model) View() string {
 		b.WriteString(fit(line, m.width))
 		b.WriteString("\n")
 	}
-	b.WriteString(fit(dimStyle.Render("tab/1-4 switch · ↑↓ select · r refresh · q quit"), m.width))
+	help := "tab switch · / search · ↑↓ select · r refresh · q quit"
+	switch m.tab {
+	case catalog, search:
+		help = "p play · " + help
+	case jobs:
+		help = "c cancel job · " + help
+	case profiles:
+		help = "enter selects profile · " + help
+	}
+	b.WriteString(fit(dimStyle.Render(help), m.width))
 	return b.String()
 }
 
 func (m Model) body(limit int) []string {
+	if m.editing {
+		return []string{"Search: " + clean(m.query) + "▏", "Enter searches · Esc leaves input"}
+	}
 	if err := m.errs[m.tab]; err != nil {
 		return []string{errStyle.Render(describe(err))}
 	}
@@ -333,6 +547,51 @@ func (m Model) body(limit int) []string {
 		return []string{dimStyle.Render("Loading…")}
 	}
 	switch m.tab {
+	case scans:
+		rows := make([]string, 0, len(m.scans))
+		for _, s := range m.scans {
+			rows = append(rows, fmt.Sprintf("%s  %s  %s", clean(s.ID), clean(s.LibraryID), clean(s.Status)))
+		}
+		return m.selectable(rows, "No scans.", limit)
+	case jobs:
+		if m.cancelling {
+			return []string{"Requesting cancellation…"}
+		}
+		rows := make([]string, 0, len(m.jobs))
+		for _, j := range m.jobs {
+			rows = append(rows, fmt.Sprintf("%s  %s  %s", clean(j.ID), clean(j.Kind), clean(j.Phase)))
+		}
+		return m.selectable(rows, "No jobs.", limit)
+	case diagnostics:
+		if m.diagnostics == nil {
+			return []string{"No diagnostics."}
+		}
+		d := m.diagnostics
+		rows := []string{"Uptime seconds: " + clean(d.UptimeSeconds), "Active deliveries: " + clean(d.ActiveDeliveries), "Queued jobs: " + clean(d.QueuedJobs), "Running jobs: " + clean(d.RunningJobs), "Database busy: " + clean(d.DBBusyCount)}
+		for _, e := range d.WorkerErrors {
+			rows = append(rows, clean(e))
+		}
+		return head(rows, limit)
+	case libraries:
+		rows := make([]string, 0, len(m.libraries))
+		for _, l := range m.libraries {
+			rows = append(rows, fmt.Sprintf("%s  %s  [%s]", clean(l.ID), clean(l.Name), clean(l.Availability)))
+		}
+		return m.selectable(rows, "No libraries.", limit)
+	case catalog, search:
+		items := m.catalog
+		if m.tab == search {
+			items = m.results
+		}
+		rows := make([]string, 0, len(items))
+		for _, i := range items {
+			rows = append(rows, fmt.Sprintf("%s  %s  [%s]", clean(i.ID), clean(i.Title), clean(i.Availability)))
+		}
+		empty := "No catalog items."
+		if m.tab == search {
+			empty = "No results. Press / to search."
+		}
+		return m.selectable(rows, empty, limit)
 	case overview:
 		if m.me == nil {
 			return []string{"No data."}
@@ -358,7 +617,11 @@ func (m Model) body(limit int) []string {
 	case profiles:
 		rows := make([]string, 0, len(m.profiles))
 		for _, p := range m.profiles {
-			rows = append(rows, fmt.Sprintf("%-38s %s", clean(p.ID), clean(p.Name)))
+			mark := ""
+			if p.ID == m.profile {
+				mark = " · selected"
+			}
+			rows = append(rows, fmt.Sprintf("%-38s %s%s", clean(p.ID), clean(p.Name), mark))
 		}
 		return m.selectable(rows, "No profiles.", limit)
 	case devices:
@@ -493,7 +756,9 @@ func Run(ctx context.Context, conn *cli.Conn) error {
 	go Pump(ctx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
 		return conn.Follow(ctx, "", h, d)
 	}, ch)
-	program := tea.NewProgram(New(ctx, conn, conn.URL, ch), tea.WithAltScreen(), tea.WithContext(ctx))
+	model := New(ctx, conn, conn.URL, ch)
+	model.profile = conn.Profile
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return ctx.Err()

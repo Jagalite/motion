@@ -2,6 +2,7 @@
 pub mod access;
 pub mod artwork;
 pub mod catalog;
+pub mod delivery;
 pub mod events;
 pub mod identity;
 pub mod jobs;
@@ -16,4 +17,6 @@ pub mod ranges;
 pub mod renditions;
 pub mod revision;
 pub mod scan;
+pub mod sources;
 pub mod viewing;
+pub mod work;

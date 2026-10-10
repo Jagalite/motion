@@ -32,6 +32,7 @@ type Env struct {
 
 // Conn is a client bound to a verified server identity.
 type Conn struct {
+	Profile string
 	*api.Client
 	URL        string
 	Health     api.Health
@@ -129,7 +130,7 @@ func (e *Env) Connect(ctx context.Context) (*Conn, error) {
 			registered = true
 		}
 	}
-	conn := &Conn{Client: client, URL: url, Health: health, Store: st, Config: cfg}
+	conn := &Conn{Profile: e.Profile, Client: client, URL: url, Health: health, Store: st, Config: cfg}
 	tokenFile := e.OperatorTokenFile
 	if tokenFile == "" {
 		tokenFile = os.Getenv("MOTION_OPERATOR_TOKEN_FILE")

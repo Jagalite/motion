@@ -116,7 +116,11 @@ pub async fn capabilities(
         api,
         feature("identity.pairing", true, true),
         feature("identity.browser_sessions", true, true),
-        feature("identity.trusted_private_ingress", false, false),
+        feature(
+            "identity.trusted_private_ingress",
+            true,
+            app.access.settings.trusted_ingress.is_some(),
+        ),
         // Household mode leaves the legacy v1 surface open: v2 grants are
         // enforced on v2 routes but profile restrictions are not enforceable.
         feature("access.restricted_mode", true, restricted),
@@ -150,4 +154,36 @@ pub async fn capabilities(
         features,
         runtime_hashes,
     }))
+}
+
+/// Process-lifetime count of busy errors returned through the public adapter.
+/// It measures observed request failures, not SQLite's internal retry attempts.
+pub(crate) static DB_BUSY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
+    caller.require(playscale_core::access::Permission::SystemAdmin)?;
+    let mut tx = app.db.begin().await?;
+    caller
+        .reauthorize(
+            &mut tx,
+            Some(playscale_core::access::Permission::SystemAdmin),
+        )
+        .await?;
+    let (queued,running):(i64,i64)=sqlx::query_as("SELECT coalesce(sum(phase='queued'),0),coalesce(sum(phase IN ('admitted','running','validating','publishing','cancelling')),0) FROM (SELECT phase FROM jobs UNION ALL SELECT phase FROM processing_jobs)")
+        .fetch_one(&mut *tx).await?;
+    // Worker error text can contain physical paths and tool output. Report
+    // stable failure identities, never raw subprocess messages.
+    let errors:Vec<String>=sqlx::query_scalar("SELECT kind || ':' || id || ':' || phase FROM (SELECT 'scan' AS kind,id,phase,created_at AS changed FROM jobs WHERE phase='failed' UNION ALL SELECT 'processing',id,phase,updated_at FROM processing_jobs WHERE phase='failed') ORDER BY changed DESC,id LIMIT 100")
+        .fetch_all(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({
+        "server_epoch":app.access.server_epoch,
+        "uptime_seconds":app.health.started.elapsed().as_secs().to_string(),
+        "active_deliveries":app.processing.deliveries.active_sessions().to_string(),
+        "queued_jobs":queued.to_string(),"running_jobs":running.to_string(),
+        "db_busy_count":DB_BUSY_COUNT.load(Ordering::Relaxed).to_string(),
+        "worker_errors":errors
+    }))
+    .into_response())
 }

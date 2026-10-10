@@ -236,9 +236,19 @@ async fn clean_with(
         let remove = remove.clone();
         let deleted = tokio::task::spawn_blocking(move || {
             let _hold = hold;
-            remove(path)
+            // A held (or unreadable) witness marks a possibly running encoder: keep
+            // its directory so recovery can find it, and do not acknowledge the
+            // cleanup. Witness creation happens under the same I/O permit, so this
+            // check cannot race a new execution.
+            if !crate::processing::held_witnesses(&path).is_ok_and(|held| held.is_empty()) {
+                return Ok(None);
+            }
+            remove(path).map(Some)
         })
         .await??;
+        let Some(deleted) = deleted else {
+            continue;
+        };
         if deleted {
             removed += 1;
         }

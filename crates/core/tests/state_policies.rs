@@ -268,23 +268,61 @@ fn incomplete_replaced_or_disabled_scan_cannot_publish() {
     for root in [None, Some("old".into()), Some("current".into())] {
         for enabled in [false, true] {
             for attempt in [1, 2, 3] {
-                let (next, effects) = finish(
-                    &job,
-                    &Completion {
-                        attempt,
-                        complete_inventory_roots: root.clone().map(|r: String| (r.clone(), r)),
-                        current_root: "current".into(),
-                        library_enabled: enabled,
-                    },
-                );
-                let publish = attempt == 2 && enabled && root.as_deref() == Some("current");
-                assert_eq!(effects.contains(&Effect::Publish { attempt: 2 }), publish);
-                if attempt != 2 {
-                    assert_eq!(next, job);
+                for binding_now in [7, 8] {
+                    let (next, effects) = finish(
+                        &job,
+                        &Completion {
+                            attempt,
+                            complete_inventory_roots: root.clone().map(|r: String| (r.clone(), r)),
+                            current_root: "current".into(),
+                            library_enabled: enabled,
+                            binding_at_start: 7,
+                            binding_now,
+                        },
+                    );
+                    // A rebind during the attempt fences publication.
+                    let publish = attempt == 2
+                        && enabled
+                        && binding_now == 7
+                        && root.as_deref() == Some("current");
+                    assert_eq!(effects.contains(&Effect::Publish { attempt: 2 }), publish);
+                    if attempt != 2 {
+                        assert_eq!(next, job);
+                    }
                 }
             }
         }
     }
+}
+
+#[test]
+fn exclusions_take_files_out_of_scope_without_proving_absence() {
+    use playscale_core::scan::reconcile_scoped;
+    let file = |id: &str, path: &str| Existing {
+        id: id.into(),
+        edition: format!("e-{id}"),
+        path: path.into(),
+        revision: format!("r-{id}"),
+    };
+    let observed = |path: &str, revision: &str| Observed {
+        path: path.into(),
+        revision: revision.into(),
+    };
+    let old = vec![file("keep", "a.mkv"), file("extra", "Extras/b.mkv")];
+    let found = vec![
+        observed("Extras/b.mkv", "r-extra"),
+        observed("a.mkv", "r-keep"),
+        observed("c.mkv", "new"),
+        observed("Extras/c.mkv", "new"),
+    ];
+    let (plan, excluded) = reconcile_scoped(&old, &found, &Coverage::Complete, &["Extras".into()]);
+    assert_eq!(excluded, ["extra"]);
+    assert!(plan.unavailable.is_empty(), "exclusion is not absence");
+    assert_eq!(plan.assignments.len(), found.len());
+    assert_eq!(plan.assignments[0], Assignment::OutOfScope);
+    assert!(matches!(plan.assignments[1], Assignment::Existing { .. }));
+    assert_eq!(plan.assignments[2], Assignment::New);
+    assert_eq!(plan.assignments[3], Assignment::OutOfScope);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 {
   "electron": "44.7.0",
   "chromium": "152.0.7977.130",
-  "screenshot": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-native-shell-OxYY3f/shell.png",
+  "screenshot": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-native-shell-1ny0ye/shell.png",
   "passed": true,
   "scope": "Production shell with mock HTTP services; no packaging or real backend qualification",
   "checks": {

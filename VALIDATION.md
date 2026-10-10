@@ -695,3 +695,111 @@ publication. It requires the new portable media-tools receipt, remaps Rust paths
 and removes local archive owner metadata. The extracted-package smoke test also
 checks archive and binary privacy before exercising bundled runtime dependencies.
 Release build receipts and smoke results are kept outside tracked source.
+
+## Delivery restart records and generation playheads (A06/A07, 2026-10-09)
+
+Delivery creation and close acknowledge only after their diagnostic/recovery
+snapshot is saved. Terminal sessions are evicted from memory only after a final
+snapshot is saved; a failed write leaves them available for retry. Intermediate
+snapshots are asynchronous and may lag. Restart applies the production core's
+`Interrupt` transition to recorded live sessions: it does not resume encoders or
+serve the previous process's manifests. Records expire after seven days at
+startup. Migration `0015` is provisional pending A02's numbering coordination.
+
+The production core owns generation identity, active-playhead acceptance,
+lease renewal, and lifecycle fencing. A pending generation's heartbeat renews
+the lease without replacing the active generation's playhead. SQLite remains
+an adapter: its conditional upsert rejects older revisions and any write over
+an interrupted record, including a late higher-revision snapshot from the old
+runtime. Recovery reads and fences snapshots in one write transaction, preventing
+an old-runtime write between those steps. Creation failure stops the admitted worker; persistence is not an
+atomic transaction with process launch.
+
+Regression coverage includes exact core playhead/lease/effect assertions,
+bounded Stateless exploration of the production reducer, SQLite snapshot
+ordering and restart fencing, and HTTP/FFmpeg integration for restart reads,
+command refusal, old-worker capacity accounting, and readable closed records
+after memory eviction. This does not qualify multi-server database sharing,
+power-loss durability, browser playback, or remote/NAS behavior. Seeded delivery
+fuzzing remains explicitly ignored as previously deferred.
+
+`cargo test -p playscale-core --test delivery_model -- --nocapture` passed
+four tests with one explicitly ignored fuzz test. All three enumerations reached
+`GraphExhausted` with zero skipped checks (configured ceilings: 3,000,000 states,
+300,000,000 transitions, depth 200):
+
+| Model bounds | States | Transitions |
+| --- | ---: | ---: |
+| Playhead: two generations, report at 6 s, pause/resume at 8/4 s | 2,611 | 107,505 |
+| Window: one generation, eight segment indices, 1/6 s segments, clock through 48 s | 329,040 | 9,193,372 |
+| Lifecycle: up to three generations, byte/HLS routes, clock through lease expiry | 133,948 | 6,732,222 |
+
+These are finite model bounds, not exhaustive real-world scheduling coverage.
+
+Native results: `cargo test --lib delivery -- --nocapture` passed two adapter
+and eight core unit tests. On the final recovery-transaction source,
+`cargo test -p playscale --test delivery -- --nocapture` passed all three real
+FFmpeg/FFprobe tests with no skips, and
+`cargo test -p playscale --test server snapshots_are_validated_retained_and_disk_pressure_is_reported -- --nocapture`
+passed. Tests used temporary databases/media/cache roots. Fresh executable
+linking and macOS loader startup were slow; superseded native runs were stopped
+and the affected integration checks were rerun on the final source.
+
+## A06/A07 seeded and mutation verification (2026-10-09)
+
+This closes the seeded-fuzz deferral above. Both seeded tests now run by default
+and require `CasesCompleted`, their exact case/transition counts, and zero
+skipped checks. Delivery's former 400,000-transition cap could stop its
+3,000-by-150 run early; it now permits and verifies all 450,000 transitions.
+Seed `20261009` passed 3,000 delivery cases / 450,000 transitions and 2,000 work
+cases / 200,000 transitions. These generated sequences found no violation;
+they do not exhaust the wider state space.
+
+The deterministic heartbeat boundary test passed for active and pending
+identities, positions 0, 60,000, 61,000, 61,001 and `u64::MAX` against a 60-second
+duration, exact lease expiry, and generation/lease rejection precedence. It
+asserts accepted lease/revision/playhead values and exact absence of effects.
+The production reducer is unchanged by this verification increment.
+
+`python3 scripts/check_execution_delivery_mutations.py` passed two baseline
+checks and detected four compiled regressions through the expected test failures:
+pending heartbeats replacing the active playhead, accepting out-of-range
+positions, renewing an expired lease, and releasing capacity on cancellation
+before worker exit. The script uses a temporary core-only workspace and isolated
+Cargo target; it rejects compile failures, missing tests, and timeouts as mutation
+evidence. This is a four-mutation sensitivity check, not a general mutation score.
+
+## A06/A07 follow-up audit and bounded progress decoding (2026-10-09)
+
+The execution audit found `BufReader::lines()` retaining unbounded encoder stdout
+until a newline. Processing now reads at most 4 KiB per select iteration and
+keeps a fixed 128-byte line prefix. Oversized lines are discarded through their
+newline; subsequent valid progress, CRLF, fragmented fields and final EOF fields
+are supported. Malformed/non-finite/negative advisory progress is ignored.
+Cancellation and the existing total processing deadline remain selectable while
+a line is incomplete. No core publication/admission decision changes: this
+parser reports advisory progress only, and media validation still gates output
+acceptance. Memory/parse-work bounds belong in this I/O adapter rather than a
+new domain lifecycle model.
+
+The plan audit does **not** establish complete A06/A07 delivery. Remaining items
+include separate startup/no-progress deadlines (processing currently has a total
+deadline), Windows Job Object containment/qualification, v2 authenticated plan
+and ticket integration with A08, delivery-creation idempotency, and A02 migration
+number coordination. The current live adapter is the experimental v1 H.264/AAC
+SDR path; browser/player, remote/NAS and additional live pipelines still need
+qualification. The four source mutations above cover selected rules, not every
+fault or property in the plan.
+
+Validation on the final parser source: `cargo test -p playscale --lib processing::
+-- --nocapture` passed all eight tests (four decoder, three supervisor and one
+atomic-publication regression). `cargo build -p playscale --bin playscale` passed.
+After warming the fresh executable with `--help`,
+`python3 scripts/processing_smoke.py` passed all 15 checks in disposable roots.
+The added fixtures write 16 MiB without newlines to each pipe: one proceeds to
+real encoding/validation, and another holds an incomplete stdout line while
+readiness and cancellation remain responsive. Existing checks also passed for
+three real recipes, cancellation/retry, restart and SIGKILL recovery, source
+replacement, cache pressure, corrupt output rejection, restore, and preservation
+of original bytes. VideoToolbox completed and its output was probed/decoded on
+this Mac; this is not qualification of other hardware or live delivery pipelines.

@@ -480,10 +480,23 @@ fn session_cookie(app: &App, token: &str, max_age: i64) -> HeaderValue {
         ""
     };
     HeaderValue::from_str(&format!(
-        "{}={token}; Path=/api/v2; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
         auth::SESSION_COOKIE
     ))
     .expect("cookie characters are ASCII")
+}
+
+// Retire the pre-SSR path so browsers cannot send two different session
+// credentials to API requests after pairing again.
+fn expire_legacy_session_cookie(headers: &mut axum::http::HeaderMap) {
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "{}=; Path=/api/v2; HttpOnly; SameSite=Strict; Max-Age=0",
+            auth::SESSION_COOKIE
+        ))
+        .unwrap(),
+    );
 }
 
 pub async fn create_session(
@@ -572,6 +585,7 @@ pub async fn create_session(
         header::SET_COOKIE,
         session_cookie(&app, &token, child.expires_at - now),
     );
+    expire_legacy_session_cookie(response.headers_mut());
     Ok(response)
 }
 
@@ -664,6 +678,7 @@ pub async fn delete_session(State(app): State<App>, caller: Caller) -> Result<Re
     response
         .headers_mut()
         .insert(header::SET_COOKIE, session_cookie(&app, "", 0));
+    expire_legacy_session_cookie(response.headers_mut());
     Ok(response)
 }
 
@@ -898,13 +913,14 @@ pub async fn replace_policy(
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
         .await?;
     let ids = serde_json::to_string(&policy.library_ids).map_err(Problem::internal)?;
-    let known: BTreeSet<String> =
-        sqlx::query_scalar("SELECT id FROM libraries WHERE id IN (SELECT value FROM json_each(?))")
-            .bind(ids)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .collect();
+    let known: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT id FROM catalog_libraries WHERE id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
     let row = auth::load_device(&mut tx, &id)
         .await?
         .ok_or_else(Problem::not_found)?;
