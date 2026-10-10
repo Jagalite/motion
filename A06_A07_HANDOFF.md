@@ -24,7 +24,9 @@ implementation and integration gates are listed below.
   request conflicts. The adapter commits the initial state and receipt before
   dispatch, survives lost HTTP waiters, and rechecks transactional authority.
 - `crates/core/src/delivery.rs` owns generations, activation, leases, playheads,
-  pacing and retention. The live adapter validates source descriptors and output,
+  pacing and retention. It also decides live route eligibility
+  (`live_route_supported`) and lets a stream-copy generation's segment 0 start
+  at the keyframe before the request (`Ready.first_segment_start_ms`). The live adapter validates source descriptors and output,
   shares execution capacity, and persists restart fences. Pending-generation
   heartbeats cannot replace the active playhead. Restart records are diagnostic;
   they cannot revive an old transport.
@@ -38,7 +40,7 @@ implementation and integration gates are listed below.
 | Migration allocation | A02 must finalize the delivery-session migration number. This branch has provisional 0015 and admission receipts at 0020; the A08 checkout was observed preparing an uncommitted rename to 0018. Do not apply both. |
 | Windows containment | Implement and natively qualify a Job Object adapter, including descendants and parent death. The existing direct-child fallback is not whole-tree qualification; live delivery rejects non-Unix platforms. |
 | Broader execution policy | Resource estimates/limits beyond the current scalar capacity ledger remain to be integrated with agreed policy/configuration contracts. Durable processing now has an optional expected-media-duration deadline; live delivery retains its separate pacing policy. |
-| Live pipeline breadth | Remux, audio-only conversion, hardware live encoding, HDR/subtitles and broader exact-track combinations need implementation/qualification beyond the current H.264/AAC SDR live recipe. |
+| Live pipeline breadth | Remux and audio_convert copy routes are implemented behind `processing.experimental_copy_routes` (default off). Before enabling: a signed media-to-timeline mapping in core covering B-frame/AAC-priming shifts and MP4 edit lists; H.264 profile/level, rotation and interlace observations in eligibility; admission against source GOP spacing (12 s target); browser qualification of copied streams (A11). Hardware live encoding, HDR and subtitles remain unimplemented. |
 | Client and storage matrix | A11/A12 real browser/desktop open, seek, generation activation and restart; remote/NAS and supported-platform native fault runs remain required. |
 
 The A08 checkout inspected during this pass has v2 identity, content,
