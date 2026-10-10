@@ -518,6 +518,7 @@ async fn run_generation(
     let Ok(lease) = lease else {
         return fail(&app, &session);
     };
+    let lease = Arc::new(lease);
     let (pin, start_ms) = {
         let inner = session.inner.lock().unwrap();
         match inner.delivery.generations.get(&generation) {
@@ -530,24 +531,36 @@ async fn run_generation(
         .tracks
         .iter()
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()));
-    // A stalled source volume must not block cancellation. Nothing runs yet, so
-    // abandoning the blocking preparation leaves no execution to account for; its
-    // descriptors close when it finishes.
+    // Cancellation/timeout fences preparation, but a stalled filesystem operation
+    // still owns capacity and prevents generation cleanup until it actually exits.
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
         let floor = app.storage.settings.min_free_bytes;
-        let preparation = tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&directory)?;
-            crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
-            let input = source_valid(&source)?;
-            let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
-            anyhow::Ok((input, witness, held))
-        });
-        tokio::select! {
-            _ = stop.cancelled() => return stopped(&app, &session),
-            prepared = preparation => prepared,
-        }
+        let late_app = app.clone();
+        let late_session = session.clone();
+        let prepared = execution::prepare(
+            lease.clone(),
+            &stop,
+            OBSERVE_DEADLINE,
+            move || {
+                std::fs::create_dir_all(&directory)?;
+                crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
+                let input = source_valid(&source)?;
+                let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
+                anyhow::Ok((input, witness, held))
+            },
+            move || {
+                stopped(&late_app, &late_session);
+            },
+        )
+        .await;
+        let Some(prepared) = prepared else {
+            tracing::warn!(delivery=%session.id, generation, "delivery preparation fenced; awaiting actual filesystem exit");
+            let _ = apply(&app, &session, Input::Failed { generation });
+            return;
+        };
+        prepared
     };
     let (input, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,

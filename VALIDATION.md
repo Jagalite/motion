@@ -917,3 +917,57 @@ HLS, generation switching, disk rejection and restart fencing also passed.
 The focused core admission unit test and both server delivery unit tests passed.
 These results qualify the admission increment, before the subsequent optional
 expected-duration execution policy.
+
+
+## Expected-duration policy and owned filesystem preparation
+
+`execution_deadline::ExpectedDurationPolicy` derives a per-command wall-clock
+budget from the revalidated media duration plus a fixed allowance. Conversion
+and validation-decode commands use the same pure policy. Progress cannot extend
+it; the absolute cap still wins. The optional setting defaults to disabled.
+Adapters supply monotonic elapsed time and the catalog observation, then execute
+tree termination. Existing output-validation/publication decisions remain in
+core and still gate readiness.
+
+The liveness model now explores seven expected-duration budgets: absent, 0, 1,
+4, 8, 9 and u64::MAX, alongside the existing absolute/startup/stall limits and
+progress observations. Across those seven cases it exhausted 1,335 states and
+5,730 transitions, with zero skipped checks. The state codec version was bumped
+for the added deadline field. The mutation harness passed six baselines and
+detected eleven compiled regressions, including removal of the expected-duration limit.
+A pure policy unit test checks scaling, overflow saturation, exact expiry and
+absolute-cap precedence.
+
+Review also found that live delivery reported a cancelled filesystem preparation
+as stopped before its blocking syscall actually returned. The adapter now keeps
+its reservation with the blocking closure. Timeout/cancellation marks it stuck;
+a late completion drops returned descriptors before reporting Stopped, allowing
+generation cleanup and releasing capacity. The core work/delivery rules already
+require actual exit; the defect was the adapter's premature observation, not a
+missing core cancellation state. The focused adapter test uses a blocked closure
+to check retained capacity, blocked replacement, callback ordering and one release
+for both cancellation and timeout. This does not qualify an actual stalled NAS.
+
+`cargo build -p playscale --bin playscale` passed on final production source.
+`cargo test -p playscale --lib -- --nocapture` passed all 26 tests, including
+the owned-preparation cancellation/timeout regression. Formatting and diff
+checks passed.
+
+The host briefly reported no space on its internal temporary volume during
+concurrent builds. Final library/delivery test temporary roots were moved to the
+external project volume. An initial smoke run using an external temporary state
+root timed out before server readiness while the test build queue was still
+active; its executable bytes did not change. This is a failed startup run, not
+a passed encoder check. A retry with internal temporary state reached readiness
+but timed out on the first recipe while native delivery tests were still running.
+Neither attempt is counted as a pass. No deadline was enlarged.
+
+Final `cargo test -p playscale --test delivery -- --nocapture` passed all six
+tests with real tools and no skips. After native tests completed, an untimed
+launch of the actual supervisor path preceded the final processing smoke run.
+`python3 scripts/processing_smoke.py` then passed all 20 checks, including the
+advancing-progress expected-duration timeout, actual encoder reaping, subsequent
+capacity reuse, all three recipes, VideoToolbox decode, cancellation/retry,
+restart/SIGKILL, rejected stale/corrupt outputs, restore and original integrity.
+The final server SHA256 was unchanged before and after the passing run:
+`e50a5b10b621ef1e905c6c78d07cd6a177e55b4f2272c0422e77bb71783257ae`.

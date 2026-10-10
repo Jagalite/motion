@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check ten execution/delivery regressions in a disposable core-only workspace.
+"""Check eleven execution/delivery regressions in a disposable core-only workspace.
 
 Requires cached Cargo dependencies. Never edits the checkout or shares its target
 directory. A compile error, timeout, or missing test is not a detected mutation.
@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEARTBEAT = "heartbeat_boundaries_renew_only_valid_generation_leases"
 STUCK = "work::tests::stuck_owner_keeps_capacity_until_exit"
 LIVENESS = "liveness_graph_covers_stalls_duplicates_regressions_and_expiry"
+DURATION = "execution_deadline::duration_policy_tests::duration_budget_scales_saturates_and_cannot_renew"
 ADMISSION = "admission_graph_covers_lost_ack_retirement_restart_conflict_and_rollback"
 SCOPE = "delivery_admission::tests::exact_retries_replay_but_changed_requests_and_foreign_receipts_do_not"
 
@@ -64,6 +65,7 @@ def main():
         check(workspace, liveness_target, LIVENESS)
         check(workspace, admission_target, ADMISSION)
         check(workspace, ["--lib"], SCOPE)
+        check(workspace, ["--lib"], DURATION)
         delivery = workspace / "crates/core/src/delivery.rs"
         work = workspace / "crates/core/src/work.rs"
         deadline = workspace / "crates/core/src/execution_deadline.rs"
@@ -76,6 +78,8 @@ def main():
         end = original_delivery.index("        Input::Tick {", start)
         heartbeat = original_delivery[start:end]
         mutants = [
+            ("advancing work outlives expected duration", deadline,
+             "self.expected_ms.is_some_and(|limit| elapsed_ms >= limit)", "false", liveness_target, LIVENESS),
             ("retry creates another delivery", admission,
              "Ok(Decision::Replay {\n        delivery_id: receipt.delivery_id.clone(),\n    })",
              "Ok(Decision::Create)", admission_target, ADMISSION),
@@ -110,7 +114,7 @@ def main():
             path.write_text(mutated)
             check(workspace, target, test, should_fail=True)
             print(f"Detected: {label}", flush=True)
-        print("PASS: 5 baselines; 10 compiled mutations detected by test failures", flush=True)
+        print("PASS: 6 baselines; 11 compiled mutations detected by test failures", flush=True)
 
 
 if __name__ == "__main__":

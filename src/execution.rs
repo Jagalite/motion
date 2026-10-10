@@ -171,6 +171,34 @@ impl Coordinator {
     }
 }
 
+/// Cancellation fences blocking preparation without pretending its filesystem
+/// operation stopped. Its reservation follows the blocking closure, and a late
+/// completion is observed before the domain may clean up its generation.
+pub(crate) async fn prepare<T: Send + 'static>(
+    lease: Arc<Lease>,
+    stop: &CancellationToken,
+    deadline: Duration,
+    operation: impl FnOnce() -> T + Send + 'static,
+    late_exit: impl FnOnce() + Send + 'static,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let ownership = lease.clone();
+    let mut work = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        operation()
+    });
+    tokio::select! {
+        result = &mut work => Some(result),
+        _ = async { tokio::select! { _ = stop.cancelled() => {}, _ = tokio::time::sleep(deadline) => {} } } => {
+            lease.stuck(async move {
+                // Drop returned descriptors before reporting stopped/allowing GC.
+                drop(work.await);
+                late_exit();
+            });
+            None
+        }
+    }
+}
+
 struct Withdraw {
     coordinator: Arc<Coordinator>,
     ticket: u64,
@@ -506,6 +534,71 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_or_timed_out_preparation_holds_capacity_until_actual_exit() {
+        for cancel in [true, false] {
+            let coordinator = Coordinator::new(Budget {
+                units: 1,
+                interactive_reserve: 0,
+            });
+            let lease = Arc::new(
+                coordinator
+                    .reserve("filesystem".into(), Class::Interactive, 1)
+                    .await
+                    .unwrap(),
+            );
+            let stop = CancellationToken::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, blocked) = std::sync::mpsc::channel();
+            let task = {
+                let lease = lease.clone();
+                let stop = stop.clone();
+                let entered = entered.clone();
+                let completed = completed.clone();
+                tokio::spawn(async move {
+                    prepare(
+                        lease,
+                        &stop,
+                        if cancel {
+                            Duration::from_secs(30)
+                        } else {
+                            Duration::from_millis(20)
+                        },
+                        move || {
+                            entered.notify_one();
+                            blocked.recv().unwrap();
+                        },
+                        move || {
+                            completed.fetch_add(1, Ordering::SeqCst);
+                        },
+                    )
+                    .await
+                })
+            };
+            entered.notified().await;
+            if cancel {
+                stop.cancel();
+            }
+            assert!(task.await.unwrap().is_none());
+            drop(lease);
+            assert_eq!(coordinator.snapshot().used, 1);
+            assert_eq!(coordinator.snapshot().stuck, ["filesystem"]);
+            assert_eq!(completed.load(Ordering::SeqCst), 0);
+            assert!(!coordinator.fits_now(Class::Interactive, 1));
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while coordinator.snapshot().used != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert!(coordinator.fits_now(Class::Interactive, 1));
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

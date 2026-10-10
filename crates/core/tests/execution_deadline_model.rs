@@ -11,23 +11,36 @@ struct State {
     advanced: bool,
     largest_observation: u64,
 }
-struct Liveness;
+struct Liveness {
+    expected: Option<u64>,
+}
+impl Liveness {
+    fn hard_expiry(&self, now: u64) -> Option<Expired> {
+        if now >= 8 {
+            Some(Expired::Total)
+        } else if self.expected.is_some_and(|limit| now >= limit) {
+            Some(Expired::ExpectedDuration)
+        } else {
+            None
+        }
+    }
+}
 impl Model for Liveness {
     type State = State;
     type Input = u64;
     type Output = Expired;
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
-            name: "playscale.execution-deadline".into(),
-            model_version: 1,
-            properties_version: 1,
-            codec_version: 1,
+            name: format!("playscale.execution-deadline.{:?}", self.expected),
+            model_version: 2,
+            properties_version: 2,
+            codec_version: 2,
             build: include_str!("../src/execution_deadline.rs").into(),
         }
     }
     fn initial_state(&self) -> Result<State, ModelError> {
         Ok(State {
-            deadline: Deadline::new(8, Some(3), Some(2)),
+            deadline: Deadline::new(8, Some(3), Some(2)).with_expected_duration(self.expected),
             now: 0,
             advanced: false,
             largest_observation: 0,
@@ -70,14 +83,9 @@ impl Model for Liveness {
             (
                 "advancement_grants_exact_stall_window",
                 !advances_in_time
-                    || (n.deadline.expired(n.now + 1)
-                        == (n.now + 1 >= 8).then_some(Expired::Total)
+                    || (n.deadline.expired(n.now + 1) == self.hard_expiry(n.now + 1)
                         && n.deadline.expired(n.now + 2)
-                            == Some(if n.now + 2 >= 8 {
-                                Expired::Total
-                            } else {
-                                Expired::NoProgress
-                            })),
+                            == Some(self.hard_expiry(n.now + 2).unwrap_or(Expired::NoProgress))),
             ),
             (
                 "expired_never_revives",
@@ -90,6 +98,11 @@ impl Model for Liveness {
             (
                 "zero_cannot_start",
                 s.advanced || *position > 0 || n.now < 3 || !t.outputs.is_empty(),
+            ),
+            (
+                "expected_duration_is_absolute",
+                self.hard_expiry(n.now)
+                    .is_none_or(|reason| t.outputs == [reason]),
             ),
             ("one_expiry_reason", t.outputs.len() <= 1),
         ];
@@ -139,15 +152,26 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, ModelError> {
 }
 #[test]
 fn liveness_graph_covers_stalls_duplicates_regressions_and_expiry() {
-    let report = stateless::explore::enumerate(&Liveness, Default::default()).unwrap();
-    assert!(report.failure.is_none(), "{:?}", report.failure);
-    assert_eq!(report.skipped_checks, 0);
-    assert_eq!(
-        report.termination,
-        stateless::explore::SearchTermination::GraphExhausted
-    );
-    println!(
-        "Liveness: {} states, {} transitions; elapsed 0..9, positions 0/1/2/3/u64::MAX",
-        report.states, report.transitions
-    );
+    for expected in [
+        None,
+        Some(0),
+        Some(1),
+        Some(4),
+        Some(8),
+        Some(9),
+        Some(u64::MAX),
+    ] {
+        let report =
+            stateless::explore::enumerate(&Liveness { expected }, Default::default()).unwrap();
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(report.skipped_checks, 0);
+        assert_eq!(
+            report.termination,
+            stateless::explore::SearchTermination::GraphExhausted
+        );
+        println!(
+            "Liveness expected={expected:?}: {} states, {} transitions; elapsed 0..9, positions 0/1/2/3/u64::MAX",
+            report.states, report.transitions
+        );
+    }
 }

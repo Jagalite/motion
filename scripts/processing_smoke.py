@@ -115,6 +115,30 @@ def main():
                 wrapper.write_text(normal_wrapper);stop(process)
                 settings['processing'].pop('startup_timeout_seconds');settings['processing'].pop('no_progress_timeout_seconds')
                 config.write_text(json.dumps(settings));process=boot()
+            # Advancing media time cannot extend a duration-derived wall-clock budget.
+            stop(process)
+            settings['processing']['expected_duration']={'allowance_seconds':2,'media_duration_multiplier':1}
+            config.write_text(json.dumps(settings));process=boot()
+            try:
+                wrapper.write_text('#!'+sys.executable+'\nimport os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\ni=0\nwhile True:\n i+=100000; os.write(1,("out_time_us="+str(i)+"\\n").encode()); time.sleep(.05)\n')
+                pidfile.unlink(missing_ok=True)
+                server_log=state/'logs/server.log';log_offset=server_log.stat().st_size
+                job=submit();wait_for(pidfile.exists);encoder_pid=int(pidfile.read_text())
+                row=terminal(job)
+                assert row['phase']=='failed' and row['output_file_id'] is None,row
+                assert row['progress_seconds'] > 0,row
+                wait_for(lambda: b'processing ExpectedDuration timeout' in server_log.read_bytes()[log_offset:],seconds=5)
+                try: os.kill(encoder_pid,0)
+                except ProcessLookupError: pass
+                else: raise AssertionError('duration-limited encoder was not reaped')
+                checks.append('expected_duration_deadline_reaps_advancing_encoder_without_publication')
+                wrapper.write_text(normal_wrapper)
+                assert terminal(submit())['phase']=='completed'
+                checks.append('expected_duration_timeout_releases_capacity_after_reaping')
+            finally:
+                wrapper.write_text(normal_wrapper);stop(process)
+                settings['processing'].pop('expected_duration')
+                config.write_text(json.dumps(settings));process=boot()
             hardware={'attempted':sys.platform=='darwin'}
             if sys.platform=='darwin':
                 row=terminal(submit(backend='videotoolbox'));hardware.update(phase=row['phase'],error=row['error']);

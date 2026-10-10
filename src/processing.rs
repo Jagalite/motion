@@ -35,6 +35,7 @@ pub struct Settings {
     /// Optional liveness limits; omitted preserves the total-timeout-only policy.
     pub startup_timeout_seconds: Option<u64>,
     pub no_progress_timeout_seconds: Option<u64>,
+    pub expected_duration: Option<playscale_core::execution_deadline::ExpectedDurationPolicy>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -46,6 +47,7 @@ impl Default for Settings {
             timeout_seconds: 7200,
             startup_timeout_seconds: None,
             no_progress_timeout_seconds: None,
+            expected_duration: None,
         }
     }
 }
@@ -61,6 +63,10 @@ impl Settings {
             (60..=31_536_000).contains(&self.retention_seconds)
                 && (1..=86400).contains(&self.timeout_seconds),
             "invalid processing retention/timeout"
+        );
+        anyhow::ensure!(
+            self.expected_duration.is_none_or(|policy| policy.valid()),
+            "invalid expected-duration policy"
         );
         for value in [
             self.startup_timeout_seconds,
@@ -454,6 +460,7 @@ async fn command(
     owner: &FsPath,
     cmd: &mut Command,
     progress: bool,
+    media_ms: u64,
 ) -> anyhow::Result<()> {
     // A separate supervisor watches this pipe. Even SIGKILL of the server closes
     // it, so an encoder cannot outlive its owner and overlap a recovered attempt.
@@ -511,6 +518,12 @@ async fn command(
             .settings
             .no_progress_timeout_seconds
             .map(|v| v * 1000),
+    )
+    .with_expected_duration(
+        app.processing
+            .settings
+            .expected_duration
+            .map(|p| p.budget_ms(media_ms)),
     );
     let elapsed = || started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     let mut output_open = true;
@@ -584,6 +597,11 @@ async fn convert(
             .bind(&source.library_id)
             .fetch_one(&app.db)
             .await?;
+    let duration = source
+        .duration_seconds
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .context("source duration unknown")?;
+    let media_ms = (duration * 1000.0).ceil() as u64;
     let directory = app.processing.root.join(job.relative());
     let stage = directory.clone();
     let cache = app.processing.root.clone();
@@ -731,6 +749,7 @@ async fn convert(
         &directory.join(".owner"),
         &mut cmd,
         true,
+        media_ms,
     )
     .await?;
     let found = scan::inspect(
@@ -741,7 +760,6 @@ async fn convert(
         permit.clone(),
     )
     .await?;
-    let duration = source.duration_seconds.context("source duration unknown")?;
     let source_tracks: Vec<db::Track> = serde_json::from_str(&source.tracks_json)?;
     let observations = |tracks: &[db::Track]| {
         tracks
@@ -800,6 +818,7 @@ async fn convert(
         &directory.join(".owner"),
         &mut decode,
         false,
+        media_ms,
     )
     .await?;
     let (root, identity): (String, String) =
@@ -1371,6 +1390,18 @@ mod settings_tests {
         let default: super::Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(default.startup_timeout_seconds, None);
         assert_eq!(default.no_progress_timeout_seconds, None);
+        assert_eq!(default.expected_duration, None);
+        for (allowance, multiplier, valid) in [
+            (1, 1, true),
+            (86400, 100, true),
+            (0, 1, false),
+            (86401, 1, false),
+            (1, 0, false),
+            (1, 101, false),
+        ] {
+            let settings: super::Settings = serde_json::from_value(serde_json::json!({"expected_duration":{"allowance_seconds":allowance,"media_duration_multiplier":multiplier}})).unwrap();
+            assert_eq!(settings.validate().is_ok(), valid);
+        }
         for field in ["startup_timeout_seconds", "no_progress_timeout_seconds"] {
             for (value, valid) in [(0, false), (1, true), (86400, true), (86401, false)] {
                 let settings: super::Settings =
