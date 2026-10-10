@@ -300,6 +300,10 @@ async fn apply_merge(
         // differing identities were rejected by the decision.
         sqlx::query("UPDATE metadata_documents SET item_id=? WHERE item_id=? AND source NOT IN (SELECT source FROM metadata_documents WHERE item_id=?)")
             .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
+        // The NFO origin moves with its contribution (it moved only if the
+        // target had no NFO contribution, hence no origin of its own).
+        sqlx::query("UPDATE nfo_origins SET item_id=? WHERE item_id=? AND NOT EXISTS (SELECT 1 FROM nfo_origins WHERE item_id=?)")
+            .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
         sqlx::query("UPDATE artwork_contributions SET item_id=? WHERE item_id=? AND (role,source) NOT IN (SELECT role,source FROM artwork_contributions WHERE item_id=?)")
             .bind(&plan.target).bind(retired).bind(&plan.target).execute(&mut **tx).await?;
         sqlx::query("UPDATE renditions SET item_id=? WHERE item_id=?")

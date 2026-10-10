@@ -112,3 +112,23 @@ fn hostile_inputs_are_refused() {
         Err(NfoError::Malformed(_))
     ));
 }
+
+#[test]
+fn legacy_id_is_imdb_only_and_never_overrides_uniqueid() {
+    let legacy = parse(b"<movie><title>X</title><id>tt0133093</id></movie>").unwrap();
+    assert_eq!(
+        legacy.external_ids,
+        [("imdb".to_string(), "tt0133093".to_string())]
+    );
+    let numeric = parse(b"<tvshow><title>X</title><id>12345</id></tvshow>").unwrap();
+    assert!(
+        numeric.external_ids.is_empty(),
+        "ambiguous provider is not guessed"
+    );
+    let explicit =
+        parse(br#"<movie><uniqueid type="imdb">tt1</uniqueid><id>tt2</id></movie>"#).unwrap();
+    assert_eq!(
+        explicit.external_ids,
+        [("imdb".to_string(), "tt1".to_string())]
+    );
+}

@@ -10,7 +10,8 @@
 //! Supported roots: `movie`, `tvshow`, `episodedetails`. Supported fields:
 //! `title`, `originaltitle`, `year`, `premiered`/`aired` (YYYY-MM-DD), `plot`,
 //! `genre` (repeatable), `tag` (repeatable), `actor/name` + `actor/role`,
-//! `uniqueid type=".." [default="true"]`, legacy `id`/`tmdbid`/`imdbid`,
+//! `uniqueid type=".." [default="true"]`, legacy `id` (IMDb `tt…` only),
+//! `tmdbid`/`imdbid`,
 //! `season`/`episode` numbers. Unsupported: ratings, artwork URLs (never
 //! fetched), stream details, sets, studios, credits beyond actors.
 use crate::metadata::{Contribution, valid_field};
@@ -306,6 +307,13 @@ pub fn parse(input: &[u8]) -> Result<Nfo, NfoError> {
         {
             external_ids.push((p.into(), v.into(), false));
         }
+    }
+    // Kodi's legacy `<id>` holds an IMDb identifier for movies; other values
+    // are ambiguous across providers and are not guessed.
+    if let Some(v) = text_of(&root, "id").filter(|v| v.starts_with("tt") && v.len() <= 32)
+        && !external_ids.iter().any(|(q, _, _)| q == "imdb")
+    {
+        external_ids.push(("imdb".into(), v.into(), false));
     }
     external_ids.sort_by_key(|(_, _, default)| !*default);
     let number = |name: &str| text_of(&root, name).and_then(|n| n.parse::<u32>().ok());

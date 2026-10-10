@@ -1029,3 +1029,84 @@ async fn sidecar_nfo_contributes_and_is_withdrawn_only_by_its_origin() {
         "back to the scanned title"
     );
 }
+
+#[tokio::test]
+async fn sidecar_fifo_pins_and_merges_are_handled() {
+    let f = Fixture::new().await;
+    // A FIFO sidecar with no writer must not stall the scan.
+    f.write("pipe.mkv", b"pipe bytes");
+    let status = std::process::Command::new("mkfifo")
+        .arg(f.root.join("pipe.nfo"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let job = tokio::time::timeout(Duration::from_secs(20), f.scan())
+        .await
+        .unwrap();
+    assert_eq!(job.phase, "completed");
+
+    // A pinned (manual) NFO identity survives removal of its sidecar.
+    f.write("pinned.mkv", b"pinned bytes");
+    f.write(
+        "pinned.nfo",
+        br#"<movie><title>Pinned</title><uniqueid type="tmdb">1</uniqueid></movie>"#,
+    );
+    f.scan().await;
+    let (_, pinned, ..) = f.file("pinned.mkv").await;
+    sqlx::query("UPDATE items SET match_state='manual' WHERE id=?")
+        .bind(&pinned)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    std::fs::remove_file(f.root.join("pinned.nfo")).unwrap();
+    f.scan().await;
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM metadata_documents WHERE item_id=? AND source='nfo'",
+    )
+    .bind(&pinned)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(kept, 1, "manual pin is not withdrawn by sidecar absence");
+
+    // After a merge moves the contribution, removing the sidecar still withdraws it.
+    f.write("source.mkv", b"source bytes");
+    f.write("source.nfo", b"<movie><title>From Sidecar</title></movie>");
+    f.write("target.mkv", b"target bytes");
+    f.scan().await;
+    let (_, source, ..) = f.file("source.mkv").await;
+    let (_, target, ..) = f.file("target.mkv").await;
+    let mut conn = f.app.db.acquire().await.unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for id in [&source, &target] {
+        let a = playscale::curation::load_aggregate(&mut conn, id)
+            .await
+            .unwrap()
+            .unwrap();
+        expected.insert(id.clone(), a.work.revision);
+    }
+    drop(conn);
+    let plan = playscale::curation::preview_merge(
+        &f.app.db,
+        &playscale_core::identity::MergeRequest {
+            sources: vec![source.clone()],
+            target: target.clone(),
+            expected,
+        },
+    )
+    .await
+    .unwrap();
+    playscale::curation::commit_merge(&f.app, &plan)
+        .await
+        .unwrap();
+    std::fs::remove_file(f.root.join("source.nfo")).unwrap();
+    f.scan().await;
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM metadata_documents WHERE item_id=? AND source='nfo'",
+    )
+    .bind(&target)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}

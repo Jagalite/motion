@@ -9,31 +9,72 @@ use std::{io::Read, path::Path};
 pub enum Sidecar {
     /// No `<stem>.nfo` next to the media file.
     Absent,
-    Present(Vec<u8>),
-    /// Exists but cannot be used (too large, unreadable, not a regular file):
-    /// keep whatever was published before.
+    /// Parsed during traversal; raw bytes are not retained.
+    Parsed(nfo::Nfo),
+    /// Exists but cannot be used (too large, unreadable, not a regular file,
+    /// malformed, or over the scan's read budget): keep whatever was
+    /// published before.
     Unusable,
 }
 
-/// Read `<stem>.nfo` beside `relative` through the handle-relative opener.
-pub fn read(root: &Path, relative: &str) -> Sidecar {
+/// Raw sidecar bytes one scan may read in total.
+pub const SCAN_BUDGET: usize = 64 * 1024 * 1024;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+
+/// Read and parse `<stem>.nfo` beside `relative`, handle-relative to the
+/// root. The open is non-blocking so a FIFO or device cannot stall the scan
+/// worker; anything but a regular file is unusable.
+pub fn read(root: &Path, relative: &str, budget: &mut usize) -> Sidecar {
     let sidecar = Path::new(relative).with_extension("nfo");
-    let file = match crate::scan::open_file(root, &sidecar) {
-        Ok(file) => file,
-        Err(error) => {
-            let missing = error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-            return if missing {
-                Sidecar::Absent
-            } else {
-                Sidecar::Unusable
-            };
-        }
+    if !sidecar
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Sidecar::Unusable;
+    }
+    let Ok(dir) = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()) else {
+        return Sidecar::Unusable;
     };
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(O_NONBLOCK);
+    }
+    let file = match dir.open_with(&sidecar, &options) {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Sidecar::Absent,
+        Err(_) => return Sidecar::Unusable,
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Sidecar::Unusable;
+    }
+    let allowance = (*budget).min(nfo::MAX_BYTES);
+    if allowance == 0 {
+        return Sidecar::Unusable;
+    }
     let mut bytes = Vec::new();
-    match file.take(nfo::MAX_BYTES as u64 + 1).read_to_end(&mut bytes) {
-        Ok(_) if bytes.len() <= nfo::MAX_BYTES => Sidecar::Present(bytes),
+    let read = file.take(allowance as u64 + 1).read_to_end(&mut bytes);
+    *budget = budget.saturating_sub(bytes.len());
+    match read {
+        Ok(_) if bytes.len() <= allowance => match nfo::parse(&bytes) {
+            Ok(parsed) => Sidecar::Parsed(parsed),
+            Err(error) => {
+                tracing::debug!(?error, "sidecar NFO ignored");
+                Sidecar::Unusable
+            }
+        },
         _ => Sidecar::Unusable,
     }
 }
@@ -56,34 +97,32 @@ pub(crate) async fn publish(
     match sidecar {
         Sidecar::Unusable => Ok(()),
         Sidecar::Absent => {
-            // Only the file that supplied the contribution can withdraw it.
+            // Only the file that supplied a contribution can withdraw it, and
+            // only if a manual identification does not pin its identity.
             let origin: Option<String> =
-                sqlx::query_scalar("SELECT file_id FROM nfo_origins WHERE item_id=?")
-                    .bind(&item)
+                sqlx::query_scalar("SELECT item_id FROM nfo_origins WHERE file_id=?")
+                    .bind(file)
                     .fetch_optional(&mut *conn)
                     .await?;
-            if origin.as_deref() == Some(file) {
-                sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
-                    .bind(&item)
-                    .bind(SOURCE)
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
-                    .bind(&item)
-                    .execute(&mut *conn)
-                    .await?;
-                crate::metadata::project_title(conn, &item).await?;
+            let Some(owner) = origin else {
+                return Ok(());
+            };
+            if !crate::matching::provider_identity_allowed(conn, &owner, SOURCE, None).await? {
+                return Ok(());
             }
+            sqlx::query("DELETE FROM metadata_documents WHERE item_id=? AND source=?")
+                .bind(&owner)
+                .bind(SOURCE)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("DELETE FROM nfo_origins WHERE item_id=?")
+                .bind(&owner)
+                .execute(&mut *conn)
+                .await?;
+            crate::metadata::project_title(conn, &owner).await?;
             Ok(())
         }
-        Sidecar::Present(bytes) => {
-            let parsed = match nfo::parse(bytes) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    tracing::debug!(?error, "sidecar NFO ignored");
-                    return Ok(());
-                }
-            };
+        Sidecar::Parsed(parsed) => {
             let document = serde_json::to_string(&parsed.contribution)?;
             let external = parsed.external_ids.first().map(|(p, v)| format!("{p}:{v}"));
             if !crate::matching::provider_identity_allowed(conn, &item, SOURCE, external.as_deref())

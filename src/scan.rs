@@ -24,7 +24,7 @@ pub struct Found {
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
     pub reused: bool,
-    /// Sidecar NFO observed beside the file (read outside the writer).
+    /// Sidecar NFO observed and parsed beside the file (outside the writer).
     pub nfo: crate::nfo::Sidecar,
 }
 
@@ -483,10 +483,11 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
     let hold = permit.clone();
     found = tokio::task::spawn_blocking(move || {
         let _hold = hold;
+        let mut budget = crate::nfo::SCAN_BUDGET;
         found
             .into_iter()
             .map(|mut f| {
-                f.nfo = crate::nfo::read(&sidecar_root, &f.relative);
+                f.nfo = crate::nfo::read(&sidecar_root, &f.relative, &mut budget);
                 f
             })
             .collect::<Vec<_>>()
