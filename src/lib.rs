@@ -8,6 +8,7 @@ pub mod curation;
 pub mod db;
 pub mod encoding;
 pub mod events;
+pub mod interchange;
 pub mod libraries;
 pub mod maintenance;
 pub mod markers;

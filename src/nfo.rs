@@ -181,33 +181,75 @@ async fn withdraw(
 
 /// On-demand metadata refresh for one work without a full scan: re-observe
 /// the sidecars beside its available files (outside the writer) and publish
-/// them in one writer transaction. Returns how many files were observed.
+/// them in one writer transaction. Reads happen only under a root whose
+/// volume identity matches the registration (checked before and after);
+/// each observation is published only if its source binding and file facts
+/// are unchanged at commit. Returns how many observations were published.
 pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize> {
-    let files: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT f.id,f.relative_path,l.root FROM media_files f JOIN editions e ON e.id=f.edition_id JOIN libraries l ON l.id=f.library_id WHERE e.item_id=? AND f.available=1 AND f.generated=0 AND l.enabled=1 ORDER BY f.id",
+    type Row = (String, String, String, String, i64, String);
+    let files: Vec<Row> = sqlx::query_as(
+        "SELECT f.id,f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision FROM media_files f JOIN editions e ON e.id=f.edition_id JOIN libraries l ON l.id=f.library_id WHERE e.item_id=? AND f.available=1 AND f.generated=0 AND l.enabled=1 ORDER BY f.id",
     )
     .bind(item)
     .fetch_all(&app.db)
     .await?;
     let observed = tokio::task::spawn_blocking(move || {
         let mut budget = SCAN_BUDGET;
+        let identity = |root: &str| {
+            std::fs::metadata(root)
+                .ok()
+                .map(|m| crate::db::root_identity(&m))
+        };
         files
             .into_iter()
-            .map(|(id, relative, root)| {
-                let sidecar = read(Path::new(&root), &relative, &mut budget);
-                (id, sidecar)
+            .map(|row| {
+                let (_, relative, root, expected, _, _) = &row;
+                let before = identity(root);
+                let sidecar = if before.as_deref() == Some(expected.as_str()) {
+                    let sidecar = read(Path::new(root), relative, &mut budget);
+                    // A root replaced during the read proves nothing.
+                    if identity(root).as_deref() == Some(expected.as_str()) {
+                        sidecar
+                    } else {
+                        Sidecar::Unusable
+                    }
+                } else {
+                    Sidecar::Unusable
+                };
+                (row, sidecar)
             })
             .collect::<Vec<_>>()
     })
     .await?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    for (file, sidecar) in &observed {
-        // A file may have changed works since it was read; publish against
-        // its current work (publish looks it up inside this transaction).
+    let mut published = 0;
+    for ((file, relative, root, identity, binding, revision), sidecar) in &observed {
+        if matches!(sidecar, Sidecar::Unusable) {
+            continue;
+        }
+        // The observation must still describe this file at this binding.
+        let current: Option<(String, String, String, i64, String, bool)> = sqlx::query_as(
+            "SELECT f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+        )
+        .bind(file)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let unchanged = current.is_some_and(|(p, r, i, b, v, available)| {
+            available
+                && &p == relative
+                && &r == root
+                && &i == identity
+                && b == *binding
+                && &v == revision
+        });
+        if !unchanged {
+            continue;
+        }
         publish(&mut tx, file, sidecar).await?;
+        published += 1;
     }
     crate::search::refresh(&mut tx, 100).await?;
     tx.commit().await?;
-    Ok(observed.len())
+    Ok(published)
 }

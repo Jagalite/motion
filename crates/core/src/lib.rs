@@ -5,6 +5,7 @@ pub mod components;
 pub mod demands;
 pub mod events;
 pub mod identity;
+pub mod interchange;
 pub mod jobs;
 pub mod maintenance;
 pub mod markers;

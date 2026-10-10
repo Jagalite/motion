@@ -1696,3 +1696,130 @@ async fn reconciliation_plans_round_trip_and_metadata_refreshes_on_demand() {
         .unwrap();
     assert_eq!(title, "Refreshed");
 }
+
+// ---------------------------------------------------------------------------
+// Interchange
+
+#[tokio::test]
+async fn curation_exports_and_imports_between_servers_by_content() {
+    let source = Fixture::new().await;
+    source.write("film.mkv", b"identical film bytes");
+    source.write("other.mkv", b"only on the source server");
+    source.scan().await;
+    let (_, film, _, film_edition) = source.file("film.mkv").await;
+    let (_, other, ..) = source.file("other.mkv").await;
+    sqlx::query("INSERT INTO metadata_documents VALUES (?,'local',1,NULL,?,1)")
+        .bind(&film)
+        .bind(
+            json!({"values":{"title":"My Film"},"tags":["favorite"],"excluded_tags":[]})
+                .to_string(),
+        )
+        .execute(&source.app.db)
+        .await
+        .unwrap();
+    orgs::save_collection(
+        &source.app,
+        "default",
+        None,
+        "Faves",
+        CollectionKind::Manual,
+        vec![film.clone(), other.clone()],
+        None,
+    )
+    .await
+    .unwrap();
+    orgs::save_playlist(
+        &source.app,
+        "default",
+        None,
+        "Tonight",
+        vec![Entry {
+            entry_id: "1".into(),
+            timeline_id: film_edition.clone(),
+        }],
+    )
+    .await
+    .unwrap();
+    let exported = playscale::interchange::export(&source.app.db, "default")
+        .await
+        .unwrap();
+    let wire = serde_json::to_string(&exported).unwrap();
+
+    let target = Fixture::new().await;
+    target.write("renamed/film.mkv", b"identical film bytes");
+    target.scan().await;
+    let (_, target_film, _, target_edition) = target.file("renamed/film.mkv").await;
+    let export: playscale_core::interchange::Export = serde_json::from_str(&wire).unwrap();
+    let plan = playscale::interchange::preview_import(&target.app.db, "default", &export)
+        .await
+        .unwrap();
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("other") || w.contains("unresolved")),
+        "{:?}",
+        plan.warnings
+    );
+    playscale::interchange::commit_import(&target.app, &export, &plan)
+        .await
+        .unwrap();
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id=?")
+        .bind(&target_film)
+        .fetch_one(&target.app.db)
+        .await
+        .unwrap();
+    assert_eq!(title, "My Film");
+    let collections = orgs::list_collections(&target.app.db, "default")
+        .await
+        .unwrap();
+    assert_eq!(collections.len(), 1);
+    assert_eq!(collections[0].item_ids, std::slice::from_ref(&target_film));
+    let playlists = orgs::list_playlists(&target.app.db, "default")
+        .await
+        .unwrap();
+    assert_eq!(playlists[0].entries[0].timeline_id, target_edition);
+    // The reviewed plan cannot be applied twice.
+    assert!(matches!(
+        playscale::interchange::commit_import(&target.app, &export, &plan).await,
+        Err(playscale::interchange::ImportError::Rejected(
+            playscale_core::interchange::InterchangeError::StalePlan
+        ))
+    ));
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catalog_receipts WHERE kind='interchange:import'")
+            .fetch_one(&target.app.db)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 1);
+}
+
+#[tokio::test]
+async fn refresh_ignores_replaced_roots_and_stale_observations() {
+    let f = Fixture::new().await;
+    f.write("film.mkv", b"film");
+    f.scan().await;
+    let (_, item, ..) = f.file("film.mkv").await;
+    // Replace the registered root at the same path with an unrelated volume.
+    let moved = f.root.with_file_name("media-original");
+    std::fs::rename(&f.root, &moved).unwrap();
+    std::fs::create_dir(&f.root).unwrap();
+    std::fs::write(f.root.join("film.mkv"), b"film").unwrap();
+    std::fs::write(
+        f.root.join("film.nfo"),
+        b"<movie><title>Impostor</title></movie>",
+    )
+    .unwrap();
+    assert_eq!(
+        playscale::nfo::refresh_item(&f.app, &item).await.unwrap(),
+        0
+    );
+    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id=?")
+        .bind(&item)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        title, "film",
+        "nothing from the replacement root is published"
+    );
+}
