@@ -1602,6 +1602,17 @@ pub async fn change_delivery(
         }
         _ => None,
     };
+    // A hardware replan checks availability inside the write transaction from
+    // the cached probe only: warm it here, after the same preflight.
+    if let DeliveryChange::Replan { plan_token, .. } = &body.value
+        && app.processing.settings.experimental_live_hardware
+        && let Ok(claims) = open(&app, plan_token)
+        && claims.principal == caller.principal.id
+        && claims.route == Route::HardwareTranscode
+        && may_probe(&app, &caller, &claims, Some(&id)).await.is_ok()
+    {
+        delivery::hardware_live(&app).await;
+    }
     let (mut tx, principal, owner) = command(&app, &caller, &id).await?;
     let durable = Scope {
         principal: &principal.id,

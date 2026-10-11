@@ -2366,7 +2366,13 @@ pub(crate) async fn change_live(
                 }
                 Route::Transcode | Route::HardwareTranscode => {
                     let hardware = selection.route == Route::HardwareTranscode;
-                    if hardware && hardware_live(app).await == HardwareState::Unavailable {
+                    // Inside the command's write transaction: only the cached
+                    // probe result counts (the v2 command warms it first), so
+                    // an encoder probe never runs while holding the writer.
+                    if hardware
+                        && !(app.processing.settings.experimental_live_hardware
+                            && app.processing.videotoolbox.get() == Some(&true))
+                    {
                         return Err(backend_unavailable());
                     }
                     validate_route(
@@ -2611,9 +2617,12 @@ async fn admit_owned(
             .clone()
             .unwrap_or(crate::processing::Backend::Software),
     };
-    // Probed once per process; outside the admission lock and the writer.
+    // Probed once per process; outside the admission lock and the writer. A
+    // planned hardware admission also needs live hardware still enabled: a
+    // plan signed before a restart that disabled it cannot start an encoder.
     let hardware_ready = backend != crate::processing::Backend::Videotoolbox
-        || crate::processing::videotoolbox_available(app).await;
+        || ((planned.is_none() || app.processing.settings.experimental_live_hardware)
+            && crate::processing::videotoolbox_available(app).await);
     let _admission = runtime.admission.lock().await;
     let mut transaction = db::begin_write(&app.db).await?;
     let principal = authority.reauthorize(&mut transaction, &r).await?;

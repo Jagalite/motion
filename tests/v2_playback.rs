@@ -191,8 +191,12 @@ impl Fixture {
 
     /// Stop this server and start another over the same state.
     async fn restart(&mut self) {
-        self.server.stop.cancel();
         let settings = self.server.app.processing.settings.clone();
+        self.restart_with(settings).await;
+    }
+
+    async fn restart_with(&mut self, settings: playscale::processing::Settings) {
+        self.server.stop.cancel();
         self.server = Server::start_with(self.dir.path(), self.key, settings).await;
     }
 
@@ -3113,7 +3117,7 @@ async fn hardware_conversion_is_planned_when_available_and_falls_back_to_softwar
         eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
         return;
     }
-    let f = Fixture::with_settings(playscale::processing::Settings {
+    let mut f = Fixture::with_settings(playscale::processing::Settings {
         experimental_live_hardware: true,
         ..Default::default()
     })
@@ -3237,4 +3241,27 @@ async fn hardware_conversion_is_planned_when_available_and_falls_back_to_softwar
     })
     .await
     .expect("hardware and CPU capacity were not released");
+
+    // A hardware plan signed before a restart that disabled live hardware
+    // cannot start an encoder.
+    let retained = f
+        .post("/api/v2/playback/plans", &auth, None, plan(&[]))
+        .await;
+    assert_eq!(retained.body["candidate_id"], format!("h-{file}"));
+    f.restart_with(Default::default()).await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-disabled-hw-1"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "playback_unavailable",
+    );
+    assert_eq!(
+        advertised_routes(&f, &auth).await,
+        "original,prepared,software_hls"
+    );
 }
