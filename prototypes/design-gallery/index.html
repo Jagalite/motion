@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Motion UI prototype</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="gallery.css">
+  <link rel="stylesheet" href="concepts/marquee.css">
+</head>
+<body>
+  <a class="g-skip" href="#stage">Skip to prototype</a>
+  <header id="gallery" class="g-bar">
+    <div class="g-row">
+      <p class="g-title"><span class="g-logo" aria-hidden="true"></span>Motion <span>design gallery</span></p>
+      <nav class="g-concepts" aria-label="Design concept"></nav>
+      <nav class="g-screens" aria-label="Jump to screen"></nav>
+      <button type="button" class="g-info-toggle" aria-controls="g-info"></button>
+    </div>
+    <p class="g-info" id="g-info"></p>
+  </header>
+  <main id="stage" tabindex="-1"></main>
+  <div id="live" class="g-sr" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+  <script src="concepts/marquee.js"></script>
+  <script>Motion.boot();</script>
+</body>
+</html>
