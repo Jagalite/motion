@@ -334,7 +334,9 @@ ownership fix, restricted-pairing startup fence, admission-bound resume assertio
 and terminal cancellation repair. GPT-6.1 Sol reviewed the final diff without
 remaining actionable findings. All 79 JavaScript/setup checks and all 20 Go API
 tests pass; Go compilation used Kyoto `59ab2a12ae834309a27ecdeeba8a2ffb`.
-Targeted playback compilation is tracked as `a4ec6126137446b498c632ca00b33e7c`.
+All 11 targeted playback adapter tests pass after Kyoto compilation
+`a4ec6126137446b498c632ca00b33e7c` (37.58 seconds execution), including selected
+subtitles, scoped generation tickets, playback-only pacing, revocation and restart.
 Formatting, contract/JSON parity and publication privacy checks pass.
 
 [Latest Electron evidence](electron-combined-margin.json) remains **failed**:
