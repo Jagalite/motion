@@ -155,7 +155,8 @@ func (f *fake) ListScans(context.Context, string, int) (api.Page[api.Scan], erro
 func (f *fake) ListJobs(_ context.Context, cursor string, limit int) (api.Page[api.Job], error) {
 	if f.jobs > 0 {
 		return pageOf(f.jobs, cursor, limit, func(i int) api.Job {
-			return api.Job{ID: fmt.Sprintf("job-%03d", i), Kind: "scan", Phase: "running"}
+			code := "source_offline"
+			return api.Job{ID: fmt.Sprintf("job-%03d", i), Kind: "scan", Phase: "running", ErrorCode: &code, AttemptGeneration: "2", RequesterID: "d1"}
 		}), nil
 	}
 	return api.Page[api.Job]{Items: []api.Job{{ID: "job1", Kind: "scan", Phase: "running"}, {ID: "job2", Kind: "convert", Phase: "queued"}}}, nil
@@ -761,7 +762,7 @@ func TestTableSelectionStaysVisibleAndNarrowRowsKeepEveryField(t *testing.T) {
 		t.Fatalf("selection scrolled away:\n%s", v)
 	}
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 44, Height: 20})
-	if v := m.View(); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by") {
+	if v := m.View(); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by d1") {
 		t.Fatalf("narrow table lost the selected job's fields:\n%s", v)
 	}
 }
@@ -822,5 +823,46 @@ func TestCancellationIsLeftToTheServer(t *testing.T) {
 	f.mu.Unlock()
 	if sent != 1 || !m.notice.err || !strings.Contains(m.notice.text, "you don't have access (not yours)") {
 		t.Fatalf("server refusal not shown: sent=%d %+v", sent, m.notice)
+	}
+}
+
+func TestRejectedCredentialClearsEverythingShown(t *testing.T) {
+	for _, via := range []string{"stream", "load"} {
+		f := &fake{}
+		m := start(t, f, 120, 40)
+		if !strings.Contains(m.View(), "Movies") {
+			t.Fatal("libraries not shown")
+		}
+		rejected := &api.Problem{Status: 401, Code: "authentication_required"}
+		if via == "stream" {
+			m, _ = update(t, m, streamMsg{state: "stopped", err: rejected})
+		} else {
+			f.libErr = rejected
+			m = drain(t, m, m.load(keyLibraries))
+		}
+		v := m.View()
+		if strings.Contains(v, "Movies") || strings.Contains(v, "Continue watching") || !strings.Contains(v, "Sign in to Motion") {
+			t.Fatalf("%s: cached data survived a rejected credential:\n%s", via, v)
+		}
+	}
+}
+
+func TestEditedSearchNeverShowsOlderResults(t *testing.T) {
+	m := start(t, &fake{}, 100, 30)
+	m = press(t, m, "/", "o", "l", "d", "enter")
+	if !strings.Contains(m.View(), "Results for “old”") {
+		t.Fatal("first search")
+	}
+	m = press(t, m, "/", "x") // debounce pending
+	if v := m.View(); strings.Contains(v, "1 title") || !strings.Contains(v, "Searching") {
+		t.Fatalf("old results shown under new text:\n%s", v)
+	}
+}
+
+func TestNarrowScanDetailRepeatsDroppedColumns(t *testing.T) {
+	m := start(t, &fake{permissions: []string{api.PermSourcesManage}}, 44, 20)
+	m = goTo(t, m, route{page: pageScans})
+	if v := m.View(); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0 files") {
+		t.Fatalf("scan detail lost dropped fields:\n%s", v)
 	}
 }

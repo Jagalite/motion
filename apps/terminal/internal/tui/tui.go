@@ -290,6 +290,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		if !m.accept(msg) {
 			return nil
 		}
+		if unauthenticated(msg.err) {
+			m.signedOut(msg.err)
+			return nil
+		}
 		if msg.key == keySession || msg.key == keyProfiles {
 			return m.viewerChanged()
 		}
@@ -307,6 +311,9 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		m.stream = msg.state
 		if msg.err != nil {
 			m.streamErr = msg.err
+			if unauthenticated(msg.err) {
+				m.signedOut(msg.err)
+			}
 		}
 		if msg.state == "closed" {
 			return nil
@@ -630,6 +637,23 @@ func (m *Model) cancelJob() tea.Cmd {
 		_, err := backend.CancelJob(ctx, id, idempotency)
 		return cancelDone{job: id, err: err}
 	})
+}
+
+func unauthenticated(err error) bool {
+	var p *api.Problem
+	return errors.As(err, &p) && p.Status == 401
+}
+
+// signedOut discards every view and request once the server rejects this
+// device's credential: nothing it showed may stay on screen, not even the
+// sidebar's libraries, until the user refreshes after pairing again.
+func (m *Model) signedOut(err error) {
+	for key := range m.cache.slots {
+		m.drop(key)
+	}
+	m.cache.seq++
+	m.cache.slots[keySession] = &slot{request: m.cache.seq, err: err}
+	m.focus, m.history, m.confirm = focusContent, nil, ""
 }
 
 // refusal phrases a failed action for the status bar.

@@ -113,8 +113,10 @@ func (m *Model) sync() {
 		// The table is given only the visible window of rows, so its own
 		// scrolling never applies and the selection is always on screen.
 		cols, rows, _ := m.tabular(f.inner)
-		visible := min(len(rows), max(f.body-4, 1))
+		// Room for the header, a position line and the wrapped row detail.
 		m.tsel = min(max(m.tsel, 0), max(len(rows)-1, 0))
+		detail := len(words(m.detail(), f.inner))
+		visible := min(len(rows), max(f.body-3-detail, 1))
 		m.toff = min(max(m.toff, m.tsel-visible+1, 0), m.tsel)
 		m.table.SetRows(nil)
 		m.table.SetColumns(cols)
@@ -149,7 +151,7 @@ func (m Model) header(width int) []string {
 		case libraryPage:
 			return plural(len(v.items), one, many)
 		case searchPage:
-			if len(v.items) == 0 {
+			if len(v.items) == 0 || v.query != strings.TrimSpace(m.search.Value()) {
 				return ""
 			}
 			return plural(len(v.items), one, many)

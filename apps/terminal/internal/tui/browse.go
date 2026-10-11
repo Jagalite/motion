@@ -301,6 +301,10 @@ func (m *Model) browse(width int) ([]string, []elem) {
 			return lines, nil
 		}
 		p, _ := data[searchPage](*m, keySearch)
+		if p.query != strings.TrimSpace(m.search.Value()) {
+			// Results for other text are never shown under this text.
+			return []string{m.spinner.View() + " " + mutedStyle.Render("Searching…")}, nil
+		}
 		m.titles(c, keySearch, p.items, "No titles match.")
 	case pageItem:
 		key := "item:" + m.route.id

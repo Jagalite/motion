@@ -220,7 +220,17 @@ func (m Model) detail() string {
 		scans, _ := data[[]api.Scan](m, keyScans)
 		for _, sc := range scans {
 			if sc.ID == id {
-				return clean(sc.ID) + " · " + clean(sc.Status) + " · " + plural(len(sc.JobIDs), "job", "jobs")
+				var observed, verified uint64
+				for _, src := range sc.Sources {
+					o, _ := strconv.ParseUint(src.ObservedFiles, 10, 64)
+					v, _ := strconv.ParseUint(src.VerifiedFiles, 10, 64)
+					observed, verified = observed+o, verified+v
+				}
+				complete := "incomplete"
+				if sc.Complete {
+					complete = "complete"
+				}
+				return fmt.Sprintf("%s · %s · %s · %d of %d files verified · %s", clean(sc.ID), clean(sc.Status), complete, verified, observed, plural(len(sc.JobIDs), "job", "jobs"))
 			}
 		}
 	case pageProfiles:
