@@ -117,10 +117,35 @@ impl Model for Observations {
 }
 impl Enumerate for Observations {
     fn inputs(&self, s: &State) -> Result<Vec<Input>, ModelError> {
-        if s.steps == 3 {
+        if s.steps == 4 {
             return Ok(vec![]);
         }
-        let mut result = vec![Input::Close, Input::Interrupt];
+        let mut result = vec![
+            Input::Close,
+            Input::Interrupt,
+            Input::ObservePlayhead {
+                generation: 1,
+                sequence: 2,
+                position_ms: 0,
+                now_ms: s.delivery.lease_expires_ms,
+            },
+        ];
+        if s.delivery.last_generation == 1 {
+            result.push(Input::Change {
+                expected_generation: 1,
+                position_ms: 0,
+                replan: None,
+                overlap: true,
+                now_ms: u64::from(s.steps) + 1,
+            });
+        }
+        if s.delivery.pending == Some(2) {
+            result.push(Input::Activate {
+                generation: 2,
+                expected_active: Some(1),
+                now_ms: u64::from(s.steps) + 1,
+            });
+        }
         for generation in [1, 2] {
             for sequence in [0, 1, 2] {
                 for position_ms in [0, 1000, 2001] {
@@ -177,7 +202,7 @@ fn ordered_playhead_observations() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "ordered observations: {} states, {} transitions; 3 events, 2 generations, 3 sequences, 3 positions, close/restart",
+        "ordered observations: {} states, {} transitions; 4 events, 2 generations with activation, 3 sequences, 3 positions, lease expiry, close/restart",
         report.states, report.transitions
     );
 }
@@ -203,8 +228,8 @@ fn watched_aggregation_preserves_independent_cuts() {
 #[test]
 fn revoked_missing_and_narrowed_owners_cannot_continue() {
     use playscale_core::{
-        access::{Device, Grant, Permission, Policy},
-        playback_session::{FileFacts, Owner, may_continue},
+        access::{Device, FileFacts, Grant, Permission, Policy},
+        playback_session::{Owner, may_continue},
     };
     let owner = Owner {
         principal: "d".into(),
