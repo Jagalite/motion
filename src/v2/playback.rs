@@ -537,7 +537,10 @@ async fn multipart_of(
             let Some(row) = row.filter(|r| r.revision == *revision) else {
                 continue 'versions;
             };
+            // Every part must pass the core live-conversion rule itself (no
+            // HDR: there is no tone mapping), not only the first.
             if !core::readable(principal, file_facts(conn, file).await?.as_ref())
+                || !delivery::live_transcodable(&row, None)
                 || rows.first().is_some_and(|first: &db::ItemRow| {
                     first.library_id != row.library_id || !compatible_parts(first, &row)
                 })
@@ -712,18 +715,25 @@ async fn readable_prepared(
 /// Whether the version still binds the file to the timeline.
 async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
     if !claims.parts.is_empty() {
-        // Exactly the pinned parts, at their revisions and durations, all in
+        // Exactly the pinned parts and nothing else: every binding of the
+        // version, whole files only, at their revisions and durations, all in
         // the first part's library.
         let rows: Vec<BoundPartRow> = sqlx::query_as(
-            "SELECT b.file_id,b.file_revision,f.revision,f.library_id,f.duration_seconds \
-             FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
+            "SELECT b.file_id,b.file_revision,coalesce(f.revision,''),coalesce(f.library_id,''),f.duration_seconds \
+             FROM media_versions v JOIN version_files b ON b.version_id=v.id LEFT JOIN catalog_files f ON f.id=b.file_id \
              WHERE v.id=? AND v.timeline_id=? AND b.start_ms IS NULL AND b.end_ms IS NULL ORDER BY b.part",
         )
         .bind(&claims.version)
         .bind(&claims.timeline)
-        .fetch_all(conn)
+        .fetch_all(&mut *conn)
         .await?;
+        let bindings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM version_files WHERE version_id=?")
+                .bind(&claims.version)
+                .fetch_one(conn)
+                .await?;
         return Ok(rows.len() == claims.parts.len()
+            && bindings == claims.parts.len() as i64
             && claims.parts.first().is_some_and(|p| p.file == claims.file)
             && rows.iter().zip(&claims.parts).all(
                 |((file, bound, revision, library, duration), pin)| {
@@ -2483,8 +2493,18 @@ pub async fn master_playlist(
     };
     let text = format!(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"\n{}\n",
-        // A capped conversion's peak is its cap (measured per segment).
-        serving.max_bitrate_bps.unwrap_or(5_000_000),
+        // A capped conversion's peak is its cap (measured per window). A copy
+        // keeps the source's rate: declare the higher of its probed average
+        // and the peak measured so far over published windows (an estimate,
+        // not a guarantee, for a copy).
+        serving.max_bitrate_bps.unwrap_or(
+            if matches!(serving.operation.as_str(), "remux" | "audio_convert") {
+                delivery::copied_rate(&app, &id, &generation)
+                    .map_or(5_000_000, |rate| rate.max(5_000_000))
+            } else {
+                5_000_000
+            },
+        ),
         stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
     Ok((

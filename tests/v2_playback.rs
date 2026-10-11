@@ -4387,9 +4387,70 @@ async fn multipart_versions_play_their_parts_in_order() {
             "{name}"
         );
     }
+    // A later part with HDR video is never converted without tone mapping.
+    bind_second(second.clone(), second_revision.clone()).await;
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
+        .bind(&second)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    let mut hdr: Value = serde_json::from_str(&tracks).unwrap();
+    for track in hdr.as_array_mut().unwrap() {
+        if track["kind"] == "video" {
+            track["color_transfer"] = json!("smpte2084");
+        }
+    }
+    let set_tracks = |value: String| {
+        let db = f.server.app.db.clone();
+        let second = second.clone();
+        async move {
+            sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+                .bind(value)
+                .bind(second)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    };
+    set_tracks(hdr.to_string()).await;
+    assert_eq!(
+        plan("auto", "auto").await.body["reason_codes"][0],
+        "source_unavailable"
+    );
+    set_tracks(tracks).await;
+    // A clipped binding added after a plan was signed fences that plan.
+    let signed = plan("auto", "auto").await;
+    assert_eq!(
+        signed.body["operation"], "video_transcode",
+        "{}",
+        signed.body
+    );
+    let (other, other_revision) = file("c-other.mp4").await;
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision,start_ms,end_ms) VALUES (?,3,?,?,0,1000)")
+        .bind(&version)
+        .bind(&other)
+        .bind(&other_revision)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-4"),
+            json!({"plan_token": signed.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=3")
+        .bind(&version)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
     // From the start, every part plays: the Matroska part's own time base does
     // not truncate the timeline.
-    bind_second(second.clone(), second_revision.clone()).await;
     let whole = plan("auto", "auto").await;
     let admitted = f
         .post(
@@ -4741,4 +4802,75 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
     let after = mean_difference(&gray_frame(&joined, "3.5"), &second_part);
     let before = mean_difference(&gray_frame(&joined, "2.5"), &second_part);
     assert!(after * 4 < before, "after {after}, before {before}");
+}
+
+/// A copy keeps the source's rate, so its manifest declares that rate (the
+/// higher of the probed average and the measured peak), not the transcode's.
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_manifests_declare_the_source_rate() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    // Noise: about 18 Mb/s of H.264 and AAC in Matroska (every stream starts at
+    // zero), so the original is copyable.
+    f.media(
+        "noise.mkv",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=640x360:rate=24,geq=random(1)*255:128:128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let file = source["file_id"].as_str().unwrap().to_owned();
+    let mut input = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+    input["failed_candidate_ids"] = json!([format!("o-{file}")]);
+    let copy = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    assert_eq!(copy.body["operation"], "remux", "{}", copy.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("copied-rate-000001"),
+            json!({"plan_token": copy.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 8_000
+    })
+    .await;
+    let master = f
+        .get(&format!("/api/v2/streams/{id}/1/master.m3u8"), &auth)
+        .await;
+    let master = String::from_utf8(master.bytes).unwrap();
+    let bandwidth: u64 = master
+        .split("BANDWIDTH=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(bandwidth > 10_000_000, "{master}");
 }

@@ -189,6 +189,24 @@ pub fn within_cap(bytes: u64, duration_ms: u64, max_bitrate_bps: u64) -> bool {
     bytes.saturating_mul(8_000) <= max_bitrate_bps.saturating_mul(duration_ms)
 }
 
+/// The highest bitrate over the runs of contiguous segments ending with the
+/// newest one whose total duration is between `min_window_ms` and
+/// `max_window_ms` (HLS peak windows); zero when no run qualifies yet.
+pub fn peak_bitrate(recent: &[(u64, u64)], min_window_ms: u64, max_window_ms: u64) -> u64 {
+    let (mut bytes, mut duration, mut peak) = (0u64, 0u64, 0u64);
+    for &(b, d) in recent.iter().rev() {
+        bytes = bytes.saturating_add(b);
+        duration = duration.saturating_add(d);
+        if duration > max_window_ms {
+            break;
+        }
+        if duration >= min_window_ms && duration > 0 {
+            peak = peak.max(bytes.saturating_mul(8_000) / duration);
+        }
+    }
+    peak
+}
+
 /// Whether every run of contiguous segments ending with the newest one, whose
 /// total duration is between `min_window_ms` and `max_window_ms` (HLS: 0.5
 /// and 1.5 target durations), stays within the cap. `recent` holds (bytes,
@@ -1342,5 +1360,16 @@ mod tests {
             9_000
         ));
         assert!(!peak_within_cap(&[(500_001, 4_000)], cap, 3_000, 9_000));
+    }
+
+    #[test]
+    fn peak_bitrate_is_the_highest_qualifying_window() {
+        assert_eq!(peak_bitrate(&[(400_000, 2_000)], 3_000, 9_000), 0);
+        // 4 s at 0.9 Mb/s, then with a 2 s tail: 6 s at (450k+400k)*8/6 s.
+        assert_eq!(peak_bitrate(&[(450_000, 4_000)], 3_000, 9_000), 900_000);
+        assert_eq!(
+            peak_bitrate(&[(450_000, 4_000), (400_000, 2_000)], 3_000, 9_000),
+            850_000 * 8_000 / 6_000
+        );
     }
 }

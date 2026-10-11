@@ -132,6 +132,9 @@ struct Inner {
         playscale_core::delivery_admission::Identity,
         serde_json::Value,
     )>,
+    /// The highest bitrate measured over published HLS peak windows, per
+    /// stream-copy generation (a copy keeps the source's rate).
+    copy_peaks: HashMap<u64, u64>,
 }
 
 /// Control of one generation worker: cancellation and pacing (true = paused).
@@ -157,6 +160,9 @@ struct Session {
     /// A multipart timeline's picture canvas: the first part's coded size
     /// (every part has it), in even dimensions.
     canvas: Option<(u32, u32)>,
+    /// The source's probed average rate over its video and audio streams (a
+    /// stream copy keeps it); None when not probed.
+    source_rate_bps: Option<u64>,
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -1114,6 +1120,16 @@ async fn observe(
             && recent[1..].iter().map(|(_, d)| d).sum::<u64>() >= target_ms * 3 / 2
         {
             recent.remove(0);
+        }
+        if copies_video(operation) {
+            let peak = playscale_core::playback_session::peak_bitrate(
+                recent,
+                target_ms / 2,
+                target_ms * 3 / 2,
+            );
+            let mut inner = session.inner.lock().unwrap();
+            let known = inner.copy_peaks.entry(generation).or_default();
+            *known = (*known).max(peak);
         }
         if let Some(cap) = max_bitrate_bps
             && !playscale_core::playback_session::peak_within_cap(
@@ -3259,6 +3275,15 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        source_rate_bps: serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
+            .ok()
+            .and_then(|tracks| {
+                tracks
+                    .iter()
+                    .filter(|t| matches!(t.kind.as_str(), "video" | "audio"))
+                    .map(|t| t.bitrate)
+                    .sum::<Option<u64>>()
+            }),
         canvas: (!parts.is_empty())
             .then(|| {
                 let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
@@ -3289,6 +3314,7 @@ async fn admit_owned(
             delivery: delivery.clone(),
             workers: HashMap::new(),
             changes: Default::default(),
+            copy_peaks: HashMap::new(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
     });
@@ -3693,6 +3719,24 @@ async fn streamed(
         }
     });
     Ok((stream_headers(content_type), body).into_response())
+}
+
+/// The rate a stream-copy generation's manifest declares: the higher of the
+/// source's probed average rate and the peak measured over the generation's
+/// published HLS windows. A copy keeps the source's rate, which is not bounded
+/// in advance, so this is an estimate, not a guarantee.
+pub(crate) fn copied_rate(app: &App, id: &str, generation: &str) -> Option<u64> {
+    let generation = generation_number(generation).ok()?;
+    let session = app.processing.deliveries.session(id).ok()?;
+    let measured = session
+        .inner
+        .lock()
+        .unwrap()
+        .copy_peaks
+        .get(&generation)
+        .copied()
+        .unwrap_or(0);
+    Some(measured.max(session.source_rate_bps.unwrap_or(0)))
 }
 
 /// The codecs of a served generation's output, from its own init segment
