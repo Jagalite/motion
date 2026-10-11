@@ -3,7 +3,7 @@
   "run_url": "https://github.com/Jagalite/motion/actions/runs/38147820272",
   "job_url": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767865",
   "result": "passed",
-  "scope": "Real-process integration and schema-9 upgrade/restore. Does not qualify later catalog-order code or unfinished heavy/package jobs.",
+  "scope": "Complete fast/full/package CI at the recorded head; later ordering changes require new exact-head checks.",
   "integration": {
     "raw_receipt_sha256": "73b0de33087baa88963e151acbb832512c588d48d5abd43ef3d575b7e07d0503",
     "receipt": {
@@ -138,5 +138,69 @@
         }
       }
     }
+  },
+  "checks": [
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767865",
+      "name": "Real-process integration, upgrade and restore",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767784",
+      "name": "Package / macos-arm64",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767593",
+      "name": "Heavy tests (Stateless models, live FFmpeg delivery)",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820124/job/114494764439",
+      "name": "Rust (fmt, clippy, fast tests)",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820116/job/114494764128",
+      "name": "notices",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820124/job/114494764617",
+      "name": "API contract (structure, JSON parity)",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147820124/job/114494764607",
+      "name": "Client controllers, desktop host and Go terminal",
+      "state": "SUCCESS"
+    },
+    {
+      "bucket": "pass",
+      "link": "https://github.com/Jagalite/motion/actions/runs/38147816327/job/114494752904",
+      "name": "notices",
+      "state": "SUCCESS"
+    }
+  ],
+  "heavy": {
+    "log_sha256": "19e10db70687c3748d87c6086127fc6a30967dab222a6063d23b9a2505acda35",
+    "job_url": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767593",
+    "passed_by_target": {
+      "delivery": 12,
+      "v2_playback": 11,
+      "access_model": 7,
+      "delivery_model": 6,
+      "timeline_viewing_model": 1,
+      "work_model": 3
+    },
+    "failed": 0,
+    "note": "Model bounds remain those declared in the test sources; these counts are test cases, not explored-state counts."
   }
 }

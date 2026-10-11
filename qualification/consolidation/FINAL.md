@@ -228,3 +228,13 @@ schema-9-to-41 upgrade/restore to its source and binary. Restart preserves the
 upgrade receipt, the old binary rejects schema 41, both rollback methods work,
 and candidate restore rotates the epoch. These passes do not qualify later
 ordering changes or the still-pending heavy/package jobs.
+
+
+CI at `a476c0e` subsequently completed successfully: all eight displayed checks
+passed. `integration-a476c0e.json` now records exact check URLs and all 40 full-tier
+tests across six targets. Test counts are not model exploration-state counts.
+`source-reconstruction-a476c0e.json` preserves the complete outside-Git application
+reconstruction receipt and both 13-check package receipts. The reconstructed
+provider identity matches the qualified `2fa508f` deployment. This is a passing
+combined checkpoint; `2d2c006` and the final composition still require their own
+exact-head CI before integration.
