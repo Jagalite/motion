@@ -36,10 +36,11 @@ struct Row {
     include_generated_media: bool,
     created_at: i64,
     manifest_digest: Option<String>,
+    error: Option<String>,
 }
 impl Row {
     fn wire(&self) -> Value {
-        json!({"id":self.id,"job_id":self.id,"created_at":super::timestamp(self.created_at),"status":match self.phase.as_str(){"completed"=>"ready","failed"|"cancelled"=>"failed",_=>"pending"},"manifest_digest":if self.phase=="completed"{self.manifest_digest.clone()}else{None}})
+        json!({"id":self.id,"job_id":self.id,"created_at":super::timestamp(self.created_at),"status":match self.phase.as_str(){"completed" if self.error.as_deref()!=Some("backup_expired")=>"ready","completed"|"failed"|"cancelled"=>"failed",_=>"pending"},"manifest_digest":if self.phase=="completed" && self.error.as_deref()!=Some("backup_expired"){self.manifest_digest.clone()}else{None}})
     }
 }
 async fn create(
@@ -249,7 +250,13 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
         &current,
         Input::Finished {
             attempt: row.attempt.try_into()?,
-            success: authorized && receipt.is_ok(),
+            success: playscale_core::maintenance::BackupReceiptFacts {
+                requester_authorized: authorized,
+                database_verified: receipt.is_ok(),
+                inventory_complete: receipt.is_ok(),
+                destination_durable: receipt.is_ok(),
+            }
+            .publishable(),
         },
     );
     let published = effects.iter().any(|e| matches!(e, Effect::Publish { .. }));
@@ -269,5 +276,43 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    drop(_guard);
+    retain_requested(app).await?;
     Ok(true)
+}
+
+async fn retain_requested(app: &App) -> anyhow::Result<()> {
+    let ids:Vec<String> = sqlx::query_scalar("SELECT id FROM backup_jobs WHERE phase='completed' AND error IS NULL ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?").bind(app.storage.settings.backups_keep as i64).fetch_all(&app.db).await?;
+    for id in ids {
+        // Withdraw the ready claim before removing bytes; retain job provenance.
+        let mut tx = begin_write(&app.db).await?;
+        sqlx::query(
+            "UPDATE backup_jobs SET error='backup_expired' WHERE id=? AND phase='completed'",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let path = app
+            .storage
+            .root
+            .join("backups")
+            .join(format!("request-{id}"));
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if path.exists() {
+                anyhow::ensure!(
+                    !std::fs::symlink_metadata(&path)?.file_type().is_symlink()
+                        && std::fs::read(path.join(".playscale-backup"))?
+                            == b"playscale-scheduled-v1",
+                    "unowned backup destination"
+                );
+                std::fs::remove_dir_all(&path)?;
+                #[cfg(unix)]
+                std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+            }
+            Ok(())
+        })
+        .await??;
+    }
+    Ok(())
 }

@@ -324,7 +324,7 @@ async fn prepare(
     let tracks: Vec<crate::db::Track> =
         serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
     if input.recipe_id == "h264720p"
-        && !tracks.iter().any(|t| {
+        && !tracks.iter().find(|t| t.kind == "video").is_some_and(|t| {
             t.kind == "video"
                 && t.width.is_some()
                 && t.height.is_some()

@@ -285,14 +285,37 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                 continue;
             }
         };
+        let mut more = false;
         match row.task.as_str() {
             "scan" => {
-                crate::scans::request_in(&mut tx, &row.library_id, None, false, false)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                match crate::scans::request_in(&mut tx, &row.library_id, None, false, false).await {
+                    Ok(_) => {}
+                    Err(
+                        crate::scans::ScanError::NoSources
+                        | crate::scans::ScanError::NotFound
+                        | crate::scans::ScanError::UnknownSource(_),
+                    ) => {
+                        sqlx::query(
+                            "UPDATE api_schedules SET enabled=0,revision=revision+1 WHERE id=?",
+                        )
+                        .bind(&row.id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    Err(crate::scans::ScanError::Storage(error)) => return Err(error),
+                }
             }
             "metadata_refresh" if p.allows(Permission::CatalogWrite) => {
-                let items:Vec<String>=sqlx::query_scalar("SELECT DISTINCT e.item_id FROM editions e JOIN media_files f ON f.edition_id=e.id JOIN library_sources ls ON ls.source_id=f.library_id WHERE ls.library_id=? AND f.available=1 AND f.generated=0 ORDER BY e.item_id").bind(&row.library_id).fetch_all(&mut *tx).await?;
+                let after: Option<String> = sqlx::query_scalar(
+                    "SELECT after_item FROM schedule_dispatch_progress WHERE schedule_id=?",
+                )
+                .bind(&row.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let mut items:Vec<String>=sqlx::query_scalar("SELECT DISTINCT e.item_id FROM editions e JOIN media_files f ON f.edition_id=e.id JOIN library_sources ls ON ls.source_id=f.library_id WHERE ls.library_id=? AND f.available=1 AND f.generated=0 AND e.item_id>? ORDER BY e.item_id LIMIT 201").bind(&row.library_id).bind(after.unwrap_or_default()).fetch_all(&mut *tx).await?;
+                more = items.len() > 200;
+                items.truncate(200);
+                let last = items.last().cloned();
                 for item in items {
                     // Shared-item mutation requires every containing library.
                     if super::catalog::curatable_item(
@@ -306,7 +329,15 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                     {
                         continue;
                     }
-                    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) SELECT ?,?,?,?,?,'queued',? WHERE NOT EXISTS(SELECT 1 FROM metadata_jobs WHERE item_id=? AND phase IN ('queued','running','cancelling'))").bind(crate::new_id()).bind(&item).bind(&p.id).bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).bind(item).execute(&mut *tx).await?;
+                    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) SELECT ?,?,?,?,?,'queued',? WHERE NOT EXISTS(SELECT 1 FROM metadata_jobs WHERE item_id=? AND phase IN ('queued','running','cancelling'))").bind(crate::new_id()).bind(&item).bind(&p.id).bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).bind(&item).execute(&mut *tx).await?;
+                }
+                if more {
+                    sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(&row.id).bind(last).execute(&mut *tx).await?;
+                } else {
+                    sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
+                        .bind(&row.id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
             }
             _ => {
@@ -317,7 +348,7 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             }
         }
         sqlx::query("UPDATE api_schedules SET next_run=? WHERE id=?")
-            .bind(next.next_run)
+            .bind(if more { row.next_run } else { next.next_run })
             .bind(row.id)
             .execute(&mut *tx)
             .await?;

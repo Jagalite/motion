@@ -264,14 +264,18 @@ async fn make_snapshot(
             .fetch_all(&mut check)
             .await?;
     let assets: Vec<(String, i64)> =
-        sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id")
+        sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
             .fetch_all(&mut check)
             .await?;
     let generated: Vec<(String, String, String, String, i64)> = if include_generated {
-        sqlx::query_as("SELECT f.id,f.revision,l.root,f.relative_path,f.bytes FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.generated=1 AND f.available=1 ORDER BY f.id").fetch_all(&mut check).await?
+        sqlx::query_as("SELECT f.id,f.revision,l.root,f.relative_path,f.bytes FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.generated=1 AND f.available=1 ORDER BY f.id LIMIT 100001").fetch_all(&mut check).await?
     } else {
         vec![]
     };
+    anyhow::ensure!(
+        assets.len() <= 100_000 && generated.len() <= 100_000,
+        "backup inventory exceeds supported bound"
+    );
     check.close().await?;
     let keep = app.storage.settings.backups_keep;
     let min_free = app.storage.settings.min_free_bytes;
@@ -386,7 +390,7 @@ pub async fn prune_history(app: &App) -> anyhow::Result<()> {
     // Keep the most recent authoritative session to preserve the legacy-write barrier.
     sqlx::query("DELETE FROM playback_sessions WHERE id IN (SELECT id FROM playback_sessions WHERE updated_at<? AND status IN ('ended','stopped','superseded','invalidated') AND id NOT IN (SELECT session_id FROM viewing_state WHERE session_id IS NOT NULL) ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
     // Published rendition provenance stays in the catalog. Idempotency keys have this documented retention horizon.
-    sqlx::query("DELETE FROM processing_jobs WHERE id IN (SELECT id FROM processing_jobs WHERE updated_at<? AND cache_cleaned=1 AND phase IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM processing_jobs WHERE id IN (SELECT id FROM processing_jobs WHERE updated_at<? AND cache_cleaned=1 AND id NOT IN (SELECT job_id FROM preparations) AND phase IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -572,8 +576,45 @@ pub(crate) async fn requested_backup(
         .await?;
         make_snapshot(app, permit.clone(), Some(name), include_generated).await?;
     }
+    let verify = destination.clone();
+    let digest = blocking(permit.clone(), move || {
+        verify_requested_snapshot(&verify, include_generated)
+    })
+    .await?;
+    // Completeness is derived from the immutable snapshot, not from the list
+    // the manifest happens to contain. Omitted files must fail recovery.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(destination.join("playscale.sqlite3"))
+        .read_only(true);
+    let mut check = sqlx::SqliteConnection::connect_with(&options).await?;
+    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_all(&mut check)
+        .await?;
+    anyhow::ensure!(integrity == ["ok"], "backup integrity failed");
+    let assets: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
+            .fetch_all(&mut check)
+            .await?;
+    let media: Vec<(String, String, i64)> = if include_generated {
+        sqlx::query_as("SELECT id,revision,bytes FROM media_files WHERE generated=1 AND available=1 ORDER BY id LIMIT 100001").fetch_all(&mut check).await?
+    } else {
+        vec![]
+    };
+    anyhow::ensure!(
+        assets.len() <= 100_000 && media.len() <= 100_000,
+        "backup inventory exceeds supported bound"
+    );
+    check.close().await?;
+    let expected_assets=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
+    let expected_media=serde_json::json!(media.into_iter().map(|(id,revision,bytes)|serde_json::json!({"file_id":id,"file_revision":revision,"path":format!("generated/{id}"),"bytes":bytes.to_string(),"sha256":revision})).collect::<Vec<_>>());
     blocking(permit, move || {
-        verify_requested_snapshot(&destination, include_generated)
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(destination.join("manifest.json"))?)?;
+        anyhow::ensure!(
+            value["assets"] == expected_assets && value["generated_media"] == expected_media,
+            "backup inventory incomplete"
+        );
+        Ok(digest)
     })
     .await
 }
@@ -588,7 +629,19 @@ fn verify_requested_snapshot(
             .is_symlink(),
         "backup destination is a symlink"
     );
-    let manifest = std::fs::read(destination.join("manifest.json"))?;
+    let manifest_path = destination.join("manifest.json");
+    anyhow::ensure!(
+        std::fs::metadata(&manifest_path)?.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
+    let mut manifest = Vec::new();
+    std::fs::File::open(manifest_path)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut manifest)?;
+    anyhow::ensure!(
+        manifest.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
     let value: serde_json::Value = serde_json::from_slice(&manifest)?;
     anyhow::ensure!(
         value["include_generated_media"].as_bool() == Some(include_generated),
