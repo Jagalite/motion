@@ -352,7 +352,8 @@ export async function scenario(page, server, ctx, engine, out) {
   const restartPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   check('after restart the player reopens at durable progress', afterRestart.ready.state === 'ready'
     && afterRestart.resume >= durable.position_ms - 1000 && afterRestart.resume <= afterReady.position_ms + 1000
-    && reopenedAdmission?.request?.start_ms === afterRestart.resume && restartPlay.advancing,
+    && reopenedAdmission?.request?.start_ms === afterRestart.resume && restartPlay.advancing
+    && restartPlay.logical >= afterRestart.resume / 1000 - 1,
   {durable: durable.position_ms, afterReady: afterReady.position_ms, admissionStart: reopenedAdmission?.request?.start_ms, afterRestart, restartPlay});
   // Leaving the outage page sends its final event during unload; it may land
   // after this render, so one 409 followed by adoption of our own unchanged
