@@ -1,0 +1,70 @@
+{
+  "source": "3f063312837ec77785e1a5a453670bc3fcd26962",
+  "source_tracked_clean": true,
+  "kyoto_job": "d9116b6097824c52b88f9ebe2766aed3",
+  "compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (Homebrew)",
+  "platform": "aarch64-apple-darwin",
+  "qualification": "focused local tests; pinned Rust 1.98.0 is checked separately by CI",
+  "timestamp_utc": "2026-10-11T03:52:39.916641+00:00",
+  "tests": [
+    {
+      "target": "catalog_persistence",
+      "binary_sha256": "7538a1b143408fca8079b0a50b49ce9bb267f68eb8cbeced1a5dda67adebb80c",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.08s"
+      ],
+      "model_configurations": []
+    },
+    {
+      "target": "contract",
+      "binary_sha256": "3dafb8e6d50819d6cb2b36f9ae4336403043d667b3df3202e6dff5125540b647",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s"
+      ],
+      "model_configurations": []
+    },
+    {
+      "target": "v2_catalog",
+      "binary_sha256": "cb2ec07ce1618556b5649e03ce8441c1538118fb4048a1997e54385194a1e0fe",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.13s"
+      ],
+      "model_configurations": []
+    },
+    {
+      "target": "v2_metadata_processing",
+      "binary_sha256": "397ceb01efde5cec10204d94169fb8aebd069d07935aa3049fa538c2dd3f48eb",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s"
+      ],
+      "model_configurations": []
+    },
+    {
+      "target": "v2_organization_viewing",
+      "binary_sha256": "9c1b7d3a2b1d7b97d4aaaf3b2cc36e7915f0b8feecfeab23ec6f7f686a20bfa9",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.80s"
+      ],
+      "model_configurations": []
+    },
+    {
+      "target": "legacy_import_model",
+      "binary_sha256": "dc0483cec3800c9ca103c43fab407edcb282c58a1e02eac3ace6401ab696ddd1",
+      "exit_code": 0,
+      "summaries": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "model_configurations": [
+        "exact=false backfill=false: 3 states, 8 transitions",
+        "exact=false backfill=true: 4 states, 12 transitions",
+        "exact=true backfill=false: 4 states, 12 transitions",
+        "exact=true backfill=true: 3 states, 8 transitions"
+      ]
+    }
+  ]
+}

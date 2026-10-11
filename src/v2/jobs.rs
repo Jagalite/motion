@@ -106,14 +106,20 @@ async fn control(
     headers: HeaderMap,
     retry: bool,
 ) -> Result<Response, Problem> {
-    caller.require(Permission::ProcessingRequest)?;
+    // Permission is selected after loading the durable job kind.
     let key = idempotency_key(&headers)?;
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
-    let principal = caller
-        .reauthorize(&mut tx, Some(Permission::ProcessingRequest))
-        .await?;
+    let principal = caller.reauthorize(&mut tx, None).await?;
     let old = row(&mut tx, &id, &principal).await?;
+    let permission = if old.kind == "metadata" {
+        Permission::CatalogWrite
+    } else {
+        Permission::ProcessingRequest
+    };
+    if !principal.allows(permission) {
+        return Err(access::AccessError::Forbidden(permission).into());
+    }
     let record = Scope {
         principal: &principal.id,
         operation: if retry { "retryJob" } else { "cancelJob" },
@@ -161,6 +167,12 @@ async fn control(
     if next != state {
         if old.kind == "scan" {
             sqlx::query("UPDATE jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        } else if old.kind == "metadata" {
+            sqlx::query("UPDATE metadata_jobs SET phase=?,error=NULL WHERE id=?")
                 .bind(crate::db::phase_name(next.phase))
                 .bind(&id)
                 .execute(&mut *tx)

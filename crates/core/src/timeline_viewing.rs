@@ -41,6 +41,15 @@ impl Status {
     }
 }
 
+/// A work is watched when any of its alternative timelines is effectively
+/// watched. Watching one cut does not copy its progress/manual override to
+/// another. No timelines or no watched timelines means unwatched.
+pub fn work_watched(timelines: impl IntoIterator<Item = (bool, Option<bool>)>) -> bool {
+    timelines
+        .into_iter()
+        .any(|(automatic, manual)| manual.unwrap_or(automatic))
+}
+
 /// The durable viewing state of one profile on one timeline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct View {
@@ -61,6 +70,46 @@ impl View {
     pub fn resumable(&self) -> bool {
         self.position_ms > 0 && !self.watched()
     }
+}
+
+/// Only an untouched SQL-backfill row may be retracted. Original legacy
+/// records remain recoverable; any canonical event/manual action wins.
+pub fn retract_unattributed_legacy(
+    attribution: &crate::identity::Attribution,
+    current: &View,
+    backfill: &View,
+    has_sessions: bool,
+) -> bool {
+    !matches!(attribution, crate::identity::Attribution::Exact { .. })
+        && !has_sessions
+        && current == backfill
+        && current.revision == 0
+        && current.manual_epoch == 0
+        && current.session.is_none()
+}
+
+/// One-time legacy import never takes authority from an existing v2 row, even
+/// a zero-position manual reset. Attribution is frozen by the identity upgrade.
+pub fn import_legacy(
+    attribution: &crate::identity::Attribution,
+    existing: Option<&View>,
+    position_ms: u64,
+    automatic_watched: bool,
+    manual_watched: Option<bool>,
+) -> Option<View> {
+    if !matches!(attribution, crate::identity::Attribution::Exact { .. })
+        || existing.is_some()
+        || position_ms > MAX_POSITION_MS
+        || (position_ms == 0 && !automatic_watched && manual_watched.is_none())
+    {
+        return None;
+    }
+    Some(View {
+        position_ms,
+        automatic_watched,
+        manual_watched,
+        ..View::default()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -513,5 +562,81 @@ mod tests {
             (s.view.position_ms, s.session.position_ms),
             (60_000, 60_000)
         );
+    }
+}
+
+#[cfg(test)]
+mod legacy_import_tests {
+    use super::*;
+    use crate::identity::Attribution;
+    #[test]
+    fn legacy_import_requires_exact_attribution_and_never_replaces_authority() {
+        for attribution in [
+            Attribution::Exact {
+                timeline: "t".into(),
+            },
+            Attribution::Ambiguous {
+                timelines: vec!["a".into(), "b".into()],
+            },
+            Attribution::Orphaned,
+        ] {
+            for position in [0, 1, MAX_POSITION_MS, MAX_POSITION_MS + 1] {
+                for manual in [None, Some(false), Some(true)] {
+                    for automatic in [false, true] {
+                        let imported =
+                            import_legacy(&attribution, None, position, automatic, manual);
+                        let expected = matches!(attribution, Attribution::Exact { .. })
+                            && position <= MAX_POSITION_MS
+                            && (position > 0 || automatic || manual.is_some());
+                        assert_eq!(imported.is_some(), expected);
+                        if let Some(view) = imported {
+                            assert_eq!(
+                                (
+                                    view.position_ms,
+                                    view.manual_watched,
+                                    view.automatic_watched
+                                ),
+                                (position, manual, automatic)
+                            );
+                            assert_eq!(view.session, None);
+                            assert_eq!(
+                                import_legacy(
+                                    &attribution,
+                                    Some(&view),
+                                    position,
+                                    automatic,
+                                    manual
+                                ),
+                                None
+                            );
+                        }
+                        for existing in [
+                            View::default(),
+                            View {
+                                revision: 4,
+                                manual_epoch: 2,
+                                manual_watched: Some(false),
+                                ..View::default()
+                            },
+                            View {
+                                session: Some("live".into()),
+                                ..View::default()
+                            },
+                        ] {
+                            assert_eq!(
+                                import_legacy(
+                                    &attribution,
+                                    Some(&existing),
+                                    position,
+                                    automatic,
+                                    manual
+                                ),
+                                None
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

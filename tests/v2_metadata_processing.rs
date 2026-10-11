@@ -1081,9 +1081,6 @@ async fn blocked_operations_are_not_routed() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
     for (method, path) in [
-        ("POST", "/api/v2/catalog/items/film-a/metadata/refresh"),
-        ("POST", "/api/v2/catalog/items/film-a/artwork"),
-        ("PUT", "/api/v2/catalog/items/film-a/artwork/selection"),
         ("GET", "/api/v2/processing/capabilities"),
         ("GET", "/api/v2/schedules"),
         ("POST", "/api/v2/admin/imports"),
@@ -1255,4 +1252,240 @@ async fn match_replay_rechecks_current_file_visibility() {
         .call("POST", "/api/v2/catalog/matches", Some(body), &headers)
         .await;
     problem(&replay, StatusCode::NOT_FOUND, "not_found");
+}
+
+#[tokio::test]
+async fn artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = bytes.into_inner();
+    let mut uploaded = Value::Null;
+    for _ in 0..2 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v2/catalog/items/film-a/artwork")
+            .header("host", "127.0.0.1:8787")
+            .header("authorization", &op)
+            .header("idempotency-key", "artwork-upload-00001")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes.clone()))
+            .unwrap();
+        let response = api::router(f.app.clone(), None)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        if uploaded.is_null() {
+            uploaded = body;
+        } else {
+            assert_eq!(body, uploaded);
+        }
+    }
+    let item = f
+        .call("GET", "/api/v2/catalog/items/film-a", None, &auth(&op))
+        .await;
+    assert_eq!(item.body["artwork_id"], Value::Null);
+    let body = json!({"role":"poster","asset_id":uploaded["id"]});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("if-match", item.headers["etag"].to_str().unwrap()),
+    ];
+    let selected = f
+        .call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/artwork/selection",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(selected.status, StatusCode::OK, "{}", selected.body);
+    assert_eq!(selected.body["artwork_id"], uploaded["id"]);
+    assert_eq!(
+        f.call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/artwork/selection",
+            Some(body),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let device = f.device(&["catalog:read"], true).await;
+    let content = f
+        .call(
+            "GET",
+            uploaded["content_url"].as_str().unwrap(),
+            None,
+            &auth(&device),
+        )
+        .await;
+    assert_eq!(content.status, StatusCode::OK);
+    assert_eq!(content.raw, bytes);
+}
+
+#[tokio::test]
+async fn metadata_refresh_is_durable_replayable_and_cancelled_before_publication() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    std::fs::write(
+        f._dir.path().join("media/Film (2001).nfo"),
+        "<movie><title>Local title</title></movie>",
+    )
+    .unwrap();
+    let path = "/api/v2/catalog/items/film-a/metadata/refresh";
+    let h = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "metadata-refresh-001"),
+    ];
+    let job = f.call("POST", path, None, &h).await;
+    assert_eq!(job.status, StatusCode::ACCEPTED, "{}", job.body);
+    assert_eq!(f.call("POST", path, None, &h).await.body, job.body);
+    let id = job.body["id"].as_str().unwrap();
+    sqlx::query("UPDATE metadata_jobs SET phase='running',attempt=1 WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::metadata_jobs::recover(&f.app.db).await.unwrap();
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let completed = f
+        .call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+        .await;
+    assert_eq!(completed.body["phase"], "completed");
+    assert_eq!(completed.body["attempt_generation"], "2");
+    let metadata = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a/metadata",
+            None,
+            &auth(&op),
+        )
+        .await;
+    assert_eq!(metadata.body["values"]["title"], "Local title");
+    std::fs::write(
+        f._dir.path().join("media/Film (2001).nfo"),
+        "<movie><title>Cancelled title</title></movie>",
+    )
+    .unwrap();
+    let job = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-refresh-002"),
+            ],
+        )
+        .await;
+    let id = job.body["id"].as_str().unwrap();
+    let cancel = f
+        .call(
+            "POST",
+            &format!("/api/v2/jobs/{id}/cancel"),
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-cancel-0001"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    assert!(!playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let metadata = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a/metadata",
+            None,
+            &auth(&op),
+        )
+        .await;
+    assert_eq!(metadata.body["values"]["title"], "Local title");
+}
+
+#[tokio::test]
+async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let file = f._dir.path().join("media/Film (2001).nfo");
+    std::fs::write(&file, "<broken>").unwrap();
+    let job = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/film-a/metadata/refresh",
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-failure-001"),
+            ],
+        )
+        .await;
+    assert_eq!(job.status, StatusCode::ACCEPTED);
+    let id = job.body["id"].as_str().unwrap();
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let state = f
+        .call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+        .await;
+    assert_eq!(state.body["phase"], "failed");
+    std::fs::write(&file, "<movie><title>Recovered title</title></movie>").unwrap();
+    sqlx::query("CREATE TRIGGER fail_metadata BEFORE INSERT ON metadata_documents WHEN NEW.source='nfo' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END").execute(&f.app.db).await.unwrap();
+    let path = format!("/api/v2/jobs/{id}/retry");
+    assert_eq!(
+        f.call(
+            "POST",
+            &path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-retry-00001")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert!(
+        playscale::metadata_jobs::run_one(&f.app).await.unwrap(),
+        "publication failure is a job failure, not a worker failure"
+    );
+    assert_eq!(
+        f.call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+            .await
+            .body["phase"],
+        "failed"
+    );
+    sqlx::query("DROP TRIGGER fail_metadata")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call(
+            "POST",
+            &path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-retry-00002")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    assert_eq!(
+        f.call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+            .await
+            .body["phase"],
+        "completed"
+    );
 }
