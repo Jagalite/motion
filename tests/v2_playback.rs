@@ -1117,7 +1117,18 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         .await;
     assert_eq!(ack.status, StatusCode::OK, "{:?}", ack.body);
 
+    let identity_before = f.get("/api/v2/system/capabilities", &auth).await.body;
     f.restart().await;
+    let identity_after = f.get("/api/v2/system/capabilities", &auth).await.body;
+    assert_eq!(identity_before["server_id"], identity_after["server_id"]);
+    assert_eq!(
+        identity_before["restore_epoch"],
+        identity_after["restore_epoch"]
+    );
+    assert_ne!(
+        identity_before["server_epoch"],
+        identity_after["server_epoch"]
+    );
 
     // The transport does not survive; its owner reads the fenced state and
     // must plan again. Closing it again is an acknowledged no-op.
@@ -1838,4 +1849,162 @@ async fn planning_skips_originals_outside_the_callers_scope() {
             .unwrap();
         assert_eq!(path, expected);
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn playback_only_observations_advance_live_conversion_and_revocation_stops_worker() {
+    assert!(
+        tools_available(),
+        "this qualification requires ffmpeg and ffprobe"
+    );
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "180");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (device, auth) = f
+        .device(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    let caps = f.get("/api/v2/system/capabilities", &auth).await;
+    assert_eq!(caps.status, StatusCode::OK);
+    for id in ["catalog.v2", "playback.v2"] {
+        let feature = caps.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .unwrap();
+        assert_eq!(feature["implemented"], true);
+        assert_eq!(feature["enabled"], true);
+        assert_eq!(feature["qualification"], "unqualified");
+    }
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "convert", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(plan.status, StatusCode::OK, "{}", plan.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("playback-only-live"),
+            json!({"plan_token":plan.body["plan_token"],"start_ms":0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    let ready = f
+        .until(id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 45000
+        })
+        .await;
+    assert!(ready["active"]["available_end_ms"].as_u64().unwrap() < 180000);
+    let denied = f
+        .post(
+            "/api/v2/playback/viewing-sessions",
+            &auth,
+            Some("no-history-write"),
+            json!({"delivery_id":id,"expected_viewing_revision":"0"}),
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    let beat = |sequence: &str, position, generation: &str| json!({"active_generation":generation,"playhead":{"sequence":sequence,"position_ms":position}});
+    let first = f
+        .post(
+            &format!("{path}/heartbeat"),
+            &auth,
+            None,
+            beat("2", 90000, "1"),
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let duplicate = f
+        .post(
+            &format!("{path}/heartbeat"),
+            &auth,
+            None,
+            beat("2", 90000, "1"),
+        )
+        .await;
+    assert_eq!(duplicate.status, StatusCode::OK);
+    let conflict = f
+        .post(
+            &format!("{path}/heartbeat"),
+            &auth,
+            None,
+            beat("2", 80000, "1"),
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let stale = f
+        .post(&format!("{path}/heartbeat"), &auth, None, beat("1", 0, "1"))
+        .await;
+    assert_eq!(stale.status, StatusCode::OK);
+    let wrong = f
+        .post(&format!("{path}/heartbeat"), &auth, None, beat("3", 0, "2"))
+        .await;
+    assert_eq!(wrong.status, StatusCode::CONFLICT);
+    let advanced = f
+        .until(id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 100000
+        })
+        .await;
+    let manifest = advanced["active"]["manifest_url"].as_str().unwrap();
+    assert_eq!(f.get(manifest, &auth).await.status, StatusCode::OK);
+    let backward = f
+        .post(
+            &format!("{path}/heartbeat"),
+            &auth,
+            None,
+            beat("3", 1000, "1"),
+        )
+        .await;
+    assert_eq!(backward.status, StatusCode::OK);
+    for table in [
+        "timeline_viewing",
+        "viewing_sessions",
+        "viewing_events",
+        "progress",
+        "viewing_state",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "playhead wrote {table}");
+    }
+    let operator = bearer(OPERATOR);
+    let row = f.get(&format!("/api/v2/devices/{device}"), &operator).await;
+    let start = std::time::Instant::now();
+    let revoked = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[
+                ("authorization", &operator),
+                ("if-match", row.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    assert_eq!(
+        f.get(manifest, &auth).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.server.app.processing.deliveries.is_live(id) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("revoked delivery retained its worker or output");
+    println!(
+        "revoked live delivery worker and output released in {:?}",
+        start.elapsed()
+    );
 }

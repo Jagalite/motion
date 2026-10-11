@@ -13426,6 +13426,10 @@
           "server_epoch": {
             "$ref": "#/components/schemas/Id"
           },
+          "restore_epoch": {
+            "description": "Changes when server state is restored or replaced; stable across ordinary process restarts. Scope durable outboxes by server_id and restore_epoch.",
+            "$ref": "#/components/schemas/Id"
+          },
           "server_version": {
             "type": "string",
             "maxLength": 256
@@ -13457,6 +13461,7 @@
         "required": [
           "server_id",
           "server_epoch",
+          "restore_epoch",
           "server_version",
           "api_version",
           "schema_version",
@@ -16514,9 +16519,26 @@
       "Heartbeat": {
         "type": "object",
         "additionalProperties": false,
+        "description": "Renews a playback-authorized delivery lease without writing viewing history. Optional playhead observations apply only to the active generation. Sequence increases within that generation; gaps are allowed. Older and exact duplicate observations have no effect and do not renew the lease. Conflicting reuse is a 409. A newer sequence may move backwards. Lease-only heartbeats also admit the pending generation while waiting for readiness.",
         "properties": {
           "active_generation": {
             "$ref": "#/components/schemas/Revision"
+          },
+          "playhead": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "sequence": {
+                "$ref": "#/components/schemas/Revision"
+              },
+              "position_ms": {
+                "$ref": "#/components/schemas/Milliseconds"
+              }
+            },
+            "required": [
+              "sequence",
+              "position_ms"
+            ]
           }
         },
         "required": [
@@ -16541,6 +16563,7 @@
         "description": "Create after candidate readiness. Supersedes previous profile+timeline authority only. Stale expected viewing revision is a 409, not a silent takeover."
       },
       "ViewingSession": {
+        "description": "Durable timeline authority survives an ordinary process restart. Delivery interruption does not interrupt viewing authority: queued events can drain and the session can rebind to a new delivery. A server identity or restore epoch change requires client reconciliation before replaying an outbox.",
         "type": "object",
         "additionalProperties": false,
         "properties": {

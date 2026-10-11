@@ -429,12 +429,12 @@ async fn facts(db: &SqlitePool, profile: &str, item: &str) -> Result<Facts, OrgE
     let metadata = crate::metadata::load(db, item)
         .await
         .map_err(|_| OrgError::Storage(anyhow::anyhow!("metadata unavailable")))?;
-    let watched: Option<(bool, Option<bool>)> = sqlx::query_as(
-        "SELECT automatic_watched,manual_watched FROM viewing_state WHERE profile_id=? AND item_id=?",
+    let watched: Vec<(bool, Option<bool>)> = sqlx::query_as(
+        "SELECT v.automatic_watched,v.manual_watched FROM timeline_viewing v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE v.profile_id=? AND e.item_id=?",
     )
     .bind(profile)
     .bind(item)
-    .fetch_optional(db)
+    .fetch_all(db)
     .await?;
     let strings = |key: &str| -> Vec<String> {
         metadata
@@ -456,7 +456,7 @@ async fn facts(db: &SqlitePool, profile: &str, item: &str) -> Result<Facts, OrgE
         person_ids: strings("person_ids"),
         tags: metadata.tags.into_iter().collect(),
         available,
-        watched: watched.is_some_and(|(automatic, manual)| manual.unwrap_or(automatic)),
+        watched: playscale_core::timeline_viewing::work_watched(watched),
     })
 }
 

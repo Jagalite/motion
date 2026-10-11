@@ -245,8 +245,8 @@ async function firstGeneration(delivery, current) {
 // The last viewing session this browser created for a principal/profile/
 // timeline, across server runtimes: the only authority adoptableRevision may
 // recognise as our own.
-const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
-const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
+const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
+const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
 // Written only by a page that is actually leaving (pagehide) and has a session.
 function leaveHandoff(data, session) {
   try { if (session) sessionStorage.setItem(handoffKey(data), JSON.stringify({session, at: Date.now()})); } catch { /* fails closed */ }
@@ -260,10 +260,10 @@ function takeHandoff(data, now = Date.now()) {
   } catch { return null; }
 }
 
-// Outbox is scoped to this server runtime, principal, profile and timeline.
+// Outbox is scoped to server identity/restore epoch, principal, profile and timeline.
 // It contains session/event identities only, never reusable authentication.
 function viewingStorage(data) {
-  const scope = JSON.stringify([data.serverEpoch, data.principalId, data.profileId, data.timelineId]);
+  const scope = JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId]);
   const storageKey = `motion:viewing:${scope}`;
   return {
     load: () => JSON.parse(localStorage.getItem(storageKey) ?? sessionStorage.getItem(storageKey) ?? 'null'),
@@ -278,7 +278,7 @@ function viewingStorage(data) {
       try {
         const prior = JSON.parse(key.slice(15).replace(/:rejected$/, ''));
         return prior[1] === data.principalId && prior[2] === data.profileId && prior[3] === data.timelineId
-          && (prior[0] !== data.serverEpoch || key.endsWith(':rejected'));
+          && (prior[0] !== data.viewingEpoch || key.endsWith(':rejected'));
       } catch { return false; }
     }),
   };
@@ -367,10 +367,16 @@ function observeViewing(element, generation, writer, current) {
 
 function renewLease(delivery, generation, current) {
   state.stopLease?.();
+  let sequence = 0n;
   state.stopLease = maintainLease(delivery, generation.generation, {
     current,
     send: async (id, active_generation, signal) => {
-      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+      const observation = state.element?.player.state;
+      const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
+      const playhead = current() && ['playing', 'paused'].includes(observation?.status)
+        && Number.isSafeInteger(position) && position >= 0
+        ? {sequence: String(++sequence), position_ms: position} : undefined;
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation, ...(playhead ? {playhead} : {})}, undefined, signal);
       if (current()) state.delivery = renewed;
       return renewed;
     },
@@ -558,7 +564,12 @@ async function switchDelivery(plan) {
     latestLease = ready;
     stopReplacementLease = maintainLease(ready, generation.generation, {current,
       send: async (id, active_generation, signal) => {
-        const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+        const observation = state.element?.player.state;
+      const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
+      const playhead = current() && ['playing', 'paused'].includes(observation?.status)
+        && Number.isSafeInteger(position) && position >= 0
+        ? {sequence: String(++sequence), position_ms: position} : undefined;
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation, ...(playhead ? {playhead} : {})}, undefined, signal);
         latestLease = renewed;
         return renewed;
       },

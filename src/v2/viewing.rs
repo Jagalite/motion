@@ -535,7 +535,7 @@ pub struct ViewingCreate {
     expected_viewing_revision: String,
 }
 
-fn decimal(value: &str) -> Option<u64> {
+pub(crate) fn decimal(value: &str) -> Option<u64> {
     (!value.is_empty()
         && value.len() <= 20
         && value.bytes().all(|b| b.is_ascii_digit())
@@ -772,26 +772,6 @@ pub async fn record_viewing(
                 .bind(now())
                 .execute(&mut *tx)
                 .await?;
-            // The acknowledged logical playhead paces the bound delivery's
-            // encoder. It is reported while this transaction holds the writer,
-            // so reports follow commit order, and only when the caller may
-            // still control that delivery (core `may_control`); a stale
-            // generation is ignored by the reducer.
-            if matches!(event.status, Status::Playing | Status::Paused)
-                && let Some(owner) = delivery::live_owner(&app, &next.session.delivery)
-                && session_core::may_control(
-                    &owner,
-                    &principal,
-                    file_facts(&mut tx, &owner.file).await?.as_ref(),
-                )
-            {
-                delivery::report_playhead(
-                    &app,
-                    &next.session.delivery,
-                    event.generation,
-                    event.position_ms,
-                );
-            }
             tx.commit().await?;
             Ok(tagged(StatusCode::OK, ack, next.session.revision))
         }

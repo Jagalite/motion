@@ -1318,3 +1318,73 @@ async fn replays_are_redacted_for_the_current_catalog_scope() {
     .unwrap();
     assert_eq!(after, before + 1);
 }
+
+#[tokio::test]
+async fn smart_watched_facts_use_timeline_authority_and_ignore_legacy_state() {
+    use playscale_core::organization::{CollectionKind, Term};
+    let f = Fixture::new(AccessMode::Restricted).await;
+    f.seed().await;
+    let terms: Vec<Term> =
+        serde_json::from_value(json!([{"field":"watched","operator":"eq","value":true}])).unwrap();
+    let filter = playscale::organization::save_filter(&f.app, "default", None, "Watched", terms)
+        .await
+        .unwrap();
+    let collection = playscale::organization::save_collection(
+        &f.app,
+        "default",
+        None,
+        "Watched",
+        CollectionKind::Smart,
+        vec![],
+        Some(filter.id),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO viewing_state(profile_id,item_id,automatic_watched,revision) VALUES ('default','film',1,1)").execute(&f.app.db).await.unwrap();
+    assert!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let operator = bearer(OPERATOR);
+    let put = f
+        .put(
+            "/api/v2/profiles/default/timelines/t-film/viewing",
+            &operator,
+            "\"r-0\"",
+            json!({"manual_watched":true,"reset_position":false}),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+    assert_eq!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap(),
+        ["film"]
+    );
+    let put = f
+        .put(
+            "/api/v2/profiles/default/timelines/t-film/viewing",
+            &operator,
+            "\"r-1\"",
+            json!({"manual_watched":false,"reset_position":false}),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+    assert!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let legacy: bool =
+        sqlx::query_scalar("SELECT automatic_watched FROM viewing_state WHERE item_id='film'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(
+        legacy,
+        "canonical overrides must not rewrite retained legacy history"
+    );
+}

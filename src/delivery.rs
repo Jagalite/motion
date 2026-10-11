@@ -1382,6 +1382,24 @@ async fn run_generation(
 /// Fail current generations whose source is no longer an available, enabled,
 /// unchanged catalog file (e.g. after library detach or a rescan).
 async fn revalidate(app: &App, session: &Arc<Session>) {
+    if let Some(owner) = &session.owner {
+        let allowed = async {
+            let mut tx = app.db.begin().await.map_err(crate::v2::Problem::from)?;
+            let device = crate::v2::auth::load_device(&mut tx, &owner.principal).await?;
+            let file = crate::v2::content::file_facts(&mut tx, &owner.file).await?;
+            Ok::<_, crate::v2::Problem>(playscale_core::playback_session::may_continue(
+                owner,
+                device.as_ref().map(|d| &d.device),
+                file.as_ref(),
+            ))
+        }
+        .await;
+        // Observation failures cannot keep unauthorized execution alive.
+        if !matches!(allowed, Ok(true)) {
+            let _ = apply(app, session, Input::Close);
+            return;
+        }
+    }
     let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(&session.file_id)
         .fetch_optional(&app.db)
@@ -2069,16 +2087,24 @@ pub(crate) fn heartbeat_live(
     app: &App,
     id: &str,
     active_generation: &str,
-    position_ms: Option<u64>,
+    observation: Option<(u64, u64)>,
 ) -> Result<DeliveryView, ApiError> {
     let session = app.processing.deliveries.session(id)?;
     let d = apply(
         app,
         &session,
-        Input::Heartbeat {
-            active_generation: generation_number(active_generation)?,
-            position_ms,
-            now_ms: app.processing.deliveries.now_ms(),
+        match observation {
+            Some((sequence, position_ms)) => Input::ObservePlayhead {
+                generation: generation_number(active_generation)?,
+                sequence,
+                position_ms,
+                now_ms: app.processing.deliveries.now_ms(),
+            },
+            None => Input::Heartbeat {
+                active_generation: generation_number(active_generation)?,
+                position_ms: None,
+                now_ms: app.processing.deliveries.now_ms(),
+            },
         },
     )
     .map_err(error)?;
@@ -2118,24 +2144,6 @@ pub(crate) fn activate_live(
         ));
     }
     Ok((acknowledged, false))
-}
-
-/// Report the client's logical playhead for the active generation, which
-/// bounds how far its encoder may run ahead (pacing). Observation only: a
-/// stale generation or a fenced delivery is ignored.
-pub(crate) fn report_playhead(app: &App, id: &str, generation: u64, position_ms: u64) {
-    let Ok(session) = app.processing.deliveries.session(id) else {
-        return;
-    };
-    let _ = apply(
-        app,
-        &session,
-        Input::Heartbeat {
-            active_generation: generation,
-            position_ms: Some(position_ms),
-            now_ms: app.processing.deliveries.now_ms(),
-        },
-    );
 }
 
 /// Close a live delivery and record the fenced state through `conn` (the

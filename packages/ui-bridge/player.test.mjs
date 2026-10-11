@@ -225,7 +225,7 @@ test('skip links retain the current player; document navigation still tears down
   assert.equal(leaves('https://other.test/', current), false);
 });
 
-test('viewing storage migrates tab data and keeps prior runtime history out of current authority', () => {
+test('viewing storage survives ordinary restart and fences restore identity', () => {
   const makeStorage = () => {
     const store = {};
     Object.defineProperties(store, {
@@ -239,7 +239,7 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   const factory = runInNewContext(source.replace('export {close, maintainLease};', 'viewingStorage;'), {
     document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, localStorage, sessionStorage,
   });
-  const data = {serverEpoch: 'e1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
+  const data = {viewingEpoch: 'server:restore1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
   const key = 'motion:viewing:' + JSON.stringify(Object.values(data));
   sessionStorage.setItem(key, '{"event_id":"immutable"}');
   const storage = factory(data);
@@ -248,8 +248,11 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   assert.equal(sessionStorage.getItem(key), null);
   assert.equal(JSON.parse(localStorage.getItem(key)).event_id, 'immutable');
   const restarted = factory({...data, serverEpoch: 'e2'});
-  assert.equal(restarted.load(), null);
-  assert.equal(restarted.hasRejected(), true);
+  assert.equal(restarted.load().event_id, 'immutable');
+  assert.equal(restarted.hasRejected(), false);
+  const restored = factory({...data, viewingEpoch: 'server:restore2'});
+  assert.equal(restored.load(), null);
+  assert.equal(restored.hasRejected(), true);
   assert.equal(factory({...data, principalId: 'p2'}).hasRejected(), false);
   storage.save(null);
   assert.equal(localStorage.getItem(key), null);
