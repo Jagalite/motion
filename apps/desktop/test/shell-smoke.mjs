@@ -21,6 +21,7 @@ const server = createServer(async (req, res) => {
   const json = value => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(value)); };
   if (req.url === '/api/v2/system/health') return json({status: 'ok', server_id: 'shell-fixture', server_epoch: serverEpoch});
   if (req.url === '/api/v2/auth/session') {
+    if (req.headers.origin !== `http://127.0.0.1:${server.address().port}`) { res.statusCode = 403; return json({code: 'invalid_origin'}); }
     if (JSON.parse(Buffer.concat(body).toString()).credential !== secret) { res.statusCode = 401; return json({}); }
     res.setHeader('Set-Cookie', 'fixture=session; HttpOnly; SameSite=Strict; Path=/');
     return json({principal: {id: 'fixture-principal'}, csrf_token: 'fixture-csrf'});

@@ -145,7 +145,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
     const credential = input.credential || readCredential(selected);
     if (credential.length < 32) throw new Error('A paired device credential is required');
     const browserSession = await request('/api/v2/auth/session', {method: 'POST',
-      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: 'credential', credential})});
+      headers: {'Content-Type': 'application/json', Origin: selected.origin}, body: JSON.stringify({kind: 'credential', credential})});
     if (!browserSession?.principal?.id || !browserSession.csrf_token) throw new Error('Invalid browser session');
     verifyCapabilities(await request('/api/v2/system/capabilities'), selected, serverEpoch, contractDigest);
     if (!current()) throw new Error('Connection changed');
