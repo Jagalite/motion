@@ -4,7 +4,7 @@
   "manifest_sha256": "ecb0028bbbe68bc92599115da1f1de97771cb855b3edd4c1aba9d23573d90526",
   "source_commit": "0339abe969e63ed6e2cdee7760f8584ab81bbbcb",
   "source_dirty": false,
-  "status": "passed",
+  "status": "invalidated",
   "command": [
     "rustup",
     "run",
@@ -22,5 +22,7 @@
   "binary_smoke": "--help",
   "help_sha256": "55dae2d3cb8af2dd98c198a2bc06bf5789f07e0134d18d5947a11f12a9599887",
   "kyoto_job": "4b25803a1e444044bdd706162c714bfc",
-  "scope": "Extracted Motion workspace release rebuild and CLI help smoke; not installed-package acceptance"
+  "scope": "Extracted Motion workspace release rebuild and CLI help smoke; not installed-package acceptance",
+  "reason": "Cargo child compiler used Homebrew 1.99.0 despite rustup-run Cargo and a pinned rustc diagnostic; compiler provenance is invalid.",
+  "actual_compiler": "rustc 1.99.0 (b940084d7 2026-09-28) (Homebrew)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.2\n"
 }

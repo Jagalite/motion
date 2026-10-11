@@ -5,6 +5,7 @@ Build-bearing: local invocations must be submitted through the shared Kyoto queu
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tarfile
@@ -38,12 +39,16 @@ def check(archive, manifest_path, work):
                 raise ValueError(f'Source archive hash mismatch: {name}')
         channel = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
         toolchain = ['rustup', 'run', channel]
+        compiler = subprocess.check_output(
+            ['rustup', 'which', '--toolchain', channel, 'rustc'], cwd=root, text=True).strip()
+        build_env = {**os.environ, 'RUSTC': compiler}
         command = [*toolchain, 'cargo', 'build', '--release', '--locked', '--workspace',
                    '--target-dir', str(work / 'target')]
         receipt['command'] = command
-        receipt['rustc'] = subprocess.check_output([*toolchain, 'rustc', '-vV'], cwd=root, text=True)
+        receipt['rustc'] = subprocess.check_output([compiler, '-vV'], cwd=root, text=True)
+        receipt['compiler_selection'] = 'RUSTC explicitly set to rustup which --toolchain ' + channel + ' rustc'
         with (work / 'build.log').open('w') as log:
-            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, env=build_env, check=True)
         binary = work / 'target/release/playscale'
         receipt['binary_sha256'] = sha(binary)
         receipt['binary_smoke'] = '--help'
