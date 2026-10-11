@@ -91,18 +91,22 @@ installation, readiness/diagnostics, bounded logs, retention, and SQLite backup/
 
 ## Public API
 
-The webpage uses the same API as other applications. The generated specification
-is at `/api/v1/openapi.json`; [API.md](API.md) explains identity, import, and media
-contracts with examples. Viewing needs no application login. Admin operations
-require `Authorization: Bearer <local token>`. Profiles are selectable viewing
-identities, not security boundaries. Browser mutations must be same-origin.
+Topcoat, Electron and the Go CLI/TUI use `/api/v2`. The served contract is at
+`/api/v2/openapi.json`; the reviewed source is
+[Motion_Server_API_v2.yaml](contracts/Motion_Server_API_v2.yaml). Protected
+operations require a scoped credential or the local operator token. Profiles
+identify viewing history; they do not replace authentication. Browser mutations
+must pass the origin and CSRF policies.
+
+Old clients and media URLs must update. See [the cutover note](MOTION_V2_CUTOVER.md)
+for retirement, data migration and rollback requirements. [API.md](API.md) is
+historical documentation of the retired API.
 
 ```sh
-curl http://127.0.0.1:8787/api/v1/items
-python3 scripts/client.py http://127.0.0.1:8787
+MOTION_ACCESS_TOKEN=your-credential python3 scripts/client.py http://127.0.0.1:8787
 ```
 
-## Next architecture and API v2
+## Architecture and API v2
 
 The [consolidation and milestone completion plan](MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md)
 is the current execution addendum: retire v1 client compatibility, preserve data
@@ -127,9 +131,9 @@ not included in this import.
 
 For the new implementation, use these documents for target architecture decisions;
 `DESIGN.md`, `IMPLEMENTATION_PLAN.md`, and `ROADMAP.md` retain earlier decisions and
-history, including proposals superseded by the new plan. `API.md` and the running
-`/api/v1/openapi.json` describe the existing API. Importing the v2 contract does not
-enable v2 endpoints or change application behavior.
+history, including proposals superseded by the new plan. The current served-operation
+inventory and capability responses describe implemented endpoints; contract presence
+alone does not establish implementation or runtime qualification.
 
 ## Verification
 

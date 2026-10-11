@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {alignNativeFrames,NativeHandoffs} from '../web/playback.js';
+import {alignNativeFrames,NativeHandoffs} from '../tests/fixtures/legacy-web/playback.js';
 let frames=new Map(),next=0;
 globalThis.requestAnimationFrame=callback=>{frames.set(++next,callback);return next;};
 globalThis.cancelAnimationFrame=id=>frames.delete(id);

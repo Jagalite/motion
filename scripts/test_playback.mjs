@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {attemptPlayback, preparationSubmitter, sourceForPlayback} from '../web/playback.js';
+import {attemptPlayback, preparationSubmitter, sourceForPlayback} from '../tests/fixtures/legacy-web/playback.js';
 const selection=(file_id,revision='v1')=>({file_id,revision,media_url:`/media/${file_id}?revision=${revision}`});
 let opened=[];
 const plan=await attemptPlayback({
@@ -39,7 +39,7 @@ assert.deepEqual(sourceForPlayback(item,null,chosen),chosen);
 assert.deepEqual(sourceForPlayback(item,{source_file_id:'other-cut',source_revision:'o1'},chosen),{file_id:'other-cut',revision:'o1'});
 assert.deepEqual(sourceForPlayback(item,{file_id:'new-original',revision:'n1'},chosen),{file_id:'new-original',revision:'n1'});
 console.log('Review regressions: final failure plan, idempotency lifecycle, source preservation PASS');
-const {PlaybackSwitches}=await import('../web/playback.js');
+const {PlaybackSwitches}=await import('../tests/fixtures/legacy-web/playback.js');
 const owner=new PlaybackSwitches(),first=owner.begin();
 const waiting=first.delay(10000);const cancelled=assert.rejects(waiting,{name:'AbortError'});
 const second=owner.begin();await cancelled;
@@ -48,7 +48,7 @@ first.finish();assert.equal(owner.pending,true);await second.delay(1);
 owner.cancel();assert.equal(second.current,false);assert.equal(owner.pending,false);
 console.log('Latest switch wins, stale completion protection, cancellable preparation: PASS');
 {
-const {transferPlayback}=await import('../web/playback.js');
+const {transferPlayback}=await import('../tests/fixtures/legacy-web/playback.js');
 const makeCore=state=>({state:{...state},calls:[],async seek(value){this.calls.push(['seek',value]);this.state.currentTime=value;},async setPlaybackRate(value){this.state.playbackRate=value;},async setVolume(value){this.state.volume=value;},async setMuted(value){this.calls.push(['mute',value]);this.state.muted=value;},async play(){this.state.status='playing';},async pause(){this.state.status='paused';}});
 const from=makeCore({currentTime:10,status:'playing',playbackIntent:'play',volume:.3,muted:false,playbackRate:1.5}),to=makeCore({muted:true});
 const selection={file_id:'converted',revision:'r'},previous={file_id:'original',revision:'r'};
@@ -99,7 +99,7 @@ resourceTask.onCancel(()=>releases++);assert.equal(releases,2);
 const detached=cancellationOwner.begin();const release=detached.onCancel(()=>releases++);release();cancellationOwner.cancel();assert.equal(releases,2);
 console.log('Superseded resource cleanup, aborted requests, detached active resource: PASS');
 {
-const {playbackSnapshot,transferPlayback}=await import('../web/playback.js');
+const {playbackSnapshot,transferPlayback}=await import('../tests/fixtures/legacy-web/playback.js');
 const from={state:{currentTime:10,status:'playing',playbackIntent:'play',volume:1,muted:false,playbackRate:1},diagnostics:{backend:{path:'native',position:10.24}},async setMuted(){}};
 const seeks=[],events=[];
 const to={async seek(time){seeks.push(time);},async setPlaybackRate(){},async setVolume(){},async play(){},async setMuted(){}};
@@ -111,7 +111,7 @@ from.diagnostics.backend={path:'software',position:20};assert.equal(playbackSnap
 console.log('Handoff uses fresh native source clock, retains safe fallback for other routes: PASS');
 }
 {
-const {transferPlayback}=await import('../web/playback.js');
+const {transferPlayback}=await import('../tests/fixtures/legacy-web/playback.js');
 // Change tracks during each await boundary, including the final server ack.
 for(const stage of ['initial-ack','track-selection','final-seek','final-ack']){
   const tracks=prefix=>[{id:prefix+'1',language:'en',label:'English',selected:true},{id:prefix+'2',language:'fr',label:'French',selected:false}];

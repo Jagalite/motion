@@ -39,11 +39,10 @@ pub struct Args {
     /// Private inherited output pipe for native-host readiness (one JSON line).
     #[arg(long)]
     pub ready_fd: Option<i32>,
-    /// Serve the production Topcoat presentation (requires matching v2 services).
+    /// Compatibility flag: Topcoat is always the production presentation.
     #[arg(long)]
     pub topcoat: bool,
-    /// `trusted_household` keeps the unauthenticated legacy v1 surface;
-    /// `restricted` requires paired credentials (v1 is operator-only).
+    /// Access policy for v2 clients. Retired APIs remain unavailable in every mode.
     #[arg(long, value_parser = parse_access_mode)]
     pub access_mode: Option<playscale_core::access::AccessMode>,
 }
@@ -77,7 +76,7 @@ impl Default for Settings {
             ffprobe: "ffprobe".into(),
             processing: Default::default(),
             storage: Default::default(),
-            // Household mode (anonymous legacy v1) is only an explicit choice.
+            // Retained household configuration cannot reopen retired routes.
             access_mode: playscale_core::access::AccessMode::Restricted,
             api: Default::default(),
         }

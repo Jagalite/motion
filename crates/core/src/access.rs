@@ -100,8 +100,8 @@ pub enum Mode {
     Integration,
 }
 
-/// Deployment setting. Household mode keeps the unauthenticated legacy v1
-/// surface; profile restrictions are then not enforceable and are reported so.
+/// Persisted deployment setting retained for configuration compatibility.
+/// Both values enforce v2 grants; neither enables retired HTTP routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
@@ -544,14 +544,6 @@ pub fn replace_policy(
         policy,
         ..device.clone()
     }))
-}
-
-/// Unauthenticated legacy routes remain only in household mode. v1 responses
-/// are not library-scoped, so restricted mode admits them only for an
-/// administrator (whose v2 scope is the whole catalog): v1 can never return
-/// more than v2 would.
-pub fn legacy_allowed(mode: AccessMode, admin: bool) -> bool {
-    admin || mode == AccessMode::TrustedHousehold
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1581,13 +1573,6 @@ mod tests {
             authenticate_ingress(None),
             Err(AccessError::CredentialRevoked)
         );
-    }
-
-    #[test]
-    fn legacy_routes_follow_access_mode() {
-        assert!(legacy_allowed(AccessMode::TrustedHousehold, false));
-        assert!(!legacy_allowed(AccessMode::Restricted, false));
-        assert!(legacy_allowed(AccessMode::Restricted, true));
     }
 }
 

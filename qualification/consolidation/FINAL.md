@@ -73,3 +73,23 @@ and the player engine/deployment matrix. Catalog, playback and client lane owner
 remain accountable for their domain fixes, with integration owning the final
 acceptance. Missing hardware/physical A/V evidence is explicitly unqualified.
 All M0–M4 rows remain open until their individual acceptance receipts exist.
+
+
+### Public prerequisite acceptance before route cutover
+
+At `67c5b39`, Kyoto `0546920f915f4333b5f665843a975e7b` compiled the focused
+metadata/preparation target successfully with one compiler job. The earlier
+combined test-compilation request was deferred twice under host memory pressure
+and cancelled in favor of this narrower request; it is not passing evidence.
+All 18 metadata/preparation HTTP tests passed. The v2-only real-profile smoke
+passed five software profiles (H.264, HEVC, 30 fps, fractional 29.97 fps, 1 fps
+and 2 fps as recorded), prepared plans/deliveries, range bytes, complete decode,
+SSE replay and restart identity. See `profile-v2-67c5b39.json` for exact source
+media and server binary hashes. The FFmpeg used by this receipt is the host tool;
+it does not qualify bundled HEVC or hardware encoding.
+
+The route-retirement implementation removes runtime v1/media and legacy assets,
+uses Topcoat by default, and keeps legacy configuration values from reopening
+old routes. Historical service regressions have a test-only router; the new
+v2 media matrix, production default UI and retirement/no-mutation matrix use
+the actual production router. Cutover compilation and runtime tests are pending.

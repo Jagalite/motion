@@ -1111,69 +1111,122 @@ async fn page_event_cursor_resumes_without_reset() {
     assert_eq!(events[0].1["resource_id"], "default");
 }
 
-#[tokio::test]
-async fn restricted_mode_closes_the_legacy_surface() {
-    let open = Fixture::new(AccessMode::TrustedHousehold).await;
-    let reply = open.call("GET", "/api/v1/libraries", None, &[]).await;
-    assert_eq!(reply.status, StatusCode::OK);
-
-    let f = Fixture::new(AccessMode::Restricted).await;
-    for path in [
-        "/api/v1/libraries",
-        "/api/v1/items",
-        "/api/v1/events",
-        "/media/x",
-    ] {
-        let reply = f.call("GET", path, None, &[]).await;
-        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{path}");
-        assert_eq!(reply.body["code"], "restricted_mode");
+// Snapshot every application table, including both historical and canonical
+// viewing state. Retired requests must not perform even a hidden side write.
+async fn retirement_snapshot(app: &App) -> Vec<(String, Vec<String>)> {
+    let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetch_all(&app.db).await.unwrap();
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let mut snapshot = Vec::new();
+    for table in tables {
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&table)
+                .fetch_all(&app.db)
+                .await
+                .unwrap();
+        let projection = columns
+            .iter()
+            .map(|name| format!("quote({})", quote(name)))
+            .collect::<Vec<_>>()
+            .join("||char(31)||");
+        let mut rows: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT {projection} FROM {}", quote(&table)))
+                .fetch_all(&app.db)
+                .await
+                .unwrap();
+        rows.sort();
+        snapshot.push((table, rows));
     }
-    let (_, device) = f.pair(&["default"], &["catalog:read"]).await;
-    let paired = f
-        .call(
-            "GET",
-            "/api/v1/libraries",
-            None,
-            &[("authorization", &bearer(&device))],
+    snapshot
+}
+
+#[tokio::test]
+async fn retired_routes_are_absent_in_every_mode_without_state_mutation() {
+    for mode in [AccessMode::TrustedHousehold, AccessMode::Restricted] {
+        let f = Fixture::new(mode).await;
+        sqlx::query(
+            "INSERT INTO items(id,title,kind) VALUES ('retired-target','Retained history','video')",
         )
-        .await;
-    assert_eq!(paired.status, StatusCode::UNAUTHORIZED);
-    // A paired administrator's v2 scope is the whole catalog, so v1 reads
-    // (which are not library-scoped) are admitted for it.
-    let (_, admin) = f.pair(&[], &["system:admin"]).await;
-    let admin_read = f
-        .call(
-            "GET",
-            "/api/v1/libraries",
-            None,
-            &[("authorization", &bearer(&admin))],
-        )
-        .await;
-    assert_eq!(admin_read.status, StatusCode::OK);
-    let operator = f
-        .call(
-            "GET",
-            "/api/v1/libraries",
-            None,
-            &[("authorization", &bearer(OPERATOR))],
-        )
-        .await;
-    assert_eq!(operator.status, StatusCode::OK);
-    let caps = f
-        .call(
-            "GET",
-            "/api/v2/system/capabilities",
-            None,
-            &[("authorization", &bearer(&device))],
-        )
-        .await;
-    let restricted = caps.body["features"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|x| x["id"] == "access.restricted_mode")
+        .execute(&f.app.db)
+        .await
         .unwrap();
-    assert_eq!(restricted["enabled"], true);
+        sqlx::query("INSERT INTO progress VALUES ('default','retired-target',17,1)")
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO viewing_state(profile_id,item_id,revision) VALUES ('default','retired-target',4)").execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,position_ms,updated_at) VALUES ('default','canonical-target',9,23000,2)").execute(&f.app.db).await.unwrap();
+        let (_, device) = f.pair(&["default"], &["catalog:read"]).await;
+        let (_, admin) = f.pair(&[], &["system:admin"]).await;
+        let capabilities = f
+            .call("GET", "/api/v2/system/capabilities", None, &[])
+            .await;
+        let access = capabilities.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == "access.restricted_mode")
+            .unwrap();
+        assert_eq!(access["enabled"], true);
+        let before = retirement_snapshot(&f.app).await;
+        for credential in [
+            None,
+            Some(bearer(&device)),
+            Some(bearer(&admin)),
+            Some(bearer(OPERATOR)),
+        ] {
+            for path in [
+                "/api/v1",
+                "/api/v1/",
+                "/api/v1/openapi.json",
+                "/api/v1/libraries",
+                "/api/v1/items",
+                "/api/v1/profiles",
+                "/api/v1/profiles/default/progress/retired-target",
+                "/api/v1/profiles/default/viewing/retired-target",
+                "/api/v1/processing-jobs",
+                "/api/v1/events",
+                "/api/v1/deliveries",
+                "/api/v1/streams/old/1/index.m3u8",
+                "/api/v1/streams/old/1/init.mp4",
+                "/api/v1/streams/old/1/segments/0.m4s",
+                "/api/v1/streams/old/1/subtitles.vtt",
+                "/media",
+                "/media/old?revision=old",
+                "/app.js",
+                "/demuxe.js",
+                "/playback.js",
+                "/session.js",
+                "/style.css",
+            ] {
+                for method in ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+                    let headers = credential
+                        .as_deref()
+                        .map(|token| vec![("authorization", token)])
+                        .unwrap_or_default();
+                    let body=(!matches!(method,"GET"|"HEAD"|"OPTIONS")).then(||json!({"position_seconds":42,"name":"Unwanted","root":"/tmp","expected_revision":4,"watched":true}));
+                    // Fixture::call uses the real production router, never the
+                    // historical service scaffolding used by other suites.
+                    let result = f.call(method, path, body, &headers).await;
+                    assert_eq!(
+                        result.status,
+                        StatusCode::NOT_FOUND,
+                        "{mode:?} {method} {path}: {}",
+                        result.body
+                    );
+                    assert!(
+                        result.body.is_null() || result.body.is_object(),
+                        "retired route returned HTML"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            retirement_snapshot(&f.app).await,
+            before,
+            "retired request mutated database in {mode:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2392,11 +2445,7 @@ async fn source_library_crud_requires_authority_preconditions_and_preserves_medi
 #[tokio::test]
 async fn topcoat_uses_real_authorized_library_reads_and_keeps_api_json() {
     let f = Fixture::new(AccessMode::Restricted).await;
-    let app = api::router_with(
-        f.app.clone(),
-        None,
-        Some(playscale::presentation::router(f.app.clone())),
-    );
+    let app = api::router(f.app.clone(), None);
     let response = app
         .clone()
         .oneshot(f.request("GET", "/", None, &[]))

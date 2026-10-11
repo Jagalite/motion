@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 
-const source = await readFile(new URL('../web/demuxe.js', import.meta.url), 'utf8');
+const source = await readFile(new URL('../tests/fixtures/legacy-web/demuxe.js', import.meta.url), 'utf8');
 const dataModule = source => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 
 async function integration(t, {runtime = true, elementAPI = true, failures = 0} = {}) {
