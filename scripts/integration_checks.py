@@ -34,6 +34,7 @@ CHECKS = [
     # Operator tooling.
     ('backup_tool', PY + ['scripts/test_backup.py'], 120),
     ('packaging_helpers', PY + ['scripts/test_packaging.py'], 120),
+    ('provider_identity', PY + ['scripts/test_motion_provider.py'], 120),
     # Browser client modules under Node.
     ('demuxe_integration', ['node', '--test', 'scripts/test_demuxe_integration.mjs'], 120),
     ('web_playback', ['node', 'scripts/test_playback.mjs'], 120),

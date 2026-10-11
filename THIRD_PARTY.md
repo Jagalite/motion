@@ -42,22 +42,26 @@ See vendor/STATELESS.md.
 
 ## Demuxe
 
-The package builder obtains a pinned Demuxe archive from npm and includes its
-assets. Source-mode users can install that same archive separately. Its original application
-runtime is Apache-2.0, not covered by Playscale's MIT license. The installer retains
-the package's license files and records installed-file and archive hashes.
-Redistributions must retain the applicable licenses and attribution notices,
-including any required NOTICE content and notices of modifications.
+The one-app package uses the exact Apache-2.0 provider-independent core candidate
+vendored under `vendor/demuxe`. It is distinct from the published npm 1.1.1 bytes.
+Its archive, original build inventory, all recorded corresponding source inputs,
+and license are retained. See that directory's README for provenance limits.
 
-The pinned npm 1.0.0 distribution includes upstream Wasm engines and retains its
-license map and third-party notices. The builder supplies its checksum-matched
-upstream source companions alongside the application archive. Modular upstream
-packages use the installer's browser-only manifest; additional providers require
-their own matching source and notice materials.
-An MIT license for Playscale does not relicense these components.
+Motion compiles an Apache-2.0 Shaka 5.2.11 derivative from checksum-pinned upstream
+source, applying `vendor/shaka/motion-paced.patch`. The application retains the
+license, modification notice, patch, new asset identity and deployment receipt.
+The source companion includes the upstream archive and complete Motion recipe.
+Per-player ownership is selected explicitly; shared component runtime injection
+is not supplied by this core candidate. Product qualification is separate from
+source licensing and is recorded in the consolidation evidence ledger.
 
-The npm 1.0.0 player uses per-player resource ownership. Shared-runtime APIs are
-used only when both the runtime export and component property are present.
+## Electron and Go/TUI
+
+Electron 44.7.0 is checksum-pinned in `packaging.lock.json`. Its MIT license and
+Chromium third-party notices are included inside the app. The Go runtime license
+and license/notice files for every linked Go module are also installed there,
+with module versions recorded. The terminal source, go.mod and go.sum are in the
+Motion source archive. Local ad-hoc signing is not Developer ID notarization.
 
 ## FFmpeg and FFprobe
 

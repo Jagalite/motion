@@ -1206,11 +1206,22 @@ pub async fn create_order_group(
     name: &str,
     kind: OrderKind,
 ) -> Result<String, CurationError> {
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let id = create_order_group_in(&mut tx, edition, name, kind).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+pub(crate) async fn create_order_group_in(
+    tx: &mut SqliteConnection,
+    edition: &str,
+    name: &str,
+    kind: OrderKind,
+) -> Result<String, CurationError> {
     if name.trim().is_empty() || name.len() > 200 {
         return Err(IdentityError::InvalidTitle.into());
     }
-    let _guard = app.jobs.lock().await;
-    let mut tx = crate::db::begin_write(&app.db).await?;
     let id = new_id();
     sqlx::query("INSERT INTO order_groups (id,edition_id,name,kind) VALUES (?,?,?,?)")
         .bind(&id)
@@ -1219,7 +1230,8 @@ pub async fn create_order_group(
         .bind(enum_name(&kind)?)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
+    sqlx::query("UPDATE items SET catalog_revision=catalog_revision+1 WHERE id=(SELECT item_id FROM editions WHERE id=?)")
+        .bind(edition).execute(&mut *tx).await?;
     Ok(id)
 }
 

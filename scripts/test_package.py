@@ -33,22 +33,27 @@ def exercise(archive, work, keep_running=False):
     clean_env = {key: value for key, value in os.environ.items()
                  if not key.startswith(('DYLD_', 'LD_', 'CARGO_', 'RUST', 'DEMUXE'))}
     clean_env['PATH'] = '/nonexistent-motion-test-path'
-    binary = app / 'motion'
+    resources = app / 'Motion.app/Contents/Resources'
+    binary = app / 'motion-server'
+    cli = app / 'motion'
+    subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app / 'Motion.app')], check=True)
+    help_text = subprocess.check_output([str(cli), '--help'], cwd=work, env=clean_env, text=True)
+    assert 'tui' in help_text and 'serve' in help_text
     configured = json.loads(subprocess.check_output([str(binary), '--check-config'], cwd=work, env=clean_env))
-    assert Path(configured['ffprobe']) == app / 'tools/ffprobe'
-    assert Path(configured['processing']['ffmpeg']) == app / 'tools/ffmpeg'
-    assert Path(configured['demuxe_dir']) == app / 'assets/demuxe'
-    launched = json.loads(subprocess.check_output([str(app / 'Motion.command'), '--check-config'], cwd=work, env=clean_env))
+    assert Path(configured['ffprobe']) == resources / 'tools/ffprobe'
+    assert Path(configured['processing']['ffmpeg']) == resources / 'tools/ffmpeg'
+    assert Path(configured['demuxe_dir']) == resources / 'assets/demuxe'
+    launched = json.loads(subprocess.check_output([str(cli), 'serve', '--check-config'], cwd=work, env=clean_env))
     assert launched == configured
     media = work / 'media'
     media.mkdir()
     fixture = media / 'Motion-package-fixture.mp4'
-    subprocess.run([str(app / 'tools/ffmpeg'), '-v', 'error', '-f', 'lavfi', '-i',
+    subprocess.run([str(resources / 'tools/ffmpeg'), '-v', 'error', '-f', 'lavfi', '-i',
                     'testsrc2=size=320x180:rate=24', '-f', 'lavfi', '-i',
                     'sine=frequency=440:sample_rate=48000', '-t', '8', '-c:v', 'libx264',
                     '-threads', '2', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart',
                     str(fixture)], cwd=work, env=clean_env, check=True)
-    probe = json.loads(subprocess.check_output([str(app / 'tools/ffprobe'), '-v', 'error',
+    probe = json.loads(subprocess.check_output([str(resources / 'tools/ffprobe'), '-v', 'error',
                         '-show_streams', '-show_format', '-of', 'json', str(fixture)], env=clean_env))
     assert {stream['codec_name'] for stream in probe['streams']} == {'h264', 'aac'}
     state = work / 'state'
@@ -56,7 +61,7 @@ def exercise(archive, work, keep_running=False):
     log = (work / 'server.log').open('wb')
     command = [str(binary), '--listen', f'127.0.0.1:{port}', '--data-dir', str(state), '--library', str(media)]
     process = subprocess.Popen(command, cwd=work, env=clean_env, stdout=log, stderr=log)
-    checks = ['archive_privacy', 'binary_privacy', 'archive_inventory', 'relocated_bundle_defaults', 'bundled_encoding_and_probe']
+    checks = ['app_signature', 'bundled_go_cli', 'archive_privacy', 'binary_privacy', 'archive_inventory', 'relocated_bundle_defaults', 'bundled_encoding_and_probe']
     success = False
     try:
         wait_for(lambda: request(port, 'GET', '/ready')[0] == 200, seconds=45)

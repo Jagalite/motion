@@ -1,0 +1,102 @@
+{
+  "kind": "installed-one-app-acceptance",
+  "source_commit": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db",
+  "harness_commit": "f5af281",
+  "archive_sha256": "29acbc6224e353c6b6d3fcaaef638e2b0ebe3da09a61248bad3c8f292e7f6810",
+  "source_archive_sha256": "fe202dcc7dcd936ddd1570b3a44771bdf978400864a87303979eaa6b03a66ca0",
+  "package": {
+    "checks": [
+      "app_signature",
+      "bundled_go_cli",
+      "archive_privacy",
+      "binary_privacy",
+      "archive_inventory",
+      "relocated_bundle_defaults",
+      "bundled_encoding_and_probe",
+      "restricted_default_refuses_anonymous_catalog",
+      "server_scan_with_bundled_ffprobe",
+      "media_bytes_and_ranges",
+      "npm_demuxe_served",
+      "server_transcode_with_bundled_ffmpeg",
+      "restart_retains_progress"
+    ],
+    "archive_sha256": "29acbc6224e353c6b6d3fcaaef638e2b0ebe3da09a61248bad3c8f292e7f6810",
+    "port": 54685,
+    "pid": 44465,
+    "app": "Relocated Motion With Spaces",
+    "item_id": "20241646-af29-4d00-804a-87d4231fc395",
+    "media_url": "/api/v2/media/files/f0235a55-73cf-48ae-b202-6316e822a73a/content?revision=51bd9488ae65d6f5d05d4a630225e48cfbcc7241df0dcc31e68d05f78d2ce40e",
+    "processing_job": {
+      "attempt_generation": "1",
+      "error_code": null,
+      "id": "21288166-9347-4352-ab43-47a6a96f3a1e",
+      "kind": "rendition",
+      "phase": "completed",
+      "progress": null,
+      "requester_id": "operator",
+      "result_ids": [
+        "ab1c41de-dc76-4ac8-9bfc-aee5dd76ff71"
+      ],
+      "revision": "5"
+    },
+    "path": "/nonexistent-motion-test-path",
+    "browser": "not yet run"
+  },
+  "native": {
+    "kind": "installed-native-desktop",
+    "checks": [
+      "packaged chrome is sandboxed without Node",
+      "owned server identity and authenticated capabilities agree",
+      "Topcoat view has no Node and legacy route is absent",
+      "server data is isolated inside disposable settings",
+      "bundled Go CLI reads the real authenticated catalog",
+      "bundled Go CLI validates playback and emits a credential-free URL",
+      "bundled Go TUI browses the real catalog and exits cleanly",
+      "installed app plays media scanned by its owned bundled server",
+      "disconnect leaves the owned server running",
+      "Stop local server terminates its listener",
+      "bundled offline helper renders downloads without catalog authority",
+      "bundled helper plays verified cache media with server stopped",
+      "disconnect terminates the offline helper",
+      "owned restart preserves identity and changes runtime epoch",
+      "closing the real application stops its owned server"
+    ],
+    "binaries": {
+      "Motion": "01523685eed20363c85ecec76d81c55c064f551c06cc77afbe20a64f66f30360",
+      "motion-server": "f794a6d0d20aaf5b2e48b6a3ca226b74dbcb60e7c8168e9da3e4473249a01e3e",
+      "motion-ui-host": "61c30d2ee3172827a9b6b1825ddbd5ee8c083f632c0af3a575036a4512227cb6"
+    },
+    "packageManifestSha256": "bebe5c486135894c1efd2ab0443a161d19387156be878c43028f4b815b32759f",
+    "packageSource": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db",
+    "provider": "sha256:4d968b37420bc8d32072e2ca553dd1a09fcbb5a841b4de51314513c42d0c334a",
+    "offlineScope": "Explicit cache fixture; download publication and reconciliation remain deferred M5 work.",
+    "harnessSha256": "b0bf6623f01c3a37f7368cc4b9232b38feb1bda7a2c19c332b115a39fd1d7ca9",
+    "tuiHarnessSha256": "cde6e7a75abeeafd916fc54acbc561719b8d133b1406b712aac16133069b3bc7",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Motion/0.1.0 Chrome/152.0.7977.130 Electron/44.7.0 Safari/537.36",
+    "ownedBinaries": [
+      "motion-server",
+      "motion-ui-host"
+    ],
+    "server": {
+      "id": "d82fb11882b56e401cecf297e3321bb1",
+      "epoch": "de2fef6a-5727-4f7e-8f12-0efd9b412820"
+    },
+    "fixtureSha256": "80cd2e7643c0975bc054f4225bcea1645f4ba1b244572d24921fdec9dbb2c5a3",
+    "result": "passed"
+  },
+  "terminal": {
+    "scope": "Installed Go TUI, real HTTP server, disposable operator/config",
+    "checks": [
+      "authenticated TUI overview rendered",
+      "real catalog fixture rendered",
+      "clean quit after selection and refresh key input"
+    ],
+    "result": "passed"
+  },
+  "limits": [
+    "Ad hoc signing, not notarized.",
+    "Seeded offline cache does not qualify M5 publication or reconciliation.",
+    "Muted synthetic media, no physical A/V or performance claim."
+  ],
+  "chromium_next_receipt": "playable-next-2d2c006.json"
+}

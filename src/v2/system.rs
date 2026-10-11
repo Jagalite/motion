@@ -7,7 +7,6 @@ use axum::{
     http::{HeaderValue, header},
     response::{IntoResponse, Response},
 };
-use playscale_core::access::AccessMode;
 use serde::Serialize;
 use std::{collections::BTreeMap, sync::atomic::Ordering};
 
@@ -103,7 +102,6 @@ pub async fn capabilities(
         sqlx::query_scalar("SELECT coalesce(max(version),0) FROM _sqlx_migrations WHERE success=1")
             .fetch_one(&app.db)
             .await?;
-    let restricted = app.access.mode == AccessMode::Restricted;
     let mut api = feature("api.v2.identity", true, true);
     api.limits = BTreeMap::from([
         ("json_body_bytes", super::BODY_LIMIT.to_string()),
@@ -133,9 +131,9 @@ pub async fn capabilities(
             true,
             app.access.settings.trusted_ingress.is_some(),
         ),
-        // Household mode leaves the legacy v1 surface open: v2 grants are
-        // enforced on v2 routes but profile restrictions are not enforceable.
-        feature("access.restricted_mode", true, restricted),
+        // Every live route enforces v2 grants after retirement, including
+        // configurations that retain the historical household mode value.
+        feature("access.restricted_mode", true, true),
         feature("events.scoped_stream", true, true),
         feature("catalog.v2", true, true),
         playback,

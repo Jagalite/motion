@@ -1,0 +1,23 @@
+{
+  "passed": 7,
+  "checks": [
+    "unavailable_configured_root_does_not_block_readiness",
+    "1000_file_inventory_and_incremental_reuse",
+    "full_scan_and_concurrent_viewing_writes",
+    "scheduled_snapshot_and_existing_restore_tool",
+    "durable_requested_snapshot_retention",
+    "disconnected_root_preserves_catalog",
+    "disk_reserve_failure_keeps_server_and_viewing_writes_live"
+  ],
+  "inventory_files": 1000,
+  "scan_seconds": {
+    "first": 61.404,
+    "incremental": 0.6,
+    "full": 3.507
+  },
+  "max_viewing_write_seconds": 0.013,
+  "binary_source": "38db68c",
+  "binary_sha256": "365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45",
+  "scope": "Fake-probe inventory and real backup/recovery; not codec or playback qualification",
+  "log_sha256": "a64e452965e2eb11c5e34fe1b9e99abf9d40a365e4a0ae5ab4dd4e18ca50ff95"
+}

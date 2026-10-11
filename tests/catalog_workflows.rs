@@ -1,10 +1,13 @@
 //! Real filesystem/SQLite evidence for guarded observation (A03), the
 //! identification workflow (A04) and organization (A09).
+#[path = "support/service_router.rs"]
+mod service_router;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use playscale::{App, api, db, matching, organization as orgs, scan};
+use playscale::{App, db, matching, organization as orgs, scan};
 use playscale_core::{
     matching::{Decision, MatchError, Status},
     organization::{
@@ -323,7 +326,7 @@ async fn manual_identity_is_pinned_against_provider_contributions() {
             ))
             .unwrap()
     };
-    let router = api::router(f.app.clone(), None);
+    let router = service_router::router(f.app.clone());
     let refused = router.clone().oneshot(put("604", 1)).await.unwrap();
     assert_eq!(refused.status(), StatusCode::CONFLICT);
     let same = router.oneshot(put("603", 1)).await.unwrap();
@@ -643,7 +646,7 @@ async fn pinned_identity_cannot_be_withdrawn_and_moves_with_a_merge() {
         .execute(&f.app.db)
         .await
         .unwrap();
-    let router = api::router(f.app.clone(), None);
+    let router = service_router::router(f.app.clone());
     let withdraw = router
         .clone()
         .oneshot(admin_request(
@@ -876,7 +879,7 @@ async fn reassigning_a_file_moves_its_version_within_the_work() {
     f.write("cut.mp4", b"directors cut");
     f.scan().await;
     let (file, item, _, edition) = f.file("cut.mp4").await;
-    let router = api::router(f.app.clone(), None);
+    let router = service_router::router(f.app.clone());
     let created = router
         .clone()
         .oneshot(admin_request(

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {ViewingSession,preferredTrack} from '../web/session.js';
+import {ViewingSession,preferredTrack} from '../tests/fixtures/legacy-web/session.js';
 const received=[];let lost=true;
 const api=async(path,options)=>{const event=JSON.parse(options.body);received.push(event);if(lost){lost=false;throw new TypeError('lost response');}await new Promise(r=>setTimeout(r,2));return {id:'session',...event};};
 const session=new ViewingSession(api,'default',{id:'session',sequence:0,status:'paused'});

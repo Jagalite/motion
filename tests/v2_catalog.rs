@@ -1991,20 +1991,143 @@ async fn restricted_source_manager_controls_demands_without_owning_shared_jobs()
 }
 
 #[tokio::test]
+async fn order_group_writer_rejects_foreign_editions_and_outside_scope() {
+    let f = Fixture::new().await;
+    f.item("visible", "Visible", &[(&f.a, "r-visible")]).await;
+    f.item("hidden", "Hidden", &[(&f.b, "r-hidden")]).await;
+    f.item(
+        "mixed",
+        "Mixed",
+        &[(&f.a, "r-mixed-a"), (&f.b, "r-mixed-b")],
+    )
+    .await;
+    let op = bearer(OPERATOR);
+    let device = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let reader = f.device(&["catalog:read"], &[&f.a]).await;
+    for (item, edition, auth, expected) in [
+        ("visible", "hidden-ed", op.as_str(), StatusCode::NOT_FOUND),
+        (
+            "hidden",
+            "hidden-ed",
+            device.as_str(),
+            StatusCode::NOT_FOUND,
+        ),
+        ("mixed", "mixed-ed", device.as_str(), StatusCode::FORBIDDEN),
+        (
+            "visible",
+            "visible-ed",
+            reader.as_str(),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let current = f
+            .call(
+                "GET",
+                &format!("/api/v2/catalog/items/{item}"),
+                None,
+                &[("authorization", &op)],
+            )
+            .await;
+        let result = f
+            .call(
+                "POST",
+                &format!("/api/v2/catalog/items/{item}/order-groups"),
+                Some(json!({"edition_id":edition,"name":"Release","kind":"custom"})),
+                &[
+                    ("authorization", auth),
+                    ("if-match", current.headers["etag"].to_str().unwrap()),
+                    ("idempotency-key", "scope-order-group-01"),
+                ],
+            )
+            .await;
+        assert_eq!(result.status, expected, "{}", result.body);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM order_groups")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn public_timeline_order_writer_drives_next_resolver() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
     f.item("ordered", "Ordered", &[(&f.a, "r1")]).await;
-    // Group provisioning is an existing service; timeline placement below uses
-    // the public writer, never an injected order_position.
-    let group = playscale::curation::create_order_group(
-        &f.app,
-        "ordered-ed",
-        "Release",
-        playscale::curation::OrderKind::Custom,
-    )
-    .await
-    .unwrap();
+    f.item("retired-order", "Retired", &[]).await;
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('order-alias','catalog:merge',0,'{}')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_aliases VALUES ('retired-order','ordered','order-alias')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    let item = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/ordered",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    let input = json!({"edition_id":"ordered-ed","name":"Release","kind":"custom"});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("if-match", item.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "ordered-group-0001"),
+    ];
+    let created = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/retired-order/order-groups",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/ordered/order-groups",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{}", replay.body);
+    assert_eq!(replay.body, created.body);
+    assert_eq!(created.body["item_id"], "ordered");
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let stale = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/ordered/order-groups",
+            Some(input),
+            &[
+                ("authorization", &op),
+                ("if-match", item.headers["etag"].to_str().unwrap()),
+                ("idempotency-key", "ordered-group-0002"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{}",
+        stale.body
+    );
+    let groups = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/ordered/order-groups",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(groups.status, StatusCode::OK, "{}", groups.body);
+    assert_eq!(groups.body["items"], json!([created.body]));
+    let group = created.body["id"].as_str().unwrap().to_owned();
     let mut ids = Vec::new();
     for position in [1, 2] {
         let item = f
@@ -2044,6 +2167,135 @@ async fn public_timeline_order_writer_drives_next_resolver() {
         .await;
     assert_eq!(end.status, StatusCode::OK, "{}", end.body);
     assert_eq!(end.body["items"], json!([]));
+}
+
+#[tokio::test]
+async fn existing_playable_timeline_order_is_fenced_scoped_and_preserves_identity() {
+    let f = Fixture::new().await;
+    f.item("first", "First", &[(&f.a, "r1")]).await;
+    f.item("second", "Second", &[(&f.a, "r2")]).await;
+    f.item("hidden", "Hidden", &[(&f.b, "r3")]).await;
+    // As after a reviewed work merge, two editions retain their playable
+    // timeline identities under one work. Generic relationships are not the
+    // canonical series/season ancestry used by ordering.
+    sqlx::query("UPDATE editions SET item_id='first' WHERE id='second-ed'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO order_groups(id,edition_id,name,kind) VALUES ('visible-order','first-ed','Release','custom'),('hidden-order','hidden-ed','Private','custom')")
+        .execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,position_ms,revision,updated_at) VALUES ('default','first-ed',1234,7,1)")
+        .execute(&f.app.db).await.unwrap();
+    let operator = bearer(OPERATOR);
+    let scoped = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let input = |group: &str, position, revision: &str| json!({"order_group_id":group,"order_position":position,"expected_group_revision":revision});
+    let first = "/api/v2/catalog/timelines/first-ed/order";
+    let second = "/api/v2/catalog/timelines/second-ed/order";
+    let placed = f
+        .call(
+            "PUT",
+            first,
+            Some(input("visible-order", 1, "1")),
+            &[("authorization", &scoped), ("if-match", "\"r-2\"")],
+        )
+        .await;
+    assert_eq!(placed.status, StatusCode::OK, "{}", placed.body);
+    assert_eq!(placed.body["revision"], "3");
+    assert_eq!(placed.body["version_ids"], json!(["first-f0"]));
+    let placed = f
+        .call(
+            "PUT",
+            second,
+            Some(input("visible-order", 2, "2")),
+            &[("authorization", &scoped), ("if-match", "\"r-2\"")],
+        )
+        .await;
+    assert_eq!(placed.status, StatusCode::OK, "{}", placed.body);
+    let next = f
+        .call(
+            "GET",
+            "/api/v2/profiles/default/timelines/first-ed/next",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+    assert_eq!(next.body["items"][0]["id"], "second-ed");
+    assert_eq!(next.body["items"][0]["version_ids"], json!(["second-f0"]));
+    for (tag, group_revision, position, expected) in [
+        ("\"r-2\"", "3", 3, StatusCode::PRECONDITION_FAILED),
+        ("\"r-3\"", "2", 3, StatusCode::CONFLICT),
+        ("\"r-3\"", "3", 2, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let rejected = f
+            .call(
+                "PUT",
+                first,
+                Some(input("visible-order", position, group_revision)),
+                &[("authorization", &scoped), ("if-match", tag)],
+            )
+            .await;
+        assert_eq!(rejected.status, expected, "{}", rejected.body);
+    }
+    let revisions: (i64,i64) = sqlx::query_as("SELECT t.revision,g.revision FROM timelines t,order_groups g WHERE t.id='first-ed' AND g.id='visible-order'").fetch_one(&f.app.db).await.unwrap();
+    assert_eq!(revisions, (3, 3));
+    let denied = f
+        .call(
+            "PUT",
+            first,
+            Some(input("hidden-order", 1, "1")),
+            &[("authorization", &scoped), ("if-match", "\"r-3\"")],
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::NOT_FOUND);
+    let unrelated = f
+        .call(
+            "PUT",
+            first,
+            Some(input("hidden-order", 1, "1")),
+            &[("authorization", &operator), ("if-match", "\"r-3\"")],
+        )
+        .await;
+    assert_eq!(unrelated.status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Seed a retained previous membership that is no longer in caller scope.
+    // This is a conservative authorization fixture, not a successful hierarchy
+    // mutation: even a legacy membership must not authorize hidden-group writes.
+    sqlx::query("UPDATE timelines SET order_group_id='hidden-order',order_position=1,revision=revision+1 WHERE id='first-ed'")
+        .execute(&f.app.db).await.unwrap();
+    // Destination and timeline are visible, but leaving the previous hidden
+    // group would mutate authority outside this device's scope.
+    let denied = f
+        .call(
+            "PUT",
+            first,
+            Some(input("visible-order", 1, "3")),
+            &[("authorization", &scoped), ("if-match", "\"r-4\"")],
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::NOT_FOUND);
+    let groups: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id,revision FROM order_groups ORDER BY id")
+            .fetch_all(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        groups,
+        vec![("hidden-order".into(), 1), ("visible-order".into(), 3)]
+    );
+    let history: (i64, i64) = sqlx::query_as(
+        "SELECT position_ms,revision FROM timeline_viewing WHERE timeline_id='first-ed'",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(history, (1234, 7));
+    let binding: (String, String) = sqlx::query_as(
+        "SELECT file_id,file_revision FROM version_files WHERE version_id='first-f0'",
+    )
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(binding, ("first-f0".into(), "r1".into()));
 }
 
 #[tokio::test]

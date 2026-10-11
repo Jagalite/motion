@@ -4048,6 +4048,187 @@
         }
       }
     },
+    "/api/v2/catalog/items/{item_id}/order-groups": {
+      "parameters": [
+        {
+          "name": "item_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "listItemOrderGroups",
+        "summary": "List item order groups",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "List item order groups.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderGroupPage"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "catalog:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ]
+      },
+      "post": {
+        "operationId": "createOrderGroup",
+        "summary": "Create an order group under the item aggregate ETag",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "Create an order group under the item aggregate ETag.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderGroup"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          }
+        },
+        "x-required-permission": "catalog:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderGroupInput"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v2/catalog/relationships/{relationship_id}": {
       "parameters": [
         {
@@ -4264,6 +4445,113 @@
           }
         },
         "x-required-permission": "catalog:read"
+      }
+    },
+    "/api/v2/catalog/timelines/{timeline_id}/order": {
+      "parameters": [
+        {
+          "name": "timeline_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "placeTimelineInOrder",
+        "summary": "Place an existing playable timeline in an explicit order",
+        "description": "Fences the timeline with If-Match and the destination group with expected_group_revision. The caller must be authorized for the timeline, destination group owner and any previous group owner. Preserves media bindings and viewing history. Returns the updated timeline ETag; read listOrderGroups for resulting group revisions. A stale retry fails its precondition rather than replaying a prior response.",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M3",
+        "x-status": "implementation_target",
+        "x-required-permission": "catalog:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "order_group_id",
+                  "order_position",
+                  "expected_group_revision"
+                ],
+                "properties": {
+                  "order_group_id": {
+                    "$ref": "#/components/schemas/Id"
+                  },
+                  "order_position": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  },
+                  "expected_group_revision": {
+                    "$ref": "#/components/schemas/Revision"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated timeline; media bindings and history identity preserved.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Timeline"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        }
       }
     },
     "/api/v2/catalog/timelines/{timeline_id}/versions": {
@@ -15251,6 +15539,74 @@
           "order_position"
         ]
       },
+      "OrderGroupInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "edition_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "aired",
+              "dvd",
+              "absolute",
+              "custom"
+            ]
+          }
+        },
+        "required": [
+          "edition_id",
+          "name",
+          "kind"
+        ]
+      },
+      "OrderGroup": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "item_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "edition_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "aired",
+              "dvd",
+              "absolute",
+              "custom"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "item_id",
+          "edition_id",
+          "name",
+          "kind"
+        ]
+      },
       "TimelineInput": {
         "type": "object",
         "additionalProperties": false,
@@ -17486,6 +17842,81 @@
           "qualification"
         ]
       },
+      "VideoProfile": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "version": {
+            "type": "integer",
+            "const": 1
+          },
+          "codec": {
+            "type": "string",
+            "enum": [
+              "h264",
+              "hevc"
+            ]
+          },
+          "max_width": {
+            "type": "integer",
+            "minimum": 128,
+            "maximum": 3840,
+            "multipleOf": 2
+          },
+          "max_height": {
+            "type": "integer",
+            "minimum": 72,
+            "maximum": 2160,
+            "multipleOf": 2
+          },
+          "video_bitrate": {
+            "type": "integer",
+            "minimum": 64000,
+            "maximum": 80000000
+          },
+          "audio_bitrate": {
+            "type": "integer",
+            "minimum": 32000,
+            "maximum": 320000
+          },
+          "frame_rate": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "numerator": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120000
+                  },
+                  "denominator": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100000
+                  }
+                },
+                "required": [
+                  "numerator",
+                  "denominator"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null preserves cadence; a rational must be 1 through 120 frames per second and allow at least half a frame in the source duration."
+          }
+        },
+        "required": [
+          "version",
+          "codec",
+          "max_width",
+          "max_height",
+          "video_bitrate",
+          "audio_bitrate"
+        ]
+      },
       "PreparationInput": {
         "type": "object",
         "additionalProperties": false,
@@ -17498,6 +17929,26 @@
           },
           "recipe_id": {
             "$ref": "#/components/schemas/Id"
+          },
+          "backend": {
+            "type": "string",
+            "enum": [
+              "software",
+              "videotoolbox"
+            ],
+            "default": "software",
+            "description": "Select a listed recipe backend. Availability is not qualification; hardware failure does not fall back to software."
+          },
+          "video_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VideoProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required exactly when recipe_id is video_profile. All values are included in the immutable preparation digest."
           },
           "tracks": {
             "$ref": "#/components/schemas/TrackSelection"
@@ -19128,6 +19579,42 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Timeline"
+            },
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "event_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "read_revision",
+          "event_cursor"
+        ],
+        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
+      },
+      "OrderGroupPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderGroup"
             },
             "maxItems": 200
           },

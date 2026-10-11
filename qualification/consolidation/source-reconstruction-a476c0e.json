@@ -1,0 +1,118 @@
+{
+  "run_url": "https://github.com/Jagalite/motion/actions/runs/38147820272",
+  "job_url": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767784",
+  "log_sha256": "2845d621a3fd0c305a2f4bf38e4a549fff12d4885a49f23e7ef9ba9c27632d5c",
+  "source_reconstruction": {
+    "schema": 1,
+    "source_archive_sha256": "8501fcda79d9a3c8044c659f2c9d0203955de064c9e565075914e68b200699f5",
+    "manifest_sha256": "ff068ff46857f5252a08b1b2ee765f538056e4d95c480c31a0152a6ab1e865ae",
+    "source_commit": "a476c0e0bec0cf8a2ab1fcdbc141fa5cc27074ff",
+    "source_dirty": false,
+    "status": "passed",
+    "command": [
+      "python3",
+      "motion/scripts/package_app.py",
+      "--source-manifest",
+      "original/motion-package.json",
+      "--output",
+      "reconstructed",
+      "--cache",
+      "inputs",
+      "--media-tools",
+      "media-tools",
+      "--jobs",
+      "2"
+    ],
+    "reconstructed_manifest_sha256": "e18356e51b352843d18fbd23b1f41e56e9b9d017da65bb5ab72390243d51be54",
+    "package_sha256": "a2c84cc5859fe2934f8ae22863f4fb3e55ba44e0de032d4d190444ab796c3ea1",
+    "provider_identity": "sha256:4d968b37420bc8d32072e2ca553dd1a09fcbb5a841b4de51314513c42d0c334a",
+    "products": [
+      "motion-server",
+      "motion-ui-host",
+      "Go CLI/TUI",
+      "Electron",
+      "FFmpeg/FFprobe",
+      "Demuxe/Shaka derivative"
+    ],
+    "installed_receipt_sha256": "34f4221d799b487cbf8d312dab984ef8d12d6e8c304a2acf4d8f4e8d9b8e7968"
+  },
+  "installed_packages": [
+    {
+      "checks": [
+        "app_signature",
+        "bundled_go_cli",
+        "archive_privacy",
+        "binary_privacy",
+        "archive_inventory",
+        "relocated_bundle_defaults",
+        "bundled_encoding_and_probe",
+        "restricted_default_refuses_anonymous_catalog",
+        "server_scan_with_bundled_ffprobe",
+        "media_bytes_and_ranges",
+        "npm_demuxe_served",
+        "server_transcode_with_bundled_ffmpeg",
+        "restart_retains_progress"
+      ],
+      "archive_sha256": "a2c84cc5859fe2934f8ae22863f4fb3e55ba44e0de032d4d190444ab796c3ea1",
+      "port": 49357,
+      "pid": 75009,
+      "app": "Relocated Motion With Spaces",
+      "item_id": "42469fc7-8d9d-428e-9d4d-13b98ac2fa83",
+      "media_url": "/api/v2/media/files/6c8f94e9-3cb2-412f-91c5-6fd5c0bae8c3/content?revision=51bd9488ae65d6f5d05d4a630225e48cfbcc7241df0dcc31e68d05f78d2ce40e",
+      "processing_job": {
+        "attempt_generation": "1",
+        "error_code": null,
+        "id": "1543cdaa-0b10-4d28-973a-97c7599e1c71",
+        "kind": "rendition",
+        "phase": "completed",
+        "progress": null,
+        "requester_id": "operator",
+        "result_ids": [
+          "7aff2afe-5484-4879-ac3f-87700a6f4935"
+        ],
+        "revision": "5"
+      },
+      "path": "/nonexistent-motion-test-path",
+      "browser": "not yet run"
+    },
+    {
+      "checks": [
+        "app_signature",
+        "bundled_go_cli",
+        "archive_privacy",
+        "binary_privacy",
+        "archive_inventory",
+        "relocated_bundle_defaults",
+        "bundled_encoding_and_probe",
+        "restricted_default_refuses_anonymous_catalog",
+        "server_scan_with_bundled_ffprobe",
+        "media_bytes_and_ranges",
+        "npm_demuxe_served",
+        "server_transcode_with_bundled_ffmpeg",
+        "restart_retains_progress"
+      ],
+      "archive_sha256": "2e8b65d417e6750380726769ceda8dd604568efafbe91b4212198e4bbde7aacc",
+      "port": 49388,
+      "pid": 75596,
+      "app": "Relocated Motion With Spaces",
+      "item_id": "02eeb6a7-05ce-44b8-85ad-559c00363d8d",
+      "media_url": "/api/v2/media/files/5ada350a-a447-432f-b2d2-0491cdd5106f/content?revision=51bd9488ae65d6f5d05d4a630225e48cfbcc7241df0dcc31e68d05f78d2ce40e",
+      "processing_job": {
+        "attempt_generation": "1",
+        "error_code": null,
+        "id": "b1ae29a5-6dde-4df2-99d0-045853421839",
+        "kind": "rendition",
+        "phase": "completed",
+        "progress": null,
+        "requester_id": "operator",
+        "result_ids": [
+          "594d2afc-e86a-4c0d-a5b0-ed0d8aa760ab"
+        ],
+        "revision": "5"
+      },
+      "path": "/nonexistent-motion-test-path",
+      "browser": "not yet run"
+    }
+  ],
+  "scope": "Complete outside-Git reconstruction and package checks at recorded source; later ordering changes need their own exact-head gate."
+}

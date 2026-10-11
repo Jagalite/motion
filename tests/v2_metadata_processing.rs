@@ -2022,3 +2022,89 @@ async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
     );
     assert_eq!(rejected.body["code"], "preparation_video_unsupported");
 }
+
+#[tokio::test]
+async fn parameterized_preparation_persists_profile_and_fences_changed_inputs() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let tracks = json!([{"index":0,"kind":"video","codec":"h264","width":640,"height":360,"color_transfer":"bt709"}]);
+    sqlx::query("UPDATE media_files SET duration_seconds=10,tracks_json=? WHERE id='file-a'")
+        .bind(tracks.to_string())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let profile = json!({"version":1,"codec":"h264","max_width":320,"max_height":180,"video_bitrate":500000,"audio_bitrate":96000,"frame_rate":{"numerator":30,"denominator":1}});
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"video_profile","backend":"software","video_profile":profile,"tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "profile-preparation-0001"),
+    ];
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let row: (String, String, String) =
+        sqlx::query_as("SELECT recipe,backend,video_profile FROM processing_jobs WHERE id=?")
+            .bind(first.body["id"].as_str().unwrap())
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "video_profile");
+    assert_eq!(row.1, "software");
+    assert_eq!(serde_json::from_str::<Value>(&row.2).unwrap(), profile);
+    let mut changed = input.clone();
+    changed["video_profile"]["max_width"] = json!(640);
+    let conflict = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(changed),
+            &headers,
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT, "{}", conflict.body);
+    for (field, value) in [
+        ("video_profile", Value::Null),
+        ("backend", json!("automatic")),
+    ] {
+        let mut invalid = input.clone();
+        invalid[field] = value;
+        let result = f
+            .call(
+                "POST",
+                "/api/v2/processing/preparations",
+                Some(invalid),
+                &[
+                    ("authorization", &op),
+                    ("idempotency-key", "invalid-profile-0001"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            result.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            result.body
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM preparations")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}

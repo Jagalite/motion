@@ -1,3 +1,6 @@
+#[path = "support/service_router.rs"]
+mod service_router;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -96,7 +99,12 @@ impl Fixture {
         for (k, v) in headers {
             request = request.header(*k, *v);
         }
-        api::router(self.app.clone(), None)
+        let router = if path.starts_with("/api/v2/") {
+            api::router(self.app.clone(), None)
+        } else {
+            service_router::router(self.app.clone())
+        };
+        router
             .oneshot(
                 request
                     .body(
@@ -186,6 +194,99 @@ async fn catalog_moves_replacements_progress_and_missing_sources() {
         .await
         .unwrap();
     assert_eq!(position, 12.5);
+}
+
+async fn v2_media_response(
+    f: &Fixture,
+    method: &str,
+    path: &str,
+    _body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "127.0.0.1:8787")
+        .header("authorization", "Bearer test-secret-token");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    api::router(f.app.clone(), None)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn v2_byte_ranges_validators_empty_files_and_permit_cleanup() {
+    let f = Fixture::new().await;
+    std::fs::write(f.root.join("one.mp4"), b"0123456789").unwrap();
+    std::fs::write(f.root.join("zero.mp4"), b"").unwrap();
+    f.scan().await;
+    let files: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id,revision,relative_path FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.app.db)
+            .await
+            .unwrap();
+    let url_for = |name: &str| {
+        let (id, revision, _) = files.iter().find(|(_, _, path)| path == name).unwrap();
+        format!("/api/v2/media/files/{id}/content?revision={revision}")
+    };
+    let url = url_for("one.mp4");
+    let url = url.as_str();
+    let response = v2_media_response(&f, "GET", url, None, &[]).await;
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    drop(response);
+    for (method, range, status, expected) in [
+        ("GET", "bytes=0-3", 206, "0123"),
+        ("GET", "bytes=-3", 206, "789"),
+        ("GET", "bytes=4-99", 206, "456789"),
+        ("GET", "bytes=4-", 206, "456789"),
+        ("GET", "bytes=99-", 416, ""),
+        ("GET", "bytes=0-1,4-5", 200, "0123456789"),
+        ("HEAD", "bytes=0-3", 200, ""),
+    ] {
+        let r = v2_media_response(&f, method, url, None, &[("range", range)]).await;
+        assert_eq!(r.status().as_u16(), status);
+        assert_eq!(
+            &r.into_body().collect().await.unwrap().to_bytes()[..],
+            expected.as_bytes()
+        );
+    }
+    for (header, value, status) in [
+        ("if-range", "\"old\"", 200),
+        ("if-range", etag.as_str(), 206),
+        ("if-none-match", etag.as_str(), 304),
+        ("if-match", "\"old\"", 412),
+    ] {
+        let r = v2_media_response(
+            &f,
+            "GET",
+            url,
+            None,
+            &[("range", "bytes=0-3"), (header, value)],
+        )
+        .await;
+        assert_eq!(r.status().as_u16(), status);
+        drop(r);
+    }
+    let zero = url_for("zero.mp4");
+    let zero = zero.as_str();
+    let r = v2_media_response(&f, "GET", zero, None, &[("range", "bytes=0-3")]).await;
+    assert_eq!(r.status(), 416);
+    assert_eq!(r.headers()["content-range"], "bytes */0");
+    drop(r);
+    assert_eq!(f.app.streams.available_permits(), 2);
+    let a = v2_media_response(&f, "GET", url, None, &[]).await;
+    let b = v2_media_response(&f, "GET", url, None, &[]).await;
+    assert_eq!(f.app.streams.available_permits(), 0);
+    assert_eq!(
+        v2_media_response(&f, "GET", url, None, &[]).await.status(),
+        503
+    );
+    drop(a);
+    drop(b);
+    assert_eq!(f.app.streams.available_permits(), 2);
 }
 
 #[tokio::test]
@@ -405,7 +506,7 @@ async fn boundary_contract_and_paths_are_private() {
     let response = api::router(f.app.clone(), None)
         .oneshot(
             Request::builder()
-                .uri("/api/v1/items")
+                .uri("/api/v2/catalog/items")
                 .header("host", "evil.invalid")
                 .body(Body::empty())
                 .unwrap(),
@@ -416,7 +517,7 @@ async fn boundary_contract_and_paths_are_private() {
     assert_eq!(
         f.response(
             "POST",
-            "/api/v1/libraries",
+            "/api/v2/libraries",
             Some(json!({"name":"x","root":"/tmp"})),
             &[
                 ("origin", "https://evil.invalid"),
@@ -427,22 +528,24 @@ async fn boundary_contract_and_paths_are_private() {
         .status(),
         403
     );
-    let (_, libs) = f.json("GET", "/api/v1/libraries", None, false).await;
+    let (_, libs) = f.json("GET", "/api/v2/libraries", None, true).await;
     assert!(!libs.to_string().contains(f.root.to_str().unwrap()));
     assert_eq!(
-        f.json("GET", "/api/v1/items?limit=0", None, false).await.0,
+        f.json("GET", "/api/v2/catalog/items?limit=0", None, true)
+            .await
+            .0,
         400
     );
-    let (_, spec) = f.json("GET", "/api/v1/openapi.json", None, false).await;
+    let (_, spec) = f.json("GET", "/api/v2/openapi.json", None, true).await;
     for path in [
-        "/api/v1/items",
-        "/api/v1/items/{id}/metadata/{source}",
-        "/api/v1/items/{id}/renditions/{source}/{external_id}",
-        "/media/{id}",
+        "/api/v2/catalog/items",
+        "/api/v2/catalog/items/{item_id}/metadata/contributions/{source_name}",
+        "/api/v2/processing/preparations",
+        "/api/v2/media/files/{file_id}/content",
     ] {
         assert!(spec["paths"][path].is_object(), "{path}");
     }
-    assert!(spec["components"]["securitySchemes"]["admin_token"].is_object());
+    assert!(spec["components"]["securitySchemes"]["bearerAuth"].is_object());
 }
 
 #[cfg(unix)]
@@ -803,7 +906,7 @@ async fn upload_art(
     if auth {
         request = request.header("authorization", "Bearer test-secret-token");
     }
-    api::router(f.app.clone(), None)
+    service_router::router(f.app.clone())
         .oneshot(request.body(Body::from(bytes)).unwrap())
         .await
         .unwrap()

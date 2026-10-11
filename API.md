@@ -1,3 +1,5 @@
+> Historical documentation: these v1 routes are retired. Use the [v2 contract](contracts/Motion_Server_API_v2.yaml) and [cutover guidance](MOTION_V2_CUTOVER.md).
+
 # Playscale core API
 
 Versioned JSON routes live under `/api/v1`; `/api/v1/openapi.json` is generated with

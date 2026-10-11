@@ -1,7 +1,7 @@
 """Real-process HTTP acceptance test. Generated media, disposable databases, no user library."""
 import hashlib,http.client,json,os,pathlib,signal,socket,subprocess,tempfile,time
 ROOT=pathlib.Path(__file__).resolve().parents[1]
-BINARY=ROOT/'target/debug/playscale'
+BINARY=pathlib.Path(os.environ.get('MOTION_SERVER_BINARY',ROOT/'target/debug/playscale')).resolve()
 
 def free_port():
     with socket.socket() as s:s.bind(('127.0.0.1',0));return s.getsockname()[1]

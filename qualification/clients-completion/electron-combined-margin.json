@@ -1,0 +1,209 @@
+{
+  "scope": "Existing Electron workflow; latest combined playback and margin; failed conversion-only startup",
+  "server": {
+    "binary": "playscale-ad67fa0",
+    "sha256": "8d8ece2350f0f0e7ac91b9fe6c2a641b24186ebed33024aaf34f8f40801a99ba",
+    "source_commit": "ad67fa0"
+  },
+  "harness_source": {
+    "role": "harness-worktree",
+    "commit": "6b15fb6b9cd01cc0fd62ed635caf34e41d0ae4d4",
+    "dirty": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "demuxe": {
+    "version": "1.1.1",
+    "archive_sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274",
+    "deployment": "composed-providers",
+    "providers": [
+      {
+        "name": "@demuxe/provider-shaka",
+        "version": "1.1.1",
+        "archive_sha256": "c77762ea95c667bd4b78fc640ace658f6fc17aa48847df50e336d9495c9e1471"
+      }
+    ],
+    "composer_sha256": "b86066b90a41eccdc4528c7843043f388448217bb67ff23c8974b781b6e16451",
+    "receipt_sha256": "f48783ba7d7b16c6c56f9fa6662a8a1e71d9f651aea77da074315ef9f63f484e",
+    "manifest_sha256": "485f333a86b587d402f79a9d54fef3e098855786471047fd50dbbfbdc32ea574"
+  },
+  "receipt_sha256": "aadeda7cc71a2d135575964d6840ecf1c63b90964928f478c05ed517126e0c0e",
+  "engine": {
+    "electron": "44.7.0",
+    "chromium": "152.0.7977.130"
+  },
+  "checks": [
+    {
+      "name": "browser session from paired credential",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "item page shows viewing state and Play",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "original plan selects byte-range original",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "player ready",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "original playback advances",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "original bytes served by range",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "seek replaces the generation at 40 s",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "seek staged and activated generation 2",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "progress persisted on the server",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "ordered viewing events accepted with consecutive sequences",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "item page offers Resume at the saved position",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "resume starts at the saved position",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "audio selector lists both tracks of the planned version",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "audio switch replans to a live HLS conversion",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "HLS manifest, variant, init and segments served",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "audio switch replaces the player over HLS and keeps position",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "an event sent during the outage is queued in the durable outbox",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "the queued event is accepted after restart with its original identity",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "after restart the player reopens at durable progress",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "after restart the cookie session authorizes playback",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "a prepared rendition is produced by a real v2 preparation",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "Convert plans the prepared rendition by byte range",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "the predecessor delivery is retired after the switch",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "progress continues on the rebound session",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "leaving the player retires its own delivery",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "home continue watching matches server viewing state",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+      "status": "pass",
+      "detail": null
+    },
+    {
+      "name": "converted title plays in the Motion player",
+      "status": "fail",
+      "detail": {
+        "legacyReady": {
+          "state": "failed",
+          "text": "Playback could not start: Requested generation position is outside the live window. (Playback is blocked: all_candidates_failed)"
+        },
+        "legacyPlay": {
+          "advancing": false,
+          "reason": "no player"
+        }
+      }
+    },
+    {
+      "name": "diagnostic: server live HLS conversion in a plain video element",
+      "status": "diagnostic-fail",
+      "detail": {
+        "plan": "hls",
+        "admitted": 201,
+        "played": false,
+        "currentTime": 0,
+        "width": 640,
+        "height": 360,
+        "error": "PipelineStatus::DEMUXER_ERROR_COULD_NOT_PARSE"
+      }
+    },
+    {
+      "name": "candidate setup and browser traffic use v2",
+      "status": "pass",
+      "detail": null
+    }
+  ],
+  "qualified": false
+}

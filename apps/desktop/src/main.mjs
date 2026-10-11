@@ -2,15 +2,22 @@ import {app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage} from
 import {readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
-import {join, resolve} from 'node:path';
+import {isAbsolute, join, resolve} from 'node:path';
 import {createOwnedServer} from './owned.mjs';
 import {createOutboxStore} from './outbox.mjs';
 import {restoreViewing} from './recovery.mjs';
 import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities, boundedJson} from './policy.mjs';
 
+if (app.isPackaged) app.setName('Motion');
+const explicitUserData = app.commandLine.getSwitchValue('user-data-dir');
+if (explicitUserData) {
+  if (!isAbsolute(explicitUserData)) throw new Error('The user-data-dir path must be absolute');
+  app.setPath('userData', explicitUserData);
+}
+
 const chromeUrl = new URL('./chrome.html', import.meta.url).href;
-const contractDigest = `sha256:${createHash('sha256').update(readFileSync(new URL('../../../contracts/Motion_Server_API_v2.yaml', import.meta.url))).digest('hex')}`;
+const contractDigest = `sha256:${createHash('sha256').update(readFileSync(app.isPackaged ? join(process.resourcesPath, 'contracts', 'Motion_Server_API_v2.yaml') : new URL('../../../contracts/Motion_Server_API_v2.yaml', import.meta.url))).digest('hex')}`;
 let window;
 let content;
 let selectedSession;
@@ -138,7 +145,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
     const credential = input.credential || readCredential(selected);
     if (credential.length < 32) throw new Error('A paired device credential is required');
     const browserSession = await request('/api/v2/auth/session', {method: 'POST',
-      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({kind: 'credential', credential})});
+      headers: {'Content-Type': 'application/json', Origin: selected.origin}, body: JSON.stringify({kind: 'credential', credential})});
     if (!browserSession?.principal?.id || !browserSession.csrf_token) throw new Error('Invalid browser session');
     verifyCapabilities(await request('/api/v2/system/capabilities'), selected, serverEpoch, contractDigest);
     if (!current()) throw new Error('Connection changed');
@@ -185,9 +192,9 @@ function openDownloads() {
     await detach();
     if (owner !== epoch) throw new Error('Offline startup cancelled');
     offlineHost ??= createOwnedServer({presentationOnly: true,
-      executable: app.isPackaged ? join(process.resourcesPath, 'bin', 'motion-ui-host') : resolve(process.env.MOTION_UI_HOST_BINARY || fileURLToPath(new URL('../../../target/debug/motion-ui-host', import.meta.url))),
+      executable: app.isPackaged ? join(process.resourcesPath, 'motion-ui-host') : resolve(process.env.MOTION_UI_HOST_BINARY || fileURLToPath(new URL('../../../target/debug/motion-ui-host', import.meta.url))),
       dataDir: app.isPackaged ? join(app.getPath('userData'), 'offline-cache') : resolve(process.env.MOTION_CACHE_DIR || join(app.getPath('userData'), 'offline-cache')),
-      demuxeDir: app.isPackaged ? join(process.resourcesPath, 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
+      demuxeDir: app.isPackaged ? join(process.resourcesPath, 'assets', 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
     });
     return attachOwnedServer(offlineHost, () => owner === epoch, async local => {
       const ses = session.fromPartition(`motion-offline-${local.helperEpoch}`, {cache: false});
@@ -252,9 +259,9 @@ else {
         await detach();
         if (owner !== epoch) throw new Error('Local startup cancelled');
         ownedServer ??= createOwnedServer({
-          executable: app.isPackaged ? join(process.resourcesPath, 'bin', 'motion-server') : resolve(process.env.MOTION_SERVER_BINARY || fileURLToPath(new URL('../../../target/debug/playscale', import.meta.url))),
+          executable: app.isPackaged ? join(process.resourcesPath, 'motion-server') : resolve(process.env.MOTION_SERVER_BINARY || fileURLToPath(new URL('../../../target/debug/playscale', import.meta.url))),
           dataDir: join(app.getPath('userData'), 'server'),
-          demuxeDir: app.isPackaged ? join(process.resourcesPath, 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
+          demuxeDir: app.isPackaged ? join(process.resourcesPath, 'assets', 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
           contractDigest,
         });
         if (ownedServer.running) throw new Error('The local server is already running. Disconnecting does not stop it; use Stop local server before restarting.');

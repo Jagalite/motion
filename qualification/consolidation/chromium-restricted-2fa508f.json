@@ -1,0 +1,328 @@
+{
+  "kind": "installed-chromium-restricted-playback",
+  "source_commit": "2fa508f528ffc95a8ed52576190c60995d005569",
+  "server_sha256": "5b8dde0eaba4894b4d5adbd09e5dc95e74fcad6d0e18c679364d0f7209b72062",
+  "provider_identity": "sha256:4d968b37420bc8d32072e2ca553dd1a09fcbb5a841b4de51314513c42d0c334a",
+  "permissions": [
+    "catalog:read",
+    "playback:request",
+    "events:read"
+  ],
+  "noHistory": {
+    "canSave": "false",
+    "canonical": {
+      "manual_epoch": "0",
+      "manual_watched": null,
+      "position_ms": 53265,
+      "profile_id": "default",
+      "revision": "58",
+      "session_id": "64a7356d-9fb9-4024-a6c5-9c47d4e97944",
+      "timeline_id": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "watched": true
+    },
+    "errors": 0,
+    "historyWrites": 0,
+    "now": 53.341122,
+    "run": {
+      "before": {
+        "manual_epoch": "0",
+        "manual_watched": null,
+        "position_ms": 53265,
+        "profile_id": "default",
+        "revision": "58",
+        "session_id": "64a7356d-9fb9-4024-a6c5-9c47d4e97944",
+        "timeline_id": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+        "watched": true
+      },
+      "initial": 0,
+      "samples": [
+        {
+          "elapsed": 2.525484999999404,
+          "error": null,
+          "status": "playing",
+          "time": 2.344452,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 4.525280000001192,
+          "error": null,
+          "status": "playing",
+          "time": 4.200276,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 6.525560000002384,
+          "error": null,
+          "status": "playing",
+          "time": 6.324811,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 8.52380000000447,
+          "error": null,
+          "status": "playing",
+          "time": 8.450666,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 10.526105000004172,
+          "error": null,
+          "status": "playing",
+          "time": 10.309889,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 12.524340000003576,
+          "error": null,
+          "status": "playing",
+          "time": 12.434856,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 14.524405000001192,
+          "error": null,
+          "status": "playing",
+          "time": 14.296176,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 16.52477000000328,
+          "error": null,
+          "status": "playing",
+          "time": 16.41846,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 18.526155000001193,
+          "error": null,
+          "status": "playing",
+          "time": 18.277577,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 20.524015000000595,
+          "error": null,
+          "status": "playing",
+          "time": 20.40358,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 22.527320000000298,
+          "error": null,
+          "status": "playing",
+          "time": 22.262619,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 24.524609999999402,
+          "error": null,
+          "status": "playing",
+          "time": 24.38623,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 26.52565000000596,
+          "error": null,
+          "status": "playing",
+          "time": 26.249865,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 28.524785000003874,
+          "error": null,
+          "status": "playing",
+          "time": 28.376192,
+          "window": {
+            "end": 48,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 30.525135000005363,
+          "error": null,
+          "status": "playing",
+          "time": 30.231828,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 32.52470500000566,
+          "error": null,
+          "status": "playing",
+          "time": 32.355503,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 34.52499500000477,
+          "error": null,
+          "status": "playing",
+          "time": 34.215128,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 36.523560000002384,
+          "error": null,
+          "status": "playing",
+          "time": 36.344552,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 38.52395000000298,
+          "error": null,
+          "status": "playing",
+          "time": 38.199315,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 40.52329500000179,
+          "error": null,
+          "status": "playing",
+          "time": 40.324538,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 42.523565000005064,
+          "error": null,
+          "status": "playing",
+          "time": 42.454896,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 44.52281500000507,
+          "error": null,
+          "status": "playing",
+          "time": 44.30937,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 46.52505000000447,
+          "error": null,
+          "status": "playing",
+          "time": 46.434262,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 48.52552500000596,
+          "error": null,
+          "status": "playing",
+          "time": 48.296197,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 50.524375,
+          "error": null,
+          "status": "playing",
+          "time": 50.419405,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        },
+        {
+          "elapsed": 52.52396500000358,
+          "error": null,
+          "status": "playing",
+          "time": 52.277298,
+          "window": {
+            "end": 60,
+            "start": 0
+          }
+        }
+      ],
+      "started": 8747.984999999404,
+      "window": {
+        "end": 48,
+        "start": 0
+      }
+    },
+    "source": "http://127.0.0.1:53668/api/v2/streams/6cd93630-beb7-4391-baf3-d965986e8ba1/1/master.m3u8",
+    "status": "playing"
+  },
+  "revocation": {
+    "deleteStatus": 204,
+    "credentialAfter": 401,
+    "browser": {
+      "observedWithinMs": 5908.03,
+      "state": "failed",
+      "text": "Playback stopped: Authentication is required",
+      "playerPresent": false,
+      "heartbeatStatus": 401,
+      "controlStatus": 401
+    },
+    "outputDirectoryExists": false,
+    "ownedTranscodeProcessObserved": false
+  },
+  "result": "passed",
+  "limits": [
+    "Synthetic muted media; no physical A/V claim.",
+    "Built-in Chromium152; WebKit explicitly deferred."
+  ]
+}

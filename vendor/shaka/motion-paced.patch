@@ -1,0 +1,135 @@
+--- a/lib/media/presentation_timeline.js
++++ b/lib/media/presentation_timeline.js
+@@ -61,6 +61,9 @@
+      * @private {?number}
+      */
+     this.minSegmentStartTime_ = null;
++
++    /** @private {?{start: number, end: number}} */
++    this.explicitSegmentWindow_ = null;
+ 
+     /**
+      * The maximum segment end time (in seconds, in the presentation timeline)
+@@ -579,14 +582,26 @@
+ 
+ 
+   /**
+-   * Gets the presentation's current segment availability start time.  Segments
+-   * ending at or before this time should be assumed to be unavailable.
+-   *
+-   * @return {number} The current segment availability start time, in seconds,
+-   *   relative to the start of the presentation.
++   * Sets the retained segment bounds of a paced, on-demand presentation.
++   * @param {number} start
++   * @param {number} end
++   */
++  setExplicitSegmentWindow(start, end) {
++    goog.asserts.assert(Number.isFinite(start) && Number.isFinite(end),
++        'Explicit segment bounds must be finite');
++    // Empty intersections expose no seekable interval, never an older window.
++    this.explicitSegmentWindow_ = {start: Math.min(start, end), end};
++  }
++
++  /**
++   * Gets the presentation's current segment availability start time.
++   * @return {number}
+    * @export
+    */
+   getSegmentAvailabilityStart() {
++    if (this.explicitSegmentWindow_) {
++      return this.explicitSegmentWindow_.start;
++    }
+     goog.asserts.assert(this.segmentAvailabilityDuration_ >= 0,
+         'The availability duration should be positive');
+ 
+@@ -619,6 +634,9 @@
+    * @export
+    */
+   getSegmentAvailabilityEnd() {
++    if (this.explicitSegmentWindow_) {
++      return Math.min(this.explicitSegmentWindow_.end, this.duration_);
++    }
+     if (!this.isDynamic()) {
+       // It's a static manifest (can also be a dynamic->static conversion)
+       if (this.maxSegmentEndTime_) {
+@@ -649,6 +667,9 @@
+    * @export
+    */
+   getSafeSeekRangeStart(offset) {
++    if (this.explicitSegmentWindow_) {
++      return this.explicitSegmentWindow_.start;
++    }
+     // The earliest known segment time, ignoring segment availability duration.
+     const earliestSegmentTime =
+         Math.max(this.minSegmentStartTime_, this.userSeekStart_);
+@@ -700,6 +721,9 @@
+    * @export
+    */
+   getSeekRangeEnd() {
++    if (this.explicitSegmentWindow_) {
++      return Math.min(this.explicitSegmentWindow_.end, this.duration_);
++    }
+     const useDelay = this.isDynamic();
+     const delay = useDelay ? this.presentationDelay_ : 0;
+     return Math.max(0, this.getSegmentAvailabilityEnd() - delay);
+--- a/lib/util/player_configuration.js
++++ b/lib/util/player_configuration.js
+@@ -157,6 +157,7 @@
+         mediaPlaylistFullMimeType:
+             'video/mp2t; codecs="avc1.42E01E, mp4a.40.2"',
+         liveSegmentsDelay: 3,
++        motionPaced: false,
+         sequenceMode: false,
+         ignoreManifestTimestampsInSegmentsMode: false,
+         disableCodecGuessing: false,
+--- a/externs/shaka/player.js
++++ b/externs/shaka/player.js
+@@ -1569,6 +1569,7 @@
+  *   ignoreManifestProgramDateTimeForTypes: !Array<string>,
+  *   mediaPlaylistFullMimeType: string,
+  *   liveSegmentsDelay: number,
++ *   motionPaced: boolean,
+  *   sequenceMode: boolean,
+  *   ignoreManifestTimestampsInSegmentsMode: boolean,
+  *   disableCodecGuessing: boolean,
+--- a/lib/hls/hls_parser.js
++++ b/lib/hls/hls_parser.js
+@@ -1405,6 +1405,38 @@
+           const syncTime = firstReference.syncTime;
+           this.presentationTimeline_.setInitialProgramDateTime(syncTime);
+         }
++      }
++    }
++
++    // Motion paced conversions advance only when complete segments are published.
++    // Intersect the currently retained active audio/video indexes on every update;
++    // do not infer expiry or future segments from elapsed wall time.
++    if (this.config_.hls.motionPaced) {
++      let start = -Infinity;
++      let end = Infinity;
++      for (const info of this.uriToStreamInfosMap_.values()) {
++        if (!info.stream.segmentIndex ||
++            (info.type != 'audio' && info.type != 'video') ||
++            info.stream.isAudioMuxedInVideo) {
++          continue;
++        }
++        let first = Infinity;
++        let last = -Infinity;
++        info.stream.segmentIndex.forEachTopLevelReference((reference) => {
++          first = Math.min(first, reference.startTime);
++          last = Math.max(last, reference.endTime);
++        });
++        if (!Number.isFinite(first) || !Number.isFinite(last)) {
++          start = end = 0;
++          break;
++        }
++        start = Math.max(start, first);
++        end = Math.min(end, last);
++      }
++      if (Number.isFinite(start) && Number.isFinite(end)) {
++        this.presentationTimeline_.setExplicitSegmentWindow(start, end);
++      } else {
++        this.presentationTimeline_.setExplicitSegmentWindow(0, 0);
+       }
+     }
+ 

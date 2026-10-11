@@ -51,7 +51,7 @@ createServer(async (req, res) => {
     } else if (name === '/session-tests.js') {
       bytes = await readFile(path.join(root, 'scripts/demuxe_session_browser.js'));
     } else if (name === '/demuxe.js') {
-      bytes = await readFile(path.join(root, 'web/demuxe.js'));
+      bytes = await readFile(path.join(root, 'tests/fixtures/legacy-web/demuxe.js'));
     } else if (name.startsWith('/assets/demuxe/')) {
       if (name.endsWith('/demuxe-providers.json') && failManifest) {
         failManifest = false; res.writeHead(503).end(); return;

@@ -161,15 +161,7 @@ async fn run() -> anyhow::Result<()> {
             "Demuxe assets absent; run scripts/install_demuxe.py before browser playback"
         );
     }
-    let router = if cli.topcoat {
-        playscale::api::router_with(
-            app.clone(),
-            assets,
-            Some(playscale::presentation::router(app.clone())),
-        )
-    } else {
-        playscale::api::router(app.clone(), assets)
-    };
+    let router = playscale::api::router(app.clone(), assets);
     // Install the shutdown handlers before anything serves. Until a handler is
     // registered, SIGINT/SIGTERM still have their default action and would kill
     // a server that is already answering requests, skipping graceful shutdown.

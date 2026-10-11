@@ -1,0 +1,519 @@
+{
+  "kind": "diagnostic-not-qualification",
+  "server_source": "7339500a4993a737dde5089b0a8dbca5f4404b21",
+  "engine": "T3 built-in Chromium 152",
+  "failure": {
+    "resources": [
+      {
+        "duration": 3.4900000020861626,
+        "path": "/api/v2/playback/plans",
+        "status": 200
+      },
+      {
+        "duration": 7.244999997317791,
+        "path": "/api/v2/playback/delivery-sessions",
+        "status": 201
+      },
+      {
+        "duration": 1.4900000020861626,
+        "path": "/api/v2/playback/delivery-sessions/20ae474f-5edf-4cd6-8ec0-df19a0366861",
+        "status": 200
+      },
+      {
+        "duration": 2.3700000047683716,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/master.m3u8",
+        "status": 200
+      },
+      {
+        "duration": 1.5199999958276749,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/variants/main/index.m3u8",
+        "status": 200
+      },
+      {
+        "duration": 1.6499999985098839,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/variants/main/init.mp4",
+        "status": 200
+      },
+      {
+        "duration": 6.094999998807907,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/segments/6.m4s",
+        "status": 200
+      },
+      {
+        "duration": 4.700000002980232,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/segments/9.m4s",
+        "status": 200
+      },
+      {
+        "duration": 4.864999994635582,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/segments/3.m4s",
+        "status": 200
+      },
+      {
+        "duration": 3.244999997317791,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/segments/12.m4s",
+        "status": 200
+      },
+      {
+        "duration": 1.8350000008940697,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/variants/main/index.m3u8",
+        "status": 200
+      },
+      {
+        "duration": 2.1999999955296516,
+        "path": "/api/v2/streams/20ae474f-5edf-4cd6-8ec0-df19a0366861/1/variants/main/index.m3u8",
+        "status": 200
+      },
+      {
+        "duration": 2.2049999982118607,
+        "path": "/api/v2/playback/delivery-sessions/20ae474f-5edf-4cd6-8ec0-df19a0366861/heartbeat",
+        "status": 200
+      },
+      {
+        "duration": 20.035000003874302,
+        "path": "/api/v2/playback/delivery-sessions/20ae474f-5edf-4cd6-8ec0-df19a0366861",
+        "status": 204
+      },
+      {
+        "duration": 14.234999999403954,
+        "path": "/api/v2/playback/plans",
+        "status": 200
+      }
+    ],
+    "text": "Legacy Broadcast\n\nPlayback could not start: Native preparation evidence timed out (Playback is blocked: all_candidates_failed)\n\nPlayPauseMute / unmuteNext titlePosition in seconds SeekVersion \nAutomatic\nUnnamed version\nAudio \nDefault\nTrack 1 (ac3)\nQuality \nAutomatic\nOriginal\nConvert\nApply quality0:00\n\nBack to title"
+  },
+  "unmodified_retry": {
+    "text": "Skip to content\nMotion\nHome\nProfiles\nSearch the catalog\nProfile: Everyone\nLegacy Broadcast\nPlayPauseMute / unmuteNext titlePosition in seconds SeekVersion \nAutomatic\nUnnamed version\nAudio \nDefault\nTrack 1 (ac3)\nQuality \nAutomatic\nOriginal\nConvert\nApply quality0.0 / 0.0 seconds\n\nBack to title",
+    "trace": [
+      {
+        "type": "verify.sample",
+        "facts": {
+          "audio": {
+            "decodedBytes": 4791,
+            "enabledTrack": false,
+            "tracksPresent": false
+          },
+          "ended": false,
+          "frames": 5,
+          "now": 7940.429999999702,
+          "paused": true,
+          "readyState": 4,
+          "seeking": false,
+          "time": 44,
+          "videoWidth": 640
+        },
+        "result": {
+          "completed": true
+        },
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 11378.505000002682,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 0,
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "complete",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 4,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.finish",
+        "result": {},
+        "verification": null
+      },
+      {
+        "type": "verify.begin",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": false,
+            "video": false
+          },
+          "budget": 2000,
+          "deadline": 0,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "preflight",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 6,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.start",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 18024.054999999702,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 9477,
+          "initialFrames": 9,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "sampling",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 6,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.sample",
+        "facts": {
+          "audio": {
+            "decodedBytes": 9477,
+            "enabledTrack": false,
+            "tracksPresent": false
+          },
+          "ended": false,
+          "frames": 9,
+          "now": 8024.145000003278,
+          "paused": true,
+          "readyState": 4,
+          "seeking": false,
+          "time": 0,
+          "videoWidth": 640
+        },
+        "result": {
+          "completed": true
+        },
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 18024.054999999702,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 9477,
+          "initialFrames": 9,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "complete",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 6,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.finish",
+        "result": {},
+        "verification": null
+      }
+    ],
+    "samples": [
+      {
+        "audio": {
+          "decodedBytes": 0,
+          "enabledTrack": false,
+          "tracksPresent": false
+        },
+        "ended": false,
+        "frames": 0,
+        "now": 5939.030000001192,
+        "paused": true,
+        "readyState": 1,
+        "seeking": true,
+        "time": 44,
+        "videoWidth": 640
+      }
+    ]
+  },
+  "explicit_start_zero_instrumentation": {
+    "text": "Skip to content\nMotion\nHome\nProfiles\nSearch the catalog\nProfile: Everyone\nLegacy Broadcast\nPlayPauseMute / unmuteNext titlePosition in seconds SeekVersion \nAutomatic\nUnnamed version\nAudio \nDefault\nTrack 1 (ac3)\nQuality \nAutomatic\nOriginal\nConvert\nApply quality30.0 / 0.0 seconds\n\nBack to title",
+    "trace": [
+      {
+        "type": "verify.begin",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": false,
+            "video": false
+          },
+          "budget": 2000,
+          "deadline": 0,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "preflight",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 4,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.start",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 260828.24499999732,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 0,
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "sampling",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 4,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.sample",
+        "facts": {
+          "audio": {
+            "decodedBytes": 4568,
+            "enabledTrack": false,
+            "tracksPresent": false
+          },
+          "ended": false,
+          "frames": 4,
+          "now": 250854.5099999979,
+          "paused": true,
+          "readyState": 4,
+          "seeking": false,
+          "time": 0,
+          "videoWidth": 640
+        },
+        "result": {
+          "completed": true
+        },
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 260828.24499999732,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 0,
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "complete",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 4,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.finish",
+        "result": {},
+        "verification": null
+      },
+      {
+        "type": "verify.begin",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": false,
+            "video": false
+          },
+          "budget": 2000,
+          "deadline": 0,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialFrames": 0,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "preflight",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 5,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.start",
+        "result": {},
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 260864.6150000021,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 4568,
+          "initialFrames": 4,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "sampling",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 5,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.sample",
+        "facts": {
+          "audio": {
+            "decodedBytes": 4568,
+            "enabledTrack": false,
+            "tracksPresent": false
+          },
+          "ended": false,
+          "frames": 4,
+          "now": 250864.6400000006,
+          "paused": true,
+          "readyState": 4,
+          "seeking": false,
+          "time": 0,
+          "videoWidth": 640
+        },
+        "result": {
+          "completed": true
+        },
+        "verification": {
+          "active": {
+            "audio": true,
+            "video": true
+          },
+          "budget": 2000,
+          "deadline": 260864.6150000021,
+          "expected": {
+            "audio": true,
+            "video": true
+          },
+          "initialAudioBytes": 4568,
+          "initialFrames": 4,
+          "initialTime": 0,
+          "metadataPreparation": false,
+          "output": false,
+          "phase": "complete",
+          "presented": false,
+          "previouslyVerified": false,
+          "request": {
+            "epoch": 0,
+            "id": 5,
+            "kind": "verification"
+          },
+          "selectiveAudio": false
+        }
+      },
+      {
+        "type": "verify.finish",
+        "result": {},
+        "verification": null
+      }
+    ],
+    "samples": [
+      {
+        "audio": {
+          "decodedBytes": 0,
+          "enabledTrack": false,
+          "tracksPresent": false
+        },
+        "ended": false,
+        "frames": 0,
+        "now": 250828.27000000328,
+        "paused": true,
+        "readyState": 0,
+        "seeking": false,
+        "time": 0,
+        "videoWidth": 0
+      }
+    ]
+  },
+  "limitations": [
+    "Original failure retained; later success does not erase it.",
+    "Zero-start result used runtime instrumentation, not a rebuilt published provider.",
+    "No physical A/V or WebKit claim."
+  ]
+}

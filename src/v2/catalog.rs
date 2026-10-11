@@ -46,7 +46,15 @@ pub fn routes() -> Router<App> {
             "/catalog/items/{item_id}/timelines",
             get(list_timelines).post(create_timeline),
         )
+        .route(
+            "/catalog/items/{item_id}/order-groups",
+            get(list_order_groups).post(create_order_group),
+        )
         .route("/catalog/timelines/{timeline_id}", get(get_timeline))
+        .route(
+            "/catalog/timelines/{timeline_id}/order",
+            axum::routing::put(place_timeline),
+        )
         .route(
             "/catalog/timelines/{timeline_id}/versions",
             get(list_versions).post(create_version),
@@ -1804,12 +1812,173 @@ async fn version_body(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct OrderGroupInput {
+    edition_id: String,
+    name: String,
+    kind: crate::curation::OrderKind,
+}
+
+pub async fn list_order_groups(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<Page<Value>>, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let limit = q.limit()?;
+    let scope = access::catalog_scope(&caller.principal);
+    let (clause, all, ids) = scope_clause(&scope, "f.library_id");
+    let mut tx = app.db.begin().await?;
+    let (item, _) = load_item(&mut tx, &scope, &id, true).await?;
+    let id = item.id;
+    let rows: Vec<(String,String,String,String,i64)> = sqlx::query_as(&format!(
+        "SELECT g.id,g.edition_id,g.name,g.kind,g.revision FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE e.item_id=? AND g.id>? AND (? OR NOT EXISTS (SELECT 1 FROM media_files f WHERE f.edition_id=e.id AND f.generated=0) OR EXISTS (SELECT 1 FROM media_files f WHERE f.edition_id=e.id AND f.generated=0 AND {clause})) ORDER BY g.id LIMIT ?"
+    )).bind(&id).bind(q.after()?).bind(all).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows = rows.into_iter().map(|(group,edition,name,kind,revision)| {
+        let value = serde_json::json!({"id":group,"item_id":id,"edition_id":edition,"name":name,"kind":kind,"revision":revision.to_string()});
+        (group,value)
+    }).collect();
+    let result = page(&mut tx, &caller.principal, rows, limit).await?;
+    tx.commit().await?;
+    Ok(Json(result))
+}
+
+/// Revision fencing, authorization and replay decisions use the production core;
+/// the adapter commits the group, aggregate revision and receipt atomically.
+pub async fn create_order_group(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<OrderGroupInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let key = idempotency_key(&headers)?;
+    let input = body.value;
+    let name = text("name", &input.name, 200)?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let row = curatable_item(&mut tx, &scope, &id, true).await?;
+    let id = row.id;
+    let edition: Option<String> =
+        sqlx::query_scalar("SELECT id FROM editions WHERE id=? AND item_id=?")
+            .bind(&input.edition_id)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if edition.is_none() {
+        return Err(Problem::not_found());
+    }
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createOrderGroup",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), &body.digest, now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    access::revise(row.revision as u64, expected, true)?;
+    let group =
+        crate::curation::create_order_group_in(&mut tx, &input.edition_id, &name, input.kind)
+            .await
+            .map_err(curation_problem)?;
+    let value = serde_json::json!({"id":group,"item_id":id,"edition_id":input.edition_id,"name":name,"kind":input.kind,"revision":"1"});
+    record
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::CREATED,
+            Some(&value),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::CREATED, &value, 1))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimelineInput {
     edition_id: String,
     duration_ms: Option<u64>,
     order_group_id: Option<String>,
     order_position: Option<u32>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineOrderInput {
+    order_group_id: String,
+    order_position: u32,
+    expected_group_revision: String,
+}
+
+/// Place an existing playable timeline without changing its media bindings or
+/// history identity. The writer transaction fences both timeline and group and
+/// supplies current ancestry/occupancy to the production core placement policy.
+pub async fn place_timeline(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<TimelineOrderInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let input = body.value;
+    let expected_group = revision_text("expected_group_revision", &input.expected_group_revision)?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let timeline: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(Problem::not_found)?;
+    curatable_item(&mut tx, &scope, &timeline.item_id, false).await?;
+    // Leaving a group also mutates its revision; scope every affected owner.
+    for group in std::iter::once(&input.order_group_id).chain(timeline.order_group_id.iter()) {
+        let owner: String = sqlx::query_scalar(
+            "SELECT e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
+        ).bind(group).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+        curatable_item(&mut tx, &scope, &owner, false).await?;
+    }
+    access::revise(timeline.revision as u64, expected, true)?;
+    crate::curation::place_timeline_in(
+        &mut tx,
+        &id,
+        &input.order_group_id,
+        input.order_position,
+        expected_group,
+    )
+    .await
+    .map_err(curation_problem)?;
+    let row: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision = row.revision as u64;
+    let value = timeline_body(&mut tx, &scope, row).await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, &value, revision))
+}
+
 pub async fn create_timeline(
     State(app): State<App>,
     caller: Caller,

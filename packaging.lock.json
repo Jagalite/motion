@@ -3,9 +3,10 @@
   "target": "aarch64-apple-darwin",
   "demuxe": {
     "name": "demuxe",
-    "version": "1.0.0",
-    "integrity": "sha512-Zqg5RMQ4rLdC8e/0YlDuA85c2phzNATicyyIpHbeSNbPoPz8x0vjhTp5rulshPTOd0sP1vUQDOrvXrzmPL/i3g==",
-    "sha256": "038a01232158eb1e432f89bbeeb9e48c2369c9e2b914f25ed9de0550ea277618"
+    "version": "1.1.1",
+    "source_kind": "vendored-core-candidate",
+    "archive": "vendor/demuxe/demuxe-core-1.1.1-candidate.tgz",
+    "sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274"
   },
   "ffmpeg": {
     "url": "https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz",
@@ -17,16 +18,11 @@
     "sha256": "090d730e867fc63631782a1287974635d1237d0fa7c6fd1d09fd543620a56689",
     "archive": "x264-c24e06c.tar.gz"
   },
-  "demuxe_sources": [
-    {
-      "url": "https://github.com/Jagalite/demuxe/releases/download/reduced-v1.0.0/demuxe-1.0.0-source.tar.gz",
-      "archive": "demuxe-1.0.0-source.tar.gz",
-      "sha256": "01cead00dfab9f7bf6111556e4ff645f9de5d52bcec1dbe1eb23aad7598d79f4"
-    },
-    {
-      "url": "https://github.com/Jagalite/demuxe/releases/download/reduced-v1.0.0/demuxe-audio-adaptation-source.tar.gz",
-      "archive": "demuxe-audio-adaptation-source.tar.gz",
-      "sha256": "2befa5c7a02f321527c20c340c16917619337aa5359fca4a3288e1ac0623a1ac"
-    }
-  ]
+  "demuxe_sources": [],
+  "electron": {
+    "version": "44.7.0",
+    "url": "https://github.com/electron/electron/releases/download/v44.7.0/electron-v44.7.0-darwin-arm64.zip",
+    "archive": "electron-v44.7.0-darwin-arm64.zip",
+    "sha256": "e04e411b58a0a14375dd21b0ab4a378fd38930a702e4e20e322fee4849404c0b"
+  }
 }

@@ -192,7 +192,7 @@ export async function scenario(page, server, ctx, engine, out) {
     writeFileSync(join(out, `${engine}-checks.json`), JSON.stringify(checks, null, 2));
     writeFileSync(join(out, `${engine}-network.json`), JSON.stringify(net, null, 2));
     writeFileSync(join(out, `${engine}-console.json`), JSON.stringify(consoleLog, null, 2));
-    console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
+    console.log(`[${engine}] ${status.toUpperCase()} ${name} ${(JSON.stringify(detail) ?? 'null').slice(0, 300)}`);
   };
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
   const legacyRequests = [];
@@ -562,7 +562,10 @@ async function main() {
     let result;
     if (engine === 'electron') {
       // The Electron main process runs the scenario itself (see header).
-      const electron = createRequire(join(root, 'apps/desktop/package.json'))('electron');
+      const electron = process.env.MOTION_ELECTRON_BINARY
+        ? resolve(process.env.MOTION_ELECTRON_BINARY)
+        : createRequire(join(root, 'apps/desktop/package.json'))('electron');
+      receipt.electronExecutableSha256 = sha256(readFileSync(electron));
       const resultFile = join(out, 'electron-result.json');
       // A host that is itself Electron may export ELECTRON_RUN_AS_NODE.
       const {ELECTRON_RUN_AS_NODE: _ignored, ...env} = process.env;

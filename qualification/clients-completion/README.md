@@ -44,7 +44,7 @@ integration/release.
 | Current caller / entry point | Replacement / owner | Acceptance and disposition |
 |---|---|---|
 | `scripts/client.py` | `/api/v2/catalog/items`; Clients | Authenticated cursor tests; converted. |
-| `client_playback_e2e.mjs`, `v2_playback_smoke.py` preparation setup | `/api/v2/processing/preparations`, `/api/v2/jobs/{id}`; data/preparation service | Converted to contract; needs served preparation API before real acceptance. |
+| `client_playback_e2e.mjs`, `v2_playback_smoke.py` preparation setup | `/api/v2/processing/preparations`, `/api/v2/jobs/{id}`; data/preparation service | Converted; adapter integrated in f9b4763, combined real acceptance pending. |
 | `client_playback_upgrade.mjs` old-binary writes | Frozen old-binary v1 setup | Explicit exception; candidate reads use v2. |
 | Go CLI/TUI | Existing public v2 catalog/playback and `playback.v2` capability | Retain negotiation. Playback owner must correct server facts; run real-server CLI/TUI afterward. |
 | `packages/ui-bridge/player.js` delivery pacing | Playback owner's C06 heartbeat playhead contract | Pending interface integration and playback-only long conversion acceptance. |
@@ -52,10 +52,10 @@ integration/release.
 | Legacy `web/app.js`, `web/playback.js`, `web/session.js`, `/media/{id}` | Topcoat/player bridge and v2 media; integration router owner | Keep until cutover gates pass, then remove mounts/assets and prove no business behavior. |
 | `operations_smoke.py` | v2 catalog, timeline viewing and diagnostics; Clients | Converted; real-server backup/restore smoke passes all five checks, including rejection of the old operator token after restore. |
 | `catalog_smoke.py` | v2 metadata/artwork/relationships; Clients | Converted; six real-process checks pass. Coverage differences below remain explicit. |
-| `processing_smoke.py`, `video_profiles_smoke.py` | v2 recipes/preparations/jobs/events; preparation owner | Current-server v1 callers; preserve engine regressions while migrating. |
-| `viewing_smoke.py`, `reliability_smoke.py`, `smoke.py` | Canonical viewing + v2 storage/catalog; playback/data owners | Current-server v1 callers; pending authority/cutover integration. |
+| `processing_smoke.py`, `video_profiles_smoke.py` | v2 recipes/preparations/jobs/events; preparation owner | Processing stress migrated to v2, runtime validation pending. Dynamic video profiles still lack a v2 replacement. |
+| `viewing_smoke.py`, `reliability_smoke.py`, `smoke.py` | Canonical viewing + v2 storage/catalog; playback/data owners | General smoke (7) and viewing (5) pass over v2. Reliability is migrated; combined runtime validation pending. |
 | `upgrade_restore_check.py` | Public v2 catalog, revision-pinned file bytes and canonical viewing; Clients | Candidate migrated; all six real-process upgrade/rollback scenarios pass. Frozen baseline alone retains v1. |
-| `test_package.py` | Exact installed v2 candidate; integration/release owner | Candidate traffic still needs migration after preparation adapter integration. |
+| `test_package.py` | Exact installed v2 candidate; integration/release owner | Candidate migrated to v2; installed-package execution pending combined preparation qualification. |
 | Go e2e anonymous v1 request | Negative legacy authorization test | Does not provision business data; revise to 404/410 when retirement lands. |
 
 The remaining legacy scripts are active dependencies, not a historical allowlist.
@@ -85,8 +85,8 @@ upstream composer SHA-256
 `b86066b90a41eccdc4528c7843043f388448217bb67ff23c8974b781b6e16451`.
 Asset integrity passed, but **two installed-package API tests failed**: that core
 archive lacks the player's runtime property and the expected borrowed-preview
-runtime behavior. Its version label does not establish compatibility. It is not
-selected for product qualification; the failed probe is retained here.
+runtime behavior. Its version label does not establish compatibility. That shared-runtime mode was rejected. The later explicit per-player evaluation
+is described below; the original failed probe is retained.
 
 The prior [28-pass/2-blocked engine receipts](../client-playback/README.md) remain
 historical evidence. They do not qualify this branch or the candidate provider.
@@ -205,3 +205,146 @@ The 1.1.1 archive is being evaluated in explicit per-player runtime ownership
 mode. The original shared-runtime test failures remain valid; this mode does
 not claim borrowed-preview compatibility. Its package probe passes two checks
 and skips the two inapplicable shared-ownership checks.
+
+### Continued migration and review
+
+- `4e617e1`: general smoke 7/7 and viewing smoke 5/5 real-process checks pass
+  against the combined schema-37 application. Exact duplicate events, changed
+  duplicate rejection, restart outbox drain, supersession, automatic completion,
+  manual revision fences, original bytes/ranges, metadata and owner lock remain
+  asserted. Positive Next is explicitly not covered by the no-next check.
+- `a371793`: installed-package candidate uses v2; only syntax checked so far.
+- `d00207d`: processing stress uses preparations, jobs, rendition references,
+  public event cursors and logical schedules. Syntax checked; real execution
+  awaits the new combined application. Existing isolated-database clock/progress
+  fault injection makes this adapter integration evidence, not exclusively HTTP
+  evidence. Hardware backend selection has no v2 contract replacement yet.
+- `f883f19`: reliability uses v2 scans and durable backup requests. Concurrent
+  writes now exercise canonical manual-watched mutations, not playback progress
+  on fake media. Unavailable-root readiness remains; the former structured
+  storage-error assertion lacks a v2 replacement. Retention checks both public
+  readiness withdrawal and retained request snapshot directories.
+- `f9b4763` composes catalog service commits through `5f15820` (schemas 38–41).
+  Sol reviewed the merge/client boundaries without findings; combined build and
+  real acceptance remain pending. Service ownership and publication authority
+  stay in catalog/core, not client helpers.
+- Sol reviewed every client commit through `f883f19`, including the live seek
+  policy and failed-Electron evidence retention, without remaining implementation
+  findings. The removed legacy-write rejection assertion remains a separate
+  negative-boundary gate while v1 is still served.
+
+Browser observations so far (T3 collaborative Chromium 152 / Electron 44.4.2
+host, not standalone Chrome): original playback advances; explicit seek replaces
+one player; reload resumes at the persisted 145473 ms. Live Shaka loads but its
+moving seek window still rejects initial positioning. These are partial probes,
+not a completed workflow receipt. Product Electron 44.7.0 reached the original
+plan but failed media requests with 409; failed-run diagnostics are being retained
+for investigation. No exact provider deployment is qualified for release yet.
+
+Release-order provisioning and dynamic video-profile recipe selection are missing
+public interfaces. Integration handoffs are on PR #14 and #17. Default cutover,
+legacy removal, positive Next and provider release handoff remain gated.
+
+### Schema-41 and playback-contract composition
+
+The current tree composes catalog `ee842e4`, playback `0621762` and the combined
+origin-fixture correction at `782c00f`. GPT-6.1 Sol reviewed the merges and
+`df7d9e4` without actionable findings. All 76 JavaScript playback/bridge/desktop
+tests and formatting checks pass. This does not replace real-client acceptance.
+
+The `f9b4763` application built successfully through Kyoto
+`bad3fce311c347ed8b77247e56f04cef`; frozen binary SHA-256 is
+`f740686f28baa41e5dedb7fef0fd40d3687716827d384d42b61e103d7108ec94`.
+Its dedicated preparation smoke passes five real HTTP/FFmpeg checks, including
+second-audio selection and generated-media backup byte equality. Processing
+stress completed 13 independent checks before a harness source-selection error;
+that error is corrected in `f8ea0f6`. The run also found an extra generated-store
+logical library, which remains a product failure. A later run timed out in its
+first encode; neither run qualifies the complete stress suite. Reliability timed
+out awaiting a requested backup and remains failed; `df7d9e4` adds last-job and
+server-log diagnostics for the next run.
+
+The live-window intersection build `38db68c` passed Kyoto
+`3daeb868b7364cb68441ec34b1dd3f95`; its frozen binary SHA-256 is
+`365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45`.
+The updated combined build is tracked separately as
+`facb0c99c69a4e63ab3f4f3e4d49bcaa` and is not yet qualified.
+
+Electron's retained 409 response was `source_revision_changed`: source bytes
+still had the same SHA-256, but the fixture ctime changed after scanning. The
+server correctly fenced that fingerprint. The process responsible for the
+metadata change is not established. New browser/Electron runs use isolated
+system-temp fixtures without weakening source validation. Release assets remain
+unqualified; archive hashes alone are not a release receipt.
+
+### Retained runtime receipts
+
+[Electron](electron-live-intersection.json) records 30 passing assertions and one
+plain-video diagnostic against frozen `38db68c`, including audio/live-HLS and
+prepared-version switching, durable outage retry, resume and restart. The raw
+receipt's source field identifies the harness worktree `782c00f`, not the frozen
+server source; the scoped receipt makes both identities explicit. Positive Next,
+installed-package acceptance and the later combined server are not qualified by
+that run.
+
+[Browser observations](browser-live-intersection-partial.json) remain partial.
+Original playback, seek and exact persisted reload resume passed. Audio switching
+hit a 0.770-second live-window start; the fixed 0.250-second margin exceeded the
+one-second limit. `f283ca1` instead caps the margin inside the remaining allowance
+and range, with tests at the narrow boundaries. Delayed Play on an already-open
+paused live conversion also jumped from 1.475 to 22.345 seconds in 2.5 seconds;
+this separate provider/pacing compatibility issue remains open on PR #16.
+
+[Reliability](reliability-v2.json) now passes all seven checks on `38db68c`,
+including physical backup retention and restore. This uses fake probe data for
+inventory and does not qualify codecs. Processing reached 18 checks before its
+cache-expiry harness confused previously stale renditions with completed physical
+cleanup; `d8d23c1` now awaits that effect independently. The generated logical
+library exposure is still a failing product assertion coordinated on PR #17.
+
+The combined `782c00f` server built successfully through Kyoto
+`facb0c99c69a4e63ab3f4f3e4d49bcaa`, SHA-256
+`6f678c7e9af9dc2b8bb9bb7f0d99b01ad80e11f1de6b56726920f3817ae65d9e`.
+The margin update's build is tracked by `fbe3fcdcdd6248788224cb67d6ef2551`.
+All 76 JavaScript checks, Rust formatting, OpenAPI structure (99 paths/150
+operations/148 schemas) and JSON parity pass at this source checkpoint. Sol
+reviewed the margin fix, composition and receipt boundaries without findings.
+
+### Managed storage correction and final composition
+
+`0198a89` registers internal processing storage as managed in the same transaction
+that creates its physical-root identity; it does not create a logical library or
+scan-source binding. Reuse cannot change user/managed ownership. Public list/get
+also hide historical automatic logical rows with that exact managed-root ID,
+without deleting them or filtering legitimate empty user libraries. These are
+adapter storage/projection rules over the existing explicit managed fact; no
+parallel client authority or new global core state is introduced.
+
+All 11 library integration tests pass after Kyoto compile
+`0dbd0a34b6954e6aaa9802a868b77e9f` at `2d5a684`, including atomic registration,
+legacy-row visibility, empty-user-library preservation and ownership refusal.
+[Processing acceptance](processing-v2.json) passes all 20 checks against frozen
+`0198a89`, binary SHA-256
+`cf5d50ddf3e717b51a8c8688470ebaad88131a4d52d17c57ca144552ef762296`.
+The earlier failed runs remain retained; this receipt closes their generated
+library isolation and physical cache-expiry assertions, not hardware profiles.
+
+Composition through `183b4a5` additionally imports playback's subtitle-directory
+ownership fix, restricted-pairing startup fence, admission-bound resume assertions
+and terminal cancellation repair. GPT-6.1 Sol reviewed the final diff without
+remaining actionable findings. All 79 JavaScript/setup checks and all 20 Go API
+tests pass; Go compilation used Kyoto `59ab2a12ae834309a27ecdeeba8a2ffb`.
+All 11 targeted playback adapter tests pass after Kyoto compilation
+`a4ec6126137446b498c632ca00b33e7c` (37.58 seconds execution), including selected
+subtitles, scoped generation tickets, playback-only pacing, revocation and restart.
+Formatting, contract/JSON parity and publication privacy checks pass.
+
+[Latest Electron evidence](electron-combined-margin.json) remains **failed**:
+server `ad67fa0`, SHA-256
+`8d8ece2350f0f0e7ac91b9fe6c2a641b24186ebed33024aaf34f8f40801a99ba`,
+passes original/audio/prepared switching, resume and restart but rejects the
+conversion-only title outside the live seek window. The same latest-margin server
+also rejected conversion startup in the collaborative browser. The bounded margin
+repair does not solve the broader provider/pacing issue. This supersedes any
+inference that the older passing Electron scenario qualifies the current product.
+No Topcoat default, legacy retirement or qualified provider release claim follows.

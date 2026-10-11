@@ -12,7 +12,7 @@ from unittest.mock import patch
 from check_source_companion import check as check_source_companion
 from build_media_tools import assert_portable, download
 from package_app import npm_archive, source_inventory, write_source_archive
-from package_privacy import assert_private_paths_absent, public_tar_member
+from package_privacy import assert_private_paths_absent, public_tar_member, private_content
 
 
 class PackagingTests(unittest.TestCase):
@@ -56,6 +56,26 @@ class PackagingTests(unittest.TestCase):
                   for p in (extracted / 'motion').rglob('*') if p.is_file()}
         self.assertEqual(actual, inventory)
         self.assertTrue((extracted / 'motion/scripts/build.sh').stat().st_mode & 0o111)
+
+    def test_extracted_source_inventory_requires_original_bytes_and_membership(self):
+        root = self.cache / 'extracted'
+        root.mkdir()
+        (root / 'Cargo.toml').write_text('original')
+        manifest = {'source_files': {'Cargo.toml': hashlib.sha256(b'original').hexdigest()}}
+        with patch('package_app.ROOT', root):
+            self.assertEqual(source_inventory(manifest), manifest['source_files'])
+            (root / 'target').mkdir()
+            (root / 'target/output').write_text('generated')
+            self.assertEqual(source_inventory(manifest), manifest['source_files'])
+            archive = self.cache / 'reconstructed.tar.gz'
+            write_source_archive(archive, manifest['source_files'], manifest)
+            (root / 'Cargo.toml').write_text('changed')
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                source_inventory(manifest)
+            (root / 'Cargo.toml').write_text('original')
+            (root / 'new-build-input.py').write_text('unexpected')
+            with self.assertRaisesRegex(ValueError, 'membership'):
+                source_inventory(manifest)
 
     def test_embedded_input_changes_and_membership_block_source_publication(self):
         root = self.source_checkout()
@@ -122,6 +142,14 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual((result.uid, result.gid, result.uname, result.gname), (0, 0, '', ''))
             self.assertEqual(result.pax_headers, {})
             self.assertEqual(result.mtime, 0)
+
+    def test_electron_system_and_url_literals_are_not_private_paths(self):
+        for value in [b'/System' + b'/' + b'Volumes/Data', b'/System' + b'/' + b'Volumes/Preboot/Cryptexes/App/System',
+                      b'https://www.quad9.net' + b'/' + b'home/privacy/', b'chrome:/' + b'/' + b'home/*']:
+            self.assertFalse(private_content(value), value)
+        for value in [b'/' + b'Volumes/Data/private', b'/System' + b'/' + b'Volumes/Data' + b'/Us' + b'ers/private/file',
+                      b'/' + b'home/privacy/file', b'chrome:/' + b'/' + b'home/private']:
+            self.assertTrue(private_content(value), value)
 
     def test_binary_embedded_paths_and_private_hosts_block_release(self):
         binary = self.cache / 'motion'

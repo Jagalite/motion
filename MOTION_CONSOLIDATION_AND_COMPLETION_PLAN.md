@@ -283,7 +283,6 @@ packaging or other helper scripts.
   integration/release owner coordinates the necessary combined-tree and installed
   product runs; individual lanes do not repeat them for every commit.
 
-Set `KYOTO_SCRIPT` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
@@ -336,7 +335,7 @@ Use four bounded lanes. These are assignments to make, not agents already runnin
 
 | Lane | Owns | Boundary |
 |---|---|---|
-| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization adapters, preparation/processing capabilities, recipes/renditions, schedule CRUD, storage/backup APIs, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
+| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization/preparation/schedule/storage/backup adapters, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
 | Playback/viewing (A06/A07/A08) | C02 playback service facts, C05/C06/C08, planning, tickets, generation and authority policies | Propose contract changes through A00; coordinate capability transport edits with the API owner and package/player decisions with clients/release. |
 | Clients (A10–A12) | All current client callers, Topcoat cutover, Go capability use, C07 player integration, real-client acceptance | No independent catalog or viewing authority; fixtures remain explicitly labeled. |
 | Integration/release (A00/A05/A14) | Contract/evidence ledger, C03/C09, CI, manifests, source/package reconstruction, final integration | Owns root manifests/lockfiles and shared-file integration; implementation lanes still own their regression tests. |
@@ -419,3 +418,40 @@ alone does not close M1/M3. Real HTTP preparation/backup acceptance,
 schema 9→41 upgrade repairs and scoped-smart regression checks pass; exact
 receipts are in qualification/data-catalog. Browser/client and combined-package
 acceptance remain separate gates; prior receipts bind only their recorded commits.
+
+
+### Clients continuation status (PR #15)
+
+The Clients tree composes catalog `69e0ff4` and playback `0621762`. Current
+callers migrated include catalog/playback preparation, general/catalog/viewing/
+operations smoke, processing stress, inventory/backup reliability, installed
+package setup and candidate upgrade observers. Frozen old-binary writes remain
+an explicit exception. `video_profiles_smoke.py` still needs a public v2 dynamic
+profile/backend interface; no full caller-migration claim is made.
+
+Exact scoped receipts are in [the Clients ledger](qualification/clients-completion/README.md).
+The earlier `38db68c` Electron workflow passed 30 assertions. The newer combined
+`ad67fa0` binary passes original/audio/prepared switching, resume and restart but
+fails conversion-only live startup. Collaborative-browser live-window and delayed
+Play behavior also remain failed. Seven reliability checks, 20 real processing checks, 11 library regressions and
+79 JavaScript/setup checks pass within their recorded scopes. Managed generated-store
+visibility is corrected with focused adapter regression coverage.
+
+Clients is **in progress**, not complete. Positive Next needs public release-order
+provisioning; dynamic profiles need a v2 contract; provider/pacing compatibility,
+latest combined acceptance and installed-package gates remain open. Topcoat
+default cutover, legacy UI/media/API retirement and a qualified provider release
+handoff are withheld until those gates pass. Candidate archive hashes identify
+inputs, not qualified release assets. Integration coordination is tracked on
+PRs #14, #16 and #17; old-binary upgrade fixtures are retained.
+
+### Final consolidation ownership (integration/release)
+
+Integration/release owns completion across PRs #14 → #17 → #19 → #18.
+PR #19 is the main-bound carrier of #16; #18 preserves #15, which remains
+closed as superseded with user approval. Integration ownership includes
+shared-file reconciliation, the one-app distribution, qualified player
+deployment, final legacy-route removal and absence tests, combined CI, installed
+acceptance and milestone evidence. See
+[the final gate ledger](qualification/consolidation/FINAL.md). Merging the lane
+PRs does not close a milestone. Historical lane receipts keep their exact scope.
