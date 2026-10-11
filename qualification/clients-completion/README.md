@@ -276,3 +276,36 @@ server correctly fenced that fingerprint. The process responsible for the
 metadata change is not established. New browser/Electron runs use isolated
 system-temp fixtures without weakening source validation. Release assets remain
 unqualified; archive hashes alone are not a release receipt.
+
+### Retained runtime receipts
+
+[Electron](electron-live-intersection.json) records 30 passing assertions and one
+plain-video diagnostic against frozen `38db68c`, including audio/live-HLS and
+prepared-version switching, durable outage retry, resume and restart. The raw
+receipt's source field identifies the harness worktree `782c00f`, not the frozen
+server source; the scoped receipt makes both identities explicit. Positive Next,
+installed-package acceptance and the later combined server are not qualified by
+that run.
+
+[Browser observations](browser-live-intersection-partial.json) remain partial.
+Original playback, seek and exact persisted reload resume passed. Audio switching
+hit a 0.770-second live-window start; the fixed 0.250-second margin exceeded the
+one-second limit. `f283ca1` instead caps the margin inside the remaining allowance
+and range, with tests at the narrow boundaries. Delayed Play on an already-open
+paused live conversion also jumped from 1.475 to 22.345 seconds in 2.5 seconds;
+this separate provider/pacing compatibility issue remains open on PR #16.
+
+[Reliability](reliability-v2.json) now passes all seven checks on `38db68c`,
+including physical backup retention and restore. This uses fake probe data for
+inventory and does not qualify codecs. Processing reached 18 checks before its
+cache-expiry harness confused previously stale renditions with completed physical
+cleanup; `d8d23c1` now awaits that effect independently. The generated logical
+library exposure is still a failing product assertion coordinated on PR #17.
+
+The combined `782c00f` server built successfully through Kyoto
+`facb0c99c69a4e63ab3f4f3e4d49bcaa`, SHA-256
+`6f678c7e9af9dc2b8bb9bb7f0d99b01ad80e11f1de6b56726920f3817ae65d9e`.
+The margin update's build is tracked by `fbe3fcdcdd6248788224cb67d6ef2551`.
+All 76 JavaScript checks, Rust formatting, OpenAPI structure (99 paths/150
+operations/148 schemas) and JSON parity pass at this source checkpoint. Sol
+reviewed the margin fix, composition and receipt boundaries without findings.
