@@ -37,6 +37,10 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/catalog/items/{item_id}/metadata", get(get_metadata))
         .route(
+            "/catalog/items/{item_id}/metadata/refresh",
+            axum::routing::post(refresh_metadata),
+        )
+        .route(
             "/catalog/items/{item_id}/metadata/contributions/{source_name}",
             put(replace_contribution),
         )
@@ -1028,4 +1032,40 @@ async fn select_artwork(
     let value = super::catalog::item_body(&mut tx, &scope, item).await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, &value, revision))
+}
+
+async fn refresh_metadata(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let key = idempotency_key(&headers)?;
+    let digest = super::sha256(b"");
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    super::catalog::curatable_item(&mut tx, &core::catalog_scope(&principal), &id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "refreshMetadata",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, crate::now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    let job = crate::new_id();
+    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) VALUES (?,?,?,?,?,'queued',?)").bind(&job).bind(&id).bind(&principal.id).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).bind(crate::now()).execute(&mut *tx).await?;
+    let value = serde_json::json!({"id":job,"revision":"1","kind":"metadata","phase":"queued","attempt_generation":"0","progress":Value::Null,"error_code":Value::Null,"result_ids":[],"requester_id":principal.id});
+    record
+        .save(&mut tx, &digest, StatusCode::ACCEPTED, Some(&value), None)
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::ACCEPTED, &value, 1))
 }

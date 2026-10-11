@@ -1081,7 +1081,6 @@ async fn blocked_operations_are_not_routed() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
     for (method, path) in [
-        ("POST", "/api/v2/catalog/items/film-a/metadata/refresh"),
         ("GET", "/api/v2/processing/capabilities"),
         ("GET", "/api/v2/schedules"),
         ("POST", "/api/v2/admin/imports"),
@@ -1330,4 +1329,85 @@ async fn artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag() 
         .await;
     assert_eq!(content.status, StatusCode::OK);
     assert_eq!(content.raw, bytes);
+}
+
+#[tokio::test]
+async fn metadata_refresh_is_durable_replayable_and_cancelled_before_publication() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    std::fs::write(
+        f._dir.path().join("media/Film (2001).nfo"),
+        "<movie><title>Local title</title></movie>",
+    )
+    .unwrap();
+    let path = "/api/v2/catalog/items/film-a/metadata/refresh";
+    let h = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "metadata-refresh-001"),
+    ];
+    let job = f.call("POST", path, None, &h).await;
+    assert_eq!(job.status, StatusCode::ACCEPTED, "{}", job.body);
+    assert_eq!(f.call("POST", path, None, &h).await.body, job.body);
+    let id = job.body["id"].as_str().unwrap();
+    sqlx::query("UPDATE metadata_jobs SET phase='running',attempt=1 WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::metadata_jobs::recover(&f.app.db).await.unwrap();
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let completed = f
+        .call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+        .await;
+    assert_eq!(completed.body["phase"], "completed");
+    assert_eq!(completed.body["attempt_generation"], "2");
+    let metadata = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a/metadata",
+            None,
+            &auth(&op),
+        )
+        .await;
+    assert_eq!(metadata.body["values"]["title"], "Local title");
+    std::fs::write(
+        f._dir.path().join("media/Film (2001).nfo"),
+        "<movie><title>Cancelled title</title></movie>",
+    )
+    .unwrap();
+    let job = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-refresh-002"),
+            ],
+        )
+        .await;
+    let id = job.body["id"].as_str().unwrap();
+    let cancel = f
+        .call(
+            "POST",
+            &format!("/api/v2/jobs/{id}/cancel"),
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-cancel-0001"),
+            ],
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    assert!(!playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let metadata = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a/metadata",
+            None,
+            &auth(&op),
+        )
+        .await;
+    assert_eq!(metadata.body["values"]["title"], "Local title");
 }

@@ -67,3 +67,5 @@ pub fn new_id() -> String {
 pub mod desktop;
 
 pub mod presentation;
+
+pub mod metadata_jobs;
