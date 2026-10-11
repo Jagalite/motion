@@ -128,8 +128,11 @@ routes is qualified separately (A11/A12).
   revision. Missing/sidecar/other-file occurrences never substitute. Track IDs
   (`a{n}`, `s{n}`) remain revision-local. Explicit prepared-rendition track and
   component pins are refused until rendition component mapping is available.
-- Live conversion uses the software recipe only; hardware encoding and copy
-  routes are not offered by the v2 planner. Any route is refused when the
+- Live conversion uses the software recipe only; hardware encoding is not
+  offered by the v2 planner. Live stream copy (`remux`, `audio_convert`) is
+  planned in Auto when `processing.experimental_copy_routes` is enabled (off by
+  default) and observed H.264 details qualify it; see
+  [the M4 ledger](qualification/m4-expansion/README.md). Any route is refused when the
   client sets a bitrate limit: the CRF recipe has no cap and stored-file average
   bitrate does not establish a VBR peak bound.
 - Multipart versions and interval (multi-episode) bindings are not planned:
