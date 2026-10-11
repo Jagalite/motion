@@ -384,7 +384,7 @@ async function disposePlayer(element) {
   element.remove();
 }
 
-async function preparePlayer(generation, position, current, savedPreferences = null) {
+async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false} = {}) {
   const data = host.dataset;
   const previous = state.element?.player.state;
   const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate} : null);
@@ -398,6 +398,9 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   element.controls = generation.transport === 'http_range';
   element.showSourceControls = false;
   element.allowFileDrop = false;
+  // An inert candidate takes no focus, keyboard or pointer input until its
+  // owner installs it.
+  element.inert = inert;
   host.append(element);
   try {
     await element.open(demuxeSource(generation, location.origin), {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
@@ -527,6 +530,7 @@ async function switchDelivery(plan) {
   state.stopObserving?.(); state.stopObserving = null;
   const nativeControls = old.element.controls;
   old.element.controls = false;
+  old.element.inert = true; // Also blocks the player's keyboard shortcuts.
   await old.element.pause().catch(() => {});
   const observed = old.element.player.state;
   const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
@@ -534,6 +538,7 @@ async function switchDelivery(plan) {
   const restore = async () => {
     if (!current()) return;
     old.element.controls = nativeControls;
+    old.element.inert = false;
     state.stopObserving = observeViewing(old.element, old.generation, state.viewing, current);
     if (wasPlaying) await old.element.play().catch(() => {});
   };
@@ -558,7 +563,7 @@ async function switchDelivery(plan) {
         return renewed;
       },
       failed: error => { leaseFailure = error; }});
-    element = await preparePlayer(generation, position, current, preferences);
+    element = await preparePlayer(generation, position, current, preferences, {inert: true});
     if (!current()) throw new Error('Playback ownership changed.');
     if (leaseFailure) throw leaseFailure;
     if (state.viewing) {
@@ -590,6 +595,7 @@ async function switchDelivery(plan) {
     state.delivery = ready;
     state.generation = generation;
     state.element = element;
+    element.inert = false;
     renewLease(latestLease ?? ready, generation, current);
     state.stopObserving = observeViewing(element, generation, state.viewing, current);
     element = null;
