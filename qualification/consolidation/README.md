@@ -92,15 +92,32 @@ Domain models and their exploration bounds remain the implementation lanes' work
 
 ## Evidence
 
-Implementation: `14ef924` (with subsequent review fixes recorded below).
+Implementation: `14ef924`; privacy fix: `1ae030b`; ledger: `19b3666`.
 
-- `python3 scripts/test_packaging.py`: 11 pass, including embedded-input changes,
+GPT-6.1 Sol reviewed `14ef924` and reproduced one P2 finding: an untracked private
+diagnostic could enter the source companion. `1ae030b` reuses the publication
+validator against the actual inventory and adds the regression. Follow-up review
+of `1ae030b`, `19b3666`, and `2344d03..19b3666` found no remaining implementation
+issues; its documentation correction (record the fix and 12-test count) is
+incorporated here. Review is source evidence, not runtime qualification.
+
+- `python3 scripts/test_packaging.py`: 12 pass, including embedded-input changes,
   additions/deletions, symlink refusal, byte-for-byte archive round trip and
   corruption rejection before compilation.
 - `node --test packages/playback/*.test.mjs packages/ui-bridge/*.test.mjs apps/desktop/test/*.test.mjs`:
   69 pass, zero skipped; controller/host units only, no browser/native A/V claim.
 - `ruby scripts/contract_json.rb --check`: pass; no wire contract was changed.
+- `scripts/check_contract.py` in an isolated environment with the pinned validator:
+  pass (97 paths, 146 operations, 148 schemas, 2,566 references).
+- Publication/history validation and seven publication-validator regressions: pass.
+  The baseline plan's absolute build-host paths originally failed this check;
+  `19b3666` uses the host-configured `KYOTO_SCRIPT` without changing queue policy.
 - Go terminal and extracted-source reconstruction: submitted to shared Kyoto;
   final job status and receipts must be recorded before claiming success.
+  Go job: `2454c17673bb45b2a4e2d977719b2f86`.
+  Reconstruction job: `9de59bde4728433c9ec8d3984127c982`, source `19b3666`, clean
+  capture, 384 inputs. The superseded `14ef924` reconstruction submission
+  `ec863f99a52a42e98271fda4bf0b98d9` was cancelled before admission.
+  At submission, the scheduler reported OS memory pressure and admitted no jobs.
 - Full combined-tree CI, installed package, browser/Electron and physical A/V:
   not yet qualified for this consolidation candidate.
