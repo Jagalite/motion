@@ -276,3 +276,32 @@ test('pacing counters survive renewal restart and failed-change rollback on the 
     assert.equal(heartbeat('delivery', generation, observation).playhead, undefined);
   }
 });
+
+test('replacement preparation heartbeat never reports the predecessor playhead', async () => {
+  const sent = [];
+  const replacement = {id: 'replacement', active: {generation: '1', media_time_origin_ms: 50000}};
+  const player = runInNewContext(source.replace('export {close, maintainLease};', `
+    status = () => {};
+    retryCommand = async () => replacement;
+    firstGeneration = async value => value;
+    let pendingBeat;
+    maintainLease = (delivery, generation, options) => {
+      pendingBeat = options.send(delivery.id, generation);
+      return () => {};
+    };
+    api = async (method, path, body) => { sent.push(body); return replacement; };
+    preparePlayer = async () => { await pendingBeat; throw new Error('candidate failed'); };
+    observeViewing = () => () => {};
+    retire = async () => {};
+    ({state, switchDelivery});
+  `), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    crypto: {randomUUID: () => 'key'}, sent, replacement,
+  });
+  const old = {controls: true, player: {state: {status: 'paused', currentTime: 10}}, pause: async () => {}};
+  Object.assign(player.state, {deliveryId: 'old', element: old, generation: {generation: '2', media_time_origin_ms: 0}});
+  assert.equal(await player.switchDelivery({plan_token: 'plan'}), false);
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.stringify(sent[0]), JSON.stringify({active_generation: '1'}));
+  assert.equal(player.state.element, old);
+});
