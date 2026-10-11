@@ -1,0 +1,66 @@
+{
+  "kind": "t3-preview-paced-provider-diagnostic",
+  "status": "focused-pass-not-product-qualification",
+  "source_commit": "ccbf31e8353987a54c47a32829f5c353d34aaf82",
+  "server_source_commit": "909b2098e56f2497c0e71509d8f37714c12df48d",
+  "server_sha256": "204fe3723db0dd59625782090a2bf85eb858c36715e1f75f2bdcc01b04c9e069",
+  "deployment_receipt_sha256": "8286bf6f6f5e6048f66e3bd8886389a94837a155e7f3ead1d1f722ec87591247",
+  "provider": {
+    "status": "candidate-not-qualified",
+    "source_archive_sha256": "360910cf83bfcd792867eec040af6ab2387822bd2c726b4e4ef2774635b16801",
+    "patch_sha256": "51d854bdd4467a6a49beec22e9ae71f67c5bae8f1b8c8f808a774b9b8984d2ff",
+    "compiled_sha256": "6c2f6da0befcbffb42e5fe311b47041213c481256796328b00203687c652e145",
+    "build_job": "e86ba726f39348e3a04d511165c7035e",
+    "candidate_runtime_identity": "sha256:fe1a85d2f532b28da4767168c7e91a4fea574ad37a4f9a331529a27ae1715de8"
+  },
+  "checks": {
+    "uncached_live_start": {
+      "ready": true,
+      "position": 0,
+      "range": [
+        0,
+        56
+      ]
+    },
+    "delayed_play": {
+      "from": 0,
+      "to": 4.989623,
+      "status": "playing"
+    },
+    "original_after_rescan": {
+      "from": 0.006802,
+      "to": 2.084533
+    },
+    "audio_switch": {
+      "replaced": true,
+      "players": 1,
+      "logical_position": 2.9,
+      "advanced_to": 11.3
+    },
+    "far_seek": {
+      "prior_position": 11.9,
+      "prior_range": [
+        0,
+        48
+      ],
+      "requested": 150,
+      "replacement_position": 150,
+      "advanced_to": 153.4,
+      "players": 1
+    },
+    "actual_completion": {
+      "status": "ended",
+      "stream_type": "vod",
+      "transport_duration": 30.083332,
+      "logical_position": 180.1,
+      "error": null
+    }
+  },
+  "limits": [
+    "Single T3 preview engine; no engine matrix or installed bundle acceptance",
+    "macOS provenance metadata changed MP4 fingerprint after scan; v2 verify scan completed before original playback",
+    "Snapshot tool failed; DOM/public-player evaluation available",
+    "Initial derivative identity mismatch rejected correctly; fresh origin used after explicit identity update",
+    "No physical audio/video or performance claim"
+  ]
+}
