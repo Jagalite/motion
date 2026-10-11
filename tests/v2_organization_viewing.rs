@@ -1345,7 +1345,7 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
     );
     assert_eq!(collection.body["item_ids"], json!([]));
     // Hidden fileless works must not consume the visible-candidate budget.
-    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO items(id,kind,title) SELECT 'bare-'||x,'film','Bare '||x FROM n")
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO items(id,kind,title) SELECT 'bare-'||x,'video','Bare '||x FROM n")
         .execute(&f.app.db).await.unwrap();
     // A hidden cut in the same edition must not affect visible membership.
     sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) SELECT 'hidden-file','t-film',library_id,'hidden.mp4','r1','fp',1 FROM media_files WHERE id='f2'").execute(&f.app.db).await.unwrap();

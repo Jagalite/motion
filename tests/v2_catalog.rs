@@ -2045,3 +2045,44 @@ async fn public_timeline_order_writer_drives_next_resolver() {
     assert_eq!(end.status, StatusCode::OK, "{}", end.body);
     assert_eq!(end.body["items"], json!([]));
 }
+
+#[tokio::test]
+async fn file_inventory_filters_scope_before_pagination() {
+    let f = Fixture::new().await;
+    f.item("a-hidden", "Hidden", &[(&f.b, "hidden")]).await;
+    f.item("b-visible", "Visible", &[(&f.a, "visible")]).await;
+    let reader = f.device(&["catalog:read", "sources:manage"], &[&f.a]).await;
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/admin/files?limit=1",
+            None,
+            &[("authorization", &reader)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    assert_eq!(files.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(files.body["items"][0]["file"]["id"], "b-visible-f0");
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/b-visible/files",
+            None,
+            &[("authorization", &reader)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    assert_eq!(files.body["items"][0]["id"], "b-visible-f0");
+    assert!(files.body["items"][0].get("relative_path").is_none());
+    assert_eq!(
+        f.call(
+            "GET",
+            "/api/v2/catalog/items/a-hidden/files",
+            None,
+            &[("authorization", &reader)]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
