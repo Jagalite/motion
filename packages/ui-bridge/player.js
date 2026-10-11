@@ -565,11 +565,12 @@ async function switchDelivery(plan) {
           {'If-Match': `"r-${session.revision}"`});
       } catch (error) {
         if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
-        // Unknown outcome: the server's binding decides. If it cannot be read,
-        // neither binding may be assumed: playback stops (see below).
-        rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000))
-          .catch(() => { throw Object.assign(new Error('The viewing session could not be confirmed. Reload to continue.'), {unresolved: true}); });
-        if (rebound?.delivery_id !== replacement.id) throw error;
+        // Unknown outcome. A read-back showing the replacement proves the
+        // commit; anything else is not proof of failure (the PUT may still
+        // commit later), so neither binding may be resumed: playback stops.
+        const unresolved = () => Object.assign(new Error('The viewing session could not be confirmed. Reload to continue.'), {unresolved: true});
+        rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000)).catch(() => { throw unresolved(); });
+        if (rebound?.delivery_id !== replacement.id) throw unresolved();
       }
       rebindCommitted = true;
       if (!current()) throw new Error('Playback ownership changed.');
