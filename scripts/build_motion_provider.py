@@ -32,7 +32,7 @@ def encoded(value):
 
 
 def implementation_identity(artifacts, backend):
-    closure = {**artifacts, 'adapter/shaka-backend.js': digest(backend)}
+    closure = {**artifacts, 'runtime/web/generated/internal/shaka-backend.js': digest(backend)}
     return 'sha256:' + hashlib.sha256(encoded(closure)).hexdigest()
 
 
@@ -83,6 +83,11 @@ def build(output, cache, source):
             path = str(target.relative_to(stage))
             assets.append({'id': path, 'path': path, 'sha256': digest(target),
                            'bytes': target.stat().st_size, 'dependencies': []})
+        # Register the adapter in the same asset closure used by Demuxe's
+        # runtime identity calculation; an out-of-band hash would be rejected.
+        adapter_path = str(backend.relative_to(stage))
+        assets.append({'id': adapter_path, 'path': adapter_path, 'sha256': digest(backend),
+                       'bytes': backend.stat().st_size, 'dependencies': []})
         artifacts = {'runtime/' + a['path']: a['sha256'] for a in assets}
         # The adapter's initial-position policy is part of this implementation,
         # even when the compiled Shaka artifacts are byte-identical.
@@ -131,6 +136,9 @@ def build(output, cache, source):
                    'files': {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}}
         (stage / 'playscale-package.json').write_bytes(encoded(receipt))
         assert_private_paths_absent(stage)
+        subprocess.run(['node', '--test', str(ROOT / 'scripts/test_demuxe_bundle.mjs')],
+                       env={**os.environ, 'DEMUXE_DIR': str(stage),
+                            'DEMUXE_RUNTIME_OWNERSHIP': 'per-player'}, check=True)
         stage.rename(output)
     return receipt
 

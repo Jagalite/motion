@@ -66,6 +66,35 @@ pub fn asset_router<S: Clone + Send + Sync + 'static>() -> AxumRouter<S> {
     AxumRouter::new().route("/ui/{file}", get(ui_asset))
 }
 
+/// Provider module URLs are stable across upgrades, unlike /ui content hashes.
+/// Do not reuse cached bytes: reproducible packages normalize file mtimes, so
+/// filesystem validators cannot distinguish different installed deployments.
+pub fn demuxe_asset_router<S: Clone + Send + Sync + 'static>(dir: PathBuf) -> AxumRouter<S> {
+    AxumRouter::new()
+        .nest_service(
+            "/assets/demuxe",
+            tower_http::services::ServeDir::new(dir).append_index_html_on_directories(false),
+        )
+        .layer(middleware::from_fn(provider_asset_headers))
+}
+
+async fn provider_asset_headers(mut request: Request, next: Next) -> Response {
+    request.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    request.headers_mut().remove(header::IF_NONE_MATCH);
+    // A normalized timestamp must not authorize combining an old partial
+    // response with new bytes. Without a content validator return the whole file.
+    if request.headers_mut().remove(header::IF_RANGE).is_some() {
+        request.headers_mut().remove(header::RANGE);
+    }
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().remove(header::LAST_MODIFIED);
+    response.headers_mut().remove(header::ETAG);
+    response
+}
+
 /// Compose the presentation with an API router whose routes use full paths
 /// under `/api/v2`. `demuxe_dir` is the verified Demuxe package directory.
 pub fn mount(
@@ -82,10 +111,7 @@ pub fn mount(
         .route("/api/v2/{*rest}", any(api_not_found))
         .merge(asset_router());
     if let Some(dir) = demuxe_dir {
-        app = app.nest_service(
-            "/assets/demuxe",
-            tower_http::services::ServeDir::new(dir).append_index_html_on_directories(false),
-        );
+        app = app.merge(demuxe_asset_router(dir));
     }
     app.fallback_service(
         AxumRouter::new()

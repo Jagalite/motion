@@ -309,9 +309,43 @@ async fn demuxe_is_served_as_its_own_unrenamed_tree() {
             .contains("javascript")
     );
     assert_eq!(body, "export const x = 1;");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert!(!headers.contains_key(header::LAST_MODIFIED));
+    assert!(!headers.contains_key(header::ETAG));
+    let file = dir.join("web/generated/player/index.js");
+    let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+    std::fs::write(&file, "export const x = 2;").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    let cached = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/assets/demuxe/web/generated/player/index.js")
+                .header(header::IF_MODIFIED_SINCE, "Thu, 01 Jan 2099 00:00:00 GMT")
+                .header(header::IF_NONE_MATCH, "*")
+                .header(header::IF_RANGE, "Thu, 01 Jan 2099 00:00:00 GMT")
+                .header(header::RANGE, "bytes=0-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.status(), StatusCode::OK);
+    assert_eq!(cached.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        cached.into_body().collect().await.unwrap().to_bytes(),
+        "export const x = 2;"
+    );
     let (status, headers, _) = get_page(&app, "/assets/demuxe/core.wasm").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CONTENT_TYPE], "application/wasm");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let (status, _, _) = get_page(&app, "/assets/demuxe/../Cargo.toml").await;
     assert_ne!(status, StatusCode::OK);
     std::fs::remove_dir_all(dir).ok();

@@ -133,8 +133,9 @@ The user selected **Chromium and Electron** for final player qualification.
 
 PR #17 merged to main at `38f80a9` after all eight exact-head checks passed.
 PR #16 had merged into the combined staging branch, not main; PR #19 carries
-that reviewed playback lane into main after #17. PR #15 follows #19. The earlier
-suggestion to close #15 as superseded is not the selected integration procedure.
+that reviewed playback lane into main after #17. The user subsequently confirmed
+that PR #15 may remain closed as superseded: all its work is preserved in #18.
+This supersedes the interim plan to reopen and merge #15 after #19.
 PR #19's initial integration run `38145957879` failed processing isolation:
 generated output storage appeared as an extra logical library. Existing fix
 `0198a89` was brought forward as `a9f9d28`, followed by its Host fixture correction
@@ -164,3 +165,15 @@ The local prerequisite build requests `7a83a39c8ac542738f56d54910b682f2` and
 pressure so review corrections could be applied. They supply no passing evidence.
 Package signing is ad hoc, not notarized. Hardware encoding, expanded M4 format
 coverage, online metadata, M5 and M6 retain their separately documented gates.
+
+The startup fix `a7d7734` passed its four generated-adapter tests in Kyoto build
+`543c8933e4174140a73f1376693d2a2d`, but package attempt
+`1a812dee13544dd89a76b2f3c801c99d` rejected that provider before compilation:
+the new adapter hash was outside the runtime's declared asset identity closure.
+The follow-up registers the adapter as a real asset and runs actual runtime
+manifest admission before publishing the provider. That failed artifact remains
+unqualified. A reused Chromium origin also retained the old adapter; those
+observations are not new-provider evidence. Stable provider URLs now prohibit
+cache reuse and filesystem-conditional responses because reproducible packages
+normalize mtimes. A same-mtime, changed-byte router regression covers the defect.
+Neither correction weakens provider identity admission or media authorization.

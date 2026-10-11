@@ -294,10 +294,7 @@ pub fn router_with(
         router = router.merge(motion_ui::asset_router());
     }
     if let Some(assets) = assets {
-        router = router.nest_service(
-            "/assets/demuxe",
-            tower_http::services::ServeDir::new(assets),
-        );
+        router = router.merge(motion_ui::demuxe_asset_router(assets));
     }
     let router = match presentation {
         None => router.fallback(|| async { ApiError::not_found() }),
