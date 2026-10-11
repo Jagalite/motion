@@ -7,13 +7,34 @@ backup jobs and bounded metadata dispatch, respectively; existing migrations and
 history remain intact. This is an implementation handoff, not an acceptance receipt.
 
 Preparation uses the existing `createPreparation` contract:
-`POST /api/v2/processing/preparations`, `Idempotency-Key`, and the usual CSRF
+`POST /api/v2/processing/preparations`, `Idempotency-Key` (16–128 characters), and the usual CSRF
 header for cookie authentication. The body contains `source` (`file_id`,
 `file_revision`), `timeline_id`, `recipe_id`, and all five `tracks` members
 (`audio_component_id`, `subtitle_component_id`, `subtitle_policy`,
 `audio_track_id`, `subtitle_track_id`). The initial client acceptance recipe is
 `remux_mp4`; send null component/track IDs and `subtitle_policy: off` for the
 baseline fixture. Explicit selections must be validated rather than ignored.
+
+For example (replace IDs/revision with the current scoped source and timeline):
+
+```json
+{
+  "source": {"file_id": "<file-id>", "file_revision": "<current-revision>"},
+  "timeline_id": "<timeline-id>",
+  "recipe_id": "remux_mp4",
+  "tracks": {
+    "audio_component_id": null,
+    "subtitle_component_id": null,
+    "subtitle_policy": "off",
+    "audio_track_id": "a1",
+    "subtitle_track_id": null
+  }
+}
+```
+
+`a1` selects the second source audio stream; use null for default selection.
+The source must have an exact whole-file binding to the requested timeline.
+Explicit component/subtitle selections are currently refused.
 
 The response is HTTP 202 and the contract Job, with an ETag. Poll
 `GET /api/v2/jobs/{job_id}` until terminal. A completed rendition job supplies
@@ -59,8 +80,10 @@ here as implementations pass review and validation.
   automatic generated-cache relocation is not claimed.
 
 Implementation through `e8c5628` passed real v2 preparation and generated-media
-backup acceptance; `26fe6aa` changes only test idempotency keys. The receipt is
+backup acceptance; `26fe6aa` and `77ebbb8` change only test keys/status expectations. The receipt is
 `qualification/data-catalog/preparation-backup-receipt.json`, binary SHA-256
 `73fe0e6e0223919ad84e613a206fc0d62101d8753d85729c6e0a57369c4dc3a5`.
 The bounded production-policy model exhausted 894 states / 10,856 transitions
-with no skipped checks. Final adapter-suite results are still being collected.
+with no skipped checks. All 64 focused local tests pass, including the final
+17-test HTTP suite at `77ebbb8`; binary hashes and source boundaries are in
+`qualification/data-catalog/completion-api-receipt.json`.

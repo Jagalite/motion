@@ -65,12 +65,15 @@ action. Bounds: 100 states, 1,000 transitions, depth 20 per configuration. SQL
 atomicity is covered separately by upgrade/failure/reopen adapter tests. This
 model does not establish whole-catalog concurrency or metadata-worker conformance.
 
-## Expanded adapter qualification (in progress)
+## Expanded adapter qualification
 
-`617a65d`, `307a999`, `71cdf27`, `ed6bf87`, and `5f15820` extend the original
-adapter set. Sol reviewed the changes and identified publication, HDR, schedule
-starvation, provenance pruning and backup recovery/retention issues; subsequent
-commits address those findings. The expanded implementation is not yet qualified.
+Production changes through `e8c5628` and final diff through `77ebbb8` were
+independently reviewed by GPT-6.1 Sol with no remaining concrete blocker.
+`26fe6aa` corrects test-only idempotency keys and `77ebbb8` corrects two
+validation-status expectations (400→422); production source is unchanged.
+Review findings fixed publication fencing, HDR admission, schedule starvation,
+provenance pruning and backup recovery/retention. Review is separate from runtime
+qualification.
 
 Core now owns preparation publication admission from current authorization,
 source enablement/scope, exact whole-file timeline binding and recipe identity,
@@ -87,8 +90,43 @@ error, respectively; both were fixed. `bb030d53c1814ffe844ae185395fc52c` was
 stopped by Kyoto for sustained memory pressure and cancelled before resubmission
 with one Cargo build job. An earlier `7410c0109cc04c84ad3936e8e7c422c5` invocation
 was cancelled because it overlapped snapshot checkout and is excluded entirely.
-No test pass is inferred from these attempts. Contract schema and publication
-privacy checks pass; final focused and real-process receipts remain pending.
+No test pass is inferred from these attempts. A subsequent one-job compilation,
+Kyoto `9372c40a9a08436491edbe45d9f3c5ec`, succeeded at `e8c5628`.
+Persistence (13), catalog (15), scoped organization (7), contract (4), publication
+transaction (2), preparation core (2), storage (2), and Stateless model (2) tests
+pass. Kyoto `58b6893e45ad4eed9d97f331191a5339` compiled the key corrections at
+`ee842e4`; that HTTP run passed 15/17 and exposed the two incorrect status
+expectations. Kyoto `4f4f5cf3a7404fbd812ee036b5ed6568` compiled `77ebbb8`; all 17 HTTP
+tests now pass. The final focused total is **64 passing tests**, zero failures or
+skips; [completion receipt](completion-api-receipt.json) records binary hashes
+and source boundaries.
+
+The preparation model exhausts 894 states and 10,856 transitions with zero
+skipped checks (bounds: 10,000 states, 100,000 transitions, depth 30, two attempts).
+It exercises the production publication policy under cancellation, retry,
+recovery, stale completion and changes to authority, source, binding and recipe.
+Adapter tests separately check transaction enforcement.
+
+[Preparation/backup receipt](preparation-backup-receipt.json) records five passing
+real HTTP/FFmpeg/FFprobe checks: exact replay, requested timeline, selected second
+audio stream, revision-pinned output and generated-media backup bytes/inventory.
+[Schema-41 receipt](upgrade-schema41-receipt.json) verifies schema 9→41 upgrade,
+canonical repair, stable restart receipts, old-binary refusal, rollback through
+both backups and restored-instance epoch rotation. Both runs use the exact
+`e8c5628` binary. No browser or installed-package claim is made.
+
+## Current CI and integration gates
+
+At `ee842e4`, pinned Rust 1.98 strict Clippy, formatting, contract and notices pass.
+Fast CI there passes the catalog/persistence/organization targets, all 43 server
+unit and 96 core unit tests, but fails the two corrected preparation assertions
+and the two unchanged Linux `motion-ui-host` cache tests described below.
+At `77ebbb8`, all 17 HTTP tests pass remotely; the fast job still fails only the
+two unchanged cache tests. Real-process integration/upgrade/restore CI passes at `77ebbb8`
+(run `38113194982`); heavy tests and packaging are still running;
+local receipts do not turn these into remote passes. The clients lane already
+owns the Linux pinned-directory fsync fix; integration must compose and validate
+it. PR #17 remains draft and is not ready for an unconditional merge.
 
 ## Earlier catalog evidence (before expanded adapters)
 
@@ -121,7 +159,7 @@ An accidentally launched direct mutation helper was stopped during its baseline
 and excluded from evidence. No mutation result or queue compliance is claimed
 for that invocation.
 
-## Real-process upgrade and remaining CI gates
+## Earlier real-process upgrade and CI evidence
 
 The corrected harness (`901a781`) passes with the candidate binary from `3f06331`
 and the existing schema-9 baseline artifact: in-place upgrade to schema 37,
@@ -146,10 +184,10 @@ overall fast job as passed.
 The real-process CI job initially failed because its receipt inventory omitted
 the new forward-repair receipt. `901a781` fixes that assertion and additionally
 verifies canonical timeline progress; the local real-process rerun passes.
-Latest remote rerun, heavy tests and packaging remain pending. PR remains a draft;
+At that checkpoint remote rerun, heavy tests and packaging were pending. PR remains a draft;
 no merge or release is authorized by this receipt.
 
-## Independent reviews
+## Earlier independent reviews
 
 GPT-6.1 Sol reviewed the original commits and the continuation through `901a781`.
 Findings corrected: unsafe empty-cut fallback, scan counter and attempt selection,
