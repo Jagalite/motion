@@ -902,21 +902,15 @@ async fn finish(
         source_revision: current.source_revision.clone(),
         published_output: current.output_file_id.clone(),
     };
-    let output_id = result
-        .as_ref()
-        .filter(|_| {
-            preparation
-                .as_ref()
-                .is_none_or(|(_, facts)| facts.admit().is_ok())
-        })
-        .map(|_| new_id());
-    let (next, effects) = playscale_core::processing::finish(
+    let output_id = result.as_ref().map(|_| new_id());
+    let (next, effects) = playscale_core::processing::finish_preparation(
         &previous,
         &playscale_core::processing::Completion {
             attempt: job.attempt.try_into()?,
             current_source_revision: source.as_ref().map(|s| s.0.clone()),
             validated_output: output_id.clone(),
         },
+        preparation.as_ref().map(|(_, facts)| facts),
     );
     if next == previous && effects.is_empty() {
         return Ok(());
