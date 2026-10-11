@@ -7,15 +7,21 @@
 // same-origin-only requests. The connection chrome and OS credential storage
 // are not exercised here (see apps/desktop/test/shell-smoke.mjs).
 import {app, BrowserWindow, session} from 'electron';
-import {rmSync, writeFileSync} from 'node:fs';
+import {existsSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {prepare, provision, scenario} from './client_playback_e2e.mjs';
 
 const out = process.env.MOTION_E2E_OUT;
 const media = url => /\/api\/v2\/(media|streams)\//.test(new URL(url).pathname);
 const resultFile = process.env.MOTION_E2E_RESULT;
 
-function adapter(contents, ses) {
-  const listeners = {response: [], console: []};
+function adapter(contents, ses, origin, token) {
+  const listeners = {request: [], response: [], console: []};
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    for (const handler of listeners.request) handler({url: () => details.url, method: () => details.method});
+    let allowed = false;
+    try { allowed = new URL(details.url).origin === origin; } catch {}
+    callback({cancel: !allowed && !details.url.startsWith(`blob:${origin}/`)});
+  });
   const requests = new Map();
   contents.debugger.attach('1.3');
   void contents.debugger.sendCommand('Network.enable');
@@ -36,7 +42,13 @@ function adapter(contents, ses) {
   ses.webRequest.onResponseStarted(details => {
     if (!media(details.url)) return;
     const response = {url: () => details.url, status: () => details.statusCode, request: () => ({method: () => details.method, postData: () => null}),
-      json: async () => { throw new Error('no body'); }};
+      json: async () => {
+        // Failed media responses are not exposed by CDP. A diagnostic read
+        // records the server's current problem; it is not the original body.
+        if (details.statusCode < 400) throw new Error('no body');
+        const response = await fetch(details.url, {headers: {Authorization: `Bearer ${token}`}});
+        return {diagnostic_read: true, status: response.status, body: await response.json()};
+      }};
     for (const handler of listeners.response) void handler(response);
   });
   contents.on('console-message', event => { for (const h of listeners.console) h({type: () => String(event.level), text: () => event.message}); });
@@ -65,22 +77,24 @@ app.whenReady().then(async () => {
     ses.setPermissionRequestHandler((_wc, permission, callback) => callback(permission === 'fullscreen'));
     ses.setPermissionCheckHandler((_wc, permission) => permission === 'fullscreen');
     ses.on('will-download', event => event.preventDefault());
-    ses.webRequest.onBeforeRequest((details, callback) => {
-      callback({cancel: !sameOrigin(details.url) && !details.url.startsWith(`blob:${origin}/`)});
-    });
     const window = new BrowserWindow({width: 1100, height: 760, show: false, webPreferences: {session: ses, sandbox: true,
       contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true,
       allowRunningInsecureContent: false, webviewTag: false, autoplayPolicy: 'no-user-gesture-required'}});
     window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
     window.webContents.on('will-navigate', (event, url) => { if (!sameOrigin(url)) event.preventDefault(); });
-    result.checks = await scenario(adapter(window.webContents, ses), server, ctx, 'electron', out);
+    result.checks = await scenario(adapter(window.webContents, ses, origin, ctx.token), server, ctx, 'electron', out);
     result.serverStartsMs = server.starts;
   } catch (error) {
     result.error = String(error?.stack ?? error);
+    const partial = `${out}/electron-checks.json`;
+    result.checks = existsSync(partial) ? JSON.parse(readFileSync(partial, 'utf8')) : [];
   } finally {
     await server.stop();
     writeFileSync(`${out}/electron-server.log`, server.log.slice(-200000));
-    rmSync(server.work, {recursive: true, force: true});
+    const durableLog = `${server.work}/data/logs/server.log`;
+    if (existsSync(durableLog)) writeFileSync(`${out}/electron-durable-server.log`, readFileSync(durableLog));
+    if (!result.error && result.checks?.every(check => check.status === 'pass')) rmSync(server.work, {recursive: true, force: true});
+    else result.retainedWork = server.work;
     writeFileSync(resultFile, JSON.stringify(result, null, 2));
     app.exit(0);
   }

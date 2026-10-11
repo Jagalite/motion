@@ -592,3 +592,86 @@ async fn a_source_with_active_processing_cannot_be_removed() {
         .unwrap();
     assert!(available, "the conversion's source stays available");
 }
+
+#[tokio::test]
+async fn managed_storage_never_becomes_a_public_library() {
+    let f = Fixture::new().await;
+    let root = f.root("generated");
+    let managed = db::add_managed_library(&f.app.db, "Generated media", &root)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::add_managed_library(&f.app.db, "Generated media", &root)
+            .await
+            .unwrap()
+            .id,
+        managed.id
+    );
+    assert!(
+        db::add_library(&f.app.db, "User source", &root)
+            .await
+            .is_err()
+    );
+    assert!(libraries::list_sources(&f.app.db).await.unwrap().is_empty());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_libraries WHERE id=?")
+        .bind(&managed.id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    // Upgrade compatibility: older workers created this logical row before
+    // marking the storage root managed. Hide it without deleting user data.
+    sqlx::query("INSERT INTO catalog_libraries(id,name,kind) VALUES (?,'Generated media','mixed')")
+        .bind(&managed.id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let empty = libraries::save_library(
+        &f.app,
+        None,
+        "My empty library",
+        LibraryKind::Mixed,
+        "en",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        libraries::list_libraries(&f.app.db)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| &v.id)
+            .collect::<Vec<_>>(),
+        vec![&empty.id]
+    );
+    assert!(matches!(
+        libraries::get_library(&f.app.db, &managed.id).await,
+        Err(libraries::LibraryError::NotFound)
+    ));
+    for (path, status) in [
+        ("/api/v2/libraries".to_string(), 200),
+        (format!("/api/v2/libraries/{}", managed.id), 404),
+    ] {
+        let response = playscale::api::router(f.app.clone(), None)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .header("Host", "127.0.0.1:8787")
+                    .header("Authorization", "Bearer test-secret-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        if status == 200 {
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["items"].as_array().unwrap().len(), 1);
+            assert_eq!(value["items"][0]["id"], empty.id);
+        }
+    }
+}

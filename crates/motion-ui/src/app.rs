@@ -392,6 +392,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-profile-id=(who.profile_id.as_str())
             data-principal-id=(who.principal_id.as_str())
             data-server-epoch=(who.server_epoch.as_str())
+            data-viewing-epoch=(who.viewing_epoch.as_str())
             data-can-save-viewing=(if who.can("viewing:write") { "true" } else { "false" })
             data-viewing-revision=(view_model.viewing_revision.as_str())
             data-viewing-manual-epoch=(view_model.viewing_manual_epoch.as_str())

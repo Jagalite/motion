@@ -16,8 +16,8 @@ use super::{
 use crate::{App, api::ApiError, db, delivery, now, viewing as legacy};
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -80,6 +80,14 @@ pub fn routes() -> Router<App> {
         .route(
             "/playback/viewing-sessions/{session_id}/delivery",
             put(viewing::replace_viewing_delivery),
+        )
+        .route(
+            "/streams/{delivery_id}/{generation}/content",
+            get(generation_content),
+        )
+        .route(
+            "/streams/{delivery_id}/{generation}/subtitles.vtt",
+            get(generation_subtitles),
         )
         .route(
             "/streams/{delivery_id}/{generation}/master.m3u8",
@@ -605,14 +613,9 @@ fn fits_budget(file: &db::ItemRow, max_height: Option<u32>, max_bitrate: Option<
         .iter()
         .find(|t| t.kind == "video")
         .and_then(|t| t.height);
-    max_height.is_none_or(|l| height.is_none_or(|h| h <= l))
-        && max_bitrate.is_none_or(|b| {
-            let bitrate = file
-                .duration_seconds
-                .filter(|d| *d > 0.0)
-                .map(|d| (file.bytes as f64 * 8.0 / d) as u64);
-            bitrate.is_none_or(|r| r <= b)
-        })
+    // File-size/duration is an average, not a peak bound for VBR media.
+    // No persisted peak/VBV guarantee is currently available for byte routes.
+    core::conversion_fits(max_height, max_bitrate, height, None)
 }
 
 /// Default audio stream (the first) of a file, when it has audio.
@@ -667,12 +670,12 @@ fn client_support(
         return Support::Unknown;
     };
     // PQ/HLG bytes are delivered unchanged: never to a client that reports no
-    // HDR support, nor when the request requires SDR.
+    // HDR support (including unknown), nor when the request requires SDR.
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
     );
-    if hdr && (require_sdr || client.hdr == "unsupported") {
+    if hdr && (require_sdr || client.hdr != "supported") {
         return Support::Unsupported;
     }
     let audio = audio.and_then(|i| {
@@ -837,9 +840,6 @@ pub async fn plan(
     let mut conn = app.db.acquire().await?;
     usable_profile(&mut conn, principal, &input.profile_id).await?;
     readable_timeline(&mut conn, principal, &input.timeline_id).await?;
-    if input.tracks.audio_component_id.is_some() || input.tracks.subtitle_component_id.is_some() {
-        return Ok(Json(blocked(&input, "component_selection_unavailable")).into_response());
-    }
     // A pinned generated version names the original it renders; only that
     // rendition may then serve the plan.
     let pinned_source = match input.version_id.as_deref() {
@@ -847,6 +847,13 @@ pub async fn plan(
         None => None,
     };
     let pinned_prepared = pinned_source.is_some();
+    if pinned_prepared
+        && (tracks_pinned
+            || input.tracks.audio_component_id.is_some()
+            || input.tracks.subtitle_component_id.is_some())
+    {
+        return Ok(Json(blocked(&input, "prepared_track_selection_unavailable")).into_response());
+    }
     // With a pinned rendition, a source pin names that rendition, not the
     // original it renders.
     let original_pin = pinned_source.as_deref().or(input
@@ -914,11 +921,81 @@ pub async fn plan(
     let audios = streams.iter().filter(|t| t.kind == "audio").count();
     let subtitles = streams.iter().filter(|t| t.kind == "subtitle").count();
     let default_audio = (audios > 0).then_some(0);
-    let audio = track_index(&input.tracks.audio_track_id, 'a', audios)?.or(default_audio);
-    let subtitle = track_index(&input.tracks.subtitle_track_id, 's', subtitles)?;
-    if subtitle.is_some() || input.tracks.subtitle_policy == "require" {
-        // No subtitle presentation path exists in the v2 delivery contract yet.
-        return Ok(Json(blocked(&input, "subtitle_delivery_unavailable")).into_response());
+    let components = crate::components::timeline_components(&app.db, &input.timeline_id)
+        .await
+        .map_err(Problem::internal)?;
+    let component_index = |id: &Option<String>, kind, name: &str| -> Option<u32> {
+        let index = playscale_core::components::embedded_track(
+            &components,
+            id.as_deref()?,
+            kind,
+            &bound.version,
+            &bound.file.id,
+            &bound.file.revision,
+        )?;
+        streams
+            .iter()
+            .filter(|t| t.kind == name)
+            .position(|t| t.index == index)
+            .map(|i| i as u32)
+    };
+    let ca = component_index(
+        &input.tracks.audio_component_id,
+        playscale_core::components::Kind::Audio,
+        "audio",
+    );
+    let cs = component_index(
+        &input.tracks.subtitle_component_id,
+        playscale_core::components::Kind::Subtitle,
+        "subtitle",
+    );
+    if (input.tracks.audio_component_id.is_some() && ca.is_none())
+        || (input.tracks.subtitle_component_id.is_some() && cs.is_none())
+    {
+        return Ok(Json(blocked(&input, "component_unavailable")).into_response());
+    }
+    let a = track_index(&input.tracks.audio_track_id, 'a', audios)?;
+    let sub = track_index(&input.tracks.subtitle_track_id, 's', subtitles)?;
+    if a.zip(ca).is_some_and(|(a, b)| a != b) || sub.zip(cs).is_some_and(|(a, b)| a != b) {
+        return Err(Problem::invalid(
+            "track_component_conflict",
+            "The track and component pins disagree",
+        ));
+    }
+    let audio = ca.or(a).or(default_audio);
+    use playscale_core::components::{SubtitleSelection, select_subtitle};
+    let subtitle = match select_subtitle(&input.tracks.subtitle_policy, cs.or(sub), subtitles) {
+        SubtitleSelection::Selected(index) => Some(index),
+        SubtitleSelection::None => None,
+        SubtitleSelection::Conflict => {
+            return Err(Problem::invalid(
+                "subtitle_policy_conflict",
+                "Explicit subtitles conflict with off",
+            ));
+        }
+        SubtitleSelection::Unavailable => {
+            return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
+        }
+        SubtitleSelection::AutomaticUnsupported => {
+            return Ok(
+                Json(blocked(&input, "automatic_subtitle_selection_unavailable")).into_response(),
+            );
+        }
+    };
+    if let Some(index) = subtitle {
+        let codec = &streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(index as usize)
+            .unwrap()
+            .codec;
+        if !matches!(
+            codec.as_str(),
+            "subrip" | "srt" | "webvtt" | "mov_text" | "text"
+        ) || !input.client.subtitle_modes.iter().any(|m| m == "text")
+        {
+            return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
+        }
     }
     let height = streams
         .iter()
@@ -999,7 +1076,9 @@ pub async fn plan(
         explicit_streams: audio != default_audio,
         pinned_prepared,
         // With a pinned rendition, track pins index that rendition's streams.
-        tracks_pinned: tracks_pinned && !pinned_prepared,
+        tracks_pinned: tracks_pinned
+            || input.tracks.audio_component_id.is_some()
+            || subtitle.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
     // A prepared plan pins the chosen rendition and plays its default streams.
@@ -1015,6 +1094,9 @@ pub async fn plan(
         }
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
+    if subtitle.is_some() && route != Route::Original {
+        return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
+    }
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -1141,6 +1223,7 @@ fn generation_json(delivery: &str, owner: &Owner, g: &delivery::GenerationView) 
         "status": g.status,
         "media_url": media_url,
         "manifest_url": manifest_url,
+        "subtitles_url": g.subtitles_url.as_ref().map(|_| format!("/api/v2/streams/{}/{}/subtitles.vtt", segment(delivery), g.generation)),
         "media_time_origin_ms": g.media_time_origin_ms,
         "requested_start_ms": g.requested_start_ms,
         "available_start_ms": g.available_start_ms,
@@ -1237,7 +1320,7 @@ pub async fn create_delivery(
 
 /// The owner of a delivery the principal controls now (core `may_control`).
 /// Unknown deliveries, v1 deliveries and other principals' are not found.
-async fn controlled_by(
+pub(crate) async fn controlled_by(
     app: &App,
     conn: &mut sqlx::SqliteConnection,
     principal: &Principal,
@@ -1327,6 +1410,14 @@ pub async fn close_delivery(
 #[serde(deny_unknown_fields)]
 pub struct Heartbeat {
     active_generation: String,
+    playhead: Option<Playhead>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Playhead {
+    sequence: String,
+    position_ms: u64,
 }
 
 pub async fn heartbeat(
@@ -1337,7 +1428,19 @@ pub async fn heartbeat(
 ) -> Result<Response, Problem> {
     let (tx, _, owner) = command(&app, &caller, &id).await?;
     require_live(&app, &id)?;
-    let view = delivery::heartbeat_live(&app, &id, &body.value.active_generation, None)
+    let observation = body
+        .value
+        .playhead
+        .map(|p| {
+            let sequence = viewing::decimal(&p.sequence)
+                .filter(|s| *s > 0)
+                .ok_or_else(|| {
+                    Problem::invalid("invalid_sequence", "Playhead sequence must be positive")
+                })?;
+            Ok::<_, Problem>((sequence, p.position_ms))
+        })
+        .transpose()?;
+    let view = delivery::heartbeat_live(&app, &id, &body.value.active_generation, observation)
         .map_err(problem)?;
     tx.commit().await?;
     Ok(Json(delivery_json(&view, &owner)).into_response())
@@ -1575,12 +1678,88 @@ fn stream_problem(e: ApiError) -> Problem {
     p
 }
 
+#[derive(Deserialize)]
+pub struct StreamParams {
+    ticket: Option<String>,
+}
+
+async fn stream_owner(
+    app: &App,
+    headers: &HeaderMap,
+    params: &StreamParams,
+    id: &str,
+    generation: &str,
+) -> Result<Owner, Problem> {
+    let principal = if let Some(token) = &params.ticket {
+        super::content::delivery_ticket(app, token, id, generation).await?
+    } else {
+        super::auth::resolve(app, &Method::GET, headers)
+            .await?
+            .principal
+    };
+    let mut conn = app.db.acquire().await?;
+    controlled_by(app, &mut conn, &principal, id).await
+}
+
+fn stream_link(path: &str, params: &StreamParams) -> String {
+    match &params.ticket {
+        Some(token) => format!(
+            "{path}?ticket={}",
+            url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>()
+        ),
+        None => path.into(),
+    }
+}
+
+pub async fn generation_content(
+    State(app): State<App>,
+    Path((id, generation)): Path<(String, String)>,
+    Query(params): Query<StreamParams>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let owner = stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
+    if !delivery::serves_generation(&app, &id, &generation)
+        || ![view.active.as_ref(), view.pending.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|g| g.generation == generation && g.transport == "http_range")
+    {
+        return Err(Problem::not_found());
+    }
+    crate::media::serve(
+        State(app),
+        Path(owner.file),
+        Query(crate::media::MediaQuery {
+            revision: Some(owner.file_revision),
+        }),
+        method,
+        headers,
+    )
+    .await
+    .map_err(problem)
+}
+
+pub async fn generation_subtitles(
+    State(app): State<App>,
+    Path((id, generation)): Path<(String, String)>,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    stream_owner(&app, &headers, &params, &id, &generation).await?;
+    delivery::subtitles(State(app), Path((id, generation)))
+        .await
+        .map_err(stream_problem)
+}
+
 pub async fn master_playlist(
     State(app): State<App>,
-    caller: Caller,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, Problem> {
-    observed(&app, &caller, &id).await?;
+    stream_owner(&app, &headers, &params, &id, &generation).await?;
     let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
     let serving = [view.active.as_ref(), view.pending.as_ref()]
         .into_iter()
@@ -1594,7 +1773,8 @@ pub async fn master_playlist(
         "avc1.64001f"
     };
     let text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"{codecs}\"\nvariants/{VARIANT}/index.m3u8\n"
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"{codecs}\"\n{}\n",
+        stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
     Ok((
         [
@@ -1609,10 +1789,11 @@ pub async fn master_playlist(
 
 pub async fn variant_playlist(
     State(app): State<App>,
-    caller: Caller,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    observed(&app, &caller, &id).await?;
+    stream_owner(&app, &headers, &params, &id, &generation).await?;
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -1620,8 +1801,8 @@ pub async fn variant_playlist(
         &app,
         &id,
         &generation,
-        |i| format!("../../segments/{i}.m4s"),
-        "init.mp4",
+        |i| stream_link(&format!("../../segments/{i}.m4s"), &params),
+        &stream_link("init.mp4", &params),
     )
     .await
     .map_err(stream_problem)
@@ -1629,10 +1810,11 @@ pub async fn variant_playlist(
 
 pub async fn init_segment(
     State(app): State<App>,
-    caller: Caller,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    observed(&app, &caller, &id).await?;
+    stream_owner(&app, &headers, &params, &id, &generation).await?;
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -1643,10 +1825,11 @@ pub async fn init_segment(
 
 pub async fn media_segment(
     State(app): State<App>,
-    caller: Caller,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
-    observed(&app, &caller, &id).await?;
+    stream_owner(&app, &headers, &params, &id, &generation).await?;
     delivery::segment(State(app), Path((id, generation, segment)))
         .await
         .map_err(stream_problem)

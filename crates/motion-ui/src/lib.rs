@@ -32,10 +32,11 @@ pub use facade::{Facade, UiPrincipal, UiQueryFacade};
 /// The strict baseline policy for server-rendered HTML (plan section 12.5).
 /// No `unsafe-eval`/`unsafe-inline` scripts; Topcoat's reactive runtime is not
 /// admitted. `wasm-unsafe-eval` is for Demuxe's WebAssembly providers only and
-/// does not allow JavaScript string compilation.
+/// does not allow JavaScript string compilation. Demuxe verifies Shaka bytes
+/// against the provider manifest before executing them through a blob script.
 pub const CONTENT_SECURITY_POLICY: &str = concat!(
     "default-src 'self'; ",
-    "script-src 'self' 'wasm-unsafe-eval'; ",
+    "script-src 'self' blob: 'wasm-unsafe-eval'; ",
     "worker-src 'self' blob:; ",
     // The pinned Demuxe archive renders one static shadow-root <style>; allow
     // exactly that text by hash (see DEMUXE_STYLE_HASH), not 'unsafe-inline'.

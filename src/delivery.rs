@@ -1382,6 +1382,24 @@ async fn run_generation(
 /// Fail current generations whose source is no longer an available, enabled,
 /// unchanged catalog file (e.g. after library detach or a rescan).
 async fn revalidate(app: &App, session: &Arc<Session>) {
+    if let Some(owner) = &session.owner {
+        let allowed = async {
+            let mut tx = app.db.begin().await.map_err(crate::v2::Problem::from)?;
+            let device = crate::v2::auth::load_device(&mut tx, &owner.principal).await?;
+            let file = crate::v2::content::file_facts(&mut tx, &owner.file).await?;
+            Ok::<_, crate::v2::Problem>(playscale_core::playback_session::may_continue(
+                owner,
+                device.as_ref().map(|d| &d.device),
+                file.as_ref(),
+            ))
+        }
+        .await;
+        // Observation failures cannot keep unauthorized execution alive.
+        if !matches!(allowed, Ok(true)) {
+            let _ = apply(app, session, Input::Close);
+            return;
+        }
+    }
     let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(&session.file_id)
         .fetch_optional(&app.db)
@@ -1847,12 +1865,17 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
 
 /// A stored representation (original or prepared rendition) served by byte
 /// ranges: no recipe and no encoder. The browser presents the file's default
-/// streams; the pin records that choice.
-fn byte_pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
+/// audio stream; an optional subtitle is extracted separately as WebVTT.
+fn byte_pin(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    subtitle: Option<u32>,
+    operation: Operation,
+) -> Pin {
     Pin {
         source_file: file.id.clone(),
         source_revision: file.revision.clone(),
-        tracks: tracks(audio, None),
+        tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: None,
     }
@@ -2065,20 +2088,44 @@ pub(crate) fn live_view(app: &App, id: &str) -> Option<DeliveryView> {
     Some(view(app, &session, &d))
 }
 
+/// The production reducer owns generation/lease validity for ticket reads too.
+pub(crate) fn serves_generation(app: &App, id: &str, generation: &str) -> bool {
+    let Ok(session) = app.processing.deliveries.session(id) else {
+        return false;
+    };
+    let Ok(generation) = generation_number(generation) else {
+        return false;
+    };
+    session
+        .inner
+        .lock()
+        .unwrap()
+        .delivery
+        .serves(generation, app.processing.deliveries.now_ms())
+}
+
 pub(crate) fn heartbeat_live(
     app: &App,
     id: &str,
     active_generation: &str,
-    position_ms: Option<u64>,
+    observation: Option<(u64, u64)>,
 ) -> Result<DeliveryView, ApiError> {
     let session = app.processing.deliveries.session(id)?;
     let d = apply(
         app,
         &session,
-        Input::Heartbeat {
-            active_generation: generation_number(active_generation)?,
-            position_ms,
-            now_ms: app.processing.deliveries.now_ms(),
+        match observation {
+            Some((sequence, position_ms)) => Input::ObservePlayhead {
+                generation: generation_number(active_generation)?,
+                sequence,
+                position_ms,
+                now_ms: app.processing.deliveries.now_ms(),
+            },
+            None => Input::Heartbeat {
+                active_generation: generation_number(active_generation)?,
+                position_ms: None,
+                now_ms: app.processing.deliveries.now_ms(),
+            },
         },
     )
     .map_err(error)?;
@@ -2118,24 +2165,6 @@ pub(crate) fn activate_live(
         ));
     }
     Ok((acknowledged, false))
-}
-
-/// Report the client's logical playhead for the active generation, which
-/// bounds how far its encoder may run ahead (pacing). Observation only: a
-/// stale generation or a fenced delivery is ignored.
-pub(crate) fn report_playhead(app: &App, id: &str, generation: u64, position_ms: u64) {
-    let Ok(session) = app.processing.deliveries.session(id) else {
-        return;
-    };
-    let _ = apply(
-        app,
-        &session,
-        Input::Heartbeat {
-            active_generation: generation,
-            position_ms: Some(position_ms),
-            now_ms: app.processing.deliveries.now_ms(),
-        },
-    );
 }
 
 /// Close a live delivery and record the fenced state through `conn` (the
@@ -2206,8 +2235,16 @@ pub(crate) async fn change_live(
                 ));
             }
             let pin = match selection.route {
-                Route::Original => byte_pin(&file, selection.audio, Operation::Original),
-                Route::Prepared => byte_pin(&file, selection.audio, Operation::Prepared),
+                Route::Original => {
+                    validate_subtitle(&file, selection.subtitle)?;
+                    byte_pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        Operation::Original,
+                    )
+                }
+                Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
                 Route::Transcode => {
                     validate_route(
                         &file,
@@ -2570,7 +2607,7 @@ async fn admit_owned(
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
         if original {
-            byte_pin(&file, r.audio_track, operation)
+            byte_pin(&file, r.audio_track, r.subtitle_track, operation)
         } else {
             pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
         },
@@ -2635,7 +2672,17 @@ async fn admit_owned(
             .bind(serde_json::to_string(&acknowledgement).map_err(ApiError::internal)?)
             .bind(crate::now()).execute(&mut *transaction).await?;
     }
-    transaction.commit().await?;
+    // Establish the session directory before publication, including byte-only
+    // sessions whose selected subtitles are extracted without an encoder.
+    // Later extraction must never recreate it after terminal cleanup.
+    let directory = runtime.root.join(&session.id);
+    tokio::fs::create_dir(&directory)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Err(error) = transaction.commit().await {
+        let _ = tokio::fs::remove_dir(&directory).await;
+        return Err(error.into());
+    }
     // No await between durable admission and registration/dispatch. The owned
     // task survives a dropped HTTP waiter; shutdown serializes on admission.
     {

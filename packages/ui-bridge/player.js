@@ -27,6 +27,10 @@ function status(message, kind = 'status') {
 async function api(method, path, body, idempotencyKey, signal, extra = {}) {
   const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf, ...extra};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (['POST', 'PUT'].includes(method) && (path.includes('/viewing-sessions') || path.endsWith('/viewing'))) {
+    if (!host?.dataset.viewingEpoch) throw new Error('Reload to establish viewing history identity.');
+    headers['X-Motion-Viewing-Epoch'] = host.dataset.viewingEpoch;
+  }
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
     method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE' || path.endsWith('/events'),
@@ -44,12 +48,16 @@ async function api(method, path, body, idempotencyKey, signal, extra = {}) {
 
 const key = () => crypto.randomUUID().replaceAll('-', '');
 
-function observedCapability() {
+function observedCapability(shared) {
   const video = document.createElement('video');
   const probe = type => (globalThis.MediaSource?.isTypeSupported?.(type) ?? false) || video.canPlayType(type) !== '';
   return {
     client_id: 'motion-ui-bridge', client_build: 'wave0', demuxe_asset_digest: null,
-    transports: video.canPlayType('application/vnd.apple.mpegurl') ? ['http_range', 'hls'] : ['http_range'],
+    // Motion HLS is rolling: native MIME support does not establish live support.
+    transports: shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
+      && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
+      && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"')
+      ? ['http_range', 'hls'] : ['http_range'],
     video_codecs: probe('video/mp4; codecs="avc1.640028"') ? ['avc1'] : [],
     audio_codecs: probe('audio/mp4; codecs="mp4a.40.2"') ? ['mp4a'] : [],
     subtitle_modes: ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
@@ -57,8 +65,8 @@ function observedCapability() {
   };
 }
 
-// Preference vocabulary differs from the planning contract. Automatic retains
-// the server's forced/foreign-audio policy; always is an explicit requirement.
+// Preference vocabulary differs from the planning contract. Automatic selection
+// may be explicitly refused; always requires the first or explicitly selected caption.
 function subtitlePolicy(preference) {
   if (preference === 'off') return 'off';
   if (preference === 'always') return 'require';
@@ -70,7 +78,37 @@ function demuxeSource(generation, origin) {
   if (!['hls', 'http_range'].includes(generation.transport) || typeof value !== 'string' || !value) throw new Error('Invalid media transport');
   const url = new URL(value, origin);
   if (url.origin !== origin || url.username || url.password) throw new Error('Media must use the selected server origin.');
-  return generation.transport === 'hls' ? {url: url.href, format: 'hls'} : url.href;
+  return generation.transport === 'hls' ? {url: url.href, format: 'hls', streaming: {live: true}} : url.href;
+}
+
+// Demuxe startTime is VOD-only. Rolling generations still have a concrete
+// media position: seek through the public live-window API after opening.
+async function openGeneration(element, generation, position, origin) {
+  const target = Math.max(0, (position - generation.media_time_origin_ms) / 1000);
+  const source = demuxeSource(generation, origin);
+  if (generation.transport === 'hls') {
+    await element.open(source);
+    // A live seek window advances while open resolves. Allow at most one
+    // second at its leading edge (including a small execution margin), never
+    // silently jump to the live edge or a later rolling window.
+    const observed = element.player.state;
+    const live = observed.streaming?.live?.seekable;
+    // Demuxe's generic seekable snapshot can lag Shaka's live observation.
+    // Both checks must admit the target, so use their intersection.
+    const ranges = Array.isArray(observed.seekable) && live
+      ? observed.seekable.map(r => ({start: Math.max(r.start, live.start), end: Math.min(r.end, live.end)}))
+      : observed.seekable;
+    let seek = target;
+    if (Array.isArray(ranges) && !ranges.some(r => target >= r.start && target <= r.end)) {
+      const near = ranges.find(r => Number.isFinite(r.start) && Number.isFinite(r.end)
+        && r.start > target && r.start + 0.25 <= target + 1 && r.start + 0.25 <= r.end);
+      if (!near) throw new Error('Requested generation position is outside the live window.');
+      seek = near.start + 0.25;
+    }
+    await element.seek(seek);
+    if (Math.abs(element.player.state.currentTime - target) > 1)
+      throw new Error('Live player did not reach the requested generation position.');
+  } else await element.open(source, {startTime: target});
 }
 
 // A version, quality or audio choice replans the same timeline. An audio
@@ -123,18 +161,18 @@ async function playNext(current = () => true) {
   finally { advancing = false; }
 }
 
-// Same pattern as the existing Motion web client: define the element and,
-// when the installed package supports it, lend it an application-owned
-// runtime with the archive's provider manifest loaded.
+// Observe the installed provider catalog through the public runtime API.
+// Packages with component runtime injection borrow this owner; other packages
+// keep per-player ownership and load the same immutable deployment themselves.
 let runtime;
 async function loadDemuxe(base) {
   runtime ??= (async () => {
-    const [{DemuxeRuntime}, {definePlayerElement, DemuxePlayerElement}] = await Promise.all([
+    const [{DemuxeRuntime}, {definePlayerElement}] = await Promise.all([
       import(`${base}web/generated/index.js`),
       import(`${base}web/generated/player/index.js`),
     ]);
     definePlayerElement();
-    if (typeof DemuxeRuntime !== 'function' || !('runtime' in DemuxePlayerElement.prototype)) return null;
+    if (typeof DemuxeRuntime !== 'function') return null;
     const shared = new DemuxeRuntime({assetBase: base});
     try {
       await shared.providers.load('demuxe-providers.json');
@@ -145,6 +183,10 @@ async function loadDemuxe(base) {
     }
   })().catch(error => { runtime = undefined; throw error; });
   return runtime;
+}
+
+function lendRuntime(element, shared) {
+  if (shared && 'runtime' in element) element.runtime = shared;
 }
 
 /** Ask the server to retire one delivery, exactly once, surviving page unload. */
@@ -245,8 +287,8 @@ async function firstGeneration(delivery, current) {
 // The last viewing session this browser created for a principal/profile/
 // timeline, across server runtimes: the only authority adoptableRevision may
 // recognise as our own.
-const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
-const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
+const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
+const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
 // Written only by a page that is actually leaving (pagehide) and has a session.
 function leaveHandoff(data, session) {
   try { if (session) sessionStorage.setItem(handoffKey(data), JSON.stringify({session, at: Date.now()})); } catch { /* fails closed */ }
@@ -260,10 +302,10 @@ function takeHandoff(data, now = Date.now()) {
   } catch { return null; }
 }
 
-// Outbox is scoped to this server runtime, principal, profile and timeline.
+// Outbox is scoped to server identity/restore epoch, principal, profile and timeline.
 // It contains session/event identities only, never reusable authentication.
 function viewingStorage(data) {
-  const scope = JSON.stringify([data.serverEpoch, data.principalId, data.profileId, data.timelineId]);
+  const scope = JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId]);
   const storageKey = `motion:viewing:${scope}`;
   return {
     load: () => JSON.parse(localStorage.getItem(storageKey) ?? sessionStorage.getItem(storageKey) ?? 'null'),
@@ -278,7 +320,7 @@ function viewingStorage(data) {
       try {
         const prior = JSON.parse(key.slice(15).replace(/:rejected$/, ''));
         return prior[1] === data.principalId && prior[2] === data.profileId && prior[3] === data.timelineId
-          && (prior[0] !== data.serverEpoch || key.endsWith(':rejected'));
+          && (prior[0] !== data.viewingEpoch || key.endsWith(':rejected'));
       } catch { return false; }
     }),
   };
@@ -312,7 +354,7 @@ async function recoverViewing(data, current) {
   const storage = viewingStorage(data);
   if (storage.hasRejected()) {
     const panel = document.getElementById('motion-progress-status');
-    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session.';
+    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or restored or replaced server state. It is retained on this device for reconciliation; it has not been replayed into this session.';
   }
   const saved = storage.load();
   if (!saved) return data.viewingRevision;
@@ -365,12 +407,27 @@ function observeViewing(element, generation, writer, current) {
   });
 }
 
+// Retained across renewal restarts/failed changes of the SAME generation.
+const playheadSequences = new Map();
+function pacingHeartbeat(id, generation, observation) {
+  const body = {active_generation: generation.generation};
+  const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
+  if (['playing', 'paused'].includes(observation?.status) && Number.isSafeInteger(position) && position >= 0) {
+    const key = JSON.stringify([id, generation.generation]);
+    const sequence = (playheadSequences.get(key) ?? 0n) + 1n;
+    playheadSequences.set(key, sequence);
+    body.playhead = {sequence: String(sequence), position_ms: position};
+  }
+  return body;
+}
+
 function renewLease(delivery, generation, current) {
   state.stopLease?.();
   state.stopLease = maintainLease(delivery, generation.generation, {
     current,
     send: async (id, active_generation, signal) => {
-      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+      const body = current() ? pacingHeartbeat(id, generation, state.element?.player.state) : {active_generation};
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, body, undefined, signal);
       if (current()) state.delivery = renewed;
       return renewed;
     },
@@ -391,7 +448,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   const shared = await loadDemuxe(data.demuxeBase);
   if (!current()) throw new Error('Playback ownership changed.');
   const element = document.createElement('demuxe-player');
-  if (shared) element.runtime = shared;
+  lendRuntime(element, shared);
   element.setAttribute('asset-base', data.demuxeBase);
   // Rolling HLS transport time is not the logical movie duration. The Motion
   // controls below the player own seeking for that route.
@@ -403,7 +460,11 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   element.inert = inert;
   host.append(element);
   try {
-    await element.open(demuxeSource(generation, location.origin), {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
+    await openGeneration(element, generation, position, location.origin);
+    if (generation.subtitles_url) {
+      if (generation.media_time_origin_ms !== 0 || typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
+      await element.player.addTextTrack({src: new URL(generation.subtitles_url, location.origin).href, label: 'Selected subtitles', default: true});
+    }
     if (preferences) {
       await element.setVolume(preferences.volume);
       await element.setMuted(preferences.muted);
@@ -647,12 +708,14 @@ async function start() {
   try {
     const viewingRevision = data.canSaveViewing === 'true' ? await recoverViewing(data, current) : null;
     if (!current()) return;
+    const shared = await loadDemuxe(data.demuxeBase);
+    if (!current()) return;
     status('Choosing how to play this on this device…');
     state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
       tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: subtitlePolicy(data.subtitlePolicy), audio_track_id: null, subtitle_track_id: null},
       quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
-      client: observedCapability(), failed_candidate_ids: [],
+      client: observedCapability(shared), failed_candidate_ids: [],
     };
     const opened = await openCandidates(state.planInput, {
       current,
@@ -762,6 +825,7 @@ function close({unloading = false} = {}) {
       } catch { /* The last successfully queued observation remains durable. */ }
     }
     state.epoch++;
+    playheadSequences.clear();
     state.stopLease?.();
     state.stopLease = null;
     // Persist first, then allow a bounded final send before retiring delivery.

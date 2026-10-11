@@ -7,6 +7,8 @@ import path from 'node:path';
 
 const root = path.resolve(import.meta.dirname, '..');
 const deployment = path.resolve(process.env.DEMUXE_DIR ?? path.join(root, 'web/vendor/demuxe'));
+const perPlayer = process.env.DEMUXE_RUNTIME_OWNERSHIP === 'per-player';
+if (perPlayer && process.env.REQUIRE_SHARED_RUNTIME === '1') throw Error('Conflicting deployment ownership requirements');
 const load = name => import(pathToFileURL(path.join(deployment, 'web/generated', name)));
 
 test('installed package has required exports and matches every recorded asset', async () => {
@@ -27,6 +29,7 @@ test('installed package has required exports and matches every recorded asset', 
 });
 
 test('component runtime ownership is mutable only before its first connection', async t => {
+  if (perPlayer) return t.skip('Explicit per-player deployment; shared component ownership is not selected');
   if (typeof (await load('index.js')).DemuxeRuntime !== 'function') return t.skip('Published package has no shared runtime API');
   const {initialElementConfiguration, transitionElementConfiguration} = await load('internal/machine/element-configuration.js');
   const initial = initialElementConfiguration({enabled: false});
@@ -39,6 +42,7 @@ test('component runtime ownership is mutable only before its first connection', 
 });
 
 test('software previews borrow catalog ownership and cannot dispose the shared runtime', async t => {
+  if (perPlayer) return t.skip('Explicit per-player deployment; borrowed preview ownership is not selected');
   const {DemuxeRuntime, SoftwarePreviewProvider} = await load('index.js');
   if (typeof DemuxeRuntime !== 'function') return t.skip('Published package has no shared runtime API');
   const base = new URL('https://example.test/assets/');
@@ -56,4 +60,22 @@ test('software previews borrow catalog ownership and cannot dispose the shared r
     assert.equal(runtime.snapshot.revision, 0);
     assert.equal(runtime.cacheStats.entries, 0);
   } finally { await runtime.destroy(); }
+});
+
+
+test('per-player deployment exposes the component lifecycle and a separate provider observer', async t => {
+  if (!perPlayer) return t.skip('Shared-runtime deployment selected');
+  const {DemuxePlayerElement} = await load('player/index.js');
+  for (const method of ['open', 'destroy']) assert.equal(typeof DemuxePlayerElement.prototype[method], 'function');
+  const {DemuxeRuntime} = await load('index.js');
+  const base = 'https://deployment.test/';
+  t.mock.method(globalThis, 'fetch', async url => {
+    assert.equal(String(url), base + 'demuxe-providers.json');
+    return new Response(await readFile(path.join(deployment, 'demuxe-providers.json')), {status: 200});
+  });
+  const observer = new DemuxeRuntime({assetBase: base});
+  try {
+    await observer.providers.load('demuxe-providers.json');
+    assert.ok(observer.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive'));
+  } finally { await observer.destroy(); }
 });

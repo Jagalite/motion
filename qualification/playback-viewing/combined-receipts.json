@@ -1,0 +1,665 @@
+{
+  "schema": 1,
+  "status": "server_acceptance_passed_product_playback_unqualified",
+  "implementation_commit": "b65524c42d76224781c2f3ed1a748780b7543649",
+  "harness_commit": "7ae375eee2985f91ba11f5448b196189fdcc06a3",
+  "compiler": {
+    "rustc": "1.98.0",
+    "explicit_RUSTC": true,
+    "kyoto": true
+  },
+  "models": {
+    "source": "a672d6cdf3ff522af91c769bca1f62b4a979bd90",
+    "build_job": "586a93e7c4604aa3a57075aaf0eec447",
+    "tests": {
+      "playscale_core": {
+        "exit": 0,
+        "binary_sha256": "27c00eeb98dbf9f5a4f955d84564609125b33042fbf669ee9a3e2eb625074a42"
+      },
+      "delivery_observation_model": {
+        "exit": 0,
+        "binary_sha256": "60eecd59d6d466c102e191cc96d726d1cda4c4b4c7ee4b7e95784f8f604fcccc"
+      },
+      "playback_session_model": {
+        "exit": 0,
+        "binary_sha256": "3eb0697d3011b6e1e4e6846b9df4d0d483b3fcfa3c7022c63c03c9c1afbd58c3"
+      },
+      "timeline_viewing_model": {
+        "exit": 0,
+        "binary_sha256": "4fc62fd2a10043cb85c41d4ce3c14a2251655859fd27b8497def1c8ea03eb9e6"
+      }
+    },
+    "production_core_unchanged_through": "b65524c42d76224781c2f3ed1a748780b7543649"
+  },
+  "router": {
+    "source": "72d52437d41fa51ab036798483d27c69d899ecfe",
+    "build_job": "cf95e4c904f943609687067004ff2ad5",
+    "tests": {
+      "v2_playback": {
+        "exit": 0,
+        "binary_sha256": "81eb825caddb3a0e10c836babb6be698cada1ee68ed3d36bd4d5fcfc74d6f98e"
+      },
+      "v2_organization_viewing": {
+        "exit": 0,
+        "binary_sha256": "e2d9c9e4d41c7429fd99afd72d23732670ba57b7beb4149d0e99b013b505e392"
+      },
+      "access_api": {
+        "exit": 0,
+        "binary_sha256": "fcfc9dd528672a320bd6de32f9aa4ed56f6b63374a8aeb114d308aabed933f78"
+      },
+      "contract": {
+        "exit": 0,
+        "binary_sha256": "93340ec5783e4bdcd515bd00392022702b854cde1549662fbfe7b16a74b4d5aa"
+      }
+    },
+    "test_counts": {
+      "v2_playback": 11,
+      "v2_organization_viewing": 8,
+      "access_api": 32,
+      "contract": 4
+    }
+  },
+  "catalog_rerun": {
+    "source": "b65524c42d76224781c2f3ed1a748780b7543649",
+    "build_job": "629ec17517d04506bfca791fc9e8a550",
+    "tests": {
+      "v2_metadata_processing": {
+        "exit": 0,
+        "binary_sha256": "4871a38b1806d7d16bc5fcefea5f5e56e3238d182173750416be5bcc13b05398"
+      }
+    },
+    "test_counts": {
+      "v2_metadata_processing": 17
+    }
+  },
+  "live": {
+    "binary_sha256": "c4b9fd52e2c4faf455b3bad5c2493e11e2b016ab61857e639c0711065cb0b6ea",
+    "checks": {
+      "tcp-playback": 0,
+      "viewing": 0,
+      "restore": 0,
+      "go-terminal": 0,
+      "upgrade": 0
+    },
+    "harness_source": "14d5d72363be155c83107a8a27d112fa4cc9d8dd",
+    "server_build_source": "72d52437d41fa51ab036798483d27c69d899ecfe"
+  },
+  "upgrade": {
+    "baseline_commit": "52491bf3e6ef323a33dd546687129bdb3b51d4d1",
+    "baseline_sha256": "64ab9dbf99d1c3f44ed3f0d835dfbc7e3d7d224c53e8f7bbc2cc5976fdef87e5",
+    "candidate_sha256": "c4b9fd52e2c4faf455b3bad5c2493e11e2b016ab61857e639c0711065cb0b6ea",
+    "checks": {
+      "baseline_state_and_operator_backup": {
+        "observed": {
+          "item_id": "69b43e49-23a0-4be3-9357-1aa55d3e3fc3",
+          "file_id": "f02761c3-35a7-4b8d-ab66-d46952eb5ad3",
+          "title": "Upgrade Signal",
+          "library_ids": [
+            "a4a2499d-0819-4a68-a0a2-debc9e36a66c"
+          ],
+          "media_sha256": "63d4d323c3549a6e42db3c02d0e1e145b5574072daa7a484c5d31bf833340b57",
+          "position_seconds": 1.25
+        },
+        "schema": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "in_place_upgrade": {
+        "from": 9,
+        "to": 41,
+        "candidate_anonymous_status": 401,
+        "upgrade_backup": "pre-upgrade-9-to-41-1791695030-6f075072-db5c-4a82-a3b5-81c484790d57.sqlite3"
+      },
+      "restart_is_not_an_upgrade": {
+        "upgrade_backups": 1,
+        "receipt_ids_unchanged": true
+      },
+      "baseline_refuses_newer_schema": {
+        "exit_code": 1,
+        "diagnostic": "migration 10 was previously applied but is missing"
+      },
+      "rollback_to_baseline": [
+        "operator_backup_via_candidate_restore",
+        "automatic_pre_upgrade_backup"
+      ],
+      "candidate_backup_restore": {
+        "schema_versions": [
+          41
+        ],
+        "restore_epoch_rotated": true
+      }
+    }
+  },
+  "javascript": {
+    "passed": 79,
+    "failed": 0
+  },
+  "go_api": {
+    "passed": 20,
+    "failed": 0,
+    "build_job": "fedf8f97479a499b82d061118c5b38c2",
+    "binary_sha256": "e06bb509dee8cb348eed227d782900698cd85edccc15a61badfeb7d6f80a16e1"
+  },
+  "browser": {
+    "started": "2026-10-11T05:10:35.204Z",
+    "kind": "production-evidence",
+    "server": {
+      "sha256": "c438491e1ff31942190aefd9afacba5fc906e20f0b744c7c4ab9f00e20b31e0d",
+      "source_commit": "14d5d72363be155c83107a8a27d112fa4cc9d8dd",
+      "build_job": "69674c954bee4338bf07d1a20386c714"
+    },
+    "demuxe": {
+      "version": "1.1.1",
+      "archive_sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274",
+      "deployment": "composed-providers",
+      "providers": [
+        {
+          "name": "@demuxe/provider-shaka",
+          "version": "1.1.1",
+          "archive_sha256": "c77762ea95c667bd4b78fc640ace658f6fc17aa48847df50e336d9495c9e1471"
+        }
+      ],
+      "composer_sha256": "b86066b90a41eccdc4528c7843043f388448217bb67ff23c8974b781b6e16451",
+      "receipt_sha256": "f48783ba7d7b16c6c56f9fa6662a8a1e71d9f651aea77da074315ef9f63f484e",
+      "manifest_sha256": "485f333a86b587d402f79a9d54fef3e098855786471047fd50dbbfbdc32ea574"
+    },
+    "source": {
+      "role": "harness-worktree",
+      "commit": "7ae375eee2985f91ba11f5448b196189fdcc06a3",
+      "diff_sha256": "8fa11d71f6ed79ac60640a28f522d081f274062e0254e7ca56a8468bee79f169",
+      "dirty_scope": "qualification and plan documentation only"
+    },
+    "engines": {
+      "chromium": {
+        "versions": {
+          "chromium": "156.0.8078.4"
+        },
+        "checks": [
+          {
+            "name": "browser session from paired credential",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "item page shows viewing state and Play",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original plan selects byte-range original",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "player ready",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original playback advances",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original bytes served by range",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "seek replaces the generation at 40 s",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "seek staged and activated generation 2",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "progress persisted on the server",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "ordered viewing events accepted with consecutive sequences",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "item page offers Resume at the saved position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "resume starts at the saved position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio selector lists both tracks of the planned version",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio switch replans to a live HLS conversion",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "HLS manifest, variant, init and segments served",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio switch replaces the player over HLS and keeps position",
+            "status": "fail",
+            "gap": null,
+            "detail": {
+              "before": 49.6,
+              "switched": {
+                "options": [
+                  "",
+                  "a0",
+                  "a1"
+                ],
+                "replaced": false,
+                "alert": "Playback change failed: Requested generation position is outside the live window."
+              },
+              "switchedPlay": {
+                "advancing": true,
+                "from": 50.599946,
+                "to": 52.830032,
+                "logical": 52.8,
+                "mode": "native"
+              }
+            }
+          },
+          {
+            "name": "a failed switch keeps the original player playing",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "an event sent during the outage is queued in the durable outbox",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the queued event is accepted after restart with its original identity",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "after restart the player reopens at durable progress",
+            "status": "pass",
+            "gap": null,
+            "detail": {
+              "durable": 54251,
+              "afterReady": 54251,
+              "admissionStart": 54251,
+              "afterRestart": {
+                "ready": {
+                  "state": "ready",
+                  "text": ""
+                },
+                "resume": 54251,
+                "banner": ""
+              },
+              "restartPlay": {
+                "advancing": true,
+                "from": 54.252907,
+                "to": 56.324138,
+                "logical": 56.3,
+                "mode": "native"
+              }
+            }
+          },
+          {
+            "name": "after restart the cookie session authorizes playback",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "a prepared rendition is produced by a real v2 preparation",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "Convert plans the prepared rendition by byte range",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the predecessor delivery is retired after the switch",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "progress continues on the rebound session",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "leaving the player retires its own delivery",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "home continue watching matches server viewing state",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "converted title plays in the Motion player",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "diagnostic: server live HLS conversion in a plain video element",
+            "status": "diagnostic-fail",
+            "gap": null
+          },
+          {
+            "name": "candidate setup and browser traffic use v2",
+            "status": "pass",
+            "gap": null
+          }
+        ],
+        "serverStartsMs": [
+          2856,
+          108
+        ],
+        "summary": {
+          "pass": 30,
+          "blocked": 0,
+          "fail": 1
+        }
+      },
+      "webkit": {
+        "versions": {
+          "webkit": "27.2"
+        },
+        "checks": [
+          {
+            "name": "browser session from paired credential",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "item page shows viewing state and Play",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original plan selects byte-range original",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "player ready",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original playback advances",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "original bytes served by range",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "seek replaces the generation at 40 s",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "seek staged and activated generation 2",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "progress persisted on the server",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "ordered viewing events accepted with consecutive sequences",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "item page offers Resume at the saved position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "resume starts at the saved position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio selector lists both tracks of the planned version",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio switch replans to a live HLS conversion",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "HLS manifest, variant, init and segments served",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "audio switch replaces the player over HLS and keeps position",
+            "status": "fail",
+            "gap": null,
+            "detail": {
+              "before": 50,
+              "switched": {
+                "options": [
+                  "",
+                  "a0",
+                  "a1"
+                ],
+                "replaced": false,
+                "alert": "Playback change failed: Requested generation position is outside the live window."
+              },
+              "switchedPlay": {
+                "advancing": true,
+                "from": 51.28347691666657,
+                "to": 53.29386262533009,
+                "logical": 53.3,
+                "mode": "native"
+              }
+            }
+          },
+          {
+            "name": "a failed switch keeps the original player playing",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "an event sent during the outage is queued in the durable outbox",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the queued event is accepted after restart with its original identity",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "after restart the player reopens at durable progress",
+            "status": "pass",
+            "gap": null,
+            "detail": {
+              "durable": 54561,
+              "afterReady": 54575,
+              "admissionStart": 54575,
+              "afterRestart": {
+                "ready": {
+                  "state": "ready",
+                  "text": ""
+                },
+                "resume": 54575,
+                "banner": ""
+              },
+              "restartPlay": {
+                "advancing": true,
+                "from": 54.575,
+                "to": 56.57620454099877,
+                "logical": 56.6,
+                "mode": "native"
+              }
+            }
+          },
+          {
+            "name": "after restart the cookie session authorizes playback",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "a prepared rendition is produced by a real v2 preparation",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "Convert plans the prepared rendition by byte range",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "the predecessor delivery is retired after the switch",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "progress continues on the rebound session",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "leaving the player retires its own delivery",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "home continue watching matches server viewing state",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+            "status": "pass",
+            "gap": null
+          },
+          {
+            "name": "converted title plays in the Motion player",
+            "status": "fail",
+            "gap": null,
+            "detail": {
+              "legacyReady": {
+                "state": "failed",
+                "text": "Playback could not start: Requested generation position is outside the live window. (Playback is blocked: all_candidates_failed)"
+              },
+              "legacyPlay": {
+                "advancing": false,
+                "reason": "no player"
+              }
+            }
+          },
+          {
+            "name": "diagnostic: server live HLS conversion in a plain video element",
+            "status": "diagnostic-pass",
+            "gap": null
+          },
+          {
+            "name": "candidate setup and browser traffic use v2",
+            "status": "pass",
+            "gap": null
+          }
+        ],
+        "serverStartsMs": [
+          398,
+          199
+        ],
+        "summary": {
+          "pass": 29,
+          "blocked": 0,
+          "fail": 2
+        }
+      }
+    },
+    "media": [
+      {
+        "name": "Legacy Broadcast.mkv",
+        "sha256": "b98745170eb8d630d2aabb64223b2f18f8eba0a8bd74ab65b95edc084efc4715"
+      },
+      {
+        "name": "Signal Film.mp4",
+        "sha256": "148dff3c0ff2d368e895bf6ff27702a0c721c9de50a43405ef293c545f3a376a"
+      }
+    ],
+    "finished": "2026-10-11T05:12:51.188Z",
+    "result": "fail"
+  },
+  "fast_ci": {
+    "source": "b65524c42d76224781c2f3ed1a748780b7543649",
+    "url": "https://github.com/Jagalite/motion/actions/runs/38113622580",
+    "conclusion": "success"
+  },
+  "remaining_gates": [
+    "intermittent deployed live-window startup and switching refusals",
+    "installed Electron/package and physical media matrix",
+    "positive Next via public release-order provisioning",
+    "default-entry cutover then legacy writer retirement/no-mutation acceptance",
+    "full macOS CI"
+  ],
+  "log_sha256": {
+    "access_api.log": "f979622ef7c8ee72f058b67e349400f7f17b62817c5d87e812f08cc37610cb8a",
+    "browser-accepted.log": "77b8c274b8b6d289a840a71c1c322fdd06c49d85c3194879a7e2b165c19d2a6e",
+    "browser-final.log": "2957666612abf7eb81b5c96887b5679f6b18b07d1aec8492b85495ac8cf0f147",
+    "browser.log": "5e43785dfc678ced796cad7e8336a4505fa2f4415e00393b7836892db78a9567",
+    "contract-structure.log": "cb34432daca6fb3bfd8fb853b8236d356c2b3b128065c0a45761ae8d4c4eaff3",
+    "contract.log": "992e3e7e1fd236a077ed5c2da53e63f8c01f2f71494e198b19fd2cbd0d8b8648",
+    "go-api.log": "d0cdaf036a8208def68c74bd1113dc69f0a20698e7982af15f2d5ddb4a371f49",
+    "go-terminal.log": "a53b67ecc18431625d6186bd4e40c308e27624345be8cb93c03cae8fa9a05afb",
+    "javascript.log": "e2435be555727796c36880728a71d93995c804c4d0e9161948251d1e7d49a462",
+    "restore.log": "d7201aa39fc9f84f489d7edc398bad5f6143719a426c70ccf258a5155ed8801d",
+    "tcp-playback.log": "8c6076ac9c1171cbde1c2ce7f23981a79510da1ecd8340285a00e0e6b4d42bf2",
+    "upgrade.log": "edbec6451dfc1cf07da231fc00a8ddaffcee9bf264409e614a859d2b5335fbbc",
+    "v2_metadata_processing.log": "30390c8db1eb3879e850707e7da02c2980368a50b031b0151b06dbbd9d02eece",
+    "v2_organization_viewing.log": "acf833e257c5262cb89a9f12d8ed12e931a8a146a5c4b17cb21efb3d9fedc835",
+    "v2_playback.log": "1ee8521351a519d7569a60109f019d5dbdb1f13abdafa0d9c4bc38c9dbab5f76",
+    "viewing.log": "acd012e5f16b14847489d9147834740b7a14abfff10b2851c94d88cbc78010d3"
+  }
+}
