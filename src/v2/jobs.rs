@@ -23,7 +23,7 @@ pub fn routes() -> Router<App> {
         .route("/jobs/{id}/retry", post(retry))
 }
 #[derive(sqlx::FromRow)]
-struct Row {
+pub(crate) struct Row {
     id: String,
     revision: i64,
     kind: String,
@@ -34,7 +34,7 @@ struct Row {
     requester_id: String,
 }
 impl Row {
-    fn wire(&self) -> Value {
+    pub(crate) fn wire(&self) -> Value {
         json!({"id":self.id,"revision":self.revision.to_string(),"kind":self.kind,"phase":self.phase,"attempt_generation":self.attempt.to_string(),"progress":Value::Null,"error_code":self.error.as_ref().map(|_|"worker_failed"),"result_ids":self.result_id.iter().collect::<Vec<_>>(),"requester_id":self.requester_id})
     }
     fn response(&self) -> Response {
@@ -44,7 +44,7 @@ impl Row {
         r
     }
 }
-async fn row(
+pub(crate) async fn row(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
     principal: &access::Principal,
@@ -106,14 +106,22 @@ async fn control(
     headers: HeaderMap,
     retry: bool,
 ) -> Result<Response, Problem> {
-    caller.require(Permission::ProcessingRequest)?;
+    // Permission is selected after loading the durable job kind.
     let key = idempotency_key(&headers)?;
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
-    let principal = caller
-        .reauthorize(&mut tx, Some(Permission::ProcessingRequest))
-        .await?;
+    let principal = caller.reauthorize(&mut tx, None).await?;
     let old = row(&mut tx, &id, &principal).await?;
+    let permission = if old.kind == "backup" {
+        Permission::SystemAdmin
+    } else if old.kind == "metadata" {
+        Permission::CatalogWrite
+    } else {
+        Permission::ProcessingRequest
+    };
+    if !principal.allows(permission) {
+        return Err(access::AccessError::Forbidden(permission).into());
+    }
     let record = Scope {
         principal: &principal.id,
         operation: if retry { "retryJob" } else { "cancelJob" },
@@ -161,6 +169,18 @@ async fn control(
     if next != state {
         if old.kind == "scan" {
             sqlx::query("UPDATE jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        } else if old.kind == "metadata" {
+            sqlx::query("UPDATE metadata_jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        } else if old.kind == "backup" {
+            sqlx::query("UPDATE backup_jobs SET phase=?,error=NULL WHERE id=?")
                 .bind(crate::db::phase_name(next.phase))
                 .bind(&id)
                 .execute(&mut *tx)

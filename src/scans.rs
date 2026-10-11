@@ -167,6 +167,18 @@ pub async fn request(
 ) -> Result<ScanView, ScanError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let view = request_in(&mut tx, library, sources, verify, require_complete).await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+pub(crate) async fn request_in(
+    tx: &mut SqliteConnection,
+    library: &str,
+    sources: Option<&[String]>,
+    verify: bool,
+    require_complete: bool,
+) -> Result<ScanView, ScanError> {
     let members: Vec<(String, bool)> = sqlx::query_as(
         "SELECT s.id,s.enabled FROM library_sources l JOIN sources s ON s.id=l.source_id WHERE l.library_id=? ORDER BY s.id",
     )
@@ -197,13 +209,15 @@ pub async fn request(
         return Err(ScanError::NoSources);
     }
     let id = new_id();
-    sqlx::query("INSERT INTO scan_requests VALUES (?,?,?,?)")
-        .bind(&id)
-        .bind(library)
-        .bind(require_complete)
-        .bind(now())
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(library)
+    .bind(require_complete)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
     for (source, enabled) in selected {
         let demand_id = new_id();
         if !enabled {
@@ -224,21 +238,20 @@ pub async fn request(
             require_complete,
             status: DemandStatus::Pending,
         };
-        let current: Vec<Attempt> = attempts(&mut tx, &source)
+        let current: Vec<Attempt> = attempts(tx, &source)
             .await?
             .into_iter()
             .map(|(a, _)| a)
             .collect();
         match core::admit(&demand, &current) {
             Admission::Join { .. } => {}
-            Admission::UpgradeQueued { job } => upgrade(&mut tx, &job).await?,
-            Admission::Enqueue => enqueue(&mut tx, &source, verify).await?,
+            Admission::UpgradeQueued { job } => upgrade(tx, &job).await?,
+            Admission::Enqueue => enqueue(tx, &source, verify).await?,
         }
         sqlx::query("INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status) VALUES (?,?,?,?,?,'pending')")
             .bind(&demand_id).bind(&id).bind(&source).bind(barrier).bind(verify).execute(&mut *tx).await?;
     }
-    tx.commit().await?;
-    get(&app.db, &id).await
+    get_in(tx, &id).await
 }
 
 /// A filesystem change hint: later demands require a newer traversal.
@@ -259,6 +272,12 @@ pub async fn mark_dirty(app: &App, source: &str) -> Result<(), ScanError> {
 pub async fn cancel(app: &App, id: &str) -> Result<ScanView, ScanError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let view = cancel_in(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+pub(crate) async fn cancel_in(tx: &mut SqliteConnection, id: &str) -> Result<ScanView, ScanError> {
     let mine: Vec<(String, String)> = sqlx::query_as(
         "SELECT id,source_id FROM scan_demands WHERE request_id=? AND status='pending'",
     )
@@ -266,11 +285,11 @@ pub async fn cancel(app: &App, id: &str) -> Result<ScanView, ScanError> {
     .fetch_all(&mut *tx)
     .await?;
     for (demand_id, source) in mine {
-        let pending = demands(&mut tx, &source).await?;
+        let pending = demands(tx, &source).await?;
         let Some(demand) = pending.iter().find(|d| d.id == demand_id).cloned() else {
             continue;
         };
-        let current = attempts(&mut tx, &source).await?;
+        let current = attempts(tx, &source).await?;
         let plain: Vec<Attempt> = current.iter().map(|(a, _)| a.clone()).collect();
         let (status, stop) = core::cancel(&demand, &pending, &plain);
         sqlx::query("UPDATE scan_demands SET status=? WHERE id=?")
@@ -287,8 +306,7 @@ pub async fn cancel(app: &App, id: &str) -> Result<ScanView, ScanError> {
                 .await?;
         }
     }
-    tx.commit().await?;
-    get(&app.db, id).await
+    get_in(tx, id).await
 }
 
 /// Inside the attempt's terminal transaction: answer the demands it satisfies
@@ -352,6 +370,12 @@ pub(crate) async fn reconcile_all(conn: &mut SqliteConnection) -> anyhow::Result
 
 pub async fn get(db: &sqlx::SqlitePool, id: &str) -> Result<ScanView, ScanError> {
     let mut tx = db.begin().await?;
+    let view = get_in(&mut tx, id).await?;
+    tx.commit().await?;
+    Ok(view)
+}
+
+pub(crate) async fn get_in(tx: &mut SqliteConnection, id: &str) -> Result<ScanView, ScanError> {
     let (library_id, require_complete): (String, bool) =
         sqlx::query_as("SELECT library_id,require_complete FROM scan_requests WHERE id=?")
             .bind(id)
@@ -364,7 +388,6 @@ pub async fn get(db: &sqlx::SqlitePool, id: &str) -> Result<ScanView, ScanError>
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    tx.commit().await?;
     let mut sources = Vec::with_capacity(rows.len());
     for (source_id, status, job_id, error, complete, incomplete) in rows {
         sources.push(SourceResult {

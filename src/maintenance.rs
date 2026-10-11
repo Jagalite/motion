@@ -276,6 +276,7 @@ async fn clean_with(
     Ok(removed)
 }
 pub async fn tick(app: &App) -> anyhow::Result<()> {
+    crate::v2::schedules::tick(app).await?;
     let rows: Vec<Schedule> = sqlx::query_as("SELECT * FROM scan_schedules WHERE next_run<=?")
         .bind(now())
         .fetch_all(&app.db)

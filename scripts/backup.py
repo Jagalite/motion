@@ -93,7 +93,7 @@ def restore(source, data):
     if data.exists():
         raise ValueError('Restore requires a new, nonexistent data directory')
     manifest_path = source / 'manifest.json'
-    if manifest_path.stat().st_size > 65536:
+    if manifest_path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError('Manifest too large')
     manifest = json.loads(manifest_path.read_text())
     database = source / 'playscale.sqlite3'

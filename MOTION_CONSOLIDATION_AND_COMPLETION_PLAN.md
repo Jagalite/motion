@@ -283,6 +283,7 @@ packaging or other helper scripts.
   integration/release owner coordinates the necessary combined-tree and installed
   product runs; individual lanes do not repeat them for every commit.
 
+Set `KYOTO_SCRIPT` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
@@ -335,7 +336,7 @@ Use four bounded lanes. These are assignments to make, not agents already runnin
 
 | Lane | Owns | Boundary |
 |---|---|---|
-| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization adapters, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
+| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization adapters, preparation/processing capabilities, recipes/renditions, schedule CRUD, storage/backup APIs, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
 | Playback/viewing (A06/A07/A08) | C02 playback service facts, C05/C06/C08, planning, tickets, generation and authority policies | Propose contract changes through A00; coordinate capability transport edits with the API owner and package/player decisions with clients/release. |
 | Clients (A10–A12) | All current client callers, Topcoat cutover, Go capability use, C07 player integration, real-client acceptance | No independent catalog or viewing authority; fixtures remain explicitly labeled. |
 | Integration/release (A00/A05/A14) | Contract/evidence ledger, C03/C09, CI, manifests, source/package reconstruction, final integration | Owns root manifests/lockfiles and shared-file integration; implementation lanes still own their regression tests. |
@@ -388,3 +389,21 @@ Current lane-4 implementation and integration gates are recorded in
       integrated revision; blocked/skipped/deferred cases remain visible.
 - [ ] Status documentation reflects the merged implementation and exact evidence.
 - [ ] M5/M6 requirements and explicit provider/platform deferrals remain tracked.
+
+### Data/catalog completion ownership update (PR #17)
+
+Data/catalog owns the missing `getProcessingCapabilities`, `listRecipes`,
+`createPreparation`, `listRenditions`, all five schedule operations,
+`getStorage`, `createBackup`, and `listBackups`. These are no longer unassigned
+cross-lane dependencies. Migrations 0038-0041 are allocated in MIGRATIONS.md;
+coordinate subsequent schema numbers with this lane and preserve prior files.
+
+The exact client interface and supported values are recorded in
+DATA_CATALOG_CLIENT_HANDOFF.md. Preparation and backup adapters reuse existing
+services, with durable request identities and publication/recovery checks.
+Scan and metadata-refresh schedules execute; preview/optimize scheduling and
+automated generated-cache restore remain explicit service gaps. Route inventory
+alone does not close M1/M3. Real HTTP preparation/backup acceptance,
+schema 9→41 upgrade repairs and scoped-smart regression checks pass; exact
+receipts are in qualification/data-catalog. Browser/client and combined-package
+acceptance remain separate gates; prior receipts bind only their recorded commits.

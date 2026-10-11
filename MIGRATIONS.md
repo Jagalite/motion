@@ -33,6 +33,20 @@ applying any pending migration to an existing database.
 | 0032 | `0032_timeline_viewing.sql` | A07 | v2 timeline-keyed viewing state, viewing sessions and acknowledged events; backfill only from exact attributions or single-timeline works |
 | 0033 | `0033_delivery_owners.sql` | A07 | durable v2 delivery owner (principal, profile, timeline, version, source) |
 
+| 0034 | `0034_scan_api_revisions.sql` | A02 data/catalog completion | public scan representation revisions |
+
+| 0035 | `0035_catalog_adapter_state.sql` | A02 data/catalog completion | timeline representation revisions and unselected artwork ownership |
+
+| 0036 | `0036_metadata_jobs.sql` | A02 data/catalog completion | durable local metadata refresh jobs and authorization witnesses |
+
+| 0037 | `0037_smart_collection_revisions.sql` | A02 data/catalog completion | durable invalidation of evaluated smart collections |
+
+| 0038 | `0038_completion_api_state.sql` | Data/catalog PR #17 | durable preparation identity |
+| 0039 | `0039_logical_schedules.sql` | Data/catalog PR #17 | logical schedules and rendition representation invalidation |
+| 0040 | `0040_backup_requests.sql` | Data/catalog PR #17 | durable backup jobs and receipts |
+
+| 0041 | `0041_schedule_dispatch_progress.sql` | Data/catalog PR #17 | bounded resumable metadata schedule fanout |
+
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`

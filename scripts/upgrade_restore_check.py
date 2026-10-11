@@ -181,19 +181,29 @@ def upgrade_receipts(path, item_id):
         timelines = [t for (t,) in db.execute(
             'SELECT t.id FROM timelines t JOIN editions e ON e.id = t.edition_id WHERE e.item_id = ? ORDER BY t.id',
             (item_id,))]
+        viewing = db.execute(
+            'SELECT profile_id,timeline_id,position_ms,revision,manual_epoch '
+            'FROM timeline_viewing WHERE timeline_id IN '
+            '(SELECT t.id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE e.item_id=?) '
+            'ORDER BY profile_id,timeline_id', (item_id,)).fetchall()
     finally:
         db.close()
     kinds = [kind for _, kind, _ in receipts]
-    assert kinds == ['migration:legacy_progress', 'migration:schema'], kinds
-    progress_receipt, schema_receipt = receipts
+    assert kinds == ['migration:legacy_progress', 'migration:schema',
+                     'migration:timeline_progress_repair'], kinds
+    progress_receipt, schema_receipt, repair_receipt = receipts
     assert json.loads(progress_receipt[2]) == {'outcomes': {'exact': 1}}, progress_receipt
     # The fixture has one timeline holding one original: attribution is exact,
     # to that timeline, with it as the only candidate.
     assert len(timelines) == 1, timelines
+    # The single-timeline schema backfill is already exact; repair preserves it.
+    assert json.loads(repair_receipt[2]) == {'imported': 0, 'retracted_unattributed': 0}, repair_receipt
+    assert viewing == [('default', timelines[0], round(POSITION * 1000), 0, 0)], viewing
     expected = [('default', item_id, 'exact', timelines[0], json.dumps([[timelines[0], 1]], separators=(',', ':')),
                  progress_receipt[0])]
     assert attribution == expected, (attribution, expected)
-    return {'receipts': receipts, 'attribution': attribution, 'schema': json.loads(schema_receipt[2])}
+    return {'receipts': receipts, 'attribution': attribution, 'timeline_viewing': viewing,
+            'schema': json.loads(schema_receipt[2])}
 
 
 def upgrade_backups(data):

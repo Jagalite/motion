@@ -124,37 +124,7 @@ pub async fn upload(
             "Image body could not be read",
         )
     })?;
-    let permit = DECODERS.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "decoder_busy",
-            "Image decoder capacity exhausted",
-        )
-    })?;
-    let (asset, mime, width, height, bytes) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
-            .with_guessed_format()
-            .map_err(ApiError::internal)?;
-        let mime = match reader.format() {
-            Some(image::ImageFormat::Png) => "image/png",
-            Some(image::ImageFormat::Jpeg) => "image/jpeg",
-            Some(image::ImageFormat::WebP) => "image/webp",
-            _ => return Err(ApiError::bad("Expected PNG, JPEG or WebP image")),
-        };
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(8192);
-        limits.max_image_height = Some(8192);
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        reader.limits(limits);
-        let decoded = reader.decode().map_err(|_| {
-            ApiError::bad("Image decoding failed or exceeds dimension/memory limits")
-        })?;
-        let asset = format!("{:x}", Sha256::digest(&bytes));
-        Ok((asset, mime, decoded.width(), decoded.height(), bytes))
-    })
-    .await
-    .map_err(ApiError::internal)??;
+    let (asset, mime, width, height, bytes) = decode_upload(bytes).await?;
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
     let revision: Option<i64> = sqlx::query_scalar(
@@ -260,4 +230,40 @@ pub async fn content(
         return Ok((StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response());
     }
     Ok(([("content-type", mime), ("etag", etag)], bytes).into_response())
+}
+
+pub(crate) async fn decode_upload(
+    bytes: Bytes,
+) -> Result<(String, &'static str, u32, u32, Bytes), ApiError> {
+    let permit = DECODERS.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decoder_busy",
+            "Image decoder capacity exhausted",
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(ApiError::internal)?;
+        let mime = match reader.format() {
+            Some(image::ImageFormat::Png) => "image/png",
+            Some(image::ImageFormat::Jpeg) => "image/jpeg",
+            Some(image::ImageFormat::WebP) => "image/webp",
+            _ => return Err(ApiError::bad("Expected PNG, JPEG or WebP image")),
+        };
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(8192);
+        limits.max_image_height = Some(8192);
+        limits.max_alloc = Some(64 * 1024 * 1024);
+        reader.limits(limits);
+        let decoded = reader.decode().map_err(|_| {
+            ApiError::bad("Image decoding failed or exceeds dimension/memory limits")
+        })?;
+        let asset = format!("{:x}", Sha256::digest(&bytes));
+        Ok((asset, mime, decoded.width(), decoded.height(), bytes))
+    })
+    .await
+    .map_err(ApiError::internal)?
 }

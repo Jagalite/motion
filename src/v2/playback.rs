@@ -705,7 +705,11 @@ fn client_support(
 }
 
 /// `a{n}` / `s{n}`: the n-th audio or subtitle stream of the planned file.
-fn track_index(id: &Option<String>, prefix: char, count: usize) -> Result<Option<u32>, Problem> {
+pub(crate) fn track_index(
+    id: &Option<String>,
+    prefix: char,
+    count: usize,
+) -> Result<Option<u32>, Problem> {
     let Some(id) = id else { return Ok(None) };
     id.strip_prefix(prefix)
         .and_then(|n| n.parse::<u32>().ok())
