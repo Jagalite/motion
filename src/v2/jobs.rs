@@ -112,7 +112,9 @@ async fn control(
     let mut tx = begin_write(&app.db).await?;
     let principal = caller.reauthorize(&mut tx, None).await?;
     let old = row(&mut tx, &id, &principal).await?;
-    let permission = if old.kind == "metadata" {
+    let permission = if old.kind == "backup" {
+        Permission::SystemAdmin
+    } else if old.kind == "metadata" {
         Permission::CatalogWrite
     } else {
         Permission::ProcessingRequest
@@ -173,6 +175,12 @@ async fn control(
                 .await?;
         } else if old.kind == "metadata" {
             sqlx::query("UPDATE metadata_jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        } else if old.kind == "backup" {
+            sqlx::query("UPDATE backup_jobs SET phase=?,error=NULL WHERE id=?")
                 .bind(crate::db::phase_name(next.phase))
                 .bind(&id)
                 .execute(&mut *tx)

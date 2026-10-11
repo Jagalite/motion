@@ -195,3 +195,28 @@ impl PreparationFacts {
         Ok(())
     }
 }
+
+pub struct RenditionFacts {
+    pub expired: bool,
+    pub phase: jobs::Phase,
+    pub source_current: bool,
+    pub binding_current: bool,
+    pub output_current: bool,
+}
+pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
+    if facts.expired {
+        "expired"
+    } else if matches!(facts.phase, jobs::Phase::Failed | jobs::Phase::Cancelled) {
+        "failed"
+    } else if !facts.source_current || !facts.binding_current {
+        "stale"
+    } else if facts.phase == jobs::Phase::Completed {
+        if facts.output_current {
+            "ready"
+        } else {
+            "stale"
+        }
+    } else {
+        "pending"
+    }
+}

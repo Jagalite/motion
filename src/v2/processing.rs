@@ -113,6 +113,16 @@ async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Val
             "lavfi",
             "-i",
             "color=s=16x16:d=0.04",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-vf",
+            "scale=16:16",
+            "-c:a",
+            "aac",
+            "-t",
+            "0.04",
             "-frames:v",
             "1",
             "-c:v",
@@ -130,7 +140,7 @@ async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Val
         .await
         .is_ok_and(|r| r.is_ok_and(|s| s.success()));
     Ok(Json(
-        json!({"ffmpeg_digest":digest,"pipelines":[{"id":"software_h264","decode":"ffmpeg","filters":["scale"],"encode":"libx264","backend":"software","available":available,"qualification":"unqualified","receipt_id":Value::Null}],"interactive_slots":1,"background_slots":1}),
+        json!({"ffmpeg_digest":digest,"pipelines":[{"id":"software_h264","decode":"ffmpeg","filters":["scale"],"encode":"libx264","backend":"software","available":available,"qualification":"unqualified","receipt_id":Value::Null}],"interactive_slots":0,"background_slots":1}),
     ))
 }
 
@@ -192,7 +202,9 @@ pub(crate) async fn publication_facts(
     )
     .await
     .ok();
-    let facts = super::content::file_facts(conn, &job.source_file_id).await?;
+    let facts = super::content::file_facts(conn, &job.source_file_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.code))?;
     let source_in_scope = principal.as_ref().is_some_and(|p| {
         facts.as_ref().is_some_and(|f| {
             f.library_ids
@@ -311,6 +323,22 @@ async fn prepare(
     }
     let tracks: Vec<crate::db::Track> =
         serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
+    if input.recipe_id == "h264720p"
+        && !tracks.iter().any(|t| {
+            t.kind == "video"
+                && t.width.is_some()
+                && t.height.is_some()
+                && !matches!(
+                    t.color_transfer.as_deref(),
+                    Some("smpte2084" | "arib-std-b67")
+                )
+        })
+    {
+        return Err(Problem::invalid(
+            "preparation_video_unsupported",
+            "H.264 preparation requires a probed SDR video stream with known dimensions",
+        ));
+    }
     super::playback::track_index(
         &input.tracks.audio_track_id,
         'a',
@@ -370,8 +398,9 @@ async fn renditions(
         Option<String>,
         Option<String>,
         bool,
+        bool,
     );
-    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,j.revision,j.expired,j.output_file_id,o.revision,f.revision,coalesce(o.available,0) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id WHERE j.id>? AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
     for (
         id,
@@ -386,20 +415,19 @@ async fn renditions(
         output_revision,
         current,
         available,
+        source_available,
     ) in rows
     {
         let binding = exact_binding(&mut tx, &timeline, &file, &revision).await?;
-        let status = if expired {
-            "expired"
-        } else if phase == "failed" || phase == "cancelled" {
-            "failed"
-        } else if current.as_deref() != Some(&revision) || !binding {
-            "stale"
-        } else if phase == "completed" {
-            if available { "ready" } else { "stale" }
-        } else {
-            "pending"
-        };
+        let status = playscale_core::processing::rendition_status(
+            &playscale_core::processing::RenditionFacts {
+                expired,
+                phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
+                source_current: source_available && current.as_deref() == Some(&revision),
+                binding_current: binding,
+                output_current: available,
+            },
+        );
         let output = output.zip(output_revision).map(
             |(file_id, file_revision)| json!({"file_id":file_id,"file_revision":file_revision}),
         );
