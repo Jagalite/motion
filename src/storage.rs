@@ -207,6 +207,7 @@ async fn make_snapshot(
         .fetch_one(&app.db)
         .await?;
     let root = app.storage.root.join("backups");
+    let detailed = requested.is_some();
     let destination = root.join(requested.unwrap_or(format!(
         "auto-{:020}-{}",
         std::time::SystemTime::now()
@@ -263,10 +264,13 @@ async fn make_snapshot(
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version")
             .fetch_all(&mut check)
             .await?;
-    let assets: Vec<(String, i64)> =
+    let assets: Vec<(String, i64)> = if detailed {
         sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
             .fetch_all(&mut check)
-            .await?;
+            .await?
+    } else {
+        vec![]
+    };
     let generated: Vec<(String, String, String, String, i64)> = if include_generated {
         sqlx::query_as("SELECT f.id,f.revision,l.root,f.relative_path,f.bytes FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.generated=1 AND f.available=1 ORDER BY f.id LIMIT 100001").fetch_all(&mut check).await?
     } else {
@@ -320,11 +324,15 @@ async fn make_snapshot(
             std::fs::File::open(stage.join("generated"))?.sync_all()?;
         }
         let mut value=serde_json::to_value(&snapshot)?;
+        if detailed {
         value["assets"]=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
         value["include_generated_media"]=serde_json::json!(include_generated);
         value["generated_media"]=serde_json::json!(media);
+        }
         let mut manifest = std::fs::File::create(stage.join("manifest.json"))?;
-        manifest.write_all(&serde_json::to_vec_pretty(&value)?)?;
+        let manifest_bytes=serde_json::to_vec_pretty(&value)?;
+        anyhow::ensure!(manifest_bytes.len()<=16*1024*1024,"backup manifest too large");
+        manifest.write_all(&manifest_bytes)?;
         manifest.sync_all()?;
         #[cfg(unix)]
         std::fs::File::open(&stage)?.sync_all()?;
@@ -520,12 +528,18 @@ impl Write for RollingLog {
 }
 /// Stable job destination makes a crash after rename but before DB acknowledgement
 /// recoverable. Never overwrite an existing completed snapshot.
+pub(crate) struct VerifiedBackup {
+    pub manifest_digest: String,
+    pub database_verified: bool,
+    pub inventory_complete: bool,
+    pub destination_durable: bool,
+}
 pub(crate) async fn requested_backup(
     app: &App,
     id: &str,
     include_generated: bool,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<VerifiedBackup> {
     let _maintenance = app.processing.maintenance.lock().await;
     let name = format!("request-{id}");
     let destination = app.storage.root.join("backups").join(&name);
@@ -579,13 +593,34 @@ pub(crate) async fn requested_backup(
     let expected_assets=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
     let expected_media=serde_json::json!(media.into_iter().map(|(id,revision,bytes)|serde_json::json!({"file_id":id,"file_revision":revision,"path":format!("generated/{id}"),"bytes":bytes.to_string(),"sha256":revision})).collect::<Vec<_>>());
     blocking(permit, move || {
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(destination.join("manifest.json"))?)?;
+        let manifest = read_backup_manifest(&destination)?;
+        let value: serde_json::Value = serde_json::from_slice(&manifest)?;
+        anyhow::ensure!(
+            format!("sha256:{}", crate::v2::sha256(&manifest)) == digest,
+            "manifest changed during recovery"
+        );
         anyhow::ensure!(
             value["assets"] == expected_assets && value["generated_media"] == expected_media,
             "backup inventory incomplete"
         );
-        Ok(digest)
+        // Re-establish durability even when the prior process died immediately
+        // after rename and before its parent-directory sync/acknowledgement.
+        std::fs::File::open(destination.join("manifest.json"))?.sync_all()?;
+        std::fs::File::open(destination.join("playscale.sqlite3"))?.sync_all()?;
+        #[cfg(unix)]
+        {
+            if include_generated {
+                std::fs::File::open(destination.join("generated"))?.sync_all()?;
+            }
+            std::fs::File::open(&destination)?.sync_all()?;
+            std::fs::File::open(destination.parent().unwrap())?.sync_all()?;
+        }
+        Ok(VerifiedBackup {
+            manifest_digest: digest,
+            database_verified: true,
+            inventory_complete: true,
+            destination_durable: true,
+        })
     })
     .await
 }
@@ -600,19 +635,7 @@ fn verify_requested_snapshot(
             .is_symlink(),
         "backup destination is a symlink"
     );
-    let manifest_path = destination.join("manifest.json");
-    anyhow::ensure!(
-        std::fs::metadata(&manifest_path)?.len() <= 16 * 1024 * 1024,
-        "backup manifest too large"
-    );
-    let mut manifest = Vec::new();
-    std::fs::File::open(manifest_path)?
-        .take(16 * 1024 * 1024 + 1)
-        .read_to_end(&mut manifest)?;
-    anyhow::ensure!(
-        manifest.len() <= 16 * 1024 * 1024,
-        "backup manifest too large"
-    );
+    let manifest = read_backup_manifest(destination)?;
     let value: serde_json::Value = serde_json::from_slice(&manifest)?;
     anyhow::ensure!(
         value["include_generated_media"].as_bool() == Some(include_generated),
@@ -660,6 +683,23 @@ fn verify_requested_snapshot(
         );
     }
     Ok(format!("sha256:{:x}", Sha256::digest(manifest)))
+}
+
+fn read_backup_manifest(destination: &Path) -> anyhow::Result<Vec<u8>> {
+    let manifest_path = destination.join("manifest.json");
+    anyhow::ensure!(
+        std::fs::metadata(&manifest_path)?.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
+    let mut manifest = Vec::new();
+    std::fs::File::open(manifest_path)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut manifest)?;
+    anyhow::ensure!(
+        manifest.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
+    Ok(manifest)
 }
 
 #[cfg(test)]

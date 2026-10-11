@@ -1448,6 +1448,127 @@ pub async fn capabilities(State(app): State<App>) -> Result<Json<Capabilities>, 
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_publication_observes_current_source_binding_and_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
+        let library = db::add_library(&pool, "fixture", dir.path()).await.unwrap();
+        sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('edition','item','Original')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available) VALUES ('source','edition',?,'source.mp4','source-revision','stamp',1,'[]',1)").bind(&library.id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,attempt,created_at,updated_at) VALUES ('job','source','source-revision','h264720p','software','key','running',1,0,0)").execute(&pool).await.unwrap();
+        let app = App {
+            health: Arc::new(crate::operations::Health::new(false)),
+            db: pool,
+            admin_token: Arc::new("test".into()),
+            origin: Arc::new("http://localhost".into()),
+            authority: Arc::new("localhost".into()),
+            ffprobe: Arc::new("ffprobe".into()),
+            jobs: Arc::new(tokio::sync::Mutex::new(())),
+            streams: Arc::new(Semaphore::new(1)),
+            event_streams: Arc::new(Semaphore::new(1)),
+            storage: Arc::new(crate::storage::Runtime::new(
+                dir.path().to_owned(),
+                Default::default(),
+            )),
+            processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
+        };
+
+        sqlx::query("UPDATE processing_jobs SET requester_id='operator' WHERE id='job'")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO timelines(id,edition_id) VALUES ('requested','edition')")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_versions(id,timeline_id,origin,equivalence) VALUES ('original','requested','original','declared')").execute(&app.db).await.unwrap();
+        sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES ('original',1,'source','source-revision')").execute(&app.db).await.unwrap();
+        let digest = crate::v2::processing::recipe("h264720p").unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json) VALUES ('job','requested',?,'{}')").bind(digest).execute(&app.db).await.unwrap();
+        for invalid in ["source", "binding", "requester"] {
+            sqlx::query("UPDATE processing_jobs SET phase='running',attempt=1,output_file_id=NULL,requester_id='operator' WHERE id='job'").execute(&app.db).await.unwrap();
+            sqlx::query("UPDATE media_files SET available=1 WHERE id='source'")
+                .execute(&app.db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE version_files SET start_ms=NULL WHERE version_id='original'")
+                .execute(&app.db)
+                .await
+                .unwrap();
+            match invalid {
+                "source" => {
+                    sqlx::query("UPDATE media_files SET available=0 WHERE id='source'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+                "binding" => {
+                    sqlx::query("UPDATE version_files SET start_ms=1 WHERE version_id='original'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    sqlx::query("UPDATE processing_jobs SET requester_id='revoked' WHERE id='job'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+            }
+            let job = load(&app, "job").await.unwrap();
+            let found = scan::Found {
+                relative: "job/1/output.mp4".into(),
+                title: "Output".into(),
+                revision: "output-revision".into(),
+                fingerprint: "stamp".into(),
+                bytes: 1,
+                duration: Some(1.0),
+                tracks: vec![],
+                reused: false,
+                nfo: crate::nfo::Sidecar::Absent,
+            };
+            finish(&app, &job, Some((found, library.id.clone())))
+                .await
+                .unwrap();
+            assert_eq!(
+                load(&app, "job").await.unwrap().phase,
+                "failed",
+                "{invalid}"
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM media_files WHERE generated=1")
+                    .fetch_one(&app.db)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0);
+        }
+        sqlx::query(
+            "UPDATE processing_jobs SET phase='failed',cache_cleaned=1,updated_at=0 WHERE id='job'",
+        )
+        .execute(&app.db)
+        .await
+        .unwrap();
+        crate::storage::prune_history(&app).await.unwrap();
+        assert!(
+            load(&app, "job").await.is_ok(),
+            "preparation provenance survives history pruning"
+        );
+    }
     #[tokio::test]
     async fn publication_is_atomic_and_duplicate_stale_completions_are_noops() {
         let dir = tempfile::tempdir().unwrap();

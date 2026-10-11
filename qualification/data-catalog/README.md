@@ -7,10 +7,12 @@ Base: `2344d03`; branch: `data-catalog-completion`.
 This lane implements forward legacy progress repair (C01), public scan demands,
 reviewed source relocation, relationship CRUD, timeline/version creation,
 item/admin file inventory, local metadata refresh, artwork upload/selection,
-and authorized smart-collection evaluation. It allocates migrations 0034–0037;
+authorized smart-collection evaluation, preparation/capabilities/recipes/renditions,
+logical schedules, storage accounting and durable backup requests. It allocates
+migrations 0034–0041;
 no previously applied migration is edited. Original media is never written.
 
-- Public now: the 17 additional operations in `contracts/served_operations.txt`.
+- Public now: the original 17 plus 12 newly owned contract operations in `contracts/served_operations.txt`.
   Timeline placement uses the production order policy; the regression connects
   the public timeline writer to the public next-timeline resolver.
 - Existing organization APIs remain public. Smart collections evaluate canonical
@@ -26,9 +28,21 @@ no previously applied migration is edited. Original media is never written.
 - Restricted scan clients control their demand; shared physical job IDs are
   deliberately omitted because those clients do not own the shared job.
 - Metadata refresh currently means local NFO refresh, not remote-provider fetch.
-- Processing/preparation/schedules, storage/backup APIs, caller migration, v1
-  retirement and combined-tree/package qualification remain integration or other
-  lane dependencies. This branch does not claim M1/M3 or complete product cutover.
+- This lane explicitly owns preparation/processing, recipes/renditions, schedule
+  CRUD and storage/backups. Exact interfaces are in
+  [the client handoff](../../DATA_CATALOG_CLIENT_HANDOFF.md). Initial recipes use
+  existing software processing; selected audio is honored and unsupported
+  components/subtitles are refused. H.264 requires a probed SDR first video.
+- Schedule scan and local metadata refresh dispatch existing services; preview
+  and optimize remain explicit `schedule_task_unavailable` gaps because no
+  existing scheduled services implement them. Metadata fanout persists a cursor
+  and queues at most 200 items per schedule per tick. Revoked owners disable
+  future dispatch; already admitted jobs retain their own authorization checks.
+- Generated-media backup inclusion copies and verifies exact revisions. Restore
+  tooling restores the SQLite snapshot; automated generated-cache relocation is
+  not yet provided. Snapshot retention preserves public job/request history.
+- Caller migration, v1 retirement and combined-tree/package qualification remain
+  integration gates. Serving these routes is not full M1/M3 milestone acceptance.
 - Client Next-button acceptance remains a client-lane gate; HTTP resolver coverage
   here is not browser evidence.
 
@@ -51,7 +65,32 @@ action. Bounds: 100 states, 1,000 transitions, depth 20 per configuration. SQL
 atomicity is covered separately by upgrade/failure/reopen adapter tests. This
 model does not establish whole-catalog concurrency or metadata-worker conformance.
 
-## Evidence status
+## Expanded adapter qualification (in progress)
+
+`617a65d`, `307a999`, `71cdf27`, `ed6bf87`, and `5f15820` extend the original
+adapter set. Sol reviewed the changes and identified publication, HDR, schedule
+starvation, provenance pruning and backup recovery/retention issues; subsequent
+commits address those findings. The expanded implementation is not yet qualified.
+
+Core now owns preparation publication admission from current authorization,
+source enablement/scope, exact whole-file timeline binding and recipe identity,
+plus rendition ready/stale classification and backup receipt publication policy.
+The existing job reducer continues to own attempts, cancellation and retries.
+Adapters perform FFmpeg/filesystem observations, copy and hash bytes, fsync and
+rename snapshots, and persist the acknowledgement only after a verified receipt.
+Schedule claims and demand creation share the reserved transaction; bounded
+metadata cursors make interrupted dispatch resumable.
+
+Compilation attempts `e219f483c1a146ff9490a98e30f78084` and
+`161dc8a6395f47feb306f7318994a30e` found a Problem-to-anyhow conversion and a borrow
+error, respectively; both were fixed. `bb030d53c1814ffe844ae185395fc52c` was
+stopped by Kyoto for sustained memory pressure and cancelled before resubmission
+with one Cargo build job. An earlier `7410c0109cc04c84ad3936e8e7c422c5` invocation
+was cancelled because it overlapped snapshot checkout and is excluded entirely.
+No test pass is inferred from these attempts. Contract schema and publication
+privacy checks pass; final focused and real-process receipts remain pending.
+
+## Earlier catalog evidence (before expanded adapters)
 
 Final focused compilation and all 50 tests pass at `3f06331`; binary hashes and
 results are in [receipt.json](receipt.json). Contract schema validation
