@@ -256,7 +256,7 @@ pub(crate) async fn library_view(
     id: &str,
 ) -> Result<LibraryView, LibraryError> {
     let (rev, name, kind, language): (i64, String, String, String) =
-        sqlx::query_as("SELECT revision,name,kind,language FROM catalog_libraries WHERE id=?")
+        sqlx::query_as("SELECT revision,name,kind,language FROM catalog_libraries WHERE id=? AND id NOT IN (SELECT id FROM libraries WHERE managed=1)")
             .bind(id)
             .fetch_one(&mut *conn)
             .await?;
@@ -290,7 +290,7 @@ pub async fn get_library(db: &SqlitePool, id: &str) -> Result<LibraryView, Libra
 
 pub async fn list_libraries(db: &SqlitePool) -> Result<Vec<LibraryView>, LibraryError> {
     let mut tx = db.begin().await?;
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM catalog_libraries ORDER BY name,id")
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM catalog_libraries WHERE id NOT IN (SELECT id FROM libraries WHERE managed=1) ORDER BY name,id")
         .fetch_all(&mut *tx)
         .await?;
     let mut out = Vec::with_capacity(ids.len());
