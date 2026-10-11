@@ -4548,7 +4548,8 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
         return;
     }
     let f = Fixture::new().await;
-    // Two seconds of picture in a three-second first part.
+    // Two seconds of picture in a three-second first part whose sound starts
+    // half a second in; the third part has anamorphic (8:9) pixels.
     f.media(
         "a-short.mp4",
         &[
@@ -4558,10 +4559,12 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
             "2",
             "-i",
             "testsrc2=size=320x240:rate=24",
+            "-itsoffset",
+            "0.5",
             "-f",
             "lavfi",
             "-t",
-            "3",
+            "2.5",
             "-i",
             "sine=frequency=440:sample_rate=44100",
             "-c:v",
@@ -4599,6 +4602,31 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
             "aac",
         ],
     );
+    f.media(
+        "c-anamorphic.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "testsrc2=size=320x240:rate=24,setsar=8/9",
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "sine=frequency=660:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
     f.scan().await;
     let ids: Vec<(String, String, String)> =
         sqlx::query_as("SELECT id,revision,relative_path FROM media_files ORDER BY relative_path")
@@ -4606,9 +4634,11 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
             .await
             .unwrap();
     let (first, second, second_revision) = (&ids[0].0, &ids[1].0, &ids[1].1);
-    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+    let (third, third_revision) = (&ids[2].0, &ids[2].1);
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id IN (?,?)")
         .bind(first)
         .bind(second)
+        .bind(third)
         .execute(&f.server.app.db)
         .await
         .unwrap();
@@ -4625,6 +4655,15 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
     .bind(&version)
     .bind(second)
     .bind(second_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,3,?,?)",
+    )
+    .bind(&version)
+    .bind(third)
+    .bind(third_revision)
     .execute(&f.server.app.db)
     .await
     .unwrap();
@@ -4650,7 +4689,7 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
     let id = admitted.body["id"].as_str().unwrap().to_owned();
     let done = f
         .until(&id, &auth, |d| {
-            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 5_900
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 8_900
                 || d["active"]["status"] == "failed"
         })
         .await;
@@ -4673,10 +4712,29 @@ async fn multipart_boundaries_follow_pinned_part_durations() {
             get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
             get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
             get(format!("/api/v2/streams/{id}/1/segments/1.m4s")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/2.m4s")).await,
         ]
         .concat(),
     )
     .unwrap();
+    // The first part's sound still starts half a second in.
+    let pcm = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&joined)
+        .args([
+            "-map", "0:a", "-f", "s16le", "-ac", "1", "-ar", "48000", "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let onset = pcm
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|s| i16::from_le_bytes(*s).unsigned_abs() > 1000)
+        .unwrap() as f64
+        / 48_000.0;
+    assert!((0.45..0.56).contains(&onset), "audio onset {onset}");
     let second_part = gray_frame(&f.dir.path().join("media/b-long.mp4"), "0.5");
     // Logical 3.5 s is the second part at 0.5 s; at 2.5 s the first part's
     // last picture still holds.

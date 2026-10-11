@@ -15,6 +15,9 @@ struct World {
     now: u64,
 }
 
+// A model input value: its size is irrelevant, and boxing would obscure the
+// generated inputs.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum Step {
     Delivery(Input),

@@ -445,6 +445,13 @@ struct Bound {
     parts: Vec<playscale_core::parts::PartPin>,
 }
 
+/// A version part as bound: part, file, bound revision, start, end.
+type PartBinding = (i64, String, String, Option<i64>, Option<i64>);
+/// A single-part binding: start, end, file duration (s), parts in the version.
+type SingleBinding = (Option<i64>, Option<i64>, Option<f64>, i64);
+/// A bound part now: file, bound revision, current revision, library, duration (s).
+type BoundPartRow = (String, String, String, String, Option<f64>);
+
 /// Parts one multipart delivery can read: the delivery worker passes each as
 /// an inherited descriptor, beside the execution witness (8 at most).
 const MAX_PARTS: usize = 7;
@@ -456,7 +463,8 @@ const MAX_PARTS: usize = 7;
 /// then means the same audio throughout). Codecs and containers may differ.
 fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
     type Audio = (Option<String>, Option<bool>, Option<bool>, Option<bool>);
-    let shape = |file: &db::ItemRow| -> Option<(Option<(u32, u32)>, Vec<Audio>)> {
+    type Shape = (Option<(u32, u32)>, Vec<Audio>);
+    let shape = |file: &db::ItemRow| -> Option<Shape> {
         let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
         let video = tracks.iter().find(|t| t.kind == "video")?;
         Some((
@@ -507,7 +515,7 @@ async fn multipart_of(
     .fetch_all(&mut *conn)
     .await?;
     'versions: for version in versions {
-        let bindings: Vec<(i64, String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        let bindings: Vec<PartBinding> = sqlx::query_as(
             "SELECT part,file_id,file_revision,start_ms,end_ms FROM version_files WHERE version_id=? ORDER BY part",
         )
         .bind(&version)
@@ -706,7 +714,7 @@ async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Resu
     if !claims.parts.is_empty() {
         // Exactly the pinned parts, at their revisions and durations, all in
         // the first part's library.
-        let rows: Vec<(String, String, String, String, Option<f64>)> = sqlx::query_as(
+        let rows: Vec<BoundPartRow> = sqlx::query_as(
             "SELECT b.file_id,b.file_revision,f.revision,f.library_id,f.duration_seconds \
              FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
              WHERE v.id=? AND v.timeline_id=? AND b.start_ms IS NULL AND b.end_ms IS NULL ORDER BY b.part",
@@ -732,7 +740,7 @@ async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Resu
     }
     // The same single part with the same interval: a changed interval is a
     // changed binding.
-    let bound: Option<(Option<i64>, Option<i64>, Option<f64>, i64)> = sqlx::query_as(
+    let bound: Option<SingleBinding> = sqlx::query_as(
         "SELECT b.start_ms,b.end_ms,f.duration_seconds,(SELECT count(*) FROM version_files o WHERE o.version_id=v.id) \
          FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
          WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.part=1",

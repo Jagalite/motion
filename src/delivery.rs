@@ -154,6 +154,9 @@ struct Session {
     /// Those later parts' file IDs and pinned revisions, revalidated like the
     /// first part's.
     part_files: Vec<(String, String)>,
+    /// A multipart timeline's picture canvas: the first part's coded size
+    /// (every part has it), in even dimensions.
+    canvas: Option<(u32, u32)>,
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -433,6 +436,10 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
+/// A multipart generation's inputs, each (descriptor, seek, remaining
+/// duration) in milliseconds, and its picture canvas.
+type PartInputs<'a> = (&'a [(u32, u64, u64)], (u32, u32));
+
 /// FFmpeg arguments for a live generation reading the source from `start_ms`
 /// (file time) and, for an interval, stopping at `end_ms` (file time).
 fn arguments(
@@ -442,7 +449,7 @@ fn arguments(
     end_ms: Option<u64>,
     audio: Option<u32>,
     burn: Option<u32>,
-    parts: Option<&[(u32, u64, u64)]>,
+    parts: Option<PartInputs<'_>>,
     cap: Option<playscale_core::playback_session::RateCap>,
     directory: &FsPath,
 ) -> Vec<String> {
@@ -472,7 +479,7 @@ fn arguments(
         // A multipart timeline from the part the start falls in: that part
         // seeks to its offset, the later parts play from their beginning.
         // Each is an inherited validated descriptor.
-        Some(parts) => {
+        Some((parts, _)) => {
             for (fd, seek, _) in parts {
                 if *seek > 0 {
                     args.extend(["-ss".to_owned(), at(*seek)]);
@@ -509,25 +516,30 @@ fn arguments(
     // overlaid before the output is scaled, so nothing is cropped. In
     // scale2ref, iw/ih name the reference (video) size on FFmpeg 6.1 through 8.
     // Multipart: each part's decoded frames are normalized and joined by the
-    // concat filter, so the parts' container time bases never meet. Each part
-    // lasts exactly its pinned (remaining) duration: its picture and sound
-    // are extended (last frame, silence) and cut to it, so playback crosses a
-    // boundary where seeking (core `parts::locate`) places it. Anamorphic
-    // pictures are resampled to square pixels rather than relabeled.
-    let joined = parts.map(|parts| {
+    // concat filter, so the parts' container time bases never meet. Pictures
+    // are resampled to square pixels and fitted (letterboxed) into one canvas,
+    // the first part's size, so parts whose pixel aspect differs still join
+    // with their display geometry. Each part keeps its own timestamps (its
+    // streams' relative offsets), its audio is filled with silence from zero,
+    // and both are extended and cut at exactly the part's pinned (remaining)
+    // duration, so playback crosses a boundary where seeking (core
+    // `parts::locate`) places it.
+    let joined = parts.map(|(parts, (width, height))| {
         let mut graph = String::new();
         let mut inputs = String::new();
         for (i, (_, _, length)) in parts.iter().enumerate() {
-            let length = format!("{}.{:03}", length / 1000, length % 1000);
+            let end = format!("{}.{:03}", length / 1000, length % 1000);
             graph.push_str(&format!(
-                "[{i}:v:0]setpts=PTS-STARTPTS,scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
-                 format=yuv420p,tpad=stop_mode=clone:stop=-1,trim=duration={length}[v{i}];"
+                "[{i}:v:0]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
+                 scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+                 pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,\
+                 tpad=stop_mode=clone:stop=-1,trim=end={end}[v{i}];"
             ));
             inputs.push_str(&format!("[v{i}]"));
             if let Some(audio) = audio {
                 graph.push_str(&format!(
-                    "[{i}:a:{audio}]asetpts=PTS-STARTPTS,aresample=48000,\
-                     aformat=channel_layouts=stereo,apad,atrim=duration={length}[a{i}];"
+                    "[{i}:a:{audio}]aresample=48000:async=1:first_pts=0,\
+                     aformat=channel_layouts=stereo,apad,atrim=end={end}[a{i}];"
                 ));
                 inputs.push_str(&format!("[a{i}]"));
             }
@@ -1269,6 +1281,10 @@ async fn run_generation(
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
     let part_inputs: Option<Vec<(u32, u64, u64)>> = if durations.is_empty() {
         None
+    } else if session.canvas.is_none() {
+        // Never fall back to reading only the first part.
+        tracing::warn!(delivery=%session.id, generation, "multipart timeline without a picture canvas");
+        return fail(&app, &session);
     } else {
         let Some((first, offset)) = playscale_core::parts::locate(&durations, start_ms) else {
             tracing::warn!(delivery=%session.id, generation, "start beyond the last part");
@@ -1363,7 +1379,7 @@ async fn run_generation(
             pin.clip.map(|clip| clip.end_ms),
             audio,
             pinned_burn(&pin),
-            part_inputs.as_deref(),
+            part_inputs.as_deref().zip(session.canvas),
             pin.max_bitrate_bps
                 .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
             &directory,
@@ -3243,6 +3259,13 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        canvas: (!parts.is_empty())
+            .then(|| {
+                let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+                let video = tracks.iter().find(|t| t.kind == "video")?;
+                Some((video.width? & !1, video.height? & !1))
+            })
+            .flatten(),
         part_files: part_sources
             .iter()
             .map(|(id, revision, _, _)| (id.clone(), revision.clone()))
