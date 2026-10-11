@@ -427,6 +427,10 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await element.open(demuxeSource(generation, location.origin), {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
+    if (generation.subtitles_url) {
+      if (generation.media_time_origin_ms !== 0 || typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
+      await element.player.addTextTrack({src: new URL(generation.subtitles_url, location.origin).href, label: 'Selected subtitles', default: true});
+    }
     if (preferences) {
       await element.setVolume(preferences.volume);
       await element.setMuted(preferences.muted);

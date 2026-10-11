@@ -125,3 +125,8 @@ commitSourceRelocation
 uploadArtwork
 selectArtwork
 refreshMetadata
+
+getDeliveryContent
+headDeliveryContent
+getDeliverySubtitles
+headDeliverySubtitles

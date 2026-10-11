@@ -45,11 +45,13 @@ def main():
                 edition = api('POST', f'/catalog/items/{item["id"]}/editions',
                               {'label': 'Default', 'kind': 'default'}, 201,
                               {'If-Match': item_headers['etag']})
+                identity = api('GET', '/system/capabilities')
+                viewing_epoch = identity['server_id'] + ':' + identity['restore_epoch']
                 timeline = edition['timeline_ids'][0]
                 viewing_path = f'/profiles/default/timelines/{timeline}/viewing'
                 viewing, viewing_headers = api('GET', viewing_path, with_headers=True)
                 api('PUT', viewing_path, {'manual_watched': True, 'reset_position': False},
-                    headers={'If-Match': viewing_headers['etag']})
+                    headers={'If-Match': viewing_headers['etag'], 'X-Motion-Viewing-Epoch': viewing_epoch})
                 manifest = backup(root / 'state', root / 'snapshot')
                 assert manifest['schema_versions']
                 # This later write must not appear in the already completed snapshot.
@@ -87,6 +89,20 @@ def main():
                 assert [row['id'] for row in catalog['items']] == [item['id']]
                 assert catalog['next_cursor'] is None
                 assert api('GET', viewing_path)['watched'] is True
+                restored_identity = api('GET', '/system/capabilities')
+                assert restored_identity['server_id'] == identity['server_id']
+                assert restored_identity['restore_epoch'] != identity['restore_epoch']
+                _, restored_headers = api('GET', viewing_path, with_headers=True)
+                stale = api('PUT', viewing_path, {'manual_watched': False, 'reset_position': False},
+                            expected=409, headers={'If-Match': restored_headers['etag'],
+                                                   'X-Motion-Viewing-Epoch': viewing_epoch})
+                assert stale['code'] == 'viewing_epoch_changed', stale
+                assert api('GET', viewing_path)['watched'] is True
+                api('PUT', viewing_path, {'manual_watched': False, 'reset_position': False},
+                    headers={'If-Match': restored_headers['etag'], 'X-Motion-Viewing-Epoch':
+                             restored_identity['server_id'] + ':' + restored_identity['restore_epoch']})
+                assert api('GET', viewing_path)['watched'] is False
+                checks.append('restore_fences_observed_history_writes_until_reconciliation')
                 checks.append('restored_server_state_and_fresh_credential')
             finally:
                 stop(process)

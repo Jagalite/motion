@@ -11745,6 +11745,576 @@
         ]
       }
     },
+    "/api/v2/streams/{delivery_id}/{generation}/content": {
+      "parameters": [
+        {
+          "name": "delivery_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        {
+          "name": "generation",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Revision"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getDeliveryContent",
+        "summary": "Read authorized DeliveryContent",
+        "tags": [
+          "media"
+        ],
+        "x-owner": "A07",
+        "x-milestone": "M4",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Read authorized DeliveryContent.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "206": {
+            "description": "Authorized byte range."
+          },
+          "416": {
+            "description": "Invalid byte range."
+          },
+          "304": {
+            "description": "Authorized current representation not modified."
+          },
+          "410": {
+            "$ref": "#/components/responses/E410"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          }
+        },
+        "description": "Generation-scoped byte delivery; tickets never authorize the source file route. Same resource authorization applies to GET and HEAD. Never map opaque IDs to unchecked paths. Retired generations return 410 only after authorization. No credentials are inferred from a supplied profile ID.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          },
+          {
+            "mediaTicket": []
+          }
+        ]
+      },
+      "head": {
+        "operationId": "headDeliveryContent",
+        "summary": "Read authorized DeliveryContent",
+        "tags": [
+          "media"
+        ],
+        "x-owner": "A07",
+        "x-milestone": "M4",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Read authorized DeliveryContent.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "206": {
+            "description": "Authorized byte range."
+          },
+          "416": {
+            "description": "Invalid byte range."
+          },
+          "304": {
+            "description": "Authorized current representation not modified."
+          },
+          "410": {
+            "$ref": "#/components/responses/E410"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          }
+        },
+        "description": "Generation-scoped byte delivery; tickets never authorize the source file route. Same resource authorization applies to GET and HEAD. Never map opaque IDs to unchecked paths. Retired generations return 410 only after authorization. No credentials are inferred from a supplied profile ID.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          },
+          {
+            "mediaTicket": []
+          }
+        ]
+      }
+    },
+    "/api/v2/streams/{delivery_id}/{generation}/subtitles.vtt": {
+      "parameters": [
+        {
+          "name": "delivery_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        {
+          "name": "generation",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Revision"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getDeliverySubtitles",
+        "summary": "Read authorized DeliverySubtitles",
+        "tags": [
+          "media"
+        ],
+        "x-owner": "A07",
+        "x-milestone": "M4",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Read authorized DeliverySubtitles.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            },
+            "content": {
+              "text/vtt": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "304": {
+            "description": "Authorized current representation not modified."
+          },
+          "410": {
+            "$ref": "#/components/responses/E410"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          }
+        },
+        "description": "Selected embedded plain-text subtitle rendered as WebVTT in original timeline time. Conversion, sidecar, styled and bitmap subtitle delivery are explicitly unsupported. Same resource authorization applies to GET and HEAD. Never map opaque IDs to unchecked paths. Retired generations return 410 only after authorization. No credentials are inferred from a supplied profile ID.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          },
+          {
+            "mediaTicket": []
+          }
+        ]
+      },
+      "head": {
+        "operationId": "headDeliverySubtitles",
+        "summary": "Read authorized DeliverySubtitles",
+        "tags": [
+          "media"
+        ],
+        "x-owner": "A07",
+        "x-milestone": "M4",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Read authorized DeliverySubtitles.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              },
+              "Content-Length": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 32
+                }
+              },
+              "Content-Range": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "304": {
+            "description": "Authorized current representation not modified."
+          },
+          "410": {
+            "$ref": "#/components/responses/E410"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          }
+        },
+        "description": "Selected embedded plain-text subtitle rendered as WebVTT in original timeline time. Conversion, sidecar, styled and bitmap subtitle delivery are explicitly unsupported. Same resource authorization applies to GET and HEAD. Never map opaque IDs to unchecked paths. Retired generations return 410 only after authorization. No credentials are inferred from a supplied profile ID.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            }
+          }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": []
+          },
+          {
+            "mediaTicket": []
+          }
+        ]
+      }
+    },
     "/api/v2/streams/{delivery_id}/{generation}/master.m3u8": {
       "parameters": [
         {
@@ -16335,6 +16905,18 @@
               }
             ]
           },
+          "subtitles_url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4096
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Selected plain-text subtitle on original byte delivery, in timeline time. Clients must present it or refuse the plan."
+          },
           "media_time_origin_ms": {
             "$ref": "#/components/schemas/Milliseconds"
           },
@@ -16381,6 +16963,7 @@
           "status",
           "media_url",
           "manifest_url",
+          "subtitles_url",
           "media_time_origin_ms",
           "requested_start_ms",
           "available_start_ms",
@@ -17953,7 +18536,7 @@
           "download_id",
           "ttl_seconds"
         ],
-        "description": "Exactly one resource family must be selected. Grant cannot widen the parent principal permissions. Streaming tickets cover exactly a delivery generation and its manifest/segments.",
+        "description": "Exactly one resource family must be selected. Grant cannot widen the parent principal permissions. Streaming tickets cover exactly a serving delivery generation and its bytes, manifest, segments and selected subtitles. Child playlist URLs retain the ticket. Tickets do not renew leases or authorize commands; retirement, restart, revocation and narrowed grants invalidate access.",
         "oneOf": [
           {
             "properties": {

@@ -340,3 +340,28 @@ test('rolling HLS requires a deployed adaptive provider and compatible MSE', () 
   assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), ['http_range']);
   assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), ['http_range', 'hls']);
 });
+
+test('selected subtitles attach after open and unsupported players dispose the candidate', async () => {
+  const calls = [];
+  let supported = true;
+  const element = {player: {addTextTrack: async track => calls.push(['text', track])},
+    setAttribute() {}, open: async () => calls.push(['open']),
+    destroy: async () => calls.push(['destroy']), remove: () => calls.push(['remove'])};
+  const host = {dataset: {demuxeBase: '/demuxe'}, append() {}};
+  const prepare = runInNewContext(source.replace('if (host) void start();', '').replace('export {close, maintainLease};',
+    'loadDemuxe = async () => null; preparePlayer;'), {
+    document: {getElementById: id => id === "motion-player" ? host : null, querySelector: () => null, addEventListener() {},
+      createElement: () => { element.player = supported ? {addTextTrack: async track => calls.push(["text", track])} : {}; return element; }},
+    addEventListener() {}, URL, location: {origin: 'https://motion.test'},
+    setTimeout: () => 0,
+  });
+  const generation = {transport: 'http_range', media_url: '/api/v2/media/files/f/content',
+    media_time_origin_ms: 0, subtitles_url: '/api/v2/streams/d/1/subtitles.vtt'};
+  await prepare(generation, 0, () => true);
+  assert.deepEqual(calls.map(x => x[0]), ['open', 'text']);
+  assert.equal(calls[1][1].src, 'https://motion.test/api/v2/streams/d/1/subtitles.vtt');
+  assert.equal(calls[1][1].default, true);
+  supported = false; calls.length = 0;
+  await assert.rejects(prepare(generation, 0, () => true), /cannot present the selected subtitle/);
+  assert.deepEqual(calls.map(x => x[0]), ['open', 'destroy', 'remove']);
+});
