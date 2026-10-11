@@ -4184,11 +4184,26 @@ async fn multipart_versions_play_their_parts_in_order() {
         return;
     }
     let f = Fixture::with_copy_routes(true).await;
-    for (name, video, tone) in [
-        ("a-part1.mp4", "testsrc2=size=320x240:rate=24", "440"),
-        ("b-part2.mp4", "testsrc2=size=320x240:rate=24,hflip", "880"),
-        ("c-other.mp4", "testsrc2=size=640x480:rate=24", "660"),
+    // The second part is Matroska (another container and time base); the
+    // others differ in picture size or audio language.
+    for (name, video, tone, language) in [
+        ("a-part1.mp4", "testsrc2=size=320x240:rate=24", "440", "eng"),
+        (
+            "b-part2.mkv",
+            "testsrc2=size=320x240:rate=24,hflip",
+            "880",
+            "eng",
+        ),
+        ("c-other.mp4", "testsrc2=size=640x480:rate=24", "660", "eng"),
+        (
+            "d-language.mp4",
+            "testsrc2=size=320x240:rate=24",
+            "660",
+            "jpn",
+        ),
     ] {
+        let tone = format!("sine=frequency={tone}:sample_rate=44100");
+        let language = format!("language={language}");
         f.media(
             name,
             &[
@@ -4199,7 +4214,7 @@ async fn multipart_versions_play_their_parts_in_order() {
                 "-f",
                 "lavfi",
                 "-i",
-                &format!("sine=frequency={tone}:sample_rate=44100"),
+                &tone,
                 "-t",
                 "6",
                 "-c:v",
@@ -4210,6 +4225,8 @@ async fn multipart_versions_play_their_parts_in_order() {
                 "48",
                 "-c:a",
                 "aac",
+                "-metadata:s:a:0",
+                &language,
             ],
         );
     }
@@ -4228,7 +4245,7 @@ async fn multipart_versions_play_their_parts_in_order() {
         }
     };
     let (first, _) = file("a-part1.mp4").await;
-    let (second, second_revision) = file("b-part2.mp4").await;
+    let (second, second_revision) = file("b-part2.mkv").await;
     let (version, timeline): (String, String) = sqlx::query_as(
         "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
     )
@@ -4240,7 +4257,7 @@ async fn multipart_versions_play_their_parts_in_order() {
     // would record them).
     sqlx::query(
         "UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) \
-         WHERE relative_path IN ('b-part2.mp4','c-other.mp4')",
+         WHERE relative_path IN ('b-part2.mkv','c-other.mp4','d-language.mp4')",
     )
     .bind(&first)
     .execute(&f.server.app.db)
@@ -4328,7 +4345,7 @@ async fn multipart_versions_play_their_parts_in_order() {
     // Logical 7.5 s is the second part at 1.5 s (mirrored), not the first.
     let media = f.dir.path().join("media");
     let delivered = gray_frame(&fragment, "0.5");
-    let second_part = mean_difference(&delivered, &gray_frame(&media.join("b-part2.mp4"), "1.5"));
+    let second_part = mean_difference(&delivered, &gray_frame(&media.join("b-part2.mkv"), "1.5"));
     let first_part = mean_difference(&delivered, &gray_frame(&media.join("a-part1.mp4"), "1.5"));
     assert!(
         second_part * 4 < first_part,
@@ -4359,13 +4376,56 @@ async fn multipart_versions_play_their_parts_in_order() {
         StatusCode::NOT_FOUND,
         "not_found",
     );
-    // A part with other streams (another picture size) cannot be concatenated.
-    let (other, other_revision) = file("c-other.mp4").await;
-    bind_second(other, other_revision).await;
-    assert_eq!(
-        plan("auto", "auto").await.body["reason_codes"][0],
-        "source_unavailable"
-    );
+    // A part of another picture size, or whose audio is another language at
+    // the same position, cannot join the timeline.
+    for name in ["c-other.mp4", "d-language.mp4"] {
+        let (other, other_revision) = file(name).await;
+        bind_second(other, other_revision).await;
+        assert_eq!(
+            plan("auto", "auto").await.body["reason_codes"][0],
+            "source_unavailable",
+            "{name}"
+        );
+    }
+    // From the start, every part plays: the Matroska part's own time base does
+    // not truncate the timeline.
+    bind_second(second.clone(), second_revision.clone()).await;
+    let whole = plan("auto", "auto").await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-3"),
+            json!({"plan_token": whole.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    // A later part changes while the delivery is live: its generation fails.
+    let seek = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("multipart-seek-00001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":1000}),
+        )
+        .await;
+    assert_eq!(seek.status, StatusCode::ACCEPTED, "{}", seek.body);
+    sqlx::query("UPDATE media_files SET revision='rescanned' WHERE id=?")
+        .bind(&second)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    // Like a changed single source: every current generation fails.
+    let fenced = f.until(&id, &auth, |d| d["status"] == "failed").await;
+    assert_eq!(fenced["status"], "failed", "{fenced}");
 }
 
 /// A bitrate cap is kept by a capped conversion: byte delivery cannot promise

@@ -449,20 +449,35 @@ struct Bound {
 /// an inherited descriptor, beside the execution witness (8 at most).
 const MAX_PARTS: usize = 7;
 
-/// Whether two parts can be played as one stream: the same streams in the
-/// same order, with the same codecs and picture size.
+/// Whether two parts can be played as one timeline: the delivery decodes each
+/// part and joins its first video stream and the selected audio ordinal, so
+/// the pictures must be the same size and the n-th audio stream of every part
+/// must be the same language and roles (a component pinned on the first part
+/// then means the same audio throughout). Codecs and containers may differ.
 fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
-    let shape = |file: &db::ItemRow| -> Option<Vec<(String, String, Option<u32>, Option<u32>)>> {
+    type Audio = (Option<String>, Option<bool>, Option<bool>, Option<bool>);
+    let shape = |file: &db::ItemRow| -> Option<(Option<(u32, u32)>, Vec<Audio>)> {
         let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
-        Some(
+        let video = tracks.iter().find(|t| t.kind == "video")?;
+        Some((
+            video.width.zip(video.height),
             tracks
-                .into_iter()
-                .filter(|t| matches!(t.kind.as_str(), "video" | "audio"))
-                .map(|t| (t.kind, t.codec, t.width, t.height))
+                .iter()
+                .filter(|t| t.kind == "audio")
+                .map(|t| {
+                    (
+                        playscale_core::components::normalize_language(t.language.as_deref()),
+                        t.forced,
+                        t.hearing_impaired,
+                        t.commentary,
+                    )
+                })
                 .collect(),
-        )
+        ))
     };
-    shape(a).is_some_and(|a| shape(b).is_some_and(|b| a == b))
+    shape(a).is_some_and(|(size, audio)| {
+        size.is_some() && shape(b).is_some_and(|other| other == (size, audio))
+    })
 }
 
 /// The first multipart original version bound to the timeline (or the pinned

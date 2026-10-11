@@ -151,6 +151,9 @@ struct Session {
     /// The validated sources of a multipart timeline's later parts, in order
     /// (the first is `source`); empty for one file.
     parts: Vec<Source>,
+    /// Those later parts' file IDs and pinned revisions, revalidated like the
+    /// first part's.
+    part_files: Vec<(String, String)>,
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -439,7 +442,7 @@ fn arguments(
     end_ms: Option<u64>,
     audio: Option<u32>,
     burn: Option<u32>,
-    concat: Option<&FsPath>,
+    parts: Option<&[(u32, u64)]>,
     cap: Option<playscale_core::playback_session::RateCap>,
     directory: &FsPath,
 ) -> Vec<String> {
@@ -451,7 +454,6 @@ fn arguments(
         "-nostdin",
         "-protocol_whitelist",
         "file",
-        "-ss",
     ]
     .map(str::to_owned)
     .to_vec();
@@ -465,21 +467,30 @@ fn arguments(
     } else {
         start_ms
     };
-    args.push(format!("{}.{:03}", input_ms / 1000, input_ms % 1000));
-    if copy {
-        // Keep source timestamps: copied video starts at the preceding keyframe,
-        // and its media time is timeline time (the route requires a zero start).
-        args.push("-copyts".into());
-    }
-    match concat {
-        // The parts of a multipart timeline, as listed (each an inherited
-        // validated descriptor).
-        Some(list) => {
-            args.extend(["-f", "concat", "-safe", "0", "-i"].map(str::to_owned));
-            args.push(list.to_string_lossy().into_owned());
+    let at = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    match parts {
+        // A multipart timeline from the part the start falls in: that part
+        // seeks to its offset, the later parts play from their beginning.
+        // Each is an inherited validated descriptor.
+        Some(parts) => {
+            for (fd, seek) in parts {
+                if *seek > 0 {
+                    args.extend(["-ss".to_owned(), at(*seek)]);
+                }
+                args.extend(["-i".to_owned(), format!("/dev/fd/{fd}")]);
+            }
         }
-        // The validated source descriptor inherited as fd 3.
-        None => args.extend(["-i", "/dev/fd/3"].map(str::to_owned)),
+        None => {
+            args.extend(["-ss".to_owned(), at(input_ms)]);
+            if copy {
+                // Keep source timestamps: copied video starts at the preceding
+                // keyframe, and its media time is timeline time (the route
+                // requires a zero start).
+                args.push("-copyts".into());
+            }
+            // The validated source descriptor inherited as fd 3.
+            args.extend(["-i", "/dev/fd/3"].map(str::to_owned));
+        }
     }
     if start_ms > input_ms {
         let trim = start_ms - input_ms;
@@ -497,8 +508,45 @@ fn arguments(
     // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
     // overlaid before the output is scaled, so nothing is cropped. In
     // scale2ref, iw/ih name the reference (video) size on FFmpeg 6.1 through 8.
-    match burn {
-        Some(index) => {
+    // Multipart: each part's decoded frames are normalized and joined by the
+    // concat filter, so the parts' container time bases never meet.
+    let joined = parts.map(|parts| {
+        let mut graph = String::new();
+        let mut inputs = String::new();
+        for i in 0..parts.len() {
+            graph.push_str(&format!("[{i}:v:0]format=yuv420p,setsar=1[v{i}];"));
+            inputs.push_str(&format!("[v{i}]"));
+            if let Some(audio) = audio {
+                graph.push_str(&format!(
+                    "[{i}:a:{audio}]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
+                ));
+                inputs.push_str(&format!("[a{i}]"));
+            }
+        }
+        let a = u8::from(audio.is_some());
+        graph.push_str(&format!(
+            "{inputs}concat=n={}:v=1:a={a}[joined]",
+            parts.len()
+        ));
+        if audio.is_some() {
+            graph.push_str("[ja]");
+        }
+        graph.push_str(&format!(";[joined]{SCALE}[v]"));
+        graph
+    });
+    match (burn, joined) {
+        (_, Some(graph)) => {
+            args.extend([
+                "-filter_complex".to_owned(),
+                graph,
+                "-map".into(),
+                "[v]".into(),
+            ]);
+            if audio.is_some() {
+                args.extend(["-map", "[ja]"].map(str::to_owned));
+            }
+        }
+        (Some(index), None) => {
             args.push("-filter_complex".into());
             args.push(format!(
                 "[0:s:{index}][0:v:0]scale2ref=w=iw:h=ih[sub][base];\
@@ -506,9 +554,9 @@ fn arguments(
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
         }
-        None => args.extend(["-map", "0:v:0"].map(str::to_owned)),
+        (None, None) => args.extend(["-map", "0:v:0"].map(str::to_owned)),
     }
-    if let Some(audio) = audio {
+    if let (Some(audio), None) = (audio, parts) {
         args.push("-map".into());
         args.push(format!("0:a:{audio}"));
     }
@@ -516,7 +564,7 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        if burn.is_none() {
+        if burn.is_none() && parts.is_none() {
             args.extend(["-vf", SCALE].map(str::to_owned));
         }
         args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
@@ -1197,15 +1245,31 @@ async fn run_generation(
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()));
     // Cancellation/timeout fences preparation, but a stalled filesystem operation
     // still owns capacity and prevents generation cleanup until it actually exits.
-    // A multipart timeline reads its parts through FFmpeg's concat demuxer:
-    // the first part is fd 3, the witness fd 4, later parts fd 5 onward.
-    let concat = (!pin.parts.is_empty()).then(|| directory.join("parts.ffconcat"));
+    // A multipart timeline reads its parts as separate inputs: the first part
+    // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
+    // (core `parts::locate`) seeks to its offset; later parts follow whole.
+    let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
+    let part_inputs: Option<Vec<(u32, u64)>> = if durations.is_empty() {
+        None
+    } else {
+        let Some((first, offset)) = playscale_core::parts::locate(&durations, start_ms) else {
+            tracing::warn!(delivery=%session.id, generation, "start beyond the last part");
+            return fail(&app, &session);
+        };
+        Some(
+            (first..durations.len())
+                .map(|i| {
+                    let fd = if i == 0 { 3 } else { 4 + i as u32 };
+                    (fd, if i == first { offset } else { 0 })
+                })
+                .collect(),
+        )
+    };
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
         let later = session.parts.clone();
-        let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-        let concat = concat.clone();
+        let parts = durations.len();
         let floor = app.storage.settings.min_free_bytes;
         let late_app = app.clone();
         let late_session = session.clone();
@@ -1218,25 +1282,13 @@ async fn run_generation(
                 crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
                 let input = source_valid(&source)?;
                 anyhow::ensure!(
-                    later.len() + 1 == durations.len().max(1),
+                    later.len() + 1 == parts.max(1),
                     "part sources do not match the pin"
                 );
                 let later = later
                     .iter()
                     .map(source_valid)
                     .collect::<anyhow::Result<Vec<_>>>()?;
-                if let Some(concat) = &concat {
-                    let mut list = String::from("ffconcat version 1.0\n");
-                    for (i, duration) in durations.iter().enumerate() {
-                        let fd = if i == 0 { 3 } else { 4 + i };
-                        list.push_str(&format!(
-                            "file '/dev/fd/{fd}'\nduration {}.{:03}\n",
-                            duration / 1000,
-                            duration % 1000
-                        ));
-                    }
-                    std::fs::write(concat, list)?;
-                }
                 let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
                 anyhow::Ok((input, later, witness, held))
             },
@@ -1292,7 +1344,7 @@ async fn run_generation(
             pin.clip.map(|clip| clip.end_ms),
             audio,
             pinned_burn(&pin),
-            concat.as_deref(),
+            part_inputs.as_deref(),
             pin.max_bitrate_bps
                 .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
             &directory,
@@ -1524,13 +1576,23 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
             return;
         }
     }
-    let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
-        .bind(&session.file_id)
-        .fetch_optional(&app.db)
-        .await;
-    if let Ok(current) = current
-        && current.as_deref() != Some(session.revision.as_str())
+    // Every part of the delivered timeline must still be its pinned revision.
+    let mut changed = false;
+    for (file, revision) in std::iter::once((&session.file_id, &session.revision))
+        .chain(session.part_files.iter().map(|(f, r)| (f, r)))
     {
+        let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+            .bind(file)
+            .fetch_optional(&app.db)
+            .await;
+        if let Ok(current) = current
+            && current.as_deref() != Some(revision.as_str())
+        {
+            changed = true;
+            break;
+        }
+    }
+    if changed {
         let generations: Vec<u64> = {
             let inner = session.inner.lock().unwrap();
             [inner.delivery.pending, inner.delivery.active]
@@ -3101,7 +3163,7 @@ async fn admit_owned(
                 "A part of the timeline changed; plan again",
             ));
         };
-        part_sources.push((row.relative_path, row.fingerprint));
+        part_sources.push((row.id, row.revision, row.relative_path, row.fingerprint));
     }
     let duration_ms = match clip {
         _ if !parts.is_empty() => Some(parts.iter().map(|p| p.duration_ms).sum()),
@@ -3158,9 +3220,13 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        part_files: part_sources
+            .iter()
+            .map(|(id, revision, _, _)| (id.clone(), revision.clone()))
+            .collect(),
         parts: part_sources
             .into_iter()
-            .map(|(relative, fingerprint)| Source {
+            .map(|(_, _, relative, fingerprint)| Source {
                 root: root.clone().into(),
                 relative: relative.into(),
                 root_identity: root_identity.clone(),
