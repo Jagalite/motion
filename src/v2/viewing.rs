@@ -365,6 +365,37 @@ pub struct WatchedInput {
     reset_position: bool,
 }
 
+/// Required transport precondition, observed under the same reserved writer
+/// transaction as the history mutation and its idempotency receipt.
+async fn require_history_identity(
+    conn: &mut SqliteConnection,
+    headers: &HeaderMap,
+) -> Result<(), Problem> {
+    let expected = headers
+        .get("x-motion-viewing-epoch")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.split_once(':'))
+        .ok_or_else(|| {
+            Problem::new(
+                StatusCode::PRECONDITION_REQUIRED,
+                "viewing_epoch_required",
+                "Supply the server identity and restore epoch from capabilities",
+            )
+        })?;
+    let current: (String, String) =
+        sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
+            .fetch_one(conn)
+            .await?;
+    if !core::accepts_history_identity(expected, (&current.0, &current.1)) {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "viewing_epoch_changed",
+            "Server history changed; reconcile retained progress before retrying",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn put_viewing(
     State(app): State<App>,
     caller: Caller,
@@ -378,6 +409,7 @@ pub async fn put_viewing(
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
+    require_history_identity(&mut tx, &headers).await?;
     admit_view(&mut tx, &principal, &profile, &timeline).await?;
     let view = load_view(&mut tx, &profile, &timeline).await?;
     let o = core::override_watched(
@@ -567,6 +599,7 @@ pub async fn create_viewing(
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
+    require_history_identity(&mut tx, &headers).await?;
     let scope = Scope {
         principal: &principal.id,
         operation: "createViewingSession",
@@ -692,6 +725,7 @@ type EventTuple = (i64, String, i64, i64, String, String);
 pub async fn record_viewing(
     State(app): State<App>,
     caller: Caller,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Body<ViewingEvent>,
 ) -> Result<Response, Problem> {
@@ -716,6 +750,7 @@ pub async fn record_viewing(
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
+    require_history_identity(&mut tx, &headers).await?;
     let row = recordable(&mut tx, &principal, &id).await?;
     let receipts: Vec<EventTuple> = sqlx::query_as(
         "SELECT sequence,event_id,delivery_generation,position_ms,status,acknowledgement_json FROM viewing_events WHERE session_id=? AND (sequence=? OR event_id=?)",
@@ -800,6 +835,7 @@ pub async fn replace_viewing_delivery(
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
+    require_history_identity(&mut tx, &headers).await?;
     let row = recordable(&mut tx, &principal, &id).await?;
     let (owner, duration) = open_delivery(&app, &delivery_id).ok_or_else(Problem::not_found)?;
     let facts = file_facts(&mut tx, &owner.file).await?;

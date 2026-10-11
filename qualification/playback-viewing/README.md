@@ -32,6 +32,13 @@ client and data/catalog lanes.
   exact outbox retries survive. Browser outboxes and ownership proofs use server
   identity plus restore epoch; a restored/replaced identity requires reconciliation.
   Capabilities expose `restore_epoch` separately from process `server_epoch`.
+  Every viewing mutation requires `X-Motion-Viewing-Epoch: server_id:restore_epoch`
+  from the observation that produced the command. Core compares identities;
+  the adapter observes current identity inside the reserved writer transaction,
+  before receipt replay or mutation. This also fences an already-open page after
+  restore. Missing/malformed headers return 428; changed identity returns 409.
+  Do not refresh the header to blindly replay an older outbox. Current browser and
+  TCP smoke callers carry the original identity; old v2 writers must update.
 - Each delivery-worker tick observes current device grants and catalog facts.
   Production core decides eligibility. Revocation, profile/playback/catalog scope
   removal, missing devices or observation failure close owned delivery work.

@@ -27,6 +27,10 @@ function status(message, kind = 'status') {
 async function api(method, path, body, idempotencyKey, signal, extra = {}) {
   const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf, ...extra};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (['POST', 'PUT'].includes(method) && (path.includes('/viewing-sessions') || path.endsWith('/viewing'))) {
+    if (!host?.dataset.viewingEpoch) throw new Error('Reload to establish viewing history identity.');
+    headers['X-Motion-Viewing-Epoch'] = host.dataset.viewingEpoch;
+  }
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
     method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE' || path.endsWith('/events'),
@@ -312,7 +316,7 @@ async function recoverViewing(data, current) {
   const storage = viewingStorage(data);
   if (storage.hasRejected()) {
     const panel = document.getElementById('motion-progress-status');
-    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session.';
+    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or restored or replaced server state. It is retained on this device for reconciliation; it has not been replayed into this session.';
   }
   const saved = storage.load();
   if (!saved) return data.viewingRevision;

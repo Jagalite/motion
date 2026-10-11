@@ -305,3 +305,21 @@ test('replacement preparation heartbeat never reports the predecessor playhead',
   assert.equal(JSON.stringify(sent[0]), JSON.stringify({active_generation: '1'}));
   assert.equal(player.state.element, old);
 });
+
+test('history requests keep the rendered epoch even if the server changes', async () => {
+  const requests = [];
+  // Keep DOM mounting disabled while exercising the production request adapter.
+  const rewritten = source.replace("const host = document.getElementById('motion-player');", "const host = {dataset: {viewingEpoch: 'server:before-restore'}};")
+    .replace(/if \(host\)/g, 'if (false)')
+    .replace('export {close, maintainLease};', 'api;');
+  const send = runInNewContext(rewritten, {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    fetch: async (path, options) => { requests.push(options); return {ok: true, status: 200, json: async () => ({})}; },
+  });
+  await send('POST', '/api/v2/playback/viewing-sessions/s/events', {sequence: '1'});
+  await send('PUT', '/api/v2/profiles/p/timelines/t/viewing', {manual_watched: true});
+  await send('POST', '/api/v2/playback/delivery-sessions/d/heartbeat', {active_generation: '1'});
+  assert.equal(requests[0].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[1].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[2].headers['X-Motion-Viewing-Epoch'], undefined);
+});

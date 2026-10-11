@@ -12,6 +12,12 @@
 //! returned records in one transaction.
 use serde::{Deserialize, Serialize};
 
+/// A durable history command is valid across ordinary restart, but cannot
+/// cross a restored database or replacement server identity.
+pub fn accepts_history_identity(expected: (&str, &str), current: (&str, &str)) -> bool {
+    expected == current
+}
+
 /// Ten years: the same bound the v1 session policy uses.
 pub const MAX_POSITION_MS: u64 = 315_360_000_000;
 /// Tolerance for container/encoder duration rounding.

@@ -89,6 +89,17 @@ impl Server {
         for (k, v) in headers {
             request = request.header(*k, *v);
         }
+        if ["POST", "PUT"].contains(&method)
+            && (path.contains("/viewing-sessions") || path.ends_with("/viewing"))
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-motion-viewing-epoch"))
+        {
+            let (server, restore) = playscale::v2::system::server_identity(&self.app)
+                .await
+                .unwrap();
+            request = request.header("x-motion-viewing-epoch", format!("{server}:{restore}"));
+        }
         let response = api::router(self.app.clone(), None)
             .oneshot(
                 request
@@ -1157,10 +1168,14 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         .await;
     assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.body);
     // A queued event from before the restart still drains with its binding.
-    let drained = f
-        .post(&events, &auth, None,
-            json!({"event_id":"e2","sequence":"2","delivery_generation":"1","position_ms":9000,"status":"paused"}))
-        .await;
+    let history_epoch = format!(
+        "{}:{}",
+        identity_before["server_id"].as_str().unwrap(),
+        identity_before["restore_epoch"].as_str().unwrap()
+    );
+    let drained = f.call("POST", &events,
+        Some(json!({"event_id":"e2","sequence":"2","delivery_generation":"1","position_ms":9000,"status":"paused"})),
+        &[("authorization", &auth), ("x-motion-viewing-epoch", &history_epoch)]).await;
     assert_eq!(drained.status, StatusCode::OK, "{:?}", drained.body);
     assert_eq!(drained.body["session"]["delivery_id"], id);
     assert_eq!(drained.body["session"]["timeline_id"], timeline);
@@ -1184,6 +1199,87 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
     assert_eq!(again.status, StatusCode::CREATED, "{:?}", again.body);
     assert_ne!(again.body["id"], id);
     assert_eq!(again.body["active"]["requested_start_ms"], 9000);
+
+    // Restore a real SQLite snapshot, including the SAME session and receipts.
+    // An already-open page must not replay across the changed durable identity.
+    let backup = f.dir.path().join("history-backup.sqlite");
+    sqlx::query("VACUUM INTO ?")
+        .bind(backup.to_str().unwrap())
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let restored_dir = tempfile::tempdir().unwrap();
+    db::restore_into(&backup, &restored_dir.path().join("db.sqlite"))
+        .await
+        .unwrap();
+    let restored = Server::start(restored_dir.path(), f.key).await;
+    let (_, restored_epoch) = playscale::v2::system::server_identity(&restored.app)
+        .await
+        .unwrap();
+    assert_ne!(
+        restored_epoch,
+        identity_before["restore_epoch"].as_str().unwrap()
+    );
+    for (method, target, body, extra) in [
+        (
+            "POST",
+            events.clone(),
+            json!({"event_id":"e2","sequence":"2","delivery_generation":"1","position_ms":9000,"status":"paused"}),
+            ("idempotency-key", "unused-retry"),
+        ),
+        (
+            "POST",
+            events.clone(),
+            json!({"event_id":"e3","sequence":"3","delivery_generation":"1","position_ms":10000,"status":"paused"}),
+            ("idempotency-key", "unused-new"),
+        ),
+        (
+            "POST",
+            "/api/v2/playback/viewing-sessions".into(),
+            json!({"delivery_id":id,"expected_viewing_revision":"0"}),
+            ("idempotency-key", "view-before-restart1"),
+        ),
+        (
+            "PUT",
+            format!("/api/v2/playback/viewing-sessions/{sid}/delivery"),
+            json!({"delivery_id":id}),
+            ("if-match", "\"r-3\""),
+        ),
+        (
+            "PUT",
+            format!("/api/v2/profiles/default/timelines/{timeline}/viewing"),
+            json!({"manual_watched":true,"reset_position":false}),
+            ("if-match", "\"r-3\""),
+        ),
+    ] {
+        let rejected = restored
+            .call(
+                method,
+                &target,
+                Some(body),
+                &[
+                    ("authorization", &auth),
+                    ("x-motion-viewing-epoch", &history_epoch),
+                    extra,
+                ],
+            )
+            .await;
+        problem(&rejected, StatusCode::CONFLICT, "viewing_epoch_changed");
+    }
+    let malformed = restored.call("POST", &events, Some(json!({"event_id":"e3","sequence":"3","delivery_generation":"1","position_ms":10000,"status":"paused"})),
+        &[("authorization", &auth), ("x-motion-viewing-epoch", "")]).await;
+    problem(
+        &malformed,
+        StatusCode::PRECONDITION_REQUIRED,
+        "viewing_epoch_required",
+    );
+    let position: i64 =
+        sqlx::query_scalar("SELECT position_ms FROM timeline_viewing WHERE timeline_id=?")
+            .bind(&timeline)
+            .fetch_one(&restored.app.db)
+            .await
+            .unwrap();
+    assert_eq!(position, 9000);
 }
 
 #[tokio::test(flavor = "multi_thread")]

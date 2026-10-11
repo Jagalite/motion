@@ -3930,6 +3930,7 @@ paths:
       parameters:
       - $ref: '#/components/parameters/IfMatch'
       - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/ViewingEpoch'
       requestBody:
         required: true
         content:
@@ -4472,6 +4473,8 @@ paths:
           $ref: '#/components/responses/E413'
         '422':
           $ref: '#/components/responses/E422'
+        '428':
+          description: Required viewing identity precondition is missing or malformed.
         '429':
           $ref: '#/components/responses/E429'
         '500':
@@ -4482,6 +4485,7 @@ paths:
       parameters:
       - $ref: '#/components/parameters/IdempotencyKey'
       - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/ViewingEpoch'
       requestBody:
         required: true
         content:
@@ -4585,6 +4589,8 @@ paths:
           $ref: '#/components/responses/E413'
         '422':
           $ref: '#/components/responses/E422'
+        '428':
+          description: Required viewing identity precondition is missing or malformed.
         '429':
           $ref: '#/components/responses/E429'
         '500':
@@ -4594,6 +4600,7 @@ paths:
       x-required-permission: viewing:write
       parameters:
       - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/ViewingEpoch'
       requestBody:
         required: true
         content:
@@ -4659,6 +4666,7 @@ paths:
       parameters:
       - $ref: '#/components/parameters/IfMatch'
       - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/ViewingEpoch'
       requestBody:
         required: true
         content:
@@ -8370,6 +8378,20 @@ components:
       description: Short-lived revocable capability restricted to a file revision, download, or delivery
         generation. Not valid on JSON APIs.
   parameters:
+    ViewingEpoch:
+      name: X-Motion-Viewing-Epoch
+      in: header
+      required: true
+      description: >-
+        server_id:restore_epoch from the state on which this command is based.
+        Stable across ordinary restart. Mismatch returns 409 viewing_epoch_changed
+        before replay or mutation; retain old work for reconciliation rather than
+        refreshing this precondition and retrying it blindly.
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 257
+
     Cursor:
       name: cursor
       in: query
@@ -10823,6 +10845,8 @@ components:
         interruption does not interrupt viewing authority: queued events can drain
         and the session can rebind to a new delivery. A server identity or restore
         epoch change requires client reconciliation before replaying an outbox.
+        All viewing mutations require X-Motion-Viewing-Epoch from the observation
+        that produced the command; do not refresh that precondition to replay old work.
       type: object
       additionalProperties: false
       properties:

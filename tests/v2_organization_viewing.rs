@@ -102,9 +102,17 @@ impl Fixture {
         body: Option<Value>,
         headers: &[(&str, &str)],
     ) -> Reply {
-        let response = self
-            .raw(self.request(method, path, body.as_ref(), headers))
-            .await;
+        let mut request = self.request(method, path, body.as_ref(), headers);
+        if ["POST", "PUT"].contains(&method) && path.ends_with("/viewing") {
+            let (server, restore) = playscale::v2::system::server_identity(&self.app)
+                .await
+                .unwrap();
+            request.headers_mut().insert(
+                "x-motion-viewing-epoch",
+                format!("{server}:{restore}").parse().unwrap(),
+            );
+        }
+        let response = self.raw(request).await;
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
