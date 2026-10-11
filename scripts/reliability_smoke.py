@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import sys
 from smoke import BINARY, free_port, request, wait_for, stop
 from backup import restore
 from v2_smoke_support import Client
@@ -85,7 +86,15 @@ def main():
                 checks.append('scheduled_snapshot_and_existing_restore_tool')
                 def backup_request():
                     backup=api('POST','/api/v2/admin/backups',{'include_generated_media':False},202)
-                    return wait_for(lambda: (j if (j:=api('GET','/api/v2/jobs/'+backup['job_id']))['phase'] in ('completed','failed','cancelled') else None),45)
+                    latest = None
+                    def terminal():
+                        nonlocal latest
+                        latest = api('GET', '/api/v2/jobs/' + backup['job_id'])
+                        return latest if latest['phase'] in ('completed', 'failed', 'cancelled') else None
+                    try:
+                        return wait_for(terminal, 45)
+                    except Exception as error:
+                        raise AssertionError({'backup': backup, 'last_job': latest}) from error
                 for _ in range(3): assert backup_request()['phase']=='completed'
                 wait_for(lambda:sum(b['status']=='ready' for b in api('GET','/api/v2/admin/backups')['items'])==2,40)
                 wait_for(lambda:len(list((state/'backups').glob('request-*/manifest.json')))==2,40)
@@ -110,6 +119,12 @@ def main():
                 assert api('GET',progress)['manual_watched'] is True
                 checks.append('disk_reserve_failure_keeps_server_and_viewing_writes_live')
                 assert (state / 'logs/server.log').exists()
+            except BaseException:
+                print(json.dumps({'completed_checks': checks}, indent=2), file=sys.stderr)
+                diagnostic = state / 'logs/server.log'
+                if diagnostic.exists():
+                    print(diagnostic.read_text()[-12000:], file=sys.stderr)
+                raise
             finally:
                 stop(process)
     print(json.dumps({'passed': len(checks), 'checks': checks, 'inventory_files': count,
