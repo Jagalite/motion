@@ -613,11 +613,9 @@ fn fits_budget(file: &db::ItemRow, max_height: Option<u32>, max_bitrate: Option<
         .iter()
         .find(|t| t.kind == "video")
         .and_then(|t| t.height);
-    let bitrate = file
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (file.bytes as f64 * 8.0 / d).ceil() as u64);
-    core::conversion_fits(max_height, max_bitrate, height, bitrate)
+    // File-size/duration is an average, not a peak bound for VBR media.
+    // No persisted peak/VBV guarantee is currently available for byte routes.
+    core::conversion_fits(max_height, max_bitrate, height, None)
 }
 
 /// Default audio stream (the first) of a file, when it has audio.
@@ -965,18 +963,25 @@ pub async fn plan(
         ));
     }
     let audio = ca.or(a).or(default_audio);
-    let subtitle = cs
-        .or(sub)
-        .or_else(|| (input.tracks.subtitle_policy == "require" && subtitles > 0).then_some(0));
-    if input.tracks.subtitle_policy == "off" && subtitle.is_some() {
-        return Err(Problem::invalid(
-            "subtitle_policy_conflict",
-            "Explicit subtitles conflict with off",
-        ));
-    }
-    if input.tracks.subtitle_policy == "require" && subtitle.is_none() {
-        return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
-    }
+    use playscale_core::components::{SubtitleSelection, select_subtitle};
+    let subtitle = match select_subtitle(&input.tracks.subtitle_policy, cs.or(sub), subtitles) {
+        SubtitleSelection::Selected(index) => Some(index),
+        SubtitleSelection::None => None,
+        SubtitleSelection::Conflict => {
+            return Err(Problem::invalid(
+                "subtitle_policy_conflict",
+                "Explicit subtitles conflict with off",
+            ));
+        }
+        SubtitleSelection::Unavailable => {
+            return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
+        }
+        SubtitleSelection::AutomaticUnsupported => {
+            return Ok(
+                Json(blocked(&input, "automatic_subtitle_selection_unavailable")).into_response(),
+            );
+        }
+    };
     if let Some(index) = subtitle {
         let codec = &streams
             .iter()

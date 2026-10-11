@@ -120,7 +120,7 @@ pub async fn capabilities(
         ("subtitles", "embedded_plain_text_original_webvtt".into()),
         ("components", "embedded_revision_bound".into()),
         ("tickets", "file_or_delivery_generation_playback".into()),
-        ("unsupported", "sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_capped_conversion,adaptive_bitrate,cast".into()),
+        ("unsupported", "automatic_subtitle_selection,sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_caps,adaptive_bitrate,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

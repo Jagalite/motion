@@ -2402,6 +2402,16 @@ async fn bounded_media_policy_requires_observed_facts_and_components_never_subst
             if limit < 240 { "blocked" } else { "ready" }
         );
     }
+    // Even a very generous cap is not proven by this variable-bitrate file's
+    // small average size. File routes have no trustworthy peak/VBV observation.
+    let mut capped = plan_input("default", &timeline, "original", None, &["http_range"]);
+    capped["quality"]["max_bitrate_bps"] = json!("999999999999");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, capped)
+            .await
+            .body["status"],
+        "blocked"
+    );
     let file = source["file_id"].as_str().unwrap();
     let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
         .bind(file)
@@ -2507,6 +2517,15 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
     input["source"] = source.clone();
     input["tracks"]["subtitle_track_id"] = json!("s0");
     input["tracks"]["subtitle_policy"] = json!("require");
+    let mut automatic = input.clone();
+    automatic["tracks"]["subtitle_track_id"] = Value::Null;
+    automatic["tracks"]["subtitle_policy"] = json!("auto");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, automatic)
+            .await
+            .body["reason_codes"][0],
+        "automatic_subtitle_selection_unavailable"
+    );
     let plan = f
         .post("/api/v2/playback/plans", &auth, None, input.clone())
         .await;

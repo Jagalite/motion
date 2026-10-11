@@ -86,6 +86,29 @@ pub fn embedded_track(
         .track_index
 }
 
+/// Automatic language/role policy is not yet qualified. Never silently drop
+/// observed embedded captions when a caller requests that policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubtitleSelection {
+    None,
+    Selected(u32),
+    Conflict,
+    Unavailable,
+    AutomaticUnsupported,
+}
+pub fn select_subtitle(policy: &str, explicit: Option<u32>, count: usize) -> SubtitleSelection {
+    use SubtitleSelection::*;
+    match (policy, explicit) {
+        ("off", Some(_)) => Conflict,
+        ("off", _) => None,
+        (_, Some(index)) => Selected(index),
+        ("require", _) if count > 0 => Selected(0),
+        ("require", _) => Unavailable,
+        (_, _) if count > 0 => AutomaticUnsupported,
+        _ => None,
+    }
+}
+
 /// Lower-case language tag; `und`, empty or malformed tags mean unknown.
 pub fn normalize_language(tag: Option<&str>) -> Option<String> {
     let tag = tag?.trim().to_ascii_lowercase();
@@ -241,6 +264,22 @@ mod tests {
             sidecar: None,
         }
     }
+    #[test]
+    fn subtitle_policy_never_silently_drops_or_substitutes_a_selection() {
+        use SubtitleSelection::*;
+        assert_eq!(
+            select_subtitle("auto", Option::None, 2),
+            AutomaticUnsupported
+        );
+        assert_eq!(select_subtitle("auto", Option::None, 0), None);
+        assert_eq!(select_subtitle("auto", Some(1), 2), Selected(1));
+        assert_eq!(select_subtitle("require", Some(1), 2), Selected(1));
+        assert_eq!(select_subtitle("require", Option::None, 2), Selected(0));
+        assert_eq!(select_subtitle("require", Option::None, 0), Unavailable);
+        assert_eq!(select_subtitle("off", Some(0), 2), Conflict);
+        assert_eq!(select_subtitle("off", Option::None, 2), None);
+    }
+
     #[test]
     fn embedded_selection_never_substitutes_kind_cut_file_revision_or_sidecar() {
         let mut components = derive(

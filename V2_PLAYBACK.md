@@ -115,7 +115,8 @@ routes is qualified separately (A11/A12).
   player, or fails explicitly if its text-track API is unavailable. Styled
   ASS/SSA, bitmap subtitles, sidecars and conversion subtitle delivery are
   explicitly refused. `require` chooses the first embedded subtitle when no
-  exact selection is supplied; `auto` without a selection currently chooses none.
+  exact selection is supplied; `auto` without an explicit selection is refused when embedded captions exist;
+  automatic forced/foreign-audio language policy is not qualified.
 - Content access can issue a file-revision ticket or a delivery-generation
   playback ticket. Generation tickets authorize only that generation's bytes,
   HLS manifests/children and selected subtitle. They do not authorize commands,
@@ -128,8 +129,9 @@ routes is qualified separately (A11/A12).
   (`a{n}`, `s{n}`) remain revision-local. Explicit prepared-rendition track and
   component pins are refused until rendition component mapping is available.
 - Live conversion uses the software recipe only; hardware encoding and copy
-  routes are not offered by the v2 planner. A conversion is refused when the
-  client sets any bitrate limit, because the CRF recipe has no bitrate cap.
+  routes are not offered by the v2 planner. Any route is refused when the
+  client sets a bitrate limit: the CRF recipe has no cap and stored-file average
+  bitrate does not establish a VBR peak bound.
 - Multipart versions and interval (multi-episode) bindings are not planned:
   they are reported as unavailable until a part-aware delivery exists.
 - HDR sources are refused for byte delivery under `require_sdr` or to a
