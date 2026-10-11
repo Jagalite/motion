@@ -1030,21 +1030,33 @@ func TestServerHistoryIsUsedWhenOffered(t *testing.T) {
 
 func TestCounterRestartIsNotANegativeRate(t *testing.T) {
 	now := time.Now()
-	s := []point{{now.Add(-3 * time.Second), 100}, {now.Add(-2 * time.Second), 110}, {now.Add(-time.Second), 3}, {now, 5}}
+	at := func(d time.Duration, n uint64) point { return point{t: now.Add(-d), v: float64(n), n: n, exact: true} }
+	s := []point{at(3*time.Second, 100), at(2*time.Second, 110), at(time.Second, 3), at(0, 5)}
 	r := rate(s)
 	if len(r) != 2 || r[0].v != 10 || r[1].v != 2 {
 		t.Fatalf("%v", r)
 	}
 	h := newHistory()
 	h.series[mBusy] = s
-	if n, _ := h.increase(mBusy, now, time.Minute); n != 12 {
-		t.Fatalf("increase %v", n)
+	if n, covered, _ := h.increase(mBusy, now, time.Minute); n != 12 || covered != 3*time.Second {
+		t.Fatalf("increase %v over %v", n, covered)
+	}
+	// Growth before the window is not counted in it.
+	old := []point{at(time.Hour, 0), at(0, 60)}
+	h.series[mBusy] = old
+	if _, _, ok := h.increase(mBusy, now, 5*time.Minute); ok {
+		t.Fatal("an interval reaching outside the window was counted")
+	}
+	// Integers beyond 2^53 still count each increment.
+	big := []point{{t: now.Add(-time.Second), v: 9007199254740992, n: 9007199254740992, exact: true}, {t: now, v: 9007199254740992, n: 9007199254740993, exact: true}}
+	if r := rate(big); len(r) != 1 || r[0].v != 1 {
+		t.Fatalf("lost a large increment: %v", r)
 	}
 }
 
 func TestSparklineFillsItsWidthAndShowsGaps(t *testing.T) {
 	now := time.Now()
-	pts := []point{{now.Add(-50 * time.Second), 1}, {now.Add(-time.Second), 4}}
+	pts := []point{{t: now.Add(-50 * time.Second), v: 1}, {t: now.Add(-time.Second), v: 4}}
 	rows := sparkline(pts, now, time.Minute, 30, 2, colorAccent, false)
 	for _, r := range rows {
 		if w := lipgloss.Width(r); w != 30 {
@@ -1062,5 +1074,35 @@ func TestSignOutForgetsMetrics(t *testing.T) {
 	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
 	if len(m.metrics.series) != 0 || strings.Contains(m.View(), "JOBS") {
 		t.Fatal("metrics survived sign-out")
+	}
+}
+
+func TestLosingAdminAndNullFieldsHideMetrics(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}}
+	m := pollAgain(t, start(t, f, 140, 60))
+	if !strings.Contains(m.View(), "210 GB") || !strings.Contains(m.View(), "Recent failures") {
+		t.Fatal("admin overview")
+	}
+	// The server stops reporting free space: it is shown as unknown.
+	m.metrics.observeStorage(time.Now().Add(time.Second), api.StorageReport{DatabaseBytes: "1", AssetBytes: "1", TemporaryBytes: "0", ReservedBytes: "0"})
+	m.sync()
+	if v := m.View(); strings.Contains(v, "210 GB") || !strings.Contains(v, "Free space unknown") {
+		t.Fatalf("stale free space shown:\n%s", v)
+	}
+	// Permission withdrawn on the next session refresh.
+	f.permissions = []string{api.PermCatalogRead}
+	m = drain(t, m, m.load(keySession))
+	if v := m.View(); strings.Contains(v, "JOBS") || strings.Contains(v, "Recent failures") || len(m.metrics.series) != 0 {
+		t.Fatalf("admin metrics survived losing system:admin:\n%s", v)
+	}
+}
+
+func TestFailedPollIsNotShownAsFresh(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}}
+	m := pollAgain(t, start(t, f, 140, 60))
+	s := m.cache.slots[keyDiagnostics]
+	m, _ = update(t, m, loaded{key: keyDiagnostics, request: s.request, err: &api.UnavailableError{Err: fmt.Errorf("refused")}})
+	if v := m.View(); !strings.Contains(v, "couldn't refresh") {
+		t.Fatalf("failed refresh not reported:\n%s", v)
 	}
 }

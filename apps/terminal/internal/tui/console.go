@@ -94,6 +94,15 @@ func (m *Model) poll() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// forgetMetrics discards administrator-only observations: diagnostics,
+// storage and their history.
+func (m *Model) forgetMetrics() {
+	for _, key := range []string{keyDiagnostics, keyStorage, keyMetrics} {
+		m.drop(key)
+	}
+	m.metrics = newHistory()
+}
+
 // observe folds console data into history and animates job progress.
 func (m *Model) observe(msg loaded) tea.Cmd {
 	now := time.Now()
@@ -175,7 +184,7 @@ func (m Model) tiles(now time.Time) [][]tile {
 		pct := make([]point, len(r))
 		peak := 0.0
 		for i, p := range r {
-			pct[i] = point{p.t, p.v * 100}
+			pct[i] = point{t: p.t, v: p.v * 100}
 			peak = math.Max(peak, p.v*100)
 		}
 		cpu.series, cpu.value = pct, fmt.Sprintf("%.1f", pct[len(pct)-1].v)
@@ -203,11 +212,13 @@ func (m Model) tiles(now time.Time) [][]tile {
 		req.value, req.note, req.missing = "…", "measuring", ""
 	}
 	errs := tile{label: "Server errors", id: mErrors, color: colorDanger, missing: unreported}
-	if n, ok := h.increase(mErrors, now, window); ok {
-		errs.series, errs.value = h.values(mErrors, now, window), countText(n)
-		errs.note = "5xx in " + windowText(window)
-	} else if _, ok := latest(mErrors); ok {
-		errs.value, errs.note, errs.missing = "0", "5xx in "+windowText(window), ""
+	if _, reported := latest(mErrors); reported {
+		if n, covered, ok := h.increase(mErrors, now, window); ok {
+			errs.series, errs.value = h.values(mErrors, now, window), countText(n)
+			errs.note = "5xx in " + windowText(covered)
+		} else {
+			errs.value, errs.note = "…", "measuring"
+		}
 	}
 	jobs := tile{label: "Jobs", id: mRunning, color: colorAccent, missing: "Needs system:admin"}
 	if v, ok := latest(mRunning); ok {
@@ -222,9 +233,12 @@ func (m Model) tiles(now time.Time) [][]tile {
 	}
 	busy := tile{label: "Database busy", id: mBusy, color: colorDanger, missing: "Needs system:admin"}
 	if v, ok := latest(mBusy); ok {
-		n, _ := h.increase(mBusy, now, window)
-		busy.series, busy.value = h.values(mBusy, now, window), countText(n)
-		busy.note = "in " + windowText(window) + " · " + countText(v) + " total"
+		if n, covered, ok := h.increase(mBusy, now, window); ok {
+			busy.series, busy.value = h.values(mBusy, now, window), countText(n)
+			busy.note = "in " + windowText(covered) + " · " + countText(v) + " total"
+		} else {
+			busy.value, busy.note = "…", countText(v)+" total · measuring"
+		}
 	}
 	disk := tile{label: "Free space", id: mFree, color: colorInfo, missing: "Needs system:admin", relative: true}
 	if v, ok := latest(mFree); ok {
@@ -384,7 +398,12 @@ func (m Model) workLines(now time.Time) []string {
 		}
 		lines = append(lines, fgStyle.Render(name)+" "+bar+"  "+state)
 	}
-	if shown == 0 {
+	switch s := m.cache.slots[keyJobs]; {
+	case s != nil && s.truncated && shown == 0:
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("None among the first %d jobs; see Processing.", len(jobs))))
+	case s != nil && s.truncated:
+		lines = append(lines, faintStyle.Render(fmt.Sprintf("From the first %d jobs only.", len(jobs))))
+	case shown == 0 && ok:
 		lines = append(lines, okStyle.Render("✓ ")+mutedStyle.Render("Nothing running or queued."))
 	}
 	return lines
@@ -427,7 +446,7 @@ func (m Model) activityLines(now time.Time, n int) []string {
 // failureLines lists the server's most recent failed jobs.
 func (m Model) failureLines() []string {
 	d, ok := data[api.Diagnostics](m, keyDiagnostics)
-	if !ok || len(d.WorkerErrors) == 0 {
+	if !ok || !m.admin() || len(d.WorkerErrors) == 0 {
 		return nil
 	}
 	lines := []string{titleStyle.Render("Recent failures") + "  " + mutedStyle.Render(plural(len(d.WorkerErrors), "job", "jobs")), ""}
@@ -492,14 +511,14 @@ func (e logEntry) render(now time.Time) string {
 // processLines describes the server process for the Server page.
 func (m Model) processLines(width int) []string {
 	d, ok := data[api.Diagnostics](m, keyDiagnostics)
-	if !ok {
+	if !ok || !m.admin() {
 		return nil
 	}
 	lines := []string{titleStyle.Render("Process"), "", row("Uptime", uptime(d.UptimeSeconds))}
 	if p := d.Process; p != nil {
 		opt := func(label string, v *string, format func(float64) string) {
 			if f, ok := parse(v); ok {
-				lines = append(lines, row(label, format(f)))
+				lines = append(lines, row(label, format(f.v)))
 			}
 		}
 		opt("PID", p.PID, func(f float64) string { return strconv.FormatFloat(f, 'f', 0, 64) })
@@ -520,27 +539,18 @@ func (m Model) processLines(width int) []string {
 		row("Jobs", clean(d.RunningJobs)+" running · "+clean(d.QueuedJobs)+" queued"),
 		row("Database busy", clean(d.DBBusyCount)+" since start"))
 	if s, ok := data[api.StorageReport](m, keyStorage); ok {
+		// Reservations are space held back (free-space policy and pending
+		// outputs), not data; they are listed but not added to what Motion uses.
 		lines = append(lines, "", titleStyle.Render("Storage"), "")
-		var used float64
 		for _, part := range []struct {
 			label string
-			v     string
-		}{{"Database", s.DatabaseBytes}, {"Assets", s.AssetBytes}, {"Temporary", s.TemporaryBytes}, {"Reserved", s.ReservedBytes}} {
-			v := part.v
-			if f, ok := parse(&v); ok {
-				used += f
-				lines = append(lines, row(part.label, bytesText(f)))
+			v     *string
+		}{{"Database", &s.DatabaseBytes}, {"Assets", &s.AssetBytes}, {"Temporary", &s.TemporaryBytes}, {"Reserved", &s.ReservedBytes}, {"Free", s.FreeBytes}} {
+			if f, ok := parse(part.v); ok {
+				lines = append(lines, row(part.label, bytesText(f.v)))
+			} else {
+				lines = append(lines, row(part.label, faintStyle.Render("unknown")))
 			}
-		}
-		if free, ok := parse(s.FreeBytes); ok {
-			lines = append(lines, row("Free", bytesText(free)))
-			if total := used + free; total > 0 {
-				w := min(max(width-20, 10), 40)
-				fill := int(math.Round(used / total * float64(w)))
-				lines = append(lines, row("", infoStyle.Render(strings.Repeat("━", fill))+ruleStyle.Render(strings.Repeat("━", w-fill))+faintStyle.Render(fmt.Sprintf("  %.0f%% used by Motion", used/total*100))))
-			}
-		} else {
-			lines = append(lines, row("Free", faintStyle.Render("unknown")))
 		}
 	}
 	return append(lines, "")
@@ -566,16 +576,20 @@ func (m Model) overviewMeta() string {
 	return strings.Join(parts, " · ")
 }
 
-// updatedText says how fresh the console's figures are.
+// updatedText says how fresh the console's figures are, and whether the
+// latest attempt to refresh them failed.
 func (m Model) updatedText() string {
 	s := m.cache.slots[keyDiagnostics]
-	if s == nil || s.at.IsZero() {
-		return ""
+	if s == nil || s.ok.IsZero() {
+		return faintStyle.Render("waiting for the first sample")
 	}
-	age := time.Since(s.at)
+	age := time.Since(s.ok)
 	text := "updated " + strconv.Itoa(int(age.Seconds())) + "s ago"
 	if age < 2*time.Second {
 		text = "updated just now"
+	}
+	if s.err != nil {
+		return dangerStyle.Render(text + " · couldn't refresh: " + describe(s.err).message)
 	}
 	if age > 3*pollEvery {
 		return accentStyle.Render(text)

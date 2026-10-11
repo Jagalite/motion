@@ -257,7 +257,22 @@ func (m *Model) busy() bool {
 			return true
 		}
 	}
-	return m.launching || len(m.cancelling) > 0
+	return m.launching || len(m.cancelling) > 0 || m.working()
+}
+
+// working reports a running job without progress on the Overview, whose
+// spinner should keep turning.
+func (m *Model) working() bool {
+	if m.route.page != pageOverview {
+		return false
+	}
+	jobs, _ := data[[]api.Job](*m, keyJobs)
+	for _, j := range jobs {
+		if phaseActive(j.Phase) && j.Phase != "queued" && j.Progress == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // spin starts the loading indicator if it is not already running.
@@ -299,6 +314,9 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return tea.Batch(m.poll(), pollTick())
 	case beatMsg:
 		m.beat++
+		if m.working() {
+			return tea.Batch(beatTick(), m.spin())
+		}
 		return beatTick()
 	case progress.FrameMsg:
 		return m.animate(msg)
@@ -316,7 +334,14 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 		}
 		switch msg.key {
+		case keyDiagnostics, keyStorage, keyMetrics:
+			if revoked(msg.err) {
+				m.forgetMetrics() // the server withdrew access to what was shown
+			}
 		case keySession:
+			if !m.admin() {
+				m.forgetMetrics()
+			}
 			// Permissions and features are known now: start polling at once.
 			return tea.Batch(m.viewerChanged(), m.poll())
 		case keyProfiles:
@@ -697,7 +722,8 @@ func (m *Model) signedOut(err error) {
 	m.cache.seq++
 	m.cache.slots[keySession] = &slot{request: m.cache.seq, err: err}
 	m.cache.viewer = ""
-	m.metrics, m.bars = newHistory(), map[string]*progress.Model{}
+	m.forgetMetrics()
+	m.bars = map[string]*progress.Model{}
 	m.focus, m.history, m.confirm = focusContent, nil, ""
 }
 

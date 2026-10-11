@@ -83,8 +83,10 @@ type slot struct {
 	truncated bool
 	err       error
 	cancel    context.CancelFunc
-	// at is when the newest reply was accepted.
+	// at is when the newest reply was accepted; ok when the newest
+	// successful one was.
 	at time.Time
+	ok time.Time
 }
 
 // cache is shared by every copy of the model: Bubble Tea copies the model on
@@ -248,7 +250,7 @@ func (m *Model) accept(msg loaded) bool {
 	s.err = msg.err
 	switch {
 	case msg.err == nil:
-		s.data, s.truncated = msg.data, msg.truncated
+		s.data, s.truncated, s.ok = msg.data, msg.truncated, s.at
 	case revoked(msg.err), msg.key == keySearch:
 		// Data the server no longer authorizes must not stay on screen, and
 		// results for an older query must not stand in for this one.

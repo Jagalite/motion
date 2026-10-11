@@ -39,12 +39,20 @@ var windows = []time.Duration{5 * time.Minute, 30 * time.Minute, time.Hour, 6 * 
 type point struct {
 	t time.Time
 	v float64
+	// n is the exact value of an integer sample; counters subtract n so
+	// values beyond 2^53 still count every increment.
+	n     uint64
+	exact bool
 }
 
 // history holds bounded time series. Server history replaces a series
 // wholesale; session samples are appended. Points are time-ordered.
 type history struct {
 	series map[string][]point
+	// present is whether the newest observation reported each series; a
+	// series that stops being reported is shown as unavailable, not as its
+	// last value.
+	present map[string]bool
 	// server is true once points came from the server's admin.metrics.
 	server bool
 	// changed is when each series last took a new value from a live sample.
@@ -54,54 +62,64 @@ type history struct {
 const sessionPoints = 2000
 
 func newHistory() *history {
-	return &history{series: map[string][]point{}, changed: map[string]time.Time{}}
+	return &history{series: map[string][]point{}, present: map[string]bool{}, changed: map[string]time.Time{}}
 }
 
-func (h *history) add(id string, t time.Time, v float64) {
+func (h *history) add(id string, t time.Time, p point) {
 	s := h.series[id]
 	if n := len(s); n > 0 && !t.After(s[n-1].t) {
 		return // out of order or duplicate
 	}
-	if n := len(s); n > 0 && s[n-1].v != v {
+	if n := len(s); n > 0 && s[n-1].v != p.v {
 		h.changed[id] = t
 	}
-	s = append(s, point{t, v})
+	p.t = t
+	s = append(s, p)
 	if len(s) > sessionPoints {
 		s = s[len(s)-sessionPoints:]
 	}
 	h.series[id] = s
 }
 
-func parse(s *string) (float64, bool) {
+// parse reads a decimal-string metric, exactly when it is an integer.
+func parse(s *string) (point, bool) {
 	if s == nil {
-		return 0, false
+		return point{}, false
+	}
+	if n, err := strconv.ParseUint(*s, 10, 64); err == nil {
+		return point{v: float64(n), n: n, exact: true}, true
 	}
 	v, err := strconv.ParseFloat(*s, 64)
-	return v, err == nil && !math.IsNaN(v) && !math.IsInf(v, 0)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return point{}, false
+	}
+	return point{v: v}, true
 }
 
-// observeDiagnostics records one diagnostics reply as a sample.
+// observe records one reply's fields; a null or missing field marks its
+// series as not currently reported.
+func (h *history) observe(t time.Time, fields map[string]*string) {
+	for id, raw := range fields {
+		p, ok := parse(raw)
+		h.present[id] = ok
+		if ok {
+			h.add(id, t, p)
+		}
+	}
+}
+
 func (h *history) observeDiagnostics(t time.Time, d api.Diagnostics) {
-	for id, s := range map[string]string{mDeliveries: d.ActiveDeliveries, mQueued: d.QueuedJobs, mRunning: d.RunningJobs, mBusy: d.DBBusyCount} {
-		if v, ok := parse(&s); ok {
-			h.add(id, t, v)
-		}
-	}
+	fields := map[string]*string{mDeliveries: &d.ActiveDeliveries, mQueued: &d.QueuedJobs, mRunning: &d.RunningJobs, mBusy: &d.DBBusyCount,
+		mCPU: nil, mMemory: nil, mOpenFiles: nil, mRequests: nil, mErrors: nil, mInFlight: nil}
 	if p := d.Process; p != nil {
-		for id, s := range map[string]*string{mCPU: p.CPUSecondsTotal, mMemory: p.ResidentBytes, mOpenFiles: p.OpenFiles, mRequests: p.RequestsTotal, mErrors: p.RequestErrorsTotal, mInFlight: p.RequestsInFlight} {
-			if v, ok := parse(s); ok {
-				h.add(id, t, v)
-			}
-		}
+		fields[mCPU], fields[mMemory], fields[mOpenFiles] = p.CPUSecondsTotal, p.ResidentBytes, p.OpenFiles
+		fields[mRequests], fields[mErrors], fields[mInFlight] = p.RequestsTotal, p.RequestErrorsTotal, p.RequestsInFlight
 	}
+	h.observe(t, fields)
 }
 
 func (h *history) observeStorage(t time.Time, s api.StorageReport) {
-	for id, v := range map[string]*string{mDatabase: &s.DatabaseBytes, mAssets: &s.AssetBytes, mTemporary: &s.TemporaryBytes, mFree: s.FreeBytes} {
-		if f, ok := parse(v); ok {
-			h.add(id, t, f)
-		}
-	}
+	h.observe(t, map[string]*string{mDatabase: &s.DatabaseBytes, mAssets: &s.AssetBytes, mTemporary: &s.TemporaryBytes, mFree: s.FreeBytes})
 }
 
 // replace adopts server history; later live samples append to it.
@@ -109,23 +127,43 @@ func (h *history) replace(m api.MetricsHistory) {
 	h.server = true
 	for _, s := range m.Series {
 		var pts []point
-		for _, p := range s.Points {
-			t, err := time.Parse(time.RFC3339, p.T)
-			v, ok := parse(&p.V)
+		for _, raw := range s.Points {
+			t, err := time.Parse(time.RFC3339, raw.T)
+			p, ok := parse(&raw.V)
 			if err == nil && ok && (len(pts) == 0 || t.After(pts[len(pts)-1].t)) {
-				pts = append(pts, point{t, v})
+				p.t = t
+				pts = append(pts, p)
 			}
 		}
 		h.series[s.ID] = pts
+		if _, seen := h.present[s.ID]; !seen {
+			h.present[s.ID] = len(pts) > 0
+		}
 	}
 }
 
+// latest is the newest value of a series that is still being reported.
 func (h *history) latest(id string) (point, bool) {
 	s := h.series[id]
-	if len(s) == 0 {
+	if len(s) == 0 || !h.present[id] {
 		return point{}, false
 	}
 	return s[len(s)-1], true
+}
+
+// delta is how much a counter grew between two samples, exactly for integer
+// samples; a drop is a restart and counts as no growth.
+func delta(a, b point) (float64, bool) {
+	if a.exact && b.exact {
+		if b.n < a.n {
+			return 0, false
+		}
+		return float64(b.n - a.n), true
+	}
+	if b.v < a.v {
+		return 0, false
+	}
+	return b.v - a.v, true
 }
 
 // rate converts a counter into per-second rates between samples. A drop is
@@ -134,11 +172,11 @@ func rate(s []point) []point {
 	var out []point
 	for i := 1; i < len(s); i++ {
 		dt := s[i].t.Sub(s[i-1].t).Seconds()
-		dv := s[i].v - s[i-1].v
-		if dt <= 0 || dv < 0 {
+		dv, ok := delta(s[i-1], s[i])
+		if dt <= 0 || !ok {
 			continue
 		}
-		out = append(out, point{s[i].t, dv / dt})
+		out = append(out, point{t: s[i].t, v: dv / dt})
 	}
 	return out
 }
@@ -157,21 +195,28 @@ func (h *history) values(id string, now time.Time, window time.Duration) []point
 	return s[i:]
 }
 
-// increase is how much a counter grew within the window, restarts excluded.
-func (h *history) increase(id string, now time.Time, window time.Duration) (float64, bool) {
+// increase is how much a counter grew over intervals wholly inside the
+// window, restarts excluded, and the span those intervals cover; ok is false
+// until there is at least one such interval.
+func (h *history) increase(id string, now time.Time, window time.Duration) (total float64, covered time.Duration, ok bool) {
 	s := h.series[id]
 	start := now.Add(-window)
-	total, seen := 0.0, false
+	var first time.Time
 	for i := 1; i < len(s); i++ {
-		if s[i].t.Before(start) {
+		if s[i-1].t.Before(start) {
 			continue
 		}
-		seen = true
-		if d := s[i].v - s[i-1].v; d > 0 {
+		if !ok {
+			first, ok = s[i-1].t, true
+		}
+		if d, grew := delta(s[i-1], s[i]); grew {
 			total += d
 		}
 	}
-	return total, seen
+	if ok {
+		covered = s[len(s)-1].t.Sub(first)
+	}
+	return total, covered, ok
 }
 
 var sparkLevels = []rune(" ▁▂▃▄▅▆▇█")
@@ -282,6 +327,9 @@ func countText(v float64) string {
 }
 
 func windowText(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
 	if d >= time.Hour {
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
