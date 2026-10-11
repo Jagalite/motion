@@ -56,8 +56,8 @@ export function media(dir) {
 }
 
 export class Server {
-  constructor({work, port, launch, demuxe}) {
-    Object.assign(this, {work, port, launch, demuxe, origin: `http://127.0.0.1:${port}`, starts: [], log: ''});
+  constructor({work, port, launch, demuxe, allowLegacy = false}) {
+    Object.assign(this, {work, port, launch, demuxe, origin: `http://127.0.0.1:${port}`, allowLegacy, requests: [], starts: [], log: ''});
   }
   async start() {
     const t0 = Date.now();
@@ -78,6 +78,8 @@ export class Server {
   }
   operator() { return readFileSync(join(this.work, 'data', 'admin-token'), 'utf8').trim(); }
   async api(method, path, body, token, extra = {}) {
+    if (!this.allowLegacy && !path.startsWith('/api/v2/')) throw new Error(`Candidate setup must use v2: ${method} ${path}`);
+    this.requests.push({method, path});
     const headers = {Accept: 'application/json', ...extra};
     if (token) headers.Authorization = `Bearer ${token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -165,7 +167,7 @@ const DEMUXE_LIVE = {id: 'demuxe-live-hls', evidence: 'live playback requires ex
 
 /**
  * The scenario over a Playwright-like `page` (goto, reload, evaluate,
- * screenshot, on('response'|'console')). Responses expose url(), status(),
+ * screenshot, on('request'|'response'|'console')). Responses expose url(), status(),
  * request().method(), request().postData() and json().
  */
 export async function scenario(page, server, ctx, engine, out) {
@@ -180,6 +182,12 @@ export async function scenario(page, server, ctx, engine, out) {
     console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
   };
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
+  const legacyRequests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.origin === server.origin && /^\/(?:api\/v1(?:\/|$)|media(?:\/|$)|(?:app|playback|session)\.js$)/.test(url.pathname))
+      legacyRequests.push({method: request.method(), path: url.pathname});
+  });
   page.on('response', async r => {
     const url = new URL(r.url());
     if (!url.pathname.startsWith('/api/v2/') || url.origin !== server.origin) return;
@@ -343,16 +351,23 @@ export async function scenario(page, server, ctx, engine, out) {
   // admitted at the current position, the viewing session is rebound to it,
   // and the predecessor is retired.
   const operator = server.operator();
-  const legacy = (await server.api('GET', '/api/v1/items', undefined, operator)).json;
-  const filmFile = (legacy.items ?? legacy).find(i => /film/i.test(i.title));
-  const job = await server.api('POST', '/api/v1/processing-jobs', {source_file_id: filmFile.file_id, source_revision: filmFile.revision,
-    recipe: 'remux_mp4', backend: 'software', idempotency_key: `e2e-${engine}-${Date.now()}`}, operator);
+  const activeId = admitted(t);
+  if (!activeId) throw new Error('No current delivery admission was observed');
+  const active = await server.api('GET', `/api/v2/playback/delivery-sessions/${activeId}`, undefined, ctx.token);
+  if (active.status !== 200 || !active.json?.source) throw new Error('Cannot resolve the current source for preparation');
+  const job = await server.api('POST', '/api/v2/processing/preparations', {
+    source: active.json.source, timeline_id: ctx.film.timeline, recipe_id: 'remux_mp4',
+    tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: 'off', audio_track_id: null, subtitle_track_id: null},
+  }, operator, {'Idempotency-Key': `e2e-${engine}-${Date.now()}`});
+  if (job.status !== 202) throw new Error(`v2 preparation is required for acceptance: ${job.status} ${JSON.stringify(job.json)}`);
   let phase = job.json?.phase;
-  for (let i = 0; i < 1200 && ['queued', 'running', 'cancelling'].includes(phase); i++) {
+  for (let i = 0; i < 1200 && ['queued', 'admitted', 'running', 'validating', 'publishing', 'cancelling'].includes(phase); i++) {
     await sleep(100);
-    phase = (await server.api('GET', `/api/v1/processing-jobs/${job.json.id}`, undefined, operator)).json?.phase;
+    const polled = await server.api('GET', `/api/v2/jobs/${job.json.id}`, undefined, operator);
+    if (polled.status !== 200) throw new Error(`Cannot poll preparation: ${polled.status}`);
+    phase = polled.json?.phase;
   }
-  check('a prepared rendition is produced by a real processing job', job.status === 201 && phase === 'completed', {status: job.status, phase});
+  check('a prepared rendition is produced by a real v2 preparation', phase === 'completed', {status: job.status, phase});
   const beforeDelivery = admitted(t);
   t = Date.now();
   await page.evaluate(() => window.__e2e.el().play());
@@ -474,6 +489,7 @@ export async function scenario(page, server, ctx, engine, out) {
   // Diagnostics inform the gap analysis; they never fail the receipt.
   checks.push({name: 'diagnostic: server live HLS conversion in a plain video element', status: diagnostic.played ? 'diagnostic-pass' : 'diagnostic-fail', gap: null, detail: diagnostic});
   console.log(`[${engine}] DIAGNOSTIC plain video HLS ${JSON.stringify(diagnostic)}`);
+  check('candidate setup and browser traffic use v2', legacyRequests.length === 0 && server.requests.every(r => r.path.startsWith('/api/v2/')), {legacyRequests, setupRequests: server.requests});
   writeFileSync(join(out, `${engine}-network.json`), JSON.stringify(net, null, 2));
   writeFileSync(join(out, `${engine}-console.log`), consoleLog.join('\n'));
   return checks;
@@ -489,6 +505,18 @@ export async function prepare(engine, binary, demuxe) {
   return {server, media: media(join(work, 'media'))};
 }
 
+export function deploymentEvidence(directory) {
+  const receiptBytes = readFileSync(join(directory, 'playscale-package.json'));
+  const installed = JSON.parse(receiptBytes);
+  for (const [name, expected] of Object.entries(installed.files)) {
+    if (sha256(readFileSync(join(directory, name))) !== expected) throw new Error(`Installed Demuxe asset changed: ${name}`);
+  }
+  return {version: installed.version, archive_sha256: installed.archive_sha256,
+    deployment: installed.deployment, providers: installed.providers ?? [],
+    composer_sha256: installed.composer_sha256 ?? null, receipt_sha256: sha256(receiptBytes),
+    manifest_sha256: sha256(readFileSync(join(directory, 'demuxe-providers.json')))};
+}
+
 async function main() {
   const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, i, all) =>
     value.startsWith('--') ? [...pairs, [value.slice(2), all[i + 1]]] : pairs, []));
@@ -500,7 +528,10 @@ async function main() {
   const demuxe = resolve(process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe'));
   const receipt = {started: new Date().toISOString(), kind: 'production-evidence',
     server: {binary, sha256: sha256(readFileSync(binary))},
-    demuxe: {dir: demuxe, version: JSON.parse(readFileSync(join(demuxe, 'playscale-package.json'), 'utf8')).version}, engines: {}};
+    demuxe: deploymentEvidence(demuxe),
+    source: {commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root, encoding: 'utf8'}).trim(),
+      dirty: execFileSync('git', ['status', '--porcelain'], {cwd: root, encoding: 'utf8'}).trim(),
+      diff_sha256: sha256(execFileSync('git', ['diff', 'HEAD', '--'], {cwd: root}))}, engines: {}};
   for (const engine of engines) {
     let result;
     if (engine === 'electron') {

@@ -5,6 +5,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import uuid
 from smoke import BINARY, free_port, request, wait_for, stop
 from backup import backup, restore
 
@@ -26,20 +27,33 @@ def main():
             try:
                 wait_for(lambda: request(port, 'GET', '/ready')[0] == 200)
                 auth = {'Authorization': 'Bearer ' + (root / 'state/admin-token').read_text().strip()}
-                def api(method, path, body=None, expected=200):
-                    status, _, data = request(port, method, '/api/v1' + path, body, auth)
+                def api(method, path, body=None, expected=200, headers=None, with_headers=False):
+                    extra = dict(headers or {})
+                    if method == 'POST':
+                        extra.setdefault('Idempotency-Key', str(uuid.uuid4()))
+                    status, response_headers, data = request(port, method, '/api/v2' + path, body, dict(auth, **extra))
                     assert status == expected, (status, data)
-                    return json.loads(data)
-                assert request(port, 'GET', '/api/v1/admin/diagnostics')[0] == 401
+                    return (json.loads(data), response_headers) if with_headers else json.loads(data)
+                assert request(port, 'GET', '/api/v2/admin/diagnostics')[0] == 401
                 diag = api('GET', '/admin/diagnostics')
-                assert diag['readiness']['ready'] is True and diag['ffprobe_available'] is True and diag['demuxe_present_at_startup'] is False
+                health = api('GET', '/system/health')
+                assert health['status'] == 'ok' and diag['server_epoch'] == health['server_epoch']
+                assert all(int(diag[key]) >= 0 for key in ('uptime_seconds', 'active_deliveries', 'queued_jobs', 'running_jobs', 'db_busy_count'))
+                assert isinstance(diag['worker_errors'], list)
                 checks.append('readiness_and_authenticated_diagnostics')
-                item = api('POST', '/catalog/items', {'title': 'Backed up movie', 'media_type': 'movie'}, 201)
-                api('PUT', f'/profiles/default/viewing/{item["id"]}', {'expected_revision': 0, 'watched': True})
+                item, item_headers = api('POST', '/catalog/items', {'title': 'Backed up movie', 'kind': 'movie', 'library_ids': []}, 201, with_headers=True)
+                edition = api('POST', f'/catalog/items/{item["id"]}/editions',
+                              {'label': 'Default', 'kind': 'default'}, 201,
+                              {'If-Match': item_headers['etag']})
+                timeline = edition['timeline_ids'][0]
+                viewing_path = f'/profiles/default/timelines/{timeline}/viewing'
+                viewing, viewing_headers = api('GET', viewing_path, with_headers=True)
+                api('PUT', viewing_path, {'manual_watched': True, 'reset_position': False},
+                    headers={'If-Match': viewing_headers['etag']})
                 manifest = backup(root / 'state', root / 'snapshot')
                 assert manifest['schema_versions']
                 # This later write must not appear in the already completed snapshot.
-                api('POST', '/catalog/items', {'title': 'After snapshot', 'media_type': 'movie'}, 201)
+                api('POST', '/catalog/items', {'title': 'After snapshot', 'kind': 'movie', 'library_ids': []}, 201)
                 restored = root / 'restored'
                 restore(root / 'snapshot', restored)
                 assert not (restored / 'admin-token').exists()
@@ -68,8 +82,11 @@ def main():
                 old_auth = auth['Authorization']
                 auth['Authorization'] = 'Bearer ' + (restored / 'admin-token').read_text().strip()
                 assert auth['Authorization'] != old_auth
-                assert api('GET', '/catalog/items')['total'] == 1
-                assert api('GET', f'/profiles/default/viewing/{item["id"]}')['watched'] is True
+                assert request(port, 'GET', '/api/v2/admin/diagnostics', headers={'Authorization': old_auth})[0] == 401
+                catalog = api('GET', '/catalog/items')
+                assert [row['id'] for row in catalog['items']] == [item['id']]
+                assert catalog['next_cursor'] is None
+                assert api('GET', viewing_path)['watched'] is True
                 checks.append('restored_server_state_and_fresh_credential')
             finally:
                 stop(process)

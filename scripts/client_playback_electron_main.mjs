@@ -14,8 +14,14 @@ const out = process.env.MOTION_E2E_OUT;
 const media = url => /\/api\/v2\/(media|streams)\//.test(new URL(url).pathname);
 const resultFile = process.env.MOTION_E2E_RESULT;
 
-function adapter(contents, ses) {
-  const listeners = {response: [], console: []};
+function adapter(contents, ses, origin) {
+  const listeners = {request: [], response: [], console: []};
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    for (const handler of listeners.request) handler({url: () => details.url, method: () => details.method});
+    let allowed = false;
+    try { allowed = new URL(details.url).origin === origin; } catch {}
+    callback({cancel: !allowed && !details.url.startsWith(`blob:${origin}/`)});
+  });
   const requests = new Map();
   contents.debugger.attach('1.3');
   void contents.debugger.sendCommand('Network.enable');
@@ -65,15 +71,12 @@ app.whenReady().then(async () => {
     ses.setPermissionRequestHandler((_wc, permission, callback) => callback(permission === 'fullscreen'));
     ses.setPermissionCheckHandler((_wc, permission) => permission === 'fullscreen');
     ses.on('will-download', event => event.preventDefault());
-    ses.webRequest.onBeforeRequest((details, callback) => {
-      callback({cancel: !sameOrigin(details.url) && !details.url.startsWith(`blob:${origin}/`)});
-    });
     const window = new BrowserWindow({width: 1100, height: 760, show: false, webPreferences: {session: ses, sandbox: true,
       contextIsolation: true, nodeIntegration: false, nodeIntegrationInSubFrames: false, webSecurity: true,
       allowRunningInsecureContent: false, webviewTag: false, autoplayPolicy: 'no-user-gesture-required'}});
     window.webContents.setWindowOpenHandler(() => ({action: 'deny'}));
     window.webContents.on('will-navigate', (event, url) => { if (!sameOrigin(url)) event.preventDefault(); });
-    result.checks = await scenario(adapter(window.webContents, ses), server, ctx, 'electron', out);
+    result.checks = await scenario(adapter(window.webContents, ses, origin), server, ctx, 'electron', out);
     result.serverStartsMs = server.starts;
   } catch (error) {
     result.error = String(error?.stack ?? error);
