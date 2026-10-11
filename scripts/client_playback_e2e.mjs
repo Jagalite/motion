@@ -192,7 +192,7 @@ export async function scenario(page, server, ctx, engine, out) {
     writeFileSync(join(out, `${engine}-checks.json`), JSON.stringify(checks, null, 2));
     writeFileSync(join(out, `${engine}-network.json`), JSON.stringify(net, null, 2));
     writeFileSync(join(out, `${engine}-console.json`), JSON.stringify(consoleLog, null, 2));
-    console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
+    console.log(`[${engine}] ${status.toUpperCase()} ${name} ${(JSON.stringify(detail) ?? 'null').slice(0, 300)}`);
   };
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
   const legacyRequests = [];

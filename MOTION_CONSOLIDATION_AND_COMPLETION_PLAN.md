@@ -400,3 +400,47 @@ Current lane-4 implementation and integration gates are recorded in
       integrated revision; blocked/skipped/deferred cases remain visible.
 - [ ] Status documentation reflects the merged implementation and exact evidence.
 - [ ] M5/M6 requirements and explicit provider/platform deferrals remain tracked.
+
+### Data/catalog completion ownership update (PR #17)
+
+Data/catalog owns the missing `getProcessingCapabilities`, `listRecipes`,
+`createPreparation`, `listRenditions`, all five schedule operations,
+`getStorage`, `createBackup`, and `listBackups`. These are no longer unassigned
+cross-lane dependencies. Migrations 0038-0041 are allocated in MIGRATIONS.md;
+coordinate subsequent schema numbers with this lane and preserve prior files.
+
+The exact client interface and supported values are recorded in
+DATA_CATALOG_CLIENT_HANDOFF.md. Preparation and backup adapters reuse existing
+services, with durable request identities and publication/recovery checks.
+Scan and metadata-refresh schedules execute; preview/optimize scheduling and
+automated generated-cache restore remain explicit service gaps. Route inventory
+alone does not close M1/M3. Real HTTP preparation/backup acceptance,
+schema 9→41 upgrade repairs and scoped-smart regression checks pass; exact
+receipts are in qualification/data-catalog. Browser/client and combined-package
+acceptance remain separate gates; prior receipts bind only their recorded commits.
+
+
+### Clients continuation status (PR #15)
+
+The Clients tree composes catalog `69e0ff4` and playback `0621762`. Current
+callers migrated include catalog/playback preparation, general/catalog/viewing/
+operations smoke, processing stress, inventory/backup reliability, installed
+package setup and candidate upgrade observers. Frozen old-binary writes remain
+an explicit exception. `video_profiles_smoke.py` still needs a public v2 dynamic
+profile/backend interface; no full caller-migration claim is made.
+
+Exact scoped receipts are in [the Clients ledger](qualification/clients-completion/README.md).
+The earlier `38db68c` Electron workflow passed 30 assertions. The newer combined
+`ad67fa0` binary passes original/audio/prepared switching, resume and restart but
+fails conversion-only live startup. Collaborative-browser live-window and delayed
+Play behavior also remain failed. Seven reliability checks, 20 real processing checks, 11 library regressions and
+79 JavaScript/setup checks pass within their recorded scopes. Managed generated-store
+visibility is corrected with focused adapter regression coverage.
+
+Clients is **in progress**, not complete. Positive Next needs public release-order
+provisioning; dynamic profiles need a v2 contract; provider/pacing compatibility,
+latest combined acceptance and installed-package gates remain open. Topcoat
+default cutover, legacy UI/media/API retirement and a qualified provider release
+handoff are withheld until those gates pass. Candidate archive hashes identify
+inputs, not qualified release assets. Integration coordination is tracked on
+PRs #14, #16 and #17; old-binary upgrade fixtures are retained.

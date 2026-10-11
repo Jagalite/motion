@@ -872,11 +872,7 @@ async fn convert(
         Ok(())
     })
     .await?;
-    let library = db::add_library(&app.db, "Generated media", &app.processing.root).await?;
-    sqlx::query("UPDATE libraries SET managed=1 WHERE id=?")
-        .bind(&library.id)
-        .execute(&app.db)
-        .await?;
+    let library = db::add_managed_library(&app.db, "Generated media", &app.processing.root).await?;
     tokio::fs::remove_file(directory.join("input")).await?;
     Ok((found, library.id))
 }

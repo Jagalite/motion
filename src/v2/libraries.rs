@@ -112,7 +112,7 @@ pub async fn list_libraries(
     };
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM catalog_libraries WHERE id>? AND (? OR id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?")
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM catalog_libraries WHERE id NOT IN (SELECT id FROM libraries WHERE managed=1) AND id>? AND (? OR id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?")
         .bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut rows = Vec::new();
     for id in ids {

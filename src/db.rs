@@ -283,6 +283,24 @@ async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
 }
 
 pub async fn add_library(db: &SqlitePool, name: &str, root: &Path) -> anyhow::Result<Library> {
+    add_library_kind(db, name, root, false).await
+}
+
+/// Internal output storage is never a logical catalog library or scan source.
+pub async fn add_managed_library(
+    db: &SqlitePool,
+    name: &str,
+    root: &Path,
+) -> anyhow::Result<Library> {
+    add_library_kind(db, name, root, true).await
+}
+
+async fn add_library_kind(
+    db: &SqlitePool,
+    name: &str,
+    root: &Path,
+    managed: bool,
+) -> anyhow::Result<Library> {
     anyhow::ensure!(
         !name.trim().is_empty() && name.len() <= 200,
         "name must contain 1–200 bytes"
@@ -296,48 +314,55 @@ pub async fn add_library(db: &SqlitePool, name: &str, root: &Path) -> anyhow::Re
     );
     let root = root.to_str().context("library root must be UTF-8")?;
     let identity = root_identity(&tokio::fs::metadata(root).await?);
-    add_verified_library(db, name, root, &identity).await
+    add_verified_library_kind(db, name, root, &identity, managed).await
 }
 
 /// Register the result of an admitted filesystem inspection. Runtime callers
 /// serialize this operation with relocation using App.jobs.
-pub(crate) async fn add_verified_library(
+async fn add_verified_library_kind(
     db: &SqlitePool,
     name: &str,
     root: &str,
     identity: &str,
+    managed: bool,
 ) -> anyhow::Result<Library> {
     anyhow::ensure!(
         !name.trim().is_empty() && name.len() <= 200,
         "invalid library name"
     );
     let mut tx = begin_write(db).await?;
-    let existing: Option<String> =
-        sqlx::query_scalar("SELECT root_identity FROM libraries WHERE root=?")
+    let existing: Option<(String, bool)> =
+        sqlx::query_as("SELECT root_identity,managed FROM libraries WHERE root=?")
             .bind(root)
             .fetch_optional(&mut *tx)
             .await?;
     anyhow::ensure!(
-        existing.as_ref().is_none_or(|v| v == identity),
+        existing.as_ref().is_none_or(|(v, _)| v == identity),
         "library root identity changed"
     );
-    sqlx::query("INSERT INTO libraries (id,name,root,root_identity) VALUES (?,?,?,?) ON CONFLICT(root) DO NOTHING")
-        .bind(new_id()).bind(name.trim()).bind(root).bind(identity).execute(&mut *tx).await?;
+    anyhow::ensure!(
+        existing.as_ref().is_none_or(|(_, kind)| *kind == managed),
+        "library storage ownership changed"
+    );
+    sqlx::query("INSERT INTO libraries (id,name,root,root_identity,managed) VALUES (?,?,?,?,?) ON CONFLICT(root) DO NOTHING")
+        .bind(new_id()).bind(name.trim()).bind(root).bind(identity).bind(managed).execute(&mut *tx).await?;
     let library: Library = sqlx::query_as("SELECT id,name FROM libraries WHERE root=?")
         .bind(root)
         .fetch_one(&mut *tx)
         .await?;
-    // Legacy configuration declares a library and root together. Preserve its
-    // stable ID while registering both parts atomically in the new model.
-    sqlx::query("INSERT INTO catalog_libraries(id,name,kind) VALUES (?,?,'mixed') ON CONFLICT(id) DO NOTHING")
+    if !managed {
+        // Legacy configuration declares a library and root together. Preserve its
+        // stable ID while registering both parts atomically in the new model.
+        sqlx::query("INSERT INTO catalog_libraries(id,name,kind) VALUES (?,?,'mixed') ON CONFLICT(id) DO NOTHING")
         .bind(&library.id).bind(&library.name).execute(&mut *tx).await?;
-    sqlx::query(
-        "INSERT INTO library_sources(library_id,source_id) VALUES (?,?) ON CONFLICT DO NOTHING",
-    )
-    .bind(&library.id)
-    .bind(&library.id)
-    .execute(&mut *tx)
-    .await?;
+        sqlx::query(
+            "INSERT INTO library_sources(library_id,source_id) VALUES (?,?) ON CONFLICT DO NOTHING",
+        )
+        .bind(&library.id)
+        .bind(&library.id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(library)
 }
