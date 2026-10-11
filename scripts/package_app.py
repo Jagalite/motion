@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 
 from check_publication import source_failures
 from build_media_tools import assert_portable, build, digest, download
@@ -106,14 +107,17 @@ def assemble(output, cache, tools, jobs):
         raise ValueError('Media receipt must contain exactly ffmpeg and ffprobe')
     if inputs != source_inventory():
         raise ValueError('Application source changed during dependency preparation')
-    rust_env = {**os.environ}
+    channel = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+    compiler = subprocess.check_output(
+        ['rustup', 'which', '--toolchain', channel, 'rustc'], cwd=ROOT, text=True).strip()
+    rust_env = {**os.environ, 'RUSTC': compiler}
     # Override inherited compiler flags so all local paths use public prefixes.
     rust_env.pop('RUSTFLAGS', None)
     rust_env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join([
         f'--remap-path-prefix={Path.home()}=/build/cargo',
         f'--remap-path-prefix={ROOT}=/build/motion',
     ])
-    subprocess.run(['cargo', 'build', '--release', '--locked', '--target-dir', str(ROOT / 'target'),
+    subprocess.run(['rustup', 'run', channel, 'cargo', 'build', '--release', '--locked', '--target-dir', str(ROOT / 'target'),
                     '--jobs', str(jobs)], cwd=ROOT, env=rust_env, check=True)
     if inputs != source_inventory():
         raise ValueError('Application source changed during compilation; retry the build')
@@ -199,7 +203,7 @@ Motion application code is MIT; dependency source archives retain their licenses
                     'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                     'source_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT)),
                     'source_files': inputs,
-                    'rustc': subprocess.check_output(['rustc', '-vV'], text=True),
+                    'rustc': subprocess.check_output([compiler, '-vV'], text=True),
                     'packaging_lock_sha256': digest(ROOT / 'packaging.lock.json'),
                     'demuxe': {**lock['demuxe'], 'deployment': deployment['deployment'], 'shared_runtime': False},
                     'media_tools': receipt,
