@@ -565,6 +565,44 @@ async fn serve_media(State(state): State<AppState>, request: Request) -> Respons
     response
 }
 
+/// Mock artwork bytes: a generated SVG per `mock-<role>-<item>` asset ID, so
+/// pages exercise real image loading under the production CSP.
+async fn mock_asset(Path(id): Path<String>) -> Response {
+    let Some(rest) = id.strip_prefix("mock-") else {
+        return problem(StatusCode::NOT_FOUND, "not_found");
+    };
+    let (role, item) = rest.split_once('-').unwrap_or((rest, ""));
+    let hue = item.bytes().fold(0u32, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(u32::from(b))
+    }) % 360;
+    let (w, h) = if role == "poster" {
+        (400, 600)
+    } else {
+        (1600, 900)
+    };
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl({hue},45%,38%)"/><stop offset="1" stop-color="hsl({},55%,12%)"/></linearGradient></defs><rect width="{w}" height="{h}" fill="url(#g)"/><circle cx="{}" cy="{}" r="{}" fill="hsl({},70%,62%)" opacity=".85"/><rect y="{}" width="{w}" height="{}" fill="hsl({hue},35%,18%)"/><text x="50%" y="{}" fill="#fff" font-family="Helvetica,Arial,sans-serif" font-size="{}" font-weight="700" text-anchor="middle" opacity=".9">{}</text></svg>"##,
+        (hue + 40) % 360,
+        w * 2 / 3,
+        h * 2 / 5,
+        w.min(h) / 5,
+        (hue + 180) % 360,
+        h * 3 / 4,
+        h / 4,
+        h * 9 / 10,
+        if role == "poster" { 34 } else { 64 },
+        role.to_uppercase()
+    );
+    let mut response = (StatusCode::OK, svg).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("image/svg+xml"),
+    );
+    headers.insert("x-motion-mock", HeaderValue::from_static("1"));
+    response
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -596,6 +634,7 @@ async fn main() {
     };
     let api = Router::new()
         .route("/api/v2/auth/session", post(create_session))
+        .route("/api/v2/media/assets/{id}/content", get(mock_asset))
         .route("/api/v2/libraries/{id}/scans", post(create_scan))
         .route(
             "/api/v2/catalog/matches/{id}/decision",

@@ -449,6 +449,16 @@ async fn metadata_read_replace_preconditions_and_scope() {
         .await
         .unwrap();
     assert_eq!(title, "My Film");
+    // The catalog item carries the resolved release year.
+    let item = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film-a",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(item.body["release_year"], 2001, "{}", item.body);
     // An identical replacement is not a new revision; the old tag is stale.
     let same = f
         .call(
@@ -1303,6 +1313,8 @@ async fn artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag() 
         .await;
     assert_eq!(selected.status, StatusCode::OK, "{}", selected.body);
     assert_eq!(selected.body["artwork_id"], uploaded["id"]);
+    assert_eq!(selected.body["artwork"]["poster"], uploaded["id"]);
+    assert_eq!(selected.body["artwork"]["backdrop"], Value::Null);
     assert_eq!(
         f.call(
             "PUT",
@@ -1314,6 +1326,22 @@ async fn artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag() 
         .status,
         StatusCode::PRECONDITION_FAILED
     );
+    // Every role resolves by the same policy; the poster stays where it was.
+    let backdrop = f
+        .call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/artwork/selection",
+            Some(json!({"role":"backdrop","asset_id":uploaded["id"]})),
+            &[
+                ("authorization", op.as_str()),
+                ("if-match", selected.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(backdrop.status, StatusCode::OK, "{}", backdrop.body);
+    assert_eq!(backdrop.body["artwork"]["backdrop"], uploaded["id"]);
+    assert_eq!(backdrop.body["artwork"]["poster"], uploaded["id"]);
+    assert_eq!(backdrop.body["artwork"]["thumbnail"], Value::Null);
     let device = f.device(&["catalog:read"], true).await;
     let content = f
         .call(

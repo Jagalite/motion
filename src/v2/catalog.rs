@@ -445,10 +445,51 @@ pub struct CatalogItemBody {
     library_ids: Vec<String>,
     availability: &'static str,
     external_ids: Vec<ExternalIdentity>,
+    /// The resolved poster; identical to `artwork.poster`.
     artwork_id: Option<String>,
+    artwork: ArtworkRoles,
+    release_year: Option<i64>,
     default_timeline_id: Option<String>,
     match_state: String,
     parent_ids: Vec<String>,
+}
+
+/// The asset resolved for each artwork role, by the same policy as the poster.
+#[derive(Serialize)]
+pub struct ArtworkRoles {
+    poster: Option<String>,
+    backdrop: Option<String>,
+    banner: Option<String>,
+    thumbnail: Option<String>,
+}
+
+/// One role's asset: a pinned selection, else the local contribution, else
+/// the only contributed candidate (`playscale_core::artwork::resolve`).
+async fn role_artwork(
+    conn: &mut sqlx::SqliteConnection,
+    item_id: &str,
+    role: &str,
+) -> Result<Option<String>, Problem> {
+    let pinned: Option<String> =
+        sqlx::query_scalar("SELECT asset_id FROM artwork_selections WHERE item_id=? AND role=?")
+            .bind(item_id)
+            .bind(role)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten();
+    let contributions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role=?",
+    )
+    .bind(item_id)
+    .bind(role)
+    .fetch_all(&mut *conn)
+    .await?;
+    let local = contributions
+        .iter()
+        .find(|(s, _)| s == "local")
+        .map(|(_, a)| a.clone());
+    let candidates = contributions.into_iter().map(|(_, a)| a).collect();
+    Ok(playscale_core::artwork::resolve(pinned, local, &candidates).0)
 }
 
 /// Availability of the files the principal may read: no files is unknown.
@@ -484,25 +525,29 @@ pub(crate) async fn item_body(
         namespace_version: String::new(),
     })
     .collect();
-    let pinned: Option<String> = sqlx::query_scalar(
-        "SELECT asset_id FROM artwork_selections WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_optional(&mut *conn)
-    .await?
-    .flatten();
-    let contributions: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let local = contributions
-        .iter()
-        .find(|(s, _)| s == "local")
-        .map(|(_, a)| a.clone());
-    let candidates = contributions.into_iter().map(|(_, a)| a).collect();
-    let (artwork_id, _) = playscale_core::artwork::resolve(pinned, local, &candidates);
+    let artwork = ArtworkRoles {
+        poster: role_artwork(conn, &row.id, "poster").await?,
+        backdrop: role_artwork(conn, &row.id, "backdrop").await?,
+        banner: role_artwork(conn, &row.id, "banner").await?,
+        thumbnail: role_artwork(conn, &row.id, "thumbnail").await?,
+    };
+    let artwork_id = artwork.poster.clone();
+    // The resolved release year, by the same policy as the metadata read.
+    let release_year = match crate::metadata::documents(conn, &row.id).await {
+        Ok(documents) => playscale_core::metadata::resolve(&documents.docs)
+            .values
+            .get("release_year")
+            .and_then(serde_json::Value::as_i64),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<sqlx::Error>(),
+                Some(sqlx::Error::RowNotFound)
+            ) =>
+        {
+            None
+        }
+        Err(e) => return Err(Problem::internal(e)),
+    };
     // Count only visible timelines: a hidden edition must not alter the
     // viewer's default selection or disclose itself through that count.
     let (clause, all, ids) = scope_clause(scope, "f.library_id");
@@ -531,6 +576,8 @@ pub(crate) async fn item_body(
         availability: availability(&visible),
         external_ids,
         artwork_id,
+        artwork,
+        release_year,
         default_timeline_id,
         match_state: row.match_state,
         parent_ids,

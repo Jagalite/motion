@@ -264,6 +264,7 @@ async fn browse_search_and_read_apply_the_catalog_scope_in_the_query() {
         shared,
         &json!({"id":"both","revision":shared["revision"],"kind":"video","title":"Shared Film",
             "library_ids":libraries,"availability":"available","external_ids":[],"artwork_id":null,
+            "artwork":{"poster":null,"backdrop":null,"banner":null,"thumbnail":null},"release_year":null,
             "default_timeline_id":"both-ed","match_state":"unmatched","parent_ids":[]})
     );
     assert_eq!(all.body["items"][2]["availability"], "unknown");

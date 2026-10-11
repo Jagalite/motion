@@ -110,6 +110,28 @@ fn visible(who: &UiPrincipal, title: &Title) -> bool {
     who.can("catalog:read") && !(title.restricted && who.profile_id == "kids")
 }
 
+/// Mock artwork: some titles have images (served by the proof server's mock
+/// asset route), the rest exercise the no-artwork placeholder.
+fn mock_art(id: &str, role: &str) -> Option<String> {
+    let has = match role {
+        "poster" => matches!(id, "item1" | "item2" | "item4" | "item5"),
+        "backdrop" => matches!(id, "item1" | "item4"),
+        "thumbnail" => matches!(id, "item6"),
+        _ => false,
+    };
+    has.then(|| format!("/api/v2/media/assets/mock-{role}-{id}/content?revision=1"))
+}
+
+fn mock_year(id: &str) -> Option<i64> {
+    match id {
+        "item1" => Some(2019),
+        "item2" => Some(2021),
+        "item3" => Some(2017),
+        "item4" => Some(2022),
+        _ => None,
+    }
+}
+
 fn card(title: &Title) -> ItemCard {
     ItemCard {
         id: title.id.into(),
@@ -117,6 +139,34 @@ fn card(title: &Title) -> ItemCard {
         kind: title.kind.into(),
         availability: Availability::Available,
         needs_review: title.needs_review,
+        artwork: Artwork {
+            poster: mock_art(title.id, "poster"),
+            backdrop: mock_art(title.id, "backdrop"),
+            thumbnail: mock_art(title.id, "thumbnail"),
+        },
+        year: mock_year(title.id),
+    }
+}
+
+fn details(title: &Title) -> ItemDetails {
+    match title.id {
+        "item1" => ItemDetails {
+            original_title: None,
+            description: Some("A night porter on a mountain railway has until dawn to find out who boarded the last train, and why it never arrived.".into()),
+            genres: vec!["Drama".into(), "Mystery".into()],
+            cast: vec![
+                CastMember { name: "Mara Okonjo".into(), role: Some("Della".into()) },
+                CastMember { name: "Tomasz Reyes".into(), role: Some("The Conductor".into()) },
+                CastMember { name: "Hanne Vos".into(), role: None },
+            ],
+        },
+        "item4" => ItemDetails {
+            original_title: None,
+            description: Some("Three generations keep a remote lighthouse running after the coast guard leaves.".into()),
+            genres: vec!["Drama".into()],
+            cast: vec![CastMember { name: "Rhiannon Teale".into(), role: Some("Cass".into()) }],
+        },
+        _ => ItemDetails::default(),
     }
 }
 
@@ -235,6 +285,7 @@ impl UiQueryFacade for MockUiQueryFacade {
             Ok(ItemView {
                 playback_available: true,
                 item: card(title),
+                details: Some(details(title)),
                 children,
                 timelines,
             })
