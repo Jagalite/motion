@@ -447,8 +447,10 @@ PRs #14, #16 and #17; old-binary upgrade fixtures are retained.
 
 ### Final consolidation ownership (integration/release)
 
-Integration/release owns completion across PRs #14 → #17 → #16 → #15,
-including shared-file reconciliation, the one-app distribution, qualified player
+Integration/release owns completion across PRs #14 → #17 → #19 → #18.
+PR #19 is the main-bound carrier of #16; #18 preserves #15, which remains
+closed as superseded with user approval. Integration ownership includes
+shared-file reconciliation, the one-app distribution, qualified player
 deployment, final legacy-route removal and absence tests, combined CI, installed
 acceptance and milestone evidence. See
 [the final gate ledger](qualification/consolidation/FINAL.md). Merging the lane

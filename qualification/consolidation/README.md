@@ -1,5 +1,10 @@
 # Consolidation integration/release ledger
 
+Current combined acceptance and PR dispositions are recorded in
+[the final gate ledger](FINAL.md). The lane-only statuses below are historical.
+The current distribution includes Electron and Go/TUI. Final player scope is
+Chromium and Electron; WebKit is explicitly deferred.
+
 Date: 2026-10-10. Base: `2344d03`. Owner: lane 4 (integration/release,
 A00/A05/A14), branch `consolidation-release`. Independent reviewer: GPT-6.1 Sol.
 This is a lane delivery record, not M1–M4 completion or release approval.

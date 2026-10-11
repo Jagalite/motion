@@ -177,3 +177,44 @@ observations are not new-provider evidence. Stable provider URLs now prohibit
 cache reuse and filesystem-conditional responses because reproducible packages
 normalize mtimes. A same-mtime, changed-byte router regression covers the defect.
 Neither correction weakens provider identity admission or media authorization.
+
+
+### Qualified provider and installed checkpoint: 2026-10-11
+
+This checkpoint supersedes the pending provider and installed statuses above.
+PR #15 remains closed as superseded, as explicitly confirmed by the user. Its
+head `d0c2cb4911bfabe9ce95a53c2b92527cd337ab8d` is preserved in #18 and has the
+same tree as `6977c694ecfffff981843a3683435b81107c4bd7`. Main integration order
+is #14, #17, #19 (carrier of #16), then #18 (including preserved #15).
+GPT-6.1 Sol reviewed the history reconciliation without outstanding findings.
+
+The provider at `2fa508f` passed runtime admission, four generated-adapter tests
+and seven Shaka parser tests. Its exact identity is
+`sha256:4d968b37420bc8d32072e2ca553dd1a09fcbb5a841b4de51314513c42d0c334a`.
+Kyoto package build `21d5c29bb6db44b98358ddde59ec4d68` succeeded. Receipts retain
+exact binary, archive, provider and harness hashes and prior failed attempts.
+
+| Gate | Receipt and observed result | Scope / remaining owner |
+|---|---|---|
+| Installed one-app | `installed-2fa508f.json`: 13 relocated package checks, 15 clean native checks, and a separate 16-check browser-handoff run passed. Bundled Go CLI and real PTY TUI exercised. | Integration/release; ad hoc signing only. The separate handoff run needed one disclosed manual Start click; `34b85b7` fixes the harness readiness race and the clean native repeat passed. Seeded offline cache does not qualify M5. |
+| Electron player | `electron-player-2fa508f.json`: 30 passed, zero failed/blocked. Original ranges, seek/resume, audio/HLS, durable outage/restart recovery, prepared rendition switching and conversion-only playback; v2-only traffic. | Clients/playback implementation; integration acceptance. Muted playback is not physical A/V verification. |
+| Chromium provider | `chromium-provider-2fa508f.json`: original playback, seek, audio switch, cold conversion, far seek and moving-window playback passed with the new provider. | Uses the recorded earlier server binary. Retained-window reopening is a direct provider probe, not a complete Motion resume workflow. Its later 401 predates explicit revocation and is not causal revocation evidence. |
+| Installed Chromium restricted playback | `chromium-restricted-2fa508f.json`: no-history device played beyond the initial 48-second window to 53.34 seconds with unchanged canonical history and no history events. Explicit revocation returned 204, bearer access became 401, and the player was removed within 5.908 seconds. Owned output disappeared. | Exact installed `2fa508f` server/provider. Integration/release owns any later candidate rerun; this is the causal revocation receipt. |
+| Public playable Next | `2d2c006`: existing playable timelines can be ordered through a fenced public PUT. All 17 catalog HTTP tests passed after Kyoto `7de68aa648294af7aed318a24a3797ac`; four contract tests and structural/parity checks passed. | GPT-6.1 Sol reviewed. Debug-server browser Next played the selected converted item. Final installed-package repetition remains required. |
+
+The ordering endpoint supplies observed timeline/group identity and revisions to
+existing production `access::revise` and `identity::place_in_order` decisions.
+SQLite locking, destination and previous-owner authorization, and transactional
+revision updates stay in the adapter. HTTP regressions cover stale timeline and
+group revisions, occupied positions, hidden/foreign owners, and unchanged file
+bindings/history. No separate model duplicates the existing core order policy.
+
+Remaining deliverables have explicit owners: integration/release owns final-head
+combined CI, complete source-companion reconstruction, final installed candidate
+and ledger closure. Data/catalog (A01) and clients (A10–A12) own the broader
+cross-work episode hierarchy and complete section 6 UI workflow evidence; the
+same-work playable Next check alone does not close M3. Playback/viewing (A06–A08)
+owns expanded multipart/interval, hardware/copy, subtitle and HDR/ABR format
+gates. Online metadata, M5/M6 and WebKit remain explicitly deferred under the
+plan/user scope. Passing these receipts or merging the four lanes does not close
+unmet milestone gates.
