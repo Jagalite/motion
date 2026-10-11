@@ -38,3 +38,23 @@ class Client:
 
     def etag(self, path):
         return self.call('GET', path)[1]['etag']
+
+    def viewing_epoch(self):
+        facts = self.json('GET', '/api/v2/system/capabilities')
+        return {'X-Motion-Viewing-Epoch': facts['server_id'] + ':' + facts['restore_epoch']}
+
+    def original_delivery(self, timeline, start_ms=0):
+        plan = self.json('POST', '/api/v2/playback/plans', {
+            'profile_id': 'default', 'timeline_id': timeline, 'version_id': None, 'source': None,
+            'tracks': {'audio_component_id': None, 'subtitle_component_id': None,
+                       'subtitle_policy': 'off', 'audio_track_id': None, 'subtitle_track_id': None},
+            'quality': {'mode': 'original', 'max_bitrate_bps': None, 'max_height': None,
+                        'allow_client_software': False, 'hdr_policy': 'preserve_if_supported'},
+            'client': {'client_id': 'http-smoke', 'client_build': 'v2', 'demuxe_asset_digest': None,
+                       'transports': ['http_range'], 'video_codecs': ['avc1'], 'audio_codecs': ['mp4a'],
+                       'subtitle_modes': ['text'], 'hdr': 'unknown', 'max_height': None,
+                       'software_decode': 'unknown', 'cross_origin_isolated': False},
+            'failed_candidate_ids': []})
+        assert plan['status'] == 'ready' and plan['operation'] == 'original', plan
+        return self.json('POST', '/api/v2/playback/delivery-sessions',
+                         {'plan_token': plan['plan_token'], 'start_ms': start_ms}, 201)
