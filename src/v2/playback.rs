@@ -670,12 +670,12 @@ fn client_support(
         return Support::Unknown;
     };
     // PQ/HLG bytes are delivered unchanged: never to a client that reports no
-    // HDR support, nor when the request requires SDR.
+    // HDR support (including unknown), nor when the request requires SDR.
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
     );
-    if hdr && (require_sdr || client.hdr == "unsupported") {
+    if hdr && (require_sdr || client.hdr != "supported") {
         return Support::Unsupported;
     }
     let audio = audio.and_then(|i| {
