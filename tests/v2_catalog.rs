@@ -1989,3 +1989,59 @@ async fn restricted_source_manager_controls_demands_without_owning_shared_jobs()
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn public_timeline_order_writer_drives_next_resolver() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    f.item("ordered", "Ordered", &[(&f.a, "r1")]).await;
+    // Group provisioning is an existing service; timeline placement below uses
+    // the public writer, never an injected order_position.
+    let group = playscale::curation::create_order_group(
+        &f.app,
+        "ordered-ed",
+        "Release",
+        playscale::curation::OrderKind::Custom,
+    )
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for position in [1, 2] {
+        let item = f
+            .call(
+                "GET",
+                "/api/v2/catalog/items/ordered",
+                None,
+                &[("authorization", &op)],
+            )
+            .await;
+        let key = format!("ordered-timeline-{position:04}");
+        let created = f.call("POST", "/api/v2/catalog/items/ordered/timelines",
+            Some(json!({"edition_id":"ordered-ed","duration_ms":1000,"order_group_id":group,"order_position":position})),
+            &[("authorization", &op),("if-match",item.headers["etag"].to_str().unwrap()),("idempotency-key",&key)]).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        assert_eq!(created.body["order_position"], position);
+        ids.push(created.body["id"].as_str().unwrap().to_owned());
+    }
+    let next = f
+        .call(
+            "GET",
+            &format!("/api/v2/profiles/default/timelines/{}/next", ids[0]),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+    assert_eq!(next.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(next.body["items"][0]["id"], ids[1]);
+    let end = f
+        .call(
+            "GET",
+            &format!("/api/v2/profiles/default/timelines/{}/next", ids[1]),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(end.status, StatusCode::OK, "{}", end.body);
+    assert_eq!(end.body["items"], json!([]));
+}
