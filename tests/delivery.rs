@@ -1,11 +1,14 @@
 //! Live HLS delivery against real FFmpeg/FFprobe from PATH. Skips (with a message)
 //! when either tool is missing.
+#[path = "support/service_router.rs"]
+mod service_router;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use playscale::{App, api, db, scan};
+use playscale::{App, db, scan};
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
@@ -200,7 +203,7 @@ async fn raw_on_key(
     if body.is_some() {
         request = request.header("content-type", "application/json");
     }
-    let response = api::router(app.clone(), None)
+    let response = service_router::router(app.clone())
         .oneshot(
             request
                 .body(

@@ -1,3 +1,6 @@
+#[path = "support/service_router.rs"]
+mod service_router;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -96,7 +99,12 @@ impl Fixture {
         for (k, v) in headers {
             request = request.header(*k, *v);
         }
-        api::router(self.app.clone(), None)
+        let router = if path.starts_with("/api/v2/") {
+            api::router(self.app.clone(), None)
+        } else {
+            service_router::router(self.app.clone())
+        };
+        router
             .oneshot(
                 request
                     .body(
@@ -498,7 +506,7 @@ async fn boundary_contract_and_paths_are_private() {
     let response = api::router(f.app.clone(), None)
         .oneshot(
             Request::builder()
-                .uri("/api/v1/items")
+                .uri("/api/v2/catalog/items")
                 .header("host", "evil.invalid")
                 .body(Body::empty())
                 .unwrap(),
@@ -509,7 +517,7 @@ async fn boundary_contract_and_paths_are_private() {
     assert_eq!(
         f.response(
             "POST",
-            "/api/v1/libraries",
+            "/api/v2/libraries",
             Some(json!({"name":"x","root":"/tmp"})),
             &[
                 ("origin", "https://evil.invalid"),
@@ -520,22 +528,24 @@ async fn boundary_contract_and_paths_are_private() {
         .status(),
         403
     );
-    let (_, libs) = f.json("GET", "/api/v1/libraries", None, false).await;
+    let (_, libs) = f.json("GET", "/api/v2/libraries", None, true).await;
     assert!(!libs.to_string().contains(f.root.to_str().unwrap()));
     assert_eq!(
-        f.json("GET", "/api/v1/items?limit=0", None, false).await.0,
+        f.json("GET", "/api/v2/catalog/items?limit=0", None, true)
+            .await
+            .0,
         400
     );
-    let (_, spec) = f.json("GET", "/api/v1/openapi.json", None, false).await;
+    let (_, spec) = f.json("GET", "/api/v2/openapi.json", None, true).await;
     for path in [
-        "/api/v1/items",
-        "/api/v1/items/{id}/metadata/{source}",
-        "/api/v1/items/{id}/renditions/{source}/{external_id}",
-        "/media/{id}",
+        "/api/v2/catalog/items",
+        "/api/v2/catalog/items/{item_id}/metadata/contributions/{source_name}",
+        "/api/v2/processing/preparations",
+        "/api/v2/media/files/{file_id}/content",
     ] {
         assert!(spec["paths"][path].is_object(), "{path}");
     }
-    assert!(spec["components"]["securitySchemes"]["admin_token"].is_object());
+    assert!(spec["components"]["securitySchemes"]["bearerAuth"].is_object());
 }
 
 #[cfg(unix)]
@@ -896,7 +906,7 @@ async fn upload_art(
     if auth {
         request = request.header("authorization", "Bearer test-secret-token");
     }
-    api::router(f.app.clone(), None)
+    service_router::router(f.app.clone())
         .oneshot(request.body(Body::from(bytes)).unwrap())
         .await
         .unwrap()

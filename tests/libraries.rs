@@ -1,5 +1,8 @@
 //! Logical libraries over storage sources: registration, overlap, exclusions,
 //! availability and the binding revision recorded by scan attempts.
+#[path = "support/service_router.rs"]
+mod service_router;
+
 use playscale::{App, administration, db, libraries, scan};
 use playscale_core::sources::{Availability, LibraryKind, SourceError};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -269,7 +272,7 @@ async fn re_registration_keeps_library_edits_and_relocation_honors_exclusions() 
         .fetch_one(&f.app.db)
         .await
         .unwrap();
-    let response = playscale::api::router(f.app.clone(), None)
+    let response = service_router::router(f.app.clone())
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")

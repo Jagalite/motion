@@ -361,7 +361,8 @@ async fn read_progress(
     ))
 }
 
-async fn boundary(State(app): State<App>, request: Request, next: Next) -> Response {
+/// Shared host/origin transport boundary; service tests reuse this policy.
+pub async fn boundary(State(app): State<App>, request: Request, next: Next) -> Response {
     let host = request
         .headers()
         .get(header::HOST)
