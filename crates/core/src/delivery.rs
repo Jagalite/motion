@@ -110,6 +110,27 @@ pub fn copy_start(
     (end_ms <= segment || fits_target(end_ms - segment, target_s)).then_some(start)
 }
 
+/// How far before an input seek target FFmpeg may begin reading: for a
+/// container that seeks by decode time, when some video has B-frame delay, it
+/// seeks 3/23 s (130.43 ms) early. Rounded up, plus 1 ms for keyframe times
+/// truncated to whole milliseconds.
+pub const COPY_SEEK_EARLY_MS: u64 = 132;
+
+/// The input seek target that starts a stream copy at the chosen keyframe
+/// (`copy_start`) for a request at `requested_ms`: at least
+/// `COPY_SEEK_EARLY_MS` after the keyframe, so an early seek still reaches it,
+/// and before the next keyframe, so an exact seek never passes it. None when
+/// the next keyframe is too close to tell them apart.
+pub fn copy_seek(keyframes_ms: &[u64], keyframe_ms: u64, requested_ms: u64) -> Option<u64> {
+    let target = requested_ms.max(keyframe_ms + COPY_SEEK_EARLY_MS);
+    keyframes_ms
+        .iter()
+        .filter(|k| **k > keyframe_ms)
+        .min()
+        .is_none_or(|next| target < *next)
+        .then_some(target)
+}
+
 /// Text subtitle codecs that can be delivered as a WebVTT sidecar in timeline
 /// time, on any route, without losing meaning. ASS/SSA are excluded: WebVTT
 /// drops their positioning, fonts and effects, which can merge signs with
@@ -1511,6 +1532,26 @@ mod tests {
             Operation::Remux,
             &detail("Constrained Baseline", 31, true, false)
         ));
+    }
+
+    #[test]
+    fn copy_seeks_late_enough_to_reach_the_chosen_keyframe_and_never_the_next() {
+        let keyframes = [10_000, 12_000, 12_100, 14_000];
+        // A request on a keyframe seeks past FFmpeg's early-seek allowance.
+        assert_eq!(copy_seek(&keyframes, 10_000, 10_000), Some(10_132));
+        assert_eq!(copy_seek(&keyframes, 10_000, 10_050), Some(10_132));
+        // A later request already lies beyond it.
+        assert_eq!(copy_seek(&keyframes, 10_000, 11_999), Some(11_999));
+        assert_eq!(copy_seek(&keyframes, 14_000, 20_000), Some(20_000));
+        // The next keyframe is within the allowance: no seek isolates this one.
+        assert_eq!(copy_seek(&keyframes, 12_000, 12_000), None);
+        assert_eq!(copy_seek(&keyframes, 12_000, 12_050), None);
+        // An early seek of at most 130.43 ms from the target never precedes the
+        // keyframe, even with sub-millisecond keyframe times.
+        for keyframe in [0, 10_000, 14_000] {
+            let target = copy_seek(&keyframes, keyframe, keyframe).unwrap();
+            assert!(target * 1000 - 130_435 >= keyframe * 1000 + 999);
+        }
     }
 
     #[test]

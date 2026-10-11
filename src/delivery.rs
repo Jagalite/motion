@@ -746,7 +746,8 @@ fn parse_copy_details(stdout: &[u8], revision: String) -> Option<CopyDetails> {
     })
 }
 
-/// The source keyframe a stream copy of `start_ms` begins at, in microseconds.
+/// The source keyframe a stream copy of `start_ms` begins at, in microseconds,
+/// and the input seek target (ms) that reaches it (core `copy_seek`).
 /// Keyframes are the demuxer's sync packets, which is where the HLS muxer cuts;
 /// the core decides from them whether every segment in the observed window fits
 /// the copy target. A stalled probe stays owned by `lease`.
@@ -756,7 +757,7 @@ async fn copy_keyframe(
     start_ms: u64,
     duration_ms: Option<u64>,
     lease: &execution::Lease,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let from = start_ms.saturating_sub(COPY_TARGET_SECONDS * 1000);
     let mut until = start_ms + 60_000 + COPY_TARGET_SECONDS * 1000;
     // Reaching the end of the media also bounds the final segment.
@@ -827,7 +828,11 @@ async fn copy_keyframe(
         COPY_TARGET_SECONDS,
         end_ms,
     )?;
-    keyframes_us.into_iter().find(|us| us / 1000 == start)
+    let seek_ms = core::copy_seek(&keyframes_ms, start, start_ms)?;
+    keyframes_us
+        .into_iter()
+        .find(|us| us / 1000 == start)
+        .map(|us| (us, seek_ms))
 }
 
 /// Largest init segment read for its video track.
@@ -1154,20 +1159,20 @@ async fn run_generation(
     };
     // A stream copy begins at the source keyframe at or before the request; know
     // which one before encoding, so the published start can be verified.
-    let copy_start = if copies_video(operation) {
+    let (copy_start, seek_ms) = if copies_video(operation) {
         // Bounded by its own deadline; not abandoned on stop, which would leave
         // the probe unowned.
         let probed = copy_keyframe(&app, &input, start_ms, duration_ms, &lease).await;
         if stop.is_cancelled() {
             return stopped(&app, &session);
         }
-        let Some(keyframe) = probed else {
+        let Some((keyframe, seek_ms)) = probed else {
             tracing::warn!(delivery=%session.id, generation, "no usable keyframe or keyframe spacing exceeds the copy target");
             return fail(&app, &session);
         };
-        Some(keyframe)
+        (Some(keyframe), seek_ms)
     } else {
-        None
+        (None, start_ms)
     };
     let mut supervisor = Command::new(&app.processing.supervisor);
     supervisor
@@ -1176,7 +1181,7 @@ async fn run_generation(
         .args(arguments(
             operation,
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
-            start_ms,
+            seek_ms,
             audio,
             &directory,
         ))
