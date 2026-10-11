@@ -164,15 +164,13 @@ def main():
             ok('byte_route_seek_change_replay_and_activation')
 
             # ---- a prepared rendition (real processing job) serves Convert by bytes
-            status, _, items = request(port, 'GET', '/api/v1/items', headers=operator)
-            source = json.loads(items)['items'][0]
-            status, _, job = request(port, 'POST', '/api/v1/processing-jobs',
-                                     {'source_file_id': source['file_id'], 'source_revision': source['revision'],
-                                      'recipe': 'remux_mp4', 'backend': 'software', 'idempotency_key': key('job')}, operator)
-            assert status == 201, job
-            job = json.loads(job)
+            _, _, job = api('POST', '/processing/preparations',
+                            {'source': p['source'], 'timeline_id': timeline, 'recipe_id': 'remux_mp4',
+                             'tracks': {'audio_component_id': None, 'subtitle_component_id': None,
+                                        'subtitle_policy': 'off', 'audio_track_id': None, 'subtitle_track_id': None}},
+                            operator, 202, {'Idempotency-Key': key('job')})
             def finished():
-                row = json.loads(request(port, 'GET', f"/api/v1/processing-jobs/{job['id']}", headers=operator)[2])
+                _, _, row = api('GET', f"/jobs/{job['id']}", auth=operator, expected=200)
                 return row if row['phase'] not in ('queued', 'running', 'cancelling') else None
             row = wait_for(finished, seconds=300)
             assert row['phase'] == 'completed', row
