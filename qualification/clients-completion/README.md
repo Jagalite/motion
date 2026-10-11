@@ -130,5 +130,17 @@ It lacks Shaka and therefore does not close C07.
 
 Go compilation job `76a1df47796b4dc0810075520631a680` failed before compilation
 because the multi-package output directory did not exist. After creating it,
-replacement job `f5acb77e345341598518fa960489f6e1` was queued. Final status and
-test execution must be recorded before claiming Go/real-server CLI acceptance.
+replacement job `f5acb77e345341598518fa960489f6e1` passed (exit 0). API, CLI,
+store and TUI tests passed; the real-server test initially failed because it
+asserted Topcoat authorization while launching the legacy homepage. `3352542`
+adds `--topcoat` to the test server without weakening assertions. Narrow rebuild
+`a6f2e77b30f64ff08681a70ca83b97ff` passed, followed by all three root tests,
+including real pairing, profile/browser authorization, events, conditional rename
+and revocation. Across the five compiled Go test binaries: 55 passes, no skips.
+This does not qualify the disabled Go playback feature.
+
+GPT-6.1 Sol reviewed every implementation commit, the evidence commit `25030b3`
+and cumulative diff through `3352542`, with no actionable findings. The final
+PR records the final reviewed documentation SHA separately. Browser/Electron
+live playback and default cutover remain blocked; passing focused tests does not
+close this lane.
