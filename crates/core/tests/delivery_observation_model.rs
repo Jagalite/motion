@@ -65,6 +65,23 @@ impl Model for Observations {
             vec![output],
         ))
     }
+    fn check_state(&self, s: &State) -> Result<Vec<Check>, ModelError> {
+        let valid = s
+            .delivery
+            .observation
+            .is_none_or(|(g, sequence, position)| {
+                sequence > 0
+                    && (s.delivery.active != Some(g) || s.delivery.playhead == Some((g, position)))
+            });
+        Ok(vec![if valid {
+            Check::passed("active_playhead_matches_latest_ordered_observation")
+        } else {
+            Check::failed(
+                "active_playhead_matches_latest_ordered_observation",
+                "playhead identity mismatch",
+            )
+        }])
+    }
     fn check_transition(
         &self,
         s: &State,
