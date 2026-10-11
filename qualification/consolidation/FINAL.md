@@ -124,3 +124,43 @@ PR #15 advanced during the reconciliation to
 and main ancestry. That head is also merged into this reconciliation. It adds no
 production or test changes to the integration tree; its duplicate Kyoto prose
 conflict is resolved as above. Closure eligibility refers to this newer head.
+
+### Current acceptance checkpoint: 2026-10-11, after installed testing
+
+This checkpoint supersedes the pending statuses above, but does not close M0–M4.
+The user selected **Chromium and Electron** for final player qualification.
+**WebKit is explicitly deferred**, not passed or silently omitted.
+
+PR #17 merged to main at `38f80a9` after all eight exact-head checks passed.
+PR #16 had merged into the combined staging branch, not main; PR #19 carries
+that reviewed playback lane into main after #17. PR #15 follows #19. The earlier
+suggestion to close #15 as superseded is not the selected integration procedure.
+PR #19's initial integration run `38145957879` failed processing isolation:
+generated output storage appeared as an extra logical library. Existing fix
+`0198a89` was brought forward as `a9f9d28`, followed by its Host fixture correction
+and unused-wrapper cleanup (`558b987`, `0d40f69`). GPT-6.1 Sol reviewed these fixes.
+The client branch incorporates them with its existing implementation preserved;
+its final tree at `d0c2cb4` equals `6977c69`. Exact-head CI remains pending.
+
+| Gate | Evidence | Status / accountable owner |
+|---|---|---|
+| Production route absence and preserved service regression | `9c0b44f`; Kyoto `7db92c647c964c57ae28a0d50cab228a`; both previously failing compiled tests passed. The absence matrix checks all configured modes and DB non-mutation. Fast CI at `7339500` also passed. | Passed at recorded source; final combined CI owned by integration/release. |
+| Relocated one-app package | `installed-7339500.json`; archive `97aa783c6a5ae873dad1e0ab5ece1a9c99891d61be255fd469b44df1a29e614b`; 13 package checks passed. | Passed at `7339500`; final artifact rebuild/reconstruction owned by integration/release. |
+| Installed Electron and Go/TUI | Same receipt; 16 real native checks, bundled Go CLI and PTY TUI, child-process ownership, sandbox, isolated settings, disconnect/stop/restart/close behavior. | Passed at recorded package. Offline cache was seeded explicitly; this does not qualify M5 download publication or reconciliation. |
+| Desktop-to-Chromium resume | Built-in Chromium resumed native progress and advanced canonical server progress. | Passed at recorded package; muted playback is not physical A/V proof. |
+| Electron player matrix | `electron-player-7339500.json`: 30 passed, zero failed/blocked; original ranges, seek, progress, resume, audio/HLS switch, durable outage recovery, real preparation and rendition switch, conversion-only playback, v2-only traffic. Earlier `electron-player-b5db877.json` retained separately. | Passed for these checks at the recorded binary/provider. New provider bytes require fresh qualification. |
+| Chromium full player matrix | First cold live open at `7339500` timed out in native preparation. Later attempts played, but do not erase the failure. Instrumentation showed preparation at the live edge before the requested-position seek; explicit initial media time zero is under investigation. | Open; integration/release owns diagnosis and clients/playback own domain fixes. |
+| Complete source reconstruction | Full outside-Git package reconstruction gate is implemented. | Open until its actual final-head CI receipt passes; integration/release. |
+| Restricted grants, long no-history playback, public Next and remaining section 6 UI workflows | Existing source/focused receipts are not a substitute for combined installed workflow acceptance. | Open; integration/release coordinates clients, playback and catalog lane owners. |
+
+Installed testing found and fixed two real product defects: the outer CLI symlink
+could select the wrong resource root (`cac9553`), and native session exchange
+omitted the server-required Origin (`7339500`). The latter preserves the server's
+authorization checks. Filesystem resource resolution and HTTP Origin supply are
+adapter responsibilities; no domain authority was moved out of core.
+
+The local prerequisite build requests `7a83a39c8ac542738f56d54910b682f2` and
+`9cb80c840e524c378bc7dd2ea045a612` were cancelled while queued under host memory
+pressure so review corrections could be applied. They supply no passing evidence.
+Package signing is ad hoc, not notarized. Hardware encoding, expanded M4 format
+coverage, online metadata, M5 and M6 retain their separately documented gates.
