@@ -93,7 +93,16 @@ export class Server {
 /** Pair a device for the default profile, grant it every library, and wait for the scan. */
 export async function provision(server) {
   const operator = server.operator();
-  const libraries = (await server.api('GET', '/api/v2/libraries?limit=10', undefined, operator)).json.items;
+  // Health can precede asynchronous configured-library admission. Never freeze
+  // an empty grant set and then misreport its hidden catalog as a scan failure.
+  let libraries = [];
+  for (let i = 0; i < 300 && !libraries.length; i++) {
+    const listed = await server.api('GET', '/api/v2/libraries?limit=10', undefined, operator);
+    if (listed.status !== 200) throw new Error(`library discovery failed: ${JSON.stringify(listed)}`);
+    libraries = listed.json.items;
+    if (!libraries.length) await sleep(200);
+  }
+  if (!libraries.length) throw new Error('configured library was not admitted before pairing');
   const pairing = (await server.api('POST', '/api/v2/auth/pairings', {device_name: 'Evidence', client_name: 'motion-client-playback'})).json;
   const permissions = ['catalog:read', 'playback:request', 'viewing:write', 'events:read'];
   const approved = await server.api('POST', `/api/v2/auth/pairings/${pairing.id}/approve`,
