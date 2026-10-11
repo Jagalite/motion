@@ -86,6 +86,15 @@ impl Default for Settings {
 /// Package locations are filesystem adapter configuration, not catalog state.
 /// A marker distinguishes a relocatable package from a normal Cargo build.
 pub fn packaged_defaults(executable: &Path, home: Option<&Path>) -> anyhow::Result<Settings> {
+    // macOS current_exe can retain the outer CLI convenience symlink. Assets
+    // belong beside its target inside Motion.app, not beside that symlink.
+    let resolved;
+    let executable = if executable.is_symlink() {
+        resolved = std::fs::canonicalize(executable)?;
+        resolved.as_path()
+    } else {
+        executable
+    };
     let root = executable
         .parent()
         .ok_or_else(|| anyhow::anyhow!("executable has no parent"))?;
@@ -279,6 +288,23 @@ mod tests {
             dir.path().canonicalize().unwrap().join("custom/probe")
         );
         assert_eq!(settings.data_dir, PathBuf::from("state"));
+        #[cfg(unix)]
+        {
+            let cli = dir.path().join("CLI");
+            std::fs::create_dir(&cli).unwrap();
+            std::fs::write(cli.join("motion-package.json"), r#"{"schema":1}"#).unwrap();
+            std::fs::write(root.join("motion"), b"fixture executable").unwrap();
+            std::os::unix::fs::symlink(root.join("motion"), cli.join("motion-server")).unwrap();
+            let linked = packaged_defaults(&cli.join("motion-server"), Some(&home)).unwrap();
+            assert_eq!(
+                linked.ffprobe,
+                root.canonicalize().unwrap().join("tools/ffprobe")
+            );
+            assert_eq!(
+                linked.demuxe_dir,
+                root.canonicalize().unwrap().join("assets/demuxe")
+            );
+        }
         std::fs::remove_file(root.join("tools/ffprobe")).unwrap();
         assert!(packaged_defaults(&root.join("motion"), Some(&home)).is_err());
     }
