@@ -1082,8 +1082,6 @@ async fn blocked_operations_are_not_routed() {
     let op = bearer(OPERATOR);
     for (method, path) in [
         ("POST", "/api/v2/catalog/items/film-a/metadata/refresh"),
-        ("POST", "/api/v2/catalog/items/film-a/artwork"),
-        ("PUT", "/api/v2/catalog/items/film-a/artwork/selection"),
         ("GET", "/api/v2/processing/capabilities"),
         ("GET", "/api/v2/schedules"),
         ("POST", "/api/v2/admin/imports"),
@@ -1255,4 +1253,81 @@ async fn match_replay_rechecks_current_file_visibility() {
         .call("POST", "/api/v2/catalog/matches", Some(body), &headers)
         .await;
     problem(&replay, StatusCode::NOT_FOUND, "not_found");
+}
+
+#[tokio::test]
+async fn artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let bytes = bytes.into_inner();
+    let mut uploaded = Value::Null;
+    for _ in 0..2 {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v2/catalog/items/film-a/artwork")
+            .header("host", "127.0.0.1:8787")
+            .header("authorization", &op)
+            .header("idempotency-key", "artwork-upload-00001")
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(bytes.clone()))
+            .unwrap();
+        let response = api::router(f.app.clone(), None)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        if uploaded.is_null() {
+            uploaded = body;
+        } else {
+            assert_eq!(body, uploaded);
+        }
+    }
+    let item = f
+        .call("GET", "/api/v2/catalog/items/film-a", None, &auth(&op))
+        .await;
+    assert_eq!(item.body["artwork_id"], Value::Null);
+    let body = json!({"role":"poster","asset_id":uploaded["id"]});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("if-match", item.headers["etag"].to_str().unwrap()),
+    ];
+    let selected = f
+        .call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/artwork/selection",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(selected.status, StatusCode::OK, "{}", selected.body);
+    assert_eq!(selected.body["artwork_id"], uploaded["id"]);
+    assert_eq!(
+        f.call(
+            "PUT",
+            "/api/v2/catalog/items/film-a/artwork/selection",
+            Some(body),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let device = f.device(&["catalog:read"], true).await;
+    let content = f
+        .call(
+            "GET",
+            uploaded["content_url"].as_str().unwrap(),
+            None,
+            &auth(&device),
+        )
+        .await;
+    assert_eq!(content.status, StatusCode::OK);
+    assert_eq!(content.raw, bytes);
 }

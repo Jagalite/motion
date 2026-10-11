@@ -343,12 +343,12 @@ fn unsupported_kind() -> Problem {
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct ItemRow {
-    id: String,
+    pub(crate) id: String,
     title: String,
     kind: String,
     media_type: String,
     parent_id: Option<String>,
-    revision: i64,
+    pub(crate) revision: i64,
     match_state: String,
 }
 
@@ -407,7 +407,7 @@ pub(crate) async fn load_item(
 
 /// A live item the principal may change: readable (else 404) and wholly
 /// inside its library scope (else 403).
-async fn curatable_item(
+pub(crate) async fn curatable_item(
     conn: &mut sqlx::SqliteConnection,
     scope: &CatalogScope,
     id: &str,
@@ -2190,13 +2190,35 @@ async fn files_page(
     if let Some(id) = &item {
         load_item(&mut tx, &scope, id, true).await?;
     }
+    let admin = item.is_none();
     let limit = q.limit()?;
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
-    type FileRow = (String, String, String, i64, Option<f64>, bool, String);
-    let rows:Vec<FileRow>=sqlx::query_as(&format!("SELECT f.id,f.revision,f.library_id,f.bytes,f.duration_seconds,f.available,f.tracks_json FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE (?1 IS NULL OR e.item_id=?1) AND f.id>?2 AND {clause} ORDER BY f.id LIMIT ?"))
+    type FileRow = (
+        String,
+        String,
+        String,
+        i64,
+        Option<f64>,
+        bool,
+        String,
+        String,
+        i64,
+    );
+    let rows:Vec<FileRow>=sqlx::query_as(&format!("SELECT f.id,f.revision,f.library_id,f.bytes,f.duration_seconds,f.available,f.tracks_json,f.relative_path,l.binding_revision FROM media_files f JOIN libraries l ON l.id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE (?1 IS NULL OR e.item_id=?1) AND f.id>?2 AND {clause} ORDER BY f.id LIMIT ?"))
         .bind(item).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
-    for (id, revision, source, bytes, duration, available, tracks) in rows {
+    for (
+        id,
+        revision,
+        source,
+        bytes,
+        duration,
+        available,
+        tracks,
+        relative_path,
+        binding_revision,
+    ) in rows
+    {
         let tracks: Vec<crate::db::Track> =
             serde_json::from_str(&tracks).map_err(Problem::internal)?;
         if tracks.len() > 256 {
@@ -2217,6 +2239,11 @@ async fn files_page(
             None
         };
         let value = serde_json::json!({"id":id,"revision":revision,"source_id":source,"size_bytes":bytes.to_string(),"verification":if available {"observed"}else{"stale"},"digest":digest,"duration_ms":duration.filter(|d|d.is_finite()&&*d>=0.0).map(|d|(d*1000.0).round() as u64),"availability":if available {"available"}else{"unavailable"},"tracks":tracks});
+        let value = if admin {
+            serde_json::json!({"file":value,"relative_path":relative_path,"binding_revision":binding_revision.to_string()})
+        } else {
+            value
+        };
         values.push((id, value));
     }
     let value = page(&mut tx, &caller.principal, values, limit).await?;

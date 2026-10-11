@@ -641,7 +641,7 @@ async fn coverage_is_backfilled_for_demands_resolved_before_0022() {
         "INSERT INTO libraries (id,name,root,root_identity) VALUES ('lib','L','/m','1:2')",
         "INSERT INTO catalog_libraries (id,name,kind) VALUES ('lib','L','mixed')",
         "INSERT INTO jobs (id,library_id,phase,created_at,complete_directories,incomplete_directories,outcome) VALUES ('job','lib','completed',1,7,2,'partial')",
-        "INSERT INTO scan_requests VALUES ('req','lib',0,1)",
+        "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('req','lib',0,1)",
         "INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status,job_id) VALUES ('d','req','lib',1,0,'partial','job')",
     ] {
         sqlx::query(sql).execute(&old).await.unwrap();

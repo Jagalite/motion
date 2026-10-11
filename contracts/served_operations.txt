@@ -120,3 +120,7 @@ getRelationship
 deleteRelationship
 listItemFiles
 listAdminFiles
+previewSourceRelocation
+commitSourceRelocation
+uploadArtwork
+selectArtwork

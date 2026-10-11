@@ -35,6 +35,8 @@ applying any pending migration to an existing database.
 
 | 0034 | `0034_scan_api_revisions.sql` | A02 data/catalog completion | public scan representation revisions |
 
+| 0035 | `0035_catalog_adapter_state.sql` | A02 data/catalog completion | timeline representation revisions and unselected artwork ownership |
+
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`

@@ -51,7 +51,11 @@ async fn visible(
     }
     Ok(())
 }
-async fn wire(tx: &mut sqlx::SqliteConnection, id: &str) -> Result<Value, Problem> {
+async fn wire(
+    tx: &mut sqlx::SqliteConnection,
+    id: &str,
+    principal: &access::Principal,
+) -> Result<Value, Problem> {
     let view = service::get_in(tx, id).await.map_err(error)?;
     let (revision, created): (i64, i64) =
         sqlx::query_as("SELECT revision,created_at FROM scan_requests WHERE id=?")
@@ -125,6 +129,11 @@ async fn wire(tx: &mut sqlx::SqliteConnection, id: &str) -> Result<Value, Proble
             playscale_core::demands::DemandStatus::Cancelled => "cancelled",
         };
         sources.push(json!({"source_id":s.source_id,"attempt_generation":generation,"status":status,"complete_directories":s.complete_directories.to_string(),"incomplete_directories":s.incomplete_directories.to_string(),"observed_files":observed.to_string(),"verified_files":verified.to_string(),"error_codes":s.error.into_iter().collect::<Vec<_>>()}));
+    }
+    // Shared physical attempts have no single requester. Only expose job IDs
+    // the jobs API authorizes; restricted clients manage their own demand.
+    if !principal.is_admin() {
+        jobs.clear();
     }
     jobs.sort();
     jobs.dedup();
@@ -221,7 +230,7 @@ async fn create(
     )
     .await
     .map_err(error)?;
-    let value = wire(&mut tx, &view.id).await?;
+    let value = wire(&mut tx, &view.id, &principal).await?;
     record
         .save(
             &mut tx,
@@ -242,7 +251,7 @@ async fn read(
     caller.require(Permission::SourcesManage)?;
     let mut tx = app.db.begin().await?;
     visible(&mut tx, &caller.principal, &id).await?;
-    let value = wire(&mut tx, &id).await?;
+    let value = wire(&mut tx, &id, &caller.principal).await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, value))
 }
@@ -265,7 +274,7 @@ async fn list(
     let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM scan_requests WHERE id>? AND (? OR library_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?").bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut rows = Vec::new();
     for id in ids {
-        rows.push((id.clone(), wire(&mut tx, &id).await?));
+        rows.push((id.clone(), wire(&mut tx, &id, &caller.principal).await?));
     }
     let value = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;
@@ -300,7 +309,7 @@ async fn cancel(
         return Ok(tagged(s.status, s.body.unwrap()));
     }
     service::cancel_in(&mut tx, &id).await.map_err(error)?;
-    let value = wire(&mut tx, &id).await?;
+    let value = wire(&mut tx, &id, &principal).await?;
     record
         .save(&mut tx, &digest, StatusCode::OK, Some(&value), None)
         .await?;

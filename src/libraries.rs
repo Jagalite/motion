@@ -640,6 +640,18 @@ pub async fn commit_relocation(
     plan: &core::RelocationPlan,
 ) -> Result<SourceView, RelocationError> {
     let _guard = app.jobs.lock().await;
+    let facts = observe_relocation(app, plan).await?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let result = commit_relocation_in(&mut tx, plan, facts).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) type RelocationObservation = (Option<String>, Vec<(String, Option<String>)>);
+pub(crate) async fn observe_relocation(
+    app: &App,
+    plan: &core::RelocationPlan,
+) -> Result<RelocationObservation, RelocationError> {
     let paths: Vec<(String, String)> =
         sqlx::query_as("SELECT id,relative_path FROM media_files WHERE library_id=?")
             .bind(&plan.source)
@@ -671,7 +683,14 @@ pub async fn commit_relocation(
     })
     .await
     .map_err(anyhow::Error::from)?;
-    let mut tx = crate::db::begin_write(&app.db).await?;
+    Ok((root_identity, fingerprints))
+}
+
+pub(crate) async fn commit_relocation_in(
+    tx: &mut SqliteConnection,
+    plan: &core::RelocationPlan,
+    (root_identity, fingerprints): RelocationObservation,
+) -> Result<SourceView, RelocationError> {
     let (rev, binding): (i64, i64) =
         sqlx::query_as("SELECT revision,binding_revision FROM sources WHERE id=?")
             .bind(&plan.source)
@@ -724,8 +743,7 @@ pub async fn commit_relocation(
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
-    Ok(get_source(&app.db, &plan.source).await?)
+    Ok(source_in(tx, &plan.source).await?)
 }
 
 pub(crate) async fn source_in(

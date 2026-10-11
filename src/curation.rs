@@ -278,6 +278,9 @@ pub(crate) async fn merge_in_transaction(
             .execute(&mut **tx)
             .await?;
     }
+    for retired in &plan.retired {
+        sqlx::query("INSERT OR IGNORE INTO item_artwork_assets(item_id,asset_id) SELECT ?,asset_id FROM item_artwork_assets WHERE item_id=?").bind(&plan.target).bind(retired).execute(&mut **tx).await?;
+    }
     apply_merge(tx, &plan, &receipt.id).await?;
     crate::search::refresh(tx, 100).await?;
     Ok(receipt)

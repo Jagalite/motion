@@ -1821,6 +1821,20 @@ async fn public_structure_writes_preserve_revisions_and_retry_identity() {
         f.call("POST", &path, Some(version), &h).await.body,
         created.body
     );
+    let stale_version=f.call("POST",&path,Some(json!({"timeline_id":id,"label":"Second","files":[{"file":{"file_id":file["id"],"file_revision":file["revision"]},"part":1,"start_ms":null,"end_ms":null}],"timeline_equivalence":"declared"})),&[("authorization",&auth),("if-match",timeline.headers["etag"].to_str().unwrap()),("idempotency-key","version-stale-0000001")]).await;
+    assert_eq!(stale_version.status, StatusCode::PRECONDITION_FAILED);
+    let admin = f
+        .call(
+            "GET",
+            "/api/v2/admin/files",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(admin.status, StatusCode::OK, "{}", admin.body);
+    assert!(admin.body["items"][0]["file"]["id"].is_string());
+    assert!(admin.body["items"][0]["relative_path"].is_string());
+    assert!(admin.body["items"][0]["binding_revision"].is_string());
     let read = f
         .call(
             "GET",
@@ -1862,5 +1876,107 @@ async fn public_structure_writes_preserve_revisions_and_retry_identity() {
         .await
         .status,
         StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn source_relocation_preview_commit_and_retry_are_fenced() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let source = f
+        .call(
+            "GET",
+            &format!("/api/v2/sources/{}", f.a),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let new_root = f._dir.path().join("relocated");
+    std::fs::create_dir(&new_root).unwrap();
+    let path = format!("/api/v2/sources/{}/relocation-plans", f.a);
+    let input = json!({"new_root_path":new_root});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", source.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "relocation-preview-01"),
+    ];
+    let preview = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    assert_eq!(
+        f.call("POST", &path, Some(input), &h).await.body,
+        preview.body
+    );
+    let path = format!("/api/v2/sources/{}/relocation", f.a);
+    let input = json!({"plan_token":preview.body["plan_token"]});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "relocation-commit-001"),
+    ];
+    let committed = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(committed.status, StatusCode::OK, "{}", committed.body);
+    assert_eq!(
+        f.call("POST", &path, Some(input.clone()), &h).await.body,
+        committed.body
+    );
+    let stale = f
+        .call(
+            "POST",
+            &path,
+            Some(input),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "relocation-commit-002"),
+            ],
+        )
+        .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT, "{}", stale.body);
+}
+
+#[tokio::test]
+async fn restricted_source_manager_controls_demands_without_owning_shared_jobs() {
+    let f = Fixture::new().await;
+    let token = f.device(&["catalog:read", "sources:manage"], &[&f.a]).await;
+    let created = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.a),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-scan-001"),
+            ],
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    assert_eq!(created.body["job_ids"], json!([]));
+    let cancelled = f
+        .call(
+            "POST",
+            &format!(
+                "/api/v2/scans/{}/cancel",
+                created.body["id"].as_str().unwrap()
+            ),
+            None,
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-cancel-01"),
+            ],
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::OK);
+    assert_eq!(cancelled.body["status"], "cancelled");
+    assert_eq!(
+        f.call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"verify","require_complete":false})),
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-hidden-01")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
     );
 }

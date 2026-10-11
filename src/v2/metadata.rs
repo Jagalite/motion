@@ -43,7 +43,16 @@ pub fn routes() -> Router<App> {
         .route("/catalog/matches", get(list_matches).post(create_match))
         .route("/catalog/matches/{match_id}", get(get_match))
         .route("/catalog/matches/{match_id}/decision", put(decide_match))
-        .route("/catalog/items/{item_id}/artwork", get(list_artwork))
+        .route(
+            "/catalog/items/{item_id}/artwork",
+            get(list_artwork)
+                .post(upload_artwork)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/catalog/items/{item_id}/artwork/selection",
+            put(select_artwork),
+        )
         .route(
             "/media/assets/{asset_id}/content",
             get(asset_content).head(asset_content),
@@ -729,8 +738,9 @@ async fn list_artwork(
         return Err(Problem::not_found());
     }
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT a.id,a.mime,length(a.bytes) FROM artwork_assets a WHERE a.id IN (SELECT asset_id FROM artwork_contributions WHERE item_id=?) AND a.id>? ORDER BY a.id LIMIT ?",
+        "SELECT a.id,a.mime,length(a.bytes) FROM artwork_assets a WHERE a.id IN (SELECT asset_id FROM artwork_contributions WHERE item_id=? UNION SELECT asset_id FROM item_artwork_assets WHERE item_id=?) AND a.id>? ORDER BY a.id LIMIT ?",
     )
+    .bind(&item_id)
     .bind(&item_id)
     .bind(q.after()?)
     .bind(i64::from(limit) + 1)
@@ -778,7 +788,7 @@ async fn asset_content(
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
     let mut conn = app.db.acquire().await?;
     let asset: Option<(String, Vec<u8>)> = sqlx::query_as(&format!(
-        "SELECT a.mime,a.bytes FROM artwork_assets a WHERE a.id=? AND (? OR EXISTS(SELECT 1 FROM artwork_contributions c JOIN editions e ON e.item_id=c.item_id JOIN media_files f ON f.edition_id=e.id WHERE c.asset_id=a.id AND c.item_id NOT IN (SELECT alias_id FROM item_aliases) AND {clause}))"
+        "SELECT a.mime,a.bytes FROM artwork_assets a WHERE a.id=? AND (? OR EXISTS(SELECT 1 FROM (SELECT item_id,asset_id FROM artwork_contributions UNION SELECT item_id,asset_id FROM item_artwork_assets) c JOIN editions e ON e.item_id=c.item_id JOIN media_files f ON f.edition_id=e.id WHERE c.asset_id=a.id AND c.item_id NOT IN (SELECT alias_id FROM item_aliases) AND {clause}))"
     ))
     .bind(&asset_id)
     .bind(all)
@@ -873,4 +883,149 @@ async fn require_curatable_file(
             "Changing this shared file requires every containing library",
         ))
     }
+}
+
+async fn upload_artwork(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let key = idempotency_key(&headers)?;
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| h.split(';').next().unwrap().trim())
+        != Some("application/octet-stream")
+    {
+        return Err(Problem::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "Send application/octet-stream",
+        ));
+    }
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err(Problem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "Artwork exceeds 8 MiB",
+        ));
+    }
+    let digest = super::sha256(&bytes);
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    super::catalog::curatable_item(&mut tx, &core::catalog_scope(&principal), &id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "uploadArtwork",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, crate::now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    tx.rollback().await?;
+    let (asset, mime, width, height, bytes) =
+        crate::artwork::decode_upload(bytes).await.map_err(|e| {
+            let (status, _, message) = e.parts();
+            Problem::new(status, "invalid_image", message)
+        })?;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    super::catalog::curatable_item(&mut tx, &core::catalog_scope(&principal), &id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "uploadArtwork",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, crate::now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO artwork_assets(id,mime,width,height,bytes) VALUES (?,?,?,?,?)",
+    )
+    .bind(&asset)
+    .bind(mime)
+    .bind(width)
+    .bind(height)
+    .bind(bytes.as_ref())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT OR IGNORE INTO item_artwork_assets(item_id,asset_id) VALUES (?,?)")
+        .bind(&id)
+        .bind(&asset)
+        .execute(&mut *tx)
+        .await?;
+    let value = serde_json::to_value(asset_body(asset, mime.into(), bytes.len() as i64))
+        .map_err(Problem::internal)?;
+    record
+        .save(&mut tx, &digest, StatusCode::CREATED, Some(&value), None)
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::CREATED, &value, 1))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtworkSelectionInput {
+    role: String,
+    asset_id: String,
+}
+async fn select_artwork(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<ArtworkSelectionInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let input = body.value;
+    if !matches!(
+        input.role.as_str(),
+        "poster" | "backdrop" | "banner" | "thumbnail"
+    ) {
+        return Err(Problem::invalid("invalid_role", "Unknown artwork role"));
+    }
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = core::catalog_scope(&principal);
+    let item = super::catalog::curatable_item(&mut tx, &scope, &id, false).await?;
+    core::revise(item.revision as u64, expected, true)?;
+    let candidates:Vec<String>=sqlx::query_scalar("SELECT asset_id FROM artwork_contributions WHERE item_id=? AND role=? UNION SELECT asset_id FROM item_artwork_assets WHERE item_id=?").bind(&id).bind(&input.role).bind(&id).fetch_all(&mut *tx).await?;
+    let current: i64 = sqlx::query_scalar(
+        "SELECT coalesce((SELECT revision FROM artwork_selections WHERE item_id=? AND role=?),0)",
+    )
+    .bind(&id)
+    .bind(&input.role)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision =
+        playscale_core::artwork::select(current, current, Some(&input.asset_id), &candidates)
+            .map_err(|_| {
+                Problem::invalid(
+                    "invalid_artwork_selection",
+                    "Select an asset owned by this item",
+                )
+            })?;
+    sqlx::query("INSERT INTO artwork_selections(item_id,role,asset_id,revision) VALUES (?,?,?,?) ON CONFLICT(item_id,role) DO UPDATE SET asset_id=excluded.asset_id,revision=excluded.revision").bind(&id).bind(input.role).bind(input.asset_id).bind(revision).execute(&mut *tx).await?;
+    let item = super::catalog::curatable_item(&mut tx, &scope, &id, false).await?;
+    let revision = item.revision as u64;
+    let value = super::catalog::item_body(&mut tx, &scope, item).await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, &value, revision))
 }
