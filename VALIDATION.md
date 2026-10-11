@@ -10,14 +10,26 @@ GitHub's web-flow identity is accepted only as committer, and the check reads th
 history reachable from HEAD with full-depth checkouts. Seven disposable-repository
 tests cover it.
 
-`.github/workflows/ci.yml` now runs on pushes and pull requests:
+CI has two tiers. `.github/workflows/ci.yml` is the fast merge gate on every
+pull request and on pushes to main:
 
 | Job | Command(s) |
 |---|---|
-| rust | `cargo fmt --all --check`; `cargo clippy --locked --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::result_large_err`; `cargo test --locked --workspace --no-fail-fast` |
+| rust | `cargo fmt --all --check`; `cargo clippy --locked --workspace --all-targets -- -D warnings -A clippy::too_many_arguments -A clippy::result_large_err`; `python3 scripts/ci/test_tier.py fast` (unit, doc and every test target except the full-only ones) |
 | contract | `scripts/check_contract.py` (pinned `scripts/ci/contract-requirements.txt`, Python 3.13); `ruby scripts/contract_json.rb --check` |
+
+`.github/workflows/ci-full.yml` runs the long suites on pushes to main,
+nightly, on demand (`gh workflow run ci-full.yml --ref <branch>`), and on pull
+requests touching migrations, `src/db.rs`, the integration/upgrade scripts,
+the lockfile, the toolchain, packaging or workflows:
+
+| Job | Command(s) |
+|---|---|
+| heavy-tests | `python3 scripts/ci/test_tier.py full`: debug-build Stateless models (`access_model`, `delivery_model`, `timeline_viewing_model`, `work_model`) and live FFmpeg delivery (`delivery`, `v2_playback`) |
 | integration | `python3 scripts/integration_checks.py --work artifacts/integration`; `python3 scripts/upgrade_restore_check.py --work artifacts/upgrade-restore` |
 | package | `package.yml` via `workflow_call` (build, then `scripts/test_package.py` on the extracted archive) |
+
+The two tiers together run the whole `cargo test --workspace`.
 
 The two allowed clippy lints have no other hits: `src/delivery.rs` (541, 564,
 871) and `src/processing.rs` (466). They fire identically on the pinned 1.98.0
