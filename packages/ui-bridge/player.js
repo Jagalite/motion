@@ -88,7 +88,18 @@ async function openGeneration(element, generation, position, origin) {
   const source = demuxeSource(generation, origin);
   if (generation.transport === 'hls') {
     await element.open(source);
-    await element.seek(target);
+    // A live seek window advances while open resolves. Allow at most one
+    // second at its leading edge (including a small execution margin), never
+    // silently jump to the live edge or a later rolling window.
+    const ranges = element.player.state.seekable;
+    let seek = target;
+    if (Array.isArray(ranges) && !ranges.some(r => target >= r.start && target <= r.end)) {
+      const near = ranges.find(r => Number.isFinite(r.start) && Number.isFinite(r.end)
+        && r.start > target && r.start + 0.25 <= target + 1 && r.start + 0.25 <= r.end);
+      if (!near) throw new Error('Requested generation position is outside the live window.');
+      seek = near.start + 0.25;
+    }
+    await element.seek(seek);
     if (Math.abs(element.player.state.currentTime - target) > 1)
       throw new Error('Live player did not reach the requested generation position.');
   } else await element.open(source, {startTime: target});
