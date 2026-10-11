@@ -35,7 +35,7 @@ require matching notice collection. It preserves discovered packaged materials;
 it does not certify that an upstream author included every required notice or
 fulfill source-offer obligations for separately bundled tools/providers.
 
-The model tests use `statelessness` 0.1.1 (imported as `stateless`), licensed under
+The model tests use `statelessness` 0.2.0 (imported as `stateless`), licensed under
 MIT. Its registry archive includes LICENSE and excludes the upstream experiments.
 The upstream copyright notice is retained in THIRD_PARTY_NOTICES.txt.
 See vendor/STATELESS.md.
@@ -82,7 +82,7 @@ materials. FFmpeg's upstream guidance: https://ffmpeg.org/legal.html.
 
 - MIT: https://opensource.org/license/mit
 - Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
-- Stateless: https://crates.io/crates/statelessness/0.1.1
+- Stateless: https://crates.io/crates/statelessness/0.2.0
 
 This document identifies the integration boundaries. It is not qualification of
 every future binary, codec bundle, or historical Git revision.

@@ -2495,9 +2495,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "statelessness"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62c04a035e8d120597440c45dc296f6bc8394145a4a6661e15642949bdf0471c"
+checksum = "a16408c5801d09925958067be17ba149acf0467efcab9285bedb2e59235320f8"
 
 [[package]]
 name = "stringprep"
