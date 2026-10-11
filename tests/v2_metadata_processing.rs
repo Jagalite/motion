@@ -1489,3 +1489,273 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
         "completed"
     );
 }
+
+#[tokio::test]
+async fn preparation_admission_pins_identity_and_replays_once() {
+    let f = Fixture::new().await;
+    sqlx::query("UPDATE media_files SET duration_seconds=10 WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "prepare-one"),
+    ];
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    assert_eq!(first.body["kind"], "rendition");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let mut changed = input.clone();
+    changed["recipe_id"] = json!("audio_aac");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(changed),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM preparations")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert_eq!(list.body["items"][0]["status"], "pending");
+    let mut wrong = input.clone();
+    wrong["timeline_id"] = json!("ed-film-b");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(wrong),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "wrong-timeline")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let mut track = input;
+    track["tracks"]["audio_track_id"] = json!("a9");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(track),
+            &[("authorization", &op), ("idempotency-key", "wrong-track")]
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    sqlx::query("UPDATE media_files SET revision='replaced' WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.body["items"][0]["status"], "stale");
+}
+
+#[tokio::test]
+async fn schedules_preserve_disabled_rows_and_atomically_claim_logical_scans() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let input = json!({"library_id":f.library,"task":"scan","interval_seconds":60,"enabled":true});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/schedules",
+            Some(input.clone()),
+            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let id = first.body["id"].as_str().unwrap();
+    let path = format!("/api/v2/schedules/{id}");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/schedules",
+            Some(input.clone()),
+            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    sqlx::query("UPDATE api_schedules SET next_run=0 WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let mut disabled = input.clone();
+    disabled["enabled"] = json!(false);
+    let updated = f
+        .call(
+            "PUT",
+            &path,
+            Some(disabled),
+            &[("authorization", &op), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.body);
+    assert_eq!(updated.body["enabled"], false);
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &op), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &op), ("if-match", "\"r-2\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn backup_request_replay_publishes_one_verified_snapshot_with_asset_inventory() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "backup-one"),
+    ];
+    let body = json!({"include_generated_media":true});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let replay = f
+        .call("POST", "/api/v2/admin/backups", Some(body), &headers)
+        .await;
+    assert_eq!(first.body, replay.body);
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(json!({"include_generated_media":false})),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert!(playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/admin/backups",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.body["items"][0]["status"], "ready", "{}", list.body);
+    let id = first.body["id"].as_str().unwrap();
+    let manifest = std::fs::read(
+        f.app
+            .storage
+            .root
+            .join("backups")
+            .join(format!("request-{id}"))
+            .join("manifest.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        list.body["items"][0]["manifest_digest"],
+        format!("sha256:{:x}", Sha256::digest(&manifest))
+    );
+    let value: Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(value["include_generated_media"], true);
+    assert!(value["assets"].is_array());
+    // Lost acknowledgement: repeat the running attempt against the immutable path.
+    sqlx::query("UPDATE backup_jobs SET phase='running',manifest_digest=NULL WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert_eq!(
+        std::fs::read_dir(f.app.storage.root.join("backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let storage = f
+        .call(
+            "GET",
+            "/api/v2/admin/storage",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(storage.status, StatusCode::OK, "{}", storage.body);
+    assert!(
+        storage.body["database_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+}

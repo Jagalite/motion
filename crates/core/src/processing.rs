@@ -167,3 +167,56 @@ impl SourceAdmission<'_> {
 pub fn queue_admits(active_jobs: i64) -> bool {
     active_jobs < 100
 }
+
+/// Current observations for a preparation's publication. Adapters must observe
+/// these in the same write transaction that acknowledges publication.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PreparationFacts {
+    pub requester_authorized: bool,
+    pub source_enabled: bool,
+    pub source_in_scope: bool,
+    pub exact_whole_timeline_binding: bool,
+    pub recipe_unchanged: bool,
+}
+impl PreparationFacts {
+    pub fn admit(&self) -> Result<(), &'static str> {
+        if !self.requester_authorized {
+            return Err("preparation_authorization_changed");
+        }
+        if !self.source_enabled || !self.source_in_scope {
+            return Err("preparation_source_unavailable");
+        }
+        if !self.exact_whole_timeline_binding {
+            return Err("preparation_timeline_changed");
+        }
+        if !self.recipe_unchanged {
+            return Err("preparation_recipe_changed");
+        }
+        Ok(())
+    }
+}
+
+pub struct RenditionFacts {
+    pub expired: bool,
+    pub phase: jobs::Phase,
+    pub source_current: bool,
+    pub binding_current: bool,
+    pub output_current: bool,
+}
+pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
+    if facts.expired {
+        "expired"
+    } else if matches!(facts.phase, jobs::Phase::Failed | jobs::Phase::Cancelled) {
+        "failed"
+    } else if !facts.source_current || !facts.binding_current {
+        "stale"
+    } else if facts.phase == jobs::Phase::Completed {
+        if facts.output_current {
+            "ready"
+        } else {
+            "stale"
+        }
+    } else {
+        "pending"
+    }
+}
