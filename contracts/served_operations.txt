@@ -108,3 +108,7 @@ revokeDevice
 searchCatalog
 setWatchedState
 subscribeEvents
+createScan
+listScans
+getScan
+cancelScan

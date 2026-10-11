@@ -1614,3 +1614,94 @@ async fn reconciliation_replays_recheck_current_catalog_scope() {
         .await;
     problem(&denied, StatusCode::NOT_FOUND, "not_found");
 }
+
+#[tokio::test]
+async fn scans_are_atomic_idempotent_scoped_demands() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let path = format!("/api/v2/libraries/{}/scans", f.a);
+    let input = json!({"mode":"verify","require_complete":true});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "scan-admission-00001"),
+    ];
+    let first = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    assert_eq!(first.body["status"], "queued");
+    assert_eq!(first.body["sources"].as_array().unwrap().len(), 1);
+    let replay = f.call("POST", &path, Some(input), &h).await;
+    assert_eq!(replay.body, first.body);
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1);
+    let conflict = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"incremental","require_complete":true})),
+            &h,
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let second = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":true})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-admission-00002"),
+            ],
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::ACCEPTED);
+    let cancel = format!(
+        "/api/v2/scans/{}/cancel",
+        first.body["id"].as_str().unwrap()
+    );
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "scan-cancel-00000001"),
+    ];
+    let cancelled = f.call("POST", &cancel, None, &h).await;
+    assert_eq!(cancelled.status, StatusCode::OK, "{}", cancelled.body);
+    assert_eq!(cancelled.body["status"], "cancelled");
+    assert_eq!(f.call("POST", &cancel, None, &h).await.body, cancelled.body);
+    let phase: String = sqlx::query_scalar("SELECT phase FROM jobs LIMIT 1")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(phase, "queued", "other demand still owns physical work");
+    let limited = f.device(&["catalog:read"], &[&f.a]).await;
+    assert_eq!(
+        f.call("GET", "/api/v2/scans", None, &[("authorization", &limited)])
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    let malformed = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":false,"source_ids":[f.a,f.a]})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-invalid-0000001"),
+            ],
+        )
+        .await;
+    assert_eq!(malformed.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let listed = f
+        .call(
+            "GET",
+            "/api/v2/scans?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    assert!(listed.body["next_cursor"].is_string());
+}

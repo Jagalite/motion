@@ -13,6 +13,7 @@ pub mod libraries;
 pub mod metadata;
 pub mod organization;
 pub mod playback;
+pub mod scans;
 pub mod system;
 pub mod viewing;
 
@@ -798,6 +799,7 @@ pub fn router() -> Router<App> {
         .merge(organization::routes())
         .merge(catalog::routes())
         .merge(libraries::routes())
+        .merge(scans::routes())
         .merge(jobs::routes())
         .merge(metadata::routes())
         .merge(playback::routes())
