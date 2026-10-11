@@ -62,6 +62,53 @@ pub struct Component {
     pub occurrences: Vec<Occurrence>,
 }
 
+/// Resolve an explicit component only on the chosen revision-bound file.
+/// Sidecars and occurrences on another cut/file never substitute for this pin.
+pub fn embedded_track(
+    components: &[Component],
+    id: &str,
+    kind: Kind,
+    version: &str,
+    file: &str,
+    revision: &str,
+) -> Option<i64> {
+    components
+        .iter()
+        .find(|c| c.id == id && c.kind == kind)?
+        .occurrences
+        .iter()
+        .find(|o| {
+            o.version_id == version
+                && o.file_id == file
+                && o.file_revision == revision
+                && o.sidecar.is_none()
+        })?
+        .track_index
+}
+
+/// Automatic language/role policy is not yet qualified. Never silently drop
+/// observed embedded captions when a caller requests that policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubtitleSelection {
+    None,
+    Selected(u32),
+    Conflict,
+    Unavailable,
+    AutomaticUnsupported,
+}
+pub fn select_subtitle(policy: &str, explicit: Option<u32>, count: usize) -> SubtitleSelection {
+    use SubtitleSelection::*;
+    match (policy, explicit) {
+        ("off", Some(_)) => Conflict,
+        ("off", _) => None,
+        (_, Some(index)) => Selected(index),
+        ("require", _) if count > 0 => Selected(0),
+        ("require", _) => Unavailable,
+        (_, _) if count > 0 => AutomaticUnsupported,
+        _ => None,
+    }
+}
+
 /// Lower-case language tag; `und`, empty or malformed tags mean unknown.
 pub fn normalize_language(tag: Option<&str>) -> Option<String> {
     let tag = tag?.trim().to_ascii_lowercase();
@@ -217,6 +264,54 @@ mod tests {
             sidecar: None,
         }
     }
+    #[test]
+    fn subtitle_policy_never_silently_drops_or_substitutes_a_selection() {
+        use SubtitleSelection::*;
+        assert_eq!(
+            select_subtitle("auto", Option::None, 2),
+            AutomaticUnsupported
+        );
+        assert_eq!(select_subtitle("auto", Option::None, 0), None);
+        assert_eq!(select_subtitle("auto", Some(1), 2), Selected(1));
+        assert_eq!(select_subtitle("require", Some(1), 2), Selected(1));
+        assert_eq!(select_subtitle("require", Option::None, 2), Selected(0));
+        assert_eq!(select_subtitle("require", Option::None, 0), Unavailable);
+        assert_eq!(select_subtitle("off", Some(0), 2), Conflict);
+        assert_eq!(select_subtitle("off", Option::None, 2), None);
+    }
+
+    #[test]
+    fn embedded_selection_never_substitutes_kind_cut_file_revision_or_sidecar() {
+        let mut components = derive(
+            "t",
+            &[(
+                "v".into(),
+                vec![track("f", 2, Kind::Audio, "en", Roles::default())],
+            )],
+        );
+        let id = components[0].id.clone();
+        assert_eq!(
+            embedded_track(&components, &id, Kind::Audio, "v", "f", "r-f"),
+            Some(2)
+        );
+        for (kind, version, file, revision) in [
+            (Kind::Subtitle, "v", "f", "r-f"),
+            (Kind::Audio, "other", "f", "r-f"),
+            (Kind::Audio, "v", "other", "r-f"),
+            (Kind::Audio, "v", "f", "stale"),
+        ] {
+            assert_eq!(
+                embedded_track(&components, &id, kind, version, file, revision),
+                None
+            );
+        }
+        components[0].occurrences[0].sidecar = Some("captions.srt".into());
+        assert_eq!(
+            embedded_track(&components, &id, Kind::Audio, "v", "f", "r-f"),
+            None
+        );
+    }
+
     #[test]
     fn components_group_across_versions_by_key_and_ordinal() {
         let commentary = Roles {

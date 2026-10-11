@@ -65,8 +65,8 @@ function observedCapability(shared) {
   };
 }
 
-// Preference vocabulary differs from the planning contract. Automatic retains
-// the server's forced/foreign-audio policy; always is an explicit requirement.
+// Preference vocabulary differs from the planning contract. Automatic selection
+// may be explicitly refused; always requires the first or explicitly selected caption.
 function subtitlePolicy(preference) {
   if (preference === 'off') return 'off';
   if (preference === 'always') return 'require';
@@ -461,6 +461,10 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await openGeneration(element, generation, position, location.origin);
+    if (generation.subtitles_url) {
+      if (generation.media_time_origin_ms !== 0 || typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
+      await element.player.addTextTrack({src: new URL(generation.subtitles_url, location.origin).href, label: 'Selected subtitles', default: true});
+    }
     if (preferences) {
       await element.setVolume(preferences.volume);
       await element.setMuted(preferences.muted);

@@ -117,8 +117,10 @@ pub async fn capabilities(
     playback.limits = BTreeMap::from([
         ("routes", "original,prepared,software_hls".into()),
         ("timeline_binding", "whole_single_part".into()),
-        ("subtitles", "unavailable".into()),
-        ("components", "unavailable".into()),
+        ("subtitles", "embedded_plain_text_original_webvtt".into()),
+        ("components", "embedded_revision_bound".into()),
+        ("tickets", "file_or_delivery_generation_playback".into()),
+        ("unsupported", "automatic_subtitle_selection,sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_caps,adaptive_bitrate,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

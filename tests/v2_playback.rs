@@ -1128,8 +1128,26 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         .await;
     assert_eq!(ack.status, StatusCode::OK, "{:?}", ack.body);
 
+    let ticket = f
+        .post(
+            "/api/v2/content-access",
+            &auth,
+            Some("restart-ticket-access"),
+            json!({"purpose":"playback","delivery_id":id,"generation":"1","ttl_seconds":600}),
+        )
+        .await;
+    assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
+    let ticket_url = ticket.body["url"].as_str().unwrap().to_owned();
+    assert_eq!(
+        f.call("GET", &ticket_url, None, &[]).await.status,
+        StatusCode::OK
+    );
     let identity_before = f.get("/api/v2/system/capabilities", &auth).await.body;
     f.restart().await;
+    assert_eq!(
+        f.call("GET", &ticket_url, None, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
     let identity_after = f.get("/api/v2/system/capabilities", &auth).await.body;
     assert_eq!(identity_before["server_id"], identity_after["server_id"]);
     assert_eq!(
@@ -2103,4 +2121,563 @@ async fn playback_only_observations_advance_live_conversion_and_revocation_stops
         "revoked live delivery worker and output released in {:?}",
         start.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generation_tickets_cover_hls_children_but_never_widen_authority() {
+    assert!(tools_available());
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "120");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (device, auth) = f
+        .device(&["default"], &["catalog:read", "playback:request"])
+        .await;
+    let (_, other) = f.device(&["default"], PLAYER).await;
+    for mode in ["original", "convert"] {
+        let plan = f
+            .post(
+                "/api/v2/playback/plans",
+                &auth,
+                None,
+                plan_input("default", &timeline, mode, None, &["http_range", "hls"]),
+            )
+            .await;
+        assert_eq!(plan.body["status"], "ready", "{}", plan.body);
+        let admitted = f
+            .post(
+                "/api/v2/playback/delivery-sessions",
+                &auth,
+                Some(&format!("ticket-delivery-{mode}")),
+                json!({"plan_token":plan.body["plan_token"],"start_ms":0}),
+            )
+            .await;
+        assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+        let id = admitted.body["id"].as_str().unwrap();
+        f.until(id, &auth, |d| d["active"]["status"] == "active")
+            .await;
+        let input = json!({"purpose":"playback","delivery_id":id,"generation":"1","file":null,"download_id":null,"ttl_seconds":60});
+        assert_eq!(
+            f.post(
+                "/api/v2/content-access",
+                &other,
+                Some(&format!("stolen-ticket-{mode}")),
+                input.clone()
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND
+        );
+        let key = format!("generation-ticket-{mode}");
+        let ticket = f
+            .post("/api/v2/content-access", &auth, Some(&key), input.clone())
+            .await;
+        assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
+        assert_eq!(
+            f.post("/api/v2/content-access", &auth, Some(&key), input.clone())
+                .await
+                .body,
+            ticket.body
+        );
+        let url = ticket.body["url"].as_str().unwrap();
+        let token = url.split("ticket=").nth(1).unwrap();
+        let response = f.call("GET", url, None, &[]).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert_eq!(f.call("HEAD", url, None, &[]).await.status, StatusCode::OK);
+        if mode == "convert" {
+            let master = String::from_utf8(response.bytes).unwrap();
+            let variant = master
+                .lines()
+                .find(|l| !l.starts_with('#') && !l.is_empty())
+                .unwrap();
+            assert!(variant.contains("?ticket="));
+            let base = url::Url::parse(&format!("http://motion.test{url}")).unwrap();
+            let variant_url = base.join(variant).unwrap();
+            let reply = f
+                .call(
+                    "GET",
+                    &format!("{}?{}", variant_url.path(), variant_url.query().unwrap()),
+                    None,
+                    &[],
+                )
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+            let playlist = String::from_utf8(reply.bytes).unwrap();
+            let init = playlist
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("#EXT-X-MAP:URI=\"")
+                        .and_then(|s| s.split('"').next())
+                })
+                .unwrap();
+            for child in std::iter::once(init).chain(
+                playlist
+                    .lines()
+                    .filter(|l| !l.starts_with('#') && !l.is_empty()),
+            ) {
+                assert!(child.contains("?ticket="));
+                let child = variant_url.join(child).unwrap();
+                assert_eq!(
+                    f.call(
+                        "GET",
+                        &format!("{}?{}", child.path(), child.query().unwrap()),
+                        None,
+                        &[]
+                    )
+                    .await
+                    .status,
+                    StatusCode::OK
+                );
+            }
+        }
+        let source = f.source().await;
+        let widened = format!(
+            "/api/v2/media/files/{}/content?ticket={token}",
+            source["file_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            f.call("GET", &widened, None, &[]).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            f.call("GET", &url.replace("/1/", "/2/"), None, &[])
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            f.call(
+                "POST",
+                &format!("/api/v2/playback/delivery-sessions/{id}/heartbeat?ticket={token}"),
+                Some(json!({"active_generation":"1"})),
+                &[]
+            )
+            .await
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        sqlx::query("UPDATE content_tickets SET expires_at=0 WHERE id=?")
+            .bind(ticket.body["id"].as_str().unwrap())
+            .execute(&f.server.app.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.call("GET", url, None, &[]).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            f.post("/api/v2/content-access", &auth, Some(&key), input.clone())
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let fresh = f
+            .post(
+                "/api/v2/content-access",
+                &auth,
+                Some(&format!("fresh-ticket-{mode}")),
+                input,
+            )
+            .await;
+        let fresh_url = fresh.body["url"].as_str().unwrap();
+        assert_eq!(
+            f.call(
+                "DELETE",
+                &format!(
+                    "/api/v2/content-access/{}",
+                    fresh.body["id"].as_str().unwrap()
+                ),
+                None,
+                &[("authorization", &auth)]
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            f.call("GET", fresh_url, None, &[]).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        // Closing a generation invalidates even an unexpired ticket.
+        let live = f
+            .post(
+                "/api/v2/content-access",
+                &auth,
+                Some(&format!("close-ticket-{mode}")),
+                json!({"purpose":"playback","delivery_id":id,"generation":"1","ttl_seconds":60}),
+            )
+            .await;
+        f.call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(
+            f.call("GET", live.body["url"].as_str().unwrap(), None, &[])
+                .await
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // Current grant removal is also enforced by already issued tickets.
+    let admitted = admit_original(&f, &auth, &timeline, "scope-ticket-delivery", 0).await;
+    let id = admitted["id"].as_str().unwrap();
+    let input = json!({"purpose":"playback","delivery_id":id,"generation":"1","ttl_seconds":60});
+    let ticket = f
+        .post(
+            "/api/v2/content-access",
+            &auth,
+            Some("scope-ticket-issue"),
+            input.clone(),
+        )
+        .await;
+    sqlx::query("UPDATE devices SET revoked=1 WHERE id=?")
+        .bind(&device)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("GET", ticket.body["url"].as_str().unwrap(), None, &[])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_ne!(
+        f.post(
+            "/api/v2/content-access",
+            &auth,
+            Some("scope-ticket-issue"),
+            input
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_media_policy_requires_observed_facts_and_components_never_substitute() {
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let second = components
+        .iter()
+        .find(|c| {
+            c.kind == playscale_core::components::Kind::Audio
+                && c.occurrences.iter().any(|o| o.track_index == Some(2))
+        })
+        .unwrap();
+    let mut input = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+    input["tracks"]["audio_component_id"] = json!(second.id);
+    let selected = f
+        .post("/api/v2/playback/plans", &auth, None, input.clone())
+        .await;
+    assert_eq!(
+        selected.body["tracks"]["audio_track_id"], "a1",
+        "{}",
+        selected.body
+    );
+    input["tracks"]["audio_component_id"] = json!("missing-component");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, input)
+            .await
+            .body["reason_codes"][0],
+        "component_unavailable"
+    );
+    for limit in [239, 240, 241] {
+        let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+        input["quality"]["max_height"] = json!(limit);
+        assert_eq!(
+            f.post("/api/v2/playback/plans", &auth, None, input)
+                .await
+                .body["status"],
+            if limit < 240 { "blocked" } else { "ready" }
+        );
+    }
+    // Even a very generous cap is not proven by this variable-bitrate file's
+    // small average size. File routes have no trustworthy peak/VBV observation.
+    let mut capped = plan_input("default", &timeline, "original", None, &["http_range"]);
+    capped["quality"]["max_bitrate_bps"] = json!("999999999999");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, capped)
+            .await
+            .body["status"],
+        "blocked"
+    );
+    let file = source["file_id"].as_str().unwrap();
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
+        .bind(file)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    // PQ and HLG cannot be tone-mapped by this service. Byte preservation is
+    // permitted only when the client reports HDR support and does not require SDR.
+    for transfer in ["smpte2084", "arib-std-b67"] {
+        let mut hdr: Value = serde_json::from_str(&tracks).unwrap();
+        for track in hdr.as_array_mut().unwrap() {
+            if track["kind"] == "video" {
+                track["color_transfer"] = json!(transfer);
+            }
+        }
+        sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+            .bind(hdr.to_string())
+            .bind(file)
+            .execute(&f.server.app.db)
+            .await
+            .unwrap();
+        for (mode, policy, capability, expected) in [
+            ("original", "preserve_if_supported", "supported", "ready"),
+            ("original", "require_sdr", "supported", "blocked"),
+            (
+                "original",
+                "preserve_if_supported",
+                "unsupported",
+                "blocked",
+            ),
+            ("original", "preserve_if_supported", "unknown", "blocked"),
+            ("convert", "preserve_if_supported", "supported", "blocked"),
+            ("convert", "reject_conversion", "supported", "blocked"),
+        ] {
+            let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+            input["quality"]["hdr_policy"] = json!(policy);
+            input["client"]["hdr"] = json!(capability);
+            let reply = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(
+                reply.body["status"], expected,
+                "{transfer} {mode} {policy} {capability}: {}",
+                reply.body
+            );
+        }
+    }
+    let mut unknown: Value = serde_json::from_str(&tracks).unwrap();
+    for t in unknown.as_array_mut().unwrap() {
+        if t["kind"] == "video" {
+            t["height"] = Value::Null;
+        }
+    }
+    sqlx::query("UPDATE media_files SET tracks_json=?,duration_seconds=NULL WHERE id=?")
+        .bind(unknown.to_string())
+        .bind(file)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    for (key, value) in [
+        ("max_height", json!(1080)),
+        ("max_bitrate_bps", json!("999999999")),
+    ] {
+        let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+        input["quality"][key] = value;
+        assert_eq!(
+            f.post("/api/v2/playback/plans", &auth, None, input)
+                .await
+                .body["status"],
+            "blocked"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refused() {
+    assert!(tools_available());
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    let original = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &original).unwrap();
+    let srt = f.dir.path().join("captions.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nSelected caption\n").unwrap();
+    f.media(
+        "film.mp4",
+        &[
+            "-i",
+            original.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+    input["source"] = source.clone();
+    input["tracks"]["subtitle_track_id"] = json!("s0");
+    input["tracks"]["subtitle_policy"] = json!("require");
+    let mut automatic = input.clone();
+    automatic["tracks"]["subtitle_track_id"] = Value::Null;
+    automatic["tracks"]["subtitle_policy"] = json!("auto");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, automatic)
+            .await
+            .body["reason_codes"][0],
+        "automatic_subtitle_selection_unavailable"
+    );
+    let plan = f
+        .post("/api/v2/playback/plans", &auth, None, input.clone())
+        .await;
+    assert_eq!(plan.body["status"], "ready", "{}", plan.body);
+    let delivery = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("text-subtitle-delivery"),
+            json!({"plan_token":plan.body["plan_token"],"start_ms":0}),
+        )
+        .await;
+    assert_eq!(delivery.status, StatusCode::CREATED, "{}", delivery.body);
+    let url = delivery.body["active"]["subtitles_url"].as_str().unwrap();
+    assert_eq!(
+        f.call("GET", url, None, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let captions = f.get(url, &auth).await;
+    assert_eq!(captions.status, StatusCode::OK, "{}", captions.body);
+    let text = String::from_utf8(captions.bytes).unwrap();
+    assert!(
+        text.starts_with("WEBVTT")
+            && text.contains("Selected caption")
+            && text.contains("00:01.000"),
+        "{text}"
+    );
+    let id = delivery.body["id"].as_str().unwrap();
+    let ticket = f
+        .post(
+            "/api/v2/content-access",
+            &auth,
+            Some("subtitle-content-access"),
+            json!({"purpose":"playback","delivery_id":id,"generation":"1","ttl_seconds":60}),
+        )
+        .await;
+    let token = ticket.body["url"]
+        .as_str()
+        .unwrap()
+        .split("ticket=")
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &format!("{url}?ticket={token}"), None, &[])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // Removing and restoring the selection creates separately pinned generations.
+    for (generation, selected) in [(2, false), (3, true)] {
+        let mut changed = input.clone();
+        if !selected {
+            changed["tracks"]["subtitle_track_id"] = Value::Null;
+            changed["tracks"]["subtitle_policy"] = json!("off");
+        }
+        let plan = f.post("/api/v2/playback/plans", &auth, None, changed).await;
+        assert_eq!(plan.body["status"], "ready", "{}", plan.body);
+        let staged = f
+            .post(
+                &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+                &auth,
+                Some(&format!("subtitle-replan-{generation}")),
+                json!({"kind":"replan", "expected_generation":(generation-1).to_string(),
+                "plan_token":plan.body["plan_token"], "position_ms":1500}),
+            )
+            .await;
+        assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+        assert_eq!(
+            staged.body["pending"]["subtitles_url"].is_string(),
+            selected
+        );
+        let activated = f
+            .post(
+                &format!(
+                    "/api/v2/playback/delivery-sessions/{id}/generations/{generation}/activate"
+                ),
+                &auth,
+                Some(&format!("subtitle-activate-{generation}")),
+                json!({"expected_active_generation":(generation-1).to_string()}),
+            )
+            .await;
+        assert_eq!(activated.status, StatusCode::OK, "{}", activated.body);
+        assert_eq!(
+            activated.body["active"]["subtitles_url"].is_string(),
+            selected
+        );
+        if selected {
+            assert_eq!(
+                f.get(
+                    activated.body["active"]["subtitles_url"].as_str().unwrap(),
+                    &auth
+                )
+                .await
+                .status,
+                StatusCode::OK
+            );
+        }
+    }
+    // The old generation ticket cannot be changed to authorize its successor.
+    assert_eq!(
+        f.call(
+            "GET",
+            &format!("/api/v2/streams/{id}/3/subtitles.vtt?ticket={token}"),
+            None,
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+    input["quality"]["mode"] = json!("convert");
+    input["client"]["transports"] = json!(["hls"]);
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, input.clone())
+            .await
+            .body["reason_codes"][0],
+        "subtitle_conversion_unavailable"
+    );
+    input["quality"]["mode"] = json!("original");
+    input["client"]["transports"] = json!(["http_range"]);
+    input["tracks"]["subtitle_policy"] = json!("off");
+    problem(
+        &f.post("/api/v2/playback/plans", &auth, None, input.clone())
+            .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subtitle_policy_conflict",
+    );
+    input["tracks"]["subtitle_policy"] = json!("require");
+    for codec in ["ass", "hdmv_pgs_subtitle", "dvd_subtitle"] {
+        let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
+            .bind(source["file_id"].as_str().unwrap())
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+        let mut tracks: Value = serde_json::from_str(&tracks).unwrap();
+        for track in tracks.as_array_mut().unwrap() {
+            if track["kind"] == "subtitle" {
+                track["codec"] = json!(codec);
+            }
+        }
+        sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+            .bind(tracks.to_string())
+            .bind(source["file_id"].as_str().unwrap())
+            .execute(&f.server.app.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.post("/api/v2/playback/plans", &auth, None, input.clone())
+                .await
+                .body["reason_codes"][0],
+            "subtitle_format_unsupported"
+        );
+    }
 }

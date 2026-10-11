@@ -1865,12 +1865,17 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
 
 /// A stored representation (original or prepared rendition) served by byte
 /// ranges: no recipe and no encoder. The browser presents the file's default
-/// streams; the pin records that choice.
-fn byte_pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
+/// audio stream; an optional subtitle is extracted separately as WebVTT.
+fn byte_pin(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    subtitle: Option<u32>,
+    operation: Operation,
+) -> Pin {
     Pin {
         source_file: file.id.clone(),
         source_revision: file.revision.clone(),
-        tracks: tracks(audio, None),
+        tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: None,
     }
@@ -2083,6 +2088,22 @@ pub(crate) fn live_view(app: &App, id: &str) -> Option<DeliveryView> {
     Some(view(app, &session, &d))
 }
 
+/// The production reducer owns generation/lease validity for ticket reads too.
+pub(crate) fn serves_generation(app: &App, id: &str, generation: &str) -> bool {
+    let Ok(session) = app.processing.deliveries.session(id) else {
+        return false;
+    };
+    let Ok(generation) = generation_number(generation) else {
+        return false;
+    };
+    session
+        .inner
+        .lock()
+        .unwrap()
+        .delivery
+        .serves(generation, app.processing.deliveries.now_ms())
+}
+
 pub(crate) fn heartbeat_live(
     app: &App,
     id: &str,
@@ -2214,8 +2235,16 @@ pub(crate) async fn change_live(
                 ));
             }
             let pin = match selection.route {
-                Route::Original => byte_pin(&file, selection.audio, Operation::Original),
-                Route::Prepared => byte_pin(&file, selection.audio, Operation::Prepared),
+                Route::Original => {
+                    validate_subtitle(&file, selection.subtitle)?;
+                    byte_pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        Operation::Original,
+                    )
+                }
+                Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
                 Route::Transcode => {
                     validate_route(
                         &file,
@@ -2578,7 +2607,7 @@ async fn admit_owned(
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
         if original {
-            byte_pin(&file, r.audio_track, operation)
+            byte_pin(&file, r.audio_track, r.subtitle_track, operation)
         } else {
             pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
         },

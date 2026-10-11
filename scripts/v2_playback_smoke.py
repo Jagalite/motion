@@ -104,7 +104,7 @@ def main():
             ok('paired_restricted_device_reads_scanned_catalog')
 
             pins = {}
-            def plan(mode, transports, audio=None):
+            def plan(mode, transports, audio=None, override=None, expected="ready"):
                 # Revision-local track pins travel with the exact source pin.
                 body = {'profile_id': 'default', 'timeline_id': timeline, 'version_id': None,
                         'source': pins['source'] if audio else None,
@@ -117,8 +117,9 @@ def main():
                                    'subtitle_modes': ['text'], 'hdr': 'unknown', 'max_height': None,
                                    'software_decode': 'unknown', 'cross_origin_isolated': False},
                         'failed_candidate_ids': []}
+                body.update(override or {})
                 _, _, p = api('POST', '/playback/plans', body, auth, 200)
-                assert p['status'] == 'ready', p
+                assert p['status'] == expected, p
                 return p
 
             def admit(p, start_ms, name):
@@ -183,6 +184,12 @@ def main():
             converted = plan('convert', ['http_range', 'hls'])
             assert (converted['transport'], converted['operation']) == ('http_range', 'prepared'), converted
             assert converted['source']['file_id'] != p['source']['file_id']
+            for selection in ({'audio_track_id': 'a1'}, {'audio_component_id': 'unmapped-component'}):
+                refused = plan('convert', ['http_range', 'hls'], override={
+                    'version_id': converted['version_id'], 'source': converted['source'],
+                    'tracks': dict(converted['tracks'], **selection)}, expected='blocked')
+                assert refused['reason_codes'] == ['prepared_track_selection_unavailable'], refused
+            ok('prepared_track_pins_refuse_silent_substitution')
             prepared = admit(converted, 0, 'admit-prepared')
             status, _, rendition = request(port, 'GET', prepared['active']['media_url'], headers=auth)
             assert status == 200 and rendition[4:8] == b'ftyp', status

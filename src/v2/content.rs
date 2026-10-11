@@ -3,9 +3,8 @@
 //! A ticket is an alternative credential on media routes only. It pins one
 //! file revision and purpose, never outlives the credential that requested
 //! it, and is re-validated against its issuing principal on every request
-//! (`access::admit_file_ticket`). Delivery-generation and download tickets
-//! need the delivery (A07) and download (A13) services; until those exist
-//! those resource families are unknown (404), never a broader grant.
+//! (`access::admit_file_ticket`). Generation tickets additionally require the
+//! current owner and reducer serving state. Download resources remain unavailable.
 use super::{
     Body, Problem, Scope,
     auth::{self, Caller, Purpose},
@@ -110,6 +109,63 @@ fn content_url(file_id: &str, revision: &str, token: &str) -> String {
     format!("{}?{}", url.path(), url.query().unwrap_or_default())
 }
 
+fn ticket_token(app: &App, nonce: &str, delivery: Option<(&str, &str)>) -> String {
+    let secret = auth::derive_secret(&app.access.key, Purpose::Ticket, nonce);
+    match delivery {
+        Some((id, generation)) => format!("{secret}.delivery.{id}.{generation}"),
+        None => secret,
+    }
+}
+
+fn with_ticket(path: &str, token: &str) -> String {
+    format!(
+        "{path}{}ticket={token}",
+        if path.contains('?') { "&" } else { "?" }
+    )
+}
+
+/// The complete opaque token is hashed in SQLite. Altering its scope suffix
+/// invalidates the lookup; a generation token is never a file credential.
+pub(crate) async fn delivery_ticket(
+    app: &App,
+    token: &str,
+    id: &str,
+    generation: &str,
+) -> Result<Principal, Problem> {
+    let suffix = format!(".delivery.{id}.{generation}");
+    if !token.ends_with(&suffix) || !crate::delivery::serves_generation(app, id, generation) {
+        return Err(TicketError::TicketInvalid.into());
+    }
+    let mut conn = app.db.acquire().await?;
+    let row: Option<TicketRow> = sqlx::query_as(
+        "SELECT principal_id,file_id,file_revision,purpose,credential_hash,expires_at,revoked FROM content_tickets WHERE token_hash=?",
+    ).bind(auth::token_hash(token)).fetch_optional(&mut *conn).await?;
+    let (issuer, file, revision, purpose, credential, expires_at, revoked) =
+        row.ok_or(TicketError::TicketInvalid)?;
+    if purpose != "playback" {
+        return Err(TicketError::TicketInvalid.into());
+    }
+    let principal = ticket_principal(&mut conn, &issuer, credential.as_deref()).await;
+    let facts = file_facts(&mut conn, &file).await?;
+    core::admit_file_ticket(
+        &FileTicket {
+            file_id: file.clone(),
+            revision,
+            purpose: TicketPurpose::Playback,
+            expires_at,
+            revoked,
+        },
+        &file,
+        None,
+        &principal,
+        facts.as_ref(),
+        now(),
+    )?;
+    let principal = principal.map_err(Problem::from)?;
+    super::playback::controlled_by(app, &mut conn, &principal, id).await?;
+    Ok(principal)
+}
+
 pub async fn create(
     State(app): State<App>,
     caller: Caller,
@@ -141,29 +197,52 @@ pub async fn create(
         target: "-",
         key: &key,
     };
-    let stored = scope.load(&mut tx).await?;
-    if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, now)? == Idempotent::Replay {
-        let stored = stored.unwrap();
-        let nonce = stored.issued_nonce.clone().unwrap_or_default();
-        let token = auth::derive_secret(&app.access.key, Purpose::Ticket, &nonce);
-        let live: Option<(String, String)> = sqlx::query_as(
-            "SELECT file_id,file_revision FROM content_tickets WHERE token_hash=? AND revoked=0 AND expires_at>?",
+    let delivery = input
+        .delivery_id
+        .as_deref()
+        .zip(input.generation.as_deref());
+    let (file, resource_url) = if let Some((id, generation)) = delivery {
+        if input.purpose != TicketPurpose::Playback {
+            return Err(Problem::invalid(
+                "unsupported_ticket_purpose",
+                "Delivery tickets support playback only; receiver and download grants are unavailable",
+            ));
+        }
+        let owner = super::playback::controlled_by(&app, &mut tx, &principal, id).await?;
+        if !crate::delivery::serves_generation(&app, id, generation) {
+            return Err(TicketError::TicketInvalid.into());
+        }
+        let view = crate::delivery::live_view(&app, id).ok_or(TicketError::TicketInvalid)?;
+        let g = [view.active.as_ref(), view.pending.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|g| g.generation == generation)
+            .ok_or(TicketError::TicketInvalid)?;
+        let endpoint = if g.transport == "hls" {
+            "master.m3u8"
+        } else {
+            "content"
+        };
+        (
+            FileRef {
+                file_id: owner.file,
+                file_revision: owner.file_revision,
+            },
+            Some(format!("/api/v2/streams/{id}/{generation}/{endpoint}")),
         )
-        .bind(auth::token_hash(&token))
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (file_id, revision) = live.ok_or(AccessError::ReplayUnavailable)?;
-        let mut body = stored.body.clone().unwrap_or_default();
-        body["url"] = content_url(&file_id, &revision, &token).into();
-        return Ok((stored.status, Json(body)).into_response());
-    }
-    let Some(file) = input.file else {
-        // Delivery and download tickets need services this server lacks.
-        return Err(Problem::not_found());
+    } else {
+        (input.file.ok_or_else(Problem::not_found)?, None)
     };
+    // Reauthorize exact issuance retries as well as first admissions.
     let facts = file_facts(&mut tx, &file.file_id).await?;
     let parent_expiry = caller.credential.as_ref().map(|(_, c)| c.expires_at);
+    // Ingress without a durable parent credential cannot mint a bearer grant.
+    if caller.credential.is_none() && principal.id != "operator" {
+        return Err(Problem::invalid(
+            "ticket_parent_required",
+            "Use a durable credential to issue content access",
+        ));
+    }
     let expires_at = core::grant_file_ticket(
         &principal,
         input.purpose,
@@ -173,9 +252,30 @@ pub async fn create(
         parent_expiry,
         now,
     )?;
+    let stored = scope.load(&mut tx).await?;
+    if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, now)? == Idempotent::Replay {
+        let stored = stored.unwrap();
+        let nonce = stored.issued_nonce.clone().unwrap_or_default();
+        let token = ticket_token(&app, &nonce, delivery);
+        let live: Option<(String, String)> = sqlx::query_as(
+            "SELECT file_id,file_revision FROM content_tickets WHERE token_hash=? AND revoked=0 AND expires_at>?",
+        )
+        .bind(auth::token_hash(&token))
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (file_id, revision) = live.ok_or(AccessError::ReplayUnavailable)?;
+        let mut body = stored.body.clone().unwrap_or_default();
+        body["url"] = resource_url
+            .as_ref()
+            .map(|path| with_ticket(path, &token))
+            .unwrap_or_else(|| content_url(&file_id, &revision, &token))
+            .into();
+        return Ok((stored.status, Json(body)).into_response());
+    }
     let id = new_id();
     let nonce = auth::nonce();
-    let token = auth::derive_secret(&app.access.key, Purpose::Ticket, &nonce);
+    let token = ticket_token(&app, &nonce, delivery);
     sqlx::query("INSERT INTO content_tickets(id,token_hash,principal_id,credential_hash,file_id,file_revision,purpose,expires_at) VALUES (?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(auth::token_hash(&token))
@@ -202,7 +302,11 @@ pub async fn create(
         )
         .await?;
     tx.commit().await?;
-    ack["url"] = content_url(&file.file_id, &file.file_revision, &token).into();
+    ack["url"] = resource_url
+        .as_ref()
+        .map(|path| with_ticket(path, &token))
+        .unwrap_or_else(|| content_url(&file.file_id, &file.file_revision, &token))
+        .into();
     Ok((StatusCode::CREATED, Json(ack)).into_response())
 }
 
@@ -238,7 +342,7 @@ pub struct MediaParams {
 type TicketRow = (String, String, String, String, Option<String>, i64, bool);
 
 /// The principal a ticket speaks for, re-derived from current state.
-async fn ticket_principal(
+pub(crate) async fn ticket_principal(
     conn: &mut sqlx::SqliteConnection,
     principal_id: &str,
     credential_hash: Option<&str>,
@@ -272,6 +376,9 @@ pub async fn file_content(
     let mut conn = app.db.acquire().await?;
     let facts = file_facts(&mut conn, &file_id).await?;
     if let Some(token) = &params.ticket {
+        if token.contains(".delivery.") {
+            return Err(TicketError::TicketInvalid.into());
+        }
         let row: Option<TicketRow> = sqlx::query_as(
             "SELECT principal_id,file_id,file_revision,purpose,credential_hash,expires_at,revoked FROM content_tickets WHERE token_hash=?",
         )
