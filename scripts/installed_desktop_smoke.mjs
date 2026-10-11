@@ -84,6 +84,7 @@ let origin;
 try {
   const chromeTarget = await wait(async () => (await targets()).find(t => t.url.endsWith('/src/chrome.html')), 'installed chrome');
   const chrome = await attach(chromeTarget);
+  await wait(() => chrome.evaluate('document.readyState === "complete"'), 'installed chrome scripts loaded');
   receipt.userAgent = await chrome.evaluate('navigator.userAgent');
   check('packaged chrome is sandboxed without Node', await chrome.evaluate('typeof process === "undefined" && typeof require === "undefined" && !!window.motionHost'));
   async function click(id, expected) {
@@ -148,7 +149,10 @@ try {
     const progress = await api('GET', `/profiles/default/timelines/${timeline.id}/viewing`);
     writeFileSync(join(out, 'browser-handoff.json'), JSON.stringify({origin, item: item.id, timeline: timeline.id, credential: claimed.access_token, progress}), {mode: 0o600});
     console.log('Waiting for built-in Chromium acceptance at browser-handoff.json');
-    await wait(() => existsSync(join(out, 'browser-done.json')), 'built-in Chromium handoff', 600000);
+    await wait(() => {
+      if (child.exitCode !== null || child.signalCode !== null) throw new Error('Installed application exited before Chromium handoff');
+      return existsSync(join(out, 'browser-done.json'));
+    }, 'built-in Chromium handoff', 600000);
     const browser = JSON.parse(readFileSync(join(out, 'browser-done.json')));
     check('built-in Chromium resumes the installed desktop timeline', browser.result === 'passed' && browser.timeline === timeline.id && browser.resumedFromMs >= progress.position_ms - 1000);
     receipt.chromium = browser;
