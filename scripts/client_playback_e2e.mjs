@@ -505,6 +505,18 @@ export async function prepare(engine, binary, demuxe) {
   return {server, media: media(join(work, 'media'))};
 }
 
+export function deploymentEvidence(directory) {
+  const receiptBytes = readFileSync(join(directory, 'playscale-package.json'));
+  const installed = JSON.parse(receiptBytes);
+  for (const [name, expected] of Object.entries(installed.files)) {
+    if (sha256(readFileSync(join(directory, name))) !== expected) throw new Error(`Installed Demuxe asset changed: ${name}`);
+  }
+  return {version: installed.version, archive_sha256: installed.archive_sha256,
+    deployment: installed.deployment, providers: installed.providers ?? [],
+    composer_sha256: installed.composer_sha256 ?? null, receipt_sha256: sha256(receiptBytes),
+    manifest_sha256: sha256(readFileSync(join(directory, 'demuxe-providers.json')))};
+}
+
 async function main() {
   const args = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, i, all) =>
     value.startsWith('--') ? [...pairs, [value.slice(2), all[i + 1]]] : pairs, []));
@@ -516,7 +528,10 @@ async function main() {
   const demuxe = resolve(process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe'));
   const receipt = {started: new Date().toISOString(), kind: 'production-evidence',
     server: {binary, sha256: sha256(readFileSync(binary))},
-    demuxe: {dir: demuxe, version: JSON.parse(readFileSync(join(demuxe, 'playscale-package.json'), 'utf8')).version}, engines: {}};
+    demuxe: deploymentEvidence(demuxe),
+    source: {commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root, encoding: 'utf8'}).trim(),
+      dirty: execFileSync('git', ['status', '--porcelain'], {cwd: root, encoding: 'utf8'}).trim(),
+      diff_sha256: sha256(execFileSync('git', ['diff', 'HEAD', '--'], {cwd: root}))}, engines: {}};
   for (const engine of engines) {
     let result;
     if (engine === 'electron') {
