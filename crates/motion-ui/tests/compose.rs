@@ -321,7 +321,10 @@ async fn demuxe_is_served_as_its_own_unrenamed_tree() {
         .unwrap()
         .set_times(std::fs::FileTimes::new().set_modified(modified))
         .unwrap();
-    assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        modified
+    );
     let cached = app
         .clone()
         .oneshot(
