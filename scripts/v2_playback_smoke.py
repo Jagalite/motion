@@ -65,13 +65,19 @@ def main():
             process = boot()
             operator = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
 
+            history_epoch = None
             def api(method, path, body=None, auth=None, expected=None, extra=None):
                 headers = dict(auth or {}); headers.update(extra or {})
+                if method in ('POST', 'PUT') and ('/viewing-sessions' in path or path.endswith('/viewing')):
+                    headers['X-Motion-Viewing-Epoch'] = history_epoch
                 status, h, data = request(port, method, '/api/v2' + path, body, headers)
                 parsed = json.loads(data) if data and h.get('content-type', '').startswith(('application/json', 'application/problem+json')) else data
                 if expected is not None:
                     assert status == expected, (method, path, status, parsed)
                 return status, h, parsed
+
+            _, _, identity = api('GET', '/system/capabilities', auth=operator, expected=200)
+            history_epoch = identity['server_id'] + ':' + identity['restore_epoch']
 
             def key(name):
                 return f'{name}-{time.time_ns()}'
@@ -98,7 +104,7 @@ def main():
             ok('paired_restricted_device_reads_scanned_catalog')
 
             pins = {}
-            def plan(mode, transports, audio=None):
+            def plan(mode, transports, audio=None, override=None, expected="ready"):
                 # Revision-local track pins travel with the exact source pin.
                 body = {'profile_id': 'default', 'timeline_id': timeline, 'version_id': None,
                         'source': pins['source'] if audio else None,
@@ -111,8 +117,9 @@ def main():
                                    'subtitle_modes': ['text'], 'hdr': 'unknown', 'max_height': None,
                                    'software_decode': 'unknown', 'cross_origin_isolated': False},
                         'failed_candidate_ids': []}
+                body.update(override or {})
                 _, _, p = api('POST', '/playback/plans', body, auth, 200)
-                assert p['status'] == 'ready', p
+                assert p['status'] == expected, p
                 return p
 
             def admit(p, start_ms, name):
@@ -164,21 +171,25 @@ def main():
             ok('byte_route_seek_change_replay_and_activation')
 
             # ---- a prepared rendition (real processing job) serves Convert by bytes
-            status, _, items = request(port, 'GET', '/api/v1/items', headers=operator)
-            source = json.loads(items)['items'][0]
-            status, _, job = request(port, 'POST', '/api/v1/processing-jobs',
-                                     {'source_file_id': source['file_id'], 'source_revision': source['revision'],
-                                      'recipe': 'remux_mp4', 'backend': 'software', 'idempotency_key': key('job')}, operator)
-            assert status == 201, job
-            job = json.loads(job)
+            _, _, job = api('POST', '/processing/preparations',
+                            {'source': p['source'], 'timeline_id': timeline, 'recipe_id': 'remux_mp4',
+                             'tracks': {'audio_component_id': None, 'subtitle_component_id': None,
+                                        'subtitle_policy': 'off', 'audio_track_id': None, 'subtitle_track_id': None}},
+                            operator, 202, {'Idempotency-Key': key('job')})
             def finished():
-                row = json.loads(request(port, 'GET', f"/api/v1/processing-jobs/{job['id']}", headers=operator)[2])
-                return row if row['phase'] not in ('queued', 'running', 'cancelling') else None
+                _, _, row = api('GET', f"/jobs/{job['id']}", auth=operator, expected=200)
+                return row if row['phase'] not in ('queued', 'admitted', 'running', 'validating', 'publishing', 'cancelling') else None
             row = wait_for(finished, seconds=300)
             assert row['phase'] == 'completed', row
             converted = plan('convert', ['http_range', 'hls'])
             assert (converted['transport'], converted['operation']) == ('http_range', 'prepared'), converted
             assert converted['source']['file_id'] != p['source']['file_id']
+            for selection in ({'audio_track_id': 'a1'}, {'audio_component_id': 'unmapped-component'}):
+                refused = plan('convert', ['http_range', 'hls'], override={
+                    'version_id': converted['version_id'], 'source': converted['source'],
+                    'tracks': dict(converted['tracks'], **selection)}, expected='blocked')
+                assert refused['reason_codes'] == ['prepared_track_selection_unavailable'], refused
+            ok('prepared_track_pins_refuse_silent_substitution')
             prepared = admit(converted, 0, 'admit-prepared')
             status, _, rendition = request(port, 'GET', prepared['active']['media_url'], headers=auth)
             assert status == 200 and rendition[4:8] == b'ftyp', status

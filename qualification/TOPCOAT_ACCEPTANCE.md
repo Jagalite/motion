@@ -1,5 +1,11 @@
 # Topcoat and desktop acceptance matrix
 
+Current consolidation work and outstanding cutover dependencies are tracked in
+[Clients lane consolidation](clients-completion/README.md). The dated
+[production client playback receipts](client-playback/README.md) extend the older
+fixture evidence below; they retain two live-HLS blocks per engine and do not
+qualify the consolidation candidate.
+
 This matrix separates A11/A12 implementation from backend, device and release
 qualification. A passing fixture test never establishes production service parity.
 The current native target is macOS arm64, unpackaged Electron 44.7.0/Chromium
@@ -8,11 +14,11 @@ architectures are not qualified here.
 
 | Requirement | Current evidence | Boundary / remaining gate |
 | --- | --- | --- |
-| Authorized SSR, hidden items, escaping, read-only rendering | `tests/access_api.rs` real SQLite/v2 catalog tests; `motion-ui/tests/compose.rs` | Preferences, viewing, continue/next, scan and playback APIs are not integrated in this snapshot. Their absence is explicit. |
+| Authorized SSR, hidden items, escaping, read-only rendering | `tests/access_api.rs` real SQLite/v2 catalog tests; `motion-ui/tests/compose.rs` | Production receipts cover viewing, continue watching and playback. Public scan workflow, Next composition and full cutover acceptance remain open. |
 | API remains JSON, range media unchanged | Composition/access tests; real owned-server receipt; concurrent HTML + range proof | Production conversion/HLS remains a separate service gate. |
 | Strict CSP, external hashed assets, exact Demuxe tree | Composition tests and `desktop/topcoat-electron-proof-darwin-arm64.json` | Native-only reduced Demuxe bundle; no Wasm/WebCodecs qualification. |
 | Client commands, retries, preconditions and conflicts | Production JS adapter tests; native proof's scan/conflict commands | Mock scan transport; real source/library creation is covered by access API tests. |
-| Playback, seek, replacement, leases, navigation, teardown | Native proof: 26 passing checks; focused JS interleaving tests | Real Demuxe/media with mock viewing/delivery authority. No production conversion/authority parity claim. |
+| Playback, seek, replacement, leases, navigation, teardown | Native proof: 26 passing checks; focused JS interleaving tests | That native proof uses mock authority. Later production receipts cover original/prepared playback and authority; live HLS remains blocked. |
 | Keyboard, labels, accessibility tree, reflow, reduced motion | Nine screens at 320 and 1280 pixels, one main/H1, accessible control names; skip link and player controls | Physical screen reader, switch input and full manual keyboard traversal remain device qualification. |
 | Render load and media coexistence | 24 simultaneous HTML requests plus HTTP 206 read, recorded latency/HTML sizes and playback process snapshot in native proof | Small mock dataset and one machine. Large real catalog, sustained CPU/RSS, playback stalls and production capacity remain performance qualification. |
 | Local server ownership and bootstrap | `desktop/owned-server.json`, real binary, isolated database, one-use inherited-pipe secret, lock/restart tests | Signing, packaging, updates and installed paths are A14 gates. |

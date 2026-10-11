@@ -1,5 +1,5 @@
-# operationIds the /api/v2 router serves today, one per line; checked by tests/contract.rs.
 # Add a line when a route lands and remove it when one is withdrawn. The contract's
+# operationIds the /api/v2 router serves today, one per line; checked by tests/contract.rs.
 # x-status is a planning field and does not record this.
 activateGeneration
 approvePairing
@@ -48,6 +48,8 @@ getCapabilities
 getCatalogItem
 getCollection
 getDelivery
+getDeliveryContent
+getDeliverySubtitles
 getDevice
 getDevicePolicy
 getDiagnostics
@@ -79,6 +81,8 @@ getTimeline
 getViewingSession
 getViewingState
 headAssetBytes
+headDeliveryContent
+headDeliverySubtitles
 headHlsInit
 headHlsMaster
 headHlsSegment

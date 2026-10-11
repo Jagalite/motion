@@ -19,7 +19,7 @@ media(join(work, 'media'));
 const result = {checks: []};
 const check = (name, pass, detail) => { result.checks.push({name, pass, detail}); console.log(`${pass ? 'PASS' : 'FAIL'} ${name} ${JSON.stringify(detail).slice(0, 300)}`); };
 
-const before = new Server({work, port, launch: mainBinary, demuxe});
+const before = new Server({work, port, launch: mainBinary, demuxe, allowLegacy: true});
 await before.start();
 const ctx = await provision(before);
 const operator = before.operator();

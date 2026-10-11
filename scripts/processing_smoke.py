@@ -2,6 +2,8 @@
 import json, pathlib, subprocess, tempfile, hashlib, sys, os, time, sqlite3, http.client
 from smoke import BINARY, free_port, request, wait_for, stop
 from backup import backup, restore
+from v2_smoke_support import Client
+from urllib.parse import urlencode
 
 
 def main():
@@ -39,31 +41,47 @@ def main():
                 raise
         try:
             process=boot();auth={'Authorization':'Bearer '+(state/'admin-token').read_text().strip()}
-            def api(method,path,body=None,expected=200,protected=True):
-                status,_,data=request(port,method,'/api/v1'+path,body,auth if protected else {})
-                assert status==expected,(path,status,data.decode());return json.loads(data)
+            def api(method,path,body=None,expected=200,headers=None):
+                client=Client(port,auth['Authorization'][7:])
+                return client.json(method,'/api/v2'+path,body,expected,headers)
             def scanned():
-                page=api('GET','/items');return page['items'][0] if page['items'] else None
-            source=wait_for(scanned);library=source['library_id']
-            def submit(recipe='h264720p',backend='software',key=None):
-                return api('POST','/processing-jobs',{'source_file_id':source['file_id'],'source_revision':source['revision'],'recipe':recipe,'backend':backend,'idempotency_key':key or str(time.time_ns())},201)
+                page=api('GET','/catalog/items')
+                if not page['items']: return None
+                item=page['items'][0]
+                file=api('GET',f"/catalog/items/{item['id']}/files")['items'][0]
+                timeline=api('GET',f"/catalog/items/{item['id']}/timelines")['items'][0]['id']
+                return {'id':item['id'],'file_id':file['id'],'revision':file['revision'],'timeline':timeline}
+            source=wait_for(scanned);library=api('GET','/libraries')['items'][0]['id']
+            def preparation(recipe):
+                return {'source':{'file_id':source['file_id'],'file_revision':source['revision']},
+                        'timeline_id':source['timeline'],'recipe_id':recipe,
+                        'tracks':{'audio_component_id':None,'subtitle_component_id':None,'subtitle_policy':'off','audio_track_id':None,'subtitle_track_id':None}}
+            def submit(recipe='h264720p',key=None):
+                return api('POST','/processing/preparations',preparation(recipe),202,{'Idempotency-Key':key or str(time.time_ns())})
+            def job_row(job):
+                row=api('GET','/jobs/'+job['id'])
+                return dict(row,output_file_id=next(iter(row['result_ids']),None),attempt=int(row['attempt_generation']))
             def terminal(job):
                 def done():
-                    row=api('GET','/processing-jobs/'+job['id']);return row if row['phase'] not in ['queued','running','cancelling'] else None
+                    row=job_row(job);return row if row['phase'] not in ['queued','admitted','running','validating','publishing','cancelling'] else None
                 return wait_for(done,seconds=35)
-            base={'source_file_id':source['file_id'],'source_revision':source['revision'],'recipe':'remux_mp4','backend':'software','idempotency_key':'same'}
-            api('POST','/processing-jobs',base,401,False)
-            first=api('POST','/processing-jobs',base,201);assert api('POST','/processing-jobs',base)['id']==first['id']
-            api('POST','/processing-jobs',{**base,'recipe':'audio_aac'},409)
+            def renditions():
+                return api('GET','/processing/renditions?limit=200')['items']
+            base=preparation('remux_mp4')
+            assert request(port,'POST','/api/v2/processing/preparations',base,{'Idempotency-Key':'processing-smoke-anonymous'})[0]==401
+            replay_key='processing-smoke-replay'
+            first=submit('remux_mp4',key=replay_key);assert submit('remux_mp4',key=replay_key)['id']==first['id']
+            api('POST','/processing/preparations',preparation('audio_aac'),409,{'Idempotency-Key':replay_key})
             for job in [first,submit('audio_aac'),submit()]:
                 row=terminal(job);assert row['phase']=='completed',row
-                choices=api('GET',f"/items/{source['id']}/playback-options")
-                rendition=next(v for v in choices['renditions'] if v['file_id']==row['output_file_id']);assert rendition['available']
-                data=request(port,'GET',rendition['media_url'])[2];assert data
+                rendition=next(v for v in renditions() if v['job_id']==job['id']);assert rendition['status']=='ready',rendition
+                output_ref=rendition['output'];assert output_ref['file_id']==row['output_file_id']
+                path='/api/v2/media/files/'+output_ref['file_id']+'/content?'+urlencode({'revision':output_ref['file_revision']})
+                status,_,data=request(port,'GET',path,headers=auth);assert status==200 and data
                 output=root/(job['id']+'.mp4');output.write_bytes(data)
                 subprocess.run([ffmpeg,'-v','error','-xerror','-i',str(output),'-f','null','-'],check=True,stdout=subprocess.DEVNULL)
-            assert len(api('GET','/items')['items'])==1
-            assert len(api('GET','/libraries'))==1
+            assert len(api('GET','/catalog/items')['items'])==1
+            assert len(api('GET','/libraries')['items'])==1
             checks.append('three_real_recipes_decode_idempotency_and_original_isolation')
             # Both pipes can flood without a newline. Parsing/storage must stay
             # bounded, and a partial progress line must not prevent cancellation.
@@ -80,7 +98,7 @@ def main():
                 flooded.unlink();gate.touch();job=submit()
                 wait_for(flooded.exists)
                 assert request(port,'GET','/ready')[0]==200
-                api('POST',f"/processing-jobs/{job['id']}/control",{'action':'cancel'})
+                api('POST',f"/jobs/{job['id']}/cancel")
                 row=terminal(job)
                 assert row['phase']=='cancelled' and row['output_file_id'] is None,row
                 checks.append('unterminated_stdout_flood_remains_cancellable')
@@ -126,7 +144,8 @@ def main():
                 job=submit();wait_for(pidfile.exists);encoder_pid=int(pidfile.read_text())
                 row=terminal(job)
                 assert row['phase']=='failed' and row['output_file_id'] is None,row
-                assert row['progress_seconds'] > 0,row
+                with sqlite3.connect(state/'playscale.sqlite3') as db:
+                    assert db.execute('SELECT progress_seconds FROM processing_jobs WHERE id=?',(job['id'],)).fetchone()[0]>0
                 wait_for(lambda: b'processing ExpectedDuration timeout' in server_log.read_bytes()[log_offset:],seconds=5)
                 try: os.kill(encoder_pid,0)
                 except ProcessLookupError: pass
@@ -139,28 +158,25 @@ def main():
                 wrapper.write_text(normal_wrapper);stop(process)
                 settings['processing'].pop('expected_duration')
                 config.write_text(json.dumps(settings));process=boot()
-            hardware={'attempted':sys.platform=='darwin'}
-            if sys.platform=='darwin':
-                row=terminal(submit(backend='videotoolbox'));hardware.update(phase=row['phase'],error=row['error']);
-                if row['phase']=='completed':checks.append('videotoolbox_h264_output_probed_and_decoded_no_software_fallback')
-            caps=api('GET','/processing-capabilities');assert caps['worker_concurrency']==1 and 'h264720p' in caps['recipes'] and caps['validated_jobs']
-            # Durable event replay begins at a known committed event, including after reconnect.
-            with sqlite3.connect(state/'playscale.sqlite3') as db: cursor=db.execute('SELECT max(id) FROM change_events').fetchone()[0]
+            hardware={'attempted':False,'reason':'v2 advertises software recipes only; hardware profile qualification remains a gate'}
+            caps=api('GET','/processing/capabilities');assert caps['background_slots']==1 and caps['ffmpeg_digest'].startswith('sha256:')
+            recipes=api('GET','/processing/recipes')['items'];assert 'h264720p' in [r['id'] for r in recipes]
+            cursor=api('GET','/jobs')['event_cursor']
             gate.touch();job=submit()
-            conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5);conn.request('GET','/api/v1/events',headers={'Last-Event-ID':str(cursor)});response=conn.getresponse();assert response.status==200
+            conn=http.client.HTTPConnection('127.0.0.1',port,timeout=5);conn.request('GET','/api/v2/events',headers=dict(auth,**{'Last-Event-ID':cursor}));response=conn.getresponse();assert response.status==200
             event=[]
             while True:
                 line=response.readline().decode().strip();event.append(line)
-                if not line and any(v.startswith('data:') for v in event):break
-            conn.close();assert any('processing' in v for v in event);checks.append('durable_sse_replay')
-            wait_for(lambda:api('GET','/processing-jobs/'+job['id'])['phase']=='running')
-            api('POST',f"/processing-jobs/{job['id']}/control",{'action':'cancel'})
+                if not line and any(v.startswith('data:') and job['id'] in v for v in event):break
+            conn.close();assert any(job['id'] in v for v in event);checks.append('durable_sse_replay')
+            wait_for(lambda:job_row(job)['phase']=='running')
+            api('POST',f"/jobs/{job['id']}/cancel")
             assert terminal(job)['phase']=='cancelled';gate.unlink()
-            api('POST',f"/processing-jobs/{job['id']}/control",{'action':'retry'})
+            api('POST',f"/jobs/{job['id']}/retry")
             assert terminal(job)['phase']=='completed';checks.append('cancel_reap_retry_new_attempt')
             # SIGTERM leaves the active attempt recoverable, while its child is reaped.
-            gate.touch();job=submit();wait_for(lambda:api('GET','/processing-jobs/'+job['id'])['phase']=='running');time.sleep(.4)
-            old=api('GET','/processing-jobs/'+job['id'])['attempt'];stop(process);gate.unlink();process=boot()
+            gate.touch();job=submit();wait_for(lambda:job_row(job)['phase']=='running');time.sleep(.4)
+            old=job_row(job)['attempt'];stop(process);gate.unlink();process=boot()
             row=terminal(job);assert row['phase']=='completed' and row['attempt']>old;checks.append('restart_recovery_without_partial_publication')
             # Abrupt server death closes the supervisor pipe and reaps the encoder.
             gate.touch();pidfile.unlink(missing_ok=True);job=submit()
@@ -172,12 +188,12 @@ def main():
             wait_for(dead,seconds=5);gate.unlink();process=boot()
             assert terminal(job)['phase']=='completed';checks.append('sigkill_reaps_encoder_and_recovers_attempt')
             # Replacement without a scan must fail the final physical source check.
-            gate.touch();job=submit();wait_for(lambda:api('GET','/processing-jobs/'+job['id'])['phase']=='running');time.sleep(.5)
+            gate.touch();job=submit();wait_for(lambda:job_row(job)['phase']=='running');time.sleep(.5)
             original_bytes=(media/'clip.mp4').read_bytes();(media/'clip.mp4').write_bytes(original_bytes+b'changed');gate.unlink()
             row=terminal(job);assert row['phase']=='failed' and row['output_file_id'] is None;checks.append('source_replacement_rejects_result')
             (media/'clip.mp4').write_bytes(original_bytes)
-            scan=api('POST',f'/libraries/{library}/scans',None,202)
-            wait_for(lambda:api('GET','/jobs/'+scan['id'])['phase']=='completed')
+            scan=api('POST',f'/libraries/{library}/scans',{'mode':'verify','require_complete':True},202)
+            wait_for(lambda:api('GET','/scans/'+scan['id'])['status']=='complete')
             source=scanned()
             # An explicit cache budget rejects work before allocating its source snapshot.
             filler=state/'generated'/'budget-fixture';filler.write_bytes(b'x'*(30*1024*1024));job=submit()
@@ -189,26 +205,30 @@ def main():
             wrapper.write_text('#!'+sys.executable+'\nimport pathlib,sys\npathlib.Path(sys.argv[-1]).write_bytes(b"not media")\n');wrapper.chmod(0o700)
             job=submit();row=terminal(job);assert row['phase']=='failed' and row['output_file_id'] is None
             wrapper.write_text(normal_wrapper);wrapper.chmod(0o700);checks.append('successful_exit_with_corrupt_output_is_rejected')
-            api('PUT',f'/admin/scan-schedules/{library}',{'interval_seconds':60})
+            schedule_input={'library_id':library,'task':'scan','interval_seconds':60,'enabled':True}
+            schedule=api('POST','/schedules',schedule_input,201)
+            # Advance only the disposable scheduler clock input, not business data.
             with sqlite3.connect(state/'playscale.sqlite3') as db:
-                before=db.execute('SELECT count(*) FROM jobs').fetchone()[0];db.execute('UPDATE scan_schedules SET next_run=0')
-            wait_for(lambda:len(api('GET','/admin/scan-schedules'))==1)
+                before=db.execute('SELECT count(*) FROM jobs').fetchone()[0];db.execute('UPDATE api_schedules SET next_run=0 WHERE id=?',(schedule['id'],))
             deadline=time.monotonic()+35
             while time.monotonic()<deadline:
                 with sqlite3.connect(state/'playscale.sqlite3') as db: count=db.execute('SELECT count(*) FROM jobs').fetchone()[0]
                 if count>before:break
                 time.sleep(.2)
-            assert count>before;api('PUT',f'/admin/scan-schedules/{library}',{'interval_seconds':0});checks.append('scheduled_scan_and_disable')
+            assert count>before
+            current=api('GET','/schedules/'+schedule['id'])
+            api('PUT','/schedules/'+schedule['id'],dict(schedule_input,enabled=False),headers={'If-Match':'"r-'+current['revision']+'"'})
+            checks.append('scheduled_scan_and_disable')
             backup(state,root/'snapshot');restore(root/'snapshot',root/'restored');stop(process);process=boot(root/'restored')
             old_auth=auth;auth={'Authorization':'Bearer '+(root/'restored/admin-token').read_text().strip()}
-            choices=api('GET',f"/items/{source['id']}/playback-options");assert all(not r['available'] for r in choices['renditions'])
+            assert all(r['status']!='ready' for r in renditions())
             assert list((state/'generated').glob('*/*/output.mp4'))
             stop(process);process=boot();auth=old_auth;checks.append('db_only_restore_invalidates_foreign_generated_cache')
             with sqlite3.connect(state/'playscale.sqlite3') as db:db.execute("UPDATE processing_jobs SET updated_at=0 WHERE phase='completed'")
-            cache=api('POST','/admin/cache');assert cache['bytes']==0,cache
-            assert all(not r['available'] for r in api('GET',f"/items/{source['id']}/playback-options")['renditions'])
+            wait_for(lambda: all(r['status']!='ready' for r in renditions()),seconds=40)
+            assert not list((state/'generated').glob('*/*/output.mp4'))
             assert hashlib.sha256((media/'clip.mp4').read_bytes()).hexdigest()==original;checks.append('cache_expiration_preserves_original_bytes')
-            spec=api('GET','/openapi.json');assert '/api/v1/events' in spec['paths'] and '/api/v1/processing-jobs' in spec['paths']
+            spec=api('GET','/openapi.json');assert '/api/v2/events' in spec['paths'] and '/api/v2/processing/preparations' in spec['paths']
             print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware},indent=2))
         except BaseException:
             log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr)

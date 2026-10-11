@@ -268,6 +268,10 @@ async fn render(State(app): State<App>, mut request: Request) -> Response {
                         .to_owned()
                 })
                 .collect();
+            let (server_id, restore_epoch) = match crate::v2::system::server_identity(&app).await {
+                Ok(identity) => identity,
+                Err(error) => return error.into_response(),
+            };
             request.extensions_mut().insert(UiPrincipal {
                 principal_id: caller.principal.id,
                 profile_id: profile.id.clone(),
@@ -275,6 +279,7 @@ async fn render(State(app): State<App>, mut request: Request) -> Response {
                 profiles,
                 permissions,
                 server_epoch: app.access.server_epoch.clone(),
+                viewing_epoch: format!("{server_id}:{restore_epoch}"),
                 csrf_token: caller.csrf.unwrap_or_default(),
             });
         }

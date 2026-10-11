@@ -42,6 +42,7 @@ type Feature struct {
 }
 
 type Capabilities struct {
+	RestoreEpoch   string            `json:"restore_epoch"`
 	ServerID       string            `json:"server_id"`
 	ServerEpoch    string            `json:"server_epoch"`
 	ServerVersion  string            `json:"server_version"`

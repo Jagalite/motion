@@ -18,6 +18,7 @@ test('planning subtitle vocabulary and explicit HLS source match the pinned cont
   assert.equal(subtitlePolicy('always'), 'require');
   for (const preference of ['forced', 'foreign_audio', undefined]) assert.equal(subtitlePolicy(preference), 'auto');
   const hls = demuxeSource({transport: 'hls', manifest_url: '/media/manifest'}, 'https://motion.test');
+  assert.equal(hls.streaming.live, true);
   assert.equal(hls.format, 'hls'); assert.equal(hls.url, 'https://motion.test/media/manifest');
   assert.equal(demuxeSource({transport: 'http_range', media_url: '/media/file'}, 'https://motion.test'), 'https://motion.test/media/file');
   assert.throws(() => demuxeSource({transport: 'hls', manifest_url: 'https://other.test/media'}, 'https://motion.test'), /selected server/);
@@ -84,7 +85,7 @@ test('a same-tab handoff is written on leave, consumed once and expires', () => 
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};
-  const lifecycle = runInNewContext(source.replace('export {close, maintainLease};', '({state, start, close});'), {
+  const lifecycle = runInNewContext(source.replace('export {close, maintainLease};', '({state, start, close});').replaceAll('await loadDemuxe(data.demuxeBase)', 'null'), {
     document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null,
       createElement: () => ({canPlayType: () => ''}), addEventListener() {}},
     addEventListener() {}, openCandidates: async () => null, URL, AbortSignal,
@@ -225,7 +226,7 @@ test('skip links retain the current player; document navigation still tears down
   assert.equal(leaves('https://other.test/', current), false);
 });
 
-test('viewing storage migrates tab data and keeps prior runtime history out of current authority', () => {
+test('viewing storage survives ordinary restart and fences restore identity', () => {
   const makeStorage = () => {
     const store = {};
     Object.defineProperties(store, {
@@ -239,7 +240,7 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   const factory = runInNewContext(source.replace('export {close, maintainLease};', 'viewingStorage;'), {
     document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, localStorage, sessionStorage,
   });
-  const data = {serverEpoch: 'e1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
+  const data = {viewingEpoch: 'server:restore1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
   const key = 'motion:viewing:' + JSON.stringify(Object.values(data));
   sessionStorage.setItem(key, '{"event_id":"immutable"}');
   const storage = factory(data);
@@ -248,9 +249,162 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   assert.equal(sessionStorage.getItem(key), null);
   assert.equal(JSON.parse(localStorage.getItem(key)).event_id, 'immutable');
   const restarted = factory({...data, serverEpoch: 'e2'});
-  assert.equal(restarted.load(), null);
-  assert.equal(restarted.hasRejected(), true);
+  assert.equal(restarted.load().event_id, 'immutable');
+  assert.equal(restarted.hasRejected(), false);
+  const restored = factory({...data, viewingEpoch: 'server:restore2'});
+  assert.equal(restored.load(), null);
+  assert.equal(restored.hasRejected(), true);
   assert.equal(factory({...data, principalId: 'p2'}).hasRejected(), false);
   storage.save(null);
   assert.equal(localStorage.getItem(key), null);
+});
+
+test('pacing counters survive renewal restart and failed-change rollback on the same generation', () => {
+  const heartbeat = runInNewContext(source.replace('export {close, maintainLease};', 'pacingHeartbeat;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const generation = {generation: '1', media_time_origin_ms: 10000};
+  const active = time => heartbeat('delivery', generation, {status: 'playing', currentTime: time});
+  assert.equal(active(2).playhead.sequence, '1');
+  // A replacement fails; the same delivery/generation resumes its renewal.
+  const resumed = active(1);
+  assert.equal(resumed.playhead.sequence, '2');
+  assert.equal(resumed.playhead.position_ms, 11000);
+  assert.equal(heartbeat('replacement', generation, {status: 'paused', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(heartbeat('delivery', {...generation, generation: '2'}, {status: 'playing', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(active(3).playhead.sequence, '3');
+  for (const observation of [{status: 'loading', currentTime: 4}, {status: 'paused', currentTime: NaN}]) {
+    assert.equal(heartbeat('delivery', generation, observation).playhead, undefined);
+  }
+});
+
+test('replacement preparation heartbeat never reports the predecessor playhead', async () => {
+  const sent = [];
+  const replacement = {id: 'replacement', active: {generation: '1', media_time_origin_ms: 50000}};
+  const player = runInNewContext(source.replace('export {close, maintainLease};', `
+    status = () => {};
+    retryCommand = async () => replacement;
+    firstGeneration = async value => value;
+    let pendingBeat;
+    maintainLease = (delivery, generation, options) => {
+      pendingBeat = options.send(delivery.id, generation);
+      return () => {};
+    };
+    api = async (method, path, body) => { sent.push(body); return replacement; };
+    preparePlayer = async () => { await pendingBeat; throw new Error('candidate failed'); };
+    observeViewing = () => () => {};
+    retire = async () => {};
+    ({state, switchDelivery});
+  `), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    crypto: {randomUUID: () => 'key'}, sent, replacement,
+  });
+  const old = {controls: true, player: {state: {status: 'paused', currentTime: 10}}, pause: async () => {}};
+  Object.assign(player.state, {deliveryId: 'old', element: old, generation: {generation: '2', media_time_origin_ms: 0}});
+  assert.equal(await player.switchDelivery({plan_token: 'plan'}), false);
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.stringify(sent[0]), JSON.stringify({active_generation: '1'}));
+  assert.equal(player.state.element, old);
+});
+
+test('history requests keep the rendered epoch even if the server changes', async () => {
+  const requests = [];
+  // Keep DOM mounting disabled while exercising the production request adapter.
+  const rewritten = source.replace("const host = document.getElementById('motion-player');", "const host = {dataset: {viewingEpoch: 'server:before-restore'}};")
+    .replace(/if \(host\)/g, 'if (false)')
+    .replace('export {close, maintainLease};', 'api;');
+  const send = runInNewContext(rewritten, {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    fetch: async (path, options) => { requests.push(options); return {ok: true, status: 200, json: async () => ({})}; },
+  });
+  await send('POST', '/api/v2/playback/viewing-sessions/s/events', {sequence: '1'});
+  await send('PUT', '/api/v2/profiles/p/timelines/t/viewing', {manual_watched: true});
+  await send('POST', '/api/v2/playback/delivery-sessions/d/heartbeat', {active_generation: '1'});
+  assert.equal(requests[0].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[1].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[2].headers['X-Motion-Viewing-Epoch'], undefined);
+});
+
+// The loaded provider catalog is an observation, not a server admission decision.
+test('rolling HLS requires a deployed adaptive provider and compatible MSE', () => {
+  const probe = (providers, mse) => {
+    const observed = runInNewContext(source.replace('export {close, maintainLease};', 'observedCapability;'), {
+      document: {getElementById: () => null, querySelector: () => null, addEventListener() {},
+        createElement: () => ({canPlayType: () => 'probably'})}, addEventListener() {},
+      MediaSource: {isTypeSupported: () => mse},
+    });
+    return [...observed(providers && {providers: {snapshot: {providers}}}).transports];
+  };
+  assert.deepEqual(probe(null, true), ['http_range']);
+  assert.deepEqual(probe([{id: 'browser-original'}], true), ['http_range']);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), ['http_range']);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), ['http_range', 'hls']);
+});
+
+test('selected subtitles attach after open and unsupported players dispose the candidate', async () => {
+  const calls = [];
+  let supported = true;
+  const element = {player: {addTextTrack: async track => calls.push(['text', track])},
+    setAttribute() {}, open: async () => calls.push(['open']),
+    destroy: async () => calls.push(['destroy']), remove: () => calls.push(['remove'])};
+  const host = {dataset: {demuxeBase: '/demuxe'}, append() {}};
+  const prepare = runInNewContext(source.replace('if (host) void start();', '').replace('export {close, maintainLease};',
+    'loadDemuxe = async () => null; preparePlayer;'), {
+    document: {getElementById: id => id === "motion-player" ? host : null, querySelector: () => null, addEventListener() {},
+      createElement: () => { element.player = supported ? {addTextTrack: async track => calls.push(["text", track])} : {}; return element; }},
+    addEventListener() {}, URL, location: {origin: 'https://motion.test'},
+    setTimeout: () => 0,
+  });
+  const generation = {transport: 'http_range', media_url: '/api/v2/media/files/f/content',
+    media_time_origin_ms: 0, subtitles_url: '/api/v2/streams/d/1/subtitles.vtt'};
+  await prepare(generation, 0, () => true);
+  assert.deepEqual(calls.map(x => x[0]), ['open', 'text']);
+  assert.equal(calls[1][1].src, 'https://motion.test/api/v2/streams/d/1/subtitles.vtt');
+  assert.equal(calls[1][1].default, true);
+  supported = false; calls.length = 0;
+  await assert.rejects(prepare(generation, 0, () => true), /cannot present the selected subtitle/);
+  assert.deepEqual(calls.map(x => x[0]), ['open', 'destroy', 'remove']);
+});
+
+test('provider observations do not require component runtime injection', () => {
+  const {lendRuntime} = runInNewContext(source.replace('export {close, maintainLease};', '({lendRuntime});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const catalog = {providers: {}};
+  const standalone = {};
+  lendRuntime(standalone, catalog);
+  assert.equal(Object.hasOwn(standalone, 'runtime'), false, 'do not invent a runtime property that the component ignores');
+  let borrowed;
+  const shared = {set runtime(value) { borrowed = value; }};
+  lendRuntime(shared, catalog);
+  assert.equal(borrowed, catalog, 'retain shared ownership when the component exposes it');
+});
+
+test('live generation opens without VOD startTime and verifies the public seek', async () => {
+  const openGeneration = runInNewContext(source.replace('export {close, maintainLease};', 'openGeneration;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  const calls = [];
+  const element = {player: {state: {currentTime: 0}},
+    async open(...args) { calls.push(args); },
+    async seek(time) { calls.push(['seek', time]); this.player.state.currentTime = time; }};
+  const generation = {transport: 'hls', manifest_url: '/live.m3u8', media_time_origin_ms: 40000};
+  await openGeneration(element, generation, 42500, 'http://localhost');
+  assert.equal(calls[0].length, 1);
+  assert.deepEqual(calls[1], ['seek', 2.5]);
+  element.player.state.seekable = [{start: 2.6, end: 40}];
+  await openGeneration(element, generation, 42500, 'http://localhost');
+  assert.equal(element.player.state.currentTime, 2.85);
+  element.player.state.streaming = {live: {seekable: {start: 2.9, end: 40}}};
+  await openGeneration(element, generation, 42500, 'http://localhost');
+  assert.equal(element.player.state.currentTime, 3.15);
+  element.player.state.streaming = undefined;
+  element.player.state.seekable = [{start: 4, end: 40}];
+  await assert.rejects(openGeneration(element, generation, 42500, 'http://localhost'), /outside the live window/);
+  element.player.state.seekable = [{start: 0, end: 40}];
+  element.seek = async () => { element.player.state.currentTime = 20; };
+  await assert.rejects(openGeneration(element, generation, 42500, 'http://localhost'), /requested generation position/);
+  calls.length = 0;
+  await openGeneration(element, {transport: 'http_range', media_url: '/file.mp4', media_time_origin_ms: 0}, 42500, 'http://localhost');
+  assert.equal(calls[0][1].startTime, 42.5);
 });

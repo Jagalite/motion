@@ -5,6 +5,9 @@ timeline viewing, preferences, continue-watching and next-in-order over the
 production router. It builds on the v2 playback adapter first written on
 `integration-web-desktop` (commits `6322595`, `a7c6f7e`, `7d0dc59`).
 
+Current consolidation decisions and exact validation are tracked in
+[the playback/viewing lane receipt](qualification/playback-viewing/README.md).
+
 ## Operations
 
 | Operation | Route |
@@ -17,6 +20,7 @@ production router. It builds on the v2 playback adapter first written on
 | `getViewingState`, `setWatchedState` | `GET`/`PUT /profiles/{p}/timelines/{t}/viewing` |
 | `getPreferences`, `replacePreferences` | `GET`/`PUT /profiles/{p}/preferences` |
 | `listContinueWatching`, `getNextTimeline` | `GET /profiles/{p}/continue-watching`, `GET /profiles/{p}/timelines/{t}/next` |
+| `getDeliveryContent`, `headDeliveryContent`, `getDeliverySubtitles`, `headDeliverySubtitles` | `GET`/`HEAD /streams/{d}/{g}/{content,subtitles.vtt}` |
 | `getHls*` | `GET /streams/{d}/{g}/master.m3u8`, `…/variants/main/{index.m3u8,init.mp4}`, `…/segments/{s}` |
 
 ## Correctness boundary
@@ -24,7 +28,7 @@ production router. It builds on the v2 playback adapter first written on
 Decisions in `crates/core`:
 
 - `playback_session`: route choice (original, prepared rendition, live
-  conversion), client quality limits for conversions (`conversion_fits`), plan
+  conversion), client quality limits (`conversion_fits`, including refusal of unknown facts under an explicit bound), plan
   token admission against current permission, profile grant, catalog scope,
   version binding and source revision, delivery control and replan
   compatibility, and who may record viewing progress.
@@ -60,11 +64,15 @@ Adapters supply the facts and commit the decided records:
 - Planning uses only whole, single-part version bindings whose reviewed file
   revision is still current; timeline reads check the work and the edition,
   like catalog timeline reads.
-- Accepted viewing events report the logical playhead to the bound delivery,
-  which paces its encoder, only while the caller may control that delivery,
-  and before the event commits so reports follow commit order. Pacing is an
-  advisory bound, not an acknowledged fact: if that commit then fails, the
-  encoder may run ahead within its normal pacing window.
+- Playback-authorized heartbeats carry optional ordered playhead observations,
+  independent of viewing events and permission. Core fences generation, sequence,
+  duration and lease expiry; duplicate/stale reports do not renew leases.
+- The delivery worker revalidates current owner grants/catalog facts each tick.
+  Revocation or narrowed scope closes owned work; worker termination is confirmed
+  before capacity is released.
+- Browser viewing outboxes and ownership proofs are scoped to server identity and
+  restore epoch. They survive ordinary process restart; restored state requires
+  reconciliation. Capabilities expose restore epoch separately from runtime epoch.
 - Admission refusals keep their v2 problem code (for example `plan_expired`)
   instead of being re-mapped through the v1 error type.
 
@@ -101,30 +109,40 @@ routes is qualified separately (A11/A12).
 
 ## Remaining gaps
 
-- Subtitles: plans that select or require a subtitle are blocked with
-  `subtitle_delivery_unavailable`; the v1 WebVTT sidecar has no v2 route yet.
-- Media tickets: stream and media routes accept bearer, cookie or ingress
-  credentials. Delivery-generation content-access tickets (for players that
-  cannot attach headers) are not implemented.
-- Component selection (`audio_component_id`, `subtitle_component_id`) is
-  blocked with `component_selection_unavailable`; track IDs (`a{n}`) are
-  revision-local stream indexes.
+- Selected embedded plain-text subtitles (`subrip`, `srt`, `webvtt`, `mov_text`,
+  `text`) are extracted from the revision-bound original as WebVTT. Original
+  generations expose `subtitles_url`; the bridge attaches it after opening the
+  player, or fails explicitly if its text-track API is unavailable. Styled
+  ASS/SSA, bitmap subtitles, sidecars and conversion subtitle delivery are
+  explicitly refused. `require` chooses the first embedded subtitle when no
+  exact selection is supplied; `auto` without an explicit selection is refused when embedded captions exist;
+  automatic forced/foreign-audio language policy is not qualified.
+- Content access can issue a file-revision ticket or a delivery-generation
+  playback ticket. Generation tickets authorize only that generation's bytes,
+  HLS manifests/children and selected subtitle. They do not authorize commands,
+  heartbeat renewal, another generation, or the file endpoint. Every read
+  rechecks issuer credentials, grants, source revision, ownership and the
+  reducer's lease/generation serving state. Restart invalidates delivery tickets.
+  Cast receiver grants and download-resource tickets remain unavailable.
+- Embedded component IDs resolve only against the selected version, file and
+  revision. Missing/sidecar/other-file occurrences never substitute. Track IDs
+  (`a{n}`, `s{n}`) remain revision-local. Explicit prepared-rendition track and
+  component pins are refused until rendition component mapping is available.
 - Live conversion uses the software recipe only; hardware encoding and copy
-  routes are not offered by the v2 planner. A conversion is refused when the
-  client sets any bitrate limit, because the CRF recipe has no bitrate cap.
+  routes are not offered by the v2 planner. Any route is refused when the
+  client sets a bitrate limit: the CRF recipe has no cap and stored-file average
+  bitrate does not establish a VBR peak bound.
 - Multipart versions and interval (multi-episode) bindings are not planned:
   they are reported as unavailable until a part-aware delivery exists.
-- Encoder pacing follows viewing events. A principal that plays a live
-  conversion without `viewing:write` sends no playhead, so its encoder pauses
-  45 s ahead of the requested start. The v2 heartbeat carries no position.
 - HDR sources are refused for byte delivery under `require_sdr` or to a
-  client reporting `hdr: unsupported`; no tone-mapped route exists.
+  client reporting `hdr: unsupported` or `unknown`; no tone-mapped route exists.
+  Reported support permits an attempt, not a display-fidelity qualification.
 - Revision-local track pins (`a{n}`) require an exact `source` pin.
-- Next-in-order uses `timelines.order_group_id`/`order_position` only. Main has
-  no placement writer until PR #4 merges, so tests place timelines by SQL.
+- Next-in-order uses `timelines.order_group_id`/`order_position`. Composed public
+  placement-writer/client Next qualification belongs to data/catalog and clients.
 - v1 item-keyed progress and v2 timeline progress are separate authorities
   after migration 0032's one-time backfill (exact attributions and
   single-timeline works only). The v1 web UI does not see v2 progress.
-- The `interrupted` viewing-session status is not produced; sessions survive
-  restarts and are rebound to a new delivery.
+- Viewing sessions deliberately survive ordinary restarts and may rebind to a
+  new delivery. Delivery interruption is separate from history authority.
 - Native qualification is macOS arm64 only.
