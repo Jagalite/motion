@@ -421,9 +421,9 @@ Exact scoped receipts are in [the Clients ledger](qualification/clients-completi
 The earlier `38db68c` Electron workflow passed 30 assertions. The newer combined
 `ad67fa0` binary passes original/audio/prepared switching, resume and restart but
 fails conversion-only live startup. Collaborative-browser live-window and delayed
-Play behavior also remain failed. Seven reliability checks and 76 JavaScript
-checks pass within their recorded scopes. Managed generated-store visibility is
-being corrected with focused adapter regression coverage.
+Play behavior also remain failed. Seven reliability checks, 20 real processing checks, 11 library regressions and
+79 JavaScript/setup checks pass within their recorded scopes. Managed generated-store
+visibility is corrected with focused adapter regression coverage.
 
 Clients is **in progress**, not complete. Positive Next needs public release-order
 provisioning; dynamic profiles need a v2 contract; provider/pacing compatibility,

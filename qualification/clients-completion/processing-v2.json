@@ -1,0 +1,35 @@
+{
+  "passed": 20,
+  "checks": [
+    "three_real_recipes_decode_and_idempotency",
+    "original_generated_library_isolation",
+    "stdout_stderr_flood_recovers_into_real_encode",
+    "unterminated_stdout_flood_remains_cancellable",
+    "startup_deadline_reaps_noisy_encoder_without_publication",
+    "noprogress_deadline_reaps_noisy_encoder_without_publication",
+    "liveness_timeout_releases_capacity_after_reaping",
+    "expected_duration_deadline_reaps_advancing_encoder_without_publication",
+    "expected_duration_timeout_releases_capacity_after_reaping",
+    "durable_sse_replay",
+    "cancel_reap_retry_new_attempt",
+    "restart_recovery_without_partial_publication",
+    "sigkill_reaps_encoder_and_recovers_attempt",
+    "source_replacement_rejects_result",
+    "cache_budget_rejects_work_before_snapshot",
+    "encoder_failure_is_terminal_without_rendition",
+    "successful_exit_with_corrupt_output_is_rejected",
+    "scheduled_scan_and_disable",
+    "db_only_restore_invalidates_foreign_generated_cache",
+    "cache_expiration_preserves_original_bytes"
+  ],
+  "hardware": {
+    "attempted": false,
+    "reason": "v2 advertises software recipes only; hardware profile qualification remains a gate"
+  },
+  "failures": [],
+  "binary_source": "0198a89",
+  "binary_sha256": "cf5d50ddf3e717b51a8c8688470ebaad88131a4d52d17c57ca144552ef762296",
+  "harness_source": "2d5a684",
+  "log_sha256": "3fd3db06a0efac5b6e73fc5c3f1fde23ca13b3744a012f1863a2245f200e0c8e",
+  "scope": "Real FFmpeg processing, failure injection, schedules, expiry and restore; excludes hardware profiles and browser playback"
+}

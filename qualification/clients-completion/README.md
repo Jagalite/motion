@@ -309,3 +309,40 @@ The margin update's build is tracked by `fbe3fcdcdd6248788224cb67d6ef2551`.
 All 76 JavaScript checks, Rust formatting, OpenAPI structure (99 paths/150
 operations/148 schemas) and JSON parity pass at this source checkpoint. Sol
 reviewed the margin fix, composition and receipt boundaries without findings.
+
+### Managed storage correction and final composition
+
+`0198a89` registers internal processing storage as managed in the same transaction
+that creates its physical-root identity; it does not create a logical library or
+scan-source binding. Reuse cannot change user/managed ownership. Public list/get
+also hide historical automatic logical rows with that exact managed-root ID,
+without deleting them or filtering legitimate empty user libraries. These are
+adapter storage/projection rules over the existing explicit managed fact; no
+parallel client authority or new global core state is introduced.
+
+All 11 library integration tests pass after Kyoto compile
+`0dbd0a34b6954e6aaa9802a868b77e9f` at `2d5a684`, including atomic registration,
+legacy-row visibility, empty-user-library preservation and ownership refusal.
+[Processing acceptance](processing-v2.json) passes all 20 checks against frozen
+`0198a89`, binary SHA-256
+`cf5d50ddf3e717b51a8c8688470ebaad88131a4d52d17c57ca144552ef762296`.
+The earlier failed runs remain retained; this receipt closes their generated
+library isolation and physical cache-expiry assertions, not hardware profiles.
+
+Composition through `183b4a5` additionally imports playback's subtitle-directory
+ownership fix, restricted-pairing startup fence, admission-bound resume assertions
+and terminal cancellation repair. GPT-6.1 Sol reviewed the final diff without
+remaining actionable findings. All 79 JavaScript/setup checks and all 20 Go API
+tests pass; Go compilation used Kyoto `59ab2a12ae834309a27ecdeeba8a2ffb`.
+Targeted playback compilation is tracked as `a4ec6126137446b498c632ca00b33e7c`.
+Formatting, contract/JSON parity and publication privacy checks pass.
+
+[Latest Electron evidence](electron-combined-margin.json) remains **failed**:
+server `ad67fa0`, SHA-256
+`8d8ece2350f0f0e7ac91b9fe6c2a641b24186ebed33024aaf34f8f40801a99ba`,
+passes original/audio/prepared switching, resume and restart but rejects the
+conversion-only title outside the live seek window. The same latest-margin server
+also rejected conversion startup in the collaborative browser. The bounded margin
+repair does not solve the broader provider/pacing issue. This supersedes any
+inference that the older passing Electron scenario qualifies the current product.
+No Topcoat default, legacy retirement or qualified provider release claim follows.
