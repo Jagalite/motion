@@ -15,6 +15,7 @@ use axum::{
 };
 use playscale_core::{
     delivery::{self as core, Delivery, Effect, Input, Operation, Pin},
+    playback_session::{Owner, Route},
     work::Class,
 };
 use serde::{Deserialize, Serialize};
@@ -29,8 +30,12 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
-/// Concurrent delivery sessions. Each may briefly run two encoders while overlapping.
+/// Concurrent encoding delivery sessions. Each may briefly run two encoders
+/// while overlapping.
 pub const MAX_SESSIONS: usize = 4;
+/// Concurrent byte-route (original) deliveries. They run no encoder; the bound
+/// only limits the memory and lease bookkeeping this process holds.
+pub const MAX_BYTE_SESSIONS: usize = 64;
 /// Bound owned admission tasks, including requests whose HTTP waiters vanished.
 pub const MAX_ADMISSIONS: usize = 32;
 /// Requested segment length; keyframes are forced on this cadence.
@@ -51,6 +56,8 @@ pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
+/// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
+pub const LIVE_MAX_HEIGHT: u32 = 720;
 /// Copied segments end at source keyframes; GOPs up to this long are served.
 pub const COPY_TARGET_SECONDS: u64 = 12;
 
@@ -109,6 +116,16 @@ struct Inner {
     delivery: Delivery,
     /// Cancellation for each generation worker that may still be running.
     workers: HashMap<u64, WorkerControl>,
+    /// Acknowledged v2 changes: request identity and acknowledged view,
+    /// recorded under this lock with the transition they acknowledge. They are
+    /// exactly as durable as the staged generation (a restart interrupts the
+    /// delivery and both). Every accepted change stages a generation, so the
+    /// reducer's generation limit bounds them; none is evicted while the
+    /// delivery is live.
+    changes: Vec<(
+        playscale_core::delivery_admission::Identity,
+        serde_json::Value,
+    )>,
 }
 
 /// Control of one generation worker: cancellation and pacing (true = paused).
@@ -121,6 +138,9 @@ struct Session {
     id: String,
     file_id: String,
     revision: String,
+    /// The v2 principal and context this delivery was admitted for; None for
+    /// v1 (operator) deliveries, which v2 callers can never observe.
+    owner: Option<Owner>,
     source: Source,
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
@@ -158,6 +178,24 @@ impl Runtime {
     pub fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
     }
+    /// Live (encoding, byte-route) deliveries. A delivery whose generations
+    /// include a segmented one counts as encoding.
+    fn counts(&self) -> (usize, usize) {
+        let sessions = self.sessions.lock().unwrap();
+        let encoding = sessions
+            .values()
+            .filter(|s| {
+                s.inner
+                    .lock()
+                    .unwrap()
+                    .delivery
+                    .generations
+                    .values()
+                    .any(|g| g.pin.operation.segmented())
+            })
+            .count();
+        (encoding, sessions.len() - encoding)
+    }
 }
 
 impl Session {
@@ -188,13 +226,23 @@ fn apply_if(
     if !current(&inner.delivery) {
         return Err(core::Error::GenerationConflict);
     }
-    let (next, effects) = core::transition(&inner.delivery, &input)?;
+    transition_locked(app, session, &mut inner, &input)
+}
+
+/// One reducer step with the session lock held by the caller.
+fn transition_locked(
+    app: &App,
+    session: &Arc<Session>,
+    inner: &mut Inner,
+    input: &Input,
+) -> Result<Delivery, core::Error> {
+    let (next, effects) = core::transition(&inner.delivery, input)?;
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
         persist(app, session, &next);
     }
     inner.delivery = next.clone();
-    dispatch(app, session, &mut inner, effects);
+    dispatch(app, session, inner, effects);
     Ok(next)
 }
 
@@ -1628,14 +1676,18 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
             .map(|(n, g)| GenerationView {
                 generation: n.to_string(),
                 status: name(g.status),
-                manifest_url: d
-                    .serves(n, app.processing.deliveries.now_ms())
-                    .then(|| format!("/api/v1/streams/{id}/{n}/index.m3u8")),
+                manifest_url: (g.pin.operation.segmented()
+                    && d.serves(n, app.processing.deliveries.now_ms()))
+                .then(|| format!("/api/v1/streams/{id}/{n}/index.m3u8")),
                 media_time_origin_ms: g.media_time_origin_ms,
                 requested_start_ms: g.requested_start_ms,
                 available_start_ms: g.available_start_ms,
                 available_end_ms: g.available_end_ms,
-                transport: "hls".into(),
+                transport: if g.pin.operation.segmented() {
+                    "hls".into()
+                } else {
+                    "http_range".into()
+                },
                 operation: name(g.pin.operation),
                 complete: g.complete,
                 paused: g.paused,
@@ -1783,6 +1835,29 @@ fn pin(
     }
 }
 
+/// Whether a live software transcode of `file` with this audio stream is
+/// admissible here (the core live-route rule, a probed duration, Unix).
+pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool {
+    cfg!(unix)
+        && file
+            .duration_seconds
+            .is_some_and(|d| d.is_finite() && d > 0.0)
+        && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
+}
+
+/// A stored representation (original or prepared rendition) served by byte
+/// ranges: no recipe and no encoder. The browser presents the file's default
+/// streams; the pin records that choice.
+fn byte_pin(file: &db::ItemRow, audio: Option<u32>, operation: Operation) -> Pin {
+    Pin {
+        source_file: file.id.clone(),
+        source_revision: file.revision.clone(),
+        tracks: tracks(audio, None),
+        operation,
+        recipe_digest: None,
+    }
+}
+
 /// Whether a backend can run `operation` here. Hardware encoding is a transcode
 /// choice and only exists on macOS.
 fn validate_backend(
@@ -1913,6 +1988,12 @@ pub trait AdmissionAuthority: Send + Sync + 'static {
         db: &'a mut sqlx::SqliteConnection,
         request: &'a CreateRequest,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ApiError>> + Send + 'a>>;
+    /// Conditions only a new admission must meet (for example an unexpired
+    /// plan). Checked after the receipt lookup, so an exact retry of an
+    /// acknowledged admission replays after reauthorization alone.
+    fn fresh(&self) -> Result<(), ApiError> {
+        Ok(())
+    }
 }
 struct LegacyAdmin;
 impl AdmissionAuthority for LegacyAdmin {
@@ -1926,6 +2007,355 @@ impl AdmissionAuthority for LegacyAdmin {
         // was checked before entering admission. V2 implements current DB policy.
         Box::pin(async { Ok("legacy-admin".into()) })
     }
+}
+
+/// A v2 admission: the plan's owner and route. The authority adapter rechecks
+/// the plan (`playback_session::admit`) inside the admission transaction.
+pub(crate) struct Planned {
+    pub owner: Owner,
+    pub version: String,
+    pub route: Route,
+}
+
+/// Admit a planned (v2) delivery. Original routes need no encoder; transcodes
+/// use the same live admission as v1. Receipts are scoped to the principal.
+pub(crate) async fn admit_planned(
+    app: App,
+    authority: Arc<dyn AdmissionAuthority>,
+    key: String,
+    r: CreateRequest,
+    planned: Planned,
+) -> Result<DeliveryView, ApiError> {
+    let slot = app
+        .processing
+        .deliveries
+        .admission_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admission_busy",
+                "Too many pending delivery admissions",
+            )
+        })?;
+    tokio::spawn(async move {
+        let _slot = slot;
+        admit_owned(&app, authority, Some(key), r, Some(planned))
+            .await
+            .map(|(_, Json(view))| view)
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+/// The v2 owner of a delivery this process holds live.
+pub(crate) fn live_owner(app: &App, id: &str) -> Option<Owner> {
+    app.processing
+        .deliveries
+        .session(id)
+        .ok()
+        .and_then(|s| s.owner.clone())
+}
+
+/// Current view of a live delivery.
+pub(crate) fn live_view(app: &App, id: &str) -> Option<DeliveryView> {
+    let session = app.processing.deliveries.session(id).ok()?;
+    let d = session.inner.lock().unwrap().delivery.clone();
+    Some(view(app, &session, &d))
+}
+
+pub(crate) fn heartbeat_live(
+    app: &App,
+    id: &str,
+    active_generation: &str,
+    position_ms: Option<u64>,
+) -> Result<DeliveryView, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let d = apply(
+        app,
+        &session,
+        Input::Heartbeat {
+            active_generation: generation_number(active_generation)?,
+            position_ms,
+            now_ms: app.processing.deliveries.now_ms(),
+        },
+    )
+    .map_err(error)?;
+    Ok(view(app, &session, &d))
+}
+
+/// Activate a generation; its acknowledgement is recorded under the delivery
+/// lock with the transition, like a change receipt, so an exact retry replays
+/// it and the same key with another request conflicts.
+pub(crate) fn activate_live(
+    app: &App,
+    id: &str,
+    generation: &str,
+    expected_active: Option<&str>,
+    receipt: &ChangeReceipt,
+) -> Result<(DeliveryView, bool), ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let input = Input::Activate {
+        generation: generation_number(generation)?,
+        expected_active: expected_active.map(generation_number).transpose()?,
+        now_ms: app.processing.deliveries.now_ms(),
+    };
+    let mut inner = session.inner.lock().unwrap();
+    if let Some(view) = replayed_change(&inner, receipt)? {
+        return Ok((view, true));
+    }
+    let before = inner.delivery.clone();
+    let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
+    let acknowledged = view(app, &session, &d);
+    // Only an activation that changed the delivery is receipted, so receipts
+    // stay bounded by the generations a delivery may create; re-activating
+    // the active generation is an acknowledged no-op either way.
+    if d != before {
+        inner.changes.push((
+            receipt.identity(),
+            serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
+        ));
+    }
+    Ok((acknowledged, false))
+}
+
+/// Report the client's logical playhead for the active generation, which
+/// bounds how far its encoder may run ahead (pacing). Observation only: a
+/// stale generation or a fenced delivery is ignored.
+pub(crate) fn report_playhead(app: &App, id: &str, generation: u64, position_ms: u64) {
+    let Ok(session) = app.processing.deliveries.session(id) else {
+        return;
+    };
+    let _ = apply(
+        app,
+        &session,
+        Input::Heartbeat {
+            active_generation: generation,
+            position_ms: Some(position_ms),
+            now_ms: app.processing.deliveries.now_ms(),
+        },
+    );
+}
+
+/// Close a live delivery and record the fenced state through `conn` (the
+/// caller's write transaction, which holds the writer lock).
+pub(crate) async fn close_live(
+    app: &App,
+    id: &str,
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let state = apply(app, &session, Input::Close).map_err(error)?;
+    record(
+        conn,
+        &session.id,
+        &session.file_id,
+        &session.revision,
+        &state,
+    )
+    .await
+    .map_err(ApiError::internal)
+}
+
+/// Exact streams for a planned replan. The source file stays the delivery's.
+pub(crate) struct Selection {
+    pub route: Route,
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
+}
+
+/// Stage a seek (`selection` None keeps the newest pin) or a planned replan.
+/// The replacement pin is validated against the current catalog row and the
+/// core live-route rule before the reducer stages it.
+pub(crate) async fn change_live(
+    app: &App,
+    id: &str,
+    expected_generation: &str,
+    position_ms: u64,
+    selection: Option<Selection>,
+    receipt: &ChangeReceipt,
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(DeliveryView, bool), ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    if let Some(view) = replayed_change(&session.inner.lock().unwrap(), receipt)? {
+        return Ok((view, true));
+    }
+    let expected_generation = generation_number(expected_generation)?;
+    let (basis, replan) = match selection {
+        None => (None, None),
+        Some(selection) => {
+            let basis = {
+                let inner = session.inner.lock().unwrap();
+                let d = &inner.delivery;
+                d.pending
+                    .or(d.active)
+                    .and_then(|n| d.generations.get(&n))
+                    .map(|g| (g.pin.clone(), d.timeline.clone()))
+            };
+            let (basis, timeline) = basis.ok_or_else(|| error(core::Error::GenerationConflict))?;
+            let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+                .bind(&session.file_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .ok_or_else(ApiError::not_found)?;
+            if file.revision != session.revision {
+                return Err(ApiError::conflict(
+                    "source_revision_changed",
+                    "Create a new delivery",
+                ));
+            }
+            let pin = match selection.route {
+                Route::Original => byte_pin(&file, selection.audio, Operation::Original),
+                Route::Prepared => byte_pin(&file, selection.audio, Operation::Prepared),
+                Route::Transcode => {
+                    validate_route(
+                        &file,
+                        selection.audio,
+                        Operation::VideoTranscode,
+                        app.processing.settings.experimental_copy_routes,
+                        None,
+                    )?;
+                    validate_subtitle(&file, selection.subtitle)?;
+                    pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        Operation::VideoTranscode,
+                        false,
+                    )
+                }
+            };
+            (Some(basis), Some((timeline, pin)))
+        }
+    };
+    let input = Input::Change {
+        expected_generation,
+        position_ms,
+        replan,
+        // A byte route has no worker; a software transcode overlaps when
+        // another interactive worker is admissible now.
+        overlap: app.processing.execution.fits_now(Class::Interactive, 1),
+        now_ms: app.processing.deliveries.now_ms(),
+    };
+    // The receipt is checked again and recorded under the same lock as the
+    // transition: a retry either replays this acknowledgement or, if the first
+    // attempt never reached the reducer, applies the change once.
+    let mut inner = session.inner.lock().unwrap();
+    if let Some(view) = replayed_change(&inner, receipt)? {
+        return Ok((view, true));
+    }
+    let d = &inner.delivery;
+    let current = basis.as_ref().is_none_or(|basis| {
+        d.pending
+            .or(d.active)
+            .and_then(|n| d.generations.get(&n))
+            .is_some_and(|g| &g.pin == basis)
+    });
+    if !current {
+        return Err(error(core::Error::GenerationConflict));
+    }
+    let d = transition_locked(app, &session, &mut inner, &input).map_err(error)?;
+    let acknowledged = view(app, &session, &d);
+    inner.changes.push((
+        receipt.identity(),
+        serde_json::to_value(&acknowledged).map_err(ApiError::internal)?,
+    ));
+    Ok((acknowledged, false))
+}
+
+/// Identity of a v2 delivery command: principal, operation and target
+/// (`scope`, e.g. "change" or "activate/2"), Idempotency-Key, body digest.
+pub(crate) struct ChangeReceipt {
+    pub principal: String,
+    pub scope: String,
+    pub key: String,
+    pub digest: String,
+}
+impl ChangeReceipt {
+    fn identity(&self) -> playscale_core::delivery_admission::Identity {
+        playscale_core::delivery_admission::Identity {
+            principal: self.principal.clone(),
+            // Keys are visible ASCII, so NUL separates scope from key.
+            key: format!("{}\0{}", self.scope, self.key),
+            digest: self.digest.clone(),
+        }
+    }
+}
+
+/// The acknowledgement of an exact retry (core `delivery_admission::decide`);
+/// a conflict when the key named a different request.
+fn replayed_change(inner: &Inner, r: &ChangeReceipt) -> Result<Option<DeliveryView>, ApiError> {
+    use playscale_core::delivery_admission::{self as admission, Decision, Receipt};
+    let request = r.identity();
+    let Some((identity, view)) = inner
+        .changes
+        .iter()
+        .find(|(i, _)| i.principal == request.principal && i.key == request.key)
+    else {
+        return Ok(None);
+    };
+    let receipt = Receipt {
+        identity: identity.clone(),
+        delivery_id: String::new(),
+    };
+    match admission::decide(&request, Some(&receipt)) {
+        Ok(Decision::Replay { .. }) => serde_json::from_value(view.clone())
+            .map(Some)
+            .map_err(ApiError::internal),
+        Ok(Decision::Create) => Ok(None),
+        Err(_) => Err(ApiError::conflict(
+            "idempotency_conflict",
+            "The Idempotency-Key was used with a different request",
+        )),
+    }
+}
+
+/// An exact retry of an acknowledged change, checked before the request's
+/// plan token is admitted again (it may have expired since).
+pub(crate) fn change_replay(
+    app: &App,
+    id: &str,
+    receipt: &ChangeReceipt,
+) -> Result<Option<DeliveryView>, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    replayed_change(&session.inner.lock().unwrap(), receipt)
+}
+
+/// The v2 owner of a delivery: held live, or recorded at its admission.
+pub(crate) async fn owner(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<Option<Owner>, ApiError> {
+    if let Some(owner) = live_owner(app, id) {
+        return Ok(Some(owner));
+    }
+    let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT principal_id,profile_id,timeline_id,file_id,file_revision FROM delivery_owners WHERE delivery_id=?",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(
+        |(principal, profile, timeline, file, file_revision)| Owner {
+            principal,
+            profile,
+            timeline,
+            file,
+            file_revision,
+        },
+    ))
+}
+
+/// Current view of a delivery: live, or its last recorded (fenced) state.
+pub(crate) async fn any_view(app: &App, id: &str) -> Result<Option<DeliveryView>, ApiError> {
+    if let Some(view) = live_view(app, id) {
+        return Ok(Some(view));
+    }
+    Ok(recorded(app, id)
+        .await?
+        .map(|(file, revision, d)| view_of(app, id, &file, &revision, &d)))
 }
 
 /// Admission survives loss of its HTTP waiter. Authority is revalidated even for
@@ -1957,7 +2387,7 @@ pub async fn admit_request(
         })?;
     tokio::spawn(async move {
         let _slot = slot;
-        admit_owned(&app, authority, key, r).await
+        admit_owned(&app, authority, key, r, None).await
     })
     .await
     .map_err(ApiError::internal)?
@@ -1968,7 +2398,13 @@ async fn admit_owned(
     authority: Arc<dyn AdmissionAuthority>,
     key: Option<String>,
     r: CreateRequest,
+    planned: Option<Planned>,
 ) -> Result<(StatusCode, Json<DeliveryView>), ApiError> {
+    // Byte routes (original or prepared) run no encoder.
+    let original = planned
+        .as_ref()
+        .is_some_and(|p| matches!(p.route, Route::Original | Route::Prepared));
+    let version = planned.as_ref().map(|p| p.version.clone());
     use playscale_core::delivery_admission::{self as admission, Decision, Identity, Receipt};
     use sha2::{Digest, Sha256};
     let runtime = &app.processing.deliveries;
@@ -1978,7 +2414,9 @@ async fn admit_owned(
     // acknowledged one replays its receipt below.
     let copy_probe = match r.operation.map(LiveOperation::operation) {
         Some(operation)
-            if copies_video(operation) && app.processing.settings.experimental_copy_routes =>
+            if !original
+                && copies_video(operation)
+                && app.processing.settings.experimental_copy_routes =>
         {
             Some(probe_copy_details(app, &r.file_id).await)
         }
@@ -1996,9 +2434,17 @@ async fn admit_owned(
     let identity = key.map(|key| Identity {
         principal,
         key,
+        // v1 receipts keep their original digest; a planned (v2) admission also
+        // pins the owner and route, so the same key cannot name another plan.
         digest: format!(
             "{:x}",
-            Sha256::digest(serde_json::to_vec(&r).expect("serializable request"))
+            Sha256::digest(
+                match &planned {
+                    None => serde_json::to_vec(&r),
+                    Some(p) => serde_json::to_vec(&(&r, &p.owner, &p.version, p.route)),
+                }
+                .expect("serializable request")
+            )
         ),
     });
     if let Some(identity) = &identity {
@@ -2034,6 +2480,7 @@ async fn admit_owned(
             }
         }
     }
+    authority.fresh()?;
     if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2053,10 +2500,21 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    let operation = r
-        .operation
-        .unwrap_or(LiveOperation::VideoTranscode)
-        .operation();
+    if let Some(planned) = &planned
+        && (planned.owner.file != file.id || planned.owner.file_revision != file.revision)
+    {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Refresh the item",
+        ));
+    }
+    let operation = if let Some(p) = planned.as_ref().filter(|_| original) {
+        p.route.operation()
+    } else {
+        r.operation
+            .unwrap_or(LiveOperation::VideoTranscode)
+            .operation()
+    };
     let copy_details = copy_probe.transpose()?;
     if !hardware_ready {
         return Err(backend_unavailable());
@@ -2076,25 +2534,29 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    validate_route(
-        &file,
-        r.audio_track,
-        operation,
-        app.processing.settings.experimental_copy_routes,
-        copy_details.as_ref(),
-    )?;
+    if !original {
+        validate_route(
+            &file,
+            r.audio_track,
+            operation,
+            app.processing.settings.experimental_copy_routes,
+            copy_details.as_ref(),
+        )?;
+    }
     validate_subtitle(&file, r.subtitle_track)?;
     let duration_ms = file
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (d * 1000.0) as u64)
-        .ok_or_else(|| ApiError::bad("Live conversion requires a probed duration"))?;
+        .map(|d| (d * 1000.0) as u64);
+    if duration_ms.is_none() && !original {
+        return Err(ApiError::bad("Live conversion requires a probed duration"));
+    }
     let (root, root_identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&file.library_id)
             .fetch_one(&mut *transaction)
             .await?;
-    if !cfg!(unix) {
+    if !cfg!(unix) && !original {
         // Encoder input is the inherited validated descriptor (Unix only).
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -2103,11 +2565,17 @@ async fn admit_owned(
         ));
     }
     let (delivery, effects) = Delivery::admit(
-        // The current catalog binds one timeline per edition.
-        file.edition_id.clone(),
-        pin(&file, r.audio_track, r.subtitle_track, operation, hardware),
+        // A planned delivery names its timeline; v1 binds one timeline per edition.
+        planned
+            .as_ref()
+            .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
+        if original {
+            byte_pin(&file, r.audio_track, operation)
+        } else {
+            pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+        },
         r.start_ms,
-        Some(duration_ms),
+        duration_ms,
         runtime.now_ms(),
     )
     .map_err(error)?;
@@ -2115,6 +2583,7 @@ async fn admit_owned(
         id: new_id(),
         file_id: file.id.clone(),
         revision: file.revision.clone(),
+        owner: planned.as_ref().map(|p| p.owner.clone()),
         source: Source {
             root: root.into(),
             relative: file.relative_path.clone().into(),
@@ -2124,10 +2593,13 @@ async fn admit_owned(
         inner: Mutex::new(Inner {
             delivery: delivery.clone(),
             workers: HashMap::new(),
+            changes: Default::default(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
     });
-    if runtime.sessions.lock().unwrap().len() >= MAX_SESSIONS {
+    // Byte routes run no encoder and do not consume encoding delivery slots.
+    let (encoding, bytes) = runtime.counts();
+    if (!original && encoding >= MAX_SESSIONS) || (original && bytes >= MAX_BYTE_SESSIONS) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "delivery_limit",
@@ -2144,6 +2616,19 @@ async fn admit_owned(
     )
     .await
     .map_err(ApiError::internal)?;
+    if let (Some(owner), Some(version)) = (&session.owner, &version) {
+        sqlx::query("INSERT INTO delivery_owners(delivery_id,principal_id,profile_id,timeline_id,version_id,file_id,file_revision,created_at) VALUES (?,?,?,?,?,?,?,?)")
+            .bind(&session.id)
+            .bind(&owner.principal)
+            .bind(&owner.profile)
+            .bind(&owner.timeline)
+            .bind(version)
+            .bind(&owner.file)
+            .bind(&owner.file_revision)
+            .bind(crate::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     if let Some(identity) = identity {
         sqlx::query("INSERT INTO delivery_admissions(principal,request_key,request_digest,delivery_id,acknowledgement_json,created_at) VALUES (?,?,?,?,?,?)")
             .bind(identity.principal).bind(identity.key).bind(identity.digest).bind(&session.id)
@@ -2437,11 +2922,30 @@ pub async fn playlist(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let generation = generation_number(&generation)?;
+    playlist_with(
+        &app,
+        &id,
+        &generation,
+        |i| format!("segments/{i}.m4s"),
+        "init.mp4",
+    )
+    .await
+}
+
+/// The media playlist of a serving segmented generation, with URIs relative
+/// to wherever the caller serves it.
+pub(crate) async fn playlist_with(
+    app: &App,
+    id: &str,
+    generation: &str,
+    segment_uri: impl Fn(u32) -> String,
+    init_uri: &str,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
     let serves = |d: &Delivery, now| {
         d.serves(generation, now) && d.generations[&generation].pin.operation.segmented()
     };
-    let (session, _permit) = admit_stream(&app, &id, serves).await?;
+    let (session, _permit) = admit_stream(app, id, serves).await?;
     let text = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
@@ -2449,11 +2953,7 @@ pub async fn playlist(
         if !serves(d, app.processing.deliveries.now_ms()) {
             return Err(ApiError::not_found());
         }
-        core::media_playlist(
-            &d.generations[&generation],
-            |i| format!("segments/{i}.m4s"),
-            "init.mp4",
-        )
+        core::media_playlist(&d.generations[&generation], segment_uri, init_uri)
     };
     Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
 }

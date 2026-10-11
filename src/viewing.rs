@@ -70,14 +70,28 @@ pub async fn watched(
     body: Result<Json<Watched>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ViewingState>, ApiError> {
     let body = json(body)?;
-    if body.expected_revision < 0 || body.expected_revision == i64::MAX {
+    Ok(Json(
+        set_watched(&app, &p, &i, body.expected_revision, body.watched, false).await?,
+    ))
+}
+/// Set or clear the manual watched override, optionally clearing the resume
+/// position, and invalidate the current session (core `override_change`).
+pub(crate) async fn set_watched(
+    app: &App,
+    p: &str,
+    i: &str,
+    expected_revision: i64,
+    watched: Option<bool>,
+    reset_position: bool,
+) -> Result<ViewingState, ApiError> {
+    if expected_revision < 0 || expected_revision == i64::MAX {
         return Err(ApiError::bad("Invalid revision"));
     }
     let _guard = app.jobs.lock().await;
-    let current = load(&app, &p, &i).await?;
+    let current = load(app, p, i).await?;
     let next = current
         .state()
-        .override_change(body.expected_revision, body.watched)
+        .override_change(expected_revision, watched)
         .map_err(|_| conflict("viewing_revision_conflict"))?;
     let mut tx = crate::db::begin_write(&app.db).await?;
     if let Some((session, status)) = &next.close_session {
@@ -89,9 +103,19 @@ pub async fn watched(
             .await?;
     }
     sqlx::query("INSERT INTO viewing_state(profile_id,item_id,manual_watched,revision) VALUES (?,?,?,?) ON CONFLICT(profile_id,item_id) DO UPDATE SET manual_watched=excluded.manual_watched,revision=excluded.revision")
-        .bind(&p).bind(&i).bind(next.view.manual_watched).bind(next.view.revision).execute(&mut *tx).await?;
+        .bind(p).bind(i).bind(next.view.manual_watched).bind(next.view.revision).execute(&mut *tx).await?;
+    if reset_position {
+        sqlx::query(
+            "UPDATE progress SET position_seconds=0,updated_at=? WHERE profile_id=? AND item_id=?",
+        )
+        .bind(now())
+        .bind(p)
+        .bind(i)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
-    Ok(Json(load(&app, &p, &i).await?))
+    load(app, p, i).await
 }
 #[derive(Serialize, ToSchema, sqlx::FromRow)]
 pub struct Session {
@@ -163,11 +187,22 @@ pub async fn start(
     body: Result<Json<Start>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<Session>), ApiError> {
     let body = json(body)?;
+    let session = start_session(&app, &p, new_id(), body).await?;
+    Ok((StatusCode::CREATED, Json(session)))
+}
+/// Create the authoritative session `id` for this profile/item, superseding
+/// any earlier one, after checking the file and expected viewing revision.
+pub(crate) async fn start_session(
+    app: &App,
+    p: &str,
+    id: String,
+    body: Start,
+) -> Result<Session, ApiError> {
     if body.expected_revision < 0 || body.expected_revision == i64::MAX {
         return Err(ApiError::bad("Invalid viewing revision"));
     }
     let _guard = app.jobs.lock().await;
-    let current = load(&app, &p, &body.item_id).await?;
+    let current = load(app, p, &body.item_id).await?;
     playscale_core::revision::advance(current.revision, body.expected_revision)
         .map_err(|_| conflict("viewing_revision_conflict"))?;
     let mut tx = crate::db::begin_write(&app.db).await?;
@@ -186,7 +221,6 @@ pub async fn start(
     .map_err(conflict)?;
     let revision = observed.identity.revision;
     let duration = observed.duration;
-    let id = new_id();
     let change = current
         .state()
         .start_change(body.expected_revision, id.clone(), duration)
@@ -203,7 +237,7 @@ pub async fn start(
     let position = next.position;
     sqlx::query("INSERT INTO playback_sessions VALUES (?,?,?,?,?,?,0,?,'paused',?,?)")
         .bind(&id)
-        .bind(&p)
+        .bind(p)
         .bind(&body.item_id)
         .bind(body.file_id)
         .bind(revision)
@@ -214,9 +248,9 @@ pub async fn start(
         .execute(&mut *tx)
         .await?;
     sqlx::query("INSERT INTO viewing_state(profile_id,item_id,revision,session_id) VALUES (?,?,?,?) ON CONFLICT(profile_id,item_id) DO UPDATE SET revision=excluded.revision,session_id=excluded.session_id")
-        .bind(&p).bind(&body.item_id).bind(next.revision).bind(&id).execute(&mut *tx).await?;
+        .bind(p).bind(&body.item_id).bind(next.revision).bind(&id).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(session(&app, &p, &id).await?)))
+    session(app, p, &id).await
 }
 #[utoipa::path(operation_id="get_playback_session",get,path="/api/v1/profiles/{profile}/playback-sessions/{id}",params(("profile"=String,Path),("id"=String,Path)),responses((status=200,description="Durable playback session",body=Session),(status=404,description="Unknown session for profile",body=crate::api::ErrorBody)))]
 pub async fn get_session(
@@ -248,9 +282,19 @@ pub async fn event(
     body: Result<Json<Event>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Session>, ApiError> {
     let body = json(body)?;
+    Ok(Json(record_event(&app, &p, &id, body).await?.0))
+}
+/// Apply one ordered event (core `viewing::event`). Returns the session and
+/// whether the event was an exact retry of the one already recorded.
+pub(crate) async fn record_event(
+    app: &App,
+    p: &str,
+    id: &str,
+    body: Event,
+) -> Result<(Session, bool), ApiError> {
     let _guard = app.jobs.lock().await;
-    let old = session(&app, &p, &id).await?;
-    let view = load(&app, &p, &old.item_id).await?;
+    let old = session(app, p, id).await?;
+    let view = load(app, p, &old.item_id).await?;
     let from = playscale_core::viewing::Session {
         sequence: old.sequence,
         position: old.position_seconds,
@@ -299,7 +343,7 @@ pub async fn event(
         duration = observed.duration;
     }
     let next =
-        playscale_core::viewing::event(&view.state(), &id, &from, &to, duration).map_err(|e| {
+        playscale_core::viewing::event(&view.state(), id, &from, &to, duration).map_err(|e| {
             if e.starts_with("invalid_") {
                 ApiError::bad(e)
             } else {
@@ -307,7 +351,7 @@ pub async fn event(
             }
         })?;
     let Some((next, next_view)) = next else {
-        return Ok(Json(old));
+        return Ok((old, true));
     };
     if let Some(file) = &body.file {
         sqlx::query(
@@ -316,7 +360,7 @@ pub async fn event(
         .bind(&file.file_id)
         .bind(&file.file_revision)
         .bind(duration)
-        .bind(&id)
+        .bind(id)
         .execute(&mut *tx)
         .await?;
     } else {
@@ -328,20 +372,20 @@ pub async fn event(
         )
         .map_err(conflict)?;
     }
-    sqlx::query("UPDATE playback_sessions SET sequence=?,position_seconds=?,status=?,updated_at=? WHERE id=?").bind(next.sequence).bind(next.position).bind(&next.status).bind(now()).bind(&id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE playback_sessions SET sequence=?,position_seconds=?,status=?,updated_at=? WHERE id=?").bind(next.sequence).bind(next.position).bind(&next.status).bind(now()).bind(id).execute(&mut *tx).await?;
     sqlx::query("INSERT INTO progress VALUES (?,?,?,?) ON CONFLICT(profile_id,item_id) DO UPDATE SET position_seconds=excluded.position_seconds,updated_at=excluded.updated_at")
-        .bind(&p).bind(&old.item_id).bind(next.position).bind(now()).execute(&mut *tx).await?;
+        .bind(p).bind(&old.item_id).bind(next.position).bind(now()).execute(&mut *tx).await?;
     sqlx::query(
         "UPDATE viewing_state SET automatic_watched=?,revision=? WHERE profile_id=? AND item_id=?",
     )
     .bind(next_view.automatic_watched)
     .bind(next_view.revision)
-    .bind(&p)
+    .bind(p)
     .bind(&old.item_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(session(&app, &p, &id).await?))
+    Ok((session(app, p, id).await?, false))
 }
 
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
@@ -356,6 +400,19 @@ pub struct Preferences {
     /// Fixed processing recipe used by Convert or proposed by Auto.
     #[serde(default = "crate::playback::default_recipe")]
     pub conversion_recipe: String,
+    /// v2 preference fields; stored documents written before them read as defaults.
+    #[serde(default = "enabled")]
+    pub allow_client_software_decode: bool,
+    #[serde(default)]
+    pub autoplay: bool,
+    #[serde(default = "default_completion")]
+    pub completion_percent: f64,
+}
+fn enabled() -> bool {
+    true
+}
+fn default_completion() -> f64 {
+    90.0
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -365,6 +422,9 @@ impl Default for Preferences {
             subtitle_mode: "foreign_audio".into(),
             quality: "auto".into(),
             conversion_recipe: crate::playback::default_recipe(),
+            allow_client_software_decode: true,
+            autoplay: false,
+            completion_percent: default_completion(),
         }
     }
 }
@@ -450,8 +510,13 @@ pub async fn put_preferences(
     if playscale_core::revision::advance(current.revision, body.expected_revision).is_err() {
         return Err(conflict("preferences_revision_conflict"));
     }
-    sqlx::query("INSERT INTO playback_preferences VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
-        .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).execute(&app.db).await?;
+    // Compare-and-set on the revision read above: v2 writers do not take
+    // `app.jobs`, so a concurrent write must turn this into a conflict.
+    let written = sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json WHERE playback_preferences.revision=?")
+        .bind(&p).bind(current.revision+1).bind(serde_json::to_string(&body.preferences).map_err(ApiError::internal)?).bind(current.revision).execute(&app.db).await?;
+    if written.rows_affected() != 1 {
+        return Err(conflict("preferences_revision_conflict"));
+    }
     Ok(Json(prefs(&app, &p).await?))
 }
 

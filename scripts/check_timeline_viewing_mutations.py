@@ -1,0 +1,72 @@
+"""Mutation check for the timeline viewing model: each compiled regression of
+crates/core/src/timeline_viewing.rs must make the Stateless model fail.
+
+Run from the repository root: python3 scripts/check_timeline_viewing_mutations.py
+Set KYOTO=/path/to/kyoto.py to submit each cargo run through that build queue.
+The source file is restored after every mutation.
+"""
+import json, os, pathlib, subprocess, sys, types
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SOURCE = ROOT / 'crates/core/src/timeline_viewing.rs'
+MUTATIONS = [
+    ('sequence_gaps_accepted',
+     '    if event.sequence != session.sequence + 1 {\n        return Err(Error::SequenceGap);\n    }\n', ''),
+    ('override_keeps_the_manual_epoch',
+     '            manual_epoch: next(view.manual_epoch)?,\n', ''),
+    ('retry_ignores_content',
+     '        return if p == event {', '        return if p.sequence == event.sequence || p.id == event.id {'),
+    ('superseded_session_still_writes',
+     '    if !authoritative(view, session) {\n        return Err(Error::Superseded);\n    }\n    if session.status.closed() {\n        return Err(Error::Closed);\n    }\n    if event.sequence <= session.sequence {',
+     '    if session.status.closed() {\n        return Err(Error::Closed);\n    }\n    if event.sequence <= session.sequence {'),
+]
+
+
+def model():
+    command = ['cargo', 'test', '-p', 'playscale-core', '--release', '--test',
+               'timeline_viewing_model', '--', '--nocapture']
+    kyoto = os.environ.get('KYOTO')
+    if not kyoto:
+        return subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    job = json.loads(subprocess.run([kyoto, 'submit', '--cwd', str(ROOT), '--', *command],
+                                    check=True, capture_output=True, text=True).stdout)
+    # `wait` exits with the job's code; a detected mutation fails the job, so
+    # read its completion record instead of requiring success.
+    done = json.loads(subprocess.run([kyoto, 'wait', job['id']],
+                                     capture_output=True, text=True).stdout)
+    if done['status'] not in ('succeeded', 'failed') or done['exit_code'] is None:
+        raise SystemExit(f"kyoto job {job['id']} did not complete: {done['status']}")
+    log = pathlib.Path(done['log']).read_text(errors='replace')
+    return types.SimpleNamespace(returncode=done['exit_code'], stdout=log, stderr=log)
+
+
+def main():
+    original = SOURCE.read_text()
+    baseline = model()
+    assert baseline.returncode == 0 and 'test result: ok. 1 passed' in baseline.stdout + baseline.stderr, \
+        baseline.stdout + baseline.stderr
+    results = {}
+    try:
+        for name, old, new in MUTATIONS:
+            assert original.count(old) == 1, name
+            SOURCE.write_text(original.replace(old, new))
+            run = model()
+            output = run.stdout + run.stderr
+            compiled = 'error[' not in output
+            # Detection needs the model test itself to have run and failed,
+            # not merely a nonzero exit (a link or queue failure is neither).
+            ran_and_failed = ('Running tests/timeline_viewing_model.rs' in output
+                              and 'test result: FAILED' in output)
+            results[name] = ('detected' if ran_and_failed else
+                             'did_not_compile' if not compiled else
+                             'MISSED' if run.returncode == 0 else 'inconclusive')
+            print(name, results[name], file=sys.stderr)
+    finally:
+        SOURCE.write_text(original)
+    print(results)
+    if any(v != 'detected' for v in results.values()):
+        raise SystemExit('a mutation was not detected')
+
+
+if __name__ == '__main__':
+    main()

@@ -30,6 +30,8 @@ applying any pending migration to an existing database.
 | 0029 | `0029_structure_events.sql` | A01/A09 | relationship update revisions; organization delete events |
 | 0030 | `0030_markers.sql` | A04 | timeline markers |
 | 0031 | `0031_search_origin_titles.sql` | A09 | reindex when an origin title is replaced |
+| 0032 | `0032_timeline_viewing.sql` | A07 | v2 timeline-keyed viewing state, viewing sessions and acknowledged events; backfill only from exact attributions or single-timeline works |
+| 0033 | `0033_delivery_owners.sql` | A07 | durable v2 delivery owner (principal, profile, timeline, version, source) |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
