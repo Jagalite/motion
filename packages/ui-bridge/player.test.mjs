@@ -27,6 +27,60 @@ test('planning subtitle vocabulary and explicit HLS source match the pinned cont
   for (const page of [{items: [{id: 'a'}]}, {items: [{id: '../bad'}]}, {items: [{id: 'b'}, {id: 'c'}]}, {}]) assert.throws(() => nextTimeline(page, 'a'), /Invalid next-title/);
 });
 
+test('audio, version and quality choices replan only the same timeline input', () => {
+  const {replanInput} = runInNewContext(source.replace('export {close, maintainLease};', '({replanInput});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const input = {profile_id: 'p', timeline_id: 't', version_id: null, source: null, failed_candidate_ids: ['o-f'],
+    tracks: {audio_track_id: null, subtitle_track_id: null, subtitle_policy: 'auto'}, quality: {mode: 'auto', max_height: null}};
+  const audioSource = {version: 'v1', file_id: 'f1', file_revision: 'r1'};
+  const next = replanInput(input, {version: '', quality: 'auto', audio: 'a1', audioSource});
+  assert.equal(next.tracks.audio_track_id, 'a1');
+  assert.equal(next.version_id, 'v1', 'a chosen track pins the version it was listed for');
+  assert.deepEqual({...next.source}, {file_id: 'f1', file_revision: 'r1'}, 'and the exact file revision');
+  assert.equal(next.tracks.subtitle_policy, 'auto');
+  assert.deepEqual([...next.failed_candidate_ids], [], 'a new choice is planned afresh');
+  assert.equal(input.tracks.audio_track_id, null, 'the current input is not mutated');
+  const other = replanInput(input, {version: 'v2', quality: 'auto', audio: 'a1', audioSource});
+  assert.equal(other.tracks.audio_track_id, null, 'ordinals of another version are not reused');
+  assert.equal(other.version_id, 'v2');
+  assert.equal(other.source, null);
+  const unpinned = replanInput(input, {version: '', quality: 'auto', audio: 'a1', audioSource: {version: 'v1'}});
+  assert.equal(unpinned.tracks.audio_track_id, null, 'a track without its file revision is never sent');
+  const back = replanInput(next, {version: 'v2', quality: 'convert', audio: '', audioSource});
+  assert.equal(back.tracks.audio_track_id, null);
+  assert.equal(back.version_id, 'v2');
+  assert.equal(back.source, null);
+  assert.equal(back.quality.mode, 'convert');
+  assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x', audioSource}), /Invalid audio/);
+});
+
+test('only a plan for the same file revision replans in place', () => {
+  const {sameSource} = runInNewContext(source.replace('export {close, maintainLease};', '({sameSource});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const delivery = {source: {file_id: 'f1', file_revision: 'r1'}};
+  assert.equal(sameSource(delivery, {source: {file_id: 'f1', file_revision: 'r1'}}), true);
+  assert.equal(sameSource(delivery, {source: {file_id: 'f2', file_revision: 'r1'}}), false, 'another version or rendition');
+  assert.equal(sameSource(delivery, {source: {file_id: 'f1', file_revision: 'r2'}}), false, 'a changed revision');
+  assert.equal(sameSource(delivery, {source: null}), false);
+});
+
+test('a same-tab handoff is written on leave, consumed once and expires', () => {
+  const store = new Map();
+  const sessionStorage = {getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k)};
+  const {leaveHandoff, takeHandoff} = runInNewContext(source.replace('export {close, maintainLease};', '({leaveHandoff, takeHandoff});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, sessionStorage, Date, JSON,
+  });
+  const data = {principalId: 'a', profileId: 'p', timelineId: 't'};
+  assert.equal(takeHandoff(data), null, 'a fresh or duplicated tab has no handoff');
+  leaveHandoff(data, 's1');
+  assert.equal(takeHandoff(data), 's1');
+  assert.equal(takeHandoff(data), null, 'consumed once');
+  leaveHandoff(data, 's2');
+  assert.equal(takeHandoff(data, Date.now() + 31000), null, 'stale handoff');
+});
+
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};

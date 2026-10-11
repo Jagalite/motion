@@ -1,0 +1,486 @@
+{
+  "started": "2026-10-11T02:00:33.134Z",
+  "kind": "production-evidence",
+  "server": {
+    "binary": "<checkout>/target/debug/playscale",
+    "sha256": "7a1e3d9c791264ed4ccabb2da66bac563ceccaf8ee57912563274eb2437f5d0c"
+  },
+  "demuxe": {
+    "dir": "<checkout>/web/vendor/demuxe",
+    "version": "1.1.0"
+  },
+  "engines": {
+    "webkit": {
+      "versions": {
+        "webkit": "27.2"
+      },
+      "checks": [
+        {
+          "name": "browser session from paired credential",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200
+          }
+        },
+        {
+          "name": "item page shows viewing state and Play",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "play": "/play/22b144e5-e243-4a80-a417-83fc444b2faa"
+          }
+        },
+        {
+          "name": "original plan selects byte-range original",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "original",
+            "status": "ready",
+            "candidate": "o-c7d09e47-88a0-4bad-91f5-11c52d3f8920",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "player ready",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "state": "ready",
+            "text": ""
+          }
+        },
+        {
+          "name": "original playback advances",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "advancing": true,
+            "from": 0,
+            "to": 3.000433917000128,
+            "logical": 3,
+            "mode": "native"
+          }
+        },
+        {
+          "name": "original bytes served by range",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            206,
+            206
+          ]
+        },
+        {
+          "name": "seek replaces the generation at 40 s",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "seek": {
+              "replaced": true,
+              "logical": 40,
+              "players": 1
+            },
+            "seekPlay": {
+              "advancing": true,
+              "from": 40.06440595866757,
+              "to": 42.24794395833304,
+              "logical": 42.2,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "seek staged and activated generation 2",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "POST 64564766-d7db-4df3-8fae-b8a4dfb32753/events 200",
+            "POST 6c0e1db1-55be-41a2-8f8b-6fa616c73acb/changes 202",
+            "GET c7d09e47-88a0-4bad-91f5-11c52d3f8920/content 206",
+            "GET c7d09e47-88a0-4bad-91f5-11c52d3f8920/content 206",
+            "POST 64564766-d7db-4df3-8fae-b8a4dfb32753/events 200",
+            "POST 2/activate 200",
+            "POST 64564766-d7db-4df3-8fae-b8a4dfb32753/events 200",
+            "POST 64564766-d7db-4df3-8fae-b8a4dfb32753/events 200"
+          ]
+        },
+        {
+          "name": "progress persisted on the server",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "manual_epoch": "0",
+            "manual_watched": null,
+            "position_ms": 48770,
+            "profile_id": "default",
+            "revision": "9",
+            "session_id": "64564766-d7db-4df3-8fae-b8a4dfb32753",
+            "timeline_id": "22b144e5-e243-4a80-a417-83fc444b2faa",
+            "watched": false
+          }
+        },
+        {
+          "name": "ordered viewing events accepted with consecutive sequences",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "1:200",
+            "2:200",
+            "3:200",
+            "4:200",
+            "5:200",
+            "6:200",
+            "7:200",
+            "8:200"
+          ]
+        },
+        {
+          "name": "item page offers Resume at the saved position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "label": "Resume"
+          }
+        },
+        {
+          "name": "resume starts at the saved position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "resumed": {
+              "ready": {
+                "state": "ready",
+                "text": ""
+              },
+              "resume": 48770
+            },
+            "resumedPlay": {
+              "advancing": true,
+              "from": 48.77,
+              "to": 50.014594958333504,
+              "logical": 50,
+              "mode": "native"
+            },
+            "saved": 48770
+          }
+        },
+        {
+          "name": "audio selector lists both tracks of the planned version",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "",
+            "a0",
+            "a1"
+          ]
+        },
+        {
+          "name": "audio switch replans to a live HLS conversion",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "hls",
+            "operation": "video_transcode",
+            "status": "ready",
+            "candidate": "t-c7d09e47-88a0-4bad-91f5-11c52d3f8920",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a1"
+          }
+        },
+        {
+          "name": "HLS manifest, variant, init and segments served",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "2/master.m3u8 200",
+            "2/variants/main/index.m3u8 200",
+            "2/variants/main/init.mp4 200",
+            "2/segments/0.m4s 200"
+          ]
+        },
+        {
+          "name": "audio switch replaces the player over HLS and keeps position",
+          "status": "blocked",
+          "gap": "demuxe-live-hls",
+          "detail": {
+            "before": 50,
+            "switched": {
+              "options": [
+                "",
+                "a0",
+                "a1"
+              ],
+              "replaced": false,
+              "alert": "Playback change failed: Native manifest has no finite VOD duration; live playback requires explicit Shaka live permission"
+            },
+            "switchedPlay": {
+              "advancing": true,
+              "from": 50.76559524966643,
+              "to": 52.7692776666674,
+              "logical": 52.8,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "a failed switch keeps the original player playing",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "before": 50,
+            "switchedPlay": {
+              "advancing": true,
+              "from": 50.76559524966643,
+              "to": 52.7692776666674,
+              "logical": 52.8,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "an event sent during the outage is queued in the durable outbox",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "queued": {
+              "position_ms": 55529,
+              "status": "paused",
+              "delivery_generation": "1",
+              "event_id": "bab2167658e144c5808c7496b21bda08",
+              "sequence": "5"
+            }
+          }
+        },
+        {
+          "name": "the queued event is accepted after restart with its original identity",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "queued": {
+              "position_ms": 55529,
+              "status": "paused",
+              "delivery_generation": "1",
+              "event_id": "bab2167658e144c5808c7496b21bda08",
+              "sequence": "5"
+            },
+            "drained": {
+              "status": 200,
+              "request": {
+                "position_ms": 55529,
+                "status": "paused",
+                "delivery_generation": "1",
+                "event_id": "bab2167658e144c5808c7496b21bda08",
+                "sequence": "5"
+              }
+            },
+            "server": 55530
+          }
+        },
+        {
+          "name": "after restart the player reopens at durable progress",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "durable": 55530,
+            "atRender": 55530,
+            "afterRestart": {
+              "ready": {
+                "state": "ready",
+                "text": ""
+              },
+              "resume": 55530,
+              "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
+            },
+            "restartPlay": {
+              "advancing": true,
+              "from": 55.53,
+              "to": 57.77697179200005,
+              "logical": 57.8,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "after restart the cookie session authorizes playback",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "sessionStarts": [
+              409,
+              201
+            ],
+            "errors": [
+              "POST /api/v2/playback/viewing-sessions 409"
+            ]
+          }
+        },
+        {
+          "name": "a prepared rendition is produced by a real processing job",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 201,
+            "phase": "completed"
+          }
+        },
+        {
+          "name": "Convert plans the prepared rendition by byte range",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "prepared",
+            "status": "ready",
+            "candidate": "p-81dc185c-060c-4de8-9fba-31e81b38fa19",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "versionSwitch": {
+              "replaced": true,
+              "logical": 60.9,
+              "players": 1
+            },
+            "switchPlay": {
+              "advancing": true,
+              "from": 61.00150812500024,
+              "to": 63.182513833001,
+              "logical": 63.2,
+              "mode": "native"
+            },
+            "beforeSwitch": 60.9,
+            "rebound": 200,
+            "delivery": "04a50461-b62f-424f-af0b-d62c664e6669",
+            "previous": "83f59259-2c10-4968-b204-9fd137896abe"
+          }
+        },
+        {
+          "name": "the predecessor delivery is retired after the switch",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200,
+            "state": "closed"
+          }
+        },
+        {
+          "name": "progress continues on the rebound session",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "events": [
+              "5:60933",
+              "6:60933",
+              "7:65939",
+              "8:70850"
+            ],
+            "position": 70850,
+            "beforeSwitch": 60.9
+          }
+        },
+        {
+          "name": "leaving the player retires its own delivery",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "product": "04a50461-b62f-424f-af0b-d62c664e6669",
+            "retired": "not observed",
+            "after": 200,
+            "state": "closed",
+            "elapsedMs": 5096
+          }
+        },
+        {
+          "name": "home continue watching matches server viewing state",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "listed": true,
+            "watched": false,
+            "position": 70850
+          }
+        },
+        {
+          "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "hls",
+            "operation": "video_transcode",
+            "status": "ready",
+            "candidate": "t-8b97de2f-f22b-467d-8c03-d4a0236fca43",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "converted title plays in the Motion player",
+          "status": "blocked",
+          "gap": "demuxe-live-hls",
+          "detail": {
+            "legacyReady": {
+              "state": "failed",
+              "text": "Playback could not start: Native manifest has no finite VOD duration; live playback requires explicit Shaka live permission (Playback is blocked: all_candidates_failed)"
+            },
+            "legacyPlay": {
+              "advancing": false,
+              "reason": "no player"
+            }
+          }
+        },
+        {
+          "name": "diagnostic: server live HLS conversion in a plain video element",
+          "status": "diagnostic-pass",
+          "gap": null,
+          "detail": {
+            "plan": "hls",
+            "admitted": 201,
+            "played": true,
+            "currentTime": 4.078154499333508,
+            "width": 640,
+            "height": 360,
+            "error": null
+          }
+        }
+      ],
+      "serverStartsMs": [
+        174,
+        291
+      ],
+      "summary": {
+        "pass": 28,
+        "blocked": 2,
+        "fail": 0
+      }
+    }
+  },
+  "media": [
+    {
+      "name": "Legacy Broadcast.mkv",
+      "sha256": "fccb7f399620a60dca1943045bf6428b4408bf74324e182f63a79d9a605b86ea"
+    },
+    {
+      "name": "Signal Film.mp4",
+      "sha256": "148dff3c0ff2d368e895bf6ff27702a0c721c9de50a43405ef293c545f3a376a"
+    }
+  ],
+  "finished": "2026-10-11T02:01:39.862Z",
+  "result": "pass-with-blocked-gaps"
+}

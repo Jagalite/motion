@@ -145,6 +145,20 @@ pub struct PlayerView {
     pub duration_ms: Option<u64>,
     pub resume_ms: u64,
     pub viewing_revision: String,
+    /// Manual watched epoch at render; a session start never adopts a newer one.
+    pub viewing_manual_epoch: String,
+    /// Audio streams of `audio_version`'s original file, by planning track ID
+    /// (`a{n}`). Choosing one other than the first asks for a conversion.
+    pub audio_tracks: Vec<TrackOption>,
+    pub audio_version: Option<String>,
+    /// The exact file revision `audio_tracks` describe; a chosen track pins it.
+    pub audio_file: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackOption {
+    pub id: String,
+    pub label: String,
 }
 
 /// Profile preferences as shown and edited on the profiles page. `etag` is the

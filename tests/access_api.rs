@@ -2632,7 +2632,7 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
 }
 
 #[tokio::test]
-async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state() {
+async fn topcoat_item_details_use_scoped_catalog_and_production_viewing_state() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let other_root = f._dir.path().join("private");
     std::fs::create_dir(&other_root).unwrap();
@@ -2726,10 +2726,12 @@ async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state
             assert!(html.contains("Film &lt;script&gt;"), "{html}");
             assert!(html.contains("Visible original"), "{html}");
             assert!(html.contains("Public season"), "{html}");
-            assert!(html.contains("Viewing history is unavailable."), "{html}");
-            assert!(html.contains("Playback is unavailable."), "{html}");
-            assert!(!html.contains("Not started."));
-            assert!(!html.contains("href=\"/play/"));
+            // Viewing state and the Play action come from the production v2
+            // viewing read and version availability, never invented.
+            assert!(html.contains("Not started."), "{html}");
+            assert!(!html.contains("Viewing history is unavailable."), "{html}");
+            assert!(!html.contains("Playback is unavailable."), "{html}");
+            assert!(html.contains("href=\"/play/visible\""), "{html}");
         }
     }
     let after: i64 = sqlx::query_scalar("SELECT count(*) FROM change_events")
@@ -2737,6 +2739,47 @@ async fn topcoat_item_details_use_scoped_catalog_without_inventing_viewing_state
         .await
         .unwrap();
     assert_eq!(before, after, "rendering must not write domain state");
+    // The player's audio choices describe only a version this principal can
+    // read: the hidden version sorts first on the same timeline and has more
+    // (and differently labelled) audio streams.
+    sqlx::query("UPDATE media_files SET tracks_json=? WHERE id='private-file'")
+        .bind(r#"[{"index":0,"kind":"video","codec":"h264","language":null},{"index":1,"kind":"audio","codec":"aac","language":"fra"},{"index":2,"kind":"audio","codec":"ac3","language":"fra"},{"index":3,"kind":"audio","codec":"dts","language":"deu"}]"#)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_files SET tracks_json=? WHERE id='visible'")
+        .bind(r#"[{"index":0,"kind":"video","codec":"h264","language":null},{"index":1,"kind":"audio","codec":"aac","language":"eng"}]"#)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(f.request("GET", "/play/visible", None, &[("authorization", &auth)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("value=\"a0\""), "{html}");
+    assert!(html.contains("eng, aac"), "{html}");
+    assert!(html.contains("data-version=\"visible\""), "{html}");
+    for leaked in [
+        "value=\"a1\"",
+        "fra",
+        "deu",
+        "private-version",
+        "Secret version",
+    ] {
+        assert!(!html.contains(leaked), "{leaked} disclosed: {html}");
+    }
     // Bounded aggregate reads fail explicitly instead of displaying an
     // incomplete timeline set as if it were complete.
     for n in 0..20 {

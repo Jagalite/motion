@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {createViewingWriter} from './viewing.mjs';
+import {adoptableRevision, createViewingWriter} from './viewing.mjs';
 
 const session = {id: 'v1', delivery_id: 'd1', profile_id: 'p1', timeline_id: 't1', sequence: '0', position_ms: 0, status: 'paused'};
 const snapshot = (position_ms, status = 'playing') => ({position_ms, status, delivery_generation: '1'});
@@ -136,4 +136,56 @@ test('u64 limits reject invalid observations and exhausted sequences', async () 
   const writer = createViewingWriter({...session, sequence: '18446744073709551615'}, options);
   writer.record(snapshot(1));
   await assert.rejects(writer.flush(), /exhausted/);
+});
+
+test('a newer viewing revision is adopted only from our own session with nothing else changed', () => {
+  const state = (over = {}) => ({revision: '7', watched: false, manual_watched: null, manual_epoch: '0', session_id: 's-own', position_ms: 52720, ...over});
+  const rendered = {ownSession: 's-own', ownSessionStatus: 'stopped', manualEpoch: '0', resumeMs: 52720};
+  assert.equal(adoptableRevision(state(), rendered), '7');
+  assert.equal(adoptableRevision(state({position_ms: 57000}), rendered), '7');
+  assert.equal(adoptableRevision(state({session_id: 's-other-device'}), rendered), null, 'another device started');
+  assert.equal(adoptableRevision(state(), {...rendered, ownSession: null}), null, 'no session of ours is known');
+  assert.equal(adoptableRevision(state(), {...rendered, ownSessionStatus: 'playing'}), null, 'another tab still uses it');
+  assert.equal(adoptableRevision(state(), {...rendered, ownSessionStatus: 'playing', sameTab: true}), '7', 'this tab\'s previous page, still unloading');
+  assert.equal(adoptableRevision(state(), {...rendered, ownSessionStatus: 'ended'}), '7');
+  assert.equal(adoptableRevision(state({manual_epoch: '1'}), rendered), null, 'a manual change, even if cleared');
+  assert.equal(adoptableRevision(state({position_ms: 60000}), rendered), null, 'progress moved elsewhere');
+  assert.equal(adoptableRevision(state({watched: true}), rendered), null);
+  assert.equal(adoptableRevision(state({manual_watched: false}), rendered), null);
+  assert.equal(adoptableRevision(state({revision: 'x'}), rendered), null);
+  assert.equal(adoptableRevision(null, rendered), null);
+});
+
+test('completion seals the writer; a later teardown records nothing new', async () => {
+  const sent = [];
+  const writer = createViewingWriter(session, {send: async (_id, e) => { sent.push(e); return {session: {...session, sequence: e.sequence, position_ms: e.position_ms, status: e.status}}; },
+    persist: () => {}, uuid: () => 'e1', wait: async () => {}});
+  writer.record({position_ms: 90000, status: 'ended', delivery_generation: '1'});
+  assert.equal(await writer.flush(), true);
+  writer.record({position_ms: 90000, status: 'stopped', delivery_generation: '1'});
+  writer.record({position_ms: 90000, status: 'ended', delivery_generation: '1'});
+  assert.equal(await writer.flush(), true);
+  assert.deepEqual(sent.map(e => e.status), ['ended']);
+  const restored = createViewingWriter({...session, status: 'ended'}, {send: async () => assert.fail('sealed'), persist: () => {}, uuid: () => 'x', wait: async () => {}});
+  restored.record({position_ms: 1, status: 'paused', delivery_generation: '1'});
+  assert.equal(await restored.flush(), true);
+});
+
+test('a rebind adopts the same session on another delivery only when idle', async () => {
+  const writer = createViewingWriter(session, {send: async (_id, e) => ({session: {...session, delivery_id: 'd2', sequence: e.sequence, position_ms: e.position_ms, status: e.status}}),
+    persist: () => {}, uuid: () => 'e1', wait: async () => {}});
+  assert.throws(() => writer.rebind({...session, id: 'other', delivery_id: 'd2'}), /Invalid viewing rebind/);
+  assert.throws(() => writer.rebind({...session, sequence: '9', delivery_id: 'd2'}), /Invalid viewing rebind/);
+  writer.record({position_ms: 1000, status: 'paused', delivery_generation: '1'});
+  assert.throws(() => writer.rebind({...session, delivery_id: 'd2'}), /pending progress/);
+  // An ack naming d2 while the writer still expects d1 is never accepted.
+  assert.equal(await writer.flush(), false);
+  assert.equal(writer.session.delivery_id, 'd1');
+  const fresh = createViewingWriter(session, {send: async (_id, e) => ({session: {...session, delivery_id: 'd2', sequence: e.sequence, position_ms: e.position_ms, status: e.status}}),
+    persist: () => {}, uuid: () => 'e2', wait: async () => {}});
+  fresh.rebind({...session, delivery_id: 'd2'});
+  assert.equal(fresh.session.delivery_id, 'd2');
+  fresh.record({position_ms: 2000, status: 'playing', delivery_generation: '1'});
+  assert.equal(await fresh.flush(), true, 'acks for the new delivery are accepted after rebind');
+  assert.equal(fresh.session.sequence, '1');
 });

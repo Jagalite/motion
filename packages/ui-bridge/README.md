@@ -87,24 +87,15 @@ node --test packages/playback/*.test.mjs packages/ui-bridge/*.test.mjs apps/desk
 
 ## Integration limits
 
-The Electron playback proof uses mock viewing/delivery services. It tests real
-Demuxe opening, playback, replacement and browser commands, but does not establish
-production backend correctness. HLS replacement, real conversion workers and
-cross-process offline recovery need separate qualification. The native connection
-shell and its test instructions are documented in `apps/desktop/README.md`.
+The Electron playback proof (`apps/desktop/proof`) uses mock viewing/delivery
+services and is fixture evidence only. Production evidence against the real
+server, in Chromium, WebKit and Electron, is recorded in
+`qualification/client-playback/README.md`. It covers original playback, seek,
+resume, audio-track replanning, outage and restart, and retirement.
 
-The production `UiQueryFacade` now dispatches reads through the authenticated
-public API router. Missing services return unavailable, never mock data. Current
-v2 preferences, timeline viewing, next/continue-watching, playback plans and
-viewing/delivery services still need integration by their owners. The separate
-`motion-ui-host` supplies offline cache views through `OfflinePresentationReader`;
-see `crates/motion-ui-host/README.md` for the port and its limits.
-
-The player maps subtitle preferences to the public planning vocabulary and
-passes explicit HLS sources to Demuxe. It advertises HLS only when native HLS
-support is observed; the installed reduced native-only bundle does not qualify
-Chromium HLS conversion. “Next title” uses the contracted release-order resolver,
-flushes pending progress and retires the old delivery before navigation. Autoplay
-uses the profile preference; browser autoplay denial leaves a usable Play control.
-No client queue order, shuffle algorithm or server current-entry mutation is
-invented where the service contract lacks an advancement operation.
+Live HLS conversions do not open in the Motion player with the current
+browser-only Demuxe deployment (its Shaka backend is required). Subtitle
+selection, prepared renditions and cross-runtime outbox replay remain open. See
+that document's gap list. The separate `motion-ui-host` supplies offline cache
+views through `OfflinePresentationReader`; see `crates/motion-ui-host/README.md`
+for the port and its limits.

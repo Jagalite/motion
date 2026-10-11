@@ -7,7 +7,11 @@ export async function openCandidates(input, {plan, admit, prepare, retire, dispo
   for (let attempt = 0; attempt < limit && current(); attempt++) {
     const choice = await plan({...input, failed_candidate_ids: [...failed]});
     if (!current()) return null;
-    if (choice.status !== 'ready') throw new Error(`Playback is blocked: ${(choice.reason_codes ?? []).join(', ') || 'no compatible version'}`);
+    if (choice.status !== 'ready') {
+      const blocked = `Playback is blocked: ${(choice.reason_codes ?? []).join(', ') || 'no compatible version'}`;
+      // After failed trials the cause is the last open failure, not the plan.
+      throw last ? Object.assign(new Error(`${last.message} (${blocked})`), {cause: last}) : new Error(blocked);
+    }
     if (choice.profile_id !== input.profile_id || choice.timeline_id !== input.timeline_id
       || typeof choice.candidate_id !== 'string' || failed.includes(choice.candidate_id)) {
       throw new Error('The planner returned a mismatched or already failed candidate.');
