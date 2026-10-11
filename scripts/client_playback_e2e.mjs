@@ -18,6 +18,11 @@
 // launch flags, so its main process (client_playback_electron_main.mjs) runs
 // the same scenario through a webContents/DevTools adapter.
 //
+// Scratch media must not be indexed (macOS Spotlight): indexing writes
+// extended attributes, which changes ctime and therefore the server's file
+// fingerprint, and the server then correctly fences the source as changed.
+// Point TMPDIR at a directory whose name ends in .noindex.
+//
 // Not CI-ready: it needs FFmpeg, Playwright browsers and (for electron) the
 // apps/desktop dev dependencies. A check fails, or is "blocked" only when the
 // observed error is the documented Demuxe live-HLS limitation.

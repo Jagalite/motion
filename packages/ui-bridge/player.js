@@ -749,6 +749,9 @@ function close({unloading = false} = {}) {
     state.stopObserving = null;
     const writer = state.viewing;
     const owner = state.viewingOwner;
+    // This tab's player is giving up its session (navigation, failure or
+    // explicit close): the next player page here may treat it as its own.
+    if (writer && host) leaveHandoff(host.dataset, writer.session.id);
     state.viewing = null;
     state.viewingOwner = null;
     if (writer && state.element && state.generation) {
@@ -814,10 +817,7 @@ controls?.addEventListener('click', event => {
   })().catch(error => status(error.message, 'alert'));
 });
 
-addEventListener('pagehide', () => {
-  if (host && state.viewing) leaveHandoff(host.dataset, state.viewing.session.id);
-  void close({unloading: true});
-});
+addEventListener('pagehide', () => { void close({unloading: true}); });
 // Fragment navigation changes focus/scroll within the owned document.
 function leavesPlayerDocument(destination, currentUrl) {
   const next = new URL(destination, currentUrl);
