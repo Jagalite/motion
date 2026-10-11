@@ -241,3 +241,20 @@ func TestBackoffRemainsBoundedDuringProlongedOutage(t *testing.T) {
 		}
 	}
 }
+
+func TestCancellationWinsOverCompletedErrorResponse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempts := 0
+	c, _ := New("http://server.invalid", &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		attempts++
+		cancel()
+		return &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/problem+json"}}, Body: io.NopCloser(strings.NewReader(`{"status":503,"code":"busy","retryable":true}`))}, nil
+	})})
+	c.Token = func() string { return "credential" }
+	c.Sleep = func(context.Context, time.Duration) error { t.Fatal("cancelled request retried"); return nil }
+	_, err := c.Me(ctx)
+	if !errors.Is(err, context.Canceled) || attempts != 1 {
+		t.Fatalf("err=%v attempts=%d", err, attempts)
+	}
+}

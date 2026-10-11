@@ -152,7 +152,10 @@ func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error
 	attempts := max(c.MaxAttempts, 1)
 	for attempt := 0; ; attempt++ {
 		header, err := c.once(ctx, r, body, out)
-		if err == nil || attempt+1 >= attempts || !r.retrySafe() || ctx.Err() != nil {
+		if err != nil && ctx.Err() != nil {
+			return header, ctx.Err()
+		}
+		if err == nil || attempt+1 >= attempts || !r.retrySafe() {
 			return header, err
 		}
 		wait, retry := retryAfter(err, attempt)
