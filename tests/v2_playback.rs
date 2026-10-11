@@ -2868,6 +2868,18 @@ async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
             reply.bytes
         }
     };
+    // The master playlist describes the copied output itself: Main profile
+    // (0x4d), level 3.0 (0x1e) and AAC-LC, not the transcode recipe.
+    let master = String::from_utf8(get(format!("{base}/master.m3u8")).await).unwrap();
+    let codecs = master
+        .split("CODECS=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap();
+    assert!(
+        codecs.starts_with("avc1.4d") && codecs.ends_with("1e,mp4a.40.2"),
+        "{master}"
+    );
     let variant = String::from_utf8(get(format!("{base}/variants/main/index.m3u8")).await).unwrap();
     assert!(variant.contains("#EXT-X-TARGETDURATION:12\n"), "{variant}");
     let streams = fragment_streams(

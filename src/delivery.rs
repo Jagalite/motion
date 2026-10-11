@@ -656,7 +656,7 @@ async fn run_descriptor(
 
 /// Observe the details stream copy eligibility needs, before any admission
 /// transaction (a probe must not hold the database writer).
-pub(crate) async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
+async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
     let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(file_id)
         .fetch_optional(&app.db)
@@ -1885,6 +1885,37 @@ pub(crate) fn copy_candidate(
         .flatten()
 }
 
+/// Observe a source's bitstream details for a plan or replan. The probe holds
+/// an admission slot, so it is bounded together with admissions, and runs in an
+/// owned task: a cancelled request never leaves it without its deadline,
+/// kill and reap.
+pub(crate) async fn observe_copy_details(
+    app: &App,
+    file_id: &str,
+) -> Result<CopyDetails, ApiError> {
+    let slot = app
+        .processing
+        .deliveries
+        .admission_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admission_busy",
+                "Too many pending delivery admissions",
+            )
+        })?;
+    let app = app.clone();
+    let file_id = file_id.to_owned();
+    tokio::spawn(async move {
+        let _slot = slot;
+        probe_copy_details(&app, &file_id).await
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
 /// Whether the core live-route rule admits this copy with observed details.
 pub(crate) fn copy_supported(
     file: &db::ItemRow,
@@ -3098,6 +3129,37 @@ async fn streamed(
         }
     });
     Ok((stream_headers(content_type), body).into_response())
+}
+
+/// The codecs of a served generation's output, from its own init segment
+/// (`fmp4::codecs`). None when the init segment is unreadable or describes a
+/// codec configuration that is not understood.
+pub(crate) async fn init_codecs(
+    app: &App,
+    id: &str,
+    generation: &str,
+) -> Result<Option<String>, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        d.serves(generation, now) && d.generations[&generation].next_segment > 0
+    })
+    .await?;
+    let path = session.directory(app, generation).join("init.mp4");
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let _permit = permit;
+        let mut init = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(MAX_INIT_BYTES + 1)
+            .read_to_end(&mut init)
+            .ok()?;
+        (init.len() as u64 <= MAX_INIT_BYTES)
+            .then(|| crate::fmp4::codecs(&init))
+            .flatten()
+    })
+    .await
+    .map_err(ApiError::internal)
 }
 
 pub async fn init(

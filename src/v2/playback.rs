@@ -1097,9 +1097,10 @@ pub async fn plan(
             return Err(Problem::internal("copy observation without a candidate"));
         };
         drop(conn);
-        // A probe failure or an unqualified bitstream leaves only conversion;
-        // admission observes the details again under its own checks.
-        source.copy = match delivery::probe_copy_details(&app, &bound.file.id).await {
+        // A probe failure, a full admission queue or an unqualified bitstream
+        // leaves only conversion; admission observes the details again under
+        // its own checks.
+        source.copy = match delivery::observe_copy_details(&app, &bound.file.id).await {
             Ok(details)
                 if delivery::copy_supported(&bound.file, audio, route.operation(), &details) =>
             {
@@ -1548,7 +1549,7 @@ pub async fn change_delivery(
                     if claims.principal == caller.principal.id
                         && matches!(claims.route, Route::Remux | Route::AudioConvert) =>
                 {
-                    Some(delivery::probe_copy_details(&app, &claims.file).await)
+                    Some(delivery::observe_copy_details(&app, &claims.file).await)
                 }
                 _ => None,
             }
@@ -1820,11 +1821,18 @@ pub async fn master_playlist(
         .flatten()
         .find(|g| g.generation == generation && g.transport == "hls" && g.manifest_url.is_some())
         .ok_or_else(Problem::not_found)?;
-    // The pinned recipe: H.264 (<= 720p) with optional AAC stereo.
-    let codecs = if serving.audio_track.is_some() {
-        "avc1.64001f,mp4a.40.2"
+    // A stream copy keeps the source's H.264 profile/level and AAC object
+    // type: describe its own output. A transcode keeps its recipe's existing
+    // description (H.264 High, AAC-LC stereo).
+    let codecs = if matches!(serving.operation.as_str(), "remux" | "audio_convert") {
+        delivery::init_codecs(&app, &id, &generation)
+            .await
+            .map_err(stream_problem)?
+            .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
+    } else if serving.audio_track.is_some() {
+        "avc1.64001f,mp4a.40.2".into()
     } else {
-        "avc1.64001f"
+        "avc1.64001f".into()
     };
     let text = format!(
         "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"{codecs}\"\n{}\n",
