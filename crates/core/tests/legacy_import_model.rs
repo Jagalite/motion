@@ -14,7 +14,7 @@ struct State {
     changed: bool,
     session: bool,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Input {
     Repair,
     RollbackRepair,
@@ -103,6 +103,17 @@ impl Model for Repair {
             }
         }
         Ok(Transition::accepted(n, vec![true]))
+    }
+    fn check_state(&self, s: &State) -> Result<Vec<Check>, ModelError> {
+        let canonical = !s.changed || s.view.as_ref().is_some_and(|v| v.revision > 0);
+        Ok(vec![if canonical {
+            Check::passed("canonical_action_retains_revision")
+        } else {
+            Check::failed(
+                "canonical_action_retains_revision",
+                "canonical authority was lost",
+            )
+        }])
     }
     fn check_transition(
         &self,

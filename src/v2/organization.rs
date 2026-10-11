@@ -635,7 +635,7 @@ async fn collection_body(
         // Bound work even when the predicate matches no members. Filter scope
         // before admission so hidden works neither consume nor disclose this bound.
         let (clause, all, libraries) = scope_clause(scope, "f.library_id");
-        let candidates: Vec<String> = sqlx::query_scalar(&format!("SELECT i.id FROM items i WHERE i.id NOT IN (SELECT alias_id FROM item_aliases) AND (? OR NOT EXISTS(SELECT 1 FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE e.item_id=i.id AND f.generated=0) OR EXISTS(SELECT 1 FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE e.item_id=i.id AND f.generated=0 AND {clause})) ORDER BY i.title,i.id LIMIT 10001"))
+        let candidates: Vec<String> = sqlx::query_scalar(&format!("SELECT i.id FROM items i WHERE i.id NOT IN (SELECT alias_id FROM item_aliases) AND (? OR EXISTS(SELECT 1 FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE e.item_id=i.id AND {clause})) ORDER BY i.title,i.id LIMIT 10001"))
             .bind(all).bind(all).bind(libraries).fetch_all(&mut *conn).await?;
         if candidates.len() > 10000 {
             return Err(Problem::new(

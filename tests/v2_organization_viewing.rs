@@ -1344,14 +1344,18 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
         collection.body
     );
     assert_eq!(collection.body["item_ids"], json!([]));
+    // Hidden fileless works must not consume the visible-candidate budget.
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10001) INSERT INTO items(id,kind,title) SELECT 'bare-'||x,'film','Bare '||x FROM n")
+        .execute(&f.app.db).await.unwrap();
     // A hidden cut in the same edition must not affect visible membership.
+    sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) SELECT 'hidden-file','t-film',library_id,'hidden.mp4','r1','fp',1 FROM media_files WHERE id='f2'").execute(&f.app.db).await.unwrap();
     sqlx::query("INSERT INTO timelines(id,edition_id) VALUES ('hidden-cut','t-film')")
         .execute(&f.app.db)
         .await
         .unwrap();
     sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES ('hidden-version','hidden-cut','Hidden','original','declared'),('visible-version','t-film','Visible','original','declared')").execute(&f.app.db).await.unwrap();
-    sqlx::query("INSERT INTO version_files(version_id,file_id,file_revision,part) VALUES ('hidden-version','f2','r1',1),('visible-version','f1','r1',1)").execute(&f.app.db).await.unwrap();
-    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,manual_watched) VALUES ('default','hidden-cut',1)").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,file_id,file_revision,part) VALUES ('hidden-version','hidden-file','r1',1),('visible-version','f1','r1',1)").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,manual_watched,revision,updated_at) VALUES ('default','hidden-cut',1,1,1)").execute(&f.app.db).await.unwrap();
     // A legacy work row cannot affect canonical watched evaluation.
     sqlx::query("INSERT INTO viewing_state(profile_id,item_id,automatic_watched) VALUES ('default','film',1)").execute(&f.app.db).await.unwrap();
     let path = format!(
