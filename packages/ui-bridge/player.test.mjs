@@ -365,3 +365,36 @@ test('selected subtitles attach after open and unsupported players dispose the c
   await assert.rejects(prepare(generation, 0, () => true), /cannot present the selected subtitle/);
   assert.deepEqual(calls.map(x => x[0]), ['open', 'destroy', 'remove']);
 });
+
+test('provider observations do not require component runtime injection', () => {
+  const {lendRuntime} = runInNewContext(source.replace('export {close, maintainLease};', '({lendRuntime});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const catalog = {providers: {}};
+  const standalone = {};
+  lendRuntime(standalone, catalog);
+  assert.equal(Object.hasOwn(standalone, 'runtime'), false, 'do not invent a runtime property that the component ignores');
+  let borrowed;
+  const shared = {set runtime(value) { borrowed = value; }};
+  lendRuntime(shared, catalog);
+  assert.equal(borrowed, catalog, 'retain shared ownership when the component exposes it');
+});
+
+test('live generation opens without VOD startTime and verifies the public seek', async () => {
+  const openGeneration = runInNewContext(source.replace('export {close, maintainLease};', 'openGeneration;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  const calls = [];
+  const element = {player: {state: {currentTime: 0}},
+    async open(...args) { calls.push(args); },
+    async seek(time) { calls.push(['seek', time]); this.player.state.currentTime = time; }};
+  const generation = {transport: 'hls', manifest_url: '/live.m3u8', media_time_origin_ms: 40000};
+  await openGeneration(element, generation, 42500, 'http://localhost');
+  assert.equal(calls[0].length, 1);
+  assert.deepEqual(calls[1], ['seek', 2.5]);
+  element.seek = async () => { element.player.state.currentTime = 20; };
+  await assert.rejects(openGeneration(element, generation, 42500, 'http://localhost'), /requested generation position/);
+  calls.length = 0;
+  await openGeneration(element, {transport: 'http_range', media_url: '/file.mp4', media_time_origin_ms: 0}, 42500, 'http://localhost');
+  assert.equal(calls[0][1].startTime, 42.5);
+});
