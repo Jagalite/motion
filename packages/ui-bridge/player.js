@@ -853,7 +853,8 @@ controls?.addEventListener('submit', event => {
   void changePlayback({kind: 'seek', position_ms: position});
 });
 controls?.addEventListener('click', event => {
-  const action = event.target?.dataset?.playerAction;
+  // Buttons hold an icon and a label; the click may land on either.
+  const action = event.target?.closest?.('[data-player-action]')?.dataset.playerAction;
   // While a playback change is in progress the current player is fenced.
   if (!action || !state.element || state.changing) return;
   void (async () => {

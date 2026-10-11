@@ -5,7 +5,9 @@
 //      public API with CSRF, a stable idempotency key and If-Match, then
 //      reloads the server-rendered page;
 //   2. runs browser pairing from the sign-in page;
-//   3. switches the viewing profile among those the server rendered.
+//   3. switches the viewing profile among those the server rendered;
+//   4. lets "Back" links (a[data-back]) return through history, since an
+//      app installed to the home screen has no browser back button.
 
 const csrf = () => document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 const newKey = () => crypto.randomUUID().replaceAll('-', '');
@@ -179,4 +181,20 @@ document.addEventListener('change', event => {
   if (!(select instanceof HTMLSelectElement) || !select.dataset.profileSwitch) return;
   document.cookie = `${select.dataset.profileSwitch}=${encodeURIComponent(select.value)}; Path=/; SameSite=Strict`;
   location.reload();
+});
+
+// A back link uses history only when an earlier page of this tab was Motion's,
+// so it never leaves the app; otherwise it follows its server-rendered href.
+const visitedKey = 'motion:visited';
+let cameFromMotion = false;
+try {
+  cameFromMotion = sessionStorage.getItem(visitedKey) === '1';
+  sessionStorage.setItem(visitedKey, '1');
+} catch { /* storage unavailable: back links follow their href */ }
+document.addEventListener('click', event => {
+  const link = event.target?.closest?.('a[data-back="history"]');
+  if (!link || !cameFromMotion || event.defaultPrevented || event.button !== 0
+    || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  history.back();
 });
