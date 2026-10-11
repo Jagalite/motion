@@ -36,6 +36,11 @@ adapter acceptance remain required for the playback owner's pacing/recovery work
 
 ## Caller inventory and integration dependencies
 
+Clients owns conversion of every current client/script caller below. Service owners
+in the replacement column supply the adapter/interface dependencies; they are not
+a reassignment of client work. Package/upgrade execution remains coordinated by
+integration/release.
+
 | Current caller / entry point | Replacement / owner | Acceptance and disposition |
 |---|---|---|
 | `scripts/client.py` | `/api/v2/catalog/items`; Clients | Authenticated cursor tests; converted. |
@@ -63,7 +68,12 @@ This inventory does not claim their retirement.
 - `3b9411b`: installer tests 3/3. Actual core/provider composition succeeded.
 - `fdcc40b`: setup/provenance tests 2/2.
 - GPT-6.1 Sol reviewed `a44eb7d`, `590cb10`, `b843d83`: no actionable findings.
-  Further commit/final-diff review is recorded as it completes.
+  GPT-6.1 Sol also reviewed `3b9411b`, `fdcc40b` and the cumulative diff through
+  `fdcc40b` without actionable implementation findings. The reviewer requested
+  the caller-ownership clarification above; it is applied. Final cumulative code
+  review `2344d03..abaf4bf`, plus `f6d2f2d` and the qualification prose
+  corrections, found no actionable correctness issues. Review accepts this
+  bounded source slice only, not C07 or lane closure.
 
 Candidate core `1.1.1`, SHA-256
 `4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274`, and Shaka
