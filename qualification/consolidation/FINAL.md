@@ -93,3 +93,28 @@ uses Topcoat by default, and keeps legacy configuration values from reopening
 old routes. Historical service regressions have a test-only router; the new
 v2 media matrix, production default UI and retirement/no-mutation matrix use
 the actual production router. Cutover compilation and runtime tests are pending.
+
+
+### PR ancestry reconciliation: 2026-10-11
+
+Reconciled remote integration input `7339500a4993a737dde5089b0a8dbca5f4404b21`
+with main `38f80a9bbca47bb8dfdcc66a65aca139321cb7e6` after PR #17 merged
+there. PR #15 head `3c3c450dde41e2d94fcf1dfdafcba11fef4eb6b3` was already
+an ancestor of the integration input. Catalog feature head `69e0ff4` was also
+already included. The remaining #17 history consisted of release merge ancestry
+and `b46314d4d3c93dc6fd3561213f2dae12b80e8ae4`, a Kyoto variable instruction.
+The only merge conflict duplicated the existing shared-Kyoto setup instruction;
+the integration version retains that instruction below its example.
+
+The reconciliation changes no production, test, migration, provider or packaging
+bytes relative to the integration input. No build or runtime test is warranted
+for this ancestry/documentation-only change, and no prior receipt is promoted to
+final-head runtime qualification. PR #15's current head is fully preserved and
+can be closed as superseded after checking that its head has not advanced; PR #17
+is already merged. PR #18 remains the integration destination, not merged to main.
+The earlier checkpoint statements about PR merge status are historical.
+
+Outstanding gates remain exact-head combined CI, route-retirement runtime checks,
+source reconstruction, relocated installed-product acceptance, and the full
+player/restricted-grant/recovery matrix. Focused provider diagnostics do not erase
+previous live-startup/switching failures or close M0–M4.
