@@ -40,6 +40,10 @@ pub struct Settings {
     /// not qualified: source timestamp mapping and browser playback of copied
     /// streams are unverified, so they stay off unless explicitly enabled.
     pub experimental_copy_routes: bool,
+    /// Plan v2 live conversions on a VideoToolbox session when one is available
+    /// and admissible, falling back to software only by a new plan. Off until
+    /// the hardware output is qualified in the supported players.
+    pub experimental_live_hardware: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -53,6 +57,7 @@ impl Default for Settings {
             no_progress_timeout_seconds: None,
             expected_duration: None,
             experimental_copy_routes: false,
+            experimental_live_hardware: false,
         }
     }
 }

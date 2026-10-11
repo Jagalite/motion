@@ -1868,6 +1868,30 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
         && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
 }
 
+/// What a plan observes about live hardware encoding here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardwareState {
+    /// Not enabled (`experimental_live_hardware`), or no session can be opened.
+    Unavailable,
+    /// No interactive hardware session is admissible now.
+    Busy,
+    Available,
+}
+
+/// Observe live hardware encoding: the server setting, the cached VideoToolbox
+/// probe and current interactive hardware capacity.
+pub(crate) async fn hardware_live(app: &App) -> HardwareState {
+    if !app.processing.settings.experimental_live_hardware
+        || !crate::processing::videotoolbox_available(app).await
+    {
+        HardwareState::Unavailable
+    } else if app.processing.hardware.fits_now(Class::Interactive, 1) {
+        HardwareState::Available
+    } else {
+        HardwareState::Busy
+    }
+}
+
 /// The stream-copy operation a plan may consider for `file` with this audio
 /// stream, before its bitstream details are observed: copy routes enabled here,
 /// the live-route preconditions of `live_transcodable`, and the core's stream
@@ -2340,7 +2364,11 @@ pub(crate) async fn change_live(
                     validate_subtitle(&file, selection.subtitle)?;
                     pin(&file, selection.audio, selection.subtitle, operation, false)
                 }
-                Route::Transcode => {
+                Route::Transcode | Route::HardwareTranscode => {
+                    let hardware = selection.route == Route::HardwareTranscode;
+                    if hardware && hardware_live(app).await == HardwareState::Unavailable {
+                        return Err(backend_unavailable());
+                    }
                     validate_route(
                         &file,
                         selection.audio,
@@ -2354,20 +2382,35 @@ pub(crate) async fn change_live(
                         selection.audio,
                         selection.subtitle,
                         Operation::VideoTranscode,
-                        false,
+                        hardware,
                     )
                 }
             };
             (Some(basis), Some((timeline, pin)))
         }
     };
+    // The staged generation runs this pin: the replan's, or for a seek the
+    // newest generation's, copied unchanged.
+    let staged_hardware = match &replan {
+        Some((_, pin)) => pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+        None => {
+            let inner = session.inner.lock().unwrap();
+            let d = &inner.delivery;
+            d.pending
+                .or(d.active)
+                .and_then(|n| d.generations.get(&n))
+                .is_some_and(|g| g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE))
+        }
+    };
     let input = Input::Change {
         expected_generation,
         position_ms,
         replan,
-        // A byte route has no worker; a software transcode overlaps when
-        // another interactive worker is admissible now.
-        overlap: app.processing.execution.fits_now(Class::Interactive, 1),
+        // A byte route has no worker; a live route overlaps when another
+        // interactive worker (and, for a hardware encode, another hardware
+        // session) is admissible now.
+        overlap: app.processing.execution.fits_now(Class::Interactive, 1)
+            && (!staged_hardware || app.processing.hardware.fits_now(Class::Interactive, 1)),
         now_ms: app.processing.deliveries.now_ms(),
     };
     // The receipt is checked again and recorded under the same lock as the
@@ -2559,8 +2602,17 @@ async fn admit_owned(
         }
         _ => None,
     };
+    // A planned (v2) admission uses exactly its signed route's backend.
+    let backend = match &planned {
+        Some(p) if p.route == Route::HardwareTranscode => crate::processing::Backend::Videotoolbox,
+        Some(_) => crate::processing::Backend::Software,
+        None => r
+            .backend
+            .clone()
+            .unwrap_or(crate::processing::Backend::Software),
+    };
     // Probed once per process; outside the admission lock and the writer.
-    let hardware_ready = r.backend != Some(crate::processing::Backend::Videotoolbox)
+    let hardware_ready = backend != crate::processing::Backend::Videotoolbox
         || crate::processing::videotoolbox_available(app).await;
     let _admission = runtime.admission.lock().await;
     let mut transaction = db::begin_write(&app.db).await?;
@@ -2650,12 +2702,7 @@ async fn admit_owned(
     if !hardware_ready {
         return Err(backend_unavailable());
     }
-    let hardware = validate_backend(
-        operation,
-        r.backend
-            .as_ref()
-            .unwrap_or(&crate::processing::Backend::Software),
-    )?;
+    let hardware = validate_backend(operation, &backend)?;
     if copy_details
         .as_ref()
         .is_some_and(|d| d.revision != file.revision)

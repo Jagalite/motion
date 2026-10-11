@@ -115,13 +115,20 @@ pub async fn capabilities(
     playback.limits = BTreeMap::from([
         (
             "routes",
-            // Stream copy is advertised only where the server admits it.
-            if app.processing.settings.experimental_copy_routes {
-                "original,prepared,stream_copy_hls,software_hls"
-            } else {
-                "original,prepared,software_hls"
-            }
-            .into(),
+            // Live routes are advertised only where the server admits them.
+            {
+                let mut routes = vec!["original", "prepared"];
+                if app.processing.settings.experimental_copy_routes {
+                    routes.push("stream_copy_hls");
+                }
+                routes.push("software_hls");
+                if crate::delivery::hardware_live(&app).await
+                    != crate::delivery::HardwareState::Unavailable
+                {
+                    routes.push("hardware_hls");
+                }
+                routes.join(",")
+            },
         ),
         ("timeline_binding", "whole_single_part".into()),
         ("subtitles", "embedded_plain_text_original_webvtt".into()),

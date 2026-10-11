@@ -31,6 +31,9 @@ pub enum Route {
     AudioConvert,
     /// A live HLS conversion of the original with exactly the selected streams.
     Transcode,
+    /// The same conversion on a hardware encoder session. Never falls back to
+    /// software within a delivery; a failure is reported and replanned.
+    HardwareTranscode,
 }
 impl Route {
     pub fn operation(self) -> Operation {
@@ -39,7 +42,7 @@ impl Route {
             Route::Prepared => Operation::Prepared,
             Route::Remux => Operation::Remux,
             Route::AudioConvert => Operation::AudioConvert,
-            Route::Transcode => Operation::VideoTranscode,
+            Route::Transcode | Route::HardwareTranscode => Operation::VideoTranscode,
         }
     }
     /// The stream-copy route for a copy operation.
@@ -53,7 +56,9 @@ impl Route {
     pub fn transport(self) -> &'static str {
         match self {
             Route::Original | Route::Prepared => "http_range",
-            Route::Remux | Route::AudioConvert | Route::Transcode => "hls",
+            Route::Remux | Route::AudioConvert | Route::Transcode | Route::HardwareTranscode => {
+                "hls"
+            }
         }
     }
     /// Candidate identities are stable for one file and route, so a client
@@ -67,6 +72,7 @@ impl Route {
             Route::Remux => "r",
             Route::AudioConvert => "c",
             Route::Transcode => "t",
+            Route::HardwareTranscode => "h",
         };
         if file_id.len() <= 126 {
             format!("{prefix}-{file_id}")
@@ -96,6 +102,9 @@ pub struct SourceFacts {
     /// Live stream copy of the selected streams. A copy keeps the source video,
     /// so `within_budget` is also its budget.
     pub copy: StreamCopy,
+    /// A hardware encoder for the conversion. Its recipe has the same output
+    /// bounds as the software one, so `conversion_within_budget` covers both.
+    pub hardware: Hardware,
     /// Stored renditions of this original whose output and source revisions
     /// are both still the registered ones (`renditions::available`), in the
     /// adapter's preference order (newest first).
@@ -113,6 +122,16 @@ pub enum StreamCopy {
     Unobserved(Route),
     /// The core live-route rule admits this copy route with observed details.
     Eligible(Route),
+}
+
+/// What the server observes about hardware encoding for a live conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hardware {
+    /// Not enabled here, or no hardware encoder session could be opened.
+    Unavailable,
+    /// Available, but no interactive hardware session is admissible now.
+    Busy,
+    Available,
 }
 
 /// Facts about one revision-valid prepared rendition.
@@ -172,9 +191,10 @@ pub enum Plan {
 /// Convert prefers a prepared rendition over a live conversion and never plays
 /// the original or a copy of its video. A live route is also needed to honor
 /// an explicit stream choice. Strict Original never converts, and a pinned
-/// prepared version is never widened. A failed copy falls back to conversion;
-/// a failed conversion never falls back to anything. Nothing here starts
-/// processing.
+/// prepared version is never widened. A failed copy falls back to conversion.
+/// A conversion uses an available hardware encoder first; a failed or busy
+/// one falls back to software, and a failed software conversion ends the
+/// plan. Nothing here starts processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
     let byte = request.range && !request.explicit_streams;
@@ -225,13 +245,14 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
 }
 
 fn transcode(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
-    let failed = request
-        .failed
-        .contains(&Route::Transcode.candidate_id(file_id));
+    let failed = |route: Route| request.failed.contains(&route.candidate_id(file_id));
     match () {
         _ if !source.transcodable => Plan::Blocked("no_live_route"),
         _ if !source.conversion_within_budget => Plan::Blocked("conversion_exceeds_quality_limit"),
-        _ if failed => Plan::Blocked("all_candidates_failed"),
+        _ if source.hardware == Hardware::Available && !failed(Route::HardwareTranscode) => {
+            Plan::Ready(Route::HardwareTranscode)
+        }
+        _ if failed(Route::Transcode) => Plan::Blocked("all_candidates_failed"),
         _ => Plan::Ready(Route::Transcode),
     }
 }
@@ -438,6 +459,7 @@ mod tests {
             transcodable: true,
             conversion_within_budget: true,
             copy: StreamCopy::Ineligible,
+            hardware: Hardware::Unavailable,
             prepared: vec![],
         }
     }
@@ -700,6 +722,7 @@ mod tests {
             Route::Remux,
             Route::AudioConvert,
             Route::Transcode,
+            Route::HardwareTranscode,
         ];
         for route in routes {
             assert_eq!(route.candidate_id(&long), route.candidate_id(&long));
@@ -963,5 +986,59 @@ mod tests {
         ] {
             assert_eq!(Route::copy(operation), None);
         }
+    }
+
+    #[test]
+    fn conversion_prefers_an_available_hardware_session_and_falls_back_to_software() {
+        let mut s = source(Support::Unsupported);
+        s.hardware = Hardware::Available;
+        for mode in [Mode::Auto, Mode::Convert] {
+            assert_eq!(
+                plan("f", &s, &request(mode)),
+                Plan::Ready(Route::HardwareTranscode)
+            );
+        }
+        // A failed hardware attempt is never offered again; software follows.
+        let mut failed = request(Mode::Auto);
+        failed.failed = vec![Route::HardwareTranscode.candidate_id("f")];
+        assert_eq!(plan("f", &s, &failed), Plan::Ready(Route::Transcode));
+        failed.failed.push(Route::Transcode.candidate_id("f"));
+        assert_eq!(
+            plan("f", &s, &failed),
+            Plan::Blocked("all_candidates_failed")
+        );
+        // Busy or unavailable hardware converts in software.
+        for hardware in [Hardware::Busy, Hardware::Unavailable] {
+            s.hardware = hardware;
+            assert_eq!(
+                plan("f", &s, &request(Mode::Auto)),
+                Plan::Ready(Route::Transcode)
+            );
+        }
+        // Hardware is still a conversion: limits and capability apply alike.
+        s.hardware = Hardware::Available;
+        s.conversion_within_budget = false;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Blocked("conversion_exceeds_quality_limit")
+        );
+        s.conversion_within_budget = true;
+        s.transcodable = false;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Blocked("no_live_route")
+        );
+        // An eligible copy still comes before any conversion.
+        s.transcodable = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Remux)
+        );
+        assert_eq!(
+            Route::HardwareTranscode.operation(),
+            Operation::VideoTranscode
+        );
+        assert_eq!(Route::HardwareTranscode.transport(), "hls");
     }
 }

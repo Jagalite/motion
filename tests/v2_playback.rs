@@ -46,18 +46,19 @@ impl Server {
     /// over the same directory is a restart: deliveries are recovered as
     /// interrupted; viewing state is durable.
     async fn start(dir: &Path, key: [u8; 32]) -> Self {
-        Self::start_with(dir, key, false).await
+        Self::start_with(dir, key, Default::default()).await
     }
 
-    /// `copy_routes` enables the live stream-copy routes.
-    async fn start_with(dir: &Path, key: [u8; 32], copy_routes: bool) -> Self {
+    async fn start_with(
+        dir: &Path,
+        key: [u8; 32],
+        settings: playscale::processing::Settings,
+    ) -> Self {
         let db = db::connect(&dir.join("db.sqlite")).await.unwrap();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let mut processing =
-            playscale::processing::Runtime::new(dir.join("cache"), Default::default());
+        let mut processing = playscale::processing::Runtime::new(dir.join("cache"), settings);
         processing.supervisor = env!("CARGO_BIN_EXE_playscale").into();
-        processing.settings.experimental_copy_routes = copy_routes;
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
             db,
@@ -148,10 +149,18 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::with_copy_routes(false).await
+        Self::with_settings(Default::default()).await
     }
 
     async fn with_copy_routes(copy_routes: bool) -> Self {
+        Self::with_settings(playscale::processing::Settings {
+            experimental_copy_routes: copy_routes,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn with_settings(settings: playscale::processing::Settings) -> Self {
         // The first launch of a freshly linked supervisor can be slow (macOS
         // assessment); warm it untimed so leases are not consumed by it.
         let warm = Command::new(env!("CARGO_BIN_EXE_playscale"))
@@ -163,7 +172,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("media")).unwrap();
         let key = playscale::v2::auth::random_key();
-        let server = Server::start_with(dir.path(), key, copy_routes).await;
+        let server = Server::start_with(dir.path(), key, settings).await;
         let library = db::add_library(&server.app.db, "Movies", &dir.path().join("media"))
             .await
             .unwrap()
@@ -183,8 +192,8 @@ impl Fixture {
     /// Stop this server and start another over the same state.
     async fn restart(&mut self) {
         self.server.stop.cancel();
-        let copy_routes = self.server.app.processing.settings.experimental_copy_routes;
-        self.server = Server::start_with(self.dir.path(), self.key, copy_routes).await;
+        let settings = self.server.app.processing.settings.clone();
+        self.server = Server::start_with(self.dir.path(), self.key, settings).await;
     }
 
     fn media(&self, name: &str, args: &[&str]) {
@@ -3080,4 +3089,152 @@ async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
         playback["limits"]["routes"],
         "original,prepared,software_hls"
     );
+}
+
+/// The routes a server advertises in its playback capability.
+async fn advertised_routes(f: &Fixture, auth: &str) -> Value {
+    let caps = f.get("/api/v2/system/capabilities", auth).await;
+    caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()["limits"]["routes"]
+        .clone()
+}
+
+/// Hardware conversion is planned as its own candidate when VideoToolbox is
+/// enabled, available and admissible; it runs Apple's encoder, a planned
+/// replan can move the delivery to software, a failed hardware candidate falls
+/// back to software, and both sessions are released on close.
+#[tokio::test(flavor = "multi_thread")]
+async fn hardware_conversion_is_planned_when_available_and_falls_back_to_software() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        experimental_live_hardware: true,
+        ..Default::default()
+    })
+    .await;
+    if !playscale::processing::videotoolbox_available(&f.server.app).await {
+        assert!(
+            std::env::var_os("MOTION_REQUIRE_VIDEOTOOLBOX").is_none(),
+            "MOTION_REQUIRE_VIDEOTOOLBOX is set but the VideoToolbox probe failed"
+        );
+        eprintln!("SKIPPED: no VideoToolbox encoder session on this host");
+        return;
+    }
+    two_audio_mp4(&f, "120");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let file = f.source().await["file_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        advertised_routes(&f, &auth).await,
+        "original,prepared,software_hls,hardware_hls"
+    );
+    let plan = |failed: &[String]| {
+        let mut input = plan_input("default", &timeline, "convert", None, &["hls"]);
+        input["failed_candidate_ids"] = json!(failed);
+        input
+    };
+    let hardware = f
+        .post("/api/v2/playback/plans", &auth, None, plan(&[]))
+        .await;
+    assert_eq!(hardware.status, StatusCode::OK, "{}", hardware.body);
+    assert_eq!(hardware.body["operation"], "video_transcode");
+    assert_eq!(hardware.body["candidate_id"], format!("h-{file}"));
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-hardware-0001"),
+            json!({"plan_token": hardware.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let segment = |generation: &str| {
+        let auth = auth.clone();
+        let f = &f;
+        let path = format!("/api/v2/streams/{id}/{generation}/segments/0.m4s");
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    // libx264 writes its settings into an SEI message; VideoToolbox does not.
+    let x264 = |bytes: &[u8]| bytes.windows(4).any(|w| w == b"x264");
+    assert!(
+        !x264(&segment("1").await),
+        "hardware output came from libx264"
+    );
+    assert_eq!(f.server.app.processing.hardware.snapshot().used, 1);
+
+    // The client moves the delivery to software with a new plan.
+    let software = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan(&[format!("h-{file}")]),
+        )
+        .await;
+    assert_eq!(
+        software.body["candidate_id"],
+        format!("t-{file}"),
+        "{}",
+        software.body
+    );
+    let staged = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("replan-to-software-1"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":software.body["plan_token"],"position_ms":30000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["pending"]["status"] == "ready" || d["pending"]["status"] == "failed"
+        })
+        .await;
+    assert_eq!(ready["pending"]["status"], "ready", "{ready}");
+    assert!(
+        x264(&segment("2").await),
+        "software output must come from libx264"
+    );
+    let exhausted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan(&[format!("h-{file}"), format!("t-{file}")]),
+        )
+        .await;
+    assert_eq!(exhausted.body["reason_codes"][0], "all_candidates_failed");
+    let closed = f
+        .call("DELETE", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.hardware.snapshot().used != 0
+            || f.server.app.processing.execution.snapshot().used != 0
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("hardware and CPU capacity were not released");
 }

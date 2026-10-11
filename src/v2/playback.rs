@@ -1050,6 +1050,11 @@ pub async fn plan(
         Some(route) => core::StreamCopy::Unobserved(route),
         None => core::StreamCopy::Ineligible,
     };
+    let hardware = match delivery::hardware_live(&app).await {
+        delivery::HardwareState::Unavailable => core::Hardware::Unavailable,
+        delivery::HardwareState::Busy => core::Hardware::Busy,
+        delivery::HardwareState::Available => core::Hardware::Available,
+    };
     let mut source = core::SourceFacts {
         available: original_available && bound.file.available,
         client_support: client_support(&bound.file, &input.client, audio, require_sdr),
@@ -1078,6 +1083,7 @@ pub async fn plan(
             None,
         ),
         copy,
+        hardware,
     };
     let request = core::Request {
         mode,

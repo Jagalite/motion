@@ -6,7 +6,7 @@
 //! function only calls the production `playback_session::plan`. Prepared
 //! renditions are covered by unit tests and are not part of this model.
 use playscale_core::playback::{Mode, Support};
-use playscale_core::playback_session::{self as core, Plan, Route, StreamCopy};
+use playscale_core::playback_session::{self as core, Hardware, Plan, Route, StreamCopy};
 use serde::{Deserialize, Serialize};
 use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
@@ -35,6 +35,14 @@ struct Config {
     copy: Option<Route>,
     /// Ground truth the observation reveals: bitstream details qualify the copy.
     details_qualify: bool,
+    /// The observed hardware encoder state.
+    hardware: HardwareFact,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum HardwareFact {
+    Unavailable,
+    Busy,
+    Available,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Outcome {
@@ -85,6 +93,11 @@ fn facts(c: &Config, copy: Option<Observed>) -> core::SourceFacts {
             (Some(route), Some(Observed::Eligible)) => StreamCopy::Eligible(route),
             _ => StreamCopy::Ineligible,
         },
+        hardware: match c.hardware {
+            HardwareFact::Unavailable => Hardware::Unavailable,
+            HardwareFact::Busy => Hardware::Busy,
+            HardwareFact::Available => Hardware::Available,
+        },
         prepared: vec![],
     }
 }
@@ -112,8 +125,8 @@ impl Model for Selection {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.route-selection".into(),
-            model_version: 1,
-            properties_version: 1,
+            model_version: 2,
+            properties_version: 2,
             codec_version: 1,
             build: include_str!("../src/playback_session.rs").into(),
         }
@@ -223,6 +236,8 @@ impl Model for Selection {
             Outcome::Ready(c.copy.unwrap())
         } else if !c.transcodable {
             Outcome::Blocked("no_live_route".into())
+        } else if c.hardware == HardwareFact::Available && !failed(Route::HardwareTranscode) {
+            Outcome::Ready(Route::HardwareTranscode)
         } else if failed(Route::Transcode) {
             Outcome::Blocked("all_candidates_failed".into())
         } else {
@@ -254,6 +269,17 @@ impl Model for Selection {
                     || s.copy == Some(Observed::Ineligible),
             ),
             check(
+                "software_conversion_only_without_an_available_unfailed_hardware_session",
+                !matches!(outcome, Outcome::Ready(Route::Transcode))
+                    || c.hardware != HardwareFact::Available
+                    || failed(Route::HardwareTranscode),
+            ),
+            check(
+                "hardware_only_when_observed_available",
+                !matches!(outcome, Outcome::Ready(Route::HardwareTranscode))
+                    || c.hardware == HardwareFact::Available,
+            ),
+            check(
                 "strict_original_never_streams_live",
                 c.mode != ModeFact::Original
                     || matches!(
@@ -277,22 +303,29 @@ impl Enumerate for Selection {
             let mut configs = vec![];
             for mode in [ModeFact::Auto, ModeFact::Convert, ModeFact::Original] {
                 for copy in [None, Some(Route::Remux), Some(Route::AudioConvert)] {
-                    for bits in 0..64u8 {
-                        let bit = |i: u8| bits & (1 << i) != 0;
-                        // Details only matter when a copy is named.
-                        if copy.is_none() && bit(5) {
-                            continue;
+                    for hardware in [
+                        HardwareFact::Unavailable,
+                        HardwareFact::Busy,
+                        HardwareFact::Available,
+                    ] {
+                        for bits in 0..64u8 {
+                            let bit = |i: u8| bits & (1 << i) != 0;
+                            // Details only matter when a copy is named.
+                            if copy.is_none() && bit(5) {
+                                continue;
+                            }
+                            configs.push(Input::Configure(Config {
+                                mode,
+                                original_supported: bit(0),
+                                explicit_streams: bit(1),
+                                hls: bit(2),
+                                within_budget: bit(3),
+                                transcodable: bit(4),
+                                copy,
+                                details_qualify: bit(5),
+                                hardware,
+                            }));
                         }
-                        configs.push(Input::Configure(Config {
-                            mode,
-                            original_supported: bit(0),
-                            explicit_streams: bit(1),
-                            hls: bit(2),
-                            within_budget: bit(3),
-                            transcodable: bit(4),
-                            copy,
-                            details_qualify: bit(5),
-                        }));
                     }
                 }
             }
@@ -354,8 +387,9 @@ fn route_selection_prefers_qualified_copies_observes_lazily_and_never_reoffers_f
     );
     println!(
         "route-selection model: {} states, {} transitions; three modes, remux/audio-convert/no \
-         copy, qualified or unqualified details, HLS, limits, conversion capability, explicit \
-         streams and client support, with repeated failure reports",
+         copy, qualified or unqualified details, unavailable/busy/available hardware, HLS, \
+         limits, conversion capability, explicit streams and client support, with repeated \
+         failure reports",
         report.states, report.transitions
     );
 }
