@@ -238,3 +238,34 @@ reconstruction receipt and both 13-check package receipts. The reconstructed
 provider identity matches the qualified `2fa508f` deployment. This is a passing
 combined checkpoint; `2d2c006` and the final composition still require their own
 exact-head CI before integration.
+
+
+### Final local candidate: `2d2c006`
+
+Kyoto `f10b63227d2a4fa8a7c66692db652a76` built the clean candidate successfully.
+Archive SHA-256 is
+`29acbc6224e353c6b6d3fcaaef638e2b0ebe3da09a61248bad3c8f292e7f6810`;
+installed server SHA-256 is
+`f794a6d0d20aaf5b2e48b6a3ca226b74dbcb60e7c8168e9da3e4473249a01e3e`.
+The provider bytes retain the qualified `4d968b37…` identity.
+
+- `installed-2d2c006.json`: all 13 relocated-package checks and all 15 real
+  installed Electron/Go/TUI checks passed without manual intervention.
+- `electron-player-2d2c006.json`: all 30 player matrix checks passed on the
+  final installed server/provider, including outage/restart and conversion.
+- `playable-next-2d2c006.json`: public ordering of existing playable timelines
+  preserves bindings/history and rejects stale retries. Electron clicks the
+  actual Next control, selects the ordered timeline, and advances converted
+  playback from 0.55 to 3.42 seconds.
+- The T3 Chromium Next repetition was interrupted by preview-host disconnection.
+  It is incomplete, not a pass or a product failure. Earlier Chromium provider,
+  no-history and causal-revocation receipts remain valid only for their recorded
+  inputs. Integration/release owns this final repetition when the host returns.
+- GPT-6.1 Sol source/evidence review and all 17 catalog HTTP tests pass. Local
+  format, contract parity/structure and publication checks pass. The forthcoming
+  final PR head still needs exact-head CI; inspect the linked PR checks before
+  merging rather than treating the earlier `a476c0e` green run as final proof.
+
+The final candidate is a qualified consolidation slice, not blanket M0–M4
+closure. Remaining milestone deliverables and accountable owners above are not
+waived. WebKit remains explicitly deferred by the user.

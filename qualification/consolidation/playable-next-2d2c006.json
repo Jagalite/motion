@@ -1,0 +1,171 @@
+{
+  "kind": "public-playable-order-acceptance",
+  "group": "ce308043-5857-4bbb-bfde-be91aae98c28",
+  "groupRevision": "3",
+  "before": [
+    {
+      "timeline": "294307f4-991d-4c49-a8cd-a9f6c9729f76",
+      "versions": [
+        "45351647-49c3-48b6-ae90-b0a0940c8d01"
+      ],
+      "history": {
+        "manual_epoch": "0",
+        "manual_watched": null,
+        "position_ms": 73452,
+        "profile_id": "default",
+        "revision": "30",
+        "session_id": "3b30802d-4726-4abb-ae99-520ebf5ccfe2",
+        "timeline_id": "294307f4-991d-4c49-a8cd-a9f6c9729f76",
+        "watched": false
+      }
+    },
+    {
+      "timeline": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "versions": [
+        "db9d433d-e65b-4e5b-9889-d66a77cad5fc"
+      ],
+      "history": {
+        "manual_epoch": "0",
+        "manual_watched": null,
+        "position_ms": 15297,
+        "profile_id": "default",
+        "revision": "66",
+        "session_id": "90a888ef-f218-471a-be29-0b69ffde44c3",
+        "timeline_id": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+        "watched": true
+      }
+    }
+  ],
+  "next": [
+    {
+      "duration_ms": null,
+      "edition_id": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "id": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "item_id": "2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "order_group_id": "ce308043-5857-4bbb-bfde-be91aae98c28",
+      "order_position": 2,
+      "revision": "4",
+      "version_ids": [
+        "db9d433d-e65b-4e5b-9889-d66a77cad5fc"
+      ]
+    }
+  ],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/catalog/items/b234098c-b2a5-4e8c-a6f3-77ed74b937a7",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/order-groups",
+      "status": 201
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76/viewing",
+      "status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/catalog/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76/order",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76/viewing",
+      "status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/catalog/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76/order",
+      "status": 412
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/order-groups",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/timelines/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0/viewing",
+      "status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/catalog/timelines/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0/order",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0/viewing",
+      "status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/catalog/timelines/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0/order",
+      "status": 412
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/order-groups",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/294307f4-991d-4c49-a8cd-a9f6c9729f76/next",
+      "status": 200
+    }
+  ],
+  "result": "passed",
+  "source_commit": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db",
+  "server_binary_sha256": "f794a6d0d20aaf5b2e48b6a3ca226b74dbcb60e7c8168e9da3e4473249a01e3e",
+  "electron": {
+    "source_commit": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db",
+    "kind": "installed-server-electron-public-next",
+    "result": "passed",
+    "from": "294307f4-991d-4c49-a8cd-a9f6c9729f76",
+    "to": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+    "ready": {
+      "state": "ready",
+      "text": ""
+    },
+    "selected": {
+      "url": "/play/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "state": "ready",
+      "text": ""
+    },
+    "start": 0.547774,
+    "final": {
+      "time": 3.418672,
+      "status": "playing",
+      "mode": "native",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.130 Electron/44.7.0 Safari/537.36"
+    }
+  },
+  "script_sha256": {
+    "motion-playable-next.mjs": "f20c1733faaffa6d74e44780cd383e860e8e380607fbc26f163732d0c9c2dbb9",
+    "motion-next-electron.cjs": "3cc6ab98d00863f7e184a3077d8ec6318a7bd57f27448003c05599c80ae216af"
+  },
+  "scope": "Existing playable timelines in one reviewed merged work; broader cross-work episode hierarchy remains open. API preserves bindings/history and rejects stale retries. Electron clicks actual Next and advances selected conversion playback. T3 Chromium repeat interrupted by preview host disconnection."
+}

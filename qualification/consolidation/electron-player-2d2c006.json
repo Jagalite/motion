@@ -1,0 +1,617 @@
+{
+  "started": "2026-10-11T15:15:44.790Z",
+  "kind": "production-evidence",
+  "server": {
+    "binary": "Motion.app/Contents/Resources/motion-server",
+    "sha256": "f794a6d0d20aaf5b2e48b6a3ca226b74dbcb60e7c8168e9da3e4473249a01e3e",
+    "source_commit": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db"
+  },
+  "demuxe": {
+    "version": "1.1.1",
+    "archive_sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274",
+    "deployment": "motion-paced-derivative",
+    "providers": [],
+    "composer_sha256": null,
+    "receipt_sha256": "8216c1eb4a9be02f0bd27cc2ebad7c3ff80196fbb0de92d5295fe0952637da20",
+    "manifest_sha256": "451d8176e1b0d8cd278ec5a1824c85cca1ec1532e69250804164cb09c226af95"
+  },
+  "source": {
+    "role": "harness-worktree",
+    "commit": "f5af281b48e423436cb0b9e228a066882908ed8f",
+    "dirty": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "engines": {
+    "electron": {
+      "versions": {
+        "electron": "44.7.0",
+        "chromium": "152.0.7977.130"
+      },
+      "checks": [
+        {
+          "name": "browser session from paired credential",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200
+          }
+        },
+        {
+          "name": "item page shows viewing state and Play",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "play": "/play/05a475a0-f4d5-4966-9115-6bc260bc8568"
+          }
+        },
+        {
+          "name": "original plan selects byte-range original",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "original",
+            "status": "ready",
+            "candidate": "o-f122df15-261f-439b-acb3-fb11ae08e049",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "player ready",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "state": "ready",
+            "text": ""
+          }
+        },
+        {
+          "name": "original playback advances",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "advancing": true,
+            "from": 0.02,
+            "to": 3.160116,
+            "logical": 3.2,
+            "mode": "native"
+          }
+        },
+        {
+          "name": "original bytes served by range",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            206,
+            206,
+            206,
+            206
+          ]
+        },
+        {
+          "name": "seek replaces the generation at 40 s",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "seek": {
+              "replaced": true,
+              "logical": 40,
+              "players": 1
+            },
+            "seekPlay": {
+              "advancing": true,
+              "from": 40.029121,
+              "to": 42.081822,
+              "logical": 42.1,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "seek staged and activated generation 2",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "POST 0c7ef31c-2dd4-4fc3-9e15-7ad12ef2a3ab/events 200",
+            "POST 1b88de7c-6279-4c89-ba3f-a902b2357475/changes 202",
+            "POST 0c7ef31c-2dd4-4fc3-9e15-7ad12ef2a3ab/events 200",
+            "POST 2/activate 200",
+            "POST 0c7ef31c-2dd4-4fc3-9e15-7ad12ef2a3ab/events 200",
+            "POST 0c7ef31c-2dd4-4fc3-9e15-7ad12ef2a3ab/events 200"
+          ]
+        },
+        {
+          "name": "progress persisted on the server",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "manual_epoch": "0",
+            "manual_watched": null,
+            "position_ms": 48627,
+            "profile_id": "default",
+            "revision": "9",
+            "session_id": "0c7ef31c-2dd4-4fc3-9e15-7ad12ef2a3ab",
+            "timeline_id": "05a475a0-f4d5-4966-9115-6bc260bc8568",
+            "watched": false
+          }
+        },
+        {
+          "name": "ordered viewing events accepted with consecutive sequences",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "1:200",
+            "2:200",
+            "3:200",
+            "4:200",
+            "5:200",
+            "6:200",
+            "7:200",
+            "8:200"
+          ]
+        },
+        {
+          "name": "item page offers Resume at the saved position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "label": "Resume"
+          }
+        },
+        {
+          "name": "resume starts at the saved position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "resumed": {
+              "ready": {
+                "state": "ready",
+                "text": ""
+              },
+              "resume": 48627
+            },
+            "resumedPlay": {
+              "advancing": true,
+              "from": 48.632147,
+              "to": 49.641237,
+              "logical": 49.6,
+              "mode": "native"
+            },
+            "saved": 48627
+          }
+        },
+        {
+          "name": "audio selector lists both tracks of the planned version",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "",
+            "a0",
+            "a1"
+          ]
+        },
+        {
+          "name": "audio switch replans to a live HLS conversion",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "hls",
+            "operation": "video_transcode",
+            "status": "ready",
+            "candidate": "t-f122df15-261f-439b-acb3-fb11ae08e049",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a1"
+          }
+        },
+        {
+          "name": "HLS manifest, variant, init and segments served",
+          "status": "pass",
+          "gap": null,
+          "detail": [
+            "2/master.m3u8 200",
+            "2/variants/main/index.m3u8 200",
+            "2/variants/main/init.mp4 200",
+            "2/segments/1.m4s 200",
+            "2/segments/2.m4s 200",
+            "2/segments/0.m4s 200",
+            "2/segments/3.m4s 200"
+          ]
+        },
+        {
+          "name": "audio switch replaces the player over HLS and keeps position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "before": 49.6,
+            "switched": {
+              "options": [
+                "",
+                "a0",
+                "a1"
+              ],
+              "replaced": true,
+              "logical": 49.7,
+              "players": 1
+            },
+            "switchedPlay": {
+              "advancing": true,
+              "from": 0.081374,
+              "to": 2.347359,
+              "logical": 52,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "an event sent during the outage is queued in the durable outbox",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "queued": {
+              "position_ms": 53213,
+              "status": "paused",
+              "delivery_generation": "2",
+              "event_id": "e6a55570c16940b98a94db6d47063c20",
+              "sequence": "7"
+            }
+          }
+        },
+        {
+          "name": "the queued event is accepted after restart with its original identity",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "queued": {
+              "position_ms": 53213,
+              "status": "paused",
+              "delivery_generation": "2",
+              "event_id": "e6a55570c16940b98a94db6d47063c20",
+              "sequence": "7"
+            },
+            "drained": {
+              "status": 200,
+              "request": {
+                "position_ms": 53213,
+                "status": "paused",
+                "delivery_generation": "2",
+                "event_id": "e6a55570c16940b98a94db6d47063c20",
+                "sequence": "7"
+              }
+            },
+            "server": 53270
+          }
+        },
+        {
+          "name": "after restart the player reopens at durable progress",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "durable": 53270,
+            "afterReady": 53270,
+            "admissionStart": 53270,
+            "afterRestart": {
+              "ready": {
+                "state": "ready",
+                "text": ""
+              },
+              "resume": 53270,
+              "banner": ""
+            },
+            "restartPlay": {
+              "advancing": true,
+              "from": 53.272127,
+              "to": 55.34633,
+              "logical": 55.3,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "after restart the cookie session authorizes playback",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "sessionStarts": [
+              201
+            ],
+            "errors": []
+          }
+        },
+        {
+          "name": "a prepared rendition is produced by a real v2 preparation",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 202,
+            "phase": "completed"
+          }
+        },
+        {
+          "name": "Convert plans the prepared rendition by byte range",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "prepared",
+            "status": "ready",
+            "candidate": "p-2d6781d5-840a-4554-9014-27ed770952df",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "versionSwitch": {
+              "replaced": true,
+              "logical": 56.8,
+              "players": 1
+            },
+            "switchPlay": {
+              "advancing": true,
+              "from": 56.869341,
+              "to": 58.9135,
+              "logical": 58.9,
+              "mode": "native"
+            },
+            "beforeSwitch": 56.8,
+            "rebound": 200,
+            "delivery": "f6d1e806-6e48-46a9-95a3-40b1066f04d2",
+            "previous": "e6567abb-8df6-4862-89d3-84e1b43e03c5"
+          }
+        },
+        {
+          "name": "the predecessor delivery is retired after the switch",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200,
+            "state": "closed"
+          }
+        },
+        {
+          "name": "progress continues on the rebound session",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "events": [
+              "4:56829",
+              "5:56830",
+              "6:61833",
+              "7:66479"
+            ],
+            "position": 66479,
+            "beforeSwitch": 56.8
+          }
+        },
+        {
+          "name": "leaving the player retires its own delivery",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "product": "f6d1e806-6e48-46a9-95a3-40b1066f04d2",
+            "retired": "not observed",
+            "after": 200,
+            "state": "closed",
+            "elapsedMs": 5119
+          }
+        },
+        {
+          "name": "home continue watching matches server viewing state",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "listed": true,
+            "watched": false,
+            "position": 66479
+          }
+        },
+        {
+          "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "hls",
+            "operation": "video_transcode",
+            "status": "ready",
+            "candidate": "t-031192a9-a496-4d7e-a02a-9f3480832900",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "converted title plays in the Motion player",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "legacyReady": {
+              "state": "ready",
+              "text": ""
+            },
+            "legacyPlay": {
+              "advancing": true,
+              "from": 0.016825,
+              "to": 3.130085,
+              "logical": 3.1,
+              "mode": "native"
+            }
+          }
+        },
+        {
+          "name": "diagnostic: server live HLS conversion in a plain video element",
+          "status": "diagnostic-pass",
+          "gap": null,
+          "detail": {
+            "plan": "hls",
+            "admitted": 201,
+            "played": true,
+            "currentTime": 4.038239,
+            "width": 640,
+            "height": 360,
+            "error": null
+          }
+        },
+        {
+          "name": "candidate setup and browser traffic use v2",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "legacyRequests": [],
+            "setupRequests": [
+              {
+                "method": "GET",
+                "path": "/api/v2/libraries?limit=10"
+              },
+              {
+                "method": "POST",
+                "path": "/api/v2/auth/pairings"
+              },
+              {
+                "method": "POST",
+                "path": "/api/v2/auth/pairings/b0c9f6bf-5f30-4b6c-8fb7-bedcb39e93a9/approve"
+              },
+              {
+                "method": "POST",
+                "path": "/api/v2/auth/pairings/b0c9f6bf-5f30-4b6c-8fb7-bedcb39e93a9/claim"
+              },
+              {
+                "method": "PUT",
+                "path": "/api/v2/devices/c88d25b8-5beb-4de1-82b6-e40eb9356bd0/policy"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/catalog/items?limit=50"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/catalog/items/771ca2c9-7cd1-499e-a80d-1791d34332fc/timelines?limit=5"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/catalog/items/969f435f-3b01-487e-a452-50dd898a6e62/timelines?limit=5"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/playback/delivery-sessions/e6567abb-8df6-4862-89d3-84e1b43e03c5"
+              },
+              {
+                "method": "POST",
+                "path": "/api/v2/processing/preparations"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/jobs/7979da49-38d2-434e-9a0e-295b3062cadb"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/playback/delivery-sessions/e6567abb-8df6-4862-89d3-84e1b43e03c5"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/playback/delivery-sessions/f6d1e806-6e48-46a9-95a3-40b1066f04d2"
+              },
+              {
+                "method": "GET",
+                "path": "/api/v2/profiles/default/timelines/05a475a0-f4d5-4966-9115-6bc260bc8568/viewing"
+              }
+            ]
+          }
+        }
+      ],
+      "serverStartsMs": [
+        600,
+        110
+      ],
+      "retainedWork": "motion-e2e-electron-H6hHNZ",
+      "summary": {
+        "pass": 30,
+        "blocked": 0,
+        "fail": 0
+      }
+    }
+  },
+  "electronExecutableSha256": "6c7bfa625e72ad31e564b262c916aa6a9d5b88f570dea195dec52255e9c6305d",
+  "finished": "2026-10-11T15:16:52.872Z",
+  "result": "qualified",
+  "raw_receipt_sha256": "f98fe2516fd378de2238d014528299695a189cf5012d1dbcab449771aab5cb53",
+  "path_normalization": "Installed binary and retained-work paths normalized; raw receipt digest retained."
+}
