@@ -190,6 +190,10 @@ impl Fixture {
                 .await
                 .unwrap();
         }
+        sqlx::query("INSERT INTO item_origins(item_id,title) SELECT id,title FROM items")
+            .execute(&self.app.db)
+            .await
+            .unwrap();
         shows
     }
 
@@ -1317,4 +1321,50 @@ async fn replays_are_redacted_for_the_current_catalog_scope() {
     .await
     .unwrap();
     assert_eq!(after, before + 1);
+}
+
+#[tokio::test]
+async fn smart_members_use_authorized_canonical_timeline_watched_state() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    f.seed().await;
+    let device = f
+        .restricted(
+            &["default"],
+            &["collections:write", "catalog:read", "viewing:write"],
+            &[&f.library],
+        )
+        .await;
+    let filter=f.post("/api/v2/catalog/filters",&device,"smart-watched-filter1",json!({"name":"Watched","profile_id":"default","all":[{"field":"watched","operator":"eq","value":true}]})).await;
+    assert_eq!(filter.status, StatusCode::CREATED, "{}", filter.body);
+    let collection=f.post("/api/v2/collections",&device,"smart-watched-create1",json!({"name":"Watched","profile_id":"default","kind":"smart","item_ids":[],"filter_id":filter.body["id"]})).await;
+    assert_eq!(
+        collection.status,
+        StatusCode::CREATED,
+        "{}",
+        collection.body
+    );
+    assert_eq!(collection.body["item_ids"], json!([]));
+    // A legacy work row cannot affect canonical watched evaluation.
+    sqlx::query("INSERT INTO viewing_state(profile_id,item_id,automatic_watched) VALUES ('default','film',1)").execute(&f.app.db).await.unwrap();
+    let path = format!(
+        "/api/v2/collections/{}",
+        collection.body["id"].as_str().unwrap()
+    );
+    let read = f
+        .call("GET", &path, None, &[("authorization", &device)])
+        .await;
+    assert_eq!(read.body["item_ids"], json!([]));
+    let watched = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/timelines/t-film/viewing",
+            Some(json!({"manual_watched":true,"reset_position":false})),
+            &[("authorization", &device), ("if-match", "\"r-0\"")],
+        )
+        .await;
+    assert_eq!(watched.status, StatusCode::OK, "{}", watched.body);
+    let read = f
+        .call("GET", &path, None, &[("authorization", &device)])
+        .await;
+    assert_eq!(read.body["item_ids"], json!(["film"]));
 }

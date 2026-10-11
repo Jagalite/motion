@@ -1411,3 +1411,81 @@ async fn metadata_refresh_is_durable_replayable_and_cancelled_before_publication
         .await;
     assert_eq!(metadata.body["values"]["title"], "Local title");
 }
+
+#[tokio::test]
+async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let file = f._dir.path().join("media/Film (2001).nfo");
+    std::fs::write(&file, "<broken>").unwrap();
+    let job = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/film-a/metadata/refresh",
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-failure-001"),
+            ],
+        )
+        .await;
+    assert_eq!(job.status, StatusCode::ACCEPTED);
+    let id = job.body["id"].as_str().unwrap();
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    let state = f
+        .call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+        .await;
+    assert_eq!(state.body["phase"], "failed");
+    std::fs::write(&file, "<movie><title>Recovered title</title></movie>").unwrap();
+    sqlx::query("CREATE TRIGGER fail_metadata BEFORE INSERT ON metadata_documents WHEN NEW.source='nfo' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END").execute(&f.app.db).await.unwrap();
+    let path = format!("/api/v2/jobs/{id}/retry");
+    assert_eq!(
+        f.call(
+            "POST",
+            &path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-retry-00001")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert!(
+        playscale::metadata_jobs::run_one(&f.app).await.unwrap(),
+        "publication failure is a job failure, not a worker failure"
+    );
+    assert_eq!(
+        f.call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+            .await
+            .body["phase"],
+        "failed"
+    );
+    sqlx::query("DROP TRIGGER fail_metadata")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call(
+            "POST",
+            &path,
+            None,
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "metadata-retry-00002")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert!(playscale::metadata_jobs::run_one(&f.app).await.unwrap());
+    assert_eq!(
+        f.call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+            .await
+            .body["phase"],
+        "completed"
+    );
+}

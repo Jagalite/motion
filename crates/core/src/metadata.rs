@@ -247,3 +247,33 @@ mod revision_tests {
         assert_eq!(item_revision([u64::MAX]), None);
     }
 }
+
+/// A bounded refresh is complete only when every requested observation was
+/// usable and still current at publication. Zero observations proves nothing.
+pub fn refresh_complete(
+    observed: usize,
+    unusable: usize,
+    current: usize,
+    authorized: bool,
+) -> bool {
+    authorized && observed > 0 && unusable == 0 && current == observed
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    #[test]
+    fn refresh_requires_complete_current_authorized_observations() {
+        for observed in 0..=3 {
+            for unusable in 0..=3 {
+                for current in 0..=3 {
+                    for authorized in [false, true] {
+                        assert_eq!(
+                            super::refresh_complete(observed, unusable, current, authorized),
+                            authorized && observed > 0 && unusable == 0 && current == observed
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

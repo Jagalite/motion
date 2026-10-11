@@ -41,6 +41,15 @@ impl Status {
     }
 }
 
+/// A work is watched when any of its alternative timelines is effectively
+/// watched. Watching one cut does not copy its progress/manual override to
+/// another. No timelines or no watched timelines means unwatched.
+pub fn work_watched(timelines: impl IntoIterator<Item = (bool, Option<bool>)>) -> bool {
+    timelines
+        .into_iter()
+        .any(|(automatic, manual)| manual.unwrap_or(automatic))
+}
+
 /// The durable viewing state of one profile on one timeline.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct View {

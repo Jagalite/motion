@@ -419,22 +419,37 @@ pub async fn load_collection(
 
 /// Facts a filter may observe, from effective metadata and the profile's
 /// viewing state.
-async fn facts(db: &SqlitePool, profile: &str, item: &str) -> Result<Facts, OrgError> {
+pub(crate) async fn facts_in(
+    db: &mut SqliteConnection,
+    profile: &str,
+    item: &str,
+    scope: &playscale_core::access::CatalogScope,
+) -> Result<Facts, OrgError> {
+    let all = matches!(scope, playscale_core::access::CatalogScope::All);
+    let ids = match scope {
+        playscale_core::access::CatalogScope::Libraries(ids) => serde_json::to_string(ids)?,
+        _ => "[]".into(),
+    };
     let (kind, title, available): (String, String, bool) = sqlx::query_as(
-        "SELECT coalesce(s.media_type,'unclassified'),i.title,EXISTS(SELECT 1 FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=i.id AND f.available=1 AND f.generated=0) FROM items i LEFT JOIN item_structure s ON s.item_id=i.id WHERE i.id=?",
+        "SELECT coalesce(s.media_type,'unclassified'),i.title,EXISTS(SELECT 1 FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=i.id AND f.available=1 AND f.generated=0 AND (?1 OR f.library_id IN (SELECT source_id FROM library_sources WHERE library_id IN (SELECT value FROM json_each(?2))))) FROM items i LEFT JOIN item_structure s ON s.item_id=i.id WHERE i.id=?3",
     )
+    .bind(all)
+    .bind(&ids)
     .bind(item)
-    .fetch_one(db)
+    .fetch_one(&mut *db)
     .await?;
-    let metadata = crate::metadata::load(db, item)
+    let documents = crate::metadata::documents(db, item)
         .await
-        .map_err(|_| OrgError::Storage(anyhow::anyhow!("metadata unavailable")))?;
-    let watched: Option<(bool, Option<bool>)> = sqlx::query_as(
-        "SELECT automatic_watched,manual_watched FROM viewing_state WHERE profile_id=? AND item_id=?",
+        .map_err(OrgError::Storage)?;
+    let metadata = playscale_core::metadata::resolve(&documents.docs);
+    let watched: Vec<(bool, Option<bool>)> = sqlx::query_as(
+        "SELECT v.automatic_watched,v.manual_watched FROM timeline_viewing v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE v.profile_id=? AND e.item_id=? AND (? OR EXISTS(SELECT 1 FROM media_files f WHERE f.edition_id=e.id AND f.library_id IN (SELECT source_id FROM library_sources WHERE library_id IN (SELECT value FROM json_each(?)))))",
     )
     .bind(profile)
     .bind(item)
-    .fetch_optional(db)
+    .bind(all)
+    .bind(&ids)
+    .fetch_all(&mut *db)
     .await?;
     let strings = |key: &str| -> Vec<String> {
         metadata
@@ -456,7 +471,7 @@ async fn facts(db: &SqlitePool, profile: &str, item: &str) -> Result<Facts, OrgE
         person_ids: strings("person_ids"),
         tags: metadata.tags.into_iter().collect(),
         available,
-        watched: watched.is_some_and(|(automatic, manual)| manual.unwrap_or(automatic)),
+        watched: playscale_core::timeline_viewing::work_watched(watched),
     })
 }
 
@@ -481,7 +496,16 @@ pub async fn members(db: &SqlitePool, profile: &str, id: &str) -> Result<Vec<Str
     .await?;
     let mut out = Vec::new();
     for (_, item) in candidates {
-        if org::matches(&filter.all, &facts(db, profile, &item).await?) {
+        if org::matches(
+            &filter.all,
+            &facts_in(
+                &mut *db.acquire().await?,
+                profile,
+                &item,
+                &playscale_core::access::CatalogScope::All,
+            )
+            .await?,
+        ) {
             out.push(item);
         }
     }

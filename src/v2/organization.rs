@@ -626,8 +626,31 @@ struct CollectionBody {
 async fn collection_body(
     conn: &mut SqliteConnection,
     scope: &CatalogScope,
-    c: service::Collection,
+    mut c: service::Collection,
 ) -> Result<(CollectionBody, u64), Problem> {
+    if c.kind == CollectionKind::Smart {
+        let filter = service::load_filter(conn, c.filter_id.as_deref().unwrap_or_default())
+            .await?
+            .ok_or_else(Problem::not_found)?;
+        let candidates:Vec<String>=sqlx::query_scalar("SELECT id FROM items WHERE id NOT IN (SELECT alias_id FROM item_aliases) ORDER BY title,id").fetch_all(&mut *conn).await?;
+        let hidden = hidden_items(conn, scope, &candidates).await?;
+        for item in candidates {
+            if hidden.contains(&item) {
+                continue;
+            }
+            let facts = service::facts_in(conn, &c.profile_id, &item, scope).await?;
+            if playscale_core::organization::matches(&filter.all, &facts) {
+                c.item_ids.push(item);
+                if c.item_ids.len() > 1000 {
+                    return Err(Problem::new(
+                        StatusCode::CONFLICT,
+                        "collection_too_large",
+                        "Smart collection exceeds 1000 members; narrow the filter",
+                    ));
+                }
+            }
+        }
+    }
     let hidden = hidden_items(conn, scope, &c.item_ids).await?;
     Ok((
         CollectionBody {

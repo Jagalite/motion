@@ -9,7 +9,7 @@ use playscale_core::{
     access::{self, Permission, Principal},
     jobs::{self, Effect, Input, Job},
 };
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{Acquire, SqliteConnection, SqlitePool};
 
 pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
     let mut tx = crate::db::begin_write(db).await?;
@@ -105,11 +105,35 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
         }
         Err(_) => false,
     };
-    let success = observed.is_ok() && permitted;
-    let (next, effects) = jobs::transition(&current, Input::Finished { attempt, success });
-    if matches!(effects.as_slice(),[Effect::Publish {attempt:a}] if *a==attempt) {
-        crate::nfo::publish_refresh_in(&mut tx, &item, &observed?).await?;
+    // Provisional writes live in a savepoint until core confirms completeness.
+    // Any unusable/stale input or adapter error rolls back the entire refresh.
+    let mut success = false;
+    if permitted && current.executing(attempt) {
+        if let Ok(observed) = &observed {
+            let unusable = observed
+                .iter()
+                .filter(|(_, s)| matches!(s, crate::nfo::Sidecar::Unusable))
+                .count();
+            let mut publication = tx.begin().await?;
+            match crate::nfo::publish_refresh_in(&mut publication, &item, observed).await {
+                Ok(count)
+                    if playscale_core::metadata::refresh_complete(
+                        observed.len(),
+                        unusable,
+                        count,
+                        permitted,
+                    ) =>
+                {
+                    publication.commit().await?;
+                    success = true;
+                }
+                _ => {
+                    publication.rollback().await?;
+                }
+            }
+        }
     }
+    let (next, _) = jobs::transition(&current, Input::Finished { attempt, success });
     sqlx::query("UPDATE metadata_jobs SET phase=?,error=? WHERE id=?")
         .bind(crate::db::phase_name(next.phase))
         .bind((!success).then_some("refresh_unavailable_or_unauthorized"))

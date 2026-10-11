@@ -1754,6 +1754,7 @@ async fn scan_followup_reports_eligible_attempt_and_decimal_counters() {
 
 #[tokio::test]
 async fn public_structure_writes_preserve_revisions_and_retry_identity() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let f = Fixture::new().await;
     let auth = bearer(OPERATOR);
     f.item("film", "Film", &[(&f.a, "r1")]).await;
@@ -1807,6 +1808,14 @@ async fn public_structure_writes_preserve_revisions_and_retry_identity() {
     let file = &files.body["items"][0];
     assert!(file["size_bytes"].is_string());
     assert!(file.get("relative_path").is_none());
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-ed",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
     let id = timeline.body["id"].as_str().unwrap();
     let version = json!({"timeline_id":id,"label":"Original","files":[{"file":{"file_id":file["id"],"file_revision":file["revision"]},"part":1,"start_ms":null,"end_ms":null}],"timeline_equivalence":"declared"});
     let path = format!("/api/v2/catalog/timelines/{id}/versions");
