@@ -63,5 +63,7 @@ jobs:
             artifacts/release/SHA256SUMS
             artifacts/package-test/receipt.json
             artifacts/source-rebuild/receipt.json
+            artifacts/source-rebuild/installed/receipt.json
+            artifacts/source-rebuild/reconstructed/Motion/motion-package.json
             artifacts/source-rebuild/build.log
           compression-level: 0

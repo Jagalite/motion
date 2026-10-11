@@ -5,11 +5,10 @@ Build-bearing: local invocations must be submitted through the shared Kyoto queu
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import tarfile
-import tomllib
+import sys
 
 
 def sha(path):
@@ -37,23 +36,37 @@ def check(archive, manifest_path, work):
         for name, expected_hash in manifest['source_files'].items():
             if sha(root / name) != expected_hash:
                 raise ValueError(f'Source archive hash mismatch: {name}')
-        channel = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
-        toolchain = ['rustup', 'run', channel]
-        compiler = subprocess.check_output(
-            ['rustup', 'which', '--toolchain', channel, 'rustc'], cwd=root, text=True).strip()
-        build_env = {**os.environ, 'RUSTC': compiler}
-        command = [*toolchain, 'cargo', 'build', '--release', '--locked', '--workspace',
-                   '--target-dir', str(work / 'target')]
-        receipt['command'] = command
-        receipt['rustc'] = subprocess.check_output([compiler, '-vV'], cwd=root, text=True)
-        receipt['compiler_selection'] = 'RUSTC explicitly set to rustup which --toolchain ' + channel + ' rustc'
+        # Exercise the shipped assembly recipe outside Git, including Go,
+        # Electron, media tools and the player derivative. A Rust-only rebuild
+        # cannot establish provenance for the installed one-app distribution.
+        output = work / 'reconstructed'
+        command = [sys.executable, str(root / 'scripts/package_app.py'),
+                   '--source-manifest', str(manifest_path), '--output', str(output),
+                   '--cache', str(work / 'inputs'), '--media-tools', str(work / 'media-tools'),
+                   '--jobs', '2']
+        receipt['command'] = ['python3', 'motion/scripts/package_app.py',
+                              '--source-manifest', 'original/motion-package.json',
+                              '--output', 'reconstructed', '--cache', 'inputs',
+                              '--media-tools', 'media-tools', '--jobs', '2']
         with (work / 'build.log').open('w') as log:
-            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, env=build_env, check=True)
-        binary = work / 'target/release/playscale'
-        receipt['binary_sha256'] = sha(binary)
-        receipt['binary_smoke'] = '--help'
-        receipt['help_sha256'] = hashlib.sha256(
-            subprocess.check_output([str(binary), '--help'], cwd=root)).hexdigest()
+            subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
+        rebuilt_path = output / 'Motion/motion-package.json'
+        rebuilt = json.loads(rebuilt_path.read_text())
+        for field in ('source_commit', 'source_dirty', 'source_files', 'packaging_lock_sha256'):
+            if rebuilt[field] != manifest[field]:
+                raise ValueError('Reconstructed provenance differs: ' + field)
+        if rebuilt['demuxe']['provider_identity'] != manifest['demuxe']['provider_identity']:
+            raise ValueError('Reconstructed player provider identity differs')
+        receipt['reconstructed_manifest_sha256'] = sha(rebuilt_path)
+        receipt['package_sha256'] = sha(output / 'Motion-macos-arm64.tar.gz')
+        receipt['provider_identity'] = rebuilt['demuxe']['provider_identity']
+        receipt['products'] = ['motion-server', 'motion-ui-host', 'Go CLI/TUI',
+                               'Electron', 'FFmpeg/FFprobe', 'Demuxe/Shaka derivative']
+        acceptance = work / 'installed'
+        subprocess.run([sys.executable, str(root / 'scripts/test_package.py'),
+                        str(output / 'Motion-macos-arm64.tar.gz'), '--work', str(acceptance)],
+                       cwd=root, check=True)
+        receipt['installed_receipt_sha256'] = sha(acceptance / 'receipt.json')
         receipt['status'] = 'passed'
     finally:
         (work / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
