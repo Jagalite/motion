@@ -375,6 +375,12 @@ test('selected subtitles attach after open and unsupported players dispose the c
   assert.deepEqual(calls.map(x => x[0]), ['open', 'text']);
   assert.equal(calls[1][1].src, 'https://motion.test/api/v2/streams/d/1/subtitles.vtt');
   assert.equal(calls[1][1].default, true);
+  // A live generation that starts mid-timeline presents its own media-time sidecar.
+  calls.length = 0;
+  await prepare({...generation, media_time_origin_ms: 12000, subtitles_url: '/api/v2/streams/d/2/subtitles.vtt'},
+    12000, () => true);
+  assert.deepEqual(calls.map(x => x[0]), ['open', 'text']);
+  assert.equal(calls[1][1].src, 'https://motion.test/api/v2/streams/d/2/subtitles.vtt');
   supported = false; calls.length = 0;
   await assert.rejects(prepare(generation, 0, () => true), /cannot present the selected subtitle/);
   assert.deepEqual(calls.map(x => x[0]), ['open', 'destroy', 'remove']);

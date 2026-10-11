@@ -2661,13 +2661,59 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
         .status,
         StatusCode::UNAUTHORIZED
     );
+    // A live conversion carries the selected subtitle too, served in the
+    // generation's media time: cue times minus its media time origin.
     input["quality"]["mode"] = json!("convert");
     input["client"]["transports"] = json!(["hls"]);
+    let converted = f
+        .post("/api/v2/playback/plans", &auth, None, input.clone())
+        .await;
     assert_eq!(
-        f.post("/api/v2/playback/plans", &auth, None, input.clone())
-            .await
-            .body["reason_codes"][0],
-        "subtitle_conversion_unavailable"
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    let live = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("text-subtitle-live-delivery"),
+            json!({"plan_token":converted.body["plan_token"],"start_ms":2000}),
+        )
+        .await;
+    assert_eq!(live.status, StatusCode::CREATED, "{}", live.body);
+    let live_id = live.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&live_id, &auth, |d| {
+            d["active"]["subtitles_url"].is_string()
+        })
+        .await;
+    let origin = ready["active"]["media_time_origin_ms"].as_u64().unwrap();
+    assert!(origin > 1000 && origin < 3000, "{ready}");
+    let captions = f
+        .get(ready["active"]["subtitles_url"].as_str().unwrap(), &auth)
+        .await;
+    assert_eq!(captions.status, StatusCode::OK, "{}", captions.body);
+    let text = String::from_utf8(captions.bytes).unwrap();
+    let expected = format!(
+        "00:00:00.000 --> 00:00:0{}.{:03}",
+        (3000 - origin) / 1000,
+        (3000 - origin) % 1000
+    );
+    assert!(
+        text.contains(&expected) && text.contains("Selected caption"),
+        "{expected}\n{text}"
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{live_id}"),
+            None,
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
     );
     input["quality"]["mode"] = json!("original");
     input["client"]["transports"] = json!(["http_range"]);

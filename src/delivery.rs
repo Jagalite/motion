@@ -3237,7 +3237,30 @@ pub async fn subtitles(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let generation = generation_number(&generation)?;
+    serve_subtitles(&app, &id, &generation, false).await
+}
+
+/// The v2 sidecar of a generation's selected subtitle, in that generation's
+/// media time (core `subtitles::shift_webvtt`): cue times minus the
+/// generation's `media_time_origin_ms`, so a live generation that starts
+/// mid-timeline presents its subtitles where its media presents its video.
+pub(crate) async fn subtitles_in_media_time(
+    app: &App,
+    id: &str,
+    generation: &str,
+) -> Result<Response, ApiError> {
+    serve_subtitles(app, id, generation, true).await
+}
+
+async fn serve_subtitles(
+    app: &App,
+    id: &str,
+    generation: &str,
+    media_time: bool,
+) -> Result<Response, ApiError> {
+    let app = app.clone();
+    let id = id.to_owned();
+    let generation = generation_number(generation)?;
     let pinned = |d: &Delivery, now| {
         d.serves(generation, now) && pinned_subtitle(&d.generations[&generation].pin).is_some()
     };
@@ -3266,8 +3289,30 @@ pub async fn subtitles(
     ))
     .await
     .map_err(ApiError::internal)??;
-    let (_, permit) = admit_stream(&app, &id, pinned).await?;
-    streamed(permit, path, "text/vtt; charset=utf-8").await
+    let (session, permit) = admit_stream(&app, &id, pinned).await?;
+    let origin = media_time
+        .then(|| {
+            let inner = session.inner.lock().unwrap();
+            inner
+                .delivery
+                .generations
+                .get(&generation)
+                .map(|g| g.media_time_origin_ms)
+        })
+        .flatten()
+        .unwrap_or(0);
+    if origin == 0 {
+        return streamed(permit, path, "text/vtt; charset=utf-8").await;
+    }
+    let shifted = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let text = std::fs::read_to_string(path).ok()?;
+        playscale_core::subtitles::shift_webvtt(&text, origin)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(subtitles_unavailable)?;
+    Ok((stream_headers("text/vtt; charset=utf-8"), shifted).into_response())
 }
 
 /// Largest sidecar accepted from the converter.

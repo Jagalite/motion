@@ -27,6 +27,7 @@ pub mod revision;
 pub mod scan;
 pub mod search;
 pub mod sources;
+pub mod subtitles;
 pub mod timeline_viewing;
 pub mod viewing;
 pub mod watch;

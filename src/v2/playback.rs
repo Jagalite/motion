@@ -1135,7 +1135,9 @@ pub async fn plan(
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
         core::Plan::Observe => return Err(Problem::internal("undecided plan")),
     };
-    if subtitle.is_some() && route != Route::Original {
+    // Selected text subtitles come from the original; a prepared rendition is
+    // another file (the core never chooses one when a subtitle is selected).
+    if subtitle.is_some() && route == Route::Prepared {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
     let expires_at = now() + core::PLAN_TTL_SECONDS;
@@ -1860,7 +1862,7 @@ pub async fn generation_subtitles(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
-    delivery::subtitles(State(app), Path((id, generation)))
+    delivery::subtitles_in_media_time(&app, &id, &generation)
         .await
         .map_err(stream_problem)
 }
