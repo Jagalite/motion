@@ -31,6 +31,11 @@ def encoded(value):
     return (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
 
 
+def implementation_identity(artifacts, backend):
+    closure = {**artifacts, 'adapter/shaka-backend.js': digest(backend)}
+    return 'sha256:' + hashlib.sha256(encoded(closure)).hexdigest()
+
+
 def build(output, cache, source):
     if output.exists() or source.exists():
         raise ValueError('Choose fresh output and source-build directories')
@@ -61,6 +66,15 @@ def build(output, cache, source):
         if before.count(anchor) != 1:
             raise ValueError('Unexpected provider configuration site')
         backend.write_text(before.replace(anchor, "player.configure({ manifest: { hls: { motionPaced: source.format === 'hls' && source.streaming?.live === true } }, streaming: { observeQualityChanges: true"))
+        # Motion generations begin at media time zero. Preparing at Shaka's
+        # moving live edge can await an unproduced segment before Motion gets
+        # a chance to seek to its requested position. Only the same HLS path
+        # opted into motionPaced above starts at zero; DASH is unchanged.
+        load = "await player.load(source.url, undefined, source.format === 'hls' ? 'application/x-mpegurl' : 'application/dash+xml');"
+        configured = backend.read_text()
+        if configured.count(load) != 1:
+            raise ValueError('Unexpected provider startup site')
+        backend.write_text(configured.replace(load, "await player.load(source.url, source.format === 'hls' && source.streaming?.live === true ? 0 : undefined, source.format === 'hls' ? 'application/x-mpegurl' : 'application/dash+xml');"))
         assets = []
         for name, deployed in ASSETS.items():
             target = stage / 'web/vendor' / deployed
@@ -70,7 +84,12 @@ def build(output, cache, source):
             assets.append({'id': path, 'path': path, 'sha256': digest(target),
                            'bytes': target.stat().st_size, 'dependencies': []})
         artifacts = {'runtime/' + a['path']: a['sha256'] for a in assets}
-        identity = 'sha256:' + hashlib.sha256(encoded(artifacts)).hexdigest()
+        # The adapter's initial-position policy is part of this implementation,
+        # even when the compiled Shaka artifacts are byte-identical.
+        identity = implementation_identity(artifacts, backend)
+        subprocess.run(['node', '--experimental-vm-modules', '--test',
+                        str(ROOT / 'scripts/test_motion_provider_adapter.mjs')],
+                       env={**os.environ, 'MOTION_PROVIDER_BACKEND': str(backend)}, check=True)
         providers = [{'id': name, 'implementationIdentity': 'demuxe-browser-v1',
                       'technology': 'browser-native', 'delivery': ['browser', 'application-bundle'],
                       'applicationBuild': 'motion-demuxe-core-' + CORE_HASH,
@@ -99,7 +118,7 @@ def build(output, cache, source):
         notices.mkdir(parents=True)
         shutil.copy2(upstream / 'LICENSE', notices / 'LICENSE')
         shutil.copy2(patch, notices / 'motion-paced.patch')
-        (notices / 'MODIFICATIONS.txt').write_text('Motion derivative of Shaka 5.2.11: opt-in retained manifest bounds for paced conversions. See motion-paced.patch.\n')
+        (notices / 'MODIFICATIONS.txt').write_text('Motion derivative of Shaka 5.2.11: opt-in retained manifest bounds for paced conversions. The Demuxe Shaka adapter opts into paced HLS and starts generation preparation at media time zero. See motion-paced.patch and scripts/build_motion_provider.py in the source companion.\n')
         if inputs != {'core': digest(CORE), 'shaka_source': digest(archive),
                       'patch': digest(patch), 'builder': digest(Path(__file__))}:
             raise ValueError('Build inputs changed during compilation')
