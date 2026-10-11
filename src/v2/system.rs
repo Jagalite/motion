@@ -113,7 +113,16 @@ pub async fn capabilities(
     ]);
     let mut playback = feature("playback.v2", true, true);
     playback.limits = BTreeMap::from([
-        ("routes", "original,prepared,software_hls".into()),
+        (
+            "routes",
+            // Stream copy is advertised only where the server admits it.
+            if app.processing.settings.experimental_copy_routes {
+                "original,prepared,stream_copy_hls,software_hls"
+            } else {
+                "original,prepared,software_hls"
+            }
+            .into(),
+        ),
         ("timeline_binding", "whole_single_part".into()),
         ("subtitles", "embedded_plain_text_original_webvtt".into()),
         ("components", "embedded_revision_bound".into()),

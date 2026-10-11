@@ -139,6 +139,21 @@ pub fn sidecar_subtitle(codec: &str) -> bool {
     matches!(codec, "subrip" | "srt" | "mov_text" | "webvtt" | "text")
 }
 
+/// The stream-copy operation these streams would use, judged from stream facts
+/// alone: remux when the selected audio is AAC (or omitted), audio conversion
+/// otherwise. None when no bitstream details could make a copy eligible. The
+/// details still decide (`live_route_supported`); this only names the
+/// candidate before they are observed.
+pub fn copy_operation(s: &SourceStreams<'_>) -> Option<Operation> {
+    (!s.hdr && s.video == Some("h264") && s.starts_at_zero && s.eight_bit_420).then(|| {
+        if s.audio.is_none_or(|a| a == "aac") {
+            Operation::Remux
+        } else {
+            Operation::AudioConvert
+        }
+    })
+}
+
 /// Whether a live segmented route can serve these streams. Stream copy is only
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.
@@ -146,19 +161,17 @@ pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool
     if s.hdr || s.video.is_none() {
         return false;
     }
-    let copy = s.video == Some("h264")
-        && s.starts_at_zero
-        && s.eight_bit_420
-        && s.details.is_some_and(|d| {
-            COPY_PROFILES.contains(&d.profile)
-                && (1..=COPY_MAX_LEVEL).contains(&d.level)
-                && d.progressive
-                && !d.rotated
-        });
+    let details = s.details.is_some_and(|d| {
+        COPY_PROFILES.contains(&d.profile)
+            && (1..=COPY_MAX_LEVEL).contains(&d.level)
+            && d.progressive
+            && !d.rotated
+    });
     match operation {
         Operation::VideoTranscode => true,
-        Operation::Remux => copy && s.audio.is_none_or(|a| a == "aac"),
-        Operation::AudioConvert => copy && s.audio.is_some_and(|a| a != "aac"),
+        Operation::Remux | Operation::AudioConvert => {
+            details && copy_operation(s) == Some(operation)
+        }
         Operation::Original | Operation::Prepared => false,
     }
 }
@@ -1532,6 +1545,33 @@ mod tests {
             Operation::Remux,
             &detail("Constrained Baseline", 31, true, false)
         ));
+        // The candidate is named before details are observed, never decided by it.
+        let unobserved = |s: SourceStreams<'static>| SourceStreams { details: None, ..s };
+        assert_eq!(
+            copy_operation(&unobserved(h264_aac)),
+            Some(Operation::Remux)
+        );
+        assert_eq!(
+            copy_operation(&unobserved(streams(Some("h264"), None, false))),
+            Some(Operation::Remux)
+        );
+        assert_eq!(
+            copy_operation(&unobserved(h264_ac3)),
+            Some(Operation::AudioConvert)
+        );
+        for never in [
+            hevc,
+            offset,
+            ten_bit,
+            streams(Some("h264"), Some("aac"), true),
+        ] {
+            assert_eq!(copy_operation(&never), None);
+        }
+        // With details, copy_operation names exactly the supported copy route.
+        for s in [h264_aac, h264_ac3] {
+            let op = copy_operation(&s).unwrap();
+            assert!(live_route_supported(op, &s));
+        }
     }
 
     #[test]

@@ -46,12 +46,18 @@ impl Server {
     /// over the same directory is a restart: deliveries are recovered as
     /// interrupted; viewing state is durable.
     async fn start(dir: &Path, key: [u8; 32]) -> Self {
+        Self::start_with(dir, key, false).await
+    }
+
+    /// `copy_routes` enables the live stream-copy routes.
+    async fn start_with(dir: &Path, key: [u8; 32], copy_routes: bool) -> Self {
         let db = db::connect(&dir.join("db.sqlite")).await.unwrap();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let mut processing =
             playscale::processing::Runtime::new(dir.join("cache"), Default::default());
         processing.supervisor = env!("CARGO_BIN_EXE_playscale").into();
+        processing.settings.experimental_copy_routes = copy_routes;
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
             db,
@@ -142,6 +148,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_copy_routes(false).await
+    }
+
+    async fn with_copy_routes(copy_routes: bool) -> Self {
         // The first launch of a freshly linked supervisor can be slow (macOS
         // assessment); warm it untimed so leases are not consumed by it.
         let warm = Command::new(env!("CARGO_BIN_EXE_playscale"))
@@ -153,7 +163,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("media")).unwrap();
         let key = playscale::v2::auth::random_key();
-        let server = Server::start(dir.path(), key).await;
+        let server = Server::start_with(dir.path(), key, copy_routes).await;
         let library = db::add_library(&server.app.db, "Movies", &dir.path().join("media"))
             .await
             .unwrap()
@@ -173,7 +183,8 @@ impl Fixture {
     /// Stop this server and start another over the same state.
     async fn restart(&mut self) {
         self.server.stop.cancel();
-        self.server = Server::start(self.dir.path(), self.key).await;
+        let copy_routes = self.server.app.processing.settings.experimental_copy_routes;
+        self.server = Server::start_with(self.dir.path(), self.key, copy_routes).await;
     }
 
     fn media(&self, name: &str, args: &[&str]) {
@@ -2680,4 +2691,359 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
             "subtitle_format_unsupported"
         );
     }
+}
+
+/// A source eligible for stream copy: Main-profile H.264 with B-frames and a
+/// 2 s GOP, an AAC track (44.1 kHz) and an AC-3 track (48 kHz), every stream
+/// starting at zero. `level` overrides the H.264 level_idc.
+fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
+    f.media(
+        name,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-t",
+            "60",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-profile:v",
+            "main",
+            "-level:v",
+            level,
+            "-g",
+            "48",
+            "-keyint_min",
+            "48",
+            "-sc_threshold",
+            "0",
+            "-c:a:0",
+            "aac",
+            "-c:a:1",
+            "ac3",
+        ],
+    );
+}
+
+/// Streams of an init segment followed by one media segment.
+fn fragment_streams(f: &Fixture, name: &str, init: Vec<u8>, segment: Vec<u8>) -> Vec<Value> {
+    let fragment = f.dir.path().join(name);
+    std::fs::write(&fragment, [init, segment].concat()).unwrap();
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .arg(&fragment)
+        .output()
+        .unwrap();
+    let streams: Value = serde_json::from_slice(&probe.stdout).unwrap();
+    streams["streams"].as_array().unwrap().clone()
+}
+
+/// Copy routes the server admits are planned over the production router: the
+/// core asks for bitstream details before choosing one, a copy keeps the
+/// source video and timestamps from the preceding keyframe, a planned replan
+/// can move between copy routes, failures fall back to conversion, Convert
+/// never copies, and unqualified details or a disabled server only convert.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    copyable_mkv(&f, "film.mkv", "3.0");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let file = source["file_id"].as_str().unwrap().to_owned();
+    let caps = f.get("/api/v2/system/capabilities", &auth).await;
+    let playback = caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        playback["limits"]["routes"], "original,prepared,stream_copy_hls,software_hls",
+        "{playback}"
+    );
+    let plan = |mode: &str, audio: &str, failed: &[String]| {
+        let mut input = pinned_plan_input(
+            "default",
+            &timeline,
+            mode,
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        input["failed_candidate_ids"] = json!(failed);
+        input
+    };
+    let original = format!("o-{file}");
+
+    // The original byte route still wins when it can honor the request.
+    let direct = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a0", &[]),
+        )
+        .await;
+    assert_eq!(direct.body["operation"], "original", "{}", direct.body);
+    // After the client reports the original failed, the AAC track is copied.
+    let remux = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a0", std::slice::from_ref(&original)),
+        )
+        .await;
+    assert_eq!(remux.status, StatusCode::OK, "{}", remux.body);
+    assert_eq!(remux.body["operation"], "remux", "{}", remux.body);
+    assert_eq!(remux.body["transport"], "hls");
+    assert_eq!(remux.body["candidate_id"], format!("r-{file}"));
+    // Convert asks for converted video: never a copy.
+    let convert = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("convert", "a0", &[]),
+        )
+        .await;
+    assert_eq!(
+        convert.body["operation"], "video_transcode",
+        "{}",
+        convert.body
+    );
+
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-remux-000001"),
+            json!({"plan_token": remux.body["plan_token"], "start_ms": 31000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 31000
+        })
+        .await;
+    assert_eq!(ready["active"]["operation"], "remux", "{ready}");
+    // Segment 0 starts at the source keyframe before the request (2 s GOP).
+    assert_eq!(ready["active"]["available_start_ms"], 30000, "{ready}");
+    let base = format!("/api/v2/streams/{id}/1");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let variant = String::from_utf8(get(format!("{base}/variants/main/index.m3u8")).await).unwrap();
+    assert!(variant.contains("#EXT-X-TARGETDURATION:12\n"), "{variant}");
+    let streams = fragment_streams(
+        &f,
+        "remux.mp4",
+        get(format!("{base}/variants/main/init.mp4")).await,
+        get(format!("{base}/segments/0.m4s")).await,
+    );
+    let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+    assert_eq!(video["profile"], "Main", "video was re-encoded");
+    let audio: Vec<_> = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0]["codec_name"], "aac");
+    assert_eq!(audio[0]["sample_rate"], "44100", "the selected first track");
+
+    // Switching to the AC-3 track replans to an audio conversion that still
+    // copies the video.
+    let converted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &[]),
+        )
+        .await;
+    assert_eq!(
+        converted.body["operation"], "audio_convert",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["candidate_id"], format!("c-{file}"));
+    let staged = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("replan-audio-convert-1"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":converted.body["plan_token"],"position_ms":12000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    assert_eq!(staged.body["pending"]["operation"], "audio_convert");
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["pending"]["status"] == "ready" || d["pending"]["status"] == "failed"
+        })
+        .await;
+    assert_eq!(ready["pending"]["status"], "ready", "{ready}");
+    assert_eq!(ready["pending"]["available_start_ms"], 12000, "{ready}");
+    let base = format!("/api/v2/streams/{id}/2");
+    let streams = fragment_streams(
+        &f,
+        "audio-convert.mp4",
+        get(format!("{base}/variants/main/init.mp4")).await,
+        get(format!("{base}/segments/0.m4s")).await,
+    );
+    let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+    assert_eq!(video["profile"], "Main", "video was re-encoded");
+    let audio: Vec<_> = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0]["codec_name"], "aac");
+    assert_eq!(
+        audio[0]["sample_rate"], "48000",
+        "the converted second track"
+    );
+    let closed = f
+        .call("DELETE", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+
+    // A failed copy falls back to conversion; a failed conversion ends it.
+    let copy_failed = vec![original.clone(), format!("c-{file}")];
+    let fallback = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &copy_failed),
+        )
+        .await;
+    assert_eq!(
+        fallback.body["operation"], "video_transcode",
+        "{}",
+        fallback.body
+    );
+    let mut all_failed = copy_failed.clone();
+    all_failed.push(format!("t-{file}"));
+    let exhausted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &all_failed),
+        )
+        .await;
+    assert_eq!(exhausted.body["reason_codes"][0], "all_candidates_failed");
+
+    // Copy-route capacity is released with the delivery.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("copy route capacity was not released");
+
+    // Observed details that do not qualify (level 5.2) leave only conversion.
+    let g = Fixture::with_copy_routes(true).await;
+    copyable_mkv(&g, "film.mkv", "5.2");
+    g.scan().await;
+    let (timeline, _) = g.timeline().await;
+    let (_, auth) = g.device(&["default"], PLAYER).await;
+    let source = g.source().await;
+    let unqualified = g
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned_plan_input(
+                "default",
+                &timeline,
+                "auto",
+                "a1",
+                &["http_range", "hls"],
+                &source,
+            ),
+        )
+        .await;
+    assert_eq!(
+        unqualified.body["operation"], "video_transcode",
+        "{}",
+        unqualified.body
+    );
+
+    // A server without copy routes neither advertises nor plans them.
+    let h = Fixture::new().await;
+    copyable_mkv(&h, "film.mkv", "3.0");
+    h.scan().await;
+    let (timeline, _) = h.timeline().await;
+    let (_, auth) = h.device(&["default"], PLAYER).await;
+    let source = h.source().await;
+    let disabled = h
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned_plan_input(
+                "default",
+                &timeline,
+                "auto",
+                "a1",
+                &["http_range", "hls"],
+                &source,
+            ),
+        )
+        .await;
+    assert_eq!(
+        disabled.body["operation"], "video_transcode",
+        "{}",
+        disabled.body
+    );
+    let caps = h.get("/api/v2/system/capabilities", &auth).await;
+    let playback = caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        playback["limits"]["routes"],
+        "original,prepared,software_hls"
+    );
 }

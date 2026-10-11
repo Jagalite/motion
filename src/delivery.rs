@@ -656,7 +656,7 @@ async fn run_descriptor(
 
 /// Observe the details stream copy eligibility needs, before any admission
 /// transaction (a probe must not hold the database writer).
-async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
+pub(crate) async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
     let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(file_id)
         .fetch_optional(&app.db)
@@ -1868,6 +1868,37 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
         && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
 }
 
+/// The stream-copy operation a plan may consider for `file` with this audio
+/// stream, before its bitstream details are observed: copy routes enabled here,
+/// the live-route preconditions of `live_transcodable`, and the core's stream
+/// facts (`copy_operation`).
+pub(crate) fn copy_candidate(
+    app: &App,
+    file: &db::ItemRow,
+    audio: Option<u32>,
+) -> Option<Operation> {
+    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio) {
+        return None;
+    }
+    with_streams(file, audio, None, core::copy_operation)
+        .ok()
+        .flatten()
+}
+
+/// Whether the core live-route rule admits this copy with observed details.
+pub(crate) fn copy_supported(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    operation: Operation,
+    details: &CopyDetails,
+) -> bool {
+    copies_video(operation)
+        && with_streams(file, audio, Some(details), |s| {
+            core::live_route_supported(operation, s)
+        })
+        .unwrap_or(false)
+}
+
 /// A stored representation (original or prepared rendition) served by byte
 /// ranges: no recipe and no encoder. The browser presents the file's default
 /// audio stream; an optional subtitle is extracted separately as WebVTT.
@@ -1917,21 +1948,14 @@ fn pinned_audio(pin: &Pin) -> Option<u32> {
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()))
 }
 
-/// Check the exact selected streams against the core's live route rule.
-fn validate_route(
+/// The selected streams of `file` as the core live-route rule reads them.
+/// Details apply only when they were observed from this file revision.
+fn with_streams<R>(
     file: &db::ItemRow,
     audio: Option<u32>,
-    operation: Operation,
-    copy_enabled: bool,
     details: Option<&CopyDetails>,
-) -> Result<(), ApiError> {
-    if copies_video(operation) && !copy_enabled {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "route_unqualified",
-            "Live stream-copy routes are not enabled on this server",
-        ));
-    }
+    decide: impl FnOnce(&core::SourceStreams<'_>) -> R,
+) -> Result<R, ApiError> {
     let streams: Vec<db::Track> =
         serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
     let Some(video) = streams.iter().find(|t| t.kind == "video") else {
@@ -1950,7 +1974,7 @@ fn validate_route(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
     );
-    let source = core::SourceStreams {
+    Ok(decide(&core::SourceStreams {
         video: Some(video.codec.as_str()),
         audio: selected.map(|t| t.codec.as_str()),
         hdr,
@@ -1963,8 +1987,28 @@ fn validate_route(
         details: details
             .filter(|d| d.revision == file.revision)
             .map(CopyDetails::observed),
-    };
-    if core::live_route_supported(operation, &source) {
+    }))
+}
+
+/// Check the exact selected streams against the core's live route rule.
+fn validate_route(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    operation: Operation,
+    copy_enabled: bool,
+    details: Option<&CopyDetails>,
+) -> Result<(), ApiError> {
+    if copies_video(operation) && !copy_enabled {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unqualified",
+            "Live stream-copy routes are not enabled on this server",
+        ));
+    }
+    let (supported, hdr) = with_streams(file, audio, details, |s| {
+        (core::live_route_supported(operation, s), s.hdr)
+    })?;
+    if supported {
         return Ok(());
     }
     Err(if hdr {
@@ -2045,8 +2089,8 @@ pub(crate) struct Planned {
     pub route: Route,
 }
 
-/// Admit a planned (v2) delivery. Original routes need no encoder; transcodes
-/// use the same live admission as v1. Receipts are scoped to the principal.
+/// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
+/// (stream copy or transcode) use the same live admission as v1. Receipts are scoped to the principal.
 pub(crate) async fn admit_planned(
     app: App,
     authority: Arc<dyn AdmissionAuthority>,
@@ -2197,6 +2241,9 @@ pub(crate) struct Selection {
     pub route: Route,
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
+    /// Bitstream details observed for a stream-copy route before the command's
+    /// write transaction; None for other routes.
+    pub copy_details: Option<CopyDetails>,
 }
 
 /// Stage a seek (`selection` None keeps the newest pin) or a planned replan.
@@ -2250,6 +2297,18 @@ pub(crate) async fn change_live(
                     )
                 }
                 Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
+                Route::Remux | Route::AudioConvert => {
+                    let operation = selection.route.operation();
+                    validate_route(
+                        &file,
+                        selection.audio,
+                        operation,
+                        app.processing.settings.experimental_copy_routes,
+                        selection.copy_details.as_ref(),
+                    )?;
+                    validate_subtitle(&file, selection.subtitle)?;
+                    pin(&file, selection.audio, selection.subtitle, operation, false)
+                }
                 Route::Transcode => {
                     validate_route(
                         &file,
@@ -2454,7 +2513,12 @@ async fn admit_owned(
     // before taking the admission lock or the database writer.
     // A probe failure is reported only for a new admission: an exact retry of an
     // acknowledged one replays its receipt below.
-    let copy_probe = match r.operation.map(LiveOperation::operation) {
+    // A planned (v2) admission runs exactly its signed route.
+    let requested = match &planned {
+        Some(p) => Some(p.route.operation()),
+        None => r.operation.map(LiveOperation::operation),
+    };
+    let copy_probe = match requested {
         Some(operation)
             if !original
                 && copies_video(operation)
@@ -2550,13 +2614,7 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    let operation = if let Some(p) = planned.as_ref().filter(|_| original) {
-        p.route.operation()
-    } else {
-        r.operation
-            .unwrap_or(LiveOperation::VideoTranscode)
-            .operation()
-    };
+    let operation = requested.unwrap_or(Operation::VideoTranscode);
     let copy_details = copy_probe.transpose()?;
     if !hardware_ready {
         return Err(backend_unavailable());

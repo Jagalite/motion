@@ -1041,7 +1041,16 @@ pub async fn plan(
             ));
         }
     }
-    let source = core::SourceFacts {
+    // A copy is named from stream facts now; its bitstream details are
+    // observed only if the core would choose it (`Plan::Observe`).
+    let copy = match delivery::copy_candidate(&app, &bound.file, audio)
+        .and_then(Route::copy)
+        .filter(|_| input.quality.hdr_policy != "reject_conversion")
+    {
+        Some(route) => core::StreamCopy::Unobserved(route),
+        None => core::StreamCopy::Ineligible,
+    };
+    let mut source = core::SourceFacts {
         available: original_available && bound.file.available,
         client_support: client_support(&bound.file, &input.client, audio, require_sdr),
         within_budget: fits_budget(&bound.file, limit, max_bitrate),
@@ -1068,6 +1077,7 @@ pub async fn plan(
             height.map(|h| h.min(delivery::LIVE_MAX_HEIGHT)),
             None,
         ),
+        copy,
     };
     let request = core::Request {
         mode,
@@ -1081,8 +1091,31 @@ pub async fn plan(
             || subtitle.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
+    let mut decided = core::plan(&bound.file.id, &source, &request);
+    if decided == core::Plan::Observe {
+        let core::StreamCopy::Unobserved(route) = source.copy else {
+            return Err(Problem::internal("copy observation without a candidate"));
+        };
+        drop(conn);
+        // A probe failure or an unqualified bitstream leaves only conversion;
+        // admission observes the details again under its own checks.
+        source.copy = match delivery::probe_copy_details(&app, &bound.file.id).await {
+            Ok(details)
+                if delivery::copy_supported(&bound.file, audio, route.operation(), &details) =>
+            {
+                core::StreamCopy::Eligible(route)
+            }
+            _ => core::StreamCopy::Ineligible,
+        };
+        decided = core::plan(&bound.file.id, &source, &request);
+        if decided == core::Plan::Observe {
+            return Err(Problem::internal(
+                "copy observation did not decide the plan",
+            ));
+        }
+    }
     // A prepared plan pins the chosen rendition and plays its default streams.
-    let (route, chosen, audio) = match core::plan(&bound.file.id, &source, &request) {
+    let (route, chosen, audio) = match decided {
         core::Plan::Ready(route) => (route, bound, audio),
         core::Plan::Prepared(i) => {
             let p = prepared
@@ -1093,6 +1126,7 @@ pub async fn plan(
             (Route::Prepared, p, audio)
         }
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
+        core::Plan::Observe => return Err(Problem::internal("undecided plan")),
     };
     if subtitle.is_some() && route != Route::Original {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
@@ -1502,6 +1536,25 @@ pub async fn change_delivery(
     body: Body<DeliveryChange>,
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
+    // A stream-copy replan needs the source's bitstream details: observe them
+    // before the write transaction. A probe failure is reported only for a new
+    // change, after an exact retry had the chance to replay.
+    let copy_probe = match &body.value {
+        DeliveryChange::Replan { plan_token, .. }
+            if app.processing.settings.experimental_copy_routes =>
+        {
+            match open(&app, plan_token) {
+                Ok(claims)
+                    if claims.principal == caller.principal.id
+                        && matches!(claims.route, Route::Remux | Route::AudioConvert) =>
+                {
+                    Some(delivery::probe_copy_details(&app, &claims.file).await)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
     let (mut tx, principal, owner) = command(&app, &caller, &id).await?;
     let durable = Scope {
         principal: &principal.id,
@@ -1579,6 +1632,7 @@ pub async fn change_delivery(
                     route: claims.route,
                     audio: claims.audio,
                     subtitle: claims.subtitle,
+                    copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
         }

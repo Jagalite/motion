@@ -23,6 +23,12 @@ pub enum Route {
     /// A stored, revision-valid generated rendition of the original, byte
     /// ranges, its default streams.
     Prepared,
+    /// A live HLS stream copy of the original's video and AAC (or no) audio,
+    /// with exactly the selected streams and source timestamps.
+    Remux,
+    /// A live HLS stream copy of the original's video with the selected audio
+    /// converted to AAC.
+    AudioConvert,
     /// A live HLS conversion of the original with exactly the selected streams.
     Transcode,
 }
@@ -31,13 +37,23 @@ impl Route {
         match self {
             Route::Original => Operation::Original,
             Route::Prepared => Operation::Prepared,
+            Route::Remux => Operation::Remux,
+            Route::AudioConvert => Operation::AudioConvert,
             Route::Transcode => Operation::VideoTranscode,
+        }
+    }
+    /// The stream-copy route for a copy operation.
+    pub fn copy(operation: Operation) -> Option<Route> {
+        match operation {
+            Operation::Remux => Some(Route::Remux),
+            Operation::AudioConvert => Some(Route::AudioConvert),
+            _ => None,
         }
     }
     pub fn transport(self) -> &'static str {
         match self {
             Route::Original | Route::Prepared => "http_range",
-            Route::Transcode => "hls",
+            Route::Remux | Route::AudioConvert | Route::Transcode => "hls",
         }
     }
     /// Candidate identities are stable for one file and route, so a client
@@ -48,6 +64,8 @@ impl Route {
         let prefix = match self {
             Route::Original => "o",
             Route::Prepared => "p",
+            Route::Remux => "r",
+            Route::AudioConvert => "c",
             Route::Transcode => "t",
         };
         if file_id.len() <= 126 {
@@ -75,10 +93,26 @@ pub struct SourceFacts {
     /// The conversion's output honors the client's height and bitrate limits
     /// (`conversion_fits`). A conversion never silently exceeds them.
     pub conversion_within_budget: bool,
+    /// Live stream copy of the selected streams. A copy keeps the source video,
+    /// so `within_budget` is also its budget.
+    pub copy: StreamCopy,
     /// Stored renditions of this original whose output and source revisions
     /// are both still the registered ones (`renditions::available`), in the
     /// adapter's preference order (newest first).
     pub prepared: Vec<PreparedFacts>,
+}
+
+/// What is known about a live stream copy of the selected streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCopy {
+    /// Not enabled on this server, or ruled out by the stream facts
+    /// (`delivery::copy_operation`), or by observed bitstream details.
+    Ineligible,
+    /// The stream facts name this copy route, but the source's bitstream
+    /// details have not been observed yet.
+    Unobserved(Route),
+    /// The core live-route rule admits this copy route with observed details.
+    Eligible(Route),
 }
 
 /// Facts about one revision-valid prepared rendition.
@@ -126,15 +160,21 @@ pub enum Plan {
     Ready(Route),
     /// The prepared rendition at this index of `SourceFacts::prepared`.
     Prepared(usize),
+    /// A stream copy would be chosen if the source's bitstream details admit
+    /// it: observe them, then plan again with `StreamCopy` decided. Planning
+    /// with decided copy facts never returns this.
+    Observe,
     Blocked(&'static str),
 }
 
 /// Select a route. Original byte delivery is preferred in Auto, then a
-/// prepared rendition, then a live conversion; Convert prefers a prepared
-/// rendition over a live conversion and never plays the original. A live
-/// conversion is also needed to honor an explicit stream choice. Strict
-/// Original never converts, and a pinned prepared version is never widened.
-/// Nothing here starts processing.
+/// prepared rendition, then a live stream copy, then a live conversion;
+/// Convert prefers a prepared rendition over a live conversion and never plays
+/// the original or a copy of its video. A live route is also needed to honor
+/// an explicit stream choice. Strict Original never converts, and a pinned
+/// prepared version is never widened. A failed copy falls back to conversion;
+/// a failed conversion never falls back to anything. Nothing here starts
+/// processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
     let byte = request.range && !request.explicit_streams;
@@ -173,9 +213,25 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
             "original_unavailable_or_unsupported"
         }),
         _ if !request.hls => Plan::Blocked("client_cannot_play_conversion"),
+        // A copy keeps the source's video at its own size and bitrate. Convert
+        // asks for converted video, so only Auto may choose a copy.
+        _ if request.mode == Mode::Auto && source.within_budget => match source.copy {
+            StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
+            StreamCopy::Unobserved(route) if !failed(route, file_id) => Plan::Observe,
+            _ => transcode(file_id, source, request),
+        },
+        _ => transcode(file_id, source, request),
+    }
+}
+
+fn transcode(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
+    let failed = request
+        .failed
+        .contains(&Route::Transcode.candidate_id(file_id));
+    match () {
         _ if !source.transcodable => Plan::Blocked("no_live_route"),
         _ if !source.conversion_within_budget => Plan::Blocked("conversion_exceeds_quality_limit"),
-        _ if failed(Route::Transcode, file_id) => Plan::Blocked("all_candidates_failed"),
+        _ if failed => Plan::Blocked("all_candidates_failed"),
         _ => Plan::Ready(Route::Transcode),
     }
 }
@@ -381,6 +437,7 @@ mod tests {
             within_budget: true,
             transcodable: true,
             conversion_within_budget: true,
+            copy: StreamCopy::Ineligible,
             prepared: vec![],
         }
     }
@@ -637,14 +694,23 @@ mod tests {
     #[test]
     fn candidate_ids_are_stable_distinct_and_bounded() {
         let long = "x".repeat(128);
-        for route in [Route::Original, Route::Prepared, Route::Transcode] {
+        let routes = [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::Transcode,
+        ];
+        for route in routes {
             assert_eq!(route.candidate_id(&long), route.candidate_id(&long));
             assert!(route.candidate_id(&long).len() <= 128);
         }
-        assert_ne!(
-            Route::Original.candidate_id("f"),
-            Route::Transcode.candidate_id("f")
-        );
+        for (i, a) in routes.iter().enumerate() {
+            for b in &routes[i + 1..] {
+                assert_ne!(a.candidate_id("f"), b.candidate_id("f"));
+                assert_ne!(a.candidate_id(&long), b.candidate_id(&long));
+            }
+        }
         assert_ne!(
             Route::Original.candidate_id(&long),
             Route::Original.candidate_id(&"y".repeat(128))
@@ -787,5 +853,115 @@ mod tests {
             ),
             Plan::Ready(Route::Original)
         );
+    }
+
+    #[test]
+    fn auto_prefers_an_eligible_stream_copy_over_conversion_and_falls_back_on_failure() {
+        let mut auto = request(Mode::Auto);
+        auto.explicit_streams = true;
+        let mut s = source(Support::Supported);
+        for route in [Route::Remux, Route::AudioConvert] {
+            s.copy = StreamCopy::Eligible(route);
+            assert_eq!(plan("f", &s, &auto), Plan::Ready(route));
+            // Unobserved details are observed first, never assumed.
+            s.copy = StreamCopy::Unobserved(route);
+            assert_eq!(plan("f", &s, &auto), Plan::Observe);
+            // A failed copy is never offered again or observed again.
+            let mut failed = auto.clone();
+            failed.failed = vec![route.candidate_id("f")];
+            for copy in [StreamCopy::Eligible(route), StreamCopy::Unobserved(route)] {
+                s.copy = copy;
+                assert_eq!(plan("f", &s, &failed), Plan::Ready(Route::Transcode));
+            }
+            failed.failed.push(Route::Transcode.candidate_id("f"));
+            assert_eq!(
+                plan("f", &s, &failed),
+                Plan::Blocked("all_candidates_failed")
+            );
+        }
+        // Byte delivery of the original still wins when it can honor the request.
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Original)
+        );
+        // A copy needs no conversion capability, but still needs HLS.
+        s.transcodable = false;
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Remux));
+        let mut range_only = auto.clone();
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
+        s.copy = StreamCopy::Ineligible;
+        assert_eq!(plan("f", &s, &auto), Plan::Blocked("no_live_route"));
+    }
+
+    #[test]
+    fn stream_copy_keeps_source_limits_and_is_never_chosen_by_strict_modes() {
+        let mut s = source(Support::Supported);
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        // The copied video keeps the source size and unknown peak bitrate: a
+        // source outside the client limits converts instead.
+        s.within_budget = false;
+        let auto = request(Mode::Auto);
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Transcode));
+        s.copy = StreamCopy::Unobserved(Route::Remux);
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Transcode));
+        s.conversion_within_budget = false;
+        assert_eq!(
+            plan("f", &s, &auto),
+            Plan::Blocked("conversion_exceeds_quality_limit")
+        );
+        // Convert asks for converted video; Original never converts.
+        let mut s = source(Support::Unsupported);
+        s.copy = StreamCopy::Eligible(Route::AudioConvert);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("original_unavailable_or_unsupported")
+        );
+        s.copy = StreamCopy::Unobserved(Route::AudioConvert);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        // An unavailable original has no copy either.
+        let mut offline = s.clone_offline();
+        offline.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &offline, &request(Mode::Auto)),
+            Plan::Blocked("source_unavailable")
+        );
+        // A pinned prepared version is never widened to a copy.
+        let mut pinned = request(Mode::Auto);
+        pinned.pinned_prepared = true;
+        assert_eq!(
+            plan("f", &s, &pinned),
+            Plan::Blocked("selected_version_unavailable")
+        );
+    }
+
+    #[test]
+    fn copy_routes_map_to_their_operations_and_hls() {
+        for (route, operation) in [
+            (Route::Remux, Operation::Remux),
+            (Route::AudioConvert, Operation::AudioConvert),
+        ] {
+            assert_eq!(route.operation(), operation);
+            assert_eq!(Route::copy(operation), Some(route));
+            assert_eq!(route.transport(), "hls");
+        }
+        for operation in [
+            Operation::Original,
+            Operation::Prepared,
+            Operation::VideoTranscode,
+        ] {
+            assert_eq!(Route::copy(operation), None);
+        }
     }
 }
