@@ -231,7 +231,9 @@ def main():
             stop(process);process=boot();auth=old_auth;checks.append('db_only_restore_invalidates_foreign_generated_cache')
             with sqlite3.connect(state/'playscale.sqlite3') as db:db.execute("UPDATE processing_jobs SET updated_at=0 WHERE phase='completed'")
             wait_for(lambda: all(r['status']!='ready' for r in renditions()),seconds=40)
-            assert not list((state/'generated').glob('*/*/output.mp4'))
+            # A prior source replacement can already make every rendition stale.
+            # Wait for the independent physical maintenance effect as well.
+            wait_for(lambda: not list((state/'generated').glob('*/*/output.mp4')), seconds=40)
             assert hashlib.sha256((media/'clip.mp4').read_bytes()).hexdigest()==original;checks.append('cache_expiration_preserves_original_bytes')
             spec=api('GET','/openapi.json');assert '/api/v2/events' in spec['paths'] and '/api/v2/processing/preparations' in spec['paths']
             print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware,'failures':failures},indent=2))
