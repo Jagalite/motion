@@ -48,8 +48,11 @@ def main():
                 timeline = edition['timeline_ids'][0]
                 viewing_path = f'/profiles/default/timelines/{timeline}/viewing'
                 viewing, viewing_headers = api('GET', viewing_path, with_headers=True)
+                identity = api('GET', '/system/capabilities')
+                history_epoch = identity['server_id'] + ':' + identity['restore_epoch']
                 api('PUT', viewing_path, {'manual_watched': True, 'reset_position': False},
-                    headers={'If-Match': viewing_headers['etag']})
+                    headers={'If-Match': viewing_headers['etag'],
+                             'X-Motion-Viewing-Epoch': history_epoch})
                 manifest = backup(root / 'state', root / 'snapshot')
                 assert manifest['schema_versions']
                 # This later write must not appear in the already completed snapshot.
