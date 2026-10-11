@@ -2442,6 +2442,7 @@ async fn bounded_media_policy_requires_observed_facts_and_components_never_subst
                 "unsupported",
                 "blocked",
             ),
+            ("original", "preserve_if_supported", "unknown", "blocked"),
             ("convert", "preserve_if_supported", "supported", "blocked"),
             ("convert", "reject_conversion", "supported", "blocked"),
         ] {

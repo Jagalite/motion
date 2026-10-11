@@ -135,7 +135,8 @@ routes is qualified separately (A11/A12).
 - Multipart versions and interval (multi-episode) bindings are not planned:
   they are reported as unavailable until a part-aware delivery exists.
 - HDR sources are refused for byte delivery under `require_sdr` or to a
-  client reporting `hdr: unsupported`; no tone-mapped route exists.
+  client reporting `hdr: unsupported` or `unknown`; no tone-mapped route exists.
+  Reported support permits an attempt, not a display-fidelity qualification.
 - Revision-local track pins (`a{n}`) require an exact `source` pin.
 - Next-in-order uses `timelines.order_group_id`/`order_position`. Composed public
   placement-writer/client Next qualification belongs to data/catalog and clients.
