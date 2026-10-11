@@ -770,7 +770,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
     Ok(view! {
         <div class="player-page">
         <header class="player-header">
-            <a class="player-back" href=(href!(item, ItemId(view_model.item_id.as_str())))>icon(name: "back") <span class="player-back-label">"Back to title"</span></a>
+            <a class="player-back" href=(href!(item, ItemId(view_model.item_id.as_str()))) data-back="player">icon(name: "back") <span class="player-back-label">"Back to title"</span></a>
             <h1 class="player-title">(view_model.title.as_str())</h1>
         </header>
         <div id="motion-player" class="player-host"

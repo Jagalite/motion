@@ -226,6 +226,20 @@ test('skip links retain the current player; document navigation still tears down
   assert.equal(leaves('https://other.test/', current), false);
 });
 
+test('back to title returns to the entry the player was opened from, past skip-link entries', () => {
+  const titleEntry = runInNewContext(source.replace('export {close, maintainLease};', 'titleEntry;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  const at = url => ({key: url, url: `https://motion.test${url}`});
+  const title = 'https://motion.test/item/i1';
+  const entries = [at('/library/l1'), at('/item/i1'), at('/play/t1'), at('/play/t1#main'), at('/play/t1#main')];
+  assert.equal(titleEntry(entries, 2, title)?.key, '/item/i1');
+  assert.equal(titleEntry(entries, 4, title)?.key, '/item/i1', 'fragment entries of the player are skipped');
+  assert.equal(titleEntry([at('/library/l1'), at('/play/t1')], 1, title), null, 'opened from elsewhere: navigate instead');
+  assert.equal(titleEntry([at('/item/i2'), at('/play/t1')], 1, title), null, 'a different title is not this one');
+  assert.equal(titleEntry([at('/play/t1')], 0, title), null);
+});
+
 test('viewing storage survives ordinary restart and fences restore identity', () => {
   const makeStorage = () => {
     const store = {};

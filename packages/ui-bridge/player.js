@@ -896,8 +896,22 @@ document.addEventListener('click', event => {
   if (!host || !link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
     || link.target || link.hasAttribute('download') || !leavesPlayerDocument(link.href, location.href)) return;
   event.preventDefault();
-  void close().finally(() => location.assign(link.href));
+  // "Back to title" returns through history when the entry before the player
+  // is that title, so the title's own Back link does not lead to the player.
+  const entry = link.dataset.back === 'player' && globalThis.navigation?.currentEntry
+    ? titleEntry(navigation.entries(), navigation.currentEntry.index, link.href) : null;
+  void close().finally(() => entry ? navigation.traverseTo(entry.key) : location.assign(link.href));
 });
+// The entry the player was opened from, past this document's own fragment
+// entries (skip links), when it is exactly the title page; otherwise null.
+function titleEntry(entries, index, titleUrl) {
+  const page = url => { const parsed = new URL(url); parsed.hash = ''; return parsed.href; };
+  const current = entries[index]?.url;
+  if (!current) return null;
+  let i = index - 1;
+  while (i >= 0 && entries[i]?.url && page(entries[i].url) === page(current)) i -= 1;
+  return i >= 0 && entries[i]?.url === titleUrl ? entries[i] : null;
+}
 // Restored from the back/forward cache: the old player and delivery are gone.
 addEventListener('pageshow', event => { if (event.persisted && host) void start(); });
 if (host) void start();
