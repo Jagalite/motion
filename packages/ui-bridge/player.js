@@ -602,9 +602,14 @@ async function switchDelivery(plan) {
     await disposePlayer(old.element);
     void retire(old.id);
     status('');
-    if (wasPlaying && current()) await state.element.play();
+    // The swap is complete; a refused resume (e.g. autoplay policy) only
+    // needs the user's Play, never the failure handling below.
+    if (wasPlaying && current()) {
+      try { await state.element.play(); } catch { if (current()) status('Press Play to continue.'); }
+    }
     return true;
   } catch (error) {
+    if (swapped) { if (current()) status(`Playback change completed with an error: ${error.message}`, 'alert'); return true; }
     stopReplacementLease?.();
     if (element) await disposePlayer(element);
     // Any replacement not swapped in is retired by this function, including
