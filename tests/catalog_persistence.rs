@@ -179,7 +179,14 @@ async fn upgrade_backs_up_preserves_ids_and_attributes_progress_without_guessing
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(receipts, ["migration:legacy_progress", "migration:schema"]);
+    assert_eq!(
+        receipts,
+        [
+            "migration:legacy_progress",
+            "migration:schema",
+            "migration:timeline_progress_repair"
+        ]
+    );
     assert!(
         sqlx::query("DELETE FROM catalog_receipts")
             .execute(&pool)
@@ -195,7 +202,7 @@ async fn upgrade_backs_up_preserves_ids_and_attributes_progress_without_guessing
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(receipts, 2);
+    assert_eq!(receipts, 3);
 }
 
 #[tokio::test]
@@ -686,4 +693,66 @@ async fn restore_into_verifies_upgrades_and_refuses_existing_destinations() {
             .is_err()
     );
     assert!(!dir.path().join("other.sqlite").exists());
+}
+
+#[tokio::test]
+async fn timeline_repair_handles_empty_cuts_existing_v2_and_reopen() {
+    for already_upgraded in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
+            .await
+            .unwrap();
+        legacy_fixture(&old).await;
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('empty-cut','single','Empty')")
+            .execute(&old)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO viewing_state(profile_id,item_id,manual_watched) VALUES ('default','single',0)").execute(&old).await.unwrap();
+        old.close().await;
+        if already_upgraded {
+            // Authentic previous-main order: SQL first, attribution afterward;
+            // no candidate repair is allowed to run during fixture preparation.
+            let old = SqlitePool::connect(&format!("sqlite://{}", path.display()))
+                .await
+                .unwrap();
+            sqlx::migrate!("./migrations").run(&old).await.unwrap();
+            sqlx::query(
+                "INSERT INTO catalog_receipts VALUES ('legacy','migration:legacy_progress',1,'{}')",
+            )
+            .execute(&old)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO legacy_progress_attribution VALUES ('default','single','exact','only','[[\"only\",1],[\"empty-cut\",0]]','legacy')").execute(&old).await.unwrap();
+            // A canonical manual reset must win even at position zero.
+            sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,position_ms,automatic_watched,manual_watched,updated_at) VALUES ('default','only',4,2,0,0,0,99)").execute(&old).await.unwrap();
+            old.close().await;
+        }
+        let pool = db::connect(&path).await.unwrap();
+        let row: (i64,i64,i64,Option<bool>,Option<String>) = sqlx::query_as("SELECT revision,manual_epoch,position_ms,manual_watched,session_id FROM timeline_viewing WHERE timeline_id='only'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            row,
+            if already_upgraded {
+                (4, 2, 0, Some(false), None)
+            } else {
+                (0, 0, 20000, Some(false), None)
+            }
+        );
+        let ambiguous: i64 = sqlx::query_scalar("SELECT count(*) FROM timeline_viewing WHERE timeline_id IN ('cut-a','cut-b','empty-cut')").fetch_one(&pool).await.unwrap();
+        assert_eq!(ambiguous, 0);
+        pool.close().await;
+        let pool = db::connect(&path).await.unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM catalog_receipts WHERE kind='migration:timeline_progress_repair'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM progress")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(retained, 3);
+    }
 }
