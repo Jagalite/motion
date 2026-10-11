@@ -81,6 +81,19 @@ function demuxeSource(generation, origin) {
   return generation.transport === 'hls' ? {url: url.href, format: 'hls', streaming: {live: true}} : url.href;
 }
 
+// Demuxe startTime is VOD-only. Rolling generations still have a concrete
+// media position: seek through the public live-window API after opening.
+async function openGeneration(element, generation, position, origin) {
+  const target = Math.max(0, (position - generation.media_time_origin_ms) / 1000);
+  const source = demuxeSource(generation, origin);
+  if (generation.transport === 'hls') {
+    await element.open(source);
+    await element.seek(target);
+    if (Math.abs(element.player.state.currentTime - target) > 1)
+      throw new Error('Live player did not reach the requested generation position.');
+  } else await element.open(source, {startTime: target});
+}
+
 // A version, quality or audio choice replans the same timeline. An audio
 // track other than the default asks the planner for a conversion that carries
 // exactly that stream; the server decides whether one is admissible.
@@ -430,7 +443,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   element.inert = inert;
   host.append(element);
   try {
-    await element.open(demuxeSource(generation, location.origin), {startTime: Math.max(0, (position - generation.media_time_origin_ms) / 1000)});
+    await openGeneration(element, generation, position, location.origin);
     if (preferences) {
       await element.setVolume(preferences.volume);
       await element.setMuted(preferences.muted);

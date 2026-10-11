@@ -51,7 +51,7 @@ integration/release.
 | Topcoat `/`, item and player pages; Electron host | Authorized production presentation service | Already opt-in through `--topcoat`; default cutover awaits replacement workflow and absence tests. |
 | Legacy `web/app.js`, `web/playback.js`, `web/session.js`, `/media/{id}` | Topcoat/player bridge and v2 media; integration router owner | Keep until cutover gates pass, then remove mounts/assets and prove no business behavior. |
 | `operations_smoke.py` | v2 catalog, timeline viewing and diagnostics; Clients | Converted; real-server backup/restore smoke passes all five checks, including rejection of the old operator token after restore. |
-| `catalog_smoke.py` | v2 metadata/artwork/scan; data/catalog owner | Current-server v1 caller; pending adapter integration and migration. |
+| `catalog_smoke.py` | v2 metadata/artwork/relationships; Clients | Converted; six real-process checks pass. Coverage differences below remain explicit. |
 | `processing_smoke.py`, `video_profiles_smoke.py` | v2 recipes/preparations/jobs/events; preparation owner | Current-server v1 callers; preserve engine regressions while migrating. |
 | `viewing_smoke.py`, `reliability_smoke.py`, `smoke.py` | Canonical viewing + v2 storage/catalog; playback/data owners | Current-server v1 callers; pending authority/cutover integration. |
 | `upgrade_restore_check.py` | Public v2 catalog, revision-pinned file bytes and canonical viewing; Clients | Candidate migrated; all six real-process upgrade/rollback scenarios pass. Frozen baseline alone retains v1. |
@@ -184,3 +184,24 @@ on macOS. This is not Linux qualification; refreshed Linux CI is tracked on PR15
 GPT-6.1 Sol reviewed `0b8e82f`, `e9fae9f` and `f31d031` without actionable findings.
 Publication privacy and diff checks pass. The service/deployment dependencies
 above still prevent lane closure and default cutover.
+
+## Combined-tree continuation
+
+Clients now includes the integration owner's composed `a518832` tree. Catalog
+smoke `0f09b3a` passes six real-process v2 checks. It does not replace the former
+external-identity lookup, file-to-edition reassignment, edition rename, or full
+season/episode hierarchy regressions. Explicit relationship revision conflicts,
+metadata attribution, edition/timeline identity and artwork restart are covered;
+the missing replacements remain acceptance gaps, not passes.
+
+Sol reviewed `0f09b3a` and `2812de3`: no implementation defect; the coverage gap
+above is recorded. CSP now permits blob scripts required by Demuxe's Shaka
+loader. CSP permits all blob scripts; provider-byte integrity is enforced by
+Demuxe and the installed deployment manifest, not by CSP. Browser execution
+reached the Shaka live-source contract after this change, but full playback
+qualification is still pending.
+
+The 1.1.1 archive is being evaluated in explicit per-player runtime ownership
+mode. The original shared-runtime test failures remain valid; this mode does
+not claim borrowed-preview compatibility. Its package probe passes two checks
+and skips the two inapplicable shared-ownership checks.
