@@ -181,6 +181,8 @@ export async function scenario(page, server, ctx, engine, out) {
     checks.push({name, status, gap: blocked ? gap.id : null, detail});
     // Preserve completed observations if a later dependency or renderer fails.
     writeFileSync(join(out, `${engine}-checks.json`), JSON.stringify(checks, null, 2));
+    writeFileSync(join(out, `${engine}-network.json`), JSON.stringify(net, null, 2));
+    writeFileSync(join(out, `${engine}-console.json`), JSON.stringify(consoleLog, null, 2));
     console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
   };
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
@@ -195,6 +197,7 @@ export async function scenario(page, server, ctx, engine, out) {
     if (!url.pathname.startsWith('/api/v2/') || url.origin !== server.origin) return;
     const method = r.request().method();
     const entry = {at: Date.now(), method, path: url.pathname, status: r.status()};
+    if (r.status() >= 400) { try { entry.problem = await r.json(); } catch {} }
     if (url.pathname.endsWith('/events')) { try { entry.request = JSON.parse(r.request().postData() ?? 'null'); } catch {} }
     if (/\/playback\/(plans|delivery-sessions)/.test(url.pathname) && method !== 'DELETE') {
       try {
