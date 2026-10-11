@@ -118,3 +118,9 @@ Outstanding gates remain exact-head combined CI, route-retirement runtime checks
 source reconstruction, relocated installed-product acceptance, and the full
 player/restricted-grant/recovery matrix. Focused provider diagnostics do not erase
 previous live-startup/switching failures or close M0–M4.
+
+PR #15 advanced during the reconciliation to
+`6977c694ecfffff981843a3683435b81107c4bd7`, incorporating reviewed playback
+and main ancestry. That head is also merged into this reconciliation. It adds no
+production or test changes to the integration tree; its duplicate Kyoto prose
+conflict is resolved as above. Closure eligibility refers to this newer head.
