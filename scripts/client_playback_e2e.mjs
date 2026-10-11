@@ -373,9 +373,18 @@ export async function scenario(page, server, ctx, engine, out) {
   const previous = await server.api('GET', `/api/v2/playback/delivery-sessions/${beforeDelivery}`, undefined, ctx.token);
   check('the predecessor delivery is retired after the switch', previous.status === 404 || ['closing', 'closed'].includes(previous.json?.status),
     {status: previous.status, state: previous.json?.status});
-  const progressAfterSwitch = await page.evaluate(() => window.__e2e.el().pause()).then(() => sleep(1500)).then(() => viewing(ctx.film.timeline));
-  check('progress continues on the rebound session', progressAfterSwitch.position_ms >= Math.round(beforeSwitch * 1000) - 1000,
-    {position: progressAfterSwitch.position_ms, beforeSwitch});
+  // After the rebind, the same session keeps recording: an accepted event with
+  // a higher sequence, and a server position beyond the switch point.
+  await sleep(5500);
+  await page.evaluate(() => window.__e2e.el().pause());
+  await sleep(1500);
+  const progressAfterSwitch = await viewing(ctx.film.timeline);
+  const earlier = since(t).filter(e => e.path.endsWith('/events') && rebound && e.at < rebound.at).map(e => BigInt(e.request?.sequence ?? 0));
+  const reboundEvents = since(t).filter(e => e.path.endsWith('/events') && rebound && e.at > rebound.at && e.status === 200);
+  check('progress continues on the rebound session', reboundEvents.length > 0
+    && reboundEvents.every(e => e.path === reboundEvents[0].path) && BigInt(reboundEvents.at(-1).request.sequence) > (earlier.length ? earlier.reduce((a, b) => (a > b ? a : b)) : 0n)
+    && progressAfterSwitch.position_ms > Math.round(beforeSwitch * 1000) + 1000,
+  {events: reboundEvents.map(e => `${e.request?.sequence}:${e.request?.position_ms}`), position: progressAfterSwitch.position_ms, beforeSwitch});
   await shot('version-switch');
 
   // Leaving retires this player's delivery.
@@ -402,7 +411,7 @@ export async function scenario(page, server, ctx, engine, out) {
   const home = await page.evaluate(() => document.querySelector('main').textContent);
   const state = await viewing(ctx.film.timeline);
   const expected = !state.watched && state.position_ms > 0;
-  check('home continue watching matches server viewing state', !/Continue watching is unavailable/i.test(home)
+  check('home continue watching matches server viewing state', !/Continue watching is (unavailable|not available)/i.test(home)
     && /Signal Film/.test(home) === expected, {listed: /Signal Film/.test(home), watched: state.watched, position: state.position_ms});
   await shot('home');
 

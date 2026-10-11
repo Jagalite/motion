@@ -246,6 +246,19 @@ async function firstGeneration(delivery, current) {
 // timeline, across server runtimes: the only authority adoptableRevision may
 // recognise as our own.
 const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
+const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
+// Written only by a page that is actually leaving (pagehide) and has a session.
+function leaveHandoff(data, session) {
+  try { if (session) sessionStorage.setItem(handoffKey(data), JSON.stringify({session, at: Date.now()})); } catch { /* fails closed */ }
+}
+function takeHandoff(data, now = Date.now()) {
+  try {
+    const raw = sessionStorage.getItem(handoffKey(data));
+    sessionStorage.removeItem(handoffKey(data));
+    const record = JSON.parse(raw ?? 'null');
+    return record && typeof record.session === 'string' && now - record.at >= 0 && now - record.at < 30000 ? record.session : null;
+  } catch { return null; }
+}
 
 // Outbox is scoped to this server runtime, principal, profile and timeline.
 // It contains session/event identities only, never reusable authentication.
@@ -485,44 +498,74 @@ async function changePlayback(change) {
 }
 
 /**
- * Move playback to a new delivery for another source: admit it at the
- * current position, prepare its player, rebind the viewing session to it
- * (revision precondition), then swap players and retire the predecessor. Any
- * failure before the swap retires the replacement and keeps the current one.
+ * Move playback to a new delivery for another source. The current player is
+ * frozen first (paused at a captured position, progress observer detached,
+ * pending progress saved), so nothing can race the rebind. The replacement is
+ * admitted at that position and leased from the moment its generation is
+ * known; the viewing session is rebound to it under its revision. A lost
+ * rebind response is reconciled by reading the session back. Only once the
+ * binding is known does one delivery get retired: the predecessor after a
+ * commit, the replacement otherwise (and the frozen player resumes).
  */
 async function switchDelivery(plan) {
   if (!state.element || !state.generation || state.changing) return false;
   state.changing = true;
   const epoch = state.epoch;
   const current = () => epoch === state.epoch;
-  const old = {id: state.deliveryId, element: state.element, generation: state.generation};
-  const observed = old.element.player.state;
-  const playing = observed.status === 'playing';
-  const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
-  const preferences = {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate};
+  const old = {id: state.deliveryId, element: state.element, generation: state.generation, delivery: state.delivery};
+  const wasPlaying = old.element.player.state.status === 'playing';
   let replacement = null;
   let element = null;
+  let stopReplacementLease = null;
+  let committed = false;
+  // Freeze the current player and save its exact position.
+  state.stopObserving?.(); state.stopObserving = null;
+  await old.element.pause().catch(() => {});
+  const observed = old.element.player.state;
+  const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
+  const preferences = {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate};
+  const restore = async () => {
+    if (!current()) return;
+    state.stopObserving = observeViewing(old.element, old.generation, state.viewing, current);
+    if (wasPlaying) await old.element.play().catch(() => {});
+  };
   try {
     status('Preparing the selected version…');
     if (state.viewing) {
-      state.viewing.record({position_ms: position, status: playing ? 'playing' : 'paused', delivery_generation: old.generation.generation});
+      state.viewing.record({position_ms: position, status: 'paused', delivery_generation: old.generation.generation});
       if (!await state.viewing.flush()) throw new Error('Progress is still pending; retry when connected.');
     }
+    if (!current()) throw new Error('Playback ownership changed.');
     replacement = await retryCommand('/api/v2/playback/delivery-sessions', {plan_token: plan.plan_token, start_ms: position}, key(), current);
     const ready = await firstGeneration(replacement, current);
     const generation = ready?.active;
     if (!current() || !generation) throw new Error('The selected version could not be prepared.');
+    // Keep the replacement alive while its player opens (its own lease).
+    stopReplacementLease = maintainLease(ready, generation.generation, {current,
+      send: (id, active_generation, signal) => api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal),
+      failed: () => {}});
     element = await preparePlayer(generation, position, current, preferences);
+    if (!current()) throw new Error('Playback ownership changed.');
     if (state.viewing) {
       const session = state.viewing.session;
-      const rebound = await api('PUT', `/api/v2/playback/viewing-sessions/${encodeURIComponent(session.id)}/delivery`,
-        {delivery_id: replacement.id}, undefined, AbortSignal.timeout(10000), {'If-Match': `"r-${session.revision}"`});
-      if (!current()) throw new Error('Playback ownership changed.');
+      const path = `/api/v2/playback/viewing-sessions/${encodeURIComponent(session.id)}`;
+      let rebound;
+      try {
+        rebound = await api('PUT', `${path}/delivery`, {delivery_id: replacement.id}, undefined, AbortSignal.timeout(10000),
+          {'If-Match': `"r-${session.revision}"`});
+      } catch (error) {
+        if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
+        // Unknown outcome: the server's binding decides.
+        rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000));
+        if (rebound?.delivery_id !== replacement.id) throw error;
+      }
+      if (!current()) { committed = true; throw new Error('Playback ownership changed.'); }
       state.viewing.rebind(rebound);
     }
+    committed = true;
     // Swap: the replacement owns the page from here on.
     state.stopLease?.(); state.stopLease = null;
-    state.stopObserving?.(); state.stopObserving = null;
+    stopReplacementLease(); stopReplacementLease = null;
     state.deliveryId = replacement.id;
     state.delivery = ready;
     state.generation = generation;
@@ -530,15 +573,18 @@ async function switchDelivery(plan) {
     renewLease(ready, generation, current);
     state.stopObserving = observeViewing(element, generation, state.viewing, current);
     element = null;
-    replacement = null;
     await disposePlayer(old.element);
     void retire(old.id);
     status('');
-    if (playing && current()) await state.element.play();
+    if (wasPlaying && current()) await state.element.play();
     return true;
   } catch (error) {
+    stopReplacementLease?.();
     if (element) await disposePlayer(element);
-    if (replacement) void retire(replacement.id);
+    // A rebind that committed while this page lost ownership leaves the
+    // session on the replacement; teardown retires whatever this page holds.
+    if (replacement && !committed) void retire(replacement.id);
+    if (!committed) await restore();
     if (current()) status(`Version change failed: ${error.message}`, 'alert');
     return false;
   } finally { state.changing = false; }
@@ -554,7 +600,10 @@ async function start() {
   // Unavailable storage means no known predecessor: adoption fails closed.
   // sessionStorage is per tab: a match there is this tab's previous page.
   const read = storage => { try { return storage.getItem(ownSessionKey(data)); } catch { return null; } };
-  const tabPredecessor = read(globalThis.sessionStorage);
+  // A same-tab predecessor is proven only by the handoff record its page
+  // wrote while leaving; it is consumed here once. A duplicated tab copies
+  // sessionStorage but not a handoff that was never written for it.
+  const tabPredecessor = takeHandoff(data);
   const predecessor = tabPredecessor ?? read(globalThis.localStorage);
   host.dataset.state = 'starting';
   try {
@@ -628,9 +677,7 @@ async function start() {
       if (session.delivery_id !== delivery.id || session.profile_id !== data.profileId || session.timeline_id !== data.timelineId) {
         throw new Error('The server returned a different viewing context.');
       }
-      for (const storage of [globalThis.sessionStorage, globalThis.localStorage]) {
-        try { storage.setItem(ownSessionKey(data), session.id); } catch { /* adoption then fails closed */ }
-      }
+      try { localStorage.setItem(ownSessionKey(data), session.id); } catch { /* adoption then fails closed */ }
       state.viewingOwner = {active: true};
       state.viewing = makeViewingWriter(session, viewingStorage(data), state.viewingOwner);
 
@@ -728,7 +775,10 @@ controls?.addEventListener('click', event => {
   })().catch(error => status(error.message, 'alert'));
 });
 
-addEventListener('pagehide', () => { void close({unloading: true}); });
+addEventListener('pagehide', () => {
+  if (host && state.viewing) leaveHandoff(host.dataset, state.viewing.session.id);
+  void close({unloading: true});
+});
 // Fragment navigation changes focus/scroll within the owned document.
 function leavesPlayerDocument(destination, currentUrl) {
   const next = new URL(destination, currentUrl);

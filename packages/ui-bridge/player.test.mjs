@@ -66,6 +66,21 @@ test('only a plan for the same file revision replans in place', () => {
   assert.equal(sameSource(delivery, {source: null}), false);
 });
 
+test('a same-tab handoff is written on leave, consumed once and expires', () => {
+  const store = new Map();
+  const sessionStorage = {getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: k => store.delete(k)};
+  const {leaveHandoff, takeHandoff} = runInNewContext(source.replace('export {close, maintainLease};', '({leaveHandoff, takeHandoff});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, sessionStorage, Date, JSON,
+  });
+  const data = {principalId: 'a', profileId: 'p', timelineId: 't'};
+  assert.equal(takeHandoff(data), null, 'a fresh or duplicated tab has no handoff');
+  leaveHandoff(data, 's1');
+  assert.equal(takeHandoff(data), 's1');
+  assert.equal(takeHandoff(data), null, 'consumed once');
+  leaveHandoff(data, 's2');
+  assert.equal(takeHandoff(data, Date.now() + 31000), null, 'stale handoff');
+});
+
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};
