@@ -866,3 +866,31 @@ func TestNarrowScanDetailRepeatsDroppedColumns(t *testing.T) {
 		t.Fatalf("scan detail lost dropped fields:\n%s", v)
 	}
 }
+
+func TestDetailWrapsLongIDsAndWideText(t *testing.T) {
+	for _, l := range words("job 0123456789abcdef0123456789abcdef0123 · 名前名前名前名前名前名前", 12) {
+		if w := lipgloss.Width(l); w > 12 {
+			t.Fatalf("line %q is %d cells", l, w)
+		}
+	}
+	if got := strings.Join(words("0123456789abcdef0123", 8), ""); got != "0123456789abcdef0123" {
+		t.Fatalf("long word lost characters: %q", got)
+	}
+}
+
+func TestResetRequeriesTheDefaultProfilesHistory(t *testing.T) {
+	m := start(t, &fake{}, 120, 40)
+	m, cmd := update(t, m, eventMsg(api.Event{Kind: "reset", ResourceType: "stream"}))
+	m = drain(t, m, cmd)
+	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" || strings.Contains(m.View(), "Choose a profile") {
+		t.Fatalf("continue watching lost its profile after a reset: %+v", p)
+	}
+}
+
+func TestRejectedActionSignsOut(t *testing.T) {
+	m := start(t, &fake{}, 120, 40)
+	m, _ = update(t, m, launchDone{err: &api.Problem{Status: 401}})
+	if v := m.View(); strings.Contains(v, "Movies") || !strings.Contains(v, "Sign in to Motion") {
+		t.Fatalf("rejected action left views:\n%s", v)
+	}
+}

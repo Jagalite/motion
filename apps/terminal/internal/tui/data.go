@@ -392,6 +392,8 @@ func fetchItem(ctx context.Context, b Backend, id, viewer string) (itemPage, err
 				view.viewing = &v
 			} else if ctx.Err() != nil {
 				return itemPage{}, ctx.Err()
+			} else if unauthenticated(err) {
+				return itemPage{}, err // history is optional; the credential is not
 			}
 		}
 		out.timelines = append(out.timelines, view)

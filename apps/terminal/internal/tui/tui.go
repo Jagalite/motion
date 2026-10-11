@@ -184,6 +184,7 @@ func (m *Model) resync() tea.Cmd {
 	for key := range m.cache.slots {
 		m.drop(key)
 	}
+	m.cache.viewer = "" // re-derived, and profile views re-queried, once identity returns
 	return m.reloadAll()
 }
 
@@ -321,12 +322,20 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return m.wait()
 	case launchDone:
 		m.launching = false
+		if unauthenticated(msg.err) {
+			m.signedOut(msg.err)
+			return nil
+		}
 		if msg.err != nil {
 			return m.say("Couldn't open the player: "+refusal(msg.err), true)
 		}
 		return m.say("Opened the player in your browser.", false)
 	case cancelDone:
 		delete(m.cancelling, msg.job)
+		if unauthenticated(msg.err) {
+			m.signedOut(msg.err)
+			return nil
+		}
 		if msg.err != nil {
 			return tea.Batch(m.say("Couldn't cancel the job: "+refusal(msg.err), true), m.load(keyJobs))
 		}
@@ -653,6 +662,7 @@ func (m *Model) signedOut(err error) {
 	}
 	m.cache.seq++
 	m.cache.slots[keySession] = &slot{request: m.cache.seq, err: err}
+	m.cache.viewer = ""
 	m.focus, m.history, m.confirm = focusContent, nil, ""
 }
 

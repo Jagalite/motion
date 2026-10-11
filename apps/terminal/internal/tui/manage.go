@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type pageKind int
@@ -323,23 +324,14 @@ func uptime(seconds string) string {
 	return fmt.Sprintf("%dm %ds", mi, s%60)
 }
 
-// words breaks plain text into lines of at most width cells.
+// words breaks plain text into lines of at most width cells, splitting
+// words wider than a line (IDs) rather than clipping them.
 func words(text string, width int) []string {
-	var lines []string
-	line := ""
-	for _, w := range strings.Fields(text) {
-		if line != "" && len([]rune(line))+1+len([]rune(w)) > width {
-			lines, line = append(lines, line), ""
-		}
-		if line != "" {
-			line += " "
-		}
-		line += w
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return nil
 	}
-	if line != "" {
-		lines = append(lines, line)
-	}
-	return lines
+	return strings.Split(ansi.Wrap(text, max(width, 1), ""), "\n")
 }
 
 // wrap breaks a comma-separated list to width.
