@@ -208,6 +208,9 @@ export async function scenario(page, server, ctx, engine, out) {
     const entry = {at: Date.now(), method, path: url.pathname, status: r.status()};
     if (r.status() >= 400) { try { entry.problem = await r.json(); } catch {} }
     if (url.pathname.endsWith('/events')) { try { entry.request = JSON.parse(r.request().postData() ?? 'null'); } catch {} }
+    if (url.pathname === '/api/v2/playback/delivery-sessions' && method === 'POST') {
+      try { entry.request = {start_ms: JSON.parse(r.request().postData() ?? 'null')?.start_ms}; } catch {}
+    }
     if (/\/playback\/(plans|delivery-sessions)/.test(url.pathname) && method !== 'DELETE') {
       try {
         const body = await r.json();
