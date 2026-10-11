@@ -30,10 +30,9 @@ before removing `save_progress`, `viewing::watched`, `viewing::start`,
 `viewing::event` and legacy preference writer mounts in `src/api.rs`.
 The legacy default web UI still calls these routes. The composed clients lane has migrated `scripts/smoke.py` and
 `viewing_smoke.py` to v2, including observed epochs and restart outbox checks.
-`reliability_smoke.py` and `test_package.py` still retain legacy viewing/progress
-traffic at this snapshot.
-Migrate their setup and assertions to reviewed public v2 routes before retirement;
-do not mark their existing passes as v2 acceptance. The old-binary portions of
+Client commits `a371793` and `f883f19` also migrate current-server package and
+reliability viewing assertions to public v2, including observed epochs. These
+callers are composed here; the legacy default UI remains the retirement blocker. The old-binary portions of
 `upgrade_restore_check.py` and `client_playback_upgrade.mjs` are the historical
 allowlist, not current-server exceptions.
 
