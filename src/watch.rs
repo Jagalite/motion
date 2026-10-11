@@ -34,8 +34,6 @@ struct Watched {
     /// FSEvents reports `/private/var/...` for `/var/...`).
     canonical: PathBuf,
     exclusions: Vec<String>,
-    /// Root identity (volume:inode) when the watch was established.
-    identity: Option<String>,
 }
 impl Watched {
     fn relative<'a>(&self, path: &'a Path) -> Option<&'a Path> {
@@ -94,6 +92,7 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
     let started = Instant::now();
     let now_ms = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut watched: BTreeMap<String, Watched> = BTreeMap::new();
+    let mut registry = core::Registry::default();
     let mut pending = BTreeMap::new();
     let mut resync = tokio::time::interval(RESYNC);
     let mut tick = tokio::time::interval(TICK);
@@ -101,10 +100,10 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = resync.tick() => {
-                match sync(&app, &mut watcher, &mut watched).await {
+                match sync(&app, &mut watcher, &mut registry, &mut watched).await {
                     // Changes made while a root was unwatched were not seen.
-                    Ok(rewatched) => {
-                        for source in rewatched {
+                    Ok(due) => {
+                        for source in due {
                             core::record(&mut pending, &source, now_ms());
                         }
                     }
@@ -173,13 +172,14 @@ fn attribute(watched: &BTreeMap<String, Watched>, observed: Observed) -> Vec<(St
     }
 }
 
-/// Watch every enabled, non-managed source root; unwatch removed, disabled or
-/// relocated ones; re-establish watches whose root identity changed (deleted
-/// and recreated, or remounted). Returns sources (re)watched after having
-/// been watched before, whose changes in between were not observed.
+/// Reconcile watches with enabled, non-managed source roots through the core
+/// registry, which decides what to (un)watch and which sources are owed a
+/// catch-up scan after a lost watch. Returns the sources whose catch-up is
+/// due now (their watch was just re-established).
 async fn sync(
     app: &App,
     watcher: &mut RecommendedWatcher,
+    registry: &mut core::Registry,
     watched: &mut BTreeMap<String, Watched>,
 ) -> anyhow::Result<Vec<String>> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
@@ -187,53 +187,52 @@ async fn sync(
     )
     .fetch_all(&app.db)
     .await?;
+    let mut details = BTreeMap::new();
     let mut wanted = BTreeMap::new();
     for (id, root, exclusions) in rows {
         let exclusions: Vec<String> = serde_json::from_str(&exclusions)?;
-        let root = PathBuf::from(root);
-        let canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        wanted.insert(
-            id,
-            Watched {
-                identity: identity(&root),
-                root,
-                canonical,
-                exclusions,
-            },
-        );
+        let path = PathBuf::from(&root);
+        let current = identity(&path);
+        wanted.insert(id.clone(), (root, current.clone()));
+        details.insert(id, (path, exclusions, current));
     }
-    let stale: Vec<String> = watched
-        .iter()
-        .filter(|(id, w)| wanted.get(*id).is_none_or(|n| n.root != w.root))
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in stale {
-        if let Some(old) = watched.remove(&id) {
-            let _ = watcher.unwatch(&old.root);
-        }
-    }
-    let mut rewatched = Vec::new();
-    for (id, want) in wanted {
-        if let Some(current) = watched.get_mut(&id) {
-            if !core::rewatch(current.identity.as_deref(), want.identity.as_deref()) {
-                current.exclusions = want.exclusions;
-                continue;
+    let mut due = Vec::new();
+    for step in registry.plan(&wanted) {
+        match step {
+            core::Step::Unwatch { id, root } => {
+                let _ = watcher.unwatch(Path::new(&root));
+                watched.remove(&id);
             }
-            let _ = watcher.unwatch(&current.root);
-            watched.remove(&id);
-            rewatched.push(id.clone());
-        }
-        match watcher.watch(&want.root, RecursiveMode::Recursive) {
-            Ok(()) => {
-                watched.insert(id, want);
-            }
-            Err(error) => {
-                // Not recorded as watched, so the next sync tries again.
-                tracing::warn!(%error, source = id, "source root cannot be watched");
+            core::Step::Watch { id, root } => {
+                let (path, exclusions, current) = details[&id].clone();
+                let result = watcher.watch(&path, RecursiveMode::Recursive);
+                if let Err(error) = &result {
+                    tracing::warn!(%error, source = id, "source root cannot be watched; will retry");
+                }
+                if registry.registered(&id, &root, current, result.is_ok()) {
+                    due.push(id.clone());
+                }
+                if result.is_ok() {
+                    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    watched.insert(
+                        id,
+                        Watched {
+                            root: path,
+                            canonical,
+                            exclusions,
+                        },
+                    );
+                }
             }
         }
     }
-    Ok(rewatched)
+    // Exclusions can change without re-registration.
+    for (id, (_, exclusions, _)) in details {
+        if let Some(entry) = watched.get_mut(&id) {
+            entry.exclusions = exclusions;
+        }
+    }
+    Ok(due)
 }
 
 /// Mark the source dirty and request a scan of it through the demand rules,

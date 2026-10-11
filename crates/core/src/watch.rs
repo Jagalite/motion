@@ -121,6 +121,74 @@ pub fn rewatch(watched_identity: Option<&str>, current_identity: Option<&str>) -
     }
 }
 
+/// Which roots are watched, and which sources are owed a catch-up scan
+/// because their watch was lost (identity changed or root unobservable).
+/// The obligation survives failed re-registration and is discharged only by
+/// a successful one, or by the source no longer being wanted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Registry {
+    watched: BTreeMap<Id, (String, Option<String>)>,
+    owed: std::collections::BTreeSet<Id>,
+}
+
+/// A registration effect for the adapter to execute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    Unwatch { id: Id, root: String },
+    Watch { id: Id, root: String },
+}
+
+impl Registry {
+    /// Reconcile with the wanted sources (`id -> (root, current identity)`).
+    pub fn plan(&mut self, wanted: &BTreeMap<Id, (String, Option<String>)>) -> Vec<Step> {
+        let mut steps = Vec::new();
+        let current: Vec<Id> = self.watched.keys().cloned().collect();
+        for id in current {
+            let (root, identity) = self.watched[&id].clone();
+            match wanted.get(&id) {
+                Some((want_root, want_identity)) if *want_root == root => {
+                    if rewatch(identity.as_deref(), want_identity.as_deref()) {
+                        self.watched.remove(&id);
+                        self.owed.insert(id.clone());
+                        steps.push(Step::Unwatch { id, root });
+                    }
+                }
+                // Removed, disabled or relocated: nothing is owed for it.
+                _ => {
+                    self.watched.remove(&id);
+                    self.owed.remove(&id);
+                    steps.push(Step::Unwatch { id, root });
+                }
+            }
+        }
+        self.owed.retain(|id| wanted.contains_key(id));
+        for (id, (root, _)) in wanted {
+            if !self.watched.contains_key(id) {
+                steps.push(Step::Watch {
+                    id: id.clone(),
+                    root: root.clone(),
+                });
+            }
+        }
+        steps
+    }
+
+    /// Record the outcome of a `Watch` step. Returns true when the source is
+    /// owed a catch-up scan that should now be requested.
+    pub fn registered(&mut self, id: &str, root: &str, identity: Option<String>, ok: bool) -> bool {
+        if !ok {
+            return false;
+        }
+        self.watched
+            .insert(id.to_string(), (root.to_string(), identity));
+        self.owed.remove(id)
+    }
+
+    pub fn owed(&self) -> impl Iterator<Item = &Id> {
+        self.owed.iter()
+    }
+}
+
 /// Drop pending hints for sources no longer watched (removed, disabled or
 /// relocated); their next scan comes from whoever re-enables them.
 pub fn retain_watched(pending: &mut BTreeMap<Id, Pending>, watched: &[Id]) {
@@ -166,6 +234,95 @@ mod tests {
         assert!(rewatch(Some("1:2"), Some("1:3")), "recreated root");
         assert!(rewatch(Some("1:2"), None), "root missing");
         assert!(rewatch(None, Some("1:2")), "never observed");
+    }
+
+    fn wanted(entries: &[(&str, &str, Option<&str>)]) -> BTreeMap<Id, (String, Option<String>)> {
+        entries
+            .iter()
+            .map(|(id, root, identity)| {
+                (
+                    id.to_string(),
+                    (root.to_string(), identity.map(str::to_string)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lost_watch_owes_a_catch_up_until_registration_succeeds() {
+        let mut registry = Registry::default();
+        let steps = registry.plan(&wanted(&[("s", "/m", Some("1:1"))]));
+        assert_eq!(
+            steps,
+            [Step::Watch {
+                id: "s".into(),
+                root: "/m".into()
+            }]
+        );
+        assert!(
+            !registry.registered("s", "/m", Some("1:1".into()), true),
+            "first watch owes nothing"
+        );
+        // Unchanged: no steps.
+        assert!(
+            registry
+                .plan(&wanted(&[("s", "/m", Some("1:1"))]))
+                .is_empty()
+        );
+        // Disk unplugged: unwatch, try again, registration fails.
+        let steps = registry.plan(&wanted(&[("s", "/m", None)]));
+        assert_eq!(steps.len(), 2);
+        assert!(!registry.registered("s", "/m", None, false));
+        assert!(registry.owed().any(|id| id == "s"));
+        // Still missing on the next pass: still owed, retried.
+        let steps = registry.plan(&wanted(&[("s", "/m", None)]));
+        assert_eq!(
+            steps,
+            [Step::Watch {
+                id: "s".into(),
+                root: "/m".into()
+            }]
+        );
+        assert!(!registry.registered("s", "/m", None, false));
+        // Disk back (new identity): registration succeeds and pays the debt once.
+        registry.plan(&wanted(&[("s", "/m", Some("2:9"))]));
+        assert!(registry.registered("s", "/m", Some("2:9".into()), true));
+        assert!(registry.owed().next().is_none());
+        assert!(
+            registry
+                .plan(&wanted(&[("s", "/m", Some("2:9"))]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn removed_or_relocated_sources_owe_nothing() {
+        let mut registry = Registry::default();
+        registry.plan(&wanted(&[("s", "/m", Some("1:1"))]));
+        registry.registered("s", "/m", Some("1:1".into()), true);
+        registry.plan(&wanted(&[("s", "/m", None)]));
+        registry.registered("s", "/m", None, false);
+        // Disabled while owed.
+        assert!(registry.plan(&wanted(&[])).is_empty());
+        assert!(registry.owed().next().is_none());
+        // Relocated: unwatch old root, watch new, nothing owed.
+        registry.plan(&wanted(&[("s", "/m", Some("1:1"))]));
+        registry.registered("s", "/m", Some("1:1".into()), true);
+        let steps = registry.plan(&wanted(&[("s", "/n", Some("3:3"))]));
+        assert_eq!(
+            steps,
+            [
+                Step::Unwatch {
+                    id: "s".into(),
+                    root: "/m".into()
+                },
+                Step::Watch {
+                    id: "s".into(),
+                    root: "/n".into()
+                }
+            ]
+        );
+        assert!(!registry.registered("s", "/n", Some("3:3".into()), true));
     }
 
     #[test]
