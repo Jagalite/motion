@@ -12,7 +12,7 @@ from unittest.mock import patch
 from check_source_companion import check as check_source_companion
 from build_media_tools import assert_portable, download
 from package_app import npm_archive, source_inventory, write_source_archive
-from package_privacy import assert_private_paths_absent, public_tar_member
+from package_privacy import assert_private_paths_absent, public_tar_member, private_content
 
 
 class PackagingTests(unittest.TestCase):
@@ -142,6 +142,14 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual((result.uid, result.gid, result.uname, result.gname), (0, 0, '', ''))
             self.assertEqual(result.pax_headers, {})
             self.assertEqual(result.mtime, 0)
+
+    def test_electron_system_and_url_literals_are_not_private_paths(self):
+        for value in [b'/System' + b'/Volumes/Data', b'/System' + b'/Volumes/Preboot/Cryptexes/App/System',
+                      b'https://www.quad9.net' + b'/home/privacy/', b'chrome:/' + b'/home/*']:
+            self.assertFalse(private_content(value), value)
+        for value in [b'/' + b'Volumes/Data/private', b'/System' + b'/Volumes/Data/Users/private/file',
+                      b'/' + b'home/privacy/file', b'chrome:/' + b'/home/private']:
+            self.assertTrue(private_content(value), value)
 
     def test_binary_embedded_paths_and_private_hosts_block_release(self):
         binary = self.cache / 'motion'
