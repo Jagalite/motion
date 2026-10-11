@@ -384,6 +384,8 @@ export async function scenario(page, server, ctx, engine, out) {
     form.querySelector('[data-player-action="quality"]').click();
     return window.__e2e.replaced(old, 60000);
   });
+  // Once replacement succeeds, every later failure must still retire/check it.
+  if (versionSwitch.replaced) product = admitted(t);
   const switchPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   const preparedPlan = since(t).find(e => e.path === '/api/v2/playback/plans');
   const rebound = since(t).find(e => e.method === 'PUT' && e.path.endsWith('/delivery'));
@@ -410,7 +412,6 @@ export async function scenario(page, server, ctx, engine, out) {
     && progressAfterSwitch.position_ms > Math.round(beforeSwitch * 1000) + 1000,
   {events: reboundEvents.map(e => `${e.request?.sequence}:${e.request?.position_ms}`), position: progressAfterSwitch.position_ms, beforeSwitch});
   await shot('version-switch');
-  if (versionSwitch.replaced) product = replacement;
   } catch (error) {
     check('prepared-version workflow is available through v2', false, {error: String(error)});
   }
