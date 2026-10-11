@@ -42,7 +42,7 @@ qualified; the release checks are listed below.
 | Original byte ranges | Implemented; Chromium/Electron receipts in [FINAL](../consolidation/FINAL.md) | Unchanged |
 | Prepared renditions | Default streams only; any track pin excluded every rendition | Implemented: a rendition serves a plan when it carries exactly the selected audio (recorded preparation audio of the same source revision); a pinned rendition version plays its own defaults |
 | Live software transcode | ≤720p; any bitrate cap refused | Implemented: capped conversions keep a client peak bitrate (VBV, measured over every HLS peak window) |
-| Live remux / audio-only conversion | v1 only, behind `processing.experimental_copy_routes` | Implemented in v2 Auto when enabled (off by default): core-decided, details observed lazily; exact-keyframe seeks fixed |
+| Live remux / audio-only conversion | v1 only, behind `processing.experimental_copy_routes` | Implemented in v2 Auto when enabled (off by default): core-decided, details observed lazily; exact-keyframe seeks fixed; the manifest declares the source's rate (probed average or measured peak, an estimate) |
 | Live hardware transcode | v1 only | Implemented in v2 when `processing.experimental_live_hardware` (off by default): available/busy/unavailable observed; a failed or busy session converts in software |
 | Interval (multi-episode) bindings | Refused | Implemented: conversion of the interval only; logical time from the interval start |
 | Multipart versions | Refused | Implemented: conversion only; parts decoded and joined (concat filter), each held to its pinned duration; ≤7 parts, one library, same picture size and audio roles; no subtitles |
@@ -62,7 +62,7 @@ fixtures. There is no HDR fixture with tone-mapping ground truth.
 
 | ID | Source SHAs | API / client changes | Supported / refused | Focused checks | Review (GPT-6.1 Sol) |
 |---|---|---|---|---|---|
-| M4-00 | ledger | None | Inventory above | Code inspection | Final PR diff |
+| M4-00 | ledger | None | Inventory above | Code inspection | Final PR diff: 3 P2 (multipart HDR, binding set, copy bandwidth), fixed in `d17556a` |
 | M4-01 copy | `fdc70b6`, `c1b74e9`, `678fcf7`, `3dcb7a2` | Plans may return `remux` / `audio_convert` (existing enums); capabilities list `stream_copy_hls` when enabled; copied `CODECS` derived from each copy's init segment | Auto + HLS + within limits + qualified H.264 details; Convert, Original, failures, unqualified details or a disabled server convert or refuse | Core `copy_seek`, `copy_operation`; route-selection model; `stream_copy_routes_are_planned_observed_and_fall_back_to_conversion`; v1 `tests/delivery.rs` | 3 P2 (CODECS, probe bounds, probe ownership) and 1 P2 (authorize before probe), all fixed |
 | M4-01 hardware | `2da18bd`, `6ef3b65` | Candidate prefix `h`; capabilities list `hardware_hls` when enabled and available | Available, unfailed session first; busy, unavailable or failed falls back to software; a plan signed before hardware was disabled cannot admit | `hardware_conversion_is_planned_when_available_and_falls_back_to_software` with `MOTION_REQUIRE_VIDEOTOOLBOX=1` (Apple encoder, no libx264 SEI; replan to software; capacity release; disabled restart) | 2 P2 (probe under the writer, enablement recheck), fixed |
 | M4-02 subtitles | `c2aedf8`, `24a6686`, `38332a8`, `c06d4c2`, `abb45a6`, `f7e4d61` | Plan claims carry `Text`, `Sidecar{name,fingerprint}` or `Bitmap`; the client `burned` mode is honored; no contract or client file changes | See inventory | Core `subtitle_occurrence`, `automatic_subtitle`, `same_language`, `presents_subtitle`; HTTP sidecar, bitmap burn-in (decoded output), automatic selection, plain-text tests | P1 (live text unsupported by the player): live text reverted. P2s on transfer permits, digest, in-place edits, canvas, seek lookback, FFmpeg 6.1 compatibility, route-aware auto: all fixed |
@@ -124,20 +124,19 @@ The playback-session and delivery models pass unchanged.
 Builds ran through the shared Kyoto queue with Rust 1.98, in this worktree's own
 target directory. Tests ran from the compiled binaries on macOS arm64, with
 host FFmpeg 8.1.2 and VideoToolbox available. The final receipts are at
-`6c1d504`. Compilation was through Kyoto (`0b29c0e6e2d14c599e351d42df9618e4`,
-`abf1f55f5fc443b8a51d2cd45d1f024a`):
+`d17556a`. Compilation was through Kyoto (`f84a3f490289462d88f430bb7f35e646`):
 
 | Suite | Result |
 |---|---|
-| `playscale-core` lib | 113 passed |
+| `playscale-core` lib | 114 passed |
 | `route_selection_model` | Graph exhausted, 28,689 states |
 | `playback_session_model`, `delivery_model`, `delivery_observation_model` | Passed (Statelessness 0.2.0) |
-| `tests/v2_playback.rs` | 21/21 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
+| `tests/v2_playback.rs` | 22/22 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
 | `tests/delivery.rs` | 12/12 |
 | `tests/access_api.rs` | 32/32 |
 | JavaScript | 54/54 (no client files changed) |
 | Contract checks | Pass (contract unchanged against main) |
-| Pinned clippy, `-p playscale-core -p playscale --all-targets` (CI allow-list) | Clean, Kyoto `82c05a76904d4a3ea2061b55440fc19f` |
+| Pinned clippy, `-p playscale-core -p playscale --all-targets` (CI allow-list) | Clean, Kyoto `f5c29d2b9d8a4a9fb10f583b9154e8d6` |
 | `cargo fmt --check`, contract checks | Pass |
 
 ## Deferred work and release checks
