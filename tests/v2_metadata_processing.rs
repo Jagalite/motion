@@ -1925,3 +1925,82 @@ async fn interrupted_retention_retries_without_new_backup_request() {
         .unwrap();
     assert_eq!(error, "backup_reclaimed");
 }
+
+#[tokio::test]
+async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    let device = f
+        .device(&["catalog:read", "processing:request"], true)
+        .await;
+    sqlx::query("UPDATE media_files SET duration_seconds=10")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
+    let mut ids = vec![];
+    for who in [&op, &device] {
+        let r = f
+            .call(
+                "POST",
+                "/api/v2/processing/preparations",
+                Some(input.clone()),
+                &[("authorization", who), ("idempotency-key", "shared-key")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
+        ids.push(r.body["id"].clone());
+    }
+    assert_ne!(ids[0], ids[1]);
+    let mut hidden = input.clone();
+    hidden["source"] = json!({"file_id":"file-b","file_revision":"rev-b"});
+    hidden["timeline_id"] = json!("ed-film-b");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(hidden),
+            &[("authorization", &device), ("idempotency-key", "hidden")]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(json!({"include_generated_media":false})),
+            &[
+                ("authorization", &device),
+                ("idempotency-key", "forbidden-backup")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let tracks = json!([{"index":0,"kind":"video","codec":"hevc","width":1920,"height":1080,"color_transfer":"smpte2084"},{"index":1,"kind":"video","codec":"h264","width":1920,"height":1080,"color_transfer":"bt709"}]);
+    sqlx::query("UPDATE media_files SET tracks_json=? WHERE id='file-a'")
+        .bind(tracks.to_string())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut hdr = input;
+    hdr["recipe_id"] = json!("h264720p");
+    let rejected = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(hdr),
+            &[("authorization", &op), ("idempotency-key", "hdr-first")],
+        )
+        .await;
+    assert_eq!(
+        rejected.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        rejected.body
+    );
+    assert_eq!(rejected.body["code"], "preparation_video_unsupported");
+}

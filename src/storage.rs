@@ -207,6 +207,7 @@ async fn make_snapshot(
         .fetch_one(&app.db)
         .await?;
     let root = app.storage.root.join("backups");
+    let detailed = requested.is_some();
     let destination = root.join(requested.unwrap_or(format!(
         "auto-{:020}-{}",
         std::time::SystemTime::now()
@@ -263,10 +264,13 @@ async fn make_snapshot(
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version")
             .fetch_all(&mut check)
             .await?;
-    let assets: Vec<(String, i64)> =
+    let assets: Vec<(String, i64)> = if detailed {
         sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
             .fetch_all(&mut check)
-            .await?;
+            .await?
+    } else {
+        vec![]
+    };
     let generated: Vec<(String, String, String, String, i64)> = if include_generated {
         sqlx::query_as("SELECT f.id,f.revision,l.root,f.relative_path,f.bytes FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.generated=1 AND f.available=1 ORDER BY f.id LIMIT 100001").fetch_all(&mut check).await?
     } else {
@@ -320,9 +324,11 @@ async fn make_snapshot(
             std::fs::File::open(stage.join("generated"))?.sync_all()?;
         }
         let mut value=serde_json::to_value(&snapshot)?;
+        if detailed {
         value["assets"]=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
         value["include_generated_media"]=serde_json::json!(include_generated);
         value["generated_media"]=serde_json::json!(media);
+        }
         let mut manifest = std::fs::File::create(stage.join("manifest.json"))?;
         let manifest_bytes=serde_json::to_vec_pretty(&value)?;
         anyhow::ensure!(manifest_bytes.len()<=16*1024*1024,"backup manifest too large");
@@ -520,35 +526,6 @@ impl Write for RollingLog {
         self.file.flush()
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn rolling_logs_bound_bytes_and_generations() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = RollingLog::new(dir.path().to_owned(), 64, 2).unwrap();
-        log.write_all(&[b'x'; 500]).unwrap();
-        log.flush().unwrap();
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert_eq!(files.len(), 3);
-        for f in files {
-            assert!(f.unwrap().metadata().unwrap().len() <= 64);
-        }
-        drop(log);
-        let _smaller = RollingLog::new(dir.path().to_owned(), 16, 1).unwrap();
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
-        for entry in std::fs::read_dir(dir.path()).unwrap() {
-            assert!(entry.unwrap().metadata().unwrap().len() <= 16);
-        }
-    }
-    #[test]
-    fn disk_reserve_rejects_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(require_space(dir.path(), u64::MAX, 1).is_err());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-}
-
 /// Stable job destination makes a crash after rename but before DB acknowledgement
 /// recoverable. Never overwrite an existing completed snapshot.
 pub(crate) struct VerifiedBackup {
@@ -723,4 +700,33 @@ fn read_backup_manifest(destination: &Path) -> anyhow::Result<Vec<u8>> {
         "backup manifest too large"
     );
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rolling_logs_bound_bytes_and_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RollingLog::new(dir.path().to_owned(), 64, 2).unwrap();
+        log.write_all(&[b'x'; 500]).unwrap();
+        log.flush().unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(files.len(), 3);
+        for f in files {
+            assert!(f.unwrap().metadata().unwrap().len() <= 64);
+        }
+        drop(log);
+        let _smaller = RollingLog::new(dir.path().to_owned(), 16, 1).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            assert!(entry.unwrap().metadata().unwrap().len() <= 16);
+        }
+    }
+    #[test]
+    fn disk_reserve_rejects_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(require_space(dir.path(), u64::MAX, 1).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
