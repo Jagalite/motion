@@ -170,6 +170,10 @@ pub struct Request {
     /// The client pinned revision-local source tracks. A rendition has its own
     /// streams, so it cannot honor them.
     pub tracks_pinned: bool,
+    /// The selected subtitle can only be presented burned into the video (a
+    /// bitmap subtitle for a client that accepts burned subtitles). Burn-in
+    /// is a video transform: only a conversion can deliver it.
+    pub burn_in: bool,
     pub failed: Vec<String>,
 }
 
@@ -197,7 +201,7 @@ pub enum Plan {
 /// plan. Nothing here starts processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
-    let byte = request.range && !request.explicit_streams;
+    let byte = request.range && !request.explicit_streams && !request.burn_in;
     // An unavailable original rules out its own byte route and any live
     // conversion of it, not a stored rendition that is still revision-valid.
     let mut candidates = vec![Candidate {
@@ -227,7 +231,9 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     match () {
         _ if request.pinned_prepared => Plan::Blocked("selected_version_unavailable"),
         _ if !source.available => Plan::Blocked("source_unavailable"),
-        _ if request.mode == Mode::Original => Plan::Blocked(if request.explicit_streams {
+        _ if request.mode == Mode::Original => Plan::Blocked(if request.burn_in {
+            "subtitle_requires_conversion"
+        } else if request.explicit_streams {
             "stream_selection_requires_conversion"
         } else {
             "original_unavailable_or_unsupported"
@@ -235,11 +241,13 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         _ if !request.hls => Plan::Blocked("client_cannot_play_conversion"),
         // A copy keeps the source's video at its own size and bitrate. Convert
         // asks for converted video, so only Auto may choose a copy.
-        _ if request.mode == Mode::Auto && source.within_budget => match source.copy {
-            StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
-            StreamCopy::Unobserved(route) if !failed(route, file_id) => Plan::Observe,
-            _ => transcode(file_id, source, request),
-        },
+        _ if request.mode == Mode::Auto && source.within_budget && !request.burn_in => {
+            match source.copy {
+                StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
+                StreamCopy::Unobserved(route) if !failed(route, file_id) => Plan::Observe,
+                _ => transcode(file_id, source, request),
+            }
+        }
         _ => transcode(file_id, source, request),
     }
 }
@@ -267,6 +275,9 @@ pub enum Subtitle {
     /// A recognized plain-text sidecar of the pinned file, by name and the
     /// fingerprint observed when it was scanned. A changed sidecar is refused.
     Sidecar { name: String, fingerprint: String },
+    /// The zero-based embedded bitmap subtitle stream (PGS, DVD, DVB) of the
+    /// pinned file, burned into converted video.
+    Bitmap(u32),
 }
 
 /// Everything a plan token pins. Signed by the adapter; never trusted unsigned.
@@ -491,6 +502,7 @@ mod tests {
             explicit_streams: false,
             pinned_prepared: false,
             tracks_pinned: false,
+            burn_in: false,
             failed: vec![],
         }
     }
@@ -1052,5 +1064,38 @@ mod tests {
             Operation::VideoTranscode
         );
         assert_eq!(Route::HardwareTranscode.transport(), "hls");
+    }
+
+    #[test]
+    fn burned_subtitles_need_a_conversion_never_bytes_or_a_copy() {
+        let mut s = source(Support::Supported);
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        let mut burn = request(Mode::Auto);
+        burn.burn_in = true;
+        burn.tracks_pinned = true;
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::Transcode));
+        s.hardware = Hardware::Available;
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
+        let mut original = burn.clone();
+        original.mode = Mode::Original;
+        assert_eq!(
+            plan("f", &s, &original),
+            Plan::Blocked("subtitle_requires_conversion")
+        );
+        let mut range_only = burn.clone();
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
+        // A prepared rendition never carries it either.
+        s.prepared = vec![PreparedFacts {
+            file: "p".into(),
+            client_support: Support::Supported,
+            within_budget: true,
+        }];
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
+        s.transcodable = false;
+        assert_eq!(plan("f", &s, &burn), Plan::Blocked("no_live_route"));
     }
 }

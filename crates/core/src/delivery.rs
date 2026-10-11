@@ -154,6 +154,12 @@ pub fn copy_operation(s: &SourceStreams<'_>) -> Option<Operation> {
     })
 }
 
+/// Bitmap subtitle codecs that a conversion can burn into the video (an
+/// overlay of decoded subpictures; no text rendering needed).
+pub fn burnable_subtitle(codec: &str) -> bool {
+    matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle")
+}
+
 /// Whether a live segmented route can serve these streams. Stream copy is only
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.

@@ -1012,6 +1012,10 @@ pub async fn plan(
             );
         }
     };
+    // A text subtitle is delivered as WebVTT to a client that presents text;
+    // a bitmap one is burned into converted video for a client that accepts
+    // burned subtitles. Anything else is refused, never substituted.
+    let mut burn = None;
     if let Some(index) = subtitle {
         let codec = &streams
             .iter()
@@ -1019,14 +1023,14 @@ pub async fn plan(
             .nth(index as usize)
             .unwrap()
             .codec;
-        if !matches!(
-            codec.as_str(),
-            "subrip" | "srt" | "webvtt" | "mov_text" | "text"
-        ) || !input.client.subtitle_modes.iter().any(|m| m == "text")
-        {
+        let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+        if playscale_core::delivery::burnable_subtitle(codec) && accepts("burned") {
+            burn = Some(index);
+        } else if !(playscale_core::delivery::sidecar_subtitle(codec) && accepts("text")) {
             return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
         }
     }
+    let subtitle = subtitle.filter(|_| burn.is_none());
     // A sidecar is pinned with the fingerprint it was scanned with; only plain
     // text (SRT, WebVTT) is delivered.
     let sidecar = match sidecar_name {
@@ -1151,7 +1155,9 @@ pub async fn plan(
         tracks_pinned: tracks_pinned
             || input.tracks.audio_component_id.is_some()
             || subtitle.is_some()
-            || sidecar.is_some(),
+            || sidecar.is_some()
+            || burn.is_some(),
+        burn_in: burn.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
     let mut decided = core::plan(&bound.file.id, &source, &request);
@@ -1209,13 +1215,14 @@ pub async fn plan(
         file_revision: chosen.file.revision.clone(),
         route,
         audio,
-        subtitle: match (subtitle, sidecar) {
-            (Some(index), _) => Some(core::Subtitle::Text(index)),
-            (None, Some(sidecar)) => Some(core::Subtitle::Sidecar {
+        subtitle: match (subtitle, sidecar, burn) {
+            (Some(index), _, _) => Some(core::Subtitle::Text(index)),
+            (None, Some(sidecar), _) => Some(core::Subtitle::Sidecar {
                 name: sidecar.name,
                 fingerprint: sidecar.fingerprint,
             }),
-            (None, None) => None,
+            (None, None, Some(index)) => Some(core::Subtitle::Bitmap(index)),
+            (None, None, None) => None,
         },
         expires_at,
     };
@@ -1236,7 +1243,7 @@ pub async fn plan(
         "operation": serde_json::to_value(route.operation()).map_err(Problem::internal)?,
         "reason_codes": [],
         "warnings": warnings,
-        "tracks": tracks_json(&input.tracks, audio, subtitle),
+        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn)),
     }))
     .into_response())
 }
@@ -1329,6 +1336,13 @@ async fn may_probe(
 fn embedded_subtitle(claims: &Claims) -> Option<u32> {
     match claims.subtitle {
         Some(core::Subtitle::Text(index)) => Some(index),
+        _ => None,
+    }
+}
+
+fn burned_subtitle(claims: &Claims) -> Option<u32> {
+    match claims.subtitle {
+        Some(core::Subtitle::Bitmap(index)) => Some(index),
         _ => None,
     }
 }
@@ -1451,6 +1465,7 @@ pub async fn create_delivery(
         version: claims.version.clone(),
         route: claims.route,
         sidecar: sidecar_of(&claims),
+        burn: burned_subtitle(&claims),
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -1777,6 +1792,7 @@ pub async fn change_delivery(
                     audio: claims.audio,
                     subtitle: embedded_subtitle(&claims),
                     sidecar: sidecar_of(&claims),
+                    burn: burned_subtitle(&claims),
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )

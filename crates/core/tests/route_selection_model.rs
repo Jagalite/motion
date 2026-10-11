@@ -27,6 +27,8 @@ struct Config {
     original_supported: bool,
     /// A non-default stream was chosen: no byte route can honor it.
     explicit_streams: bool,
+    /// The selected subtitle must be burned into the video.
+    burn_in: bool,
     hls: bool,
     /// The source fits the client's limits (copy keeps the source's size).
     within_budget: bool,
@@ -112,7 +114,8 @@ fn request(c: &Config, failed: &[Route]) -> core::Request {
         hls: c.hls,
         explicit_streams: c.explicit_streams,
         pinned_prepared: false,
-        tracks_pinned: false,
+        tracks_pinned: c.burn_in,
+        burn_in: c.burn_in,
         failed: failed.iter().map(|r| r.candidate_id(FILE)).collect(),
     }
 }
@@ -125,8 +128,8 @@ impl Model for Selection {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.route-selection".into(),
-            model_version: 2,
-            properties_version: 2,
+            model_version: 3,
+            properties_version: 3,
             codec_version: 1,
             build: include_str!("../src/playback_session.rs").into(),
         }
@@ -210,10 +213,12 @@ impl Model for Selection {
         // Stated independently of the production rules.
         let original_usable = c.mode != ModeFact::Convert
             && !c.explicit_streams
+            && !c.burn_in
             && c.original_supported
             && c.within_budget
             && !failed(Route::Original);
         let copy_open = c.mode == ModeFact::Auto
+            && !c.burn_in
             && c.hls
             && c.within_budget
             && c.copy.is_some_and(|r| !failed(r));
@@ -221,7 +226,9 @@ impl Model for Selection {
             Outcome::Ready(Route::Original)
         } else if c.mode == ModeFact::Original {
             Outcome::Blocked(
-                if c.explicit_streams {
+                if c.burn_in {
+                    "subtitle_requires_conversion"
+                } else if c.explicit_streams {
                     "stream_selection_requires_conversion"
                 } else {
                     "original_unavailable_or_unsupported"
@@ -280,6 +287,15 @@ impl Model for Selection {
                     || c.hardware == HardwareFact::Available,
             ),
             check(
+                "burned_subtitles_only_on_a_conversion",
+                !c.burn_in
+                    || matches!(
+                        outcome,
+                        Outcome::Ready(Route::Transcode | Route::HardwareTranscode)
+                            | Outcome::Blocked(_)
+                    ),
+            ),
+            check(
                 "strict_original_never_streams_live",
                 c.mode != ModeFact::Original
                     || matches!(
@@ -308,7 +324,7 @@ impl Enumerate for Selection {
                         HardwareFact::Busy,
                         HardwareFact::Available,
                     ] {
-                        for bits in 0..64u8 {
+                        for bits in 0..128u8 {
                             let bit = |i: u8| bits & (1 << i) != 0;
                             // Details only matter when a copy is named.
                             if copy.is_none() && bit(5) {
@@ -323,6 +339,7 @@ impl Enumerate for Selection {
                                 transcodable: bit(4),
                                 copy,
                                 details_qualify: bit(5),
+                                burn_in: bit(6),
                                 hardware,
                             }));
                         }
@@ -387,8 +404,8 @@ fn route_selection_prefers_qualified_copies_observes_lazily_and_never_reoffers_f
     );
     println!(
         "route-selection model: {} states, {} transitions; three modes, remux/audio-convert/no \
-         copy, qualified or unqualified details, unavailable/busy/available hardware, HLS, \
-         limits, conversion capability, explicit streams and client support, with repeated \
+         copy, qualified or unqualified details, unavailable/busy/available hardware, burned \
+         subtitles, HLS, limits, conversion capability, explicit streams and client support, with repeated \
          failure reports",
         report.states, report.transitions
     );

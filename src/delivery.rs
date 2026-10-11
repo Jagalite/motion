@@ -426,6 +426,7 @@ fn arguments(
     hardware: bool,
     start_ms: u64,
     audio: Option<u32>,
+    burn: Option<u32>,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
@@ -454,7 +455,20 @@ fn arguments(
         ]
         .map(str::to_owned),
     );
-    args.extend(["-map", "0:v:0"].map(str::to_owned));
+    const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    // A burned bitmap subtitle is overlaid on the source-size video before it
+    // is scaled, so subpicture and picture share one canvas.
+    let burn = burn.filter(|_| !copy);
+    match burn {
+        Some(index) => {
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:v:0][0:s:{index}]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        None => args.extend(["-map", "0:v:0"].map(str::to_owned)),
+    }
     if let Some(audio) = audio {
         args.push("-map".into());
         args.push(format!("0:a:{audio}"));
@@ -463,15 +477,10 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        args.extend(
-            [
-                "-vf",
-                "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                "-pix_fmt",
-                "yuv420p",
-            ]
-            .map(str::to_owned),
-        );
+        if burn.is_none() {
+            args.extend(["-vf", SCALE].map(str::to_owned));
+        }
+        args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
         if hardware {
             // -allow_sw 0: fail rather than silently encode in software.
             args.extend(
@@ -1183,6 +1192,7 @@ async fn run_generation(
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
             seek_ms,
             audio,
+            pinned_burn(&pin),
             &directory,
         ))
         .stdin(Stdio::piped())
@@ -1813,6 +1823,55 @@ fn pinned_subtitle(pin: &Pin) -> Option<u32> {
 }
 
 const SIDECAR_TRACK: &str = "subtitle-sidecar:";
+const BURN_TRACK: &str = "subtitle-burn:";
+
+/// A bitmap subtitle stream burned into this generation's video.
+fn pinned_burn(pin: &Pin) -> Option<u32> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix(BURN_TRACK).and_then(|i| i.parse().ok()))
+}
+
+/// Pin a burned bitmap subtitle in place of an absent text one.
+fn with_burn(mut pin: Pin, burn: Option<u32>) -> Pin {
+    if let Some(index) = burn {
+        for track in &mut pin.tracks {
+            if track == "subtitle:none" {
+                *track = format!("{BURN_TRACK}{index}");
+            }
+        }
+    }
+    pin
+}
+
+/// A burned subtitle must be an embedded bitmap stream, and burn-in is a
+/// video transform: only a transcode can carry it.
+fn validate_burn(
+    file: &db::ItemRow,
+    burn: Option<u32>,
+    operation: Operation,
+) -> Result<(), ApiError> {
+    let Some(index) = burn else {
+        return Ok(());
+    };
+    let streams: Vec<db::Track> =
+        serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
+    let codec = streams
+        .iter()
+        .filter(|t| t.kind == "subtitle")
+        .nth(index as usize)
+        .map(|t| t.codec.as_str())
+        .ok_or_else(|| ApiError::bad("Unknown subtitle track"))?;
+    if operation == Operation::VideoTranscode && core::burnable_subtitle(codec) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "Only bitmap subtitles are burned, and only into a transcode",
+        ))
+    }
+}
 
 /// A pinned plain-text sidecar: (fingerprint, file name).
 fn pinned_sidecar(pin: &Pin) -> Option<(&str, &str)> {
@@ -2214,6 +2273,8 @@ pub(crate) struct Planned {
     pub route: Route,
     /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
     pub sidecar: Option<Sidecar>,
+    /// An embedded bitmap subtitle burned into the converted video.
+    pub burn: Option<u32>,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2369,6 +2430,7 @@ pub(crate) struct Selection {
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
     pub sidecar: Option<Sidecar>,
+    pub burn: Option<u32>,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2466,7 +2528,11 @@ pub(crate) async fn change_live(
                 }
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
-            let pin = with_sidecar(pin, selection.sidecar.as_ref());
+            validate_burn(&file, selection.burn, pin.operation)?;
+            let pin = with_burn(
+                with_sidecar(pin, selection.sidecar.as_ref()),
+                selection.burn,
+            );
             (Some(basis), Some((timeline, pin)))
         }
     };
@@ -2714,7 +2780,19 @@ async fn admit_owned(
             Sha256::digest(
                 match &planned {
                     None => serde_json::to_vec(&r),
-                    Some(p) => serde_json::to_vec(&(&r, &p.owner, &p.version, p.route)),
+                    // A sidecar or burned subtitle is part of the request too;
+                    // digests without one keep their earlier form.
+                    Some(p) if p.sidecar.is_none() && p.burn.is_none() => {
+                        serde_json::to_vec(&(&r, &p.owner, &p.version, p.route))
+                    }
+                    Some(p) => serde_json::to_vec(&(
+                        &r,
+                        &p.owner,
+                        &p.version,
+                        p.route,
+                        p.sidecar.as_ref().map(|s| (&s.name, &s.fingerprint)),
+                        p.burn,
+                    )),
                 }
                 .expect("serializable request")
             )
@@ -2808,6 +2886,8 @@ async fn admit_owned(
     validate_subtitle(&file, r.subtitle_track)?;
     let sidecar = planned.as_ref().and_then(|p| p.sidecar.as_ref());
     validate_sidecar(&mut transaction, &file.id, sidecar).await?;
+    let burn = planned.as_ref().and_then(|p| p.burn);
+    validate_burn(&file, burn, operation)?;
     let duration_ms = file
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -2833,13 +2913,16 @@ async fn admit_owned(
         planned
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
-        with_sidecar(
-            if original {
-                byte_pin(&file, r.audio_track, r.subtitle_track, operation)
-            } else {
-                pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
-            },
-            sidecar,
+        with_burn(
+            with_sidecar(
+                if original {
+                    byte_pin(&file, r.audio_track, r.subtitle_track, operation)
+                } else {
+                    pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+                },
+                sidecar,
+            ),
+            burn,
         ),
         r.start_ms,
         duration_ms,
@@ -3432,6 +3515,7 @@ async fn ensure_subtitles(
             (source, Some(format), "0:s:0".to_owned())
         }
     };
+    let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
         tokio::task::spawn_blocking(move || source_valid(&source)),
@@ -3474,6 +3558,26 @@ async fn ensure_subtitles(
             return Err(subtitles_unavailable());
         }
     };
+    // The converter read the descriptor after it was validated: an in-place
+    // edit in between would be published under the pinned fingerprint.
+    // Observe the descriptor again before publishing.
+    let unchanged = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            input
+                .metadata()
+                .is_ok_and(|m| scan::fingerprint(&m) == expected)
+        }),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?;
+    if !unchanged {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Create a new delivery",
+        ));
+    }
     // Publish into the existing delivery directory only: if cleanup removed it,
     // the delivery is gone and nothing is resurrected.
     let partial = path.with_extension("vtt.partial");

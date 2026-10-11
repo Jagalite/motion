@@ -3358,6 +3358,26 @@ async fn sidecar_subtitles_are_component_pinned_and_fingerprinted() {
         )
         .await;
     assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    // The same key with another subtitle choice is a different request.
+    let plain = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["http_range"]),
+        )
+        .await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-original-01"),
+            json!({"plan_token": plain.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
     let url = admitted.body["active"]["subtitles_url"]
         .as_str()
         .unwrap()
@@ -3461,4 +3481,220 @@ async fn sidecar_subtitles_are_component_pinned_and_fingerprinted() {
         StatusCode::CONFLICT,
         "source_revision_changed",
     );
+}
+
+/// A minimal PGS (`.sup`) stream: one opaque white `w`x`h` box at (`x`, `y`)
+/// on a `width`x`height` canvas, shown from `start_ms` until `end_ms`.
+fn pgs_box(
+    width: u16,
+    height: u16,
+    (x, y, w, h): (u16, u16, u16, u16),
+    start_ms: u32,
+    end_ms: u32,
+) -> Vec<u8> {
+    let segment = |pts_ms: u32, kind: u8, payload: &[u8]| {
+        let mut out = b"PG".to_vec();
+        out.extend((pts_ms * 90).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.push(kind);
+        out.extend((payload.len() as u16).to_be_bytes());
+        out.extend(payload);
+        out
+    };
+    let be = |v: u16| v.to_be_bytes();
+    let window = [&[1u8, 0][..], &be(x), &be(y), &be(w), &be(h)].concat();
+    let mut rle = Vec::new();
+    for _ in 0..h {
+        rle.extend([
+            0x00,
+            0xC0 | (w >> 8) as u8,
+            (w & 0xff) as u8,
+            0x01,
+            0x00,
+            0x00,
+        ]);
+    }
+    let mut ods = vec![0, 0, 0, 0xC0];
+    ods.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+    ods.extend(be(w));
+    ods.extend(be(h));
+    ods.extend(&rle);
+    let pcs = |number: u16, state: u8, objects: bool| {
+        let mut p = [
+            &be(width)[..],
+            &be(height),
+            &[0x10],
+            &be(number),
+            &[state, 0, 0],
+        ]
+        .concat();
+        if objects {
+            p.extend([1, 0, 0, 0, 0]);
+            p.extend(be(x));
+            p.extend(be(y));
+        } else {
+            p.push(0);
+        }
+        p
+    };
+    [
+        segment(start_ms, 0x16, &pcs(0, 0x80, true)),
+        segment(start_ms, 0x17, &window),
+        segment(start_ms, 0x14, &[0, 0, 1, 235, 128, 128, 255]),
+        segment(start_ms, 0x15, &ods),
+        segment(start_ms, 0x80, &[]),
+        segment(end_ms, 0x16, &pcs(1, 0x00, false)),
+        segment(end_ms, 0x17, &window),
+        segment(end_ms, 0x80, &[]),
+    ]
+    .concat()
+}
+
+/// A bitmap subtitle is burned into a conversion for a client that accepts
+/// burned subtitles: never offered on byte delivery, a copy or to a client
+/// that does not accept it, and the decoded output carries the subpicture.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_subtitles_are_burned_into_conversions_only() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    two_audio_mp4(&f, "20");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("box.sup");
+    std::fs::write(&sup, pgs_box(320, 240, (40, 40, 240, 60), 0, 6000)).unwrap();
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let input = |mode: &str, modes: &[&str]| {
+        let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        input["source"] = source.clone();
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(modes);
+        input
+    };
+    let plan = |body| f.post("/api/v2/playback/plans", &auth, None, body);
+    assert_eq!(
+        plan(input("auto", &["text"])).await.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    assert_eq!(
+        plan(input("original", &["text", "burned"])).await.body["reason_codes"][0],
+        "subtitle_requires_conversion"
+    );
+    // Auto skips the original and the (eligible) copy for a conversion.
+    let burned = plan(input("auto", &["text", "burned"])).await;
+    assert_eq!(
+        burned.body["operation"], "video_transcode",
+        "{}",
+        burned.body
+    );
+    assert_eq!(burned.body["tracks"]["subtitle_track_id"], "s0");
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-subtitle-001"),
+            json!({"plan_token": burned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+        })
+        .await;
+    // Burned, not a sidecar.
+    assert_eq!(ready["active"]["subtitles_url"], Value::Null, "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base_url = format!("/api/v2/streams/{id}/1");
+    let fragment = f.dir.path().join("burned.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        // FFmpeg presents a subpicture from just after the first frame on.
+        .args([
+            "-ss",
+            "1",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mean = |x0: usize, y0: usize, w: usize, h: usize| {
+        let mut sum = 0usize;
+        for y in y0..y0 + h {
+            sum += frame[y * 320 + x0..y * 320 + x0 + w]
+                .iter()
+                .map(|&p| p as usize)
+                .sum::<usize>();
+        }
+        sum / (w * h)
+    };
+    // Inside the box (inset from its edges) is white; below it is the picture.
+    assert!(
+        mean(50, 50, 220, 40) > 225,
+        "box mean {}",
+        mean(50, 50, 220, 40)
+    );
+    assert!(
+        mean(50, 150, 220, 40) < 200,
+        "picture mean {}",
+        mean(50, 150, 220, 40)
+    );
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
 }
