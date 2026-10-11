@@ -277,6 +277,10 @@ pub struct Delivery {
     /// generation, with that generation. A candidate is not being watched yet: it
     /// is paced from its requested start, and its heartbeats record no playhead.
     pub playhead: Option<(u64, u64)>,
+    /// Latest ordered pacing observation (generation, sequence, position).
+    /// Process-owned delivery state; restored deliveries are interrupted.
+    #[serde(default)]
+    pub observation: Option<(u64, u64, u64)>,
     pub timeline: String,
     pub duration_ms: Option<u64>,
     pub status: Status,
@@ -342,6 +346,12 @@ pub enum Input {
         active_generation: u64,
         /// Logical timeline playhead, when the client reports it.
         position_ms: Option<u64>,
+        now_ms: u64,
+    },
+    ObservePlayhead {
+        generation: u64,
+        sequence: u64,
+        position_ms: u64,
         now_ms: u64,
     },
     Tick {
@@ -459,6 +469,7 @@ impl Delivery {
             revision: 1,
             policy,
             playhead: None,
+            observation: None,
             timeline,
             duration_ms,
             status: Status::Starting,
@@ -936,6 +947,36 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
             {
                 d.playhead = Some((*active_generation, *position));
             }
+        }
+        Input::ObservePlayhead {
+            generation,
+            sequence,
+            position_ms,
+            now_ms,
+        } => {
+            if !d.lease_valid(*now_ms) {
+                return Err(Error::DeliveryClosed);
+            }
+            if d.active != Some(*generation) {
+                return Err(Error::GenerationConflict);
+            }
+            if *sequence == 0 || !within(d.duration_ms, *position_ms) {
+                return Err(Error::InvalidPosition);
+            }
+            if let Some((g, s, p)) = d.observation
+                && g == *generation
+                && *sequence <= s
+            {
+                if *sequence == s && *position_ms != p {
+                    return Err(Error::GenerationConflict);
+                }
+                // Older reports and exact duplicates have no effects, including
+                // no lease renewal. A newer observation may seek backwards.
+                return Ok((before.clone(), Vec::new()));
+            }
+            d.observation = Some((*generation, *sequence, *position_ms));
+            d.playhead = Some((*generation, *position_ms));
+            d.lease_expires_ms = now_ms.saturating_add(LEASE_MS).max(d.lease_expires_ms);
         }
         Input::Tick { now_ms } => {
             if !d.status.fenced() && *now_ms >= d.lease_expires_ms {

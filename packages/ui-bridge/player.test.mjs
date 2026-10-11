@@ -225,7 +225,7 @@ test('skip links retain the current player; document navigation still tears down
   assert.equal(leaves('https://other.test/', current), false);
 });
 
-test('viewing storage migrates tab data and keeps prior runtime history out of current authority', () => {
+test('viewing storage survives ordinary restart and fences restore identity', () => {
   const makeStorage = () => {
     const store = {};
     Object.defineProperties(store, {
@@ -239,7 +239,7 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   const factory = runInNewContext(source.replace('export {close, maintainLease};', 'viewingStorage;'), {
     document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, localStorage, sessionStorage,
   });
-  const data = {serverEpoch: 'e1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
+  const data = {viewingEpoch: 'server:restore1', principalId: 'p1', profileId: 'profile', timelineId: 'timeline'};
   const key = 'motion:viewing:' + JSON.stringify(Object.values(data));
   sessionStorage.setItem(key, '{"event_id":"immutable"}');
   const storage = factory(data);
@@ -248,9 +248,78 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   assert.equal(sessionStorage.getItem(key), null);
   assert.equal(JSON.parse(localStorage.getItem(key)).event_id, 'immutable');
   const restarted = factory({...data, serverEpoch: 'e2'});
-  assert.equal(restarted.load(), null);
-  assert.equal(restarted.hasRejected(), true);
+  assert.equal(restarted.load().event_id, 'immutable');
+  assert.equal(restarted.hasRejected(), false);
+  const restored = factory({...data, viewingEpoch: 'server:restore2'});
+  assert.equal(restored.load(), null);
+  assert.equal(restored.hasRejected(), true);
   assert.equal(factory({...data, principalId: 'p2'}).hasRejected(), false);
   storage.save(null);
   assert.equal(localStorage.getItem(key), null);
+});
+
+test('pacing counters survive renewal restart and failed-change rollback on the same generation', () => {
+  const heartbeat = runInNewContext(source.replace('export {close, maintainLease};', 'pacingHeartbeat;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const generation = {generation: '1', media_time_origin_ms: 10000};
+  const active = time => heartbeat('delivery', generation, {status: 'playing', currentTime: time});
+  assert.equal(active(2).playhead.sequence, '1');
+  // A replacement fails; the same delivery/generation resumes its renewal.
+  const resumed = active(1);
+  assert.equal(resumed.playhead.sequence, '2');
+  assert.equal(resumed.playhead.position_ms, 11000);
+  assert.equal(heartbeat('replacement', generation, {status: 'paused', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(heartbeat('delivery', {...generation, generation: '2'}, {status: 'playing', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(active(3).playhead.sequence, '3');
+  for (const observation of [{status: 'loading', currentTime: 4}, {status: 'paused', currentTime: NaN}]) {
+    assert.equal(heartbeat('delivery', generation, observation).playhead, undefined);
+  }
+});
+
+test('replacement preparation heartbeat never reports the predecessor playhead', async () => {
+  const sent = [];
+  const replacement = {id: 'replacement', active: {generation: '1', media_time_origin_ms: 50000}};
+  const player = runInNewContext(source.replace('export {close, maintainLease};', `
+    status = () => {};
+    retryCommand = async () => replacement;
+    firstGeneration = async value => value;
+    let pendingBeat;
+    maintainLease = (delivery, generation, options) => {
+      pendingBeat = options.send(delivery.id, generation);
+      return () => {};
+    };
+    api = async (method, path, body) => { sent.push(body); return replacement; };
+    preparePlayer = async () => { await pendingBeat; throw new Error('candidate failed'); };
+    observeViewing = () => () => {};
+    retire = async () => {};
+    ({state, switchDelivery});
+  `), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    crypto: {randomUUID: () => 'key'}, sent, replacement,
+  });
+  const old = {controls: true, player: {state: {status: 'paused', currentTime: 10}}, pause: async () => {}};
+  Object.assign(player.state, {deliveryId: 'old', element: old, generation: {generation: '2', media_time_origin_ms: 0}});
+  assert.equal(await player.switchDelivery({plan_token: 'plan'}), false);
+  assert.equal(sent.length, 1);
+  assert.equal(JSON.stringify(sent[0]), JSON.stringify({active_generation: '1'}));
+  assert.equal(player.state.element, old);
+});
+
+test('history requests keep the rendered epoch even if the server changes', async () => {
+  const requests = [];
+  // Keep DOM mounting disabled while exercising the production request adapter.
+  const rewritten = source.replace("const host = document.getElementById('motion-player');", "const host = {dataset: {viewingEpoch: 'server:before-restore'}};")
+    .replace(/if \(host\)/g, 'if (false)')
+    .replace('export {close, maintainLease};', 'api;');
+  const send = runInNewContext(rewritten, {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+    fetch: async (path, options) => { requests.push(options); return {ok: true, status: 200, json: async () => ({})}; },
+  });
+  await send('POST', '/api/v2/playback/viewing-sessions/s/events', {sequence: '1'});
+  await send('PUT', '/api/v2/profiles/p/timelines/t/viewing', {manual_watched: true});
+  await send('POST', '/api/v2/playback/delivery-sessions/d/heartbeat', {active_generation: '1'});
+  assert.equal(requests[0].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[1].headers['X-Motion-Viewing-Epoch'], 'server:before-restore');
+  assert.equal(requests[2].headers['X-Motion-Viewing-Epoch'], undefined);
 });

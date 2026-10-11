@@ -362,3 +362,18 @@ func waitFor(t *testing.T, b *syncBuffer, needle string) {
 	}
 	t.Fatalf("timed out waiting for %s in %q", needle, b.String())
 }
+
+// Keep service negotiation independently executable from browser-cutover checks.
+func TestE2EPlaybackCapabilityNegotiationAgainstRealServer(t *testing.T) {
+	bin := os.Getenv("MOTION_E2E_SERVER_BIN")
+	if bin == "" {
+		t.Skip("set MOTION_E2E_SERVER_BIN to the built server binary")
+	}
+	srv := startServer(t, bin)
+	// Real negotiation must reach timeline lookup, rather than refuse a served
+	// player because of stale implementation flags. No browser is launched.
+	play := run(t, srv, t.TempDir(), "--operator-token-file", srv.operator, "--json", "play", "missing-timeline", "--print-url")
+	if play.code != cli.ExitNotFound || strings.Contains(play.stderr, "feature_unavailable") {
+		t.Fatalf("play capability negotiation: %+v", play)
+	}
+}

@@ -1,0 +1,87 @@
+{
+  "source_commit": "db2bdbc7e6742b04d78b7b6ae79d30b352bbf9da",
+  "platform": "macOS arm64",
+  "rust_toolchain": "1.98.0",
+  "source_state": "Executable inputs match source commit; qualification documentation only was dirty.",
+  "kyoto_jobs": [
+    {
+      "id": "54c28638539d492b9f220c830e406748",
+      "status": "succeeded",
+      "exit_code": 0,
+      "started": 1791690485.489855,
+      "finished": 1791690509.525791
+    },
+    {
+      "id": "3ff1a9380d1c4611b5f1f5a2e88e899d",
+      "status": "succeeded",
+      "exit_code": 0,
+      "started": 1791690493.1468601,
+      "finished": 1791690628.6127858
+    },
+    {
+      "id": "13dd90a163d44e08b76ec9746fd1677b",
+      "status": "succeeded",
+      "exit_code": 0,
+      "started": 1791690296.825052,
+      "finished": 1791690297.99679
+    }
+  ],
+  "tcp_smoke": {
+    "checks": [
+      "paired_restricted_device_reads_scanned_catalog",
+      "original_bytes_and_ranges_match_the_file",
+      "ordered_events_and_exact_retry",
+      "byte_route_seek_change_replay_and_activation",
+      "prepared_rendition_plans_and_serves_bytes_for_convert",
+      "hls_conversion_serves_selected_audio_track",
+      "viewing_session_rebinds_to_the_conversion",
+      "live_audio_switch_by_replan_and_activation",
+      "sigkill_recovery_interrupts_delivery_keeps_progress_and_drains_outbox",
+      "resume_supersedes_the_previous_session"
+    ],
+    "passed": 10,
+    "binary_sha256": "fc74c03df024b876c38850d119f437f211a7be8870ba61d3a7d4d88aa46ee103",
+    "fixture_sha256": "d12d6e493f2ff3a5e1eadf5807e1b7fe8d192840713fe2db109dd38ed0398e53"
+  },
+  "checks": {
+    "core_unit_tests": 92,
+    "ordered_observation_tests": 3,
+    "ordered_observation_graph": {
+      "states": 313,
+      "transitions": 2867,
+      "termination": "GraphExhausted"
+    },
+    "playback_session_graph": {
+      "states": 253696,
+      "transitions": 3890752,
+      "termination": "GraphExhausted"
+    },
+    "delivery_seeded": {
+      "seed": 20261009,
+      "cases": 3000,
+      "transitions": 450000,
+      "termination": "CasesCompleted"
+    },
+    "heartbeat_boundary_tests": 1,
+    "v2_playback_tests": 8,
+    "v2_organization_viewing_tests": 7,
+    "javascript_tests": 72,
+    "go_real_server_capability_negotiation": "passed",
+    "revocation_worker_and_output_release_seconds": 1.780388792,
+    "access_api_tests": 32
+  },
+  "excluded": [
+    "Interrupted unpinned full delivery-model run is not passing evidence.",
+    "Full timeline-viewing model compiled but was not executed in this qualification.",
+    "Full Go pairing/browser suite failed at unauthorized profile navigation (200 instead of 403).",
+    "No installed product, browser or Electron media qualification."
+  ],
+  "ci": {
+    "source_run": "https://github.com/Jagalite/motion/actions/runs/38109450892",
+    "contract": "passed",
+    "format": "passed",
+    "clippy": "passed",
+    "fast_tests": "failed: two unchanged motion-ui-host cache durability tests returned 409 instead of 200",
+    "notices": "failed: shared consolidation plan includes pre-existing absolute developer-machine paths"
+  }
+}

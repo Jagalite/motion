@@ -102,9 +102,17 @@ impl Fixture {
         body: Option<Value>,
         headers: &[(&str, &str)],
     ) -> Reply {
-        let response = self
-            .raw(self.request(method, path, body.as_ref(), headers))
-            .await;
+        let mut request = self.request(method, path, body.as_ref(), headers);
+        if ["POST", "PUT"].contains(&method) && path.ends_with("/viewing") {
+            let (server, restore) = playscale::v2::system::server_identity(&self.app)
+                .await
+                .unwrap();
+            request.headers_mut().insert(
+                "x-motion-viewing-epoch",
+                format!("{server}:{restore}").parse().unwrap(),
+            );
+        }
+        let response = self.raw(request).await;
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -173,6 +181,7 @@ impl Fixture {
             "INSERT INTO items(id,title,kind) VALUES ('film','A Film','video')",
             "INSERT INTO items(id,title,kind) VALUES ('show','B Show','video')",
             "INSERT INTO items(id,title,kind) VALUES ('bare','C Bare','video')",
+            "INSERT INTO item_origins(item_id,title) SELECT id,title FROM items",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-film','film','Original')",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-show','show','Original')",
             "INSERT INTO timelines(id,edition_id) VALUES ('t-film','t-film'), ('t-show','t-show')",
@@ -1381,4 +1390,74 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
         .await;
     assert_eq!(read.body["item_ids"], json!(["film"]));
     assert_ne!(before, read.headers["etag"]);
+}
+
+#[tokio::test]
+async fn smart_watched_facts_use_timeline_authority_and_ignore_legacy_state() {
+    use playscale_core::organization::{CollectionKind, Term};
+    let f = Fixture::new(AccessMode::Restricted).await;
+    f.seed().await;
+    let terms: Vec<Term> =
+        serde_json::from_value(json!([{"field":"watched","operator":"eq","value":true}])).unwrap();
+    let filter = playscale::organization::save_filter(&f.app, "default", None, "Watched", terms)
+        .await
+        .unwrap();
+    let collection = playscale::organization::save_collection(
+        &f.app,
+        "default",
+        None,
+        "Watched",
+        CollectionKind::Smart,
+        vec![],
+        Some(filter.id),
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO viewing_state(profile_id,item_id,automatic_watched,revision) VALUES ('default','film',1,1)").execute(&f.app.db).await.unwrap();
+    assert!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let operator = bearer(OPERATOR);
+    let put = f
+        .put(
+            "/api/v2/profiles/default/timelines/t-film/viewing",
+            &operator,
+            "\"r-0\"",
+            json!({"manual_watched":true,"reset_position":false}),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+    assert_eq!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap(),
+        ["film"]
+    );
+    let put = f
+        .put(
+            "/api/v2/profiles/default/timelines/t-film/viewing",
+            &operator,
+            "\"r-1\"",
+            json!({"manual_watched":false,"reset_position":false}),
+        )
+        .await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+    assert!(
+        playscale::organization::members(&f.app.db, "default", &collection.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let legacy: bool =
+        sqlx::query_scalar("SELECT automatic_watched FROM viewing_state WHERE item_id='film'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(
+        legacy,
+        "canonical overrides must not rewrite retained legacy history"
+    );
 }

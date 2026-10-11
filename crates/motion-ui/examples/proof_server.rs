@@ -124,6 +124,7 @@ async fn authenticate(State(state): State<AppState>, mut request: Request, next:
             .map(String::from)
             .to_vec(),
             server_epoch: "proof-epoch".into(),
+            viewing_epoch: "server:restore".into(),
             csrf_token: csrf,
         });
     } else if request.uri().path().starts_with("/api/v2/")

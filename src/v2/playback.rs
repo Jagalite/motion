@@ -1323,6 +1323,14 @@ pub async fn close_delivery(
 #[serde(deny_unknown_fields)]
 pub struct Heartbeat {
     active_generation: String,
+    playhead: Option<Playhead>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Playhead {
+    sequence: String,
+    position_ms: u64,
 }
 
 pub async fn heartbeat(
@@ -1333,7 +1341,19 @@ pub async fn heartbeat(
 ) -> Result<Response, Problem> {
     let (tx, _, owner) = command(&app, &caller, &id).await?;
     require_live(&app, &id)?;
-    let view = delivery::heartbeat_live(&app, &id, &body.value.active_generation, None)
+    let observation = body
+        .value
+        .playhead
+        .map(|p| {
+            let sequence = viewing::decimal(&p.sequence)
+                .filter(|s| *s > 0)
+                .ok_or_else(|| {
+                    Problem::invalid("invalid_sequence", "Playhead sequence must be positive")
+                })?;
+            Ok::<_, Problem>((sequence, p.position_ms))
+        })
+        .transpose()?;
+    let view = delivery::heartbeat_live(&app, &id, &body.value.active_generation, observation)
         .map_err(problem)?;
     tx.commit().await?;
     Ok(Json(delivery_json(&view, &owner)).into_response())

@@ -27,6 +27,10 @@ function status(message, kind = 'status') {
 async function api(method, path, body, idempotencyKey, signal, extra = {}) {
   const headers = {'Accept': 'application/json', 'X-CSRF-Token': csrf, ...extra};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (['POST', 'PUT'].includes(method) && (path.includes('/viewing-sessions') || path.endsWith('/viewing'))) {
+    if (!host?.dataset.viewingEpoch) throw new Error('Reload to establish viewing history identity.');
+    headers['X-Motion-Viewing-Epoch'] = host.dataset.viewingEpoch;
+  }
   if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   const response = await fetch(path, {
     method, headers, credentials: 'same-origin', redirect: 'error', cache: 'no-store', keepalive: method === 'DELETE' || path.endsWith('/events'),
@@ -245,8 +249,8 @@ async function firstGeneration(delivery, current) {
 // The last viewing session this browser created for a principal/profile/
 // timeline, across server runtimes: the only authority adoptableRevision may
 // recognise as our own.
-const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
-const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.principalId, data.profileId, data.timelineId])}`;
+const ownSessionKey = data => `motion:viewing-owner:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
+const handoffKey = data => `motion:viewing-handoff:${JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId])}`;
 // Written only by a page that is actually leaving (pagehide) and has a session.
 function leaveHandoff(data, session) {
   try { if (session) sessionStorage.setItem(handoffKey(data), JSON.stringify({session, at: Date.now()})); } catch { /* fails closed */ }
@@ -260,10 +264,10 @@ function takeHandoff(data, now = Date.now()) {
   } catch { return null; }
 }
 
-// Outbox is scoped to this server runtime, principal, profile and timeline.
+// Outbox is scoped to server identity/restore epoch, principal, profile and timeline.
 // It contains session/event identities only, never reusable authentication.
 function viewingStorage(data) {
-  const scope = JSON.stringify([data.serverEpoch, data.principalId, data.profileId, data.timelineId]);
+  const scope = JSON.stringify([data.viewingEpoch, data.principalId, data.profileId, data.timelineId]);
   const storageKey = `motion:viewing:${scope}`;
   return {
     load: () => JSON.parse(localStorage.getItem(storageKey) ?? sessionStorage.getItem(storageKey) ?? 'null'),
@@ -278,7 +282,7 @@ function viewingStorage(data) {
       try {
         const prior = JSON.parse(key.slice(15).replace(/:rejected$/, ''));
         return prior[1] === data.principalId && prior[2] === data.profileId && prior[3] === data.timelineId
-          && (prior[0] !== data.serverEpoch || key.endsWith(':rejected'));
+          && (prior[0] !== data.viewingEpoch || key.endsWith(':rejected'));
       } catch { return false; }
     }),
   };
@@ -312,7 +316,7 @@ async function recoverViewing(data, current) {
   const storage = viewingStorage(data);
   if (storage.hasRejected()) {
     const panel = document.getElementById('motion-progress-status');
-    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session.';
+    if (panel) panel.textContent = 'Earlier progress belongs to a rejected session or restored or replaced server state. It is retained on this device for reconciliation; it has not been replayed into this session.';
   }
   const saved = storage.load();
   if (!saved) return data.viewingRevision;
@@ -365,12 +369,27 @@ function observeViewing(element, generation, writer, current) {
   });
 }
 
+// Retained across renewal restarts/failed changes of the SAME generation.
+const playheadSequences = new Map();
+function pacingHeartbeat(id, generation, observation) {
+  const body = {active_generation: generation.generation};
+  const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
+  if (['playing', 'paused'].includes(observation?.status) && Number.isSafeInteger(position) && position >= 0) {
+    const key = JSON.stringify([id, generation.generation]);
+    const sequence = (playheadSequences.get(key) ?? 0n) + 1n;
+    playheadSequences.set(key, sequence);
+    body.playhead = {sequence: String(sequence), position_ms: position};
+  }
+  return body;
+}
+
 function renewLease(delivery, generation, current) {
   state.stopLease?.();
   state.stopLease = maintainLease(delivery, generation.generation, {
     current,
     send: async (id, active_generation, signal) => {
-      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+      const body = current() ? pacingHeartbeat(id, generation, state.element?.player.state) : {active_generation};
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, body, undefined, signal);
       if (current()) state.delivery = renewed;
       return renewed;
     },
@@ -762,6 +781,7 @@ function close({unloading = false} = {}) {
       } catch { /* The last successfully queued observation remains durable. */ }
     }
     state.epoch++;
+    playheadSequences.clear();
     state.stopLease?.();
     state.stopLease = null;
     // Persist first, then allow a bounded final send before retiring delivery.

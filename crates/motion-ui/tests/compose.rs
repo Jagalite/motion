@@ -30,6 +30,7 @@ fn principal(profile: &str, permissions: &[&str]) -> UiPrincipal {
         }],
         permissions: permissions.iter().map(|p| p.to_string()).collect(),
         server_epoch: "epoch1".into(),
+        viewing_epoch: "server:restore".into(),
         csrf_token: "csrf-abc".into(),
     }
 }

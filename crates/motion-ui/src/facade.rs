@@ -23,6 +23,8 @@ pub struct UiPrincipal {
     pub permissions: Vec<String>,
     /// Server runtime epoch; caches keyed without it must not survive a restart/restore.
     pub server_epoch: String,
+    /// Server identity plus restore epoch; stable across ordinary restarts.
+    pub viewing_epoch: String,
     /// CSRF token for this browser session, embedded for the external command module.
     pub csrf_token: String,
 }

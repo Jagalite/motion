@@ -85,6 +85,7 @@ fn feature(id: &'static str, implemented: bool, enabled: bool) -> Feature {
 pub struct Capabilities {
     server_id: String,
     server_epoch: String,
+    restore_epoch: String,
     server_version: &'static str,
     api_version: &'static str,
     schema_version: String,
@@ -97,7 +98,7 @@ pub async fn capabilities(
     State(app): State<App>,
     _caller: Caller,
 ) -> Result<Json<Capabilities>, Problem> {
-    let (server_id, _) = server_identity(&app).await?;
+    let (server_id, restore_epoch) = server_identity(&app).await?;
     let schema: i64 =
         sqlx::query_scalar("SELECT coalesce(max(version),0) FROM _sqlx_migrations WHERE success=1")
             .fetch_one(&app.db)
@@ -112,6 +113,15 @@ pub async fn capabilities(
             playscale_core::access::IDEMPOTENCY_RETENTION_SECONDS.to_string(),
         ),
     ]);
+    let mut playback = feature("playback.v2", true, true);
+    playback.limits = BTreeMap::from([
+        ("routes", "original,prepared,software_hls".into()),
+        ("timeline_binding", "whole_single_part".into()),
+        ("subtitles", "unavailable".into()),
+        ("components", "unavailable".into()),
+        ("playhead", "heartbeat_ordered_observation".into()),
+        ("viewing_restart", "recoverable".into()),
+    ]);
     let features = vec![
         api,
         feature("identity.pairing", true, true),
@@ -125,8 +135,8 @@ pub async fn capabilities(
         // enforced on v2 routes but profile restrictions are not enforceable.
         feature("access.restricted_mode", true, restricted),
         feature("events.scoped_stream", true, true),
-        feature("catalog.v2", false, false),
-        feature("playback.v2", false, false),
+        feature("catalog.v2", true, true),
+        playback,
     ];
     let mut runtime_hashes = BTreeMap::new();
     if let Some(hash) = app
@@ -147,6 +157,7 @@ pub async fn capabilities(
     Ok(Json(Capabilities {
         server_id,
         server_epoch: app.access.server_epoch.clone(),
+        restore_epoch,
         server_version: env!("CARGO_PKG_VERSION"),
         api_version: "2.0.0",
         schema_version: schema.to_string(),

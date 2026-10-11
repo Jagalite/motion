@@ -292,6 +292,33 @@ pub fn may_control(owner: &Owner, principal: &Principal, file: Option<&FileFacts
         && readable(principal, file)
 }
 
+/// Revalidate long-lived delivery work against the owner's current device grant.
+/// Credential expiry is enforced by request admission and the delivery lease;
+/// this policy fences device revocation and scope removal even without requests.
+pub fn may_continue(
+    owner: &Owner,
+    device: Option<&crate::access::Device>,
+    file: Option<&FileFacts>,
+) -> bool {
+    let principal = if owner.principal == "operator" {
+        Some(Principal::operator())
+    } else {
+        device
+            .filter(|d| !d.revoked && d.id == owner.principal)
+            .map(|d| Principal {
+                id: d.id.clone(),
+                device_id: Some(d.id.clone()),
+                mode: crate::access::Mode::Paired,
+                grant: d.grant.clone(),
+                policy: d.policy.clone(),
+                policy_revision: d.revision,
+            })
+    };
+    principal
+        .as_ref()
+        .is_some_and(|p| may_control(owner, p, file))
+}
+
 /// A replan may change route and streams but never the delivery's timeline,
 /// profile or source file revision; those need a new delivery.
 pub fn replan_compatible(owner: &Owner, claims: &Claims) -> bool {

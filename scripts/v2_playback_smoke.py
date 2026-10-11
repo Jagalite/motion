@@ -65,13 +65,19 @@ def main():
             process = boot()
             operator = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
 
+            history_epoch = None
             def api(method, path, body=None, auth=None, expected=None, extra=None):
                 headers = dict(auth or {}); headers.update(extra or {})
+                if method in ('POST', 'PUT') and ('/viewing-sessions' in path or path.endswith('/viewing')):
+                    headers['X-Motion-Viewing-Epoch'] = history_epoch
                 status, h, data = request(port, method, '/api/v2' + path, body, headers)
                 parsed = json.loads(data) if data and h.get('content-type', '').startswith(('application/json', 'application/problem+json')) else data
                 if expected is not None:
                     assert status == expected, (method, path, status, parsed)
                 return status, h, parsed
+
+            _, _, identity = api('GET', '/system/capabilities', auth=operator, expected=200)
+            history_epoch = identity['server_id'] + ':' + identity['restore_epoch']
 
             def key(name):
                 return f'{name}-{time.time_ns()}'
