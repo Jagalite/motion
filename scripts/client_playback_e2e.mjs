@@ -538,9 +538,9 @@ async function main() {
   const binary = resolve(process.env.MOTION_SERVER_BINARY ?? join(root, 'target/debug/playscale'));
   const demuxe = resolve(process.env.MOTION_DEMUXE_DIR ?? join(root, 'web/vendor/demuxe'));
   const receipt = {started: new Date().toISOString(), kind: 'production-evidence',
-    server: {binary, sha256: sha256(readFileSync(binary))},
+    server: {binary, sha256: sha256(readFileSync(binary)), source_commit: process.env.MOTION_BINARY_SOURCE ?? null},
     demuxe: deploymentEvidence(demuxe),
-    source: {commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root, encoding: 'utf8'}).trim(),
+    source: {role: 'harness-worktree', commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root, encoding: 'utf8'}).trim(),
       dirty: execFileSync('git', ['status', '--porcelain'], {cwd: root, encoding: 'utf8'}).trim(),
       diff_sha256: sha256(execFileSync('git', ['diff', 'HEAD', '--'], {cwd: root}))}, engines: {}};
   for (const engine of engines) {
