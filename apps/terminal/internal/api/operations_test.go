@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestRetryJobKeepsIdentityAcrossLostAcknowledgement(t *testing.T) {
@@ -39,5 +40,37 @@ func TestRetryJobDoesNotRetryDomainConflict(t *testing.T) {
 	_, err := c.RetryJob(context.Background(), "completed", "retry-job-key")
 	if !IsCode(err, "not_retryable") || calls != 1 {
 		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestStorageAndMetricsUseContractPaths(t *testing.T) {
+	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/admin/storage":
+			io.WriteString(w, `{"database_bytes":"18446744073709551615","asset_bytes":"1","temporary_bytes":"0","reserved_bytes":"0","free_bytes":null}`)
+		case "/api/v2/admin/metrics":
+			if r.URL.Query().Get("since") != "2026-10-12T10:00:00Z" || r.URL.Query().Get("step_seconds") != "30" {
+				t.Errorf("query %v", r.URL.Query())
+			}
+			io.WriteString(w, `{"sampled_at":"2026-10-12T10:15:30Z","interval_seconds":10,"retention_seconds":86400,"series":[{"id":"http.requests_total","kind":"counter","unit":"count","points":[{"t":"2026-10-12T10:15:30Z","v":"5"}]}]}`)
+		case "/api/v2/admin/diagnostics":
+			io.WriteString(w, `{"server_epoch":"e","uptime_seconds":"1","active_deliveries":"0","queued_jobs":"0","running_jobs":"0","db_busy_count":"0","worker_errors":[],"process":{"pid":"7","cpu_seconds_total":"1.5","resident_bytes":"10","virtual_bytes":null,"open_files":null,"threads":null,"cpu_count":"8","requests_total":"3","request_errors_total":"0","requests_in_flight":"1"}}`)
+		default:
+			t.Errorf("unexpected %s", r.URL)
+		}
+	}))
+	ctx := context.Background()
+	s, err := c.Storage(ctx)
+	if err != nil || s.DatabaseBytes != "18446744073709551615" || s.FreeBytes != nil {
+		t.Fatalf("%+v %v", s, err)
+	}
+	since, _ := time.Parse(time.RFC3339, "2026-10-12T12:00:00+02:00")
+	h, err := c.Metrics(ctx, since, 30)
+	if err != nil || len(h.Series) != 1 || h.Series[0].Points[0].V != "5" {
+		t.Fatalf("%+v %v", h, err)
+	}
+	d, err := c.Diagnostics(ctx)
+	if err != nil || d.Process == nil || *d.Process.CPUSecondsTotal != "1.5" || d.Process.OpenFiles != nil {
+		t.Fatalf("%+v %v", d, err)
 	}
 }

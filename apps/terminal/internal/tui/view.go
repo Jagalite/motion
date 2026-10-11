@@ -165,6 +165,8 @@ func (m Model) header(width int) []string {
 			return plural(len(v), one, many)
 		case []api.Profile:
 			return plural(len(v), one, many)
+		case []api.Source:
+			return plural(len(v), one, many)
 		}
 		return ""
 	}
@@ -200,8 +202,10 @@ func (m Model) header(width int) []string {
 		lines = m.titled("Devices", count(keyDevices, "device", "devices"))
 	case pageProfiles:
 		lines = m.titled("Profiles", count(keyProfiles, "profile", "profiles"))
-	case pageDiagnostics:
-		lines = m.titled("Diagnostics", "")
+	case pageOverview:
+		lines = m.titled("Overview", m.overviewMeta())
+	case pageSources:
+		lines = m.titled("Sources", count(keySources, "source", "sources"))
 	case pageActivity:
 		lines = m.titled("Activity", plural(len(m.log), "change", "changes"))
 	case pageServer:
@@ -473,7 +477,7 @@ func (m Model) connection() string {
 	var p *api.Problem
 	switch {
 	case m.stream == "live":
-		return okStyle.Render("● Live")
+		return m.liveDot() + okStyle.Render(" Live")
 	case m.stream == "connecting":
 		return faintStyle.Render("◌ Connecting")
 	case strings.HasPrefix(m.stream, "reconnecting"):

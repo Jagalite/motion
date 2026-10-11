@@ -24,18 +24,23 @@ motion serve --data-dir ... --access-mode restricted  # runs the bundled Rust se
 
 ## Terminal interface
 
-`motion tui` follows the Marquee web UI (`crates/motion-ui`): a sidebar with
-Home, the principal's libraries, the management screens it may use, Profiles
-and Server; a top bar with search and the active profile; and a status bar
-showing whether live updates are connected. Home shows Continue watching and
-the libraries; library, search and item pages use poster grids (`v` switches
-to a list). Item pages compose the item, its editions, timelines, versions,
-the profile's viewing state and its children from v2 reads, bounded like the
-web item page. Wide terminals show the full sidebar, medium ones an icon rail
-and narrow ones a breadcrumb; `tab` moves between sidebar and page, `esc`
-goes back, `/` searches, `p` opens the browser player, `?` lists every
-shortcut. The interface paints the Marquee charcoal palette; `NO_COLOR` or a
-colorless terminal gets plain text.
+`motion tui` is a monitoring console in the style of the Marquee web UI
+(`crates/motion-ui`). Its home, Overview, shows live server metrics with
+sparklines (jobs, deliveries, database busy, free space and, from servers that
+report them, CPU, memory, requests and server errors), work in progress with
+animated progress, recent activity from the event stream and recent failures.
+It polls `/admin/diagnostics` and `/admin/storage` (both need `system:admin`);
+history comes from `/admin/metrics` when the server offers the `admin.metrics`
+feature, and is otherwise sampled while the console is open, which it says.
+`[` and `]` change the chart window.
+
+The sidebar also has Processing (jobs, with confirmed cancellation), Scans,
+Activity and Server (process, storage, identity and features); the library
+(browse, per-library grids, all titles, item details, search); and Sources,
+Devices and Profiles. Wide terminals show the full sidebar, medium ones an
+icon rail and narrow ones a breadcrumb; `tab` moves between sidebar and page,
+`esc` goes back, `/` searches, `?` lists every shortcut. The interface paints
+the Marquee charcoal palette; `NO_COLOR` gets plain text.
 
 ## Contract for scripts
 
@@ -89,7 +94,7 @@ is not evidence that every operation is routed. This audit inspects
 | A08 presentation | Actual pinned Topcoat Tower service at the composition root; request-scoped facade traverses authorized v2 reads, preserves the original URI and genuine peer metadata, and bounds renders to eight concurrent requests and 15 seconds. Home, libraries, search, item details (children, editions, timelines and versions), matches, jobs and diagnostics have real reads. | Timeline viewing/player, profile preferences, scan-backed sources still need their complete service bridges. Missing services render unavailable; continue-watching and item viewing history explicitly say unavailable, and item pages offer no Play link until the playback service is connected. Qualify the real browser independently of router tests. |
 | A08 other domains | Logical libraries/source registration; catalog item CRUD/search, editions, reviewed merge/split, timeline/version reads; metadata contributions, matching and artwork reads; collections/filters/playlists/queues; owned jobs and cancellation/retry; diagnostics. | Source relocation and scan demands, relationships and timeline/version creation, full file-track evidence, metadata refresh/upload/selection/markers, v2 viewing/delivery, preparation/schedules, offline/downloads, durable backup/import jobs. The reviewed contract remains the target, not a claim that every operation is routed. |
 | A10 CLI | Identity/device/profile commands, event tail, Rust `serve`, library/source creation, catalog search/show, jobs list/show/cancel/retry, diagnostics, typed scan requests and capability-gated token-free browser-player launch. | Real source-scan and playback workflows depend on v2 domain services. `server stop` has no reviewed lifecycle operation yet; no PID guessing or unrelated-process termination is used. |
-| A10 TUI | Marquee layout: home (continue watching, libraries), library/all-titles grids, debounced search, item details (editions, timelines, versions, viewing state, children), processing with confirmed job cancellation, scans, devices, diagnostics, activity, profiles and server details; permission-gated navigation and capability-gated browser-player launch. Unicode input, responsive layouts, per-request cancellation, bounded paging, event reset/re-query and stale-load rejection are tested. | An isolated real-server PTY check exercised overview, libraries, catalog, search, jobs and diagnostics; scans correctly returned the missing-endpoint error. Scan and playback completion require the services above; a typed command or screen is not backend completion. |
+| A10 TUI | Monitoring console: live overview (polled diagnostics/storage, server or session metric history, work in progress, activity, failures) and server details; Marquee layout with browse (continue watching, libraries), library/all-titles grids, debounced search, item details (editions, timelines, versions, viewing state, children), processing with confirmed job cancellation, scans, devices, diagnostics, activity, profiles and server details; permission-gated navigation and capability-gated browser-player launch. Unicode input, responsive layouts, per-request cancellation, bounded paging, event reset/re-query and stale-load rejection are tested. | An isolated real-server PTY check exercised overview, libraries, catalog, search, jobs and diagnostics; scans correctly returned the missing-endpoint error. Scan and playback completion require the services above; a typed command or screen is not backend completion. |
 | A10 credentials | Explicit opt-in restrictive file store and server-identity checks. | OS credential-store integration is not implemented; the documented file-store limitation remains. |
 
 Transport URL encoding and reconnect delay calculation stay in the Go HTTP

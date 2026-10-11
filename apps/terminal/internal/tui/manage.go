@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 	"github.com/charmbracelet/bubbles/key"
@@ -22,9 +23,9 @@ const (
 
 func (m Model) kind() pageKind {
 	switch m.route.page {
-	case pageProcessing, pageScans, pageDevices, pageProfiles:
+	case pageProcessing, pageScans, pageDevices, pageSources, pageProfiles:
 		return kindTable
-	case pageDiagnostics, pageActivity, pageServer:
+	case pageOverview, pageActivity, pageServer:
 		return kindText
 	}
 	return kindBrowse
@@ -127,6 +128,13 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 			ids = append(ids, d.ID)
 		}
 		return project(width, []column{{"Device", 18, false}, {"State", 8, false}, {"Access", 15, true}, {"ID", 36, true}}, rows, ids)
+	case pageSources:
+		sources, _ := data[[]api.Source](m, keySources)
+		for _, s := range sources {
+			rows = append(rows, table.Row{clean(s.Name), availabilityText(s.Availability), clean(s.RootPath), clean(s.ID)})
+			ids = append(ids, s.ID)
+		}
+		return project(width, []column{{"Source", 18, false}, {"State", 16, false}, {"Location", 28, true}, {"ID", 36, true}}, rows, ids)
 	case pageProfiles:
 		profiles, _ := data[[]api.Profile](m, keyProfiles)
 		viewer := m.viewer()
@@ -163,6 +171,8 @@ func (m Model) tableKey() string {
 		return keyScans
 	case pageDevices:
 		return keyDevices
+	case pageSources:
+		return keySources
 	}
 	return keyProfiles
 }
@@ -175,6 +185,8 @@ func (m Model) tableEmpty() string {
 		return "No scans yet."
 	case pageDevices:
 		return "No paired devices."
+	case pageSources:
+		return "No storage sources registered."
 	}
 	return "No profiles."
 }
@@ -215,6 +227,13 @@ func (m Model) detail() string {
 		for _, d := range devices {
 			if d.ID == id {
 				return clean(d.ID) + " · " + clean(strings.Join(d.Permissions, ", "))
+			}
+		}
+	case pageSources:
+		sources, _ := data[[]api.Source](m, keySources)
+		for _, s := range sources {
+			if s.ID == id {
+				return clean(s.ID) + " · " + availabilityText(s.Availability) + " · " + clean(s.RootPath) + " · " + plural(len(s.Exclusions), "exclusion", "exclusions")
 			}
 		}
 	case pageScans:
@@ -361,34 +380,16 @@ func wrap(items []string, width int) []string {
 // text renders the scrollable body of a text page.
 func (m Model) text(width int) []string {
 	switch m.route.page {
+	case pageOverview:
+		return m.overview(width)
 	case pageActivity:
 		if len(m.log) == 0 {
 			return m.empty("Waiting for changes. Scans, edits and playback appear here as they happen.")
 		}
+		now := time.Now()
 		lines := make([]string, len(m.log))
-		for i, l := range m.log {
-			stamp, rest, _ := strings.Cut(l, "  ")
-			lines[i] = faintStyle.Render(stamp) + "  " + fgStyle.Render(rest)
-		}
-		return lines
-	case pageDiagnostics:
-		if lines, ok := m.pending(keyDiagnostics, "diagnostics"); ok {
-			return lines
-		}
-		d, _ := data[api.Diagnostics](m, keyDiagnostics)
-		lines := []string{
-			row("Uptime", uptime(d.UptimeSeconds)),
-			row("Active deliveries", clean(d.ActiveDeliveries)),
-			row("Queued jobs", clean(d.QueuedJobs)),
-			row("Running jobs", clean(d.RunningJobs)),
-			row("Database busy", clean(d.DBBusyCount)),
-			"", titleStyle.Render("Worker errors"), "",
-		}
-		if len(d.WorkerErrors) == 0 {
-			return append(lines, mutedStyle.Render("None reported."))
-		}
-		for _, e := range d.WorkerErrors {
-			lines = append(lines, dangerStyle.Render("▎")+fgStyle.Render(clean(e)))
+		for i, e := range m.log {
+			lines[i] = e.render(now)
 		}
 		return lines
 	case pageServer:
@@ -396,10 +397,10 @@ func (m Model) text(width int) []string {
 			return lines
 		}
 		me, caps := m.me(), m.caps()
-		lines := []string{titleStyle.Render("This device"), "",
+		lines := append(m.processLines(width), titleStyle.Render("This device"), "",
 			row("Principal", clean(me.ID)+"  "+faintStyle.Render(clean(me.Mode))),
 			row("Profiles", clean(strings.Join(me.ProfileIDs, ", "))),
-		}
+		)
 		for i, l := range wrap(me.Permissions, max(width-20, 20)) {
 			label := ""
 			if i == 0 {

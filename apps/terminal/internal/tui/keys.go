@@ -12,6 +12,7 @@ type keyMap struct {
 	Refresh, Help, Quit   key.Binding
 	Confirm, Keep         key.Binding
 	Submit, Leave         key.Binding
+	Shorter, Longer       key.Binding
 }
 
 var keys = keyMap{
@@ -38,6 +39,8 @@ var keys = keyMap{
 	Keep:     key.NewBinding(key.WithKeys("n", "esc"), key.WithHelp("n", "keep")),
 	Submit:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "results")),
 	Leave:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "leave search")),
+	Shorter:  key.NewBinding(key.WithKeys("["), key.WithHelp("[", "shorter window")),
+	Longer:   key.NewBinding(key.WithKeys("]"), key.WithHelp("]", "longer window")),
 }
 
 // helpKeys adapts a context's bindings to the help bubble.
@@ -58,6 +61,6 @@ func fullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{keys.Up, keys.Down, keys.Left, keys.Right, keys.PageUp, keys.PageDown, keys.Top, keys.Bottom},
 		{keys.Open, keys.Back, keys.Focus, keys.Search, keys.Refresh, keys.Help, keys.Quit},
-		{keys.Play, keys.Layout, keys.Choose, keys.Cancel},
+		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Cancel},
 	}
 }

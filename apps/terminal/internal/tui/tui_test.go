@@ -32,6 +32,9 @@ type fake struct {
 	continueFor  []string
 	cancelled    []string
 	jobs         int
+	diagCalls    int
+	metricsCalls int
+	process      bool
 	libErr       error
 	cancelErr    error
 }
@@ -168,7 +171,34 @@ func (f *fake) CancelJob(_ context.Context, id, key string) (api.Tagged[api.Job]
 	return api.Tagged[api.Job]{}, f.cancelErr
 }
 func (f *fake) Diagnostics(context.Context) (api.Diagnostics, error) {
-	return api.Diagnostics{UptimeSeconds: "3700", WorkerErrors: []string{"worker \x1b[2Jfailed"}}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.diagCalls++
+	d := api.Diagnostics{UptimeSeconds: "3700", ActiveDeliveries: "1", QueuedJobs: "2", RunningJobs: "1", DBBusyCount: fmt.Sprint(f.diagCalls),
+		WorkerErrors: []string{"scan:job-x:failed \x1b[2J"}}
+	if f.process {
+		cpu, rss, req := fmt.Sprintf("%d.5", f.diagCalls*2), "183500800", fmt.Sprint(f.diagCalls*100)
+		d.Process = &api.ProcessMetrics{CPUSecondsTotal: &cpu, ResidentBytes: &rss, RequestsTotal: &req, RequestErrorsTotal: &req}
+	}
+	return d, nil
+}
+func (f *fake) Storage(context.Context) (api.StorageReport, error) {
+	free := "210000000000"
+	return api.StorageReport{DatabaseBytes: "12000000", AssetBytes: "1200000000", TemporaryBytes: "0", ReservedBytes: "0", FreeBytes: &free}, nil
+}
+func (f *fake) Metrics(_ context.Context, since time.Time, step int) (api.MetricsHistory, error) {
+	f.mu.Lock()
+	f.metricsCalls++
+	f.mu.Unlock()
+	now := time.Now().UTC()
+	var pts []api.MetricPoint
+	for i := 30; i >= 0; i-- {
+		pts = append(pts, api.MetricPoint{T: now.Add(-time.Duration(i) * 10 * time.Second).Format(time.RFC3339), V: fmt.Sprint(1000 + (30-i)*10)})
+	}
+	return api.MetricsHistory{IntervalSeconds: 10, Series: []api.MetricSeries{{ID: "http.requests_total", Kind: "counter", Points: pts}}}, nil
+}
+func (f *fake) ListSources(context.Context, string, int) (api.Page[api.Source], error) {
+	return api.Page[api.Source]{Items: []api.Source{{ID: "src", Name: "Media \x1b[2J", RootPath: "/srv/media", Availability: "unavailable"}}}, nil
 }
 
 func update(t *testing.T, m Model, msg tea.Msg) (Model, tea.Cmd) {
@@ -240,7 +270,8 @@ func start(t *testing.T, f *fake, w, h int) Model {
 	t.Helper()
 	m := New(context.Background(), f, "http://srv", nil)
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: w, Height: h})
-	return drain(t, m, m.Init())
+	// Init without the poll and animation ticks, which never finish.
+	return drain(t, m, tea.Batch(m.reloadAll(), m.poll()))
 }
 
 // goTo opens a top-level page as the sidebar does, including the layout
@@ -323,7 +354,13 @@ func TestLeavingAPageCancelsItsLoad(t *testing.T) {
 	m.route = route{page: pageLibrary, id: "lib"}
 	cmd := m.open(route{page: pageItem, id: "film001"})
 	done := make(chan tea.Msg, 1)
-	go func() { done <- cmd().(tea.BatchMsg)[0]() }()
+	go func() {
+		msg := cmd()
+		for b, ok := msg.(tea.BatchMsg); ok; b, ok = msg.(tea.BatchMsg) {
+			msg = b[0]()
+		}
+		done <- msg
+	}()
 	for f.itemCalls.Load() == 0 {
 		time.Sleep(time.Millisecond)
 	}
@@ -360,7 +397,7 @@ func TestChangedHintsReloadOnlyCachedAffectedViews(t *testing.T) {
 	if f.profileCalls.Load() != before+1 || f.itemCalls.Load() != 0 {
 		t.Fatal("unrelated or unvisited views were re-queried")
 	}
-	if !strings.Contains(m.log[len(m.log)-1], "item") {
+	if m.log[len(m.log)-1].resource != "item" {
 		t.Fatal("event not logged")
 	}
 }
@@ -384,7 +421,7 @@ func TestListsLoadEveryPageUpToTheCap(t *testing.T) {
 func TestEveryPageFitsTheTerminalAtEverySize(t *testing.T) {
 	f := &fake{titles: 40, permissions: []string{api.PermSystemAdmin}}
 	pages := []route{{page: pageHome}, {page: pageLibrary, id: "lib"}, {page: pageCatalog}, {page: pageItem, id: "film001"}, {page: pageSearch},
-		{page: pageProcessing}, {page: pageScans}, {page: pageDevices}, {page: pageDiagnostics}, {page: pageActivity}, {page: pageProfiles}, {page: pageServer}}
+		{page: pageProcessing}, {page: pageScans}, {page: pageDevices}, {page: pageSources}, {page: pageOverview}, {page: pageActivity}, {page: pageProfiles}, {page: pageServer}}
 	for _, size := range [][2]int{{20, 6}, {24, 10}, {50, 14}, {69, 20}, {80, 24}, {120, 40}, {220, 60}} {
 		for _, r := range pages {
 			for _, nav := range []bool{false, true} {
@@ -414,7 +451,10 @@ func TestEveryPageFitsTheTerminalAtEverySize(t *testing.T) {
 
 func TestGridFocusMovesSpatiallyAndStaysVisible(t *testing.T) {
 	m := start(t, &fake{titles: 40}, 100, 24)
-	m = press(t, m, "tab", "down") // sidebar: Home → Movies
+	m = press(t, m, "tab")
+	for m.navEntries()[m.navSel].route.page != pageLibrary {
+		m = press(t, m, "down")
+	}
 	m = press(t, m, "enter")
 	if m.route.page != pageLibrary || m.focus != focusContent {
 		t.Fatalf("sidebar did not open the library: %+v", m.route)
@@ -563,6 +603,7 @@ func TestPlaybackLaunchUsesNoCredentialAndRequiresCapability(t *testing.T) {
 func TestContinueWatchingFollowsTheChosenProfile(t *testing.T) {
 	f := &fake{profiles: 2, permissions: []string{api.PermPlaybackRequest}, features: []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}}
 	m := start(t, f, 120, 40)
+	m = goTo(t, m, route{page: pageHome})
 	if v := m.View(); !strings.Contains(v, "Resume at 2:30 · 7:30 left") {
 		t.Fatalf("continue watching missing:\n%s", v)
 	}
@@ -600,12 +641,13 @@ func TestJobCancellationAsksFirstAndSendsOneKeyedRequest(t *testing.T) {
 
 func TestPermissionGatedScreensAppearOnlyWhenAllowed(t *testing.T) {
 	m := start(t, &fake{}, 120, 40)
-	if v := m.View(); strings.Contains(v, "Diagnostics") || strings.Contains(v, "Devices") || !strings.Contains(v, "Activity") {
+	v := m.View()
+	if strings.Contains(v, "Devices") || strings.Contains(v, "Sources") || !strings.Contains(v, "Activity") || !strings.Contains(v, "need the system:admin permission") {
 		t.Fatalf("navigation ignores permissions:\n%s", v)
 	}
 	m = start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 120, 40)
-	if v := m.View(); !strings.Contains(v, "Diagnostics") || !strings.Contains(v, "Devices") {
-		t.Fatal("administrator screens missing")
+	if v := m.View(); !strings.Contains(v, "Devices") || !strings.Contains(v, "Sources") || !strings.Contains(v, "JOBS") {
+		t.Fatalf("administrator screens missing:\n%s", v)
 	}
 }
 
@@ -619,15 +661,15 @@ func TestUnreachableServerShowsOfflineState(t *testing.T) {
 
 func TestNarrowTerminalKeepsLocationAndNavigation(t *testing.T) {
 	m := start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 24, 10)
-	m = goTo(t, m, route{page: pageDiagnostics})
-	if !strings.Contains(m.View(), "Diagnostics") {
+	m = goTo(t, m, route{page: pageServer})
+	if !strings.Contains(m.View(), "Server") {
 		t.Fatal("active screen clipped out of navigation")
 	}
 	if !strings.Contains(m.View(), "? help") {
 		t.Fatal("narrow status bar lost the help shortcut")
 	}
 	m = press(t, m, "tab")
-	if v := m.View(); !strings.Contains(v, "▎ ∿  Diagnostics") || !strings.Contains(v, "Server") || strings.Contains(v, "Uptime") {
+	if v := m.View(); !strings.Contains(v, "▎ ◈  Server") || !strings.Contains(v, "Overview") || strings.Contains(v, "Uptime") {
 		t.Fatalf("narrow sidebar not shown:\n%s", v)
 	}
 }
@@ -737,7 +779,7 @@ func TestHelpPageListsShortcutsAndQuitStillQuits(t *testing.T) {
 
 func TestRevokedAccessRemovesWhatWasShown(t *testing.T) {
 	f := &fake{}
-	m := start(t, f, 120, 40)
+	m := goTo(t, start(t, f, 120, 40), route{page: pageHome})
 	if !strings.Contains(m.View(), "Movies") {
 		t.Fatal("libraries not shown")
 	}
@@ -785,7 +827,7 @@ func TestTypingAbandonsTheSearchInFlight(t *testing.T) {
 }
 
 func TestSwitchingProfileHidesThePreviousProfilesHistory(t *testing.T) {
-	m := start(t, &fake{profiles: 2}, 120, 40)
+	m := goTo(t, start(t, &fake{profiles: 2}, 120, 40), route{page: pageHome})
 	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" {
 		t.Fatal("initial continue watching")
 	}
@@ -879,7 +921,7 @@ func TestDetailWrapsLongIDsAndWideText(t *testing.T) {
 }
 
 func TestResetRequeriesTheDefaultProfilesHistory(t *testing.T) {
-	m := start(t, &fake{}, 120, 40)
+	m := goTo(t, start(t, &fake{}, 120, 40), route{page: pageHome})
 	m, cmd := update(t, m, eventMsg(api.Event{Kind: "reset", ResourceType: "stream"}))
 	m = drain(t, m, cmd)
 	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" || strings.Contains(m.View(), "Choose a profile") {
@@ -900,5 +942,125 @@ func TestCappedTablesSayTheyArePartial(t *testing.T) {
 	m = goTo(t, m, route{page: pageProcessing})
 	if v := m.View(); !strings.Contains(v, "first 2000 jobs") || !strings.Contains(v, "only the first 2000 are shown") {
 		t.Fatalf("truncation not shown:\n%s", v)
+	}
+}
+
+// pollAgain runs a poll as if its interval had passed.
+func pollAgain(t *testing.T, m Model) Model {
+	t.Helper()
+	for _, s := range m.cache.slots {
+		s.at = s.at.Add(-time.Minute)
+	}
+	for id, pts := range m.metrics.series { // samples a little apart, like real polls
+		for i := range pts {
+			pts[i].t = pts[i].t.Add(-pollEvery)
+		}
+		m.metrics.series[id] = pts
+	}
+	cmd := m.poll()
+	m.sync()
+	return drain(t, m, cmd)
+}
+
+func TestOverviewPollsOnlyForAdministrators(t *testing.T) {
+	f := &fake{}
+	m := start(t, f, 120, 40)
+	m = pollAgain(t, m)
+	if f.diagCalls != 0 {
+		t.Fatalf("polled diagnostics without system:admin: %d", f.diagCalls)
+	}
+	f = &fake{permissions: []string{api.PermSystemAdmin}}
+	m = start(t, f, 120, 60)
+	m = pollAgain(t, m)
+	if f.diagCalls != 2 {
+		t.Fatalf("diagnostics polls: %d", f.diagCalls)
+	}
+	v := m.View()
+	for _, want := range []string{"JOBS", "1 running", "2 queued", "DELIVERIES", "FREE SPACE", "210 GB", "aren't reported by this server", "Sampled while this window is open", "Recent failures", "Work in progress"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("overview lacks %q:\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "\x1b[2J") {
+		t.Fatal("unsafe text")
+	}
+	m = goTo(t, m, route{page: pageCatalog})
+	before := f.diagCalls
+	m = pollAgain(t, m)
+	if f.diagCalls != before {
+		t.Fatal("polled diagnostics for a page that does not show them")
+	}
+}
+
+func TestProcessMetricsBecomeRates(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}, process: true}
+	m := start(t, f, 140, 44)
+	m = pollAgain(t, m)
+	m = pollAgain(t, m)
+	cpu := m.metrics.values(mCPU, time.Now(), time.Hour)
+	if len(cpu) == 0 {
+		t.Fatal("no CPU rate")
+	}
+	// 2 CPU-seconds per poll interval of 2 s (plus scheduling time): ~one core.
+	if got := cpu[len(cpu)-1].v * 100; got < 80 || got > 101 {
+		t.Fatalf("cpu %.1f%%", got)
+	}
+	if v := m.View(); !strings.Contains(v, "CPU") || !strings.Contains(v, "peak") || !strings.Contains(v, "184 MB") || strings.Contains(v, "Not reported") {
+		t.Fatalf("process tiles:\n%s", v)
+	}
+}
+
+func TestServerHistoryIsUsedWhenOffered(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}, features: []api.Feature{{ID: "admin.metrics", Implemented: true, Enabled: true}}}
+	m := start(t, f, 140, 44)
+	if f.metricsCalls != 1 || !m.metrics.server {
+		t.Fatalf("history not loaded: %d", f.metricsCalls)
+	}
+	if r := m.metrics.values(mRequests, time.Now(), time.Hour); len(r) != 30 || r[0].v != 1 {
+		t.Fatalf("requests rate from server history: %v", r)
+	}
+	if !strings.Contains(m.View(), "History from the server") {
+		t.Fatal("source not labelled")
+	}
+	m = press(t, m, "]")
+	if m.windowSpan() != 30*time.Minute || f.metricsCalls != 2 {
+		t.Fatalf("window change did not re-query: %v %d", m.windowSpan(), f.metricsCalls)
+	}
+}
+
+func TestCounterRestartIsNotANegativeRate(t *testing.T) {
+	now := time.Now()
+	s := []point{{now.Add(-3 * time.Second), 100}, {now.Add(-2 * time.Second), 110}, {now.Add(-time.Second), 3}, {now, 5}}
+	r := rate(s)
+	if len(r) != 2 || r[0].v != 10 || r[1].v != 2 {
+		t.Fatalf("%v", r)
+	}
+	h := newHistory()
+	h.series[mBusy] = s
+	if n, _ := h.increase(mBusy, now, time.Minute); n != 12 {
+		t.Fatalf("increase %v", n)
+	}
+}
+
+func TestSparklineFillsItsWidthAndShowsGaps(t *testing.T) {
+	now := time.Now()
+	pts := []point{{now.Add(-50 * time.Second), 1}, {now.Add(-time.Second), 4}}
+	rows := sparkline(pts, now, time.Minute, 30, 2, colorAccent, false)
+	for _, r := range rows {
+		if w := lipgloss.Width(r); w != 30 {
+			t.Fatalf("width %d", w)
+		}
+	}
+	if !strings.Contains(rows[1], "·") || !strings.ContainsAny(rows[0]+rows[1], "▁▂▃▄▅▆▇█") {
+		t.Fatalf("rows %q", rows)
+	}
+}
+
+func TestSignOutForgetsMetrics(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}}
+	m := pollAgain(t, start(t, f, 120, 40))
+	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
+	if len(m.metrics.series) != 0 || strings.Contains(m.View(), "JOBS") {
+		t.Fatal("metrics survived sign-out")
 	}
 }

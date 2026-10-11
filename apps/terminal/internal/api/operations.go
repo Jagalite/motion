@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strconv"
+	"time"
 )
 
 type ScanInput struct {
@@ -50,6 +53,52 @@ type Diagnostics struct {
 	RunningJobs      string   `json:"running_jobs"`
 	DBBusyCount      string   `json:"db_busy_count"`
 	WorkerErrors     []string `json:"worker_errors"`
+	// Process is reported by servers with the admin.metrics feature.
+	Process *ProcessMetrics `json:"process,omitempty"`
+}
+
+// ProcessMetrics describes the server process. Fields a platform cannot
+// provide are null.
+type ProcessMetrics struct {
+	PID                *string `json:"pid"`
+	CPUSecondsTotal    *string `json:"cpu_seconds_total"`
+	ResidentBytes      *string `json:"resident_bytes"`
+	VirtualBytes       *string `json:"virtual_bytes"`
+	OpenFiles          *string `json:"open_files"`
+	Threads            *string `json:"threads"`
+	CPUCount           *string `json:"cpu_count"`
+	RequestsTotal      *string `json:"requests_total"`
+	RequestErrorsTotal *string `json:"request_errors_total"`
+	RequestsInFlight   *string `json:"requests_in_flight"`
+}
+
+// StorageReport is the server's storage use; FreeBytes is null when unknown.
+type StorageReport struct {
+	DatabaseBytes  string  `json:"database_bytes"`
+	AssetBytes     string  `json:"asset_bytes"`
+	TemporaryBytes string  `json:"temporary_bytes"`
+	ReservedBytes  string  `json:"reserved_bytes"`
+	FreeBytes      *string `json:"free_bytes"`
+}
+
+// MetricsHistory is sampled server history (admin.metrics).
+type MetricsHistory struct {
+	SampledAt        string         `json:"sampled_at"`
+	IntervalSeconds  int64          `json:"interval_seconds"`
+	RetentionSeconds int64          `json:"retention_seconds"`
+	Series           []MetricSeries `json:"series"`
+}
+
+type MetricSeries struct {
+	ID     string        `json:"id"`
+	Kind   string        `json:"kind"`
+	Unit   string        `json:"unit"`
+	Points []MetricPoint `json:"points"`
+}
+
+type MetricPoint struct {
+	T string `json:"t"`
+	V string `json:"v"`
 }
 
 func (c *Client) CreateScan(ctx context.Context, library string, input ScanInput, key string) (Tagged[Scan], error) {
@@ -87,6 +136,27 @@ func (c *Client) RetryJob(ctx context.Context, id, key string) (Tagged[Job], err
 	h, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/jobs/" + esc(id) + "/retry", auth: true, idempotencyKey: key}, &v)
 	return Tagged[Job]{Value: v, ETag: h.Get("ETag")}, err
 }
+func (c *Client) Storage(ctx context.Context) (StorageReport, error) {
+	var v StorageReport
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/storage", auth: true}, &v)
+	return v, err
+}
+
+// Metrics reads sampled history since a time, downsampled to step seconds
+// (0 leaves both to the server).
+func (c *Client) Metrics(ctx context.Context, since time.Time, step int) (MetricsHistory, error) {
+	var v MetricsHistory
+	q := url.Values{}
+	if !since.IsZero() {
+		q.Set("since", since.UTC().Format(time.RFC3339))
+	}
+	if step > 0 {
+		q.Set("step_seconds", strconv.Itoa(step))
+	}
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/metrics", query: q, auth: true}, &v)
+	return v, err
+}
+
 func (c *Client) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	var v Diagnostics
 	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/diagnostics", auth: true}, &v)

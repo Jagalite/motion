@@ -34,6 +34,9 @@ type Backend interface {
 	ListJobs(context.Context, string, int) (api.Page[api.Job], error)
 	CancelJob(context.Context, string, string) (api.Tagged[api.Job], error)
 	Diagnostics(context.Context) (api.Diagnostics, error)
+	Storage(context.Context) (api.StorageReport, error)
+	Metrics(context.Context, time.Time, int) (api.MetricsHistory, error)
+	ListSources(context.Context, string, int) (api.Page[api.Source], error)
 }
 
 const (
@@ -59,6 +62,9 @@ const (
 	keyScans       = "scans"
 	keyDevices     = "devices"
 	keyDiagnostics = "diagnostics"
+	keyStorage     = "storage"
+	keyMetrics     = "metrics"
+	keySources     = "sources"
 )
 
 // baseKeys are loaded at start and after every resync: the shell needs them.
@@ -77,6 +83,8 @@ type slot struct {
 	truncated bool
 	err       error
 	cancel    context.CancelFunc
+	// at is when the newest reply was accepted.
+	at time.Time
 }
 
 // cache is shared by every copy of the model: Bubble Tea copies the model on
@@ -236,7 +244,7 @@ func (m *Model) accept(msg loaded) bool {
 	if s == nil || s.request != msg.request {
 		return false // superseded, cancelled or discarded by a reset
 	}
-	s.loading, s.cancel = false, nil
+	s.loading, s.cancel, s.at = false, nil, time.Now()
 	s.err = msg.err
 	switch {
 	case msg.err == nil:
@@ -302,6 +310,20 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 		return func(ctx context.Context) (any, bool, error) {
 			d, err := b.Diagnostics(ctx)
 			return d, false, err
+		}
+	case keyStorage:
+		return func(ctx context.Context) (any, bool, error) {
+			s, err := b.Storage(ctx)
+			return s, false, err
+		}
+	case keySources:
+		return list(b.ListSources)
+	case keyMetrics:
+		window := m.windowSpan()
+		return func(ctx context.Context) (any, bool, error) {
+			step := max(10, int(window.Seconds()/240))
+			h, err := b.Metrics(ctx, time.Now().Add(-window), step)
+			return h, false, err
 		}
 	case keyCatalog:
 		return list(func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {

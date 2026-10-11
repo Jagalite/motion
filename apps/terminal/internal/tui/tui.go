@@ -24,6 +24,7 @@ import (
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -104,13 +105,19 @@ type Model struct {
 	vp        viewport.Model
 	table     table.Model
 
-	log        []string
+	log        []logEntry
 	stream     string
 	streamErr  error
 	notice     notice
 	confirm    string
 	cancelling map[string]bool
 	launching  bool
+
+	// metrics is the console's history; bars animate job progress.
+	metrics *history
+	bars    map[string]*progress.Model
+	window  int
+	beat    int
 }
 
 func New(ctx context.Context, backend Backend, server string, incoming <-chan tea.Msg) Model {
@@ -140,11 +147,12 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 		search: search, help: h, table: tbl, vp: viewport.New(0, 0),
 		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
 		cancelling: map[string]bool{}, stream: "connecting",
+		metrics: newHistory(), bars: map[string]*progress.Model{},
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.reloadAll(), m.wait())
+	return tea.Batch(m.reloadAll(), m.wait(), m.poll(), pollTick(), beatTick())
 }
 
 // wait receives the next stream message; it ends with the interface.
@@ -287,6 +295,13 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		return cmd
 	case tea.KeyMsg:
 		return m.key(msg)
+	case pollMsg:
+		return tea.Batch(m.poll(), pollTick())
+	case beatMsg:
+		m.beat++
+		return beatTick()
+	case progress.FrameMsg:
+		return m.animate(msg)
 	case loaded:
 		if !m.accept(msg) {
 			return nil
@@ -295,7 +310,16 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.signedOut(msg.err)
 			return nil
 		}
-		if msg.key == keySession || msg.key == keyProfiles {
+		if msg.err == nil {
+			if cmd := m.observe(msg); cmd != nil {
+				return cmd
+			}
+		}
+		switch msg.key {
+		case keySession:
+			// Permissions and features are known now: start polling at once.
+			return tea.Batch(m.viewerChanged(), m.poll())
+		case keyProfiles:
 			return m.viewerChanged()
 		}
 	case eventMsg:
@@ -390,11 +414,11 @@ func (m *Model) record(e api.Event) {
 	if e.ResourceID != nil {
 		id = *e.ResourceID
 	}
-	line := fmt.Sprintf("%s  %-8s %s %s", time.Now().Format(time.TimeOnly), e.Kind, e.ResourceType, id)
+	reason := ""
 	if e.Reason != nil {
-		line += "  (" + *e.Reason + ")"
+		reason = *e.Reason
 	}
-	m.log = append(m.log, clean(line))
+	m.log = append(m.log, logEntry{at: time.Now(), kind: clean(e.Kind), resource: clean(e.ResourceType), id: clean(id), reason: clean(reason)})
 	if len(m.log) > eventLog {
 		m.log = m.log[len(m.log)-eventLog:]
 	}
@@ -450,7 +474,7 @@ func (m *Model) show(r route, sel, offset int) tea.Cmd {
 			return nil
 		}
 	}
-	return tea.Batch(m.ensure(r.keys()...), m.spin())
+	return tea.Batch(m.ensure(r.keys()...), m.poll(), m.spin())
 }
 
 // navIndex is the sidebar entry for the current section.
@@ -498,7 +522,17 @@ func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
 	case key.Matches(msg, keys.Search):
 		return m.focusSearch()
 	case key.Matches(msg, keys.Refresh):
-		return m.reloadAll()
+		return tea.Batch(m.reloadAll(), m.poll())
+	case key.Matches(msg, keys.Shorter, keys.Longer) && m.route.page == pageOverview:
+		if key.Matches(msg, keys.Shorter) {
+			m.window = max(m.window-1, 0)
+		} else {
+			m.window = min(m.window+1, len(windows)-1)
+		}
+		if m.metricsFeature() {
+			return m.load(keyMetrics) // the server downsamples to the new span
+		}
+		return nil
 	case key.Matches(msg, keys.Focus):
 		if m.focus == focusNav {
 			m.focus = focusContent
@@ -663,6 +697,7 @@ func (m *Model) signedOut(err error) {
 	m.cache.seq++
 	m.cache.slots[keySession] = &slot{request: m.cache.seq, err: err}
 	m.cache.viewer = ""
+	m.metrics, m.bars = newHistory(), map[string]*progress.Model{}
 	m.focus, m.history, m.confirm = focusContent, nil, ""
 }
 
