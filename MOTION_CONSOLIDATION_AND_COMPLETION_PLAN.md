@@ -283,7 +283,7 @@ packaging or other helper scripts.
   integration/release owner coordinates the necessary combined-tree and installed
   product runs; individual lanes do not repeat them for every commit.
 
-Set `KYOTO` to the shared installation's `kyoto.py` path in your environment.
+Set `KYOTO_SCRIPT` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
