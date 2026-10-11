@@ -1577,7 +1577,7 @@ async fn preparation_admission_pins_identity_and_replays_once() {
         )
         .await
         .status,
-        StatusCode::BAD_REQUEST
+        StatusCode::UNPROCESSABLE_ENTITY
     );
     sqlx::query("UPDATE media_files SET revision='replaced' WHERE id='file-a'")
         .execute(&f.app.db)
@@ -2016,7 +2016,7 @@ async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
         .await;
     assert_eq!(
         rejected.status,
-        StatusCode::BAD_REQUEST,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "{}",
         rejected.body
     );
