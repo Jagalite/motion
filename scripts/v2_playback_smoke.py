@@ -171,7 +171,7 @@ def main():
                             operator, 202, {'Idempotency-Key': key('job')})
             def finished():
                 _, _, row = api('GET', f"/jobs/{job['id']}", auth=operator, expected=200)
-                return row if row['phase'] not in ('queued', 'running', 'cancelling') else None
+                return row if row['phase'] not in ('queued', 'admitted', 'running', 'validating', 'publishing', 'cancelling') else None
             row = wait_for(finished, seconds=300)
             assert row['phase'] == 'completed', row
             converted = plan('convert', ['http_range', 'hls'])

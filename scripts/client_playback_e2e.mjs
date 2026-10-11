@@ -167,7 +167,7 @@ const DEMUXE_LIVE = {id: 'demuxe-live-hls', evidence: 'live playback requires ex
 
 /**
  * The scenario over a Playwright-like `page` (goto, reload, evaluate,
- * screenshot, on('response'|'console')). Responses expose url(), status(),
+ * screenshot, on('request'|'response'|'console')). Responses expose url(), status(),
  * request().method(), request().postData() and json().
  */
 export async function scenario(page, server, ctx, engine, out) {
@@ -361,7 +361,7 @@ export async function scenario(page, server, ctx, engine, out) {
   }, operator, {'Idempotency-Key': `e2e-${engine}-${Date.now()}`});
   if (job.status !== 202) throw new Error(`v2 preparation is required for acceptance: ${job.status} ${JSON.stringify(job.json)}`);
   let phase = job.json?.phase;
-  for (let i = 0; i < 1200 && ['queued', 'running', 'cancelling'].includes(phase); i++) {
+  for (let i = 0; i < 1200 && ['queued', 'admitted', 'running', 'validating', 'publishing', 'cancelling'].includes(phase); i++) {
     await sleep(100);
     const polled = await server.api('GET', `/api/v2/jobs/${job.json.id}`, undefined, operator);
     if (polled.status !== 200) throw new Error(`Cannot poll preparation: ${polled.status}`);
