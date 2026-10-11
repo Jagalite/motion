@@ -63,7 +63,8 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
     let selected = {
         let _guard = app.jobs.lock().await;
         let mut tx = crate::db::begin_write(&app.db).await?;
-        let row:Option<(String,String,i64,String,Option<String>,Option<String>)>=sqlx::query_as("SELECT id,item_id,attempt,requester_id,credential_hash,ingress_id FROM metadata_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1").fetch_optional(&mut *tx).await?;
+        type QueuedRow = (String, String, i64, String, Option<String>, Option<String>);
+        let row:Option<QueuedRow>=sqlx::query_as("SELECT id,item_id,attempt,requester_id,credential_hash,ingress_id FROM metadata_jobs WHERE phase='queued' ORDER BY created_at,id LIMIT 1").fetch_optional(&mut *tx).await?;
         let Some((id, item, attempt, owner, hash, ingress)) = row else {
             return Ok(false);
         };
@@ -108,28 +109,29 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
     // Provisional writes live in a savepoint until core confirms completeness.
     // Any unusable/stale input or adapter error rolls back the entire refresh.
     let mut success = false;
-    if permitted && current.executing(attempt) {
-        if let Ok(observed) = &observed {
-            let unusable = observed
-                .iter()
-                .filter(|(_, s)| matches!(s, crate::nfo::Sidecar::Unusable))
-                .count();
-            let mut publication = tx.begin().await?;
-            match crate::nfo::publish_refresh_in(&mut publication, &item, observed).await {
-                Ok(count)
-                    if playscale_core::metadata::refresh_complete(
-                        observed.len(),
-                        unusable,
-                        count,
-                        permitted,
-                    ) =>
-                {
-                    publication.commit().await?;
-                    success = true;
-                }
-                _ => {
-                    publication.rollback().await?;
-                }
+    if permitted
+        && current.executing(attempt)
+        && let Ok(observed) = &observed
+    {
+        let unusable = observed
+            .iter()
+            .filter(|(_, s)| matches!(s, crate::nfo::Sidecar::Unusable))
+            .count();
+        let mut publication = tx.begin().await?;
+        match crate::nfo::publish_refresh_in(&mut publication, &item, observed).await {
+            Ok(count)
+                if playscale_core::metadata::refresh_complete(
+                    observed.len(),
+                    unusable,
+                    count,
+                    permitted,
+                ) =>
+            {
+                publication.commit().await?;
+                success = true;
+            }
+            _ => {
+                publication.rollback().await?;
             }
         }
     }

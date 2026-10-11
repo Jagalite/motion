@@ -1369,9 +1369,9 @@ pub async fn delete_relationship(
 ) -> Result<(), CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let result = delete_relationship_in(&mut tx, id, expected_revision).await?;
+    delete_relationship_in(&mut tx, id, expected_revision).await?;
     tx.commit().await?;
-    Ok(result)
+    Ok(())
 }
 
 pub(crate) async fn delete_relationship_in(

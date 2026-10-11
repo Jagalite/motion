@@ -43,10 +43,10 @@ impl Repair {
     }
     fn repair(&self, s: &State) -> State {
         let mut next = s.clone();
-        if let Some(view) = &s.view {
-            if core::retract_unattributed_legacy(&self.attribution(), view, &legacy(), s.session) {
-                next.view = None;
-            }
+        if let Some(view) = &s.view
+            && core::retract_unattributed_legacy(&self.attribution(), view, &legacy(), s.session)
+        {
+            next.view = None;
         }
         if let Some(view) =
             core::import_legacy(&self.attribution(), next.view.as_ref(), 20000, false, None)

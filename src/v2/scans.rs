@@ -88,7 +88,8 @@ async fn wire(
                 require_complete: view.require_complete,
                 status: s.status,
             };
-            let candidates:Vec<(String,i64,String,i64,i64,bool,Option<i64>,bool)>=sqlx::query_as("SELECT id,attempt,phase,reused_files,inspected_files,full_scan,started_barrier,direct_request FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY created_at,id").bind(&s.source_id).fetch_all(&mut *tx).await?;
+            type AttemptRow = (String, i64, String, i64, i64, bool, Option<i64>, bool);
+            let candidates:Vec<AttemptRow>=sqlx::query_as("SELECT id,attempt,phase,reused_files,inspected_files,full_scan,started_barrier,direct_request FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY created_at,id").bind(&s.source_id).fetch_all(&mut *tx).await?;
             let mut selected = None;
             for (id, generation, phase, reused, inspected, verify, barrier, direct) in candidates {
                 let attempt = playscale_core::demands::Attempt {
@@ -176,16 +177,15 @@ async fn create(
 ) -> Result<Response, Problem> {
     caller.require(Permission::SourcesManage)?;
     let key = idempotency_key(&headers)?;
-    if let Some(ids) = &body.value.source_ids {
-        if ids.is_empty()
+    if let Some(ids) = &body.value.source_ids
+        && (ids.is_empty()
             || ids.len() > 100
-            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len()
-        {
-            return Err(Problem::invalid(
-                "invalid_sources",
-                "Select 1-100 distinct sources",
-            ));
-        }
+            || ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len())
+    {
+        return Err(Problem::invalid(
+            "invalid_sources",
+            "Select 1-100 distinct sources",
+        ));
     }
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;

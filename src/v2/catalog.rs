@@ -1745,12 +1745,12 @@ async fn version_body(
 ) -> Result<Value, Problem> {
     let (revision, label, origin, equivalence): (i64, String, String, String) =
         sqlx::query_as("SELECT revision,label,origin,equivalence FROM media_versions WHERE id=?")
-            .bind(&version)
+            .bind(version)
             .fetch_one(&mut *conn)
             .await?;
     type BindingRow = (String, String, i64, Option<i64>, Option<i64>, bool, String);
     let bindings: Vec<BindingRow>=sqlx::query_as("SELECT b.file_id,b.file_revision,b.part,b.start_ms,b.end_ms,f.available,f.revision FROM version_files b JOIN media_files f ON f.id=b.file_id WHERE b.version_id=? ORDER BY b.part LIMIT 101")
-            .bind(&version).fetch_all(&mut *conn).await?;
+            .bind(version).fetch_all(&mut *conn).await?;
     if bindings.len() > 100 {
         return Err(Problem::new(
             StatusCode::CONFLICT,
