@@ -326,16 +326,6 @@ async fn add_verified_library_kind(
     identity: &str,
     managed: bool,
 ) -> anyhow::Result<Library> {
-    add_verified_library_kind(db, name, root, identity, false).await
-}
-
-async fn add_verified_library_kind(
-    db: &SqlitePool,
-    name: &str,
-    root: &str,
-    identity: &str,
-    managed: bool,
-) -> anyhow::Result<Library> {
     anyhow::ensure!(
         !name.trim().is_empty() && name.len() <= 200,
         "invalid library name"
