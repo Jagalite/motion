@@ -7,7 +7,7 @@ from urllib.parse import urlencode
 
 
 def main():
-    checks=[]
+    checks=[]; failures=[]
     with tempfile.TemporaryDirectory(prefix='playscale-processing-') as directory:
         root=pathlib.Path(directory); media=root/'media'; media.mkdir()
         import shutil
@@ -48,9 +48,13 @@ def main():
                 page=api('GET','/catalog/items')
                 if not page['items']: return None
                 item=page['items'][0]
-                file=api('GET',f"/catalog/items/{item['id']}/files")['items'][0]
-                timeline=api('GET',f"/catalog/items/{item['id']}/timelines")['items'][0]['id']
-                return {'id':item['id'],'file_id':file['id'],'revision':file['revision'],'timeline':timeline}
+                for timeline in api('GET',f"/catalog/items/{item['id']}/timelines")['items']:
+                    versions=api('GET',f"/catalog/timelines/{timeline['id']}/versions")['items']
+                    original=next((v for v in versions if v['origin']=='original'),None)
+                    if original:
+                        file=original['files'][0]['file']
+                        return {'id':item['id'],'file_id':file['file_id'],'revision':file['file_revision'],'timeline':timeline['id']}
+                return None
             source=wait_for(scanned);library=api('GET','/libraries')['items'][0]['id']
             def preparation(recipe):
                 return {'source':{'file_id':source['file_id'],'file_revision':source['revision']},
@@ -81,8 +85,10 @@ def main():
                 output=root/(job['id']+'.mp4');output.write_bytes(data)
                 subprocess.run([ffmpeg,'-v','error','-xerror','-i',str(output),'-f','null','-'],check=True,stdout=subprocess.DEVNULL)
             assert len(api('GET','/catalog/items')['items'])==1
-            assert len(api('GET','/libraries')['items'])==1
-            checks.append('three_real_recipes_decode_idempotency_and_original_isolation')
+            libraries=api('GET','/libraries')['items']
+            if len(libraries)!=1: failures.append({'check':'original_generated_library_isolation','libraries':libraries})
+            checks.append('three_real_recipes_decode_and_idempotency')
+            if not failures: checks.append('original_generated_library_isolation')
             # Both pipes can flood without a newline. Parsing/storage must stay
             # bounded, and a partial progress line must not prevent cancellation.
             flooded=root/'flood-drained'
@@ -158,7 +164,7 @@ def main():
                 wrapper.write_text(normal_wrapper);stop(process)
                 settings['processing'].pop('expected_duration')
                 config.write_text(json.dumps(settings));process=boot()
-            hardware={'attempted':False,'reason':'v2 advertises software recipes only; hardware profile qualification remains a gate'}
+            hardware={'attempted':False,'reason':'this receipt exercises software only; hardware profile qualification remains a gate'}
             caps=api('GET','/processing/capabilities');assert caps['background_slots']==1 and caps['ffmpeg_digest'].startswith('sha256:')
             recipes=api('GET','/processing/recipes')['items'];assert 'h264720p' in [r['id'] for r in recipes]
             cursor=api('GET','/jobs')['event_cursor']
@@ -226,11 +232,15 @@ def main():
             stop(process);process=boot();auth=old_auth;checks.append('db_only_restore_invalidates_foreign_generated_cache')
             with sqlite3.connect(state/'playscale.sqlite3') as db:db.execute("UPDATE processing_jobs SET updated_at=0 WHERE phase='completed'")
             wait_for(lambda: all(r['status']!='ready' for r in renditions()),seconds=40)
-            assert not list((state/'generated').glob('*/*/output.mp4'))
+            # A prior source replacement can already make every rendition stale.
+            # Wait for the independent physical maintenance effect as well.
+            wait_for(lambda: not list((state/'generated').glob('*/*/output.mp4')), seconds=40)
             assert hashlib.sha256((media/'clip.mp4').read_bytes()).hexdigest()==original;checks.append('cache_expiration_preserves_original_bytes')
             spec=api('GET','/openapi.json');assert '/api/v2/events' in spec['paths'] and '/api/v2/processing/preparations' in spec['paths']
-            print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware},indent=2))
+            print(json.dumps({'passed':len(checks),'checks':checks,'hardware':hardware,'failures':failures},indent=2))
+            assert not failures,failures
         except BaseException:
+            print(json.dumps({'completed_checks':checks,'failures':failures}),file=sys.stderr)
             log.flush();print((root/'log').read_text()[-8000:],file=sys.stderr)
             server_log=state/'logs/server.log'
             if server_log.exists(): print(server_log.read_text()[-8000:],file=sys.stderr)
