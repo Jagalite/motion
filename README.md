@@ -104,6 +104,13 @@ python3 scripts/client.py http://127.0.0.1:8787
 
 ## Next architecture and API v2
 
+The [consolidation and milestone completion plan](MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md)
+is the current execution addendum: retire v1 client compatibility, preserve data
+upgrades, repair integration gaps, and close M0–M4 with explicit acceptance evidence.
+It supersedes the older plan's requirement to keep serving v1; the remaining
+architecture and later milestones still apply. This is planned work, not a claim
+that the cutover has shipped.
+
 The [Motion architecture and implementation plan](Motion_Final_Architecture_and_Implementation_Plan.md)
 (design version 1.1.0, Topcoat revision) is the main design document. It and the
 [API v2 contract](contracts/Motion_Server_API_v2.yaml) describe the next
