@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 
+from check_publication import source_failures
 from build_media_tools import assert_portable, build, digest, download
 from package_privacy import assert_private_paths_absent, public_tar_member
 
@@ -39,6 +40,9 @@ def source_inventory():
         if path.is_symlink() or not path.is_file():
             raise ValueError(f'Source input is missing or not a regular file: {name}')
         result[name] = digest(path)
+    failures = source_failures(ROOT, result)
+    if failures:
+        raise ValueError('Source publication privacy check failed: ' + '; '.join(failures))
     return result
 
 

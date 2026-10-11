@@ -93,6 +93,13 @@ class PackagingTests(unittest.TestCase):
             run.assert_not_called()
         self.assertEqual(json.loads((work / 'receipt.json').read_text())['status'], 'failed')
 
+    def test_untracked_private_diagnostic_blocks_source_capture(self):
+        root = self.source_checkout()
+        (root / 'diagnostic.txt').write_bytes(b'/' + b'Users/private-person/private-library')
+        with patch('package_app.ROOT', root):
+            with self.assertRaisesRegex(ValueError, 'Source publication privacy'):
+                source_inventory()
+
     def test_symlink_input_is_rejected(self):
         root = self.source_checkout()
         (root / 'linked').symlink_to(self.cache / 'outside')
