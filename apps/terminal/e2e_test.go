@@ -322,6 +322,12 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	if shown.code != cli.ExitOK || data(t, shown.stdout)["title"] != "Unicode 猫 Film" {
 		t.Fatalf("show: %+v", shown)
 	}
+	// Real negotiation must reach timeline lookup, rather than refuse a served
+	// player because of stale implementation flags. No browser is launched.
+	play := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "play", "missing-timeline", "--print-url")
+	if play.code != cli.ExitNotFound || strings.Contains(play.stderr, "feature_unavailable") {
+		t.Fatalf("play capability negotiation: %+v", play)
+	}
 	diagnostics := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "diagnostics")
 	if diagnostics.code != cli.ExitOK || data(t, diagnostics.stdout)["server_epoch"] == "" {
 		t.Fatalf("diagnostics: %+v", diagnostics)

@@ -365,18 +365,27 @@ function observeViewing(element, generation, writer, current) {
   });
 }
 
+// Retained across renewal restarts/failed changes of the SAME generation.
+const playheadSequences = new Map();
+function pacingHeartbeat(id, generation, observation) {
+  const body = {active_generation: generation.generation};
+  const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
+  if (['playing', 'paused'].includes(observation?.status) && Number.isSafeInteger(position) && position >= 0) {
+    const key = JSON.stringify([id, generation.generation]);
+    const sequence = (playheadSequences.get(key) ?? 0n) + 1n;
+    playheadSequences.set(key, sequence);
+    body.playhead = {sequence: String(sequence), position_ms: position};
+  }
+  return body;
+}
+
 function renewLease(delivery, generation, current) {
   state.stopLease?.();
-  let sequence = 0n;
   state.stopLease = maintainLease(delivery, generation.generation, {
     current,
     send: async (id, active_generation, signal) => {
-      const observation = state.element?.player.state;
-      const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
-      const playhead = current() && ['playing', 'paused'].includes(observation?.status)
-        && Number.isSafeInteger(position) && position >= 0
-        ? {sequence: String(++sequence), position_ms: position} : undefined;
-      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation, ...(playhead ? {playhead} : {})}, undefined, signal);
+      const body = current() ? pacingHeartbeat(id, generation, state.element?.player.state) : {active_generation};
+      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, body, undefined, signal);
       if (current()) state.delivery = renewed;
       return renewed;
     },
@@ -564,12 +573,7 @@ async function switchDelivery(plan) {
     latestLease = ready;
     stopReplacementLease = maintainLease(ready, generation.generation, {current,
       send: async (id, active_generation, signal) => {
-        const observation = state.element?.player.state;
-      const position = Math.round((observation?.currentTime ?? NaN) * 1000 + generation.media_time_origin_ms);
-      const playhead = current() && ['playing', 'paused'].includes(observation?.status)
-        && Number.isSafeInteger(position) && position >= 0
-        ? {sequence: String(++sequence), position_ms: position} : undefined;
-      const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation, ...(playhead ? {playhead} : {})}, undefined, signal);
+        const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
         latestLease = renewed;
         return renewed;
       },
@@ -773,6 +777,7 @@ function close({unloading = false} = {}) {
       } catch { /* The last successfully queued observation remains durable. */ }
     }
     state.epoch++;
+    playheadSequences.clear();
     state.stopLease?.();
     state.stopLease = null;
     // Persist first, then allow a bounded final send before retiring delivery.

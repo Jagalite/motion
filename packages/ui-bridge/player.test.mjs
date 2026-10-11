@@ -257,3 +257,22 @@ test('viewing storage survives ordinary restart and fences restore identity', ()
   storage.save(null);
   assert.equal(localStorage.getItem(key), null);
 });
+
+test('pacing counters survive renewal restart and failed-change rollback on the same generation', () => {
+  const heartbeat = runInNewContext(source.replace('export {close, maintainLease};', 'pacingHeartbeat;'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const generation = {generation: '1', media_time_origin_ms: 10000};
+  const active = time => heartbeat('delivery', generation, {status: 'playing', currentTime: time});
+  assert.equal(active(2).playhead.sequence, '1');
+  // A replacement fails; the same delivery/generation resumes its renewal.
+  const resumed = active(1);
+  assert.equal(resumed.playhead.sequence, '2');
+  assert.equal(resumed.playhead.position_ms, 11000);
+  assert.equal(heartbeat('replacement', generation, {status: 'paused', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(heartbeat('delivery', {...generation, generation: '2'}, {status: 'playing', currentTime: 0}).playhead.sequence, '1');
+  assert.equal(active(3).playhead.sequence, '3');
+  for (const observation of [{status: 'loading', currentTime: 4}, {status: 'paused', currentTime: NaN}]) {
+    assert.equal(heartbeat('delivery', generation, observation).playhead, undefined);
+  }
+});
