@@ -1,11 +1,14 @@
-// Package tui is the Bubble Tea interface over the public API.
+// Package tui is the Bubble Tea interface over the public API, laid out like
+// the Marquee web UI: a sidebar of libraries and management screens, a top
+// bar with search and the active profile, content panels, and a status bar.
 //
 // Events are drained on their own goroutine into a bounded channel with a
 // non-blocking send, so a slow screen never stalls the stream; when hints are
 // dropped a resync is delivered as soon as the interface catches up, which
-// discards cached views and re-queries every screen, as does a server reset.
-// Every load carries a per-screen request number, so an older query that
-// completes late cannot overwrite a newer one. Nothing renders credentials.
+// discards cached views and re-queries, as does a server reset. Every load
+// carries a request number and its own context: a newer load for the same
+// view cancels the older one, and a reply that is not the newest is ignored.
+// Nothing renders credentials.
 package tui
 
 import (
@@ -18,110 +21,119 @@ import (
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 	"github.com/Jagalite/motion/apps/terminal/internal/cli"
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
-
-// Backend is the subset of the API the interface uses; tests substitute it.
-type Backend interface {
-	GetTimeline(context.Context, string) (api.Tagged[api.Timeline], error)
-	GetProfile(context.Context, string) (api.Tagged[api.Profile], error)
-	Me(context.Context) (api.Principal, error)
-	Capabilities(context.Context) (api.Capabilities, error)
-	ListProfiles(context.Context, string, int) (api.Page[api.Profile], error)
-	ListDevices(context.Context, string, int) (api.Page[api.Device], error)
-	ListLibraries(context.Context, string, int) (api.Page[api.Library], error)
-	ListCatalog(context.Context, string, int, string) (api.Page[api.CatalogItem], error)
-	SearchCatalog(context.Context, string, string, int) (api.Page[api.CatalogItem], error)
-	ListScans(context.Context, string, int) (api.Page[api.Scan], error)
-	ListJobs(context.Context, string, int) (api.Page[api.Job], error)
-	CancelJob(context.Context, string, string) (api.Tagged[api.Job], error)
-	Diagnostics(context.Context) (api.Diagnostics, error)
-}
-
-type screen int
-
-const (
-	overview screen = iota
-	profiles
-	devices
-	events
-	libraries
-	catalog
-	search
-	scans
-	jobs
-	diagnostics
-	screens
-)
-
-var titles = [...]string{"Overview", "Profiles", "Devices", "Events", "Libraries", "Catalog", "Search", "Scans", "Jobs", "Diagnostics"}
 
 const (
 	eventBuffer = 256
 	eventLog    = 200
-	// Lists load every page up to this many rows, then say so.
-	listCap = 2000
+	searchDelay = 250 * time.Millisecond
+	noticeTime  = 5 * time.Second
+	searchLimit = 200
 )
 
-type loaded struct {
-	screen    screen
-	request   int
-	data      any
-	truncated bool
-	err       error
-}
+type focus int
+
+const (
+	focusContent focus = iota
+	focusNav
+	focusSearch
+)
 
 type eventMsg api.Event
 type resyncMsg struct{}
-type launchDone struct {
-	screen screen
-	err    error
-}
-type actionDone struct{ err error }
 type streamMsg struct {
 	state string
 	err   error
 }
+type launchDone struct{ err error }
+type cancelDone struct {
+	job string
+	err error
+}
+type searchDue struct{ seq int }
+type noticeDone struct{ seq int }
+
+type notice struct {
+	text string
+	err  bool
+	seq  int
+}
 
 // Model is the interface state.
 type Model struct {
-	profile     string
-	openBrowser func(context.Context, string) error
 	ctx         context.Context
 	backend     Backend
 	server      string
-	tab         screen
-	width       int
-	height      int
-	me          *api.Principal
-	caps        *api.Capabilities
-	profiles    []api.Profile
-	libraries   []api.Library
-	catalog     []api.CatalogItem
-	results     []api.CatalogItem
-	scans       []api.Scan
-	jobs        []api.Job
-	diagnostics *api.Diagnostics
-	cancelling  bool
-	query       string
-	editing     bool
-	devices     []api.Device
-	truncated   map[screen]bool
-	log         []string
-	errs        map[screen]error
-	requests    map[screen]int
-	loading     map[screen]bool
-	selected    map[screen]int
-	stream      string
 	incoming    <-chan tea.Msg
+	openBrowser func(context.Context, string) error
+	// profile is the chosen viewing profile; "" uses the principal's first.
+	profile string
+
+	cache  *cache
+	width  int
+	height int
+
+	focus   focus
+	route   route
+	history []visit
+	sel     int
+	offset  int
+	navSel  int
+	list    bool
+	helping bool
+
+	search    textinput.Model
+	searchSeq int
+	spinner   spinner.Model
+	spinning  bool
+	help      help.Model
+	vp        viewport.Model
+	table     table.Model
+
+	log        []string
+	stream     string
+	streamErr  error
+	notice     notice
+	confirm    string
+	cancelling map[string]bool
+	launching  bool
 }
 
 func New(ctx context.Context, backend Backend, server string, incoming <-chan tea.Msg) Model {
+	search := textinput.New()
+	search.Prompt = ""
+	search.Placeholder = "Search titles"
+	search.CharLimit = searchLimit
+	search.Cursor.SetMode(cursor.CursorStatic)
+	search.TextStyle = fgStyle
+	search.PlaceholderStyle = faintStyle
+	search.Cursor.Style = accentStyle
+	search.Cursor.TextStyle = fgStyle
+	h := help.New()
+	h.Styles.ShortKey, h.Styles.FullKey = keyStyle, keyStyle
+	h.Styles.ShortDesc, h.Styles.FullDesc = faintStyle, mutedStyle
+	h.Styles.ShortSeparator, h.Styles.FullSeparator, h.Styles.Ellipsis = faintStyle, faintStyle, faintStyle
+	h.ShortSeparator = "  "
+	tbl := table.New(table.WithFocused(true))
+	tbl.SetStyles(table.Styles{
+		Header:   headingStyle.Padding(0, 1),
+		Cell:     fgStyle.UnsetForeground().Padding(0, 1),
+		Selected: focusStyle.Background(colorRaised2),
+	})
 	return Model{
 		ctx: ctx, backend: backend, server: server, incoming: incoming, openBrowser: cli.OpenBrowser,
-		errs: map[screen]error{}, loading: map[screen]bool{}, selected: map[screen]int{},
-		requests: map[screen]int{}, truncated: map[screen]bool{}, stream: "connecting",
+		cache:  &cache{slots: map[string]*slot{}},
+		search: search, help: h, table: tbl, vp: viewport.New(0, 0),
+		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
+		cancelling: map[string]bool{}, stream: "connecting",
 	}
 }
 
@@ -148,310 +160,199 @@ func (m Model) wait() tea.Cmd {
 	}
 }
 
+// reloadAll re-queries the shell and the current page.
 func (m *Model) reloadAll() tea.Cmd {
-	return tea.Batch(m.load(overview), m.load(profiles), m.load(devices), m.load(libraries), m.load(catalog), m.load(search), m.load(scans), m.load(jobs), m.load(diagnostics))
-}
-
-func all[T any](ctx context.Context, list func(context.Context, string, int) (api.Page[T], error)) ([]T, bool, error) {
-	var items []T
-	cursor := ""
+	cmds := []tea.Cmd{}
 	seen := map[string]bool{}
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, false, err
+	for _, key := range append(append([]string{}, baseKeys...), m.route.keys()...) {
+		if !seen[key] {
+			seen[key] = true
+			cmds = append(cmds, m.load(key))
 		}
-		if seen[cursor] {
-			return nil, false, fmt.Errorf("server returned a repeated pagination cursor")
-		}
-		seen[cursor] = true
-		page, err := list(ctx, cursor, 200)
-		if err != nil {
-			return nil, false, err
-		}
-		items = append(items, page.Items...)
-		if page.NextCursor == nil {
-			return items, false, nil
-		}
-		if len(items) >= listCap {
-			return items, true, nil
-		}
-		cursor = *page.NextCursor
 	}
+	return tea.Batch(append(cmds, m.spin())...)
 }
 
-func (m *Model) load(s screen) tea.Cmd {
-	m.requests[s]++
-	m.loading[s] = true
-	ctx, backend, request, query := m.ctx, m.backend, m.requests[s], m.query
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		switch s {
-		case overview:
-			me, err := backend.Me(ctx)
-			if err != nil {
-				return loaded{screen: s, request: request, err: err}
-			}
-			caps, err := backend.Capabilities(ctx)
-			return loaded{screen: s, request: request, data: [2]any{me, caps}, err: err}
-		case scans:
-			items, truncated, err := all(ctx, backend.ListScans)
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
-		case jobs:
-			items, truncated, err := all(ctx, backend.ListJobs)
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
-		case diagnostics:
-			value, err := backend.Diagnostics(ctx)
-			return loaded{screen: s, request: request, data: value, err: err}
-		case libraries:
-			items, truncated, err := all(ctx, backend.ListLibraries)
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
-		case catalog, search:
-			var items []api.CatalogItem
-			var truncated bool
-			var err error
-			if s == catalog {
-				items, truncated, err = all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-					return backend.ListCatalog(ctx, cursor, limit, "")
-				})
-			} else if strings.TrimSpace(query) != "" {
-				items, truncated, err = all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-					return backend.SearchCatalog(ctx, query, cursor, limit)
-				})
-			}
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
-		case profiles:
-			items, truncated, err := all(ctx, backend.ListProfiles)
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
-		case devices:
-			items, truncated, err := all(ctx, backend.ListDevices)
-			return loaded{screen: s, request: request, data: items, truncated: truncated, err: err}
+// resync discards every cached view and rebuilds the shell and current page.
+func (m *Model) resync() tea.Cmd {
+	for key := range m.cache.slots {
+		m.drop(key)
+	}
+	return m.reloadAll()
+}
+
+func (m Model) me() *api.Principal {
+	if s, ok := data[session](m, keySession); ok {
+		return &s.me
+	}
+	return nil
+}
+
+func (m Model) caps() *api.Capabilities {
+	if s, ok := data[session](m, keySession); ok {
+		return &s.caps
+	}
+	return nil
+}
+
+// viewer is the profile used for viewing reads and playback.
+func (m Model) viewer() string {
+	if m.profile != "" {
+		return m.profile
+	}
+	if me := m.me(); me != nil && len(me.ProfileIDs) > 0 {
+		return me.ProfileIDs[0]
+	}
+	if profiles, ok := data[[]api.Profile](m, keyProfiles); ok && len(profiles) > 0 {
+		return profiles[0].ID
+	}
+	return ""
+}
+
+func (m Model) profileName() string {
+	id := m.viewer()
+	profiles, _ := data[[]api.Profile](m, keyProfiles)
+	for _, p := range profiles {
+		if p.ID == id {
+			return clean(p.Name)
 		}
+	}
+	return clean(id)
+}
+
+// viewerChanged re-queries profile-specific views after the profile changes.
+func (m *Model) viewerChanged() tea.Cmd {
+	viewer := m.viewer()
+	if viewer == m.cache.viewer {
 		return nil
 	}
+	m.cache.viewer = viewer
+	return m.reload(func(key string) bool { return key == keyContinue || strings.HasPrefix(key, "item:") })
 }
 
-func (m *Model) rows(s screen) int {
-	switch s {
-	case scans:
-		return len(m.scans)
-	case jobs:
-		return len(m.jobs)
-	case libraries:
-		return len(m.libraries)
-	case catalog:
-		return len(m.catalog)
-	case search:
-		return len(m.results)
-	case profiles:
-		return len(m.profiles)
-	case devices:
-		return len(m.devices)
-	case events:
-		return len(m.log)
+func (m *Model) busy() bool {
+	for _, s := range m.cache.slots {
+		if s.loading {
+			return true
+		}
 	}
-	return 0
+	return m.launching || len(m.cancelling) > 0
+}
+
+// spin starts the loading indicator if it is not already running.
+func (m *Model) spin() tea.Cmd {
+	if m.spinning {
+		return nil
+	}
+	m.spinning = true
+	return m.spinner.Tick
+}
+
+func (m *Model) say(text string, err bool) tea.Cmd {
+	m.notice = notice{text: text, err: err, seq: m.notice.seq + 1}
+	seq := m.notice.seq
+	return tea.Tick(noticeTime, func(time.Time) tea.Msg { return noticeDone{seq: seq} })
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	cmd := m.update(msg)
+	m.sync()
+	return m, cmd
+}
+
+func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+	case spinner.TickMsg:
+		if !m.busy() {
+			m.spinning = false
+			return nil
+		}
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return cmd
 	case tea.KeyMsg:
-		if m.editing && msg.String() != "ctrl+c" {
-			switch msg.Type {
-			case tea.KeyEsc:
-				m.editing = false
-			case tea.KeyEnter:
-				m.editing = false
-				m.results = nil
-				return m, m.load(search)
-			case tea.KeyBackspace, tea.KeyCtrlH:
-				r := []rune(m.query)
-				if len(r) > 0 {
-					m.query = string(r[:len(r)-1])
-				}
-			case tea.KeyRunes:
-				r := []rune(m.query + string(msg.Runes))
-				if len(r) <= 500 {
-					m.query = string(r)
-				}
-			case tea.KeySpace:
-				if len([]rune(m.query)) < 500 {
-					m.query += " "
-				}
-			}
-			return m, nil
-		}
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		case "tab", "right", "l":
-			m.tab = (m.tab + 1) % screens
-		case "shift+tab", "left", "h":
-			m.tab = (m.tab + screens - 1) % screens
-		case "/":
-			m.tab = search
-			m.editing = true
-		case "0":
-			m.tab = diagnostics
-		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-			m.tab = screen(msg.String()[0] - '1')
-		case "up", "k":
-			m.selected[m.tab] = max(m.selected[m.tab]-1, 0)
-		case "down", "j":
-			m.selected[m.tab] = min(m.selected[m.tab]+1, max(m.rows(m.tab)-1, 0))
-		case "enter":
-			if m.tab == profiles && len(m.profiles) > 0 {
-				m.profile = m.profiles[min(m.selected[profiles], len(m.profiles)-1)].ID
-			}
-		case "p":
-			if m.tab == catalog || m.tab == search {
-				items := m.catalog
-				if m.tab == search {
-					items = m.results
-				}
-				if len(items) == 0 {
-					return m, nil
-				}
-				selected := items[min(m.selected[m.tab], len(items)-1)]
-				ready := false
-				if m.caps != nil {
-					for _, f := range m.caps.Features {
-						if f.ID == "playback.v2" && f.Implemented && f.Enabled {
-							ready = true
-						}
-					}
-				}
-				if !ready || m.me == nil || !m.me.Allows(api.PermPlaybackRequest) {
-					m.errs[m.tab] = fmt.Errorf("player unavailable or playback permission missing; press r to refresh")
-					return m, nil
-				}
-				if selected.DefaultTimelineID == nil {
-					m.errs[m.tab] = fmt.Errorf("choose a timeline on the item's web page; press r to refresh")
-					return m, nil
-				}
-				ctx, backend, server, profile, id, tab, open := m.ctx, m.backend, m.server, m.profile, *selected.DefaultTimelineID, m.tab, m.openBrowser
-				return m, func() tea.Msg {
-					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-					defer cancel()
-					timeline, err := backend.GetTimeline(ctx, id)
-					if err == nil && profile != "" {
-						_, err = backend.GetProfile(ctx, profile)
-					}
-					if err == nil {
-						var target string
-						target, err = cli.PlayerURL(server, timeline.Value.ID, profile)
-						if err == nil {
-							err = open(ctx, target)
-						}
-					}
-					return launchDone{screen: tab, err: err}
-				}
-			}
-		case "c":
-			if m.tab == jobs && !m.cancelling && len(m.jobs) > 0 {
-				id := m.jobs[min(m.selected[jobs], len(m.jobs)-1)].ID
-				backend, ctx, key := m.backend, m.ctx, api.NewIdempotencyKey()
-				m.cancelling = true
-				return m, func() tea.Msg {
-					ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-					defer cancel()
-					_, err := backend.CancelJob(ctx, id, key)
-					return actionDone{err: err}
-				}
-			}
-		case "r":
-			return m, m.reloadAll()
-		}
-	case launchDone:
-		m.errs[msg.screen] = msg.err
-		return m, nil
-	case actionDone:
-		m.cancelling = false
-		m.errs[jobs] = msg.err
-		if msg.err == nil {
-			return m, m.load(jobs)
-		}
-		return m, nil
+		return m.key(msg)
 	case loaded:
-		if msg.request != m.requests[msg.screen] {
-			return m, nil // superseded by a newer query or a reset
+		if !m.accept(msg) {
+			return nil
 		}
-		m.loading[msg.screen] = false
-		m.errs[msg.screen] = msg.err
-		if msg.err != nil {
-			return m, nil
+		if msg.key == keySession || msg.key == keyProfiles {
+			return m.viewerChanged()
 		}
-		m.truncated[msg.screen] = msg.truncated
-		switch msg.screen {
-		case overview:
-			pair := msg.data.([2]any)
-			me, caps := pair[0].(api.Principal), pair[1].(api.Capabilities)
-			m.me, m.caps = &me, &caps
-		case scans:
-			m.scans = msg.data.([]api.Scan)
-		case jobs:
-			m.jobs = msg.data.([]api.Job)
-		case diagnostics:
-			d := msg.data.(api.Diagnostics)
-			m.diagnostics = &d
-		case libraries:
-			m.libraries = msg.data.([]api.Library)
-		case catalog:
-			m.catalog = msg.data.([]api.CatalogItem)
-		case search:
-			m.results = msg.data.([]api.CatalogItem)
-		case profiles:
-			m.profiles = msg.data.([]api.Profile)
-		case devices:
-			m.devices = msg.data.([]api.Device)
-		}
-		m.selected[msg.screen] = min(m.selected[msg.screen], max(m.rows(msg.screen)-1, 0))
 	case eventMsg:
-		m.stream = "live"
+		m.stream, m.streamErr = "live", nil
 		m.record(api.Event(msg))
 		if msg.Kind == "reset" {
-			return m, tea.Batch(m.resync(), m.wait())
+			return tea.Batch(m.resync(), m.wait())
 		}
-		cmd := m.wait()
-		switch msg.ResourceType {
-		case "library", "source":
-			return m, tea.Batch(cmd, m.load(libraries), m.load(catalog), m.load(search))
-		case "item", "catalog", "catalog_item", "item_metadata", "item_artwork", "timeline", "version":
-			return m, tea.Batch(cmd, m.load(catalog), m.load(search))
-		case "scan":
-			return m, tea.Batch(cmd, m.load(scans), m.load(jobs), m.load(diagnostics))
-		case "job", "processing":
-			return m, tea.Batch(cmd, m.load(jobs), m.load(diagnostics))
-		case "profile":
-			return m, tea.Batch(cmd, m.load(profiles))
-		case "device":
-			return m, tea.Batch(cmd, m.load(devices), m.load(overview))
-		}
-		return m, cmd
+		return tea.Batch(m.wait(), m.invalidate(msg.ResourceType))
 	case resyncMsg:
 		m.record(api.Event{Kind: "reset", ResourceType: "client", Reason: ptr("event_backlog")})
-		return m, tea.Batch(m.resync(), m.wait())
+		return tea.Batch(m.resync(), m.wait())
 	case streamMsg:
 		m.stream = msg.state
 		if msg.err != nil {
-			m.errs[events] = msg.err
+			m.streamErr = msg.err
 		}
 		if msg.state == "closed" {
-			return m, nil
+			return nil
 		}
-		return m, m.wait()
+		return m.wait()
+	case launchDone:
+		m.launching = false
+		if msg.err != nil {
+			return m.say("Couldn't open the player: "+describe(msg.err).message, true)
+		}
+		return m.say("Opened the player in your browser.", false)
+	case cancelDone:
+		delete(m.cancelling, msg.job)
+		if msg.err != nil {
+			return tea.Batch(m.say("Couldn't cancel the job: "+describe(msg.err).message, true), m.load(keyJobs))
+		}
+		return tea.Batch(m.say("Cancellation requested.", false), m.load(keyJobs))
+	case searchDue:
+		if msg.seq == m.searchSeq {
+			return m.runSearch()
+		}
+	case noticeDone:
+		if msg.seq == m.notice.seq {
+			m.notice = notice{seq: m.notice.seq}
+		}
 	}
-	return m, nil
+	return nil
 }
 
-// resync discards cached views and rebuilds them from fresh queries.
-func (m *Model) resync() tea.Cmd {
-	m.profiles, m.devices, m.me, m.caps = nil, nil, nil, nil
-	m.libraries, m.catalog, m.results = nil, nil, nil
-	m.scans, m.jobs, m.diagnostics = nil, nil, nil
-	return m.reloadAll()
+// invalidate re-queries the cached views a change hint may affect.
+func (m *Model) invalidate(resource string) tea.Cmd {
+	prefix := func(prefixes ...string) func(string) bool {
+		return func(key string) bool {
+			for _, p := range prefixes {
+				if key == p || strings.HasPrefix(key, p+":") {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	switch resource {
+	case "library", "source":
+		return m.reload(prefix(keyLibraries, "library", keyCatalog, keySearch, "item"))
+	case "item", "catalog", "catalog_item", "item_metadata", "item_artwork", "timeline", "version", "edition":
+		return m.reload(prefix("library", keyCatalog, keySearch, "item", keyContinue))
+	case "viewing", "viewing_state":
+		return m.reload(prefix("item", keyContinue))
+	case "scan":
+		return m.reload(prefix(keyScans, keyJobs, keyDiagnostics))
+	case "job", "processing":
+		return m.reload(prefix(keyJobs, keyDiagnostics))
+	case "profile":
+		return m.reload(prefix(keyProfiles))
+	case "device":
+		return m.reload(prefix(keyDevices, keySession))
+	}
+	return nil
 }
 
 func ptr(s string) *string { return &s }
@@ -471,225 +372,279 @@ func (m *Model) record(e api.Event) {
 	}
 }
 
-var (
-	tabStyle    = lipgloss.NewStyle().Padding(0, 1)
-	activeStyle = tabStyle.Bold(true).Reverse(true)
-	dimStyle    = lipgloss.NewStyle().Faint(true)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	selStyle    = lipgloss.NewStyle().Reverse(true)
-)
-
-// clean removes control characters from server-supplied text.
-func clean(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			return -1
-		}
-		return r
-	}, s)
+// navigate opens a top-level page, as the sidebar does.
+func (m *Model) navigate(r route) tea.Cmd {
+	m.history = nil
+	return m.show(r, 0, 0)
 }
 
-// fit clips a rendered line to the terminal width, styles included.
-func fit(s string, width int) string {
-	if width <= 0 {
-		return s
-	}
-	return lipgloss.NewStyle().MaxWidth(width).Render(s)
+// open pushes a page, remembering where the user was.
+func (m *Model) open(r route) tea.Cmd {
+	m.history = append(m.history, visit{route: m.route, sel: m.sel, offset: m.offset})
+	return m.show(r, 0, 0)
 }
 
-func (m Model) View() string {
-	var b strings.Builder
-	tabs := make([]string, 0, screens)
-	for i := screen(0); i < screens; i++ {
-		style := tabStyle
-		if i == m.tab {
-			style = activeStyle
-		}
-		tabs = append(tabs, style.Render(fmt.Sprintf("%d %s", i+1, titles[i])))
+// back returns to the previous page; with no history the sidebar takes focus.
+func (m *Model) back() tea.Cmd {
+	if len(m.history) == 0 {
+		m.focus = focusNav
+		m.navSel = m.navIndex()
+		return nil
 	}
-	tabLine := lipgloss.JoinHorizontal(lipgloss.Top, tabs...)
-	if m.width > 0 && lipgloss.Width(tabLine) > m.width {
-		tabLine = activeStyle.Render(titles[m.tab]) + dimStyle.Render(" · tab switches screens")
-	}
-	b.WriteString(fit(tabLine, m.width))
-	b.WriteString("\n")
-	b.WriteString(fit(dimStyle.Render(clean(fmt.Sprintf("%s · events %s", m.server, m.stream))), m.width))
-	b.WriteString("\n\n")
-	limit := max(m.height-5, 1)
-	if m.height == 0 {
-		limit = 1 << 30
-	}
-	for _, line := range m.body(limit) {
-		b.WriteString(fit(line, m.width))
-		b.WriteString("\n")
-	}
-	help := "tab switch · / search · ↑↓ select · r refresh · q quit"
-	switch m.tab {
-	case catalog, search:
-		help = "p play · " + help
-	case jobs:
-		help = "c cancel job · " + help
-	case profiles:
-		help = "enter selects profile · " + help
-	}
-	b.WriteString(fit(dimStyle.Render(help), m.width))
-	return b.String()
+	v := m.history[len(m.history)-1]
+	m.history = m.history[:len(m.history)-1]
+	return m.show(v.route, v.sel, v.offset)
 }
 
-func (m Model) body(limit int) []string {
-	if m.editing {
-		return []string{"Search: " + clean(m.query) + "▏", "Enter searches · Esc leaves input"}
+// show switches page. Loads for library and item pages that are no longer on
+// screen or in history are cancelled; their replies would be ignored anyway.
+func (m *Model) show(r route, sel, offset int) tea.Cmd {
+	m.route, m.sel, m.offset, m.helping = r, sel, offset, false
+	if r.page == pageActivity {
+		m.vp.GotoBottom()
+	} else {
+		m.vp.GotoTop()
 	}
-	if err := m.errs[m.tab]; err != nil {
-		return []string{errStyle.Render(describe(err))}
+	keep := map[string]bool{}
+	for _, v := range append(m.history, visit{route: r}) {
+		for _, k := range v.route.keys() {
+			keep[k] = true
+		}
 	}
-	if m.loading[m.tab] && m.tab != events {
-		return []string{dimStyle.Render("Loading…")}
+	for key := range m.cache.slots {
+		if (strings.HasPrefix(key, "library:") || strings.HasPrefix(key, "item:")) && !keep[key] {
+			m.drop(key)
+		}
 	}
-	switch m.tab {
-	case scans:
-		rows := make([]string, 0, len(m.scans))
-		for _, s := range m.scans {
-			rows = append(rows, fmt.Sprintf("%s  %s  %s", clean(s.ID), clean(s.LibraryID), clean(s.Status)))
+	if r.page == pageSearch {
+		if strings.TrimSpace(m.search.Value()) == "" {
+			return nil
 		}
-		return m.selectable(rows, "No scans.", limit)
-	case jobs:
-		if m.cancelling {
-			return []string{"Requesting cancellation…"}
+	}
+	return tea.Batch(m.ensure(r.keys()...), m.spin())
+}
+
+// navIndex is the sidebar entry for the current section.
+func (m Model) navIndex() int {
+	section := m.section()
+	for i, e := range m.navEntries() {
+		if e.route == section {
+			return i
 		}
-		rows := make([]string, 0, len(m.jobs))
-		for _, j := range m.jobs {
-			rows = append(rows, fmt.Sprintf("%s  %s  %s", clean(j.ID), clean(j.Kind), clean(j.Phase)))
+	}
+	return 0
+}
+
+func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
+	if msg.String() == "ctrl+c" {
+		return tea.Quit
+	}
+	if m.confirm != "" {
+		switch {
+		case key.Matches(msg, keys.Confirm):
+			return m.cancelJob()
+		case key.Matches(msg, keys.Keep):
+			m.confirm = ""
 		}
-		return m.selectable(rows, "No jobs.", limit)
-	case diagnostics:
-		if m.diagnostics == nil {
-			return []string{"No diagnostics."}
+		return nil
+	}
+	if m.focus == focusSearch {
+		return m.searchKey(msg)
+	}
+	if m.helping {
+		switch {
+		case key.Matches(msg, keys.Quit):
+			return tea.Quit
+		case key.Matches(msg, keys.Help, keys.Back):
+			m.helping = false
 		}
-		d := m.diagnostics
-		rows := []string{"Uptime seconds: " + clean(d.UptimeSeconds), "Active deliveries: " + clean(d.ActiveDeliveries), "Queued jobs: " + clean(d.QueuedJobs), "Running jobs: " + clean(d.RunningJobs), "Database busy: " + clean(d.DBBusyCount)}
-		for _, e := range d.WorkerErrors {
-			rows = append(rows, clean(e))
+		return nil
+	}
+	switch {
+	case key.Matches(msg, keys.Quit):
+		return tea.Quit
+	case key.Matches(msg, keys.Help):
+		m.helping = true
+		return nil
+	case key.Matches(msg, keys.Search):
+		return m.focusSearch()
+	case key.Matches(msg, keys.Refresh):
+		return m.reloadAll()
+	case key.Matches(msg, keys.Focus):
+		if m.focus == focusNav {
+			m.focus = focusContent
+		} else {
+			m.focus, m.navSel = focusNav, m.navIndex()
 		}
-		return head(rows, limit)
-	case libraries:
-		rows := make([]string, 0, len(m.libraries))
-		for _, l := range m.libraries {
-			rows = append(rows, fmt.Sprintf("%s  %s  [%s]", clean(l.ID), clean(l.Name), clean(l.Availability)))
+		return nil
+	}
+	if m.focus == focusNav {
+		return m.navKey(msg)
+	}
+	return m.contentKey(msg)
+}
+
+func (m *Model) navKey(msg tea.KeyMsg) tea.Cmd {
+	entries := m.navEntries()
+	switch {
+	case key.Matches(msg, keys.Up):
+		m.navSel = max(m.navSel-1, 0)
+	case key.Matches(msg, keys.Down):
+		m.navSel = min(m.navSel+1, len(entries)-1)
+	case key.Matches(msg, keys.Top):
+		m.navSel = 0
+	case key.Matches(msg, keys.Bottom):
+		m.navSel = len(entries) - 1
+	case key.Matches(msg, keys.Open, keys.Right):
+		m.focus = focusContent
+		if r := entries[min(m.navSel, len(entries)-1)].route; r != m.route || len(m.history) > 0 {
+			return m.navigate(r)
 		}
-		return m.selectable(rows, "No libraries.", limit)
-	case catalog, search:
-		items := m.catalog
-		if m.tab == search {
-			items = m.results
-		}
-		rows := make([]string, 0, len(items))
-		for _, i := range items {
-			rows = append(rows, fmt.Sprintf("%s  %s  [%s]", clean(i.ID), clean(i.Title), clean(i.Availability)))
-		}
-		empty := "No catalog items."
-		if m.tab == search {
-			empty = "No results. Press / to search."
-		}
-		return m.selectable(rows, empty, limit)
-	case overview:
-		if m.me == nil {
-			return []string{"No data."}
-		}
-		lines := []string{
-			"Principal   " + clean(m.me.ID) + " (" + m.me.Mode + ")",
-			"Profiles    " + clean(strings.Join(m.me.ProfileIDs, ", ")),
-			"Permissions " + strings.Join(m.me.Permissions, ", "),
-		}
-		if m.caps != nil {
-			lines = append(lines, "", "Server "+clean(m.caps.ServerVersion)+" · API "+clean(m.caps.APIVersion)+" · schema "+m.caps.SchemaVersion, "")
-			for _, f := range m.caps.Features {
-				state := "off"
-				if f.Enabled {
-					state = "on"
-				} else if !f.Implemented {
-					state = "not implemented"
-				}
-				lines = append(lines, fmt.Sprintf("  %-32s %s", clean(f.ID), state))
-			}
-		}
-		return head(lines, limit)
-	case profiles:
-		rows := make([]string, 0, len(m.profiles))
-		for _, p := range m.profiles {
-			mark := ""
-			if p.ID == m.profile {
-				mark = " · selected"
-			}
-			rows = append(rows, fmt.Sprintf("%-38s %s%s", clean(p.ID), clean(p.Name), mark))
-		}
-		return m.selectable(rows, "No profiles.", limit)
-	case devices:
-		if m.me != nil && !m.me.Allows(api.PermSystemAdmin) {
-			return []string{dimStyle.Render("Device management requires system:admin.")}
-		}
-		rows := make([]string, 0, len(m.devices))
-		for _, d := range m.devices {
-			state := "active"
-			if d.Revoked {
-				state = "revoked"
-			}
-			rows = append(rows, fmt.Sprintf("%-38s %-8s %s", clean(d.ID), state, clean(d.Name)))
-		}
-		return m.selectable(rows, "No devices.", limit)
-	case events:
-		if len(m.log) == 0 {
-			return []string{dimStyle.Render("Waiting for events…")}
-		}
-		// The log follows its newest line.
-		if len(m.log) > limit {
-			return m.log[len(m.log)-limit:]
-		}
-		return m.log
+	case key.Matches(msg, keys.Back):
+		m.focus = focusContent
 	}
 	return nil
 }
 
-func head(lines []string, limit int) []string {
-	if len(lines) > limit {
-		return lines[:limit]
+func (m *Model) focusSearch() tea.Cmd {
+	m.focus = focusSearch
+	m.search.CursorEnd()
+	cmd := m.search.Focus()
+	if m.route.page != pageSearch {
+		return tea.Batch(cmd, m.navigate(route{page: pageSearch}))
 	}
-	return lines
+	return cmd
 }
 
-// selectable renders a window of rows that keeps the selection visible.
-func (m Model) selectable(rows []string, empty string, limit int) []string {
-	if len(rows) == 0 {
-		return []string{dimStyle.Render(empty)}
+func (m *Model) searchKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.search.Blur()
+		m.focus = focusContent
+		return nil
+	case tea.KeyEnter, tea.KeyDown:
+		m.search.Blur()
+		m.focus = focusContent
+		if msg.Type == tea.KeyEnter {
+			return m.runSearch()
+		}
+		return nil
+	case tea.KeyTab, tea.KeyShiftTab:
+		m.search.Blur()
+		m.focus, m.navSel = focusNav, m.navIndex()
+		return nil
 	}
-	if m.truncated[m.tab] {
-		limit = max(limit-1, 1)
+	before := m.search.Value()
+	var cmd tea.Cmd
+	m.search, cmd = m.search.Update(msg)
+	if m.search.Value() == before {
+		return cmd
 	}
-	sel := min(m.selected[m.tab], len(rows)-1)
-	rows[sel] = selStyle.Render(rows[sel])
-	start := 0
-	if sel >= limit {
-		start = sel - limit + 1
-	}
-	window := rows[start:min(start+limit, len(rows))]
-	if m.truncated[m.tab] {
-		window = append(window, dimStyle.Render(fmt.Sprintf("Showing the first %d; narrow the list on the command line.", len(rows))))
-	}
-	return window
+	m.searchSeq++
+	seq := m.searchSeq
+	return tea.Batch(cmd, tea.Tick(searchDelay, func(time.Time) tea.Msg { return searchDue{seq: seq} }))
 }
 
-func describe(err error) string {
+// runSearch queries the current text unless those results are already shown
+// or in flight. Clearing the text cancels any search in flight.
+func (m *Model) runSearch() tea.Cmd {
+	m.searchSeq++ // a pending debounce must not repeat this query
+	query := strings.TrimSpace(m.search.Value())
+	if query == "" {
+		m.drop(keySearch)
+		return nil
+	}
+	if s := m.cache.slots[keySearch]; s != nil && s.err == nil {
+		if p, ok := s.data.(searchPage); ok && p.query == query && !s.loading {
+			return nil
+		}
+	}
+	m.sel, m.offset = 0, 0
+	return tea.Batch(m.load(keySearch), m.spin())
+}
+
+// launch opens the browser player for a timeline. The browser signs in on
+// its own; no credential is placed in the URL.
+func (m *Model) launch(timeline string) tea.Cmd {
+	if m.launching {
+		return nil
+	}
+	if !m.canPlay() {
+		return m.say("Playback isn't available on this server or for this device.", true)
+	}
+	m.launching = true
+	ctx, backend, server, profile, open := m.ctx, m.backend, m.server, m.viewer(), m.openBrowser
+	return tea.Batch(m.spin(), func() tea.Msg {
+		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
+		defer cancel()
+		t, err := backend.GetTimeline(ctx, timeline)
+		if err == nil && profile != "" {
+			_, err = backend.GetProfile(ctx, profile)
+		}
+		if err == nil {
+			var target string
+			if target, err = cli.PlayerURL(server, t.Value.ID, profile); err == nil {
+				err = open(ctx, target)
+			}
+		}
+		return launchDone{err: err}
+	})
+}
+
+// canPlay reports whether the server offers the player and the principal
+// may request playback; the server still decides each request.
+func (m Model) canPlay() bool {
+	caps, me := m.caps(), m.me()
+	if caps == nil || me == nil || !me.Allows(api.PermPlaybackRequest) {
+		return false
+	}
+	f, ok := caps.Feature("playback.v2")
+	return ok && f.Implemented && f.Enabled
+}
+
+func (m *Model) cancelJob() tea.Cmd {
+	id := m.confirm
+	m.confirm = ""
+	if m.cancelling[id] {
+		return nil
+	}
+	m.cancelling[id] = true
+	backend, ctx, idempotency := m.backend, m.ctx, api.NewIdempotencyKey()
+	return tea.Batch(m.spin(), func() tea.Msg {
+		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
+		defer cancel()
+		_, err := backend.CancelJob(ctx, id, idempotency)
+		return cancelDone{job: id, err: err}
+	})
+}
+
+// problem is an error as the interface presents it.
+type problem struct {
+	title   string
+	message string
+	offline bool
+}
+
+func describe(err error) problem {
 	var p *api.Problem
 	var u *api.UnavailableError
 	switch {
-	case errors.As(err, &p) && (p.Status == 401 || p.Status == 403):
-		return "Not authorized: " + clean(p.Detail)
+	case errors.Is(err, errIncomplete):
+		return problem{title: "Too much to show", message: "This title has more editions or versions than the terminal shows at once."}
+	case errors.As(err, &p) && p.Status == 401:
+		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Pair it again with `motion auth pair`."}
+	case errors.As(err, &p) && p.Status == 403:
+		return problem{title: "You don't have access", message: "This profile or device is not allowed to view this. " + clean(p.Detail)}
+	case errors.As(err, &p) && p.Status == 404:
+		return problem{title: "Nothing here", message: "This no longer exists or is not visible to you."}
 	case errors.As(err, &u):
-		return "Server unavailable; press r to retry."
+		return problem{title: "Server unavailable", message: "Motion can't be reached. It may be busy, restarting or offline.", offline: true}
+	case errors.Is(err, context.DeadlineExceeded):
+		return problem{title: "Server unavailable", message: "The server took too long to respond.", offline: true}
 	case errors.As(err, &p):
-		return clean(p.Error())
+		return problem{title: "Something went wrong", message: clean(p.Error())}
 	}
-	return clean(err.Error())
+	return problem{title: "Something went wrong", message: clean(err.Error())}
 }
 
 // Pump forwards the event stream into ch without ever blocking the stream on

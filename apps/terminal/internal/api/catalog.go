@@ -109,3 +109,71 @@ func (c *Client) GetTimeline(ctx context.Context, id string) (Tagged[Timeline], 
 	h, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/catalog/timelines/" + esc(id), auth: true}, &v)
 	return Tagged[Timeline]{Value: v, ETag: h.Get("ETag")}, err
 }
+
+// ListCatalogChildren lists the items whose parent is parent.
+func (c *Client) ListCatalogChildren(ctx context.Context, parent, cursor string, limit int) (Page[CatalogItem], error) {
+	var v Page[CatalogItem]
+	q := pageQuery(cursor, limit)
+	q.Set("parent_id", parent)
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/catalog/items", query: q, auth: true}, &v)
+	return v, err
+}
+
+type Edition struct {
+	ID          string   `json:"id"`
+	Revision    string   `json:"revision"`
+	ItemID      string   `json:"item_id"`
+	Label       string   `json:"label"`
+	Kind        string   `json:"kind"`
+	TimelineIDs []string `json:"timeline_ids"`
+}
+
+type MediaVersion struct {
+	ID                  string `json:"id"`
+	Revision            string `json:"revision"`
+	TimelineID          string `json:"timeline_id"`
+	Label               string `json:"label"`
+	Origin              string `json:"origin"`
+	TimelineEquivalence string `json:"timeline_equivalence"`
+	Availability        string `json:"availability"`
+}
+
+type ViewingState struct {
+	ProfileID  string `json:"profile_id"`
+	TimelineID string `json:"timeline_id"`
+	Revision   string `json:"revision"`
+	PositionMS int64  `json:"position_ms"`
+	Watched    bool   `json:"watched"`
+}
+
+type ContinueEntry struct {
+	Item     CatalogItem  `json:"item"`
+	Timeline Timeline     `json:"timeline"`
+	Viewing  ViewingState `json:"viewing"`
+}
+
+func (c *Client) ListItemEditions(ctx context.Context, item, cursor string, limit int) (Page[Edition], error) {
+	var v Page[Edition]
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/catalog/items/" + esc(item) + "/editions", query: pageQuery(cursor, limit), auth: true}, &v)
+	return v, err
+}
+func (c *Client) ListItemTimelines(ctx context.Context, item, cursor string, limit int) (Page[Timeline], error) {
+	var v Page[Timeline]
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/catalog/items/" + esc(item) + "/timelines", query: pageQuery(cursor, limit), auth: true}, &v)
+	return v, err
+}
+func (c *Client) ListVersions(ctx context.Context, timeline, cursor string, limit int) (Page[MediaVersion], error) {
+	var v Page[MediaVersion]
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/catalog/timelines/" + esc(timeline) + "/versions", query: pageQuery(cursor, limit), auth: true}, &v)
+	return v, err
+}
+func (c *Client) GetViewingState(ctx context.Context, profile, timeline string) (ViewingState, error) {
+	var v ViewingState
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/profiles/" + esc(profile) + "/timelines/" + esc(timeline) + "/viewing", auth: true}, &v)
+	return v, err
+}
+func (c *Client) ListContinueWatching(ctx context.Context, profile, cursor string, limit int) (Page[ContinueEntry], error) {
+	var v Page[ContinueEntry]
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/profiles/" + esc(profile) + "/continue-watching", query: pageQuery(cursor, limit), auth: true}, &v)
+	return v, err
+}

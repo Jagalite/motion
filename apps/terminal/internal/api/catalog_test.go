@@ -104,3 +104,53 @@ func TestScanEmptySelectionIsDifferentFromAllSources(t *testing.T) {
 		t.Fatalf("all=%s selected=%s", all, selected)
 	}
 }
+
+func TestItemDetailReadsUseContractPathsAndEscapeIDs(t *testing.T) {
+	seen := map[string]bool{}
+	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer mdv_secret" {
+			t.Errorf("unexpected %s %s", r.Method, r.URL)
+		}
+		seen[r.URL.EscapedPath()+"?"+r.URL.RawQuery] = true
+		switch r.URL.EscapedPath() {
+		case "/api/v2/profiles/p%2F1/timelines/t%2F%E7%8C%AB/viewing":
+			io.WriteString(w, `{"profile_id":"p/1","timeline_id":"t/猫","revision":"3","manual_epoch":"0","position_ms":61000,"watched":false,"manual_watched":null,"session_id":null}`)
+		case "/api/v2/profiles/p%2F1/continue-watching":
+			io.WriteString(w, `{"items":[{"item":{"id":"i","title":"Film"},"timeline":{"id":"t","duration_ms":120000},"viewing":{"position_ms":60000}}],"next_cursor":null,"read_revision":"1","event_cursor":"e"}`)
+		default:
+			io.WriteString(w, `{"items":[],"next_cursor":null,"read_revision":"1","event_cursor":"e"}`)
+		}
+	}))
+	ctx := context.Background()
+	if _, err := c.ListCatalogChildren(ctx, "i/猫", "", 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListItemEditions(ctx, "i/猫", "", 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListItemTimelines(ctx, "i/猫", "", 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListVersions(ctx, "t/猫", "", 200); err != nil {
+		t.Fatal(err)
+	}
+	v, err := c.GetViewingState(ctx, "p/1", "t/猫")
+	if err != nil || v.PositionMS != 61000 || v.Watched {
+		t.Fatalf("%+v %v", v, err)
+	}
+	cw, err := c.ListContinueWatching(ctx, "p/1", "", 20)
+	if err != nil || len(cw.Items) != 1 || *cw.Items[0].Timeline.DurationMS != 120000 || cw.Items[0].Viewing.PositionMS != 60000 {
+		t.Fatalf("%+v %v", cw, err)
+	}
+	for _, want := range []string{
+		"/api/v2/catalog/items?limit=200&parent_id=i%2F%E7%8C%AB",
+		"/api/v2/catalog/items/i%2F%E7%8C%AB/editions?limit=200",
+		"/api/v2/catalog/items/i%2F%E7%8C%AB/timelines?limit=20",
+		"/api/v2/catalog/timelines/t%2F%E7%8C%AB/versions?limit=200",
+		"/api/v2/profiles/p%2F1/continue-watching?limit=20",
+	} {
+		if !seen[want] {
+			t.Errorf("missing request %s in %v", want, seen)
+		}
+	}
+}
