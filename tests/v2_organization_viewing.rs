@@ -181,6 +181,7 @@ impl Fixture {
             "INSERT INTO items(id,title,kind) VALUES ('film','A Film','video')",
             "INSERT INTO items(id,title,kind) VALUES ('show','B Show','video')",
             "INSERT INTO items(id,title,kind) VALUES ('bare','C Bare','video')",
+            "INSERT INTO item_origins(item_id,title) SELECT id,title FROM items",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-film','film','Original')",
             "INSERT INTO editions(id,item_id,label) VALUES ('t-show','show','Original')",
             "INSERT INTO timelines(id,edition_id) VALUES ('t-film','t-film'), ('t-show','t-show')",

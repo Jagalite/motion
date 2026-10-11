@@ -322,12 +322,6 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	if shown.code != cli.ExitOK || data(t, shown.stdout)["title"] != "Unicode 猫 Film" {
 		t.Fatalf("show: %+v", shown)
 	}
-	// Real negotiation must reach timeline lookup, rather than refuse a served
-	// player because of stale implementation flags. No browser is launched.
-	play := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "play", "missing-timeline", "--print-url")
-	if play.code != cli.ExitNotFound || strings.Contains(play.stderr, "feature_unavailable") {
-		t.Fatalf("play capability negotiation: %+v", play)
-	}
 	diagnostics := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "diagnostics")
 	if diagnostics.code != cli.ExitOK || data(t, diagnostics.stdout)["server_epoch"] == "" {
 		t.Fatalf("diagnostics: %+v", diagnostics)
@@ -367,4 +361,19 @@ func waitFor(t *testing.T, b *syncBuffer, needle string) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s in %q", needle, b.String())
+}
+
+// Keep service negotiation independently executable from browser-cutover checks.
+func TestE2EPlaybackCapabilityNegotiationAgainstRealServer(t *testing.T) {
+	bin := os.Getenv("MOTION_E2E_SERVER_BIN")
+	if bin == "" {
+		t.Skip("set MOTION_E2E_SERVER_BIN to the built server binary")
+	}
+	srv := startServer(t, bin)
+	// Real negotiation must reach timeline lookup, rather than refuse a served
+	// player because of stale implementation flags. No browser is launched.
+	play := run(t, srv, t.TempDir(), "--operator-token-file", srv.operator, "--json", "play", "missing-timeline", "--print-url")
+	if play.code != cli.ExitNotFound || strings.Contains(play.stderr, "feature_unavailable") {
+		t.Fatalf("play capability negotiation: %+v", play)
+	}
 }

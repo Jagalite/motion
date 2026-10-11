@@ -28,6 +28,7 @@ use playscale_core::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::SqliteConnection;
 
 impl From<Error> for Problem {
     fn from(e: Error) -> Self {
