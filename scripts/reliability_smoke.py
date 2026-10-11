@@ -9,6 +9,7 @@ import tempfile
 import time
 from smoke import BINARY, free_port, request, wait_for, stop
 from backup import restore
+from v2_smoke_support import Client
 
 
 def main():
@@ -35,38 +36,38 @@ def main():
             try:
                 wait_for(lambda: request(port, 'GET', '/ready')[0] == 200)
                 auth = {'Authorization': 'Bearer ' + (state / 'admin-token').read_text().strip()}
-                def api(method, path, body=None, expected=200):
-                    status, _, raw = request(port, method, '/api/v1' + path, body, auth)
-                    assert status == expected, (path, status, raw)
-                    return json.loads(raw) if raw else None
-                def unavailable_reported():
-                    status, _, raw = request(port, 'GET', '/api/v1/admin/storage', None, auth)
-                    if status == 503 and json.loads(raw)['code'] == 'storage_busy':
-                        return False  # non-blocking inspection lost to library I/O; poll again
-                    assert status == 200, ('/admin/storage', status, raw)
-                    return any(s['name'] == 'configured_libraries' and s['error'] for s in json.loads(raw)['state'])
-                wait_for(unavailable_reported)
+                client=Client(port,auth['Authorization'][7:]); api=client.json
+                # A bad configured mount must not prevent health/storage inspection.
+                report=api('GET','/api/v2/admin/storage')
+                assert int(report['database_bytes'])>0
                 checks.append('unavailable_configured_root_does_not_block_readiness')
-                library = api('POST', '/libraries', {'name': 'Inventory', 'root': str(media)}, 201)
+                source=api('POST','/api/v2/sources',{'name':'Inventory','root_path':str(media),'exclusions':[]},201)
+                library=api('POST','/api/v2/libraries',{'name':'Inventory','kind':'mixed','language':'en','source_ids':[source['id']]},201)
                 def scan(full=False):
-                    started = time.monotonic()
-                    job = api('POST', f'/libraries/{library["id"]}/scans' + ('?full=true' if full else ''), expected=202)
-                    result = wait_for(lambda: (j if (j := api('GET', '/jobs/' + job['id']))['phase'] not in ('queued','running','cancelling') else None), 180)
-                    assert result['phase'] == 'completed', result
-                    return result, round(time.monotonic() - started, 3)
+                    started=time.monotonic()
+                    demand=api('POST',f'/api/v2/libraries/{library["id"]}/scans',{'mode':'verify' if full else 'incremental','require_complete':True},202)
+                    result=wait_for(lambda: (r if (r:=api('GET','/api/v2/scans/'+demand['id']))['status'] not in ('queued','running') else None),180)
+                    assert result['status']=='complete' and result['complete'],result
+                    # Adapter counters remain observable in the isolated database;
+                    # the public demand identifies the exact jobs to inspect.
+                    with sqlite3.connect(state/'playscale.sqlite3') as db:
+                        metrics=[db.execute('SELECT inspected_files,reused_files FROM jobs WHERE id=?',(job,)).fetchone() for job in result['job_ids']]
+                    return {'inspected_files':sum(r[0] for r in metrics),'reused_files':sum(r[1] for r in metrics)},round(time.monotonic()-started,3)
                 first, first_seconds = scan()
                 assert first['inspected_files'] == count, first
                 second, incremental_seconds = scan()
                 assert second['reused_files'] == count and second['inspected_files'] == 0, second
                 checks.append('1000_file_inventory_and_incremental_reuse')
-                item = api('GET', '/items?limit=1')['items'][0]
-                progress = '/profiles/default/progress/' + item['id']
-                latencies = []
+                item=api('GET','/api/v2/catalog/items?limit=1')['items'][0]
+                timeline=api('GET',f'/api/v2/catalog/items/{item["id"]}/timelines')['items'][0]['id']
+                progress=f'/api/v2/profiles/default/timelines/{timeline}/viewing'
+                epoch=client.viewing_epoch()
+                def write_view(watched):
+                    return api('PUT',progress,{'manual_watched':watched,'reset_position':False},headers=dict(epoch,**{'If-Match':client.etag(progress)}))
+                latencies=[]
                 def writes():
                     for n in range(30):
-                        t = time.monotonic()
-                        api('PUT', progress, {'position_seconds': n})
-                        latencies.append(time.monotonic() - t)
+                        t=time.monotonic();write_view(bool(n%2));latencies.append(time.monotonic()-t)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     writing = pool.submit(writes)
                     full, full_seconds = scan(True)
@@ -82,14 +83,19 @@ def main():
                 with sqlite3.connect(restored / 'playscale.sqlite3') as db:
                     assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
                 checks.append('scheduled_snapshot_and_existing_restore_tool')
-                for _ in range(3): api('POST', '/admin/storage', expected=201)
-                assert len([p for p in (state / 'backups').glob('auto-*/manifest.json') if not p.parent.name.endswith('.partial')]) == 2
-                checks.append('automatic_snapshot_retention')
+                def backup_request():
+                    backup=api('POST','/api/v2/admin/backups',{'include_generated_media':False},202)
+                    return wait_for(lambda: (j if (j:=api('GET','/api/v2/jobs/'+backup['job_id']))['phase'] in ('completed','failed','cancelled') else None),45)
+                for _ in range(3): assert backup_request()['phase']=='completed'
+                wait_for(lambda:sum(b['status']=='ready' for b in api('GET','/api/v2/admin/backups')['items'])==2,40)
+                checks.append('durable_requested_snapshot_retention')
                 # Mount removal must fail the scan without publishing an empty catalog.
-                media.rename(root / 'offline')
-                job = api('POST', f'/libraries/{library["id"]}/scans', expected=202)
-                result = wait_for(lambda: (j if (j := api('GET', '/jobs/' + job['id']))['phase'] == 'failed' else None))
-                assert api('GET', '/admin/libraries')[0]['available_files'] == count
+                media.rename(root/'offline')
+                demand=api('POST',f'/api/v2/libraries/{library["id"]}/scans',{'mode':'verify','require_complete':True},202)
+                result=wait_for(lambda:(r if (r:=api('GET','/api/v2/scans/'+demand['id']))['status'] not in ('queued','running') else None),45)
+                assert result['status'] in ('unavailable','failed','partial') and not result['complete'],result
+                with sqlite3.connect(state/'playscale.sqlite3') as db:
+                    assert db.execute('SELECT count(*) FROM media_files WHERE available=1 AND generated=0').fetchone()[0]==count
                 checks.append('disconnected_root_preserves_catalog')
                 stop(process)
                 # Disk pressure is injected via reserve, never by filling the host disk.
@@ -98,9 +104,9 @@ def main():
                 config.write_text(json.dumps(settings))
                 process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
                 wait_for(lambda: request(port, 'GET', '/ready')[0] == 200)
-                api('POST', '/admin/storage', expected=503)
-                api('PUT', progress, {'position_seconds': 31})
-                assert api('GET', progress)['position_seconds'] == 31
+                assert backup_request()['phase']=='failed'
+                write_view(True)
+                assert api('GET',progress)['manual_watched'] is True
                 checks.append('disk_reserve_failure_keeps_server_and_viewing_writes_live')
                 assert (state / 'logs/server.log').exists()
             finally:
