@@ -144,11 +144,11 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(result.mtime, 0)
 
     def test_electron_system_and_url_literals_are_not_private_paths(self):
-        for value in [b'/System' + b'/Volumes/Data', b'/System' + b'/Volumes/Preboot/Cryptexes/App/System',
-                      b'https://www.quad9.net' + b'/home/privacy/', b'chrome:/' + b'/home/*']:
+        for value in [b'/System' + b'/' + b'Volumes/Data', b'/System' + b'/' + b'Volumes/Preboot/Cryptexes/App/System',
+                      b'https://www.quad9.net' + b'/' + b'home/privacy/', b'chrome:/' + b'/' + b'home/*']:
             self.assertFalse(private_content(value), value)
-        for value in [b'/' + b'Volumes/Data/private', b'/System' + b'/Volumes/Data/Users/private/file',
-                      b'/' + b'home/privacy/file', b'chrome:/' + b'/home/private']:
+        for value in [b'/' + b'Volumes/Data/private', b'/System' + b'/' + b'Volumes/Data' + b'/Us' + b'ers/private/file',
+                      b'/' + b'home/privacy/file', b'chrome:/' + b'/' + b'home/private']:
             self.assertTrue(private_content(value), value)
 
     def test_binary_embedded_paths_and_private_hosts_block_release(self):
