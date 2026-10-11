@@ -130,7 +130,7 @@ try {
     join(out, 'settings/server/admin-token'), join(out, 'terminal-settings'), item.title, join(out, 'tui-receipt.json')], {timeout: 90000});
   check('bundled Go TUI browses the real catalog and exits cleanly', JSON.parse(readFileSync(join(out, 'tui-receipt.json'))).result === 'passed');
   await view.send('Page.navigate', {url: `${origin}/item/${item.id}`});
-  const play = await wait(() => view.evaluate('document.querySelector("a[href^=\"/play/\"]")?.getAttribute("href")'), 'item Play link');
+  const play = await wait(() => view.evaluate(`document.querySelector('a[href^="/play/"]')?.getAttribute('href')`), 'item Play link');
   await view.send('Page.navigate', {url: origin + play});
   const videoTime = () => view.evaluate('(()=>{const h=document.querySelector("demuxe-player");if(h?.player){h.setMuted?.(true);h.play().catch(()=>{});}return h?.player?.state?.currentTime??0;})()');
   await wait(async () => (await videoTime()) > 1, 'installed owned player advances');
