@@ -1,7 +1,9 @@
 # M4 playback expansion ledger
 
 Owner: M4 implementation lane (A06/A07 with A08). Branch `m4-playback-expansion`.
-Input: merged main `8d6dd7f`, the baseline named in plan section 10. Independent
+Input: main `db0d05c`. Work started from `8d6dd7f`, the baseline named in
+plan section 10, and was rebased onto `db0d05c`. That rebase changed only UI,
+prototype and plan files, none of which this lane touches. Independent
 reviewer: GPT-6.1 Sol. This ledger records implementation slices and their
 evidence. It does not record release qualification or M4 closure.
 
@@ -43,16 +45,16 @@ hardware fixtures do not exist yet. Each work package that needs one adds it.
 
 | ID | Source SHA | API / client changes | Supported / refused | Focused checks | Review | Release-only checks |
 |---|---|---|---|---|---|---|
-| M4-00 | `cebc5cd` and this update | None | Matrix above | Code inspection against main `8d6dd7f` | GPT-6.1 Sol final PR diff (finding 4 below) | None |
-| M4-01a seek fix | `d1e1f09` | None | Copies starting within 132 ms after a keyframe no longer fail | Core `copy_seeks_late_enough_to_reach_the_chosen_keyframe_and_never_the_next`; v1 `tests/delivery.rs` 12/12 | GPT-6.1 Sol: no findings (the audio start trade-off is recorded) | None |
-| M4-01b v2 copy routes | `4133aaa` | Plans may return `operation: remux` / `audio_convert` with `transport: hls` (existing contract enums). Capabilities `routes` gains `stream_copy_hls` only when enabled. No contract or client file changes | Auto + HLS + within limits + qualified H.264 details. Convert, Original, a failed copy, unqualified details or a disabled server get conversion or the existing refusal | Core unit tests (101); Stateless `route_selection_model`; `tests/v2_playback.rs` 12/12 including `stream_copy_routes_are_planned_observed_and_fall_back_to_conversion`; `fmp4` unit tests 7/7 | GPT-6.1 Sol on `4133aaa`: three P2 findings, all fixed in `c7ceb28` (below) | Chromium/Electron copied-stream playback, then enabling by default |
+| M4-00 | `b9407a3` and this update | None | Matrix above | Code inspection against main `8d6dd7f` | GPT-6.1 Sol final PR diff (finding 4 below) | None |
+| M4-01a seek fix | `ae38d86` | None | Copies starting within 132 ms after a keyframe no longer fail | Core `copy_seeks_late_enough_to_reach_the_chosen_keyframe_and_never_the_next`; v1 `tests/delivery.rs` 12/12 | GPT-6.1 Sol: no findings (the audio start trade-off is recorded) | None |
+| M4-01b v2 copy routes | `64af9f5` | Plans may return `operation: remux` / `audio_convert` with `transport: hls` (existing contract enums). Capabilities `routes` gains `stream_copy_hls` only when enabled. No contract or client file changes | Auto + HLS + within limits + qualified H.264 details. Convert, Original, a failed copy, unqualified details or a disabled server get conversion or the existing refusal | Core unit tests (101); Stateless `route_selection_model`; `tests/v2_playback.rs` 12/12 including `stream_copy_routes_are_planned_observed_and_fall_back_to_conversion`; `fmp4` unit tests 7/7 | GPT-6.1 Sol on `64af9f5`: three P2 findings, all fixed in `c9f99d7` (below) | Chromium/Electron copied-stream playback, then enabling by default |
 | M4-01c hardware | — | — | — | — | — | — |
 | M4-02 | — | — | — | — | — | — |
 | M4-03 | — | — | — | — | — | — |
 | M4-04 | — | — | — | — | — | — |
 | M4-05 | — | — | — | — | — | — |
 
-### Review findings on `4133aaa` and their disposition (fixed in `c7ceb28`)
+### Review findings on `64af9f5` and their disposition (fixed in `c9f99d7`)
 
 1. **Copied-stream CODECS.** The master playlist advertised the transcode
    recipe's `avc1.64001f,mp4a.40.2` for copied output. Copy generations now
@@ -68,9 +70,9 @@ hardware fixtures do not exist yet. Each work package that needs one adds it.
    client disconnect.
 
 Reran after the fixes: `tests/v2_playback.rs` 12/12; fmp4 7/7. GPT-6.1 Sol
-reviewed `c7ceb28` with no findings.
+reviewed `c9f99d7` with no findings.
 
-### Final PR-diff review and its disposition (fixed in `6d6e92e`)
+### Final PR-diff review and its disposition (fixed in `40619dd`)
 
 4. **Probe before authorization.** Copy probes for admission and replan ran
    before the transaction rechecked the plan. A retained plan from a device
@@ -80,7 +82,7 @@ reviewed `c7ceb28` with no findings.
    reauthorization and exact-retry replay are unchanged. The HTTP test admits
    a retained `audio_convert` plan after scope removal and expects 404. That
    proves the refusal, not the absence of a probe; the absence follows from
-   code order. GPT-6.1 Sol reviewed `6d6e92e` with no findings.
+   code order. GPT-6.1 Sol reviewed `40619dd` with no findings.
 
 ## M4-01b correctness boundary
 
@@ -129,17 +131,22 @@ host FFmpeg.
 
 | Kyoto job | Command | Source | Result |
 |---|---|---|---|
-| `6a02fcc955ad425d8ddc84618a591fb3` | core lib test compile | pre-commit `4133aaa` content | ok. 100 core unit tests passed |
-| `205b0036d7c94fadb515572eeba7a4d3` | `v2_playback` + `delivery` test compile | `d1e1f09` + `4133aaa` content | ok. v2 12/12, v1 delivery 12/12, core 101 |
-| `5cf58b59ef7344519dd6f12642f911cc` | Stateless model compile | `4133aaa` content (model fixed after it, see below) | ok. Route selection model: 1,297 states, 1,944 transitions, graph exhausted. Playback-session model passed. |
-| `b558efcfbd3143b486c7729a9b3d6e9a` | `playscale --lib` + `v2_playback` test compile | `c7ceb28` | ok. v2 12/12, fmp4 7/7 |
-| `8100c00754974af8999c8b4fec128185` | `cargo clippy -D warnings` (CI allow-list), core + server lib, three test targets | `c7ceb28` | ok |
-| `f3f9063203ae482196bbdfb89bd46dc0` | `v2_playback` test compile | `6d6e92e` | ok. v2 12/12 |
-| `4e7edbab009443469da7e61beed6c419` | `cargo clippy -D warnings` (as above) | `6d6e92e` | ok |
+| `6a02fcc955ad425d8ddc84618a591fb3` | core lib test compile | pre-commit `64af9f5` content | ok. 100 core unit tests passed |
+| `205b0036d7c94fadb515572eeba7a4d3` | `v2_playback` + `delivery` test compile | `ae38d86` + `64af9f5` content | ok. v2 12/12, v1 delivery 12/12, core 101 |
+| `5cf58b59ef7344519dd6f12642f911cc` | Stateless model compile | `64af9f5` content (model fixed after it, see below) | ok. Route selection model: 1,297 states, 1,944 transitions, graph exhausted. Playback-session model passed. |
+| `b558efcfbd3143b486c7729a9b3d6e9a` | `playscale --lib` + `v2_playback` test compile | `c9f99d7` | ok. v2 12/12, fmp4 7/7 |
+| `8100c00754974af8999c8b4fec128185` | `cargo clippy -D warnings` (CI allow-list), core + server lib, three test targets | `c9f99d7` | ok |
+| `f3f9063203ae482196bbdfb89bd46dc0` | `v2_playback` test compile | `40619dd` | ok. v2 12/12 |
+| `4e7edbab009443469da7e61beed6c419` | `cargo clippy -D warnings` (as above) | `40619dd` | ok |
 
 Model fix before commit: the first route-selection run hit its depth bound
 because an unused ghost list grew on every repeated plan. The list was removed
 and the rerun exhausted the graph.
+
+Rebase receipt: the commits were reviewed and tested at their pre-rebase SHAs
+(`d1e1f09`, `4133aaa`, `c7ceb28`, `6d6e92e`). Their content is unchanged under
+the SHAs recorded above. Kyoto `a2e29a324e074b809f8e3ce1586e864d` compiled
+`v2_playback` on the rebased tree, and it passed 12/12.
 
 ## Deferred release checks
 
