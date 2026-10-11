@@ -199,10 +199,6 @@ impl Fixture {
                 .await
                 .unwrap();
         }
-        sqlx::query("INSERT INTO item_origins(item_id,title) SELECT id,title FROM items")
-            .execute(&self.app.db)
-            .await
-            .unwrap();
         shows
     }
 

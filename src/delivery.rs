@@ -2672,7 +2672,17 @@ async fn admit_owned(
             .bind(serde_json::to_string(&acknowledgement).map_err(ApiError::internal)?)
             .bind(crate::now()).execute(&mut *transaction).await?;
     }
-    transaction.commit().await?;
+    // Establish the session directory before publication, including byte-only
+    // sessions whose selected subtitles are extracted without an encoder.
+    // Later extraction must never recreate it after terminal cleanup.
+    let directory = runtime.root.join(&session.id);
+    tokio::fs::create_dir(&directory)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Err(error) = transaction.commit().await {
+        let _ = tokio::fs::remove_dir(&directory).await;
+        return Err(error.into());
+    }
     // No await between durable admission and registration/dispatch. The owned
     // task survives a dropped HTTP waiter; shutdown serializes on admission.
     {
