@@ -21,8 +21,8 @@ its output file ID in `result_ids`; refresh timeline versions/playback planning
 to discover the generated version. Replaying the identical request under the
 same principal/key returns its original admission. Changing its body conflicts.
 
-Preparation acceptance remains pending until the endpoint, publication fencing,
-and real FFmpeg fixture pass. Capability qualification must reflect receipts,
+Server-side preparation acceptance passed at `e8c5628` using real HTTP, FFmpeg
+and FFprobe. The client/browser acceptance remains a separate lane gate. Capability qualification must reflect receipts,
 not merely installed binaries. Updated commit IDs and evidence will be recorded
 here as implementations pass review and validation.
 
@@ -58,5 +58,9 @@ here as implementations pass review and validation.
   retained snapshot bytes. Existing restore tooling restores the database;
   automatic generated-cache relocation is not claimed.
 
-Implementation commits through `ed6bf87` are review checkpoints. Compiled and
-real-process acceptance receipts will supersede this pending qualification note.
+Implementation through `e8c5628` passed real v2 preparation and generated-media
+backup acceptance; `26fe6aa` changes only test idempotency keys. The receipt is
+`qualification/data-catalog/preparation-backup-receipt.json`, binary SHA-256
+`73fe0e6e0223919ad84e613a206fc0d62101d8753d85729c6e0a57369c4dc3a5`.
+The bounded production-policy model exhausted 894 states / 10,856 transitions
+with no skipped checks. Final adapter-suite results are still being collected.
