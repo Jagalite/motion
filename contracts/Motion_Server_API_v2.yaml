@@ -11588,6 +11588,51 @@ components:
       - max_bitrate_bps
       - allowed_backends
       - qualification
+    VideoProfile:
+      type: object
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          const: 1
+        codec:
+          type: string
+          enum: [h264, hevc]
+        max_width:
+          type: integer
+          minimum: 128
+          maximum: 3840
+          multipleOf: 2
+        max_height:
+          type: integer
+          minimum: 72
+          maximum: 2160
+          multipleOf: 2
+        video_bitrate:
+          type: integer
+          minimum: 64000
+          maximum: 80000000
+        audio_bitrate:
+          type: integer
+          minimum: 32000
+          maximum: 320000
+        frame_rate:
+          anyOf:
+          - type: object
+            additionalProperties: false
+            properties:
+              numerator:
+                type: integer
+                minimum: 1
+                maximum: 120000
+              denominator:
+                type: integer
+                minimum: 1
+                maximum: 100000
+            required: [numerator, denominator]
+          - type: 'null'
+          description: Null preserves cadence; a rational must be 1 through 120 frames per second and allow at least half a frame in the source duration.
+      required: [version, codec, max_width, max_height, video_bitrate, audio_bitrate]
     PreparationInput:
       type: object
       additionalProperties: false
@@ -11598,6 +11643,16 @@ components:
           $ref: '#/components/schemas/Id'
         recipe_id:
           $ref: '#/components/schemas/Id'
+        backend:
+          type: string
+          enum: [software, videotoolbox]
+          default: software
+          description: Select a listed recipe backend. Availability is not qualification; hardware failure does not fall back to software.
+        video_profile:
+          anyOf:
+          - $ref: '#/components/schemas/VideoProfile'
+          - type: 'null'
+          description: Required exactly when recipe_id is video_profile. All values are included in the immutable preparation digest.
         tracks:
           $ref: '#/components/schemas/TrackSelection'
       required:

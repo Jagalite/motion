@@ -26,11 +26,15 @@ pub(crate) fn recipe(id: &str) -> Option<Value> {
         "remux_mp4" => ("MP4 stream copy", None, None, None),
         "audio_aac" => ("MP4 with AAC audio", None, Some("aac"), None),
         "h264720p" => ("H.264 720p", Some("h264"), Some("aac"), Some(720)),
+        "video_profile" => ("Bounded video profile", None, Some("aac"), None),
         _ => return None,
     };
     // Version describes the existing worker's complete fixed recipe semantics;
     // changes to encoder arguments or validation require a version bump.
     let semantics = match id {
+        "video_profile" => {
+            "v1;bounded-video-profile;scale-aspect-even;fps-filter-near;passthrough;yuv420p;bitrate-vbv2;veryfast-threads2;x265-pools2-frame-threads2;videotoolbox-no-software;hvc1;aac;metadata-strip;faststart"
+        }
         "remux_mp4" => {
             "v1;mp4;v0-copy;a-selected-copy;no-subtitles;no-data;metadata-strip;faststart"
         }
@@ -41,9 +45,39 @@ pub(crate) fn recipe(id: &str) -> Option<Value> {
             "v1;mp4;v0-libx264-veryfast-crf23-threads2;yuv420p;scale-min1280x720-aspect-even;a-selected-aac160k;no-subtitles;no-data;metadata-strip;faststart"
         }
     };
+    let backends = if matches!(id, "h264720p" | "video_profile") && cfg!(target_os = "macos") {
+        vec!["software", "videotoolbox"]
+    } else {
+        vec!["software"]
+    };
     Some(
-        json!({"id":id,"digest":format!("sha256:{}",super::sha256(semantics.as_bytes())),"name":name,"purpose":"rendition","output_container":"mp4","video_codec":video,"audio_codec":audio,"max_height":height,"max_bitrate_bps":Value::Null,"allowed_backends":["software"],"qualification":"unqualified"}),
+        json!({"id":id,"digest":format!("sha256:{}",super::sha256(semantics.as_bytes())),"name":name,"purpose":"rendition","output_container":"mp4","video_codec":video,"audio_codec":audio,"max_height":height,"max_bitrate_bps":Value::Null,"allowed_backends":backends,"qualification":"unqualified"}),
     )
+}
+
+// Fixed software recipes retain their historical digest. Parameterized recipes
+// bind all persisted encoder inputs, so recovery/publication cannot substitute
+// a different profile or backend under a previous preparation identity.
+fn recipe_digest(
+    id: &str,
+    backend: &str,
+    profile: Option<&crate::encoding::VideoProfile>,
+) -> Option<String> {
+    let descriptor = recipe(id)?;
+    let base = descriptor["digest"].as_str()?;
+    if profile.is_none() && backend == "software" && id != "video_profile" {
+        return Some(base.to_owned());
+    }
+    if (id == "video_profile") != profile.is_some() {
+        return None;
+    }
+    let inputs =
+        serde_json::to_vec(&json!({"semantics":base,"backend":backend,"video_profile":profile}))
+            .ok()?;
+    Some(format!("sha256:{}", super::sha256(&inputs)))
+}
+fn software_backend() -> String {
+    "software".into()
 }
 
 async fn recipes(
@@ -54,7 +88,7 @@ async fn recipes(
     caller.require(Permission::ProcessingRequest)?;
     let limit = q.limit()?;
     let after = q.after()?;
-    let rows = ["audio_aac", "h264720p", "remux_mp4"]
+    let rows = ["audio_aac", "h264720p", "remux_mp4", "video_profile"]
         .into_iter()
         .filter(|id| *id > after)
         .map(|id| (id.into(), recipe(id).unwrap()))
@@ -184,6 +218,10 @@ struct Input {
     source: FileRef,
     timeline_id: String,
     recipe_id: String,
+    #[serde(default = "software_backend")]
+    backend: String,
+    #[serde(default)]
+    video_profile: Option<crate::encoding::VideoProfile>,
     tracks: Tracks,
 }
 
@@ -233,8 +271,12 @@ pub(crate) async fn publication_facts(
             source_enabled: enabled,
             source_in_scope,
             exact_whole_timeline_binding: binding,
-            recipe_unchanged: recipe(&job.recipe)
-                .is_some_and(|r| r["digest"].as_str() == Some(digest.as_str())),
+            recipe_unchanged: recipe_digest(
+                &job.recipe,
+                &job.backend,
+                job.video_profile.as_deref(),
+            )
+            .is_some_and(|current| current == digest),
         },
     )))
 }
@@ -250,6 +292,35 @@ async fn prepare(
     let input = body.value;
     let recipe = recipe(&input.recipe_id)
         .ok_or_else(|| Problem::invalid("unknown_recipe", "Select a listed recipe"))?;
+    if !recipe["allowed_backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b.as_str() == Some(&input.backend))
+    {
+        return Err(Problem::invalid(
+            "unsupported_backend",
+            "Select a recipe backend supported on this platform",
+        ));
+    }
+    if (input.recipe_id == "video_profile") != input.video_profile.is_some() {
+        return Err(Problem::invalid(
+            "invalid_video_profile",
+            "video_profile is required only for the video_profile recipe",
+        ));
+    }
+    if let Some(profile) = &input.video_profile {
+        profile
+            .validate()
+            .map_err(|reason| Problem::invalid("invalid_video_profile", reason))?;
+    }
+    let digest = recipe_digest(
+        &input.recipe_id,
+        &input.backend,
+        input.video_profile.as_ref(),
+    )
+    .ok_or_else(|| Problem::invalid("invalid_video_profile", "Invalid recipe inputs"))?;
+
     if !matches!(
         input.tracks.subtitle_policy.as_str(),
         "off" | "auto" | "require"
@@ -335,7 +406,7 @@ async fn prepare(
     }
     let tracks: Vec<crate::db::Track> =
         serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
-    if input.recipe_id == "h264720p"
+    if matches!(input.recipe_id.as_str(), "h264720p" | "video_profile")
         && !tracks.iter().find(|t| t.kind == "video").is_some_and(|t| {
             t.kind == "video"
                 && t.width.is_some()
@@ -348,7 +419,17 @@ async fn prepare(
     {
         return Err(Problem::invalid(
             "preparation_video_unsupported",
-            "H.264 preparation requires a probed SDR video stream with known dimensions",
+            "Video preparation requires a probed SDR video stream with known dimensions",
+        ));
+    }
+    if input
+        .video_profile
+        .as_ref()
+        .is_some_and(|profile| !profile.admits_duration(source.duration_seconds.unwrap_or(0.0)))
+    {
+        return Err(Problem::invalid(
+            "invalid_video_profile",
+            "Source is shorter than half a requested frame interval",
         ));
     }
     super::playback::track_index(
@@ -369,8 +450,8 @@ async fn prepare(
         ));
     }
     let id = crate::new_id();
-    sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id) VALUES (?,?,?,?,'software',?,'queued',?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(recipe["digest"].as_str().unwrap()).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id,video_profile) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(&input.backend).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).bind(input.video_profile.as_ref().map(sqlx::types::Json)).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
     let value = super::jobs::row(&mut tx, &id, &principal).await?.wire();
     record
         .save(
@@ -448,4 +529,36 @@ async fn renditions(
     let result = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod recipe_identity_tests {
+    use super::*;
+    #[test]
+    fn publication_digest_binds_profile_and_backend_without_changing_fixed_software() {
+        let mut profile = crate::encoding::VideoProfile {
+            version: 1,
+            codec: crate::encoding::VideoCodec::H264,
+            max_width: 320,
+            max_height: 180,
+            video_bitrate: 500_000,
+            audio_bitrate: 96_000,
+            frame_rate: None,
+        };
+        let initial = recipe_digest("video_profile", "software", Some(&profile)).unwrap();
+        assert_ne!(
+            Some(initial.clone()),
+            recipe_digest("video_profile", "videotoolbox", Some(&profile))
+        );
+        profile.max_width = 640;
+        assert_ne!(
+            Some(initial),
+            recipe_digest("video_profile", "software", Some(&profile))
+        );
+        assert_eq!(
+            recipe_digest("remux_mp4", "software", None).unwrap(),
+            recipe("remux_mp4").unwrap()["digest"].as_str().unwrap()
+        );
+        assert!(recipe_digest("video_profile", "software", None).is_none());
+    }
 }

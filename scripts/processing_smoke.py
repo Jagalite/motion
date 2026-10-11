@@ -164,7 +164,7 @@ def main():
                 wrapper.write_text(normal_wrapper);stop(process)
                 settings['processing'].pop('expected_duration')
                 config.write_text(json.dumps(settings));process=boot()
-            hardware={'attempted':False,'reason':'v2 advertises software recipes only; hardware profile qualification remains a gate'}
+            hardware={'attempted':False,'reason':'this receipt exercises software only; hardware profile qualification remains a gate'}
             caps=api('GET','/processing/capabilities');assert caps['background_slots']==1 and caps['ffmpeg_digest'].startswith('sha256:')
             recipes=api('GET','/processing/recipes')['items'];assert 'h264720p' in [r['id'] for r in recipes]
             cursor=api('GET','/jobs')['event_cursor']
