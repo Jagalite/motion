@@ -517,7 +517,10 @@ async function switchDelivery(plan) {
   let replacement = null;
   let element = null;
   let stopReplacementLease = null;
-  let committed = false;
+  let latestLease = null;
+  let leaseFailure = null;
+  let rebindCommitted = false;
+  let swapped = false;
   // Freeze the current player and save its exact position.
   state.stopObserving?.(); state.stopObserving = null;
   await old.element.pause().catch(() => {});
@@ -540,12 +543,19 @@ async function switchDelivery(plan) {
     const ready = await firstGeneration(replacement, current);
     const generation = ready?.active;
     if (!current() || !generation) throw new Error('The selected version could not be prepared.');
-    // Keep the replacement alive while its player opens (its own lease).
+    // Keep the replacement alive while its player opens (its own lease); the
+    // latest confirmed lease is carried into the swap, a failure aborts it.
+    latestLease = ready;
     stopReplacementLease = maintainLease(ready, generation.generation, {current,
-      send: (id, active_generation, signal) => api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal),
-      failed: () => {}});
+      send: async (id, active_generation, signal) => {
+        const renewed = await api('POST', `/api/v2/playback/delivery-sessions/${encodeURIComponent(id)}/heartbeat`, {active_generation}, undefined, signal);
+        latestLease = renewed;
+        return renewed;
+      },
+      failed: error => { leaseFailure = error; }});
     element = await preparePlayer(generation, position, current, preferences);
     if (!current()) throw new Error('Playback ownership changed.');
+    if (leaseFailure) throw leaseFailure;
     if (state.viewing) {
       const session = state.viewing.session;
       const path = `/api/v2/playback/viewing-sessions/${encodeURIComponent(session.id)}`;
@@ -555,14 +565,18 @@ async function switchDelivery(plan) {
           {'If-Match': `"r-${session.revision}"`});
       } catch (error) {
         if (error.status && error.status < 500 && ![408, 425, 429].includes(error.status)) throw error;
-        // Unknown outcome: the server's binding decides.
-        rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000));
+        // Unknown outcome: the server's binding decides. If it cannot be read,
+        // neither binding may be assumed: playback stops (see below).
+        rebound = await api('GET', path, undefined, undefined, AbortSignal.timeout(10000))
+          .catch(() => { throw Object.assign(new Error('The viewing session could not be confirmed. Reload to continue.'), {unresolved: true}); });
         if (rebound?.delivery_id !== replacement.id) throw error;
       }
-      if (!current()) { committed = true; throw new Error('Playback ownership changed.'); }
+      rebindCommitted = true;
+      if (!current()) throw new Error('Playback ownership changed.');
       state.viewing.rebind(rebound);
     }
-    committed = true;
+    if (leaseFailure) throw leaseFailure;
+    swapped = true;
     // Swap: the replacement owns the page from here on.
     state.stopLease?.(); state.stopLease = null;
     stopReplacementLease(); stopReplacementLease = null;
@@ -570,7 +584,7 @@ async function switchDelivery(plan) {
     state.delivery = ready;
     state.generation = generation;
     state.element = element;
-    renewLease(ready, generation, current);
+    renewLease(latestLease ?? ready, generation, current);
     state.stopObserving = observeViewing(element, generation, state.viewing, current);
     element = null;
     await disposePlayer(old.element);
@@ -581,10 +595,17 @@ async function switchDelivery(plan) {
   } catch (error) {
     stopReplacementLease?.();
     if (element) await disposePlayer(element);
-    // A rebind that committed while this page lost ownership leaves the
-    // session on the replacement; teardown retires whatever this page holds.
-    if (replacement && !committed) void retire(replacement.id);
-    if (!committed) await restore();
+    // Any replacement not swapped in is retired by this function, including
+    // one whose rebind committed after this page lost ownership (teardown
+    // retires only the delivery the page still holds).
+    if (replacement && !swapped) void retire(replacement.id);
+    if (error.unresolved || (rebindCommitted && current())) {
+      // The session may be bound to a delivery that is gone; do not resume
+      // the old binding. Stop cleanly and let a reload start fresh.
+      if (current()) { status(`Playback stopped: ${error.message}`, 'alert'); host.dataset.state = 'failed'; await close(); }
+      return false;
+    }
+    if (!rebindCommitted) await restore();
     if (current()) status(`Version change failed: ${error.message}`, 'alert');
     return false;
   } finally { state.changing = false; }
