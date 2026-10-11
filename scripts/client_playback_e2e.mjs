@@ -179,6 +179,8 @@ export async function scenario(page, server, ctx, engine, out) {
     const blocked = !pass && gap && JSON.stringify(detail).includes(gap.evidence);
     const status = pass ? 'pass' : blocked ? 'blocked' : 'fail';
     checks.push({name, status, gap: blocked ? gap.id : null, detail});
+    // Preserve completed observations if a later dependency or renderer fails.
+    writeFileSync(join(out, `${engine}-checks.json`), JSON.stringify(checks, null, 2));
     console.log(`[${engine}] ${status.toUpperCase()} ${name} ${JSON.stringify(detail).slice(0, 300)}`);
   };
   page.on('console', m => consoleLog.push(`${m.type()}: ${m.text()}`.slice(0, 600)));
@@ -350,8 +352,10 @@ export async function scenario(page, server, ctx, engine, out) {
   // Version switch to a prepared rendition (another file): a new delivery is
   // admitted at the current position, the viewing session is rebound to it,
   // and the predecessor is retired.
+  let product = admitted(t);
+  try {
   const operator = server.operator();
-  const activeId = admitted(t);
+  const activeId = product;
   if (!activeId) throw new Error('No current delivery admission was observed');
   const active = await server.api('GET', `/api/v2/playback/delivery-sessions/${activeId}`, undefined, ctx.token);
   if (active.status !== 200 || !active.json?.source) throw new Error('Cannot resolve the current source for preparation');
@@ -406,9 +410,12 @@ export async function scenario(page, server, ctx, engine, out) {
     && progressAfterSwitch.position_ms > Math.round(beforeSwitch * 1000) + 1000,
   {events: reboundEvents.map(e => `${e.request?.sequence}:${e.request?.position_ms}`), position: progressAfterSwitch.position_ms, beforeSwitch});
   await shot('version-switch');
+  if (versionSwitch.replaced) product = replacement;
+  } catch (error) {
+    check('prepared-version workflow is available through v2', false, {error: String(error)});
+  }
 
   // Leaving retires this player's delivery.
-  const product = admitted(t);
   t = Date.now();
   const left = Date.now();
   await page.goto(`${server.origin}/`);
@@ -560,7 +567,7 @@ async function main() {
           result = {versions: {[engine]: browser.version()}, checks, serverStartsMs: server.starts};
         } finally { await browser.close(); }
       } catch (error) {
-        result = {error: String(error?.stack ?? error)};
+        result = {error: String(error?.stack ?? error), checks: existsSync(join(out, `${engine}-checks.json`)) ? JSON.parse(readFileSync(join(out, `${engine}-checks.json`), 'utf8')) : []};
       } finally {
         await server.stop();
         writeFileSync(join(out, `${engine}-server.log`), server.log.slice(-200000));
