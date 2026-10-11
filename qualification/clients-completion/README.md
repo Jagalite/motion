@@ -54,7 +54,8 @@ integration/release.
 | `catalog_smoke.py` | v2 metadata/artwork/scan; data/catalog owner | Current-server v1 caller; pending adapter integration and migration. |
 | `processing_smoke.py`, `video_profiles_smoke.py` | v2 recipes/preparations/jobs/events; preparation owner | Current-server v1 callers; preserve engine regressions while migrating. |
 | `viewing_smoke.py`, `reliability_smoke.py`, `smoke.py` | Canonical viewing + v2 storage/catalog; playback/data owners | Current-server v1 callers; pending authority/cutover integration. |
-| `test_package.py`, `upgrade_restore_check.py` | Exact installed v2 candidate; integration/release owner | Candidate traffic still needs migration; distinguish old-binary writes from candidate reads. |
+| `upgrade_restore_check.py` | Public v2 catalog, revision-pinned file bytes and canonical viewing; Clients | Candidate migrated; all six real-process upgrade/rollback scenarios pass. Frozen baseline alone retains v1. |
+| `test_package.py` | Exact installed v2 candidate; integration/release owner | Candidate traffic still needs migration after preparation adapter integration. |
 | Go e2e anonymous v1 request | Negative legacy authorization test | Does not provision business data; revise to 404/410 when retirement lands. |
 
 The remaining legacy scripts are active dependencies, not a historical allowlist.
@@ -154,3 +155,13 @@ v2 health/epoch and counters; the retired v1 ffprobe/Demuxe diagnostic fields ar
 not represented as v2 claims. Backup/restore still uses the operator filesystem
 tool, preserving its snapshot-integrity and non-overwrite checks. No production
 state rule changed.
+
+The upgrade/restore caller now rejects candidate JSON calls outside `/api/v2/`;
+only explicit frozen-baseline instances permit legacy calls. Candidate observation
+compares v2 item/library identities, revision-pinned original bytes and canonical
+timeline viewing position against the baseline's observations. All six scenarios
+passed: baseline backup, in-place migration 9 to 33, restart idempotence, old-binary
+refusal, rollback through both pre-upgrade backups, and candidate backup/restore
+with epoch rotation. The [receipt](upgrade-v2-observer.json) binds both binaries.
+The existing stamped baseline build was reused read-only; no compilation ran.
+This is a debug-server migration gate, not installed-package qualification.

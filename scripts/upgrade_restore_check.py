@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tarfile
 import tomllib
+from urllib.parse import urlencode, quote
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from smoke import free_port, request, stop, wait_for  # noqa: E402
@@ -93,7 +94,8 @@ def build_baseline(directory):
 
 
 class Server:
-    def __init__(self, binary, data, media, log, extra=()):
+    def __init__(self, binary, data, media, log, extra=(), *, legacy=False):
+        self.legacy = legacy
         self.port = free_port()
         self.data = data
         self.command = [str(binary), '--listen', f'127.0.0.1:{self.port}', '--data-dir', str(data),
@@ -106,7 +108,7 @@ class Server:
         try:
             # Generous: an upgrade start backs up and migrates before serving, and
             # a shared, swapping host has taken over 50 s for that in debug builds.
-            wait_for(lambda: self.process.poll() is not None or request(self.port, 'GET', '/health')[0] == 200, 180)
+            wait_for(lambda: self.process.poll() is not None or request(self.port, 'GET', '/health' if self.legacy else '/api/v2/system/health')[0] == 200, 180)
             assert self.process.poll() is None, f'server exited with {self.process.returncode}; see {self.log}'
         except BaseException:
             # Keep the startup failure as the reported error: a server that is
@@ -133,12 +135,13 @@ class Server:
         return {'Authorization': 'Bearer ' + (self.data / 'admin-token').read_text().strip()}
 
     def json(self, method, path, body=None, auth=True, expected=200):
+        assert self.legacy or path.startswith('/api/v2/'), f'Candidate requested retired API: {path}'
         status, _, data = request(self.port, method, path, body, self.auth() if auth else None)
         assert status == expected, (method, path, status, data[:500])
         return json.loads(data) if data else None
 
 
-def observe(server):
+def observe_legacy(server):
     """The externally visible state this check preserves across versions."""
     items = server.json('GET', '/api/v1/items')['items']
     assert len(items) == 1, items
@@ -154,6 +157,41 @@ def observe(server):
         'library_ids': sorted(library['id'] for library in libraries),
         'media_sha256': hashlib.sha256(body).hexdigest(),
         'position_seconds': progress['position_seconds'],
+    }
+
+
+
+def observe(server):
+    """Compare public v2 state with the frozen baseline's logical observations."""
+    if server.legacy:
+        return observe_legacy(server)
+
+    def page(path):
+        result = server.json('GET', '/api/v2' + path)
+        assert result['next_cursor'] is None, result
+        return result['items']
+
+    items = page('/catalog/items')
+    assert len(items) == 1, items
+    item = items[0]
+    timelines = page(f'/catalog/items/{item["id"]}/timelines')
+    assert len(timelines) == 1, timelines
+    timeline = timelines[0]['id']
+    versions = page(f'/catalog/timelines/{timeline}/versions')
+    assert len(versions) == 1 and len(versions[0]['files']) == 1, versions
+    file = versions[0]['files'][0]['file']
+    media_url = '/api/v2/media/files/' + quote(file['file_id'], safe='') + '/content?' + urlencode({'revision': file['file_revision']})
+    status, _, body = request(server.port, 'GET', media_url, headers=server.auth())
+    assert status == 200, (status, body[:500])
+    viewing = server.json('GET', f'/api/v2/profiles/default/timelines/{timeline}/viewing')
+    libraries = page('/libraries')
+    return {
+        'item_id': item['id'],
+        'file_id': file['file_id'],
+        'title': item['title'],
+        'library_ids': sorted(library['id'] for library in libraries),
+        'media_sha256': hashlib.sha256(body).hexdigest(),
+        'position_seconds': viewing['position_ms'] / 1000,
     }
 
 
@@ -215,7 +253,7 @@ def run(baseline, baseline_backup_tool, candidate, work):
     log = work / 'servers.log'
 
     # 1. Baseline writes real state.
-    with Server(baseline, data, media, log) as server:
+    with Server(baseline, data, media, log, legacy=True) as server:
         item = wait_for(lambda: (server.json('GET', '/api/v1/items')['items'] or [None])[0], 60)
         server.json('PUT', f'/api/v1/items/{item["id"]}/metadata/catabolic',
                     {'expected_revision': 0, 'external_id': 'upgrade-item', 'values': {'title': TITLE}, 'tags': []})
@@ -233,10 +271,10 @@ def run(baseline, baseline_backup_tool, candidate, work):
     latest = latest_migration()
     with Server(candidate, data, media, log) as server:
         after = observe(server)
-        anonymous = request(server.port, 'GET', '/api/v1/items')[0]
+        anonymous = request(server.port, 'GET', '/api/v2/catalog/items')[0]
         capabilities = server.json('GET', '/api/v2/system/capabilities')
     assert after == before, (before, after)
-    assert anonymous in (401, 403), f'restricted mode served the legacy catalog anonymously: {anonymous}'
+    assert anonymous in (401, 403), f'restricted mode served the v2 catalog anonymously: {anonymous}'
     assert capabilities['schema_version'] == str(latest), capabilities
     backups = upgrade_backups(data)
     assert len(backups) == 1, backups
@@ -251,7 +289,7 @@ def run(baseline, baseline_backup_tool, candidate, work):
     assert receipts['schema']['to_version'] == latest, receipts
     assert pathlib.Path(receipts['schema']['verified_backup']).name == backups[0].name, receipts
     checks['in_place_upgrade'] = {'from': baseline_facts['migrations'][-1], 'to': latest,
-                                  'legacy_anonymous_status': anonymous, 'upgrade_backup': backups[0].name}
+                                  'candidate_anonymous_status': anonymous, 'upgrade_backup': backups[0].name}
 
     # 3. A second start is not an upgrade.
     with Server(candidate, data, media, log) as server:
@@ -261,7 +299,7 @@ def run(baseline, baseline_backup_tool, candidate, work):
     checks['restart_is_not_an_upgrade'] = {'upgrade_backups': 1, 'receipt_ids_unchanged': True}
 
     # 4. The baseline refuses the newer schema without damaging it.
-    refused = subprocess.run(Server(baseline, data, media, log).command, stdout=subprocess.PIPE,
+    refused = subprocess.run(Server(baseline, data, media, log, legacy=True).command, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, timeout=60)
     with log.open('ab') as stream:
         stream.write(refused.stdout)
@@ -277,12 +315,12 @@ def run(baseline, baseline_backup_tool, candidate, work):
     # 5. Rollback to the baseline from either pre-upgrade copy.
     rollback = work / 'rollback-from-operator-backup'
     candidate_backup_tool.restore(operator_backup, rollback)
-    with Server(baseline, rollback, media, log) as server:
+    with Server(baseline, rollback, media, log, legacy=True) as server:
         assert observe(server) == before
     automatic = work / 'rollback-from-upgrade-backup'
     automatic.mkdir(mode=0o700)
     shutil.copyfile(backups[0], automatic / 'playscale.sqlite3')
-    with Server(baseline, automatic, media, log) as server:
+    with Server(baseline, automatic, media, log, legacy=True) as server:
         assert observe(server) == before
     checks['rollback_to_baseline'] = ['operator_backup_via_candidate_restore', 'automatic_pre_upgrade_backup']
 
