@@ -344,14 +344,16 @@ export async function scenario(page, server, ctx, engine, out) {
   await helpers();
   const afterRestart = await page.evaluate(async () => ({ready: await window.__e2e.ready(), resume: Number(window.__e2e.host().dataset.resumeMs),
     banner: document.getElementById('motion-progress-status')?.textContent ?? ''}));
-  // The previous page's final event may land between the snapshot above and
-  // this render; the page must resume at the server's state when it rendered
-  // (never behind the snapshot), which the new session then starts from.
-  const atRender = await viewing(ctx.film.timeline);
+  // This read follows player readiness, not HTML rendering: autoplay and the
+  // previous page's final event can advance history in between. Bound the
+  // rendered resume by both observations and verify the actual admission start.
+  const afterReady = await viewing(ctx.film.timeline);
+  const reopenedAdmission = since(t).find(e => e.path === '/api/v2/playback/delivery-sessions' && e.status === 201);
   const restartPlay = await page.evaluate(() => window.__e2e.play(2, 30000));
   check('after restart the player reopens at durable progress', afterRestart.ready.state === 'ready'
-    && afterRestart.resume >= durable.position_ms - 1000 && Math.abs(afterRestart.resume - atRender.position_ms) <= 1000 && restartPlay.advancing,
-  {durable: durable.position_ms, atRender: atRender.position_ms, afterRestart, restartPlay});
+    && afterRestart.resume >= durable.position_ms - 1000 && afterRestart.resume <= afterReady.position_ms + 1000
+    && reopenedAdmission?.request?.start_ms === afterRestart.resume && restartPlay.advancing,
+  {durable: durable.position_ms, afterReady: afterReady.position_ms, admissionStart: reopenedAdmission?.request?.start_ms, afterRestart, restartPlay});
   // Leaving the outage page sends its final event during unload; it may land
   // after this render, so one 409 followed by adoption of our own unchanged
   // session's revision (adoptableRevision) and a 201 is expected.
