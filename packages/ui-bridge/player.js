@@ -91,7 +91,13 @@ async function openGeneration(element, generation, position, origin) {
     // A live seek window advances while open resolves. Allow at most one
     // second at its leading edge (including a small execution margin), never
     // silently jump to the live edge or a later rolling window.
-    const ranges = element.player.state.seekable;
+    const observed = element.player.state;
+    const live = observed.streaming?.live?.seekable;
+    // Demuxe's generic seekable snapshot can lag Shaka's live observation.
+    // Both checks must admit the target, so use their intersection.
+    const ranges = Array.isArray(observed.seekable) && live
+      ? observed.seekable.map(r => ({start: Math.max(r.start, live.start), end: Math.min(r.end, live.end)}))
+      : observed.seekable;
     let seek = target;
     if (Array.isArray(ranges) && !ranges.some(r => target >= r.start && target <= r.end)) {
       const near = ranges.find(r => Number.isFinite(r.start) && Number.isFinite(r.end)
