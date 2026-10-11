@@ -44,12 +44,16 @@ async function api(method, path, body, idempotencyKey, signal, extra = {}) {
 
 const key = () => crypto.randomUUID().replaceAll('-', '');
 
-function observedCapability() {
+function observedCapability(shared) {
   const video = document.createElement('video');
   const probe = type => (globalThis.MediaSource?.isTypeSupported?.(type) ?? false) || video.canPlayType(type) !== '';
   return {
     client_id: 'motion-ui-bridge', client_build: 'wave0', demuxe_asset_digest: null,
-    transports: video.canPlayType('application/vnd.apple.mpegurl') ? ['http_range', 'hls'] : ['http_range'],
+    // Motion HLS is rolling: native MIME support does not establish live support.
+    transports: shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
+      && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
+      && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"')
+      ? ['http_range', 'hls'] : ['http_range'],
     video_codecs: probe('video/mp4; codecs="avc1.640028"') ? ['avc1'] : [],
     audio_codecs: probe('audio/mp4; codecs="mp4a.40.2"') ? ['mp4a'] : [],
     subtitle_modes: ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
@@ -70,7 +74,7 @@ function demuxeSource(generation, origin) {
   if (!['hls', 'http_range'].includes(generation.transport) || typeof value !== 'string' || !value) throw new Error('Invalid media transport');
   const url = new URL(value, origin);
   if (url.origin !== origin || url.username || url.password) throw new Error('Media must use the selected server origin.');
-  return generation.transport === 'hls' ? {url: url.href, format: 'hls'} : url.href;
+  return generation.transport === 'hls' ? {url: url.href, format: 'hls', streaming: {live: true}} : url.href;
 }
 
 // A version, quality or audio choice replans the same timeline. An audio
@@ -647,12 +651,14 @@ async function start() {
   try {
     const viewingRevision = data.canSaveViewing === 'true' ? await recoverViewing(data, current) : null;
     if (!current()) return;
+    const shared = await loadDemuxe(data.demuxeBase);
+    if (!current()) return;
     status('Choosing how to play this on this device…');
     state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
       tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: subtitlePolicy(data.subtitlePolicy), audio_track_id: null, subtitle_track_id: null},
       quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
-      client: observedCapability(), failed_candidate_ids: [],
+      client: observedCapability(shared), failed_candidate_ids: [],
     };
     const opened = await openCandidates(state.planInput, {
       current,

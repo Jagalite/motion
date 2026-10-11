@@ -18,6 +18,7 @@ test('planning subtitle vocabulary and explicit HLS source match the pinned cont
   assert.equal(subtitlePolicy('always'), 'require');
   for (const preference of ['forced', 'foreign_audio', undefined]) assert.equal(subtitlePolicy(preference), 'auto');
   const hls = demuxeSource({transport: 'hls', manifest_url: '/media/manifest'}, 'https://motion.test');
+  assert.equal(hls.streaming.live, true);
   assert.equal(hls.format, 'hls'); assert.equal(hls.url, 'https://motion.test/media/manifest');
   assert.equal(demuxeSource({transport: 'http_range', media_url: '/media/file'}, 'https://motion.test'), 'https://motion.test/media/file');
   assert.throws(() => demuxeSource({transport: 'hls', manifest_url: 'https://other.test/media'}, 'https://motion.test'), /selected server/);
@@ -84,7 +85,7 @@ test('a same-tab handoff is written on leave, consumed once and expires', () => 
 test('a restored document gets a fresh teardown instead of reusing its prior close promise', async () => {
   const panel = {setAttribute() {}, remove() {}};
   const host = {dataset: {}, querySelector: () => panel};
-  const lifecycle = runInNewContext(source.replace('export {close, maintainLease};', '({state, start, close});'), {
+  const lifecycle = runInNewContext(source.replace('export {close, maintainLease};', '({state, start, close});').replaceAll('await loadDemuxe(data.demuxeBase)', 'null'), {
     document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null,
       createElement: () => ({canPlayType: () => ''}), addEventListener() {}},
     addEventListener() {}, openCandidates: async () => null, URL, AbortSignal,
@@ -253,4 +254,20 @@ test('viewing storage migrates tab data and keeps prior runtime history out of c
   assert.equal(factory({...data, principalId: 'p2'}).hasRejected(), false);
   storage.save(null);
   assert.equal(localStorage.getItem(key), null);
+});
+
+// The loaded provider catalog is an observation, not a server admission decision.
+test('rolling HLS requires a deployed adaptive provider and compatible MSE', () => {
+  const probe = (providers, mse) => {
+    const observed = runInNewContext(source.replace('export {close, maintainLease};', 'observedCapability;'), {
+      document: {getElementById: () => null, querySelector: () => null, addEventListener() {},
+        createElement: () => ({canPlayType: () => 'probably'})}, addEventListener() {},
+      MediaSource: {isTypeSupported: () => mse},
+    });
+    return [...observed(providers && {providers: {snapshot: {providers}}}).transports];
+  };
+  assert.deepEqual(probe(null, true), ['http_range']);
+  assert.deepEqual(probe([{id: 'browser-original'}], true), ['http_range']);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), ['http_range']);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), ['http_range', 'hls']);
 });
