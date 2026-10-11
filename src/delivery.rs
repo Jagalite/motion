@@ -160,9 +160,9 @@ struct Session {
     /// A multipart timeline's picture canvas: the first part's coded size
     /// (every part has it), in even dimensions.
     canvas: Option<(u32, u32)>,
-    /// The source's probed average rate over its video and audio streams (a
-    /// stream copy keeps it); None when not probed.
-    source_rate_bps: Option<u64>,
+    /// The source's probed average rates: its first video stream and each
+    /// audio stream in order (a stream copy keeps those it carries).
+    stream_rates: (Option<u64>, Vec<Option<u64>>),
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -3275,15 +3275,21 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
-        source_rate_bps: serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
-            .ok()
-            .and_then(|tracks| {
-                tracks
-                    .iter()
-                    .filter(|t| matches!(t.kind.as_str(), "video" | "audio"))
-                    .map(|t| t.bitrate)
-                    .sum::<Option<u64>>()
-            }),
+        stream_rates: serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
+            .map(|tracks| {
+                (
+                    tracks
+                        .iter()
+                        .find(|t| t.kind == "video")
+                        .and_then(|t| t.bitrate),
+                    tracks
+                        .iter()
+                        .filter(|t| t.kind == "audio")
+                        .map(|t| t.bitrate)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default(),
         canvas: (!parts.is_empty())
             .then(|| {
                 let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
@@ -3722,21 +3728,31 @@ async fn streamed(
 }
 
 /// The rate a stream-copy generation's manifest declares: the higher of the
-/// source's probed average rate and the peak measured over the generation's
-/// published HLS windows. A copy keeps the source's rate, which is not bounded
-/// in advance, so this is an estimate, not a guarantee.
+/// probed average rate of exactly the streams it outputs (the copied video,
+/// and the copied audio for remux or the converted 160 kb/s AAC for audio
+/// conversion) and the peak measured over its published HLS windows. A copy
+/// keeps the source's rate, which is not bounded in advance, so this is an
+/// estimate, not a guarantee.
 pub(crate) fn copied_rate(app: &App, id: &str, generation: &str) -> Option<u64> {
     let generation = generation_number(generation).ok()?;
     let session = app.processing.deliveries.session(id).ok()?;
-    let measured = session
-        .inner
-        .lock()
-        .unwrap()
-        .copy_peaks
-        .get(&generation)
-        .copied()
-        .unwrap_or(0);
-    Some(measured.max(session.source_rate_bps.unwrap_or(0)))
+    let (measured, pin) = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.copy_peaks.get(&generation).copied().unwrap_or(0),
+            inner.delivery.generations.get(&generation)?.pin.clone(),
+        )
+    };
+    let (video, audios) = &session.stream_rates;
+    let audio = match (pin.operation, pinned_audio(&pin)) {
+        (_, None) => Some(0),
+        (Operation::AudioConvert, Some(_)) => {
+            Some(playscale_core::playback_session::LIVE_AUDIO_BPS)
+        }
+        (_, Some(index)) => audios.get(index as usize).copied().flatten(),
+    };
+    let probed = video.zip(audio).map(|(v, a)| v + a).unwrap_or(0);
+    Some(measured.max(probed))
 }
 
 /// The codecs of a served generation's output, from its own init segment
