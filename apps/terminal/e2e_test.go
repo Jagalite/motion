@@ -34,7 +34,7 @@ type server struct {
 func startServer(t *testing.T, bin string) *server {
 	t.Helper()
 	data := t.TempDir()
-	cmd := exec.Command(bin, "--listen", "127.0.0.1:0", "--data-dir", data, "--access-mode", "restricted")
+	cmd := exec.Command(bin, "--listen", "127.0.0.1:0", "--data-dir", data, "--access-mode", "restricted", "--topcoat")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
