@@ -40,25 +40,38 @@ def main():
         command=[str(BINARY),'--access-mode','trusted_household','--listen',f'127.0.0.1:{port}','--data-dir',str(state),'--library',str(media),'--demuxe-dir',str(ROOT/'web/vendor/demuxe')]
         process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
         try:
-            wait_for(lambda:request(port,'GET','/health')[0]==200)
+            from v2_smoke_support import Client
+            wait_for(lambda:request(port,'GET','/api/v2/system/health')[0]==200, seconds=120)
+            client=Client(port,(state/'admin-token').read_text().strip()); api=client.json
             def catalog():
-                status,_,body=request(port,'GET','/api/v1/items');assert status==200
-                items=json.loads(body)['items'];return items[0] if items else None
-            item=wait_for(catalog);assert abs(item['duration_seconds']-3)<.1;assert len(item['tracks'])==2;checks.append('real_ffprobe_catalog')
-            status,headers,body=request(port,'GET',item['media_url']);assert status==200 and body==payload;checks.append('original_bytes_sha256')
+                items=api('GET','/api/v2/catalog/items')['items']; return items[0] if items else None
+            item=wait_for(catalog)
+            timeline=api('GET',f'/api/v2/catalog/items/{item["id"]}/timelines')['items'][0]
+            version=api('GET',f'/api/v2/catalog/timelines/{timeline["id"]}/versions')['items'][0]
+            source=version['files'][0]['file']
+            file=next(f for f in api('GET',f'/api/v2/catalog/items/{item["id"]}/files')['items'] if f['id']==source['file_id'])
+            assert abs(file['duration_ms']-3000)<100
+            assert len(file['tracks'])==2; checks.append('real_ffprobe_catalog')
+            delivery=client.original_delivery(timeline['id']); media_url=delivery['active']['media_url']
+            body,headers=client.call('GET',media_url); assert body==payload; checks.append('original_bytes_sha256')
             for method,extra,status_expected,expected in [('GET',{'Range':'bytes=2-99999999'},206,payload[2:]),('GET',{'Range':'bytes=-12'},206,payload[-12:]),('HEAD',{'Range':'bytes=0-9'},200,b''),('GET',{'Range':'bytes=0-9','If-Range':'"stale"'},200,payload),('GET',{'If-None-Match':headers['etag']},304,b'')]:
-                status,_,body=request(port,method,item['media_url'],headers=extra);assert status==status_expected and body==expected,(method,extra,status)
+                body,_=client.call(method,media_url,expected=status_expected,headers=extra); assert body==expected
             checks.append('wire_ranges_and_validators')
-            token=(state/'admin-token').read_text().strip();auth={'Authorization':'Bearer '+token}
-            assert request(port,'POST','/api/v1/libraries',{'name':'unauthorized','root':str(media)})[0]==401
-            assert request(port,'PUT',f'/api/v1/items/{item["id"]}/metadata/catabolic',{'expected_revision':0,'external_id':'test-item','values':{'title':'Imported Signal'},'tags':['Test']},dict(auth,Origin='https://untrusted.invalid'))[0]==403
-            status,_,body=request(port,'PUT',f'/api/v1/items/{item["id"]}/metadata/catabolic',{'expected_revision':0,'external_id':'test-item','values':{'title':'Imported Signal'},'tags':['Test']},auth);assert status==200 and json.loads(body)['tags']==['test'];checks.append('authenticated_metadata_import')
-            progress=f'/api/v1/profiles/default/progress/{item["id"]}'
-            assert request(port,'PUT',progress,{'position_seconds':1.25})[0]==200
-            status,_,body=request(port,'GET','/api/v1/openapi.json');assert status==200 and '/api/v1/items/{id}/metadata/{source}' in json.loads(body)['paths'];checks.append('public_openapi')
+            assert request(port,'POST','/api/v2/libraries',{'name':'unauthorized','root':str(media)})[0]==401
+            metadata=f'/api/v2/catalog/items/{item["id"]}/metadata'
+            contribution={'values':{'title':'Imported Signal'},'tags':['Test'],'excluded_tags':[],'locked_fields':[]}
+            fence={'If-Match':client.etag(metadata)}
+            api('PUT',metadata+'/contributions/catabolic',contribution,403,dict(fence,Origin='https://untrusted.invalid'))
+            api('PUT',metadata+'/contributions/catabolic',contribution,headers=fence)
+            assert next(c for c in api('GET',metadata)['contributions'] if c['source']=='catabolic')['tags']==['test']; checks.append('authenticated_metadata_import')
+            epoch=client.viewing_epoch()
+            session=api('POST','/api/v2/playback/viewing-sessions',{'delivery_id':delivery['id'],'expected_viewing_revision':'0'},201,epoch)
+            api('POST',f'/api/v2/playback/viewing-sessions/{session["id"]}/events',{'event_id':'smoke-progress','sequence':'1','delivery_generation':delivery['active']['generation'],'position_ms':1250,'status':'paused'},headers=epoch)
+            spec=api('GET','/api/v2/openapi.json'); assert '/api/v2/catalog/items/{item_id}/metadata/contributions/{source_name}' in spec['paths']; checks.append('public_openapi')
             stop(process)
-            process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT);wait_for(lambda:request(port,'GET','/health')[0]==200)
-            assert json.loads(request(port,'GET',progress)[2])['position_seconds']==1.25;assert catalog()['title']=='Imported Signal';checks.append('restart_preserves_progress_and_curation')
+            process=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT);wait_for(lambda:request(port,'GET','/api/v2/system/health')[0]==200)
+            progress=api('GET',f'/api/v2/profiles/default/timelines/{timeline["id"]}/viewing')
+            assert progress['position_ms']==1250;assert catalog()['title']=='Imported Signal';checks.append('restart_preserves_progress_and_curation')
             # A second owner must fail without touching the running catalog.
             second=subprocess.run([str(BINARY),'--access-mode','trusted_household','--listen',f'127.0.0.1:{free_port()}','--data-dir',str(state)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
             assert second.returncode!=0;checks.append('single_owner_lock')

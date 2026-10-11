@@ -392,6 +392,12 @@ test('live generation opens without VOD startTime and verifies the public seek',
   await openGeneration(element, generation, 42500, 'http://localhost');
   assert.equal(calls[0].length, 1);
   assert.deepEqual(calls[1], ['seek', 2.5]);
+  element.player.state.seekable = [{start: 2.6, end: 40}];
+  await openGeneration(element, generation, 42500, 'http://localhost');
+  assert.equal(element.player.state.currentTime, 2.85);
+  element.player.state.seekable = [{start: 4, end: 40}];
+  await assert.rejects(openGeneration(element, generation, 42500, 'http://localhost'), /outside the live window/);
+  element.player.state.seekable = [{start: 0, end: 40}];
   element.seek = async () => { element.player.state.currentTime = 20; };
   await assert.rejects(openGeneration(element, generation, 42500, 'http://localhost'), /requested generation position/);
   calls.length = 0;
