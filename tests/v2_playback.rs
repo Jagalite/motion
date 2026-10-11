@@ -2408,6 +2408,44 @@ async fn bounded_media_policy_requires_observed_facts_and_components_never_subst
         .fetch_one(&f.server.app.db)
         .await
         .unwrap();
+    // PQ and HLG cannot be tone-mapped by this service. Byte preservation is
+    // permitted only when the client reports HDR support and does not require SDR.
+    for transfer in ["smpte2084", "arib-std-b67"] {
+        let mut hdr: Value = serde_json::from_str(&tracks).unwrap();
+        for track in hdr.as_array_mut().unwrap() {
+            if track["kind"] == "video" {
+                track["color_transfer"] = json!(transfer);
+            }
+        }
+        sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+            .bind(hdr.to_string())
+            .bind(file)
+            .execute(&f.server.app.db)
+            .await
+            .unwrap();
+        for (mode, policy, capability, expected) in [
+            ("original", "preserve_if_supported", "supported", "ready"),
+            ("original", "require_sdr", "supported", "blocked"),
+            (
+                "original",
+                "preserve_if_supported",
+                "unsupported",
+                "blocked",
+            ),
+            ("convert", "preserve_if_supported", "supported", "blocked"),
+            ("convert", "reject_conversion", "supported", "blocked"),
+        ] {
+            let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+            input["quality"]["hdr_policy"] = json!(policy);
+            input["client"]["hdr"] = json!(capability);
+            let reply = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(
+                reply.body["status"], expected,
+                "{transfer} {mode} {policy} {capability}: {}",
+                reply.body
+            );
+        }
+    }
     let mut unknown: Value = serde_json::from_str(&tracks).unwrap();
     for t in unknown.as_array_mut().unwrap() {
         if t["kind"] == "video" {
