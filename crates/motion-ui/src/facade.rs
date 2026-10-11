@@ -76,6 +76,39 @@ pub struct ItemCard {
     pub kind: String,
     pub availability: Availability,
     pub needs_review: bool,
+    /// Same-origin URLs of the resolved artwork, read with the session's own
+    /// authorization. None when no asset is resolved for the role.
+    pub artwork: Artwork,
+    pub year: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Artwork {
+    pub poster: Option<String>,
+    pub backdrop: Option<String>,
+    pub thumbnail: Option<String>,
+}
+
+impl Artwork {
+    /// The best 16:9 image: a backdrop, else an episode thumbnail.
+    pub fn wide(&self) -> Option<&str> {
+        self.backdrop.as_deref().or(self.thumbnail.as_deref())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CastMember {
+    pub name: String,
+    pub role: Option<String>,
+}
+
+/// Descriptive metadata for a detail page, from the item's resolved metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemDetails {
+    pub original_title: Option<String>,
+    pub description: Option<String>,
+    pub genres: Vec<String>,
+    pub cast: Vec<CastMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +160,8 @@ pub struct TimelineView {
 pub struct ItemView {
     pub playback_available: bool,
     pub item: ItemCard,
+    /// None when the metadata read is unavailable, not when it is empty.
+    pub details: Option<ItemDetails>,
     pub children: Vec<ItemCard>,
     pub timelines: Vec<TimelineView>,
 }

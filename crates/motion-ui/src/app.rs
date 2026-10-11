@@ -353,14 +353,27 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
 
 // --- Components -------------------------------------------------------------
 
+/// Artwork with a stable placeholder beneath it. The image has empty alt text
+/// (the title is always rendered as text), so a failed load shows the
+/// placeholder rather than a broken-image glyph.
 #[component]
-async fn poster(id: String, title: String) -> Result<impl View> {
+async fn poster(id: String, title: String, #[default] src: Option<String>) -> Result<impl View> {
     let letters = initials(&title);
     Ok(view! {
         <span class=(art_tone(&id)) aria-hidden="true">
             <span class="art-initials">(letters.as_str())</span>
         </span>
+        if let Some(src) = &src {
+            <img class="art-img" src=(src.as_str()) alt="" loading="lazy" decoding="async">
+        }
     })
+}
+
+fn card_meta_year(card: &ItemCard) -> String {
+    match card.year {
+        Some(year) => year.to_string(),
+        None => kind_label(&card.kind).to_string(),
+    }
 }
 
 #[component]
@@ -371,19 +384,45 @@ async fn item_grid(items: Vec<ItemCard>, label: &str) -> Result<impl View> {
                 <li class="poster-card">
                     <a href=(href!(item, ItemId(entry.id.as_str())))>
                         <span class="poster-frame">
-                            poster(id: entry.id.clone(), title: entry.title.clone())
+                            poster(id: entry.id.clone(), title: entry.title.clone(), src: entry.artwork.poster.clone())
                             if entry.needs_review {
                                 <span class="badge badge-review">"Needs review"</span>
                             }
                         </span>
                         <span class="card-title">(entry.title.as_str())</span>
                         <span class="card-meta">
-                            (kind_label(&entry.kind))
+                            (card_meta_year(&entry))
                             if entry.availability != Availability::Available {
                                 <span class="meta-sep" aria-hidden="true"></span>
                                 <span class="availability">(availability_text(entry.availability))</span>
                             }
                             if entry.needs_review { <span class="visually-hidden">", needs review"</span> }
+                        </span>
+                    </a>
+                </li>
+            }
+        </ul>
+    })
+}
+
+/// Episodes and other 16:9 entries: stills instead of posters.
+#[component]
+async fn wide_grid(items: Vec<ItemCard>, label: &str) -> Result<impl View> {
+    Ok(view! {
+        <ul class="wide-grid" aria-label=(label)>
+            for entry in items {
+                <li class="wide-card">
+                    <a href=(href!(item, ItemId(entry.id.as_str())))>
+                        <span class="wide-frame">
+                            poster(id: entry.id.clone(), title: entry.title.clone(),
+                                src: entry.artwork.wide().or(entry.artwork.poster.as_deref()).map(str::to_owned))
+                        </span>
+                        <span class="card-title">(entry.title.as_str())</span>
+                        <span class="card-meta">(kind_label(&entry.kind))
+                            if entry.availability != Availability::Available {
+                                <span class="meta-sep" aria-hidden="true"></span>
+                                <span class="availability">(availability_text(entry.availability))</span>
+                            }
                         </span>
                     </a>
                 </li>
@@ -417,7 +456,8 @@ async fn home(cx: &Cx) -> Result<impl View> {
                         <li class="wide-card">
                             <a href=(href!(play, TimelineId(entry.timeline_id.as_str())))>
                                 <span class="wide-frame">
-                                    poster(id: entry.item.id.clone(), title: entry.item.title.clone())
+                                    poster(id: entry.item.id.clone(), title: entry.item.title.clone(),
+                                        src: entry.item.artwork.wide().or(entry.item.artwork.poster.as_deref()).map(str::to_owned))
                                     <span class="play-badge" aria-hidden="true">icon(name: "play")</span>
                                     if let Some(duration) = entry.duration_ms {
                                         <progress max=(duration) value=(entry.position_ms)
@@ -493,6 +533,13 @@ async fn item(cx: &Cx) -> Result<impl View> {
     let view_model = facade(cx).0.item(who, id).await.map_err(ui_error)?;
     let can_play = who.can("playback:request") && view_model.playback_available;
     let title = view_model.item.title.clone();
+    let details = view_model.details.clone();
+    let genres = details
+        .as_ref()
+        .map(|d| d.genres.join(", "))
+        .unwrap_or_default();
+    let cast = details.as_ref().map(|d| d.cast.clone()).unwrap_or_default();
+    let wide_children = view_model.item.kind == "season";
     let entries_heading = match view_model.item.kind.as_str() {
         "series" => "Seasons",
         "season" => "Episodes",
@@ -500,21 +547,39 @@ async fn item(cx: &Cx) -> Result<impl View> {
     };
     Ok(view! {
         <article class="detail">
-            <div class=(format!("detail-backdrop {}", art_tone(&view_model.item.id))) aria-hidden="true"></div>
+            <div class=(format!("detail-backdrop {}", art_tone(&view_model.item.id))) aria-hidden="true">
+                if let Some(src) = view_model.item.artwork.backdrop.as_deref() {
+                    <img class="art-img" src=(src) alt="" decoding="async">
+                }
+            </div>
             <div class="detail-hero">
                 <div class="detail-poster">
-                    poster(id: view_model.item.id.clone(), title: title.clone())
+                    poster(id: view_model.item.id.clone(), title: title.clone(), src: view_model.item.artwork.poster.clone())
                 </div>
                 <div class="detail-info">
                     <h1 class="detail-title">(title.as_str())</h1>
+                    if let Some(original) = details.as_ref().and_then(|d| d.original_title.as_deref()).filter(|o| *o != title) {
+                        <p class="detail-original">(original)</p>
+                    }
                     <p class="item-meta">
+                        if let Some(year) = view_model.item.year {
+                            <span class="meta-year">(year)</span>
+                            <span class="meta-sep" aria-hidden="true"></span>
+                        }
                         <span class="meta-kind">(kind_label(&view_model.item.kind))</span>
+                        if !genres.is_empty() {
+                            <span class="meta-sep" aria-hidden="true"></span>
+                            <span class="meta-genres">(genres.as_str())</span>
+                        }
                         <span class="meta-sep" aria-hidden="true"></span>
                         <span class=(if view_model.item.availability == Availability::Available { "availability is-ok" } else { "availability" })>(availability_text(view_model.item.availability))</span>
                         if view_model.item.needs_review {
                             <span class="badge badge-review">"Identification needs review"</span>
                         }
                     </p>
+                    if let Some(description) = details.as_ref().and_then(|d| d.description.as_deref()) {
+                        <p class="detail-synopsis">(description)</p>
+                    }
                     if !view_model.playback_available {
                         <p class="muted">"Playback is unavailable."</p>
                     }
@@ -568,7 +633,27 @@ async fn item(cx: &Cx) -> Result<impl View> {
                     <h2 class="shelf-title" id="entries-heading">
                         (entries_heading)
                     </h2>
-                    item_grid(items: view_model.children, label: "Entries")
+                    if wide_children {
+                        wide_grid(items: view_model.children, label: "Entries")
+                    } else {
+                        item_grid(items: view_model.children, label: "Entries")
+                    }
+                </section>
+            }
+            if !cast.is_empty() {
+                <section class="shelf" aria-labelledby="cast-heading">
+                    <h2 class="shelf-title" id="cast-heading">"Cast"</h2>
+                    <ul class="cast-row">
+                        for member in cast.iter() {
+                            <li class="cast-card">
+                                <span class=(format!("cast-avatar {}", art_tone(&member.name))) aria-hidden="true">(initials(&member.name))</span>
+                                <span class="cast-name">(member.name.as_str())</span>
+                                if let Some(role) = member.role.as_deref() {
+                                    <span class="cast-role">(role)</span>
+                                }
+                            </li>
+                        }
+                    </ul>
                 </section>
             }
         </article>

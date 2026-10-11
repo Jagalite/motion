@@ -51,6 +51,14 @@ fn library(v: &Value) -> LibraryCard {
         availability: availability(v),
     }
 }
+/// A resolved artwork role as a same-origin getAssetBytes URL. The browser
+/// reads it with the session's own credential, so catalog scope still applies.
+fn artwork(v: &Value, role: &str) -> Option<String> {
+    v["artwork"][role]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(v2::metadata::asset_content_url)
+}
 fn item(v: &Value) -> ItemCard {
     ItemCard {
         id: text(v, "id"),
@@ -58,6 +66,48 @@ fn item(v: &Value) -> ItemCard {
         kind: text(v, "kind"),
         availability: availability(v),
         needs_review: matches!(v["match_state"].as_str(), Some("review" | "unmatched")),
+        artwork: Artwork {
+            poster: artwork(v, "poster"),
+            backdrop: artwork(v, "backdrop"),
+            thumbnail: artwork(v, "thumbnail"),
+        },
+        year: v["release_year"].as_i64(),
+    }
+}
+/// Detail-page fields from a resolved metadata `values` object.
+fn details(values: &Value) -> ItemDetails {
+    let words = |key: &str| -> Option<String> {
+        values[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    ItemDetails {
+        original_title: words("original_title"),
+        description: words("description"),
+        genres: values["genres"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|g| g.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cast: values["cast"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some(CastMember {
+                            name: c["name"].as_str()?.to_owned(),
+                            role: c["role"].as_str().map(str::to_owned),
+                        })
+                    })
+                    .take(30)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 fn segment(s: &str) -> String {
@@ -441,8 +491,16 @@ impl UiQueryFacade for Queries {
                     .iter()
                     .any(|v| v.availability == Availability::Available)
             });
+            // Descriptive metadata is optional on the page: an unavailable
+            // read is reported as None, never as an item with no metadata.
+            let details = self
+                .read(&format!("{path}/metadata"))
+                .await
+                .ok()
+                .map(|m| details(&m["values"]));
             Ok(ItemView {
                 item: item(&value),
+                details,
                 children,
                 timelines,
                 playback_available,

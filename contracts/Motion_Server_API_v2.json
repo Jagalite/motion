@@ -15250,7 +15250,24 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "The resolved poster asset; identical to artwork.poster."
+          },
+          "artwork": {
+            "$ref": "#/components/schemas/CatalogItemArtwork"
+          },
+          "release_year": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9999
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Release year from the item's resolved metadata, when known."
           },
           "default_timeline_id": {
             "anyOf": [
@@ -15288,11 +15305,66 @@
           "availability",
           "external_ids",
           "artwork_id",
+          "artwork",
+          "release_year",
           "default_timeline_id",
           "match_state",
           "parent_ids"
         ],
         "description": "Logical content only. File copies and generated renditions do not create extra browse rows. Permissions are evaluated before lists, counts, facets and relations."
+      },
+      "CatalogItemArtwork": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The asset resolved for each artwork role (a pinned selection, else the local contribution, else the only contributed candidate). Bytes are read with getAssetBytes.",
+        "properties": {
+          "poster": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "backdrop": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "banner": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "thumbnail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "poster",
+          "backdrop",
+          "banner",
+          "thumbnail"
+        ]
       },
       "CatalogItemInput": {
         "type": "object",

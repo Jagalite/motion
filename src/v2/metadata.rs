@@ -714,6 +714,17 @@ struct AssetBody {
     source_revision: Option<String>,
 }
 
+/// The getAssetBytes URL of an artwork asset at its (only) revision.
+pub fn asset_content_url(id: &str) -> String {
+    let mut url = url::Url::parse("http://local/api/v2/media/assets/").unwrap();
+    url.path_segments_mut()
+        .unwrap()
+        .pop_if_empty()
+        .push(id)
+        .push("content");
+    format!("{}?revision={ASSET_REVISION}", url.path())
+}
+
 fn asset_body(id: String, mime: String, size: i64) -> AssetBody {
     AssetBody {
         digest: format!("sha256:{id}"),
@@ -721,7 +732,7 @@ fn asset_body(id: String, mime: String, size: i64) -> AssetBody {
         kind: "artwork",
         mime_type: mime,
         size_bytes: size.max(0).to_string(),
-        content_url: format!("/api/v2/media/assets/{id}/content?revision={ASSET_REVISION}"),
+        content_url: asset_content_url(&id),
         source_revision: None,
         id,
     }
