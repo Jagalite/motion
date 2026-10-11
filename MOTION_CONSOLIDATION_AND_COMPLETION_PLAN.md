@@ -335,7 +335,7 @@ Use four bounded lanes. These are assignments to make, not agents already runnin
 
 | Lane | Owns | Boundary |
 |---|---|---|
-| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization adapters, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
+| Data/catalog API (A01–A04/A09 with A02) | C01, scan/structure/metadata/organization/preparation/schedule/storage/backup adapters, legacy history readers, migration registry | Sole allocator of schema numbers; playback owns its domain policy while this lane coordinates persistence changes. |
 | Playback/viewing (A06/A07/A08) | C02 playback service facts, C05/C06/C08, planning, tickets, generation and authority policies | Propose contract changes through A00; coordinate capability transport edits with the API owner and package/player decisions with clients/release. |
 | Clients (A10–A12) | All current client callers, Topcoat cutover, Go capability use, C07 player integration, real-client acceptance | No independent catalog or viewing authority; fixtures remain explicitly labeled. |
 | Integration/release (A00/A05/A14) | Contract/evidence ledger, C03/C09, CI, manifests, source/package reconstruction, final integration | Owns root manifests/lockfiles and shared-file integration; implementation lanes still own their regression tests. |
@@ -444,3 +444,12 @@ default cutover, legacy UI/media/API retirement and a qualified provider release
 handoff are withheld until those gates pass. Candidate archive hashes identify
 inputs, not qualified release assets. Integration coordination is tracked on
 PRs #14, #16 and #17; old-binary upgrade fixtures are retained.
+
+### Final consolidation ownership (integration/release)
+
+Integration/release owns completion across PRs #14 → #17 → #16 → #15,
+including shared-file reconciliation, the one-app distribution, qualified player
+deployment, final legacy-route removal and absence tests, combined CI, installed
+acceptance and milestone evidence. See
+[the final gate ledger](qualification/consolidation/FINAL.md). Merging the lane
+PRs does not close a milestone. Historical lane receipts keep their exact scope.
