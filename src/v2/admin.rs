@@ -40,7 +40,7 @@ struct Row {
 }
 impl Row {
     fn wire(&self) -> Value {
-        json!({"id":self.id,"job_id":self.id,"created_at":super::timestamp(self.created_at),"status":match self.phase.as_str(){"completed" if self.error.as_deref()!=Some("backup_expired")=>"ready","completed"|"failed"|"cancelled"=>"failed",_=>"pending"},"manifest_digest":if self.phase=="completed" && self.error.as_deref()!=Some("backup_expired"){self.manifest_digest.clone()}else{None}})
+        json!({"id":self.id,"job_id":self.id,"created_at":super::timestamp(self.created_at),"status":match self.phase.as_str(){"completed" if self.error.is_none()=>"ready","completed"|"failed"|"cancelled"=>"failed",_=>"pending"},"manifest_digest":if self.phase=="completed" && self.error.is_none(){self.manifest_digest.clone()}else{None}})
     }
 }
 async fn create(
@@ -183,6 +183,7 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
         return Ok(false);
     };
     let permit = std::sync::Arc::new(permit);
+    retain_requested(app).await?;
     let selected = {
         let _guard = app.jobs.lock().await;
         let mut tx = begin_write(&app.db).await?;
@@ -252,9 +253,9 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
             attempt: row.attempt.try_into()?,
             success: playscale_core::maintenance::BackupReceiptFacts {
                 requester_authorized: authorized,
-                database_verified: receipt.is_ok(),
-                inventory_complete: receipt.is_ok(),
-                destination_durable: receipt.is_ok(),
+                database_verified: receipt.as_ref().is_ok_and(|r| r.database_verified),
+                inventory_complete: receipt.as_ref().is_ok_and(|r| r.inventory_complete),
+                destination_durable: receipt.as_ref().is_ok_and(|r| r.destination_durable),
             }
             .publishable(),
         },
@@ -263,7 +264,7 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
     sqlx::query("UPDATE backup_jobs SET phase=?,manifest_digest=?,error=? WHERE id=?")
         .bind(crate::db::phase_name(next.phase))
         .bind(if published {
-            receipt.as_ref().ok()
+            receipt.as_ref().ok().map(|r| &r.manifest_digest)
         } else {
             None
         })
@@ -282,7 +283,7 @@ pub async fn run_backup(app: &App) -> anyhow::Result<bool> {
 }
 
 async fn retain_requested(app: &App) -> anyhow::Result<()> {
-    let ids:Vec<String> = sqlx::query_scalar("SELECT id FROM backup_jobs WHERE phase='completed' AND error IS NULL ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?").bind(app.storage.settings.backups_keep as i64).fetch_all(&app.db).await?;
+    let ids:Vec<String> = sqlx::query_scalar("SELECT id FROM backup_jobs WHERE phase='completed' AND error='backup_expired' UNION SELECT id FROM (SELECT id FROM backup_jobs WHERE phase='completed' AND error IS NULL ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?) LIMIT 500").bind(app.storage.settings.backups_keep as i64).fetch_all(&app.db).await?;
     for id in ids {
         // Withdraw the ready claim before removing bytes; retain job provenance.
         let mut tx = begin_write(&app.db).await?;
@@ -298,7 +299,7 @@ async fn retain_requested(app: &App) -> anyhow::Result<()> {
             .root
             .join("backups")
             .join(format!("request-{id}"));
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if path.exists() {
                 anyhow::ensure!(
                     !std::fs::symlink_metadata(&path)?.file_type().is_symlink()
@@ -312,7 +313,13 @@ async fn retain_requested(app: &App) -> anyhow::Result<()> {
             }
             Ok(())
         })
-        .await??;
+        .await?;
+        match removed {
+            Err(error) => tracing::warn!(%error,"expired backup cleanup will retry"),
+            Ok(()) => {
+                sqlx::query("UPDATE backup_jobs SET error='backup_reclaimed' WHERE id=? AND error='backup_expired'").bind(&id).execute(&app.db).await?;
+            }
+        }
     }
     Ok(())
 }

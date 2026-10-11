@@ -1886,3 +1886,42 @@ async fn backup_retention_preserves_history_and_corrupt_recovery_fails_closed() 
         .unwrap();
     assert_eq!(phase, "failed");
 }
+
+#[tokio::test]
+async fn interrupted_retention_retries_without_new_backup_request() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let response = f
+        .call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(json!({"include_generated_media":false})),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "retention-restart"),
+            ],
+        )
+        .await;
+    let id = response.body["id"].as_str().unwrap();
+    playscale::v2::admin::run_backup(&f.app).await.unwrap();
+    let path = f
+        .app
+        .storage
+        .root
+        .join("backups")
+        .join(format!("request-{id}"));
+    assert!(path.exists());
+    sqlx::query("UPDATE backup_jobs SET error='backup_expired' WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(!playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert!(!path.exists());
+    let error: String = sqlx::query_scalar("SELECT error FROM backup_jobs WHERE id=?")
+        .bind(id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(error, "backup_reclaimed");
+}
