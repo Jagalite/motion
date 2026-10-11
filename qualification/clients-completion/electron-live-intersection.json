@@ -1,7 +1,7 @@
 {
   "scope": "Existing Electron workflow only; excludes positive Next and installed package",
   "server": {
-    "binary": "/Volumes/seed1/Projects/motion-clients-completion-artifacts/playscale-38db68c",
+    "binary": "playscale-38db68c",
     "sha256": "365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45",
     "source_commit": "38db68c"
   },
@@ -26,7 +26,7 @@
     "manifest_sha256": "485f333a86b587d402f79a9d54fef3e098855786471047fd50dbbfbdc32ea574"
   },
   "receipt_sha256": "bac758919f8d70e1f2cbb60229c9da0e3051ff8e393c73f79a9edeb1f6c31a2c",
-  "full_receipt_path": "/Volumes/seed1/Projects/motion-clients-completion-artifacts/electron-live-intersection/receipt.json",
+  "full_receipt_path": "local-artifacts/electron-live-intersection/receipt.json",
   "engine": {
     "electron": "44.7.0",
     "chromium": "152.0.7977.130"
