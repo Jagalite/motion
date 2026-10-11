@@ -43,3 +43,33 @@ section is restored by the client merge and the row is restored with this ledger
 No production merge findings remain. Retained scoped watched queries, restore
 epoch headers, forward migration files, valid idempotency keys and both lanes'
 regressions require runtime confirmation on the final candidate.
+
+## Integration checkpoint: 2026-10-11
+
+PR #14 merged at `b3aeeadcae4a988397f9ad2a3c7cf9cb43f0bdbc` after its
+exact-head checks passed. PR #17 incorporates that main baseline at `b46314d`;
+its fast gates pass while full macOS checks remain queued. PRs #16 and #15 have
+not been merged. PR #18 carries the combined implementation; this is not milestone
+closure and does not supersede the required integration order.
+
+| Deliverable | Implementation / review | Evidence and remaining gate |
+|---|---|---|
+| Paced HLS availability | `8b9f34a`; GPT-6.1 Sol reviewed | Fresh provider rebuild Kyoto `02254edf69104207bfc9ed714480b8be` passed with identical provider identity. Seven parser/timeline regressions pass. `paced-provider-diagnostic.json` records browser startup, delayed playback, audio switch, far seek and end-of-stream observations. Full engine and installed-player matrix remains open. |
+| One-app bundle | `1346cbd`, `4c646d2`, `33e6fcc`; GPT-6.1 Sol reviewed | Electron shell, Go CLI/TUI, Rust services, private owned-server channels, media tools, exact player closure and notices assembled by the recipe. Fourteen packaging and 22 desktop tests pass. Kyoto package build `6539318a08e243088306d05a04c287c1` at `33e6fcc` is in progress; no installed-product claim yet. |
+| Public Next prerequisites | `1770fef`; GPT-6.1 Sol reviewed, alias finding fixed | Kyoto `ece3076e64694974a5d6205147c26746` passed; compiled binaries passed 16 catalog HTTP tests and four contract tests. Public order-group creation, canonical alias replay, stale revisions, scope/ownership rejection and ordered Next all exercised. |
+| Dynamic preparation inputs | `67c5b39`; GPT-6.1 Sol reviewed | Bounded profiles/backends are persisted and included in publication identity. Current-server profile smoke now uses v2, with EOF/deadline-bounded SSE replay. Contract/syntax pass; Kyoto `638f3eba0db54e3d829da53218203b02` compilation and real profile acceptance remain pending. |
+| Complete source reconstruction | `d957b49`; GPT-6.1 Sol reviewed | Gate now reconstructs the complete package outside Git, verifies source/provider identity, then exercises the reconstructed archive. Source checks pass; full reconstruction is not yet run. |
+
+The initial package attempt at `4c646d2` failed publication screening on synthetic
+path strings in a test fixture, before compilation. `33e6fcc` preserves the exact
+test bytes while making the source fixture compatible with the privacy checker;
+both publication checks and packaging tests pass. It does not relax the checker.
+
+Integration/release (this thread) owns the remaining work: ordered merges;
+legacy mount/asset removal with anonymous, scoped and operator absence tests;
+Topcoat default; service-regression preservation; exact-head combined CI;
+source reconstruction; relocated installed CLI/TUI and Electron acceptance;
+and the player engine/deployment matrix. Catalog, playback and client lane owners
+remain accountable for their domain fixes, with integration owning the final
+acceptance. Missing hardware/physical A/V evidence is explicitly unqualified.
+All M0–M4 rows remain open until their individual acceptance receipts exist.
