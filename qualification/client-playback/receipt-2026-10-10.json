@@ -1,9 +1,9 @@
 {
-  "started": "2026-10-10T19:28:26.028Z",
+  "started": "2026-10-11T01:56:56.012Z",
   "kind": "production-evidence",
   "server": {
     "binary": "<checkout>/target/debug/playscale",
-    "sha256": "b35cf9686873dc82ab113c0b7d422845f605ef245d70758a95fbcadd57aa0399"
+    "sha256": "7a1e3d9c791264ed4ccabb2da66bac563ceccaf8ee57912563274eb2437f5d0c"
   },
   "demuxe": {
     "dir": "<checkout>/web/vendor/demuxe",
@@ -28,7 +28,7 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "play": "/play/43347f2e-8861-4771-b1af-25ac7afc497c"
+            "play": "/play/a94b220f-ef5c-4799-b219-d7361c6c689b"
           }
         },
         {
@@ -39,7 +39,7 @@
             "transport": "http_range",
             "operation": "original",
             "status": "ready",
-            "candidate": "o-22e160a5-ade3-49a7-b976-50db19f192ec",
+            "candidate": "o-a21418dd-de74-4c89-85b0-ff1f9c68cb62",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -61,8 +61,8 @@
           "gap": null,
           "detail": {
             "advancing": true,
-            "from": 0.006704,
-            "to": 3.13665,
+            "from": 0.004792,
+            "to": 3.139589,
             "logical": 3.1,
             "mode": "native"
           }
@@ -87,8 +87,8 @@
             },
             "seekPlay": {
               "advancing": true,
-              "from": 40.03717,
-              "to": 42.076849,
+              "from": 40.032499,
+              "to": 42.08485,
               "logical": 42.1,
               "mode": "native"
             }
@@ -99,13 +99,13 @@
           "status": "pass",
           "gap": null,
           "detail": [
-            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
-            "POST af22a0af-a696-4ee3-9009-3efded636d8b/changes 202",
-            "GET 22e160a5-ade3-49a7-b976-50db19f192ec/content 206",
-            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
+            "POST 0964ad7e-116f-44b0-89e5-17d4b6cdce55/events 200",
+            "POST 4638f35f-0fbc-4284-8223-77972127192a/changes 202",
+            "GET a21418dd-de74-4c89-85b0-ff1f9c68cb62/content 206",
+            "POST 0964ad7e-116f-44b0-89e5-17d4b6cdce55/events 200",
             "POST 2/activate 200",
-            "POST 195d98ad-b961-486d-983a-de750b640785/events 200",
-            "POST 195d98ad-b961-486d-983a-de750b640785/events 200"
+            "POST 0964ad7e-116f-44b0-89e5-17d4b6cdce55/events 200",
+            "POST 0964ad7e-116f-44b0-89e5-17d4b6cdce55/events 200"
           ]
         },
         {
@@ -115,11 +115,11 @@
           "detail": {
             "manual_epoch": "0",
             "manual_watched": null,
-            "position_ms": 48609,
+            "position_ms": 48614,
             "profile_id": "default",
             "revision": "9",
-            "session_id": "195d98ad-b961-486d-983a-de750b640785",
-            "timeline_id": "43347f2e-8861-4771-b1af-25ac7afc497c",
+            "session_id": "0964ad7e-116f-44b0-89e5-17d4b6cdce55",
+            "timeline_id": "a94b220f-ef5c-4799-b219-d7361c6c689b",
             "watched": false
           }
         },
@@ -156,16 +156,16 @@
                 "state": "ready",
                 "text": ""
               },
-              "resume": 48609
+              "resume": 48614
             },
             "resumedPlay": {
               "advancing": true,
-              "from": 48.611287,
-              "to": 49.621677,
+              "from": 48.617397,
+              "to": 49.621114,
               "logical": 49.6,
               "mode": "native"
             },
-            "saved": 48609
+            "saved": 48614
           }
         },
         {
@@ -186,7 +186,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-22e160a5-ade3-49a7-b976-50db19f192ec",
+            "candidate": "t-a21418dd-de74-4c89-85b0-ff1f9c68cb62",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -200,392 +200,8 @@
           "detail": [
             "2/master.m3u8 200",
             "2/variants/main/index.m3u8 200",
-            "2/variants/main/init.mp4 200",
-            "2/segments/0.m4s 200"
-          ]
-        },
-        {
-          "name": "audio switch replaces the player over HLS and keeps position",
-          "status": "blocked",
-          "gap": "demuxe-live-hls",
-          "detail": {
-            "before": 49.6,
-            "switched": {
-              "options": [
-                "",
-                "a0",
-                "a1"
-              ],
-              "replaced": false,
-              "alert": "Playback change failed: Native manifest has no finite VOD duration; live playback requires explicit Shaka live permission"
-            },
-            "switchedPlay": {
-              "advancing": true,
-              "from": 50.277109,
-              "to": 52.54191,
-              "logical": 52.5,
-              "mode": "native"
-            }
-          }
-        },
-        {
-          "name": "a failed switch keeps the original player playing",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "before": 49.6,
-            "switchedPlay": {
-              "advancing": true,
-              "from": 50.277109,
-              "to": 52.54191,
-              "logical": 52.5,
-              "mode": "native"
-            }
-          }
-        },
-        {
-          "name": "an event sent during the outage is queued in the durable outbox",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "queued": {
-              "position_ms": 53841,
-              "status": "paused",
-              "delivery_generation": "1",
-              "event_id": "5df23ee7205a43068768bf428c284ce0",
-              "sequence": "5"
-            }
-          }
-        },
-        {
-          "name": "the queued event is accepted after restart with its original identity",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "queued": {
-              "position_ms": 53841,
-              "status": "paused",
-              "delivery_generation": "1",
-              "event_id": "5df23ee7205a43068768bf428c284ce0",
-              "sequence": "5"
-            },
-            "drained": {
-              "status": 200,
-              "request": {
-                "position_ms": 53841,
-                "status": "paused",
-                "delivery_generation": "1",
-                "event_id": "5df23ee7205a43068768bf428c284ce0",
-                "sequence": "5"
-              }
-            },
-            "server": 53889
-          }
-        },
-        {
-          "name": "after restart the player reopens at durable progress",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "durable": 53889,
-            "afterRestart": {
-              "ready": {
-                "state": "ready",
-                "text": ""
-              },
-              "resume": 53889,
-              "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
-            },
-            "restartPlay": {
-              "advancing": true,
-              "from": 53.892854,
-              "to": 55.969627,
-              "logical": 56,
-              "mode": "native"
-            }
-          }
-        },
-        {
-          "name": "after restart the cookie session authorizes playback",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "sessionStarts": [
-              409,
-              201
-            ],
-            "errors": [
-              "POST /api/v2/playback/viewing-sessions 409"
-            ]
-          }
-        },
-        {
-          "name": "leaving the player retires its own delivery",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "product": "84c233fb-678a-436a-87f0-fb10d88ffa0f",
-            "retired": "not observed",
-            "after": 200,
-            "state": "closed",
-            "elapsedMs": 5123
-          }
-        },
-        {
-          "name": "home lists continue watching",
-          "status": "pass",
-          "gap": null,
-          "detail": {}
-        },
-        {
-          "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "transport": "hls",
-            "operation": "video_transcode",
-            "status": "ready",
-            "candidate": "t-3d72f8c0-4aee-47bf-a0a0-896484d826b7",
-            "reason": [],
-            "pending": null,
-            "generation": null,
-            "audio": "a0"
-          }
-        },
-        {
-          "name": "converted title plays in the Motion player",
-          "status": "blocked",
-          "gap": "demuxe-live-hls",
-          "detail": {
-            "legacyReady": {
-              "state": "failed",
-              "text": "Playback could not start: Native manifest has no finite VOD duration; live playback requires explicit Shaka live permission (Playback is blocked: all_candidates_failed)"
-            },
-            "legacyPlay": {
-              "advancing": false,
-              "reason": "no player"
-            }
-          }
-        },
-        {
-          "name": "diagnostic: server live HLS conversion in a plain video element",
-          "status": "diagnostic-fail",
-          "gap": null,
-          "detail": {
-            "plan": "hls",
-            "admitted": 201,
-            "played": false,
-            "currentTime": 0,
-            "width": 640,
-            "height": 360,
-            "error": "PipelineStatus::DEMUXER_ERROR_COULD_NOT_PARSE"
-          }
-        }
-      ],
-      "serverStartsMs": [
-        2908,
-        116
-      ],
-      "summary": {
-        "pass": 23,
-        "blocked": 2,
-        "fail": 0
-      }
-    },
-    "webkit": {
-      "versions": {
-        "webkit": "27.2"
-      },
-      "checks": [
-        {
-          "name": "browser session from paired credential",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "status": 200
-          }
-        },
-        {
-          "name": "item page shows viewing state and Play",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "play": "/play/02af9fb4-e5d4-4cea-9932-396678b7305b"
-          }
-        },
-        {
-          "name": "original plan selects byte-range original",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "transport": "http_range",
-            "operation": "original",
-            "status": "ready",
-            "candidate": "o-5a16c916-366f-4ea3-bbde-8170bc57f5a3",
-            "reason": [],
-            "pending": null,
-            "generation": null,
-            "audio": "a0"
-          }
-        },
-        {
-          "name": "player ready",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "state": "ready",
-            "text": ""
-          }
-        },
-        {
-          "name": "original playback advances",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "advancing": true,
-            "from": 0,
-            "to": 3.2482074170039805,
-            "logical": 3.2,
-            "mode": "native"
-          }
-        },
-        {
-          "name": "original bytes served by range",
-          "status": "pass",
-          "gap": null,
-          "detail": [
-            206,
-            206
-          ]
-        },
-        {
-          "name": "seek replaces the generation at 40 s",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "seek": {
-              "replaced": true,
-              "logical": 40,
-              "players": 1
-            },
-            "seekPlay": {
-              "advancing": true,
-              "from": 40.07869791631477,
-              "to": 42.25387212466641,
-              "logical": 42.3,
-              "mode": "native"
-            }
-          }
-        },
-        {
-          "name": "seek staged and activated generation 2",
-          "status": "pass",
-          "gap": null,
-          "detail": [
-            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
-            "POST 1183c3f8-4b2b-491b-be9d-8530802cfe4f/changes 202",
-            "GET 5a16c916-366f-4ea3-bbde-8170bc57f5a3/content 206",
-            "GET 5a16c916-366f-4ea3-bbde-8170bc57f5a3/content 206",
-            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
-            "POST 2/activate 200",
-            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200",
-            "POST 2414e273-64d7-4bf3-b661-234a20745058/events 200"
-          ]
-        },
-        {
-          "name": "progress persisted on the server",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "manual_epoch": "0",
-            "manual_watched": null,
-            "position_ms": 48765,
-            "profile_id": "default",
-            "revision": "9",
-            "session_id": "2414e273-64d7-4bf3-b661-234a20745058",
-            "timeline_id": "02af9fb4-e5d4-4cea-9932-396678b7305b",
-            "watched": false
-          }
-        },
-        {
-          "name": "ordered viewing events accepted with consecutive sequences",
-          "status": "pass",
-          "gap": null,
-          "detail": [
-            "1:200",
-            "2:200",
-            "3:200",
-            "4:200",
-            "5:200",
-            "6:200",
-            "7:200",
-            "8:200"
-          ]
-        },
-        {
-          "name": "item page offers Resume at the saved position",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "label": "Resume"
-          }
-        },
-        {
-          "name": "resume starts at the saved position",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "resumed": {
-              "ready": {
-                "state": "ready",
-                "text": ""
-              },
-              "resume": 48765
-            },
-            "resumedPlay": {
-              "advancing": true,
-              "from": 48.765,
-              "to": 50.014235875321916,
-              "logical": 50,
-              "mode": "native"
-            },
-            "saved": 48765
-          }
-        },
-        {
-          "name": "audio selector lists both tracks of the planned version",
-          "status": "pass",
-          "gap": null,
-          "detail": [
-            "",
-            "a0",
-            "a1"
-          ]
-        },
-        {
-          "name": "audio switch replans to a live HLS conversion",
-          "status": "pass",
-          "gap": null,
-          "detail": {
-            "transport": "hls",
-            "operation": "video_transcode",
-            "status": "ready",
-            "candidate": "t-5a16c916-366f-4ea3-bbde-8170bc57f5a3",
-            "reason": [],
-            "pending": null,
-            "generation": null,
-            "audio": "a1"
-          }
-        },
-        {
-          "name": "HLS manifest, variant, init and segments served",
-          "status": "pass",
-          "gap": null,
-          "detail": [
-            "2/master.m3u8 200",
-            "2/variants/main/index.m3u8 200",
-            "2/variants/main/init.mp4 200",
             "2/segments/0.m4s 200",
+            "2/variants/main/init.mp4 200",
             "2/segments/1.m4s 200"
           ]
         },
@@ -594,7 +210,7 @@
           "status": "blocked",
           "gap": "demuxe-live-hls",
           "detail": {
-            "before": 50,
+            "before": 49.6,
             "switched": {
               "options": [
                 "",
@@ -606,9 +222,9 @@
             },
             "switchedPlay": {
               "advancing": true,
-              "from": 51.03850874999775,
-              "to": 53.28244616699539,
-              "logical": 53.3,
+              "from": 50.479419,
+              "to": 52.544127,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -618,12 +234,12 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "before": 50,
+            "before": 49.6,
             "switchedPlay": {
               "advancing": true,
-              "from": 51.03850874999775,
-              "to": 53.28244616699539,
-              "logical": 53.3,
+              "from": 50.479419,
+              "to": 52.544127,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -634,10 +250,10 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54902,
-              "status": "paused",
+              "position_ms": 55466,
+              "status": "playing",
               "delivery_generation": "1",
-              "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
+              "event_id": "69414c0fef9344e69e45d336a13511f3",
               "sequence": "5"
             }
           }
@@ -648,23 +264,23 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54902,
-              "status": "paused",
+              "position_ms": 55466,
+              "status": "playing",
               "delivery_generation": "1",
-              "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
+              "event_id": "69414c0fef9344e69e45d336a13511f3",
               "sequence": "5"
             },
             "drained": {
               "status": 200,
               "request": {
-                "position_ms": 54902,
-                "status": "paused",
+                "position_ms": 55466,
+                "status": "playing",
                 "delivery_generation": "1",
-                "event_id": "1aab939a8b6e4fad8b41719b1481c9bf",
+                "event_id": "69414c0fef9344e69e45d336a13511f3",
                 "sequence": "5"
               }
             },
-            "server": 54903
+            "server": 58754
           }
         },
         {
@@ -672,20 +288,21 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "durable": 54903,
+            "durable": 58754,
+            "atRender": 58754,
             "afterRestart": {
               "ready": {
                 "state": "ready",
                 "text": ""
               },
-              "resume": 54903,
+              "resume": 58754,
               "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
             },
             "restartPlay": {
               "advancing": true,
-              "from": 54.903,
-              "to": 57.15208883297832,
-              "logical": 57.2,
+              "from": 58.759132,
+              "to": 60.828198,
+              "logical": 60.8,
               "mode": "native"
             }
           }
@@ -705,22 +322,97 @@
           }
         },
         {
+          "name": "a prepared rendition is produced by a real processing job",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 201,
+            "phase": "completed"
+          }
+        },
+        {
+          "name": "Convert plans the prepared rendition by byte range",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "prepared",
+            "status": "ready",
+            "candidate": "p-453bdada-e9ff-4b76-ac7b-b6564f395d4b",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "versionSwitch": {
+              "replaced": true,
+              "logical": 64.9,
+              "players": 1
+            },
+            "switchPlay": {
+              "advancing": true,
+              "from": 64.914394,
+              "to": 66.940142,
+              "logical": 66.9,
+              "mode": "native"
+            },
+            "beforeSwitch": 64.8,
+            "rebound": 200,
+            "delivery": "67ec3acc-90f5-494d-a798-e99faeb767b5",
+            "previous": "c0b78dd2-c1d1-47c5-b309-d52d7cf1f4d4"
+          }
+        },
+        {
+          "name": "the predecessor delivery is retired after the switch",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200,
+            "state": "closed"
+          }
+        },
+        {
+          "name": "progress continues on the rebound session",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "events": [
+              "5:64869",
+              "6:64870",
+              "7:69862",
+              "8:74475"
+            ],
+            "position": 74475,
+            "beforeSwitch": 64.8
+          }
+        },
+        {
           "name": "leaving the player retires its own delivery",
           "status": "pass",
           "gap": null,
           "detail": {
-            "product": "b3c5bd13-3249-4375-9e78-4399afe76484",
+            "product": "67ec3acc-90f5-494d-a798-e99faeb767b5",
             "retired": "not observed",
             "after": 200,
             "state": "closed",
-            "elapsedMs": 5156
+            "elapsedMs": 5092
           }
         },
         {
-          "name": "home lists continue watching",
+          "name": "home continue watching matches server viewing state",
           "status": "pass",
           "gap": null,
-          "detail": {}
+          "detail": {
+            "listed": true,
+            "watched": false,
+            "position": 74475
+          }
         },
         {
           "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
@@ -730,7 +422,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-f2095782-d054-4d14-bc0e-d81c25a7ba57",
+            "candidate": "t-37b648c0-f9f5-4e9f-a15f-b98212490651",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -760,7 +452,7 @@
             "plan": "hls",
             "admitted": 201,
             "played": true,
-            "currentTime": 4.0068929996422575,
+            "currentTime": 4.009152,
             "width": 640,
             "height": 360,
             "error": null
@@ -768,13 +460,21 @@
         }
       ],
       "serverStartsMs": [
-        2990,
-        110
+        184,
+        357
       ],
       "summary": {
-        "pass": 23,
+        "pass": 28,
         "blocked": 2,
         "fail": 0
+      }
+    },
+    "webkit": {
+      "error": "Error: scan did not publish both titles: {}\n    at provision (file://<checkout>/scripts/client_playback_e2e.mjs:116:31)\n    at async main (file://<checkout>/scripts/client_playback_e2e.mjs:522:21)\n    at async file://<checkout>/scripts/client_playback_e2e.mjs:555:90",
+      "summary": {
+        "pass": 0,
+        "blocked": 0,
+        "fail": 1
       }
     },
     "electron": {
@@ -796,7 +496,7 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "play": "/play/754a3c03-3a36-4496-936a-47b580f47fe4"
+            "play": "/play/9d9b88c6-f4b0-4d84-b9d8-4347a03e2872"
           }
         },
         {
@@ -807,7 +507,7 @@
             "transport": "http_range",
             "operation": "original",
             "status": "ready",
-            "candidate": "o-66f58b0b-4a03-47a3-aacf-1442fc595fad",
+            "candidate": "o-f1bda006-4170-4be0-9f64-40200f6689d9",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -829,9 +529,9 @@
           "gap": null,
           "detail": {
             "advancing": true,
-            "from": 0.05211,
-            "to": 3.189607,
-            "logical": 3.2,
+            "from": 0.023464,
+            "to": 3.135948,
+            "logical": 3.1,
             "mode": "native"
           }
         },
@@ -855,9 +555,9 @@
             },
             "seekPlay": {
               "advancing": true,
-              "from": 40.11421,
-              "to": 42.22598,
-              "logical": 42.2,
+              "from": 40.055506,
+              "to": 42.074328,
+              "logical": 42.1,
               "mode": "native"
             }
           }
@@ -867,13 +567,13 @@
           "status": "pass",
           "gap": null,
           "detail": [
-            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
-            "POST 998812c9-2683-43ea-b4a4-9174e6c6026f/changes 202",
-            "GET 66f58b0b-4a03-47a3-aacf-1442fc595fad/content 206",
-            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
+            "POST 581e9a0a-0572-4cf1-b1a3-97dba2383ca9/events 200",
+            "POST 8ff51974-b76e-4ace-ae62-f37f2cbe9ddd/changes 202",
+            "GET f1bda006-4170-4be0-9f64-40200f6689d9/content 206",
+            "POST 581e9a0a-0572-4cf1-b1a3-97dba2383ca9/events 200",
             "POST 2/activate 200",
-            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200",
-            "POST daf10861-a4c0-41ba-9a92-3d2ba79de58d/events 200"
+            "POST 581e9a0a-0572-4cf1-b1a3-97dba2383ca9/events 200",
+            "POST 581e9a0a-0572-4cf1-b1a3-97dba2383ca9/events 200"
           ]
         },
         {
@@ -883,11 +583,11 @@
           "detail": {
             "manual_epoch": "0",
             "manual_watched": null,
-            "position_ms": 48737,
+            "position_ms": 48612,
             "profile_id": "default",
             "revision": "9",
-            "session_id": "daf10861-a4c0-41ba-9a92-3d2ba79de58d",
-            "timeline_id": "754a3c03-3a36-4496-936a-47b580f47fe4",
+            "session_id": "581e9a0a-0572-4cf1-b1a3-97dba2383ca9",
+            "timeline_id": "9d9b88c6-f4b0-4d84-b9d8-4347a03e2872",
             "watched": false
           }
         },
@@ -924,16 +624,16 @@
                 "state": "ready",
                 "text": ""
               },
-              "resume": 48737
+              "resume": 48612
             },
             "resumedPlay": {
               "advancing": true,
-              "from": 48.742792,
-              "to": 49.7486,
-              "logical": 49.7,
+              "from": 48.613876,
+              "to": 49.627624,
+              "logical": 49.6,
               "mode": "native"
             },
-            "saved": 48737
+            "saved": 48612
           }
         },
         {
@@ -954,7 +654,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-66f58b0b-4a03-47a3-aacf-1442fc595fad",
+            "candidate": "t-f1bda006-4170-4be0-9f64-40200f6689d9",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -978,7 +678,7 @@
           "status": "blocked",
           "gap": "demuxe-live-hls",
           "detail": {
-            "before": 49.7,
+            "before": 49.6,
             "switched": {
               "options": [
                 "",
@@ -990,9 +690,9 @@
             },
             "switchedPlay": {
               "advancing": true,
-              "from": 51.101849,
-              "to": 53.205642,
-              "logical": 53.2,
+              "from": 50.364803,
+              "to": 52.487748,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -1002,12 +702,12 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "before": 49.7,
+            "before": 49.6,
             "switchedPlay": {
               "advancing": true,
-              "from": 51.101849,
-              "to": 53.205642,
-              "logical": 53.2,
+              "from": 50.364803,
+              "to": 52.487748,
+              "logical": 52.5,
               "mode": "native"
             }
           }
@@ -1018,10 +718,10 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54650,
-              "status": "paused",
+              "position_ms": 55410,
+              "status": "playing",
               "delivery_generation": "1",
-              "event_id": "3d76888dba534a2b93939a60461e285e",
+              "event_id": "bcb40dd387724012afab51f4fe8cc8e3",
               "sequence": "5"
             }
           }
@@ -1032,23 +732,23 @@
           "gap": null,
           "detail": {
             "queued": {
-              "position_ms": 54650,
-              "status": "paused",
+              "position_ms": 55410,
+              "status": "playing",
               "delivery_generation": "1",
-              "event_id": "3d76888dba534a2b93939a60461e285e",
+              "event_id": "bcb40dd387724012afab51f4fe8cc8e3",
               "sequence": "5"
             },
             "drained": {
               "status": 200,
               "request": {
-                "position_ms": 54650,
-                "status": "paused",
+                "position_ms": 55410,
+                "status": "playing",
                 "delivery_generation": "1",
-                "event_id": "3d76888dba534a2b93939a60461e285e",
+                "event_id": "bcb40dd387724012afab51f4fe8cc8e3",
                 "sequence": "5"
               }
             },
-            "server": 54698
+            "server": 55410
           }
         },
         {
@@ -1056,20 +756,21 @@
           "status": "pass",
           "gap": null,
           "detail": {
-            "durable": 54698,
+            "durable": 58812,
+            "atRender": 59024,
             "afterRestart": {
               "ready": {
                 "state": "ready",
                 "text": ""
               },
-              "resume": 54698,
+              "resume": 58812,
               "banner": "Earlier progress belongs to a rejected session or another server runtime. It is retained on this device for reconciliation; it has not been replayed into this session."
             },
             "restartPlay": {
               "advancing": true,
-              "from": 54.700729,
-              "to": 56.769176,
-              "logical": 56.8,
+              "from": 58.817836,
+              "to": 60.890233,
+              "logical": 60.9,
               "mode": "native"
             }
           }
@@ -1089,22 +790,97 @@
           }
         },
         {
+          "name": "a prepared rendition is produced by a real processing job",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 201,
+            "phase": "completed"
+          }
+        },
+        {
+          "name": "Convert plans the prepared rendition by byte range",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "transport": "http_range",
+            "operation": "prepared",
+            "status": "ready",
+            "candidate": "p-64a1fbda-fa21-41d2-9a00-0c494ed9f154",
+            "reason": [],
+            "pending": null,
+            "generation": null,
+            "audio": "a0"
+          }
+        },
+        {
+          "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "versionSwitch": {
+              "replaced": true,
+              "logical": 67.9,
+              "players": 1
+            },
+            "switchPlay": {
+              "advancing": true,
+              "from": 67.955023,
+              "to": 70.011319,
+              "logical": 70,
+              "mode": "native"
+            },
+            "beforeSwitch": 67.9,
+            "rebound": 200,
+            "delivery": "e32b62d5-91db-4f40-85b2-bb7fc423762f",
+            "previous": "9876c256-1006-464a-bb23-fe35a1995d69"
+          }
+        },
+        {
+          "name": "the predecessor delivery is retired after the switch",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "status": 200,
+            "state": "closed"
+          }
+        },
+        {
+          "name": "progress continues on the rebound session",
+          "status": "pass",
+          "gap": null,
+          "detail": {
+            "events": [
+              "5:67928",
+              "6:67929",
+              "7:72933",
+              "8:77628"
+            ],
+            "position": 77628,
+            "beforeSwitch": 67.9
+          }
+        },
+        {
           "name": "leaving the player retires its own delivery",
           "status": "pass",
           "gap": null,
           "detail": {
-            "product": "b0cc1912-f299-4d8a-974a-c43fd38d5468",
+            "product": "e32b62d5-91db-4f40-85b2-bb7fc423762f",
             "retired": "not observed",
             "after": 200,
             "state": "closed",
-            "elapsedMs": 5287
+            "elapsedMs": 5113
           }
         },
         {
-          "name": "home lists continue watching",
+          "name": "home continue watching matches server viewing state",
           "status": "pass",
           "gap": null,
-          "detail": {}
+          "detail": {
+            "listed": true,
+            "watched": false,
+            "position": 77628
+          }
         },
         {
           "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
@@ -1114,7 +890,7 @@
             "transport": "hls",
             "operation": "video_transcode",
             "status": "ready",
-            "candidate": "t-c542872e-4311-44e9-9b62-097c2ccd1530",
+            "candidate": "t-0430909e-8fa3-427e-9608-6a1aa9ec4bbf",
             "reason": [],
             "pending": null,
             "generation": null,
@@ -1138,25 +914,25 @@
         },
         {
           "name": "diagnostic: server live HLS conversion in a plain video element",
-          "status": "diagnostic-fail",
+          "status": "diagnostic-pass",
           "gap": null,
           "detail": {
             "plan": "hls",
             "admitted": 201,
-            "played": false,
-            "currentTime": 0,
+            "played": true,
+            "currentTime": 4.00606,
             "width": 640,
             "height": 360,
-            "error": "PipelineStatus::DEMUXER_ERROR_COULD_NOT_PARSE"
+            "error": null
           }
         }
       ],
       "serverStartsMs": [
-        1128,
-        182
+        470,
+        335
       ],
       "summary": {
-        "pass": 23,
+        "pass": 28,
         "blocked": 2,
         "fail": 0
       }
@@ -1165,13 +941,13 @@
   "media": [
     {
       "name": "Legacy Broadcast.mkv",
-      "sha256": "51ac0f90ef84ae133b7b1b4c92426a638d4c6c6781c3acf395ec9cf02a19b4c3"
+      "sha256": "7108d958f1ea2fba08b9868dbc0f40ee0b0288abefad5b9399e9482721c9a1c9"
     },
     {
       "name": "Signal Film.mp4",
-      "sha256": "6f04e56f06ce0b4f31d56b8766272e8a91be1bbbf5377c533b8de961c7543832"
+      "sha256": "148dff3c0ff2d368e895bf6ff27702a0c721c9de50a43405ef293c545f3a376a"
     }
   ],
-  "finished": "2026-10-10T19:31:26.973Z",
-  "result": "pass-with-blocked-gaps"
+  "finished": "2026-10-11T02:00:21.062Z",
+  "result": "fail"
 }

@@ -1,8 +1,12 @@
 # Client playback against production APIs (A11/A12 integration)
 
 Recorded October 10, 2026 on macOS 26.5 arm64, against the combined branch:
-the playback API server commits plus these client commits. The receipt is
-[receipt-2026-10-10.json](receipt-2026-10-10.json). Screenshots, network and
+the playback API server commits plus these client commits, on server binary
+SHA-256 `7a1e3d9c…`. The receipts are
+[receipt-2026-10-10.json](receipt-2026-10-10.json) (Chromium and Electron;
+its WebKit attempt stopped in setup before the scenario, while waiting for the
+startup scan) and [receipt-2026-10-10-webkit.json](receipt-2026-10-10-webkit.json)
+(WebKit, rerun with a longer scan wait). Screenshots, network and
 console logs, server logs and browser videos were kept outside the repository
 with the run.
 
@@ -19,9 +23,9 @@ with the run.
 
 | Engine | Driver | Result |
 |---|---|---|
-| Chromium 156.0.8078.4 | Playwright 1.64 | 23 pass, 2 blocked, 0 fail |
-| WebKit 27.2 | Playwright 1.64 | 23 pass, 2 blocked, 0 fail |
-| Electron 44.7.0 (Chromium 152) | Electron main-process adapter: Playwright's launcher flags are rejected by Electron 44. The renderer uses the production sandbox/partition/same-origin settings. | 23 pass, 2 blocked, 0 fail |
+| Chromium 156.0.8078.4 | Playwright 1.64 | 28 pass, 2 blocked, 0 fail |
+| WebKit 27.2 | Playwright 1.64 | 28 pass, 2 blocked, 0 fail |
+| Electron 44.7.0 (Chromium 152) | Electron main-process adapter: Playwright's launcher flags are rejected by Electron 44. The renderer uses the production sandbox/partition/same-origin settings. | 28 pass, 2 blocked, 0 fail |
 
 The connection chrome and OS credential storage of `apps/desktop/src/main.mjs` are
 not part of this run (see `apps/desktop/test/shell-smoke.mjs`).
@@ -46,9 +50,14 @@ not part of this run (see `apps/desktop/test/shell-smoke.mjs`).
   - The player reopens at the durable position and a new viewing session starts.
   - One 409 is expected when the previous page's unload event arrives after
     render; the client adopts it only when it is its own unchanged session.
+- **Version switch:** a real `remux_mp4` processing job produces a prepared
+  rendition. Choosing Convert plans it by byte range on another file. The
+  player admits a new delivery, rebinds the viewing session (200), keeps
+  playing at position and retires the predecessor. The rebound session then
+  records further progress with a higher sequence.
 - **Leaving:** leaving the player retires that player's own delivery, which is
   gone within 5 s against a 30 s lease.
-- **Home:** continue watching lists the title.
+- **Home:** continue watching matches the server's viewing state.
 - **Conversion-only title:** an MPEG-2/AC-3 Matroska title is planned as a live
   HLS conversion.
 
@@ -95,7 +104,9 @@ MOTION_PLAYWRIGHT_DIR=<tool-dir> node scripts/client_playback_e2e.mjs \
   --engines chromium,webkit,electron --out <new empty dir>
 ```
 
-The run needs FFmpeg/FFprobe on `PATH`. It is not CI-ready (browsers, Electron,
+The run needs FFmpeg/FFprobe on `PATH`, and `TMPDIR` must point to a directory
+that Spotlight doesn't index (a name ending in `.noindex`). Indexing changes
+file ctime, and with it the server's file fingerprint. It is not CI-ready (browsers, Electron,
 real media). The receipt records the server binary's SHA-256, the Demuxe version,
 the media hashes, every check with its detail, and `result`, which is one of
 `qualified`, `pass-with-blocked-gaps` or `fail`.

@@ -103,7 +103,7 @@ export async function provision(server) {
   if (policy.status !== 200) throw new Error(`policy failed: ${JSON.stringify(policy.json)}`);
   const token = claimed.access_token;
   const titles = {};
-  for (let i = 0; i < 300 && Object.keys(titles).length < 2; i++) {
+  for (let i = 0; i < 900 && Object.keys(titles).length < 2; i++) {
     const items = (await server.api('GET', '/api/v2/catalog/items?limit=50', undefined, token)).json?.items ?? [];
     for (const item of items) {
       const timelines = (await server.api('GET', `/api/v2/catalog/items/${item.id}/timelines?limit=5`, undefined, token)).json?.items ?? [];
