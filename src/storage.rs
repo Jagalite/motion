@@ -526,35 +526,6 @@ impl Write for RollingLog {
         self.file.flush()
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn rolling_logs_bound_bytes_and_generations() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut log = RollingLog::new(dir.path().to_owned(), 64, 2).unwrap();
-        log.write_all(&[b'x'; 500]).unwrap();
-        log.flush().unwrap();
-        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert_eq!(files.len(), 3);
-        for f in files {
-            assert!(f.unwrap().metadata().unwrap().len() <= 64);
-        }
-        drop(log);
-        let _smaller = RollingLog::new(dir.path().to_owned(), 16, 1).unwrap();
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
-        for entry in std::fs::read_dir(dir.path()).unwrap() {
-            assert!(entry.unwrap().metadata().unwrap().len() <= 16);
-        }
-    }
-    #[test]
-    fn disk_reserve_rejects_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(require_space(dir.path(), u64::MAX, 1).is_err());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-}
-
 /// Stable job destination makes a crash after rename but before DB acknowledgement
 /// recoverable. Never overwrite an existing completed snapshot.
 pub(crate) struct VerifiedBackup {
@@ -729,4 +700,33 @@ fn read_backup_manifest(destination: &Path) -> anyhow::Result<Vec<u8>> {
         "backup manifest too large"
     );
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rolling_logs_bound_bytes_and_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = RollingLog::new(dir.path().to_owned(), 64, 2).unwrap();
+        log.write_all(&[b'x'; 500]).unwrap();
+        log.flush().unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(files.len(), 3);
+        for f in files {
+            assert!(f.unwrap().metadata().unwrap().len() <= 64);
+        }
+        drop(log);
+        let _smaller = RollingLog::new(dir.path().to_owned(), 16, 1).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            assert!(entry.unwrap().metadata().unwrap().len() <= 16);
+        }
+    }
+    #[test]
+    fn disk_reserve_rejects_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(require_space(dir.path(), u64::MAX, 1).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
