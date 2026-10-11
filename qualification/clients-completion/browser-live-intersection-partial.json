@@ -1,0 +1,105 @@
+{
+  "scope": "Partial T3 collaborative browser observations; not full workflow qualification",
+  "binary_source": "38db68c",
+  "binary_sha256": "365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45",
+  "original": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/32f30a14-0dd8-466c-a379-bdd032f84e80"
+    },
+    "value": {
+      "error": null,
+      "from": 0,
+      "status": "playing",
+      "to": 2.32121
+    }
+  },
+  "seek": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/32f30a14-0dd8-466c-a379-bdd032f84e80"
+    },
+    "value": {
+      "error": null,
+      "logical": "43.7 / 0.0 seconds",
+      "players": 1,
+      "replaced": true,
+      "status": "playing",
+      "time": 43.658563
+    }
+  },
+  "saved": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/32f30a14-0dd8-466c-a379-bdd032f84e80"
+    },
+    "value": {
+      "time": 48.710086,
+      "viewing": {
+        "manual_epoch": "0",
+        "manual_watched": null,
+        "position_ms": 48710,
+        "profile_id": "default",
+        "revision": "10",
+        "session_id": "a3beb05e-4f55-493b-a53e-ad5feb448fb4",
+        "timeline_id": "32f30a14-0dd8-466c-a379-bdd032f84e80",
+        "watched": false
+      }
+    }
+  },
+  "resume": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/32f30a14-0dd8-466c-a379-bdd032f84e80"
+    },
+    "value": {
+      "status": "paused",
+      "time": 48.71
+    }
+  },
+  "switch_retry_failure": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/32f30a14-0dd8-466c-a379-bdd032f84e80"
+    },
+    "value": {
+      "logical": "96.9 / 0.0 seconds",
+      "opened": {
+        "live": {
+          "isLive": true,
+          "latencySeconds": 16.757,
+          "nearLive": true,
+          "seekable": {
+            "end": 12.770000219345093,
+            "start": 0.7700002193450928
+          }
+        },
+        "seekable": [
+          {
+            "end": 12.236000061035156,
+            "start": 0.23600006103515625
+          }
+        ],
+        "time": 12.013
+      },
+      "replaced": false,
+      "status": "paused",
+      "stream": "vod",
+      "text": "Skip to content\nMotion\nHome\nProfiles\nSearch the catalog\nProfile: Everyone\nSignal Film\n\nPlayback change failed: Requested generation position is outside the live window.\n\nPlayPauseMute / unmuteNext titlePosition in seconds SeekVersion \nAutomatic\nUnnam",
+      "time": 96.870071
+    }
+  },
+  "conversion_delayed_play": {
+    "toolIcon": {
+      "_tag": "website",
+      "pageUrl": "http://127.0.0.1:54409/play/7cac9dc8-5fe4-4bdf-bf2f-66ead0ea756a"
+    },
+    "value": {
+      "error": null,
+      "from": 1.475307,
+      "status": "playing",
+      "stream": "live",
+      "to": 22.345141
+    }
+  }
+}

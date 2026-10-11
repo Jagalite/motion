@@ -1,0 +1,161 @@
+{
+  "scope": "Existing Electron workflow only; excludes positive Next and installed package",
+  "server": {
+    "binary": "/Volumes/seed1/Projects/motion-clients-completion-artifacts/playscale-38db68c",
+    "sha256": "365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45",
+    "source_commit": "38db68c"
+  },
+  "harness_source": {
+    "commit": "782c00fbf93fc499551408b8695b13161de61f12",
+    "dirty": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "demuxe": {
+    "version": "1.1.1",
+    "archive_sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274",
+    "deployment": "composed-providers",
+    "providers": [
+      {
+        "name": "@demuxe/provider-shaka",
+        "version": "1.1.1",
+        "archive_sha256": "c77762ea95c667bd4b78fc640ace658f6fc17aa48847df50e336d9495c9e1471"
+      }
+    ],
+    "composer_sha256": "b86066b90a41eccdc4528c7843043f388448217bb67ff23c8974b781b6e16451",
+    "receipt_sha256": "f48783ba7d7b16c6c56f9fa6662a8a1e71d9f651aea77da074315ef9f63f484e",
+    "manifest_sha256": "485f333a86b587d402f79a9d54fef3e098855786471047fd50dbbfbdc32ea574"
+  },
+  "receipt_sha256": "bac758919f8d70e1f2cbb60229c9da0e3051ff8e393c73f79a9edeb1f6c31a2c",
+  "full_receipt_path": "/Volumes/seed1/Projects/motion-clients-completion-artifacts/electron-live-intersection/receipt.json",
+  "engine": {
+    "electron": "44.7.0",
+    "chromium": "152.0.7977.130"
+  },
+  "checks": [
+    {
+      "name": "browser session from paired credential",
+      "status": "pass"
+    },
+    {
+      "name": "item page shows viewing state and Play",
+      "status": "pass"
+    },
+    {
+      "name": "original plan selects byte-range original",
+      "status": "pass"
+    },
+    {
+      "name": "player ready",
+      "status": "pass"
+    },
+    {
+      "name": "original playback advances",
+      "status": "pass"
+    },
+    {
+      "name": "original bytes served by range",
+      "status": "pass"
+    },
+    {
+      "name": "seek replaces the generation at 40 s",
+      "status": "pass"
+    },
+    {
+      "name": "seek staged and activated generation 2",
+      "status": "pass"
+    },
+    {
+      "name": "progress persisted on the server",
+      "status": "pass"
+    },
+    {
+      "name": "ordered viewing events accepted with consecutive sequences",
+      "status": "pass"
+    },
+    {
+      "name": "item page offers Resume at the saved position",
+      "status": "pass"
+    },
+    {
+      "name": "resume starts at the saved position",
+      "status": "pass"
+    },
+    {
+      "name": "audio selector lists both tracks of the planned version",
+      "status": "pass"
+    },
+    {
+      "name": "audio switch replans to a live HLS conversion",
+      "status": "pass"
+    },
+    {
+      "name": "HLS manifest, variant, init and segments served",
+      "status": "pass"
+    },
+    {
+      "name": "audio switch replaces the player over HLS and keeps position",
+      "status": "pass"
+    },
+    {
+      "name": "an event sent during the outage is queued in the durable outbox",
+      "status": "pass"
+    },
+    {
+      "name": "the queued event is accepted after restart with its original identity",
+      "status": "pass"
+    },
+    {
+      "name": "after restart the player reopens at durable progress",
+      "status": "pass"
+    },
+    {
+      "name": "after restart the cookie session authorizes playback",
+      "status": "pass"
+    },
+    {
+      "name": "a prepared rendition is produced by a real v2 preparation",
+      "status": "pass"
+    },
+    {
+      "name": "Convert plans the prepared rendition by byte range",
+      "status": "pass"
+    },
+    {
+      "name": "the version switch admits a new delivery, rebinds viewing and keeps playing at position",
+      "status": "pass"
+    },
+    {
+      "name": "the predecessor delivery is retired after the switch",
+      "status": "pass"
+    },
+    {
+      "name": "progress continues on the rebound session",
+      "status": "pass"
+    },
+    {
+      "name": "leaving the player retires its own delivery",
+      "status": "pass"
+    },
+    {
+      "name": "home continue watching matches server viewing state",
+      "status": "pass"
+    },
+    {
+      "name": "MPEG-2/AC-3 title is planned as a live HLS conversion",
+      "status": "pass"
+    },
+    {
+      "name": "converted title plays in the Motion player",
+      "status": "pass"
+    },
+    {
+      "name": "diagnostic: server live HLS conversion in a plain video element",
+      "status": "diagnostic-pass"
+    },
+    {
+      "name": "candidate setup and browser traffic use v2",
+      "status": "pass"
+    }
+  ],
+  "latest_combined_tree_qualified": false
+}
