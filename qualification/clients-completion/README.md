@@ -165,3 +165,22 @@ refusal, rollback through both pre-upgrade backups, and candidate backup/restore
 with epoch rotation. The [receipt](upgrade-v2-observer.json) binds both binaries.
 The existing stamped baseline build was reused read-only; no compilation ran.
 This is a debug-server migration gate, not installed-package qualification.
+
+## Follow-up cache publication repair
+
+Linux fast CI at `f3f10df` failed two offline-cache event publication tests with
+HTTP409. Integration commit `28f6332` identified fsync on cap-std's O_PATH handle
+as the cause. `f31d031` ports its implementation and regression test: a readable
+directory handle is verified against the capability directory's device/inode,
+then synced after file sync and rename and before memory publication/acknowledgement.
+The directory-replacement regression proves writes remain with the opened cache.
+Core event admission, ordering and retry rules are unchanged; actual filesystem
+acknowledgement remains an adapter responsibility and is covered by integration
+tests, including failed publication and concurrent exact retries.
+
+Focused Kyoto compilation `39a3ececcf9a498a944ec83f6b5e769f` passed at clean source
+`f31d031` (exit0, 93.2seconds). All six compiled cache tests then passed locally
+on macOS. This is not Linux qualification; refreshed Linux CI is tracked on PR15.
+GPT-6.1 Sol reviewed `0b8e82f`, `e9fae9f` and `f31d031` without actionable findings.
+Publication privacy and diff checks pass. The service/deployment dependencies
+above still prevent lane closure and default cutover.
