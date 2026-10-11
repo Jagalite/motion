@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "source_archive_sha256": "1425cab5c576a8075d7be9e09cfb7a568fd81a936a111d79d105b96e191cb2e6",
+  "manifest_sha256": "ecb0028bbbe68bc92599115da1f1de97771cb855b3edd4c1aba9d23573d90526",
+  "source_commit": "0339abe969e63ed6e2cdee7760f8584ab81bbbcb",
+  "source_dirty": false,
+  "status": "passed",
+  "command": [
+    "rustup",
+    "run",
+    "1.98.0",
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "--workspace",
+    "--target-dir",
+    "$WORK/target"
+  ],
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "binary_sha256": "73211765054d17420aaa4cfc9407133640d594ddcd63705d436bcb2a0a73dec9",
+  "binary_smoke": "--help",
+  "help_sha256": "55dae2d3cb8af2dd98c198a2bc06bf5789f07e0134d18d5947a11f12a9599887",
+  "kyoto_job": "4b25803a1e444044bdd706162c714bfc",
+  "scope": "Extracted Motion workspace release rebuild and CLI help smoke; not installed-package acceptance"
+}
