@@ -29,19 +29,40 @@ func (m Model) kind() pageKind {
 	return kindBrowse
 }
 
-// columns divides width among columns; the last one takes what is left.
-func columns(width int, titles []string, widths []int) []table.Column {
-	cols := make([]table.Column, len(titles))
+// column is a table column; optional columns are dropped, last first, when
+// the terminal is too narrow. The selected row's detail line below the table
+// repeats every field, so nothing is lost.
+type column struct {
+	title    string
+	width    int
+	optional bool
+}
+
+// fit chooses the columns that fit width and sizes the last one to the rest.
+func fit(width int, specs []column) ([]table.Column, []int) {
+	keep := make([]bool, len(specs))
 	used := 0
-	for i, t := range titles {
-		w := widths[i]
-		if i == len(titles)-1 {
-			w = max(width-used-2*len(titles), 8)
+	for i, c := range specs {
+		if !c.optional {
+			keep[i], used = true, used+c.width+2
 		}
-		cols[i] = table.Column{Title: t, Width: w}
-		used += w
 	}
-	return cols
+	for i, c := range specs {
+		if c.optional && used+c.width+2 <= width {
+			keep[i], used = true, used+c.width+2
+		}
+	}
+	var cols []table.Column
+	var index []int
+	for i, c := range specs {
+		if keep[i] {
+			cols, index = append(cols, table.Column{Title: c.title, Width: c.width}), append(index, i)
+		}
+	}
+	if n := len(cols); n > 0 {
+		cols[n-1].Width = max(cols[n-1].Width+width-used, 4)
+	}
+	return cols, index
 }
 
 // tabular is the table for the current page and its rows' IDs.
@@ -67,7 +88,7 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{kindLabel(clean(j.Kind)), phase, progress, problem, clean(j.ID)})
 			ids = append(ids, j.ID)
 		}
-		return columns(width, []string{"Job", "Phase", "Progress", "Problem", "ID"}, []int{16, 13, 9, 18, 0}), rows, ids
+		return project(width, []column{{"Job", 14, false}, {"Phase", 12, false}, {"Progress", 9, true}, {"Problem", 18, true}, {"ID", 36, true}}, rows, ids)
 	case pageScans:
 		scans, _ := data[[]api.Scan](m, keyScans)
 		names := map[string]string{}
@@ -93,7 +114,7 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{library, clean(s.Status), complete, fmt.Sprintf("%d / %d", verified, observed), clean(s.ID)})
 			ids = append(ids, s.ID)
 		}
-		return columns(width, []string{"Library", "Status", "Complete", "Verified", "ID"}, []int{18, 12, 9, 12, 0}), rows, ids
+		return project(width, []column{{"Library", 16, false}, {"Status", 11, false}, {"Complete", 9, true}, {"Verified", 10, true}, {"ID", 36, true}}, rows, ids)
 	case pageDevices:
 		devices, _ := data[[]api.Device](m, keyDevices)
 		for _, d := range devices {
@@ -104,7 +125,7 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{clean(d.Name), state, plural(len(d.Permissions), "permission", "permissions"), clean(d.ID)})
 			ids = append(ids, d.ID)
 		}
-		return columns(width, []string{"Device", "State", "Access", "ID"}, []int{22, 9, 15, 0}), rows, ids
+		return project(width, []column{{"Device", 18, false}, {"State", 8, false}, {"Access", 15, true}, {"ID", 36, true}}, rows, ids)
 	case pageProfiles:
 		profiles, _ := data[[]api.Profile](m, keyProfiles)
 		viewer := m.viewer()
@@ -116,9 +137,21 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{clean(p.Name), use, clean(p.ID)})
 			ids = append(ids, p.ID)
 		}
-		return columns(width, []string{"Profile", "", "ID"}, []int{24, 10, 0}), rows, ids
+		return project(width, []column{{"Profile", 18, false}, {"", 8, false}, {"ID", 36, true}}, rows, ids)
 	}
 	return nil, nil, nil
+}
+
+// project keeps the cells of the columns that fit.
+func project(width int, specs []column, rows []table.Row, ids []string) ([]table.Column, []table.Row, []string) {
+	cols, index := fit(width, specs)
+	out := make([]table.Row, len(rows))
+	for r, row := range rows {
+		for _, i := range index {
+			out[r] = append(out[r], row[i])
+		}
+	}
+	return cols, out, ids
 }
 
 func (m Model) tableKey() string {
@@ -148,13 +181,13 @@ func (m Model) tableEmpty() string {
 // selectedID is the ID of the focused table row.
 func (m Model) selectedID() string {
 	_, _, ids := m.tabular(0)
-	if c := m.table.Cursor(); c >= 0 && c < len(ids) {
-		return ids[c]
+	if m.tsel >= 0 && m.tsel < len(ids) {
+		return ids[m.tsel]
 	}
 	return ""
 }
 
-// detail describes the focused row below the table.
+// detail describes the focused row in full, as plain text.
 func (m Model) detail() string {
 	id := m.selectedID()
 	switch m.route.page {
@@ -162,51 +195,62 @@ func (m Model) detail() string {
 		jobs, _ := data[[]api.Job](m, keyJobs)
 		for _, j := range jobs {
 			if j.ID == id {
-				text := "Attempt " + clean(j.AttemptGeneration) + " · requested by " + clean(j.RequesterID)
+				text := clean(j.ID) + " · " + clean(j.Phase)
+				if j.Progress != nil {
+					text += fmt.Sprintf(" · %.0f%%", *j.Progress*100)
+				}
+				if j.ErrorCode != nil {
+					text += " · " + clean(*j.ErrorCode)
+				}
+				text += " · attempt " + clean(j.AttemptGeneration) + " · requested by " + clean(j.RequesterID)
 				if len(j.ResultIDs) > 0 {
 					text += " · " + plural(len(j.ResultIDs), "result", "results")
 				}
-				return mutedStyle.Render(text)
+				return text
 			}
 		}
 	case pageDevices:
 		devices, _ := data[[]api.Device](m, keyDevices)
 		for _, d := range devices {
 			if d.ID == id {
-				return mutedStyle.Render("Permissions: " + clean(strings.Join(d.Permissions, ", ")))
+				return clean(d.ID) + " · " + clean(strings.Join(d.Permissions, ", "))
+			}
+		}
+	case pageScans:
+		scans, _ := data[[]api.Scan](m, keyScans)
+		for _, sc := range scans {
+			if sc.ID == id {
+				return clean(sc.ID) + " · " + clean(sc.Status) + " · " + plural(len(sc.JobIDs), "job", "jobs")
 			}
 		}
 	case pageProfiles:
-		return mutedStyle.Render("Continue watching, viewing history and playback use the profile in use.")
+		return clean(id) + " · continue watching, viewing history and playback use the profile in use."
 	}
 	return ""
 }
 
 func (m *Model) tableKeyMsg(msg tea.KeyMsg) tea.Cmd {
+	page := max(m.frame().body-4, 1)
 	switch {
 	case key.Matches(msg, keys.Up):
-		m.table.MoveUp(1)
+		m.tsel--
 	case key.Matches(msg, keys.Down):
-		m.table.MoveDown(1)
+		m.tsel++
 	case key.Matches(msg, keys.PageUp):
-		m.table.MoveUp(max(m.table.Height()-1, 1))
+		m.tsel -= page
 	case key.Matches(msg, keys.PageDown):
-		m.table.MoveDown(max(m.table.Height()-1, 1))
+		m.tsel += page
 	case key.Matches(msg, keys.Top):
-		m.table.GotoTop()
+		m.tsel = 0
 	case key.Matches(msg, keys.Bottom):
-		m.table.GotoBottom()
+		m.tsel = 1 << 30
 	case key.Matches(msg, keys.Left):
 		m.focus, m.navSel = focusNav, m.navIndex()
 	case key.Matches(msg, keys.Back):
 		return m.back()
 	case m.route.page == pageProcessing && key.Matches(msg, keys.Cancel):
-		id := m.selectedID()
-		switch {
-		case id == "":
-		case m.me() == nil || !m.me().Allows(api.PermProcessingRequest):
-			return m.say("Cancelling jobs requires the processing:request permission.", true)
-		default:
+		// The server decides per job kind who may cancel; a refusal is shown.
+		if id := m.selectedID(); id != "" {
 			m.confirm = id
 		}
 	case m.route.page == pageProfiles && key.Matches(msg, keys.Choose):
@@ -267,6 +311,25 @@ func uptime(seconds string) string {
 		return fmt.Sprintf("%dh %dm", h, mi)
 	}
 	return fmt.Sprintf("%dm %ds", mi, s%60)
+}
+
+// words breaks plain text into lines of at most width cells.
+func words(text string, width int) []string {
+	var lines []string
+	line := ""
+	for _, w := range strings.Fields(text) {
+		if line != "" && len([]rune(line))+1+len([]rune(w)) > width {
+			lines, line = append(lines, line), ""
+		}
+		if line != "" {
+			line += " "
+		}
+		line += w
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // wrap breaks a comma-separated list to width.

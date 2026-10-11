@@ -86,6 +86,12 @@ type Model struct {
 	history []visit
 	sel     int
 	offset  int
+	// reveal asks the next layout pass to scroll the focused element into
+	// view; scrolling past the last element leaves it false.
+	reveal bool
+	// tsel and toff are the table selection and its first visible row.
+	tsel    int
+	toff    int
 	navSel  int
 	list    bool
 	helping bool
@@ -227,7 +233,13 @@ func (m *Model) viewerChanged() tea.Cmd {
 		return nil
 	}
 	m.cache.viewer = viewer
-	return m.reload(func(key string) bool { return key == keyContinue || strings.HasPrefix(key, "item:") })
+	dependent := func(key string) bool { return key == keyContinue || strings.HasPrefix(key, "item:") }
+	for key, s := range m.cache.slots {
+		if dependent(key) {
+			s.data, s.err = nil, nil // never show one profile's history as another's
+		}
+	}
+	return m.reload(dependent)
 }
 
 func (m *Model) busy() bool {
@@ -303,13 +315,13 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case launchDone:
 		m.launching = false
 		if msg.err != nil {
-			return m.say("Couldn't open the player: "+describe(msg.err).message, true)
+			return m.say("Couldn't open the player: "+refusal(msg.err), true)
 		}
 		return m.say("Opened the player in your browser.", false)
 	case cancelDone:
 		delete(m.cancelling, msg.job)
 		if msg.err != nil {
-			return tea.Batch(m.say("Couldn't cancel the job: "+describe(msg.err).message, true), m.load(keyJobs))
+			return tea.Batch(m.say("Couldn't cancel the job: "+refusal(msg.err), true), m.load(keyJobs))
 		}
 		return tea.Batch(m.say("Cancellation requested.", false), m.load(keyJobs))
 	case searchDue:
@@ -399,7 +411,8 @@ func (m *Model) back() tea.Cmd {
 // show switches page. Loads for library and item pages that are no longer on
 // screen or in history are cancelled; their replies would be ignored anyway.
 func (m *Model) show(r route, sel, offset int) tea.Cmd {
-	m.route, m.sel, m.offset, m.helping = r, sel, offset, false
+	m.route, m.sel, m.offset, m.helping, m.reveal = r, sel, offset, false, true
+	m.tsel, m.toff = 0, 0
 	if r.page == pageActivity {
 		m.vp.GotoBottom()
 	} else {
@@ -541,6 +554,7 @@ func (m *Model) searchKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	}
 	m.searchSeq++
+	m.abandon(keySearch) // its reply would answer different text
 	seq := m.searchSeq
 	return tea.Batch(cmd, tea.Tick(searchDelay, func(time.Time) tea.Msg { return searchDue{seq: seq} }))
 }
@@ -559,7 +573,7 @@ func (m *Model) runSearch() tea.Cmd {
 			return nil
 		}
 	}
-	m.sel, m.offset = 0, 0
+	m.sel, m.offset, m.reveal = 0, 0, true
 	return tea.Batch(m.load(keySearch), m.spin())
 }
 
@@ -616,6 +630,17 @@ func (m *Model) cancelJob() tea.Cmd {
 		_, err := backend.CancelJob(ctx, id, idempotency)
 		return cancelDone{job: id, err: err}
 	})
+}
+
+// refusal phrases a failed action for the status bar.
+func refusal(err error) string {
+	var p *api.Problem
+	if errors.As(err, &p) && p.Status >= 400 && p.Status < 500 && p.Status != 401 {
+		if detail := clean(p.Detail); detail != "" {
+			return strings.ToLower(describe(err).title[:1]) + describe(err).title[1:] + " (" + detail + ")."
+		}
+	}
+	return describe(err).message
 }
 
 // problem is an error as the interface presents it.

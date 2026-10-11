@@ -238,10 +238,31 @@ func (m *Model) accept(msg loaded) bool {
 	}
 	s.loading, s.cancel = false, nil
 	s.err = msg.err
-	if msg.err == nil {
+	switch {
+	case msg.err == nil:
 		s.data, s.truncated = msg.data, msg.truncated
+	case revoked(msg.err), msg.key == keySearch:
+		// Data the server no longer authorizes must not stay on screen, and
+		// results for an older query must not stand in for this one.
+		s.data, s.truncated = nil, false
 	}
 	return true
+}
+
+// revoked reports a failure that withdraws access to what was shown.
+func revoked(err error) bool {
+	var p *api.Problem
+	return errors.As(err, &p) && (p.Status == 401 || p.Status == 403 || p.Status == 404)
+}
+
+// abandon cancels a request in flight and retires its request number, so its
+// reply is ignored; the data already shown stays.
+func (m *Model) abandon(key string) {
+	if s := m.cache.slots[key]; s != nil && s.loading {
+		s.cancel()
+		m.cache.seq++
+		s.request, s.loading, s.cancel = m.cache.seq, false, nil
+	}
 }
 
 func data[T any](m Model, key string) (T, bool) {

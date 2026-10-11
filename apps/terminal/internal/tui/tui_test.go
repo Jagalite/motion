@@ -31,6 +31,9 @@ type fake struct {
 	itemCtx      context.Context
 	continueFor  []string
 	cancelled    []string
+	jobs         int
+	libErr       error
+	cancelErr    error
 }
 
 func (f *fake) Me(context.Context) (api.Principal, error) {
@@ -76,6 +79,9 @@ func (f *fake) ListDevices(context.Context, string, int) (api.Page[api.Device], 
 	return api.Page[api.Device]{Items: []api.Device{{ID: "dev", Name: "Studio\x1b]0;x\x07", Permissions: []string{"catalog:read"}}}}, nil
 }
 func (f *fake) ListLibraries(context.Context, string, int) (api.Page[api.Library], error) {
+	if f.libErr != nil {
+		return api.Page[api.Library]{}, f.libErr
+	}
 	return api.Page[api.Library]{Items: []api.Library{{ID: "lib", Name: "Movies", Kind: "movies", Availability: "degraded"}}}, nil
 }
 func (f *fake) GetLibrary(_ context.Context, id string) (api.Tagged[api.Library], error) {
@@ -146,14 +152,19 @@ func (f *fake) ListContinueWatching(_ context.Context, profile, _ string, _ int)
 func (f *fake) ListScans(context.Context, string, int) (api.Page[api.Scan], error) {
 	return api.Page[api.Scan]{Items: []api.Scan{{ID: "scan", LibraryID: "lib", Status: "complete", Complete: true}}}, nil
 }
-func (f *fake) ListJobs(context.Context, string, int) (api.Page[api.Job], error) {
+func (f *fake) ListJobs(_ context.Context, cursor string, limit int) (api.Page[api.Job], error) {
+	if f.jobs > 0 {
+		return pageOf(f.jobs, cursor, limit, func(i int) api.Job {
+			return api.Job{ID: fmt.Sprintf("job-%03d", i), Kind: "scan", Phase: "running"}
+		}), nil
+	}
 	return api.Page[api.Job]{Items: []api.Job{{ID: "job1", Kind: "scan", Phase: "running"}, {ID: "job2", Kind: "convert", Phase: "queued"}}}, nil
 }
 func (f *fake) CancelJob(_ context.Context, id, key string) (api.Tagged[api.Job], error) {
 	f.mu.Lock()
 	f.cancelled = append(f.cancelled, id+"/"+key)
 	f.mu.Unlock()
-	return api.Tagged[api.Job]{}, nil
+	return api.Tagged[api.Job]{}, f.cancelErr
 }
 func (f *fake) Diagnostics(context.Context) (api.Diagnostics, error) {
 	return api.Diagnostics{UptimeSeconds: "3700", WorkerErrors: []string{"worker \x1b[2Jfailed"}}, nil
@@ -611,6 +622,9 @@ func TestNarrowTerminalKeepsLocationAndNavigation(t *testing.T) {
 	if !strings.Contains(m.View(), "Diagnostics") {
 		t.Fatal("active screen clipped out of navigation")
 	}
+	if !strings.Contains(m.View(), "? help") {
+		t.Fatal("narrow status bar lost the help shortcut")
+	}
 	m = press(t, m, "tab")
 	if v := m.View(); !strings.Contains(v, "▎ ∿  Diagnostics") || !strings.Contains(v, "Server") || strings.Contains(v, "Uptime") {
 		t.Fatalf("narrow sidebar not shown:\n%s", v)
@@ -717,5 +731,96 @@ func TestHelpPageListsShortcutsAndQuitStillQuits(t *testing.T) {
 		t.Fatal("q did not quit from the help page")
 	} else if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("q did not quit from the help page")
+	}
+}
+
+func TestRevokedAccessRemovesWhatWasShown(t *testing.T) {
+	f := &fake{}
+	m := start(t, f, 120, 40)
+	if !strings.Contains(m.View(), "Movies") {
+		t.Fatal("libraries not shown")
+	}
+	f.libErr = &api.Problem{Status: 403, Code: "forbidden", Detail: "revoked"}
+	m = press(t, m, "r")
+	if v := m.View(); strings.Contains(v, "Movies") || !strings.Contains(v, "You don't have access") {
+		t.Fatalf("revoked libraries still shown:\n%s", v)
+	}
+}
+
+func TestTableSelectionStaysVisibleAndNarrowRowsKeepEveryField(t *testing.T) {
+	m := start(t, &fake{jobs: 60}, 100, 24)
+	m = goTo(t, m, route{page: pageProcessing})
+	m = press(t, m, "G")
+	if v := m.View(); m.selectedID() != "job-059" || !strings.Contains(v, "job-059") || !strings.Contains(v, "of 60") {
+		t.Fatalf("last job not visible (%s):\n%s", m.selectedID(), v)
+	}
+	for range 30 {
+		m = press(t, m, "up")
+	}
+	if v := m.View(); !strings.Contains(v, "job-029") {
+		t.Fatalf("selection scrolled away:\n%s", v)
+	}
+	m, _ = update(t, m, tea.WindowSizeMsg{Width: 44, Height: 20})
+	if v := m.View(); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by") {
+		t.Fatalf("narrow table lost the selected job's fields:\n%s", v)
+	}
+}
+
+func TestTypingAbandonsTheSearchInFlight(t *testing.T) {
+	m := start(t, &fake{}, 100, 30)
+	m = press(t, m, "/", "a", "enter")
+	m = press(t, m, "/")
+	inFlight := m.load(keySearch) // "a" again, still running
+	m = press(t, m, "b")          // now "ab"; its debounce has not fired
+	m, _ = update(t, m, inFlight())
+	if p, ok := data[searchPage](m, keySearch); ok && p.query != "a" {
+		t.Fatalf("reply for other text applied: %+v", p)
+	}
+	m, cmd := update(t, m, searchDue{seq: m.searchSeq})
+	m = drain(t, m, cmd)
+	if p, _ := data[searchPage](m, keySearch); p.query != "ab" || !strings.Contains(m.View(), "Results for “ab”") {
+		t.Fatalf("current text not searched: %+v", p)
+	}
+}
+
+func TestSwitchingProfileHidesThePreviousProfilesHistory(t *testing.T) {
+	m := start(t, &fake{profiles: 2}, 120, 40)
+	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" {
+		t.Fatal("initial continue watching")
+	}
+	m.profile = "p0001"
+	cmd := m.viewerChanged() // the reply has not arrived yet
+	m.sync()
+	if _, ok := data[continuePage](m, keyContinue); ok || strings.Contains(m.View(), "Resume at") {
+		t.Fatal("previous profile's history shown under the new profile")
+	}
+	m = drain(t, m, cmd)
+	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0001" {
+		t.Fatalf("not re-queried: %+v", p)
+	}
+}
+
+func TestItemPageWithoutActionsStillScrolls(t *testing.T) {
+	m := start(t, &fake{}, 100, 14) // no playback capability: nothing focusable above the children
+	cmd := m.open(route{page: pageItem, id: "film001"})
+	m.sync()
+	m = drain(t, m, cmd)
+	before := m.offset
+	m = press(t, m, "down", "down", "down")
+	if m.offset <= before {
+		t.Fatalf("page did not scroll: %d", m.offset)
+	}
+}
+
+func TestCancellationIsLeftToTheServer(t *testing.T) {
+	f := &fake{permissions: []string{api.PermCatalogWrite}, cancelErr: &api.Problem{Status: 403, Code: "forbidden", Detail: "not yours"}}
+	m := start(t, f, 100, 30)
+	m = goTo(t, m, route{page: pageProcessing})
+	m = press(t, m, "c", "y")
+	f.mu.Lock()
+	sent := len(f.cancelled)
+	f.mu.Unlock()
+	if sent != 1 || !m.notice.err || !strings.Contains(m.notice.text, "you don't have access (not yours)") {
+		t.Fatalf("server refusal not shown: sent=%d %+v", sent, m.notice)
 	}
 }

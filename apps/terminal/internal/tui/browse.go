@@ -520,23 +520,24 @@ func abs(n int) int {
 
 func (m *Model) browseKey(msg tea.KeyMsg) tea.Cmd {
 	_, elems := m.browse(m.frame().inner)
+	body := m.frame().body
+	// vertical moves focus by rows; with nothing further it scrolls instead,
+	// so text below the last element (or a page without any) stays reachable.
 	vertical := func(dr, times int) {
 		for range times {
 			next := nearest(elems, m.sel, dr, 0)
 			if next < 0 {
+				m.offset += dr * max(body/2, 1)
+				m.reveal = false
 				return
 			}
-			m.sel = next
+			m.sel, m.reveal = next, true
 		}
 	}
-	rows := max(m.frame().body/8, 1)
+	rows := max(body/8, 1)
 	switch {
 	case key.Matches(msg, keys.Up):
-		if next := nearest(elems, m.sel, -1, 0); next >= 0 {
-			m.sel = next
-		} else {
-			m.offset = 0
-		}
+		vertical(-1, 1)
 	case key.Matches(msg, keys.Down):
 		vertical(1, 1)
 	case key.Matches(msg, keys.PageUp):
@@ -544,16 +545,16 @@ func (m *Model) browseKey(msg tea.KeyMsg) tea.Cmd {
 	case key.Matches(msg, keys.PageDown):
 		vertical(1, rows)
 	case key.Matches(msg, keys.Top):
-		m.sel, m.offset = 0, 0
+		m.sel, m.offset, m.reveal = 0, 0, true
 	case key.Matches(msg, keys.Bottom):
-		m.sel = max(len(elems)-1, 0)
+		m.sel, m.reveal = max(len(elems)-1, 0), true
 	case key.Matches(msg, keys.Right):
 		if next := nearest(elems, m.sel, 0, 1); next >= 0 {
-			m.sel = next
+			m.sel, m.reveal = next, true
 		}
 	case key.Matches(msg, keys.Left):
 		if next := nearest(elems, m.sel, 0, -1); next >= 0 {
-			m.sel = next
+			m.sel, m.reveal = next, true
 		} else {
 			m.focus, m.navSel = focusNav, m.navIndex()
 		}

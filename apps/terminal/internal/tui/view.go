@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -91,7 +92,7 @@ func (m *Model) sync() {
 	case kindBrowse:
 		lines, elems := m.browse(f.inner)
 		m.sel = min(max(m.sel, 0), max(len(elems)-1, 0))
-		if m.sel < len(elems) {
+		if m.sel < len(elems) && m.reveal {
 			e := elems[m.sel]
 			top := e.head
 			if e.bottom-top+1 > f.body {
@@ -109,15 +110,18 @@ func (m *Model) sync() {
 		m.vp.SetContent(strings.Join(lines, "\n"))
 		m.vp.SetYOffset(m.offset)
 	case kindTable:
+		// The table is given only the visible window of rows, so its own
+		// scrolling never applies and the selection is always on screen.
 		cols, rows, _ := m.tabular(f.inner)
-		c := m.table.Cursor()
+		visible := min(len(rows), max(f.body-4, 1))
+		m.tsel = min(max(m.tsel, 0), max(len(rows)-1, 0))
+		m.toff = min(max(m.toff, m.tsel-visible+1, 0), m.tsel)
 		m.table.SetRows(nil)
 		m.table.SetColumns(cols)
-		m.table.SetRows(rows)
-		m.table.SetCursor(max(c, 0))
+		m.table.SetRows(rows[m.toff:min(m.toff+visible, len(rows))])
+		m.table.SetHeight(visible + 1)
 		m.table.SetWidth(f.inner)
-		// The table ends at its last row, so the row detail sits below it.
-		m.table.SetHeight(min(max(f.body-2, 2), len(rows)+1))
+		m.table.SetCursor(m.tsel - m.toff)
 	case kindText:
 		follow := m.vp.AtBottom()
 		m.vp.Width, m.vp.Height = f.inner, f.body
@@ -290,7 +294,16 @@ func (m Model) body(f frame) []string {
 		if len(m.table.Rows()) == 0 {
 			return m.empty(m.tableEmpty())
 		}
-		return append(strings.Split(m.table.View(), "\n"), "", truncate(m.detail(), f.inner))
+		lines := strings.Split(m.table.View(), "\n")
+		_, rows, _ := m.tabular(f.inner)
+		if len(rows) > len(m.table.Rows()) {
+			lines = append(lines, faintStyle.Render(fmt.Sprintf("%d–%d of %d", m.toff+1, m.toff+len(m.table.Rows()), len(rows))))
+		}
+		lines = append(lines, "")
+		for _, l := range words(m.detail(), f.inner) {
+			lines = append(lines, mutedStyle.Render(l))
+		}
+		return lines
 	}
 	return strings.Split(m.vp.View(), "\n")
 }
@@ -478,6 +491,10 @@ func (m Model) statusbar(width int) string {
 	}
 	gap := width - ansi.StringWidth(left) - ansi.StringWidth(right) - 1
 	if gap < 1 {
+		right = h.ShortHelpView([]key.Binding{keys.Help})
+		gap = width - ansi.StringWidth(left) - ansi.StringWidth(right) - 1
+	}
+	if gap < 1 {
 		return truncate(left, width)
 	}
 	return left + strings.Repeat(" ", gap) + right
@@ -503,7 +520,7 @@ func (m Model) shortHelp() []key.Binding {
 	case kindTable:
 		b := []key.Binding{move("select")}
 		switch {
-		case m.route.page == pageProcessing && m.me() != nil && m.me().Allows(api.PermProcessingRequest):
+		case m.route.page == pageProcessing && len(m.table.Rows()) > 0:
 			b = append(b, keys.Cancel)
 		case m.route.page == pageProfiles:
 			b = append(b, keys.Choose)
