@@ -54,6 +54,10 @@ pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 /// Stream copy of H.264 with audio converted to stereo AAC.
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
+/// How far before a generation's start a burned-subtitle conversion begins
+/// reading, so a bitmap cue that started earlier and is still showing is
+/// drawn. Cues established longer before the start are not restored.
+pub const BURN_LOOKBACK_MS: u64 = 20_000;
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
 /// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
@@ -441,7 +445,17 @@ fn arguments(
     ]
     .map(str::to_owned)
     .to_vec();
-    args.push(format!("{}.{:03}", start_ms / 1000, start_ms % 1000));
+    // A burned bitmap cue is established by a display set that may precede
+    // the start: read BURN_LOOKBACK_MS earlier and trim the output to the
+    // start, so cues still showing there are drawn. Output time zero is the
+    // start either way.
+    let burn = burn.filter(|_| !copy);
+    let input_ms = if burn.is_some() {
+        start_ms.saturating_sub(BURN_LOOKBACK_MS)
+    } else {
+        start_ms
+    };
+    args.push(format!("{}.{:03}", input_ms / 1000, input_ms % 1000));
     if copy {
         // Keep source timestamps: copied video starts at the preceding keyframe,
         // and its media time is timeline time (the route requires a zero start).
@@ -455,15 +469,21 @@ fn arguments(
         ]
         .map(str::to_owned),
     );
+    if start_ms > input_ms {
+        let trim = start_ms - input_ms;
+        args.push("-ss".into());
+        args.push(format!("{}.{:03}", trim / 1000, trim % 1000));
+    }
     const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
-    // A burned bitmap subtitle is overlaid on the source-size video before it
-    // is scaled, so subpicture and picture share one canvas.
-    let burn = burn.filter(|_| !copy);
+    // A burned bitmap subtitle's canvas is scaled to the source video's size
+    // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
+    // overlaid before the output is scaled, so nothing is cropped.
     match burn {
         Some(index) => {
             args.push("-filter_complex".into());
             args.push(format!(
-                "[0:v:0][0:s:{index}]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
+                "[0:s:{index}][0:v:0]scale2ref=w=rw:h=rh[sub][base];\
+                 [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
         }

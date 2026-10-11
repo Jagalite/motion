@@ -3565,7 +3565,8 @@ async fn bitmap_subtitles_are_burned_into_conversions_only() {
     let base = f.dir.path().join("base.mp4");
     std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
     let sup = f.dir.path().join("box.sup");
-    std::fs::write(&sup, pgs_box(320, 240, (40, 40, 240, 60), 0, 6000)).unwrap();
+    // A 640x480 canvas on 320x240 video: the box maps to (40, 40, 240, 60).
+    std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 0, 10000)).unwrap();
     f.media(
         "film.mkv",
         &[
@@ -3638,57 +3639,91 @@ async fn bitmap_subtitles_are_burned_into_conversions_only() {
             reply.bytes
         }
     };
-    let base_url = format!("/api/v2/streams/{id}/1");
-    let fragment = f.dir.path().join("burned.mp4");
-    std::fs::write(
-        &fragment,
-        [
-            get(format!("{base_url}/variants/main/init.mp4")).await,
-            get(format!("{base_url}/segments/0.m4s")).await,
-        ]
-        .concat(),
-    )
-    .unwrap();
-    let frame = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&fragment)
-        // FFmpeg presents a subpicture from just after the first frame on.
-        .args([
-            "-ss",
-            "1",
-            "-frames:v",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "gray",
-            "-",
-        ])
-        .output()
-        .unwrap()
-        .stdout;
-    assert_eq!(frame.len(), 320 * 240);
-    let mean = |x0: usize, y0: usize, w: usize, h: usize| {
-        let mut sum = 0usize;
-        for y in y0..y0 + h {
-            sum += frame[y * 320 + x0..y * 320 + x0 + w]
-                .iter()
-                .map(|&p| p as usize)
-                .sum::<usize>();
+    // Mean luma inside the box (inset from its edges) and below it, `at`
+    // seconds into a generation's first segment.
+    let means = |generation_id: String, at: &'static str| {
+        let get = &get;
+        let f = &f;
+        async move {
+            let base_url = format!("/api/v2/streams/{generation_id}");
+            let fragment = f
+                .dir
+                .path()
+                .join(format!("burned-{}.mp4", generation_id.replace('/', "-")));
+            std::fs::write(
+                &fragment,
+                [
+                    get(format!("{base_url}/variants/main/init.mp4")).await,
+                    get(format!("{base_url}/segments/0.m4s")).await,
+                ]
+                .concat(),
+            )
+            .unwrap();
+            let frame = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&fragment)
+                .args([
+                    "-ss",
+                    at,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(frame.len(), 320 * 240);
+            let mean = |x0: usize, y0: usize| {
+                let mut sum = 0usize;
+                for y in y0..y0 + 40 {
+                    sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                        .iter()
+                        .map(|&p| p as usize)
+                        .sum::<usize>();
+                }
+                sum / (220 * 40)
+            };
+            (mean(50, 50), mean(50, 150))
         }
-        sum / (w * h)
     };
-    // Inside the box (inset from its edges) is white; below it is the picture.
-    assert!(
-        mean(50, 50, 220, 40) > 225,
-        "box mean {}",
-        mean(50, 50, 220, 40)
-    );
-    assert!(
-        mean(50, 150, 220, 40) < 200,
-        "picture mean {}",
-        mean(50, 150, 220, 40)
-    );
+    // From the start (FFmpeg presents a subpicture from just after the first
+    // frame on): the box, scaled from its larger canvas, is white.
+    let (inside, below) = means(format!("{id}/1"), "1").await;
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    // Starting at 8 s, inside the 0-10 s cue: the cue is still drawn although
+    // its display set precedes the start (2 s GOP: input seeking skips it).
+    let later = plan(input("auto", &["text", "burned"])).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-subtitle-002"),
+            json!({"plan_token": later.body["plan_token"], "start_ms": 8000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 8000
+        })
+        .await;
+    assert_eq!(ready["active"]["media_time_origin_ms"], 8000, "{ready}");
+    let (inside, below) = means(format!("{id}/1"), "0.5").await;
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
     let closed = f
         .call(
             "DELETE",
