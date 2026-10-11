@@ -266,7 +266,6 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    let player = path.starts_with("/play/");
     let can_manage = who
         .as_ref()
         .is_some_and(|who| !manage_links(who).is_empty());
@@ -300,7 +299,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             </head>
             <body>
                 <a class="skip-link" href="#main">"Skip to content"</a>
-                <div class=(if player { "shell is-player" } else { "shell" })>
+                <div class="shell">
                     <aside class="sidebar">
                         <a class="brand" href=(href!(home))>
                             <span class="brand-mark" aria-hidden="true">

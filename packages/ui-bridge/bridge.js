@@ -183,18 +183,19 @@ document.addEventListener('change', event => {
   location.reload();
 });
 
-// A back link uses history only when an earlier page of this tab was Motion's,
-// so it never leaves the app; otherwise it follows its server-rendered href.
-const visitedKey = 'motion:visited';
-let cameFromMotion = false;
-try {
-  cameFromMotion = sessionStorage.getItem(visitedKey) === '1';
-  sessionStorage.setItem(visitedKey, '1');
-} catch { /* storage unavailable: back links follow their href */ }
+// A back link uses history only when the entry right before this one is a
+// Motion page (the Navigation API lists only this origin's contiguous
+// entries), so it never leaves the app; otherwise it follows its href.
+function previousEntryIsMotion() {
+  const index = globalThis.navigation?.currentEntry?.index ?? -1;
+  if (index < 1) return false;
+  const previous = navigation.entries()[index - 1]?.url;
+  return Boolean(previous) && new URL(previous).origin === location.origin;
+}
 document.addEventListener('click', event => {
   const link = event.target?.closest?.('a[data-back="history"]');
-  if (!link || !cameFromMotion || event.defaultPrevented || event.button !== 0
-    || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (!link || event.defaultPrevented || event.button !== 0
+    || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !previousEntryIsMotion()) return;
   event.preventDefault();
   history.back();
 });

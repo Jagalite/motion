@@ -555,8 +555,15 @@ async fn phone_shell_installs_and_navigates_by_tabs() {
     let (_, _, sources) = get_page(&admin, "/sources").await;
     assert!(sources.contains(r#"class="tab-link is-current" href="/manage""#));
 
+    // Phone CSS hides the app frame only around a rendered player
+    // (.shell:has(.player-page)), so a playback error keeps its navigation.
     let (_, _, player) = get_page(&viewer, "/play/tl1").await;
-    assert!(player.contains(r#"<div class="shell is-player">"#));
+    assert!(player.contains(r#"class="player-page""#));
+    let (status, _, missing) = get_page(&viewer, "/play/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !missing.contains(r#"class="player-page""#) && missing.contains(r#"<nav class="tabbar""#)
+    );
 }
 
 #[tokio::test]
