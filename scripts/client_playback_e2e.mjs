@@ -562,7 +562,10 @@ async function main() {
     let result;
     if (engine === 'electron') {
       // The Electron main process runs the scenario itself (see header).
-      const electron = createRequire(join(root, 'apps/desktop/package.json'))('electron');
+      const electron = process.env.MOTION_ELECTRON_BINARY
+        ? resolve(process.env.MOTION_ELECTRON_BINARY)
+        : createRequire(join(root, 'apps/desktop/package.json'))('electron');
+      receipt.electronExecutableSha256 = sha256(readFileSync(electron));
       const resultFile = join(out, 'electron-result.json');
       // A host that is itself Electron may export ELECTRON_RUN_AS_NODE.
       const {ELECTRON_RUN_AS_NODE: _ignored, ...env} = process.env;
