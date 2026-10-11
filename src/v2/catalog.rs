@@ -35,20 +35,33 @@ pub fn routes() -> Router<App> {
     Router::new()
         .route("/catalog/items", get(list_items).post(create_item))
         .route("/catalog/search", get(search))
+        .route("/catalog/items/{item_id}/files", get(list_item_files))
+        .route("/admin/files", get(list_admin_files))
         .route("/catalog/items/{item_id}", get(get_item).put(replace_item))
         .route(
             "/catalog/items/{item_id}/editions",
             get(list_editions).post(create_edition),
         )
-        .route("/catalog/items/{item_id}/timelines", get(list_timelines))
+        .route(
+            "/catalog/items/{item_id}/timelines",
+            get(list_timelines).post(create_timeline),
+        )
         .route("/catalog/timelines/{timeline_id}", get(get_timeline))
         .route(
             "/catalog/timelines/{timeline_id}/versions",
-            get(list_versions),
+            get(list_versions).post(create_version),
         )
         .route("/catalog/items/{item_id}/merge-plans", post(preview_merge))
         .route("/catalog/items/{item_id}/split-plans", post(preview_split))
         .route("/catalog/reconciliations", post(commit_reconciliation))
+        .route(
+            "/catalog/items/{item_id}/relationships",
+            get(list_relationships).post(create_relationship),
+        )
+        .route(
+            "/catalog/relationships/{id}",
+            get(get_relationship).delete(delete_relationship),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,61 +1712,10 @@ pub async fn list_versions(
     let ids = version_ids(&mut tx, &scope, &id, q.after()?, i64::from(limit) + 1).await?;
     let mut values = Vec::new();
     for version in ids {
-        let (revision, label, origin, equivalence): (i64, String, String, String) = sqlx::query_as(
-            "SELECT revision,label,origin,equivalence FROM media_versions WHERE id=?",
-        )
-        .bind(&version)
-        .fetch_one(&mut *tx)
-        .await?;
-        type BindingRow = (String, String, i64, Option<i64>, Option<i64>, bool, String);
-        let bindings: Vec<BindingRow>=sqlx::query_as("SELECT b.file_id,b.file_revision,b.part,b.start_ms,b.end_ms,f.available,f.revision FROM version_files b JOIN media_files f ON f.id=b.file_id WHERE b.version_id=? ORDER BY b.part LIMIT 101")
-            .bind(&version).fetch_all(&mut *tx).await?;
-        if bindings.len() > 100 {
-            return Err(Problem::new(
-                StatusCode::CONFLICT,
-                "version_too_large",
-                "Version exceeds the public representation bound",
-            ));
-        }
-        let core_bindings: Vec<_> = bindings
-            .iter()
-            .map(
-                |(file, revision, part, start, end, _, _)| playscale_core::identity::Binding {
-                    file_id: file.clone(),
-                    revision: revision.clone(),
-                    part: *part as u32,
-                    start_ms: start.map(|v| v as u64),
-                    end_ms: end.map(|v| v as u64),
-                },
-            )
-            .collect();
-        let mut occurrences: Vec<_> = bindings
-            .iter()
-            .map(
-                |(file, _, _, _, _, available, current)| playscale_core::identity::Occurrence {
-                    file_id: file.clone(),
-                    revision: current.clone(),
-                    available: *available,
-                },
-            )
-            .collect();
-        let (clause, all, scope_ids) = scope_clause(&scope, "f.library_id");
-        for binding in &core_bindings {
-            let copy:Option<(String,String)>=sqlx::query_as(&format!("SELECT f.id,f.revision FROM media_files f WHERE f.available=1 AND f.revision=? AND {clause} ORDER BY f.id LIMIT 1"))
-                .bind(&binding.revision).bind(all).bind(&scope_ids).fetch_optional(&mut *tx).await?;
-            if let Some((file_id, revision)) = copy {
-                occurrences.push(playscale_core::identity::Occurrence {
-                    file_id,
-                    revision,
-                    available: true,
-                });
-            }
-        }
-        let available = !core_bindings.is_empty()
-            && playscale_core::identity::version_availability(&core_bindings, &occurrences)
-                == playscale_core::identity::Availability::Available;
-        let files:Vec<_>=bindings.into_iter().map(|(file,revision,part,start,end,_,_)|serde_json::json!({"file":{"file_id":file,"file_revision":revision},"part":part,"start_ms":start,"end_ms":end})).collect();
-        values.push((version.clone(),serde_json::json!({"id":version,"revision":revision.to_string(),"timeline_id":id,"label":label,"origin":origin,"files":files,"timeline_equivalence":equivalence,"availability":if available {"available"} else {"unavailable"}})));
+        values.push((
+            version.clone(),
+            version_body(&mut tx, &scope, &version, &id).await?,
+        ));
     }
     let value = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;
@@ -1773,4 +1735,491 @@ pub(crate) async fn require_edition(
     } else {
         Err(Problem::not_found())
     }
+}
+
+async fn version_body(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    version: &str,
+    id: &str,
+) -> Result<Value, Problem> {
+    let (revision, label, origin, equivalence): (i64, String, String, String) =
+        sqlx::query_as("SELECT revision,label,origin,equivalence FROM media_versions WHERE id=?")
+            .bind(&version)
+            .fetch_one(&mut *conn)
+            .await?;
+    type BindingRow = (String, String, i64, Option<i64>, Option<i64>, bool, String);
+    let bindings: Vec<BindingRow>=sqlx::query_as("SELECT b.file_id,b.file_revision,b.part,b.start_ms,b.end_ms,f.available,f.revision FROM version_files b JOIN media_files f ON f.id=b.file_id WHERE b.version_id=? ORDER BY b.part LIMIT 101")
+            .bind(&version).fetch_all(&mut *conn).await?;
+    if bindings.len() > 100 {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "version_too_large",
+            "Version exceeds the public representation bound",
+        ));
+    }
+    let core_bindings: Vec<_> = bindings
+        .iter()
+        .map(
+            |(file, revision, part, start, end, _, _)| playscale_core::identity::Binding {
+                file_id: file.clone(),
+                revision: revision.clone(),
+                part: *part as u32,
+                start_ms: start.map(|v| v as u64),
+                end_ms: end.map(|v| v as u64),
+            },
+        )
+        .collect();
+    let mut occurrences: Vec<_> = bindings
+        .iter()
+        .map(
+            |(file, _, _, _, _, available, current)| playscale_core::identity::Occurrence {
+                file_id: file.clone(),
+                revision: current.clone(),
+                available: *available,
+            },
+        )
+        .collect();
+    let (clause, all, scope_ids) = scope_clause(scope, "f.library_id");
+    for binding in &core_bindings {
+        let copy:Option<(String,String)>=sqlx::query_as(&format!("SELECT f.id,f.revision FROM media_files f WHERE f.available=1 AND f.revision=? AND {clause} ORDER BY f.id LIMIT 1"))
+                .bind(&binding.revision).bind(all).bind(&scope_ids).fetch_optional(&mut *conn).await?;
+        if let Some((file_id, revision)) = copy {
+            occurrences.push(playscale_core::identity::Occurrence {
+                file_id,
+                revision,
+                available: true,
+            });
+        }
+    }
+    let available = !core_bindings.is_empty()
+        && playscale_core::identity::version_availability(&core_bindings, &occurrences)
+            == playscale_core::identity::Availability::Available;
+    let files:Vec<_>=bindings.into_iter().map(|(file,revision,part,start,end,_,_)|serde_json::json!({"file":{"file_id":file,"file_revision":revision},"part":part,"start_ms":start,"end_ms":end})).collect();
+
+    Ok(
+        serde_json::json!({"id":version,"revision":revision.to_string(),"timeline_id":id,"label":label,"origin":origin,"files":files,"timeline_equivalence":equivalence,"availability":if available {"available"} else {"unavailable"}}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineInput {
+    edition_id: String,
+    duration_ms: Option<u64>,
+    order_group_id: Option<String>,
+    order_position: Option<u32>,
+}
+pub async fn create_timeline(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<TimelineInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let key = idempotency_key(&headers)?;
+    let input = body.value;
+    if input.duration_ms.is_some_and(|n| n > 9_007_199_254_740_991)
+        || input.order_group_id.is_some() != input.order_position.is_some()
+    {
+        return Err(Problem::invalid(
+            "invalid_timeline",
+            "Invalid duration or incomplete ordering",
+        ));
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let row = curatable_item(&mut tx, &scope, &id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createTimeline",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), &body.digest, now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    access::revise(row.revision as u64, expected, true)?;
+    let timeline = crate::curation::create_timeline_in(
+        &mut tx,
+        &id,
+        &input.edition_id,
+        expected,
+        input.duration_ms,
+    )
+    .await
+    .map_err(curation_problem)?;
+    if let (Some(group), Some(position)) = (input.order_group_id, input.order_position) {
+        let (revision,owner):(i64,String)=sqlx::query_as("SELECT g.revision,e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?").bind(&group).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+        curatable_item(&mut tx, &scope, &owner, false).await?;
+        crate::curation::place_timeline_in(&mut tx, &timeline, &group, position, revision as u64)
+            .await
+            .map_err(curation_problem)?;
+    }
+    let row: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&timeline)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision = row.revision as u64;
+    let value = timeline_body(&mut tx, &scope, row).await?;
+    record
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::CREATED,
+            Some(&value),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::CREATED, &value, revision))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundFile {
+    file: VersionFileRef,
+    part: u32,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionFileRef {
+    file_id: String,
+    file_revision: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionInput {
+    timeline_id: String,
+    label: String,
+    files: Vec<BoundFile>,
+    timeline_equivalence: playscale_core::identity::Equivalence,
+}
+pub async fn create_version(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<VersionInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let key = idempotency_key(&headers)?;
+    let input = body.value;
+    if input.timeline_id != id
+        || input.files.is_empty()
+        || input.files.len() > 100
+        || input.label.len() > 200
+    {
+        return Err(Problem::invalid(
+            "invalid_version",
+            "Invalid target, label or bindings",
+        ));
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let timeline: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(Problem::not_found)?;
+    let item = curatable_item(&mut tx, &scope, &timeline.item_id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createVersion",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), &body.digest, now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    access::revise(timeline.revision as u64, expected, true)?;
+    let mut bindings = Vec::new();
+    for binding in input.files {
+        let owner: String = sqlx::query_scalar(
+            "SELECT e.item_id FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE f.id=?",
+        )
+        .bind(&binding.file.file_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(Problem::not_found)?;
+        curatable_item(&mut tx, &scope, &owner, false).await?;
+        if binding
+            .start_ms
+            .into_iter()
+            .chain(binding.end_ms)
+            .any(|n| n > 9_007_199_254_740_991)
+        {
+            return Err(Problem::invalid(
+                "invalid_interval",
+                "Interval exceeds safe integer bound",
+            ));
+        }
+        bindings.push(playscale_core::identity::Binding {
+            file_id: binding.file.file_id,
+            revision: binding.file.file_revision,
+            part: binding.part,
+            start_ms: binding.start_ms,
+            end_ms: binding.end_ms,
+        });
+    }
+    let request = playscale_core::identity::VersionRequest {
+        bindings,
+        equivalence: input.timeline_equivalence,
+    };
+    let version = crate::curation::create_version_explicit_in(
+        &mut tx,
+        &id,
+        &input.label,
+        &request,
+        item.revision as u64,
+    )
+    .await
+    .map_err(curation_problem)?;
+    let value = version_body(&mut tx, &scope, &version, &id).await?;
+    record
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::CREATED,
+            Some(&value),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::CREATED, &value, 1))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipInput {
+    source_item_id: String,
+    target_item_id: String,
+    kind: playscale_core::identity::RelationshipKind,
+    position: Option<u32>,
+}
+async fn relationship(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    id: &str,
+) -> Result<Value, Problem> {
+    let (revision,source,target,kind,position):(i64,String,String,String,Option<i64>)=sqlx::query_as("SELECT revision,source_item_id,target_item_id,kind,position FROM item_relationships WHERE id=?").bind(id).fetch_optional(&mut *conn).await?.ok_or_else(Problem::not_found)?;
+    load_item(conn, scope, &source, false).await?;
+    load_item(conn, scope, &target, false).await?;
+    Ok(
+        serde_json::json!({"id":id,"revision":revision.to_string(),"source_item_id":source,"target_item_id":target,"kind":kind,"position":position}),
+    )
+}
+pub async fn create_relationship(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<RelationshipInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let key = idempotency_key(&headers)?;
+    let input = body.value;
+    if input.source_item_id != id {
+        return Err(Problem::invalid(
+            "source_mismatch",
+            "Path must name source_item_id",
+        ));
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let row = curatable_item(&mut tx, &scope, &id, false).await?;
+    curatable_item(&mut tx, &scope, &input.target_item_id, false).await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createRelationship",
+        target: &id,
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(stored.as_ref().map(|s| &s.record), &body.digest, now())?
+        == Idempotent::Replay
+    {
+        return Ok(replayed(stored.unwrap()));
+    }
+    access::revise(row.revision as u64, expected, true)?;
+    let relation = crate::curation::create_relationship_in(
+        &mut tx,
+        &id,
+        &input.target_item_id,
+        input.kind,
+        input.position,
+    )
+    .await
+    .map_err(curation_problem)?;
+    let value = relationship(&mut tx, &scope, &relation.id).await?;
+    record
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::CREATED,
+            Some(&value),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::CREATED, &value, 1))
+}
+pub async fn get_relationship(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let mut tx = app.db.begin().await?;
+    let value = relationship(&mut tx, &access::catalog_scope(&caller.principal), &id).await?;
+    tx.commit().await?;
+    Ok(tagged(
+        StatusCode::OK,
+        &value,
+        value["revision"].as_str().unwrap().parse().unwrap(),
+    ))
+}
+pub async fn delete_relationship(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let value = relationship(&mut tx, &scope, &id).await?;
+    for field in ["source_item_id", "target_item_id"] {
+        curatable_item(&mut tx, &scope, value[field].as_str().unwrap(), false).await?;
+    }
+    access::revise(
+        value["revision"].as_str().unwrap().parse().unwrap(),
+        expected,
+        true,
+    )?;
+    crate::curation::delete_relationship_in(&mut tx, &id, expected)
+        .await
+        .map_err(curation_problem)?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+pub async fn list_relationships(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let mut tx = app.db.begin().await?;
+    let scope = access::catalog_scope(&caller.principal);
+    load_item(&mut tx, &scope, &id, false).await?;
+    let limit = q.limit()?;
+    let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM item_relationships WHERE (source_item_id=? OR target_item_id=?) AND id>? ORDER BY id").bind(&id).bind(&id).bind(q.after()?).fetch_all(&mut *tx).await?;
+    let mut rows = Vec::new();
+    for id in ids {
+        match relationship(&mut tx, &scope, &id).await {
+            Ok(value) => rows.push((id, value)),
+            Err(e) if e.status == StatusCode::NOT_FOUND => continue,
+            Err(e) => return Err(e),
+        }
+        if rows.len() > limit as usize {
+            break;
+        }
+    }
+    let value = page(&mut tx, &caller.principal, rows, limit).await?;
+    tx.commit().await?;
+    Ok(Json(value).into_response())
+}
+
+pub async fn list_item_files(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> Result<Response, Problem> {
+    files_page(app, caller, Some(id), q).await
+}
+pub async fn list_admin_files(
+    State(app): State<App>,
+    caller: Caller,
+    Query(q): Query<PageQuery>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::SourcesManage)?;
+    files_page(app, caller, None, q).await
+}
+async fn files_page(
+    app: App,
+    caller: Caller,
+    item: Option<String>,
+    q: PageQuery,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let mut tx = app.db.begin().await?;
+    let scope = access::catalog_scope(&caller.principal);
+    if let Some(id) = &item {
+        load_item(&mut tx, &scope, id, true).await?;
+    }
+    let limit = q.limit()?;
+    let (clause, all, ids) = scope_clause(&scope, "f.library_id");
+    type FileRow = (String, String, String, i64, Option<f64>, bool, String);
+    let rows:Vec<FileRow>=sqlx::query_as(&format!("SELECT f.id,f.revision,f.library_id,f.bytes,f.duration_seconds,f.available,f.tracks_json FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE (?1 IS NULL OR e.item_id=?1) AND f.id>?2 AND {clause} ORDER BY f.id LIMIT ?"))
+        .bind(item).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let mut values = Vec::new();
+    for (id, revision, source, bytes, duration, available, tracks) in rows {
+        let tracks: Vec<crate::db::Track> =
+            serde_json::from_str(&tracks).map_err(Problem::internal)?;
+        if tracks.len() > 256 {
+            return Err(Problem::invalid(
+                "too_many_tracks",
+                "File exceeds public track bound",
+            ));
+        }
+        let mut indices = BTreeMap::new();
+        let tracks:Vec<_>=tracks.into_iter().map(|t|{
+            let (kind,prefix)=match t.kind.as_str(){"audio"=>("audio","a"),"subtitle"=>("subtitle","s"),"video"=>("video","v"),"attachment"=>("attachment","x"),_=>("other","o")};
+            let index=indices.entry(prefix).or_insert(0);let id=format!("{prefix}{index}");*index+=1;
+            serde_json::json!({"id":id,"component_id":Value::Null,"kind":kind,"codec":t.codec,"language":t.language,"title":t.title,"forced":t.forced.unwrap_or(false),"default":t.default_track.unwrap_or(false),"sdh":t.hearing_impaired.unwrap_or(false),"channels":Value::Null,"channel_layout":Value::Null,"width":t.width.filter(|n|*n>0),"height":t.height.filter(|n|*n>0),"bit_depth":Value::Null,"transfer":t.color_transfer})
+        }).collect();
+        let digest = if revision.len() == 64 && revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(format!("sha256:{revision}"))
+        } else {
+            None
+        };
+        let value = serde_json::json!({"id":id,"revision":revision,"source_id":source,"size_bytes":bytes.to_string(),"verification":if available {"observed"}else{"stale"},"digest":digest,"duration_ms":duration.filter(|d|d.is_finite()&&*d>=0.0).map(|d|(d*1000.0).round() as u64),"availability":if available {"available"}else{"unavailable"},"tracks":tracks});
+        values.push((id, value));
+    }
+    let value = page(&mut tx, &caller.principal, values, limit).await?;
+    tx.commit().await?;
+    Ok(Json(value).into_response())
 }

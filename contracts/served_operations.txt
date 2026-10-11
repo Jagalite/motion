@@ -112,3 +112,11 @@ createScan
 listScans
 getScan
 cancelScan
+createTimeline
+createVersion
+createRelationship
+listItemRelationships
+getRelationship
+deleteRelationship
+listItemFiles
+listAdminFiles

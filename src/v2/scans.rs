@@ -70,7 +70,36 @@ async fn wire(tx: &mut sqlx::SqliteConnection, id: &str) -> Result<Value, Proble
             .fetch_optional(&mut *tx)
             .await?
         } else if s.status == playscale_core::demands::DemandStatus::Pending {
-            sqlx::query_as("SELECT id,attempt,phase,reused_files,inspected_files FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY CASE phase WHEN 'running' THEN 0 ELSE 1 END,created_at,id LIMIT 1").bind(&s.source_id).fetch_optional(&mut *tx).await?
+            let (barrier, verify): (i64, bool) = sqlx::query_as(
+                "SELECT barrier,verify FROM scan_demands WHERE request_id=? AND source_id=?",
+            )
+            .bind(id)
+            .bind(&s.source_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let demand = playscale_core::demands::Demand {
+                id: String::new(),
+                barrier: barrier as u64,
+                verify,
+                require_complete: view.require_complete,
+                status: s.status,
+            };
+            let candidates:Vec<(String,i64,String,i64,i64,bool,Option<i64>,bool)>=sqlx::query_as("SELECT id,attempt,phase,reused_files,inspected_files,full_scan,started_barrier,direct_request FROM jobs WHERE library_id=? AND phase IN ('queued','running','cancelling') ORDER BY created_at,id").bind(&s.source_id).fetch_all(&mut *tx).await?;
+            let mut selected = None;
+            for (id, generation, phase, reused, inspected, verify, barrier, direct) in candidates {
+                let attempt = playscale_core::demands::Attempt {
+                    job: id.clone(),
+                    phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
+                    verify,
+                    started_barrier: barrier.map(|b| b as u64),
+                    direct,
+                };
+                if playscale_core::demands::can_satisfy(&attempt, &demand) {
+                    selected = Some((id, generation, phase, reused, inspected));
+                    break;
+                }
+            }
+            selected
         } else {
             None
         };
@@ -95,7 +124,7 @@ async fn wire(tx: &mut sqlx::SqliteConnection, id: &str) -> Result<Value, Proble
             playscale_core::demands::DemandStatus::Failed => "failed",
             playscale_core::demands::DemandStatus::Cancelled => "cancelled",
         };
-        sources.push(json!({"source_id":s.source_id,"attempt_generation":generation,"status":status,"complete_directories":s.complete_directories,"incomplete_directories":s.incomplete_directories,"observed_files":observed,"verified_files":verified,"error_codes":s.error.into_iter().collect::<Vec<_>>()}));
+        sources.push(json!({"source_id":s.source_id,"attempt_generation":generation,"status":status,"complete_directories":s.complete_directories.to_string(),"incomplete_directories":s.incomplete_directories.to_string(),"observed_files":observed.to_string(),"verified_files":verified.to_string(),"error_codes":s.error.into_iter().collect::<Vec<_>>()}));
     }
     jobs.sort();
     jobs.dedup();

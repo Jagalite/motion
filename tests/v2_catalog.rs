@@ -1705,3 +1705,162 @@ async fn scans_are_atomic_idempotent_scoped_demands() {
     assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
     assert!(listed.body["next_cursor"].is_string());
 }
+
+#[tokio::test]
+async fn scan_followup_reports_eligible_attempt_and_decimal_counters() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let path = format!("/api/v2/libraries/{}/scans", f.a);
+    let first = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-followup-00001"),
+            ],
+        )
+        .await;
+    let old = first.body["job_ids"][0].as_str().unwrap();
+    sqlx::query("UPDATE jobs SET phase='running',attempt=1,started_barrier=1 WHERE id=?")
+        .bind(old)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let next = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-followup-00002"),
+            ],
+        )
+        .await;
+    assert_eq!(next.status, StatusCode::ACCEPTED, "{}", next.body);
+    assert_eq!(next.body["status"], "queued");
+    assert_ne!(next.body["job_ids"][0], old);
+    for field in [
+        "complete_directories",
+        "incomplete_directories",
+        "observed_files",
+        "verified_files",
+    ] {
+        assert_eq!(next.body["sources"][0][field], "0");
+    }
+}
+
+#[tokio::test]
+async fn public_structure_writes_preserve_revisions_and_retry_identity() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    f.item("film", "Film", &[(&f.a, "r1")]).await;
+    f.item("extra", "Extra", &[(&f.a, "r2")]).await;
+    let read = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let etag = read.headers["etag"].to_str().unwrap();
+    let input = json!({"edition_id":"film-ed","duration_ms":100000,"order_group_id":null,"order_position":null});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", etag),
+        ("idempotency-key", "timeline-create-00001"),
+    ];
+    let timeline = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/film/timelines",
+            Some(input.clone()),
+            &h,
+        )
+        .await;
+    assert_eq!(timeline.status, StatusCode::CREATED, "{}", timeline.body);
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/catalog/items/film/timelines",
+            Some(input),
+            &h
+        )
+        .await
+        .body,
+        timeline.body
+    );
+    let stale=f.call("POST","/api/v2/catalog/items/film/timelines",Some(json!({"edition_id":"film-ed","duration_ms":null,"order_group_id":null,"order_position":null})),&[("authorization",&auth),("if-match",etag),("idempotency-key","timeline-create-00002")]).await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film/files",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    let file = &files.body["items"][0];
+    assert!(file["size_bytes"].is_string());
+    assert!(file.get("relative_path").is_none());
+    let id = timeline.body["id"].as_str().unwrap();
+    let version = json!({"timeline_id":id,"label":"Original","files":[{"file":{"file_id":file["id"],"file_revision":file["revision"]},"part":1,"start_ms":null,"end_ms":null}],"timeline_equivalence":"declared"});
+    let path = format!("/api/v2/catalog/timelines/{id}/versions");
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", timeline.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "version-create-000001"),
+    ];
+    let created = f.call("POST", &path, Some(version.clone()), &h).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(
+        f.call("POST", &path, Some(version), &h).await.body,
+        created.body
+    );
+    let read = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/extra",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let relation=f.call("POST","/api/v2/catalog/items/extra/relationships",Some(json!({"source_item_id":"extra","target_item_id":"film","kind":"extra_of","position":null})),&[("authorization",&auth),("if-match",read.headers["etag"].to_str().unwrap()),("idempotency-key","relation-create-0001")]).await;
+    assert_eq!(relation.status, StatusCode::CREATED, "{}", relation.body);
+    let path = format!(
+        "/api/v2/catalog/relationships/{}",
+        relation.body["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        f.call("GET", &path, None, &[("authorization", &auth)])
+            .await
+            .body,
+        relation.body
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-0\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+}
