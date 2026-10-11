@@ -189,6 +189,31 @@ pub fn within_cap(bytes: u64, duration_ms: u64, max_bitrate_bps: u64) -> bool {
     bytes.saturating_mul(8_000) <= max_bitrate_bps.saturating_mul(duration_ms)
 }
 
+/// Whether every run of contiguous segments ending with the newest one, whose
+/// total duration is between `min_window_ms` and `max_window_ms` (HLS: 0.5
+/// and 1.5 target durations), stays within the cap. `recent` holds (bytes,
+/// duration) of the generation's segments in order, newest last; runs ending
+/// earlier were checked when their own last segment was published.
+pub fn peak_within_cap(
+    recent: &[(u64, u64)],
+    max_bitrate_bps: u64,
+    min_window_ms: u64,
+    max_window_ms: u64,
+) -> bool {
+    let (mut bytes, mut duration) = (0u64, 0u64);
+    for &(b, d) in recent.iter().rev() {
+        bytes = bytes.saturating_add(b);
+        duration = duration.saturating_add(d);
+        if duration > max_window_ms {
+            break;
+        }
+        if duration >= min_window_ms && !within_cap(bytes, duration, max_bitrate_bps) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether a conversion whose output is at most `output_height` lines and, when
 /// capped, at most `output_max_bitrate` bits/s honors the requested limits. An
 /// uncapped (quality-targeted) encoder cannot promise any bitrate limit.
@@ -1292,5 +1317,30 @@ mod tests {
         assert_eq!(rate_cap(u64::MAX, window), None);
         assert!(within_cap(1_000_000, 4_000, 2_000_000));
         assert!(!within_cap(1_000_001, 4_000, 2_000_000));
+    }
+
+    #[test]
+    fn peak_bitrate_is_checked_over_every_qualifying_window() {
+        let cap = 1_000_000;
+        // A compliant 4 s segment then a 2 s tail that alone is too short to
+        // count, but whose 6 s window with its predecessor is over the cap.
+        assert!(peak_within_cap(&[(450_000, 4_000)], cap, 3_000, 9_000));
+        assert!(!peak_within_cap(
+            &[(450_000, 4_000), (400_000, 2_000)],
+            cap,
+            3_000,
+            9_000
+        ));
+        // A short segment alone is not a window.
+        assert!(peak_within_cap(&[(400_000, 2_000)], cap, 3_000, 9_000));
+        // Windows longer than 1.5 targets are not counted: the oldest segment
+        // here only joins a 12 s run.
+        assert!(peak_within_cap(
+            &[(9_000_000, 4_000), (400_000, 4_000), (400_000, 4_000)],
+            cap,
+            3_000,
+            9_000
+        ));
+        assert!(!peak_within_cap(&[(500_001, 4_000)], cap, 3_000, 9_000));
     }
 }

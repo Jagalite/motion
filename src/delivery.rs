@@ -1044,6 +1044,7 @@ async fn observe(
     operation: Operation,
     copy_start: Option<u64>,
     max_bitrate_bps: Option<u64>,
+    recent: &mut Vec<(u64, u64)>,
 ) -> bool {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -1083,14 +1084,22 @@ async fn observe(
             return false;
         }
         // A capped conversion's peak bitrate is measured, not assumed: every
-        // segment long enough to count toward HLS peak bitrate (at least half
-        // the target duration) must be within the cap.
+        // run of contiguous segments that HLS counts toward peak bitrate (0.5
+        // to 1.5 target durations) and ends with this one must be within the
+        // cap before it is published.
+        let target_ms = target_seconds(operation) * 1000;
+        recent.push((metadata.len(), segment.duration_ms));
+        while recent.len() > 1
+            && recent[1..].iter().map(|(_, d)| d).sum::<u64>() >= target_ms * 3 / 2
+        {
+            recent.remove(0);
+        }
         if let Some(cap) = max_bitrate_bps
-            && segment.duration_ms * 2 >= target_seconds(operation) * 1000
-            && !playscale_core::playback_session::within_cap(
-                metadata.len(),
-                segment.duration_ms,
+            && !playscale_core::playback_session::peak_within_cap(
+                recent,
                 cap,
+                target_ms / 2,
+                target_ms * 3 / 2,
             )
         {
             tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), duration_ms = segment.duration_ms, cap, "segment exceeds the bitrate cap");
@@ -1404,6 +1413,8 @@ async fn run_generation(
         });
     }
     let mut reported = 0u32;
+    // (bytes, duration) of recently published segments, for peak windows.
+    let mut recent: Vec<(u64, u64)> = Vec::new();
     let mut video = None;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     // Liveness, decided by the core deadline policy. Its clock advances only
@@ -1471,6 +1482,7 @@ async fn run_generation(
                             operation,
                             copy_start,
                             pin.max_bitrate_bps,
+                            &mut recent,
                         ),
                     ) => observed,
                 };
@@ -1517,6 +1529,7 @@ async fn run_generation(
                     operation,
                     copy_start,
                     pin.max_bitrate_bps,
+                    &mut recent,
                 ),
             )
             .await;
