@@ -521,14 +521,19 @@ async function switchDelivery(plan) {
   let leaseFailure = null;
   let rebindCommitted = false;
   let swapped = false;
-  // Freeze the current player and save its exact position.
+  // Freeze the current player and save its exact position. It stays fenced
+  // (no page or native controls) until a rejection restores it or the
+  // replacement is installed; state.changing fences the page controls.
   state.stopObserving?.(); state.stopObserving = null;
+  const nativeControls = old.element.controls;
+  old.element.controls = false;
   await old.element.pause().catch(() => {});
   const observed = old.element.player.state;
   const position = Math.max(0, Math.round(observed.currentTime * 1000 + old.generation.media_time_origin_ms));
   const preferences = {volume: observed.volume, muted: observed.muted, rate: observed.playbackRate};
   const restore = async () => {
     if (!current()) return;
+    old.element.controls = nativeControls;
     state.stopObserving = observeViewing(old.element, old.generation, state.viewing, current);
     if (wasPlaying) await old.element.play().catch(() => {});
   };
@@ -771,7 +776,8 @@ controls?.addEventListener('submit', event => {
 });
 controls?.addEventListener('click', event => {
   const action = event.target?.dataset?.playerAction;
-  if (!action || !state.element) return;
+  // While a playback change is in progress the current player is fenced.
+  if (!action || !state.element || state.changing) return;
   void (async () => {
     if (action === 'play') await state.element.play();
     if (action === 'pause') await state.element.pause();
