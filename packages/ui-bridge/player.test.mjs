@@ -340,3 +340,18 @@ test('rolling HLS requires a deployed adaptive provider and compatible MSE', () 
   assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), ['http_range']);
   assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), ['http_range', 'hls']);
 });
+
+
+test('provider observations do not require component runtime injection', () => {
+  const {lendRuntime} = runInNewContext(source.replace('export {close, maintainLease};', '({lendRuntime});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const catalog = {providers: {}};
+  const standalone = {};
+  lendRuntime(standalone, catalog);
+  assert.equal(Object.hasOwn(standalone, 'runtime'), false, 'do not invent a runtime property that the component ignores');
+  let borrowed;
+  const shared = {set runtime(value) { borrowed = value; }};
+  lendRuntime(shared, catalog);
+  assert.equal(borrowed, catalog, 'retain shared ownership when the component exposes it');
+});

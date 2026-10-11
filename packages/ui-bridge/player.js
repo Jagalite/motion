@@ -131,18 +131,18 @@ async function playNext(current = () => true) {
   finally { advancing = false; }
 }
 
-// Same pattern as the existing Motion web client: define the element and,
-// when the installed package supports it, lend it an application-owned
-// runtime with the archive's provider manifest loaded.
+// Observe the installed provider catalog through the public runtime API.
+// Packages with component runtime injection borrow this owner; other packages
+// keep per-player ownership and load the same immutable deployment themselves.
 let runtime;
 async function loadDemuxe(base) {
   runtime ??= (async () => {
-    const [{DemuxeRuntime}, {definePlayerElement, DemuxePlayerElement}] = await Promise.all([
+    const [{DemuxeRuntime}, {definePlayerElement}] = await Promise.all([
       import(`${base}web/generated/index.js`),
       import(`${base}web/generated/player/index.js`),
     ]);
     definePlayerElement();
-    if (typeof DemuxeRuntime !== 'function' || !('runtime' in DemuxePlayerElement.prototype)) return null;
+    if (typeof DemuxeRuntime !== 'function') return null;
     const shared = new DemuxeRuntime({assetBase: base});
     try {
       await shared.providers.load('demuxe-providers.json');
@@ -153,6 +153,10 @@ async function loadDemuxe(base) {
     }
   })().catch(error => { runtime = undefined; throw error; });
   return runtime;
+}
+
+function lendRuntime(element, shared) {
+  if (shared && 'runtime' in element) element.runtime = shared;
 }
 
 /** Ask the server to retire one delivery, exactly once, surviving page unload. */
@@ -414,7 +418,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   const shared = await loadDemuxe(data.demuxeBase);
   if (!current()) throw new Error('Playback ownership changed.');
   const element = document.createElement('demuxe-player');
-  if (shared) element.runtime = shared;
+  lendRuntime(element, shared);
   element.setAttribute('asset-base', data.demuxeBase);
   // Rolling HLS transport time is not the logical movie duration. The Motion
   // controls below the player own seeking for that route.
