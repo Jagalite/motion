@@ -1106,3 +1106,21 @@ func TestFailedPollIsNotShownAsFresh(t *testing.T) {
 		t.Fatalf("failed refresh not reported:\n%s", v)
 	}
 }
+
+func TestNullProcessFieldsAndFailedStoragePollsAreShown(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}, process: true}
+	m := pollAgain(t, pollAgain(t, start(t, f, 140, 60)))
+	if !strings.Contains(m.View(), "peak") {
+		t.Fatal("cpu rate missing")
+	}
+	f.process = false // the server stops reporting process metrics
+	m = pollAgain(t, m)
+	if v := m.View(); strings.Contains(v, "peak") || !strings.Contains(v, "aren't reported") {
+		t.Fatalf("stale rates shown:\n%s", v)
+	}
+	s := m.cache.slots[keyStorage]
+	m, _ = update(t, m, loaded{key: keyStorage, request: s.request, err: &api.UnavailableError{Err: fmt.Errorf("refused")}})
+	if v := m.View(); !strings.Contains(v, "storage couldn't refresh") {
+		t.Fatalf("storage failure hidden:\n%s", v)
+	}
+}

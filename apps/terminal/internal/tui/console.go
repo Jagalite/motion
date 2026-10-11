@@ -180,17 +180,20 @@ func (m Model) tiles(now time.Time) [][]tile {
 	}
 	unreported := "Not reported by this server"
 	cpu := tile{label: "CPU", id: mCPU, unit: "%", color: colorAccent, missing: unreported}
-	if r := h.values(mCPU, now, window); len(r) > 0 {
-		pct := make([]point, len(r))
-		peak := 0.0
-		for i, p := range r {
-			pct[i] = point{t: p.t, v: p.v * 100}
-			peak = math.Max(peak, p.v*100)
+	// Rates only for fields reported now, never a stale one.
+	if _, reported := latest(mCPU); reported {
+		if r := h.values(mCPU, now, window); len(r) > 0 {
+			pct := make([]point, len(r))
+			peak := 0.0
+			for i, p := range r {
+				pct[i] = point{t: p.t, v: p.v * 100}
+				peak = math.Max(peak, p.v*100)
+			}
+			cpu.series, cpu.value = pct, fmt.Sprintf("%.1f", pct[len(pct)-1].v)
+			cpu.note = fmt.Sprintf("peak %.0f%%", peak)
+		} else {
+			cpu.value, cpu.note = "…", "measuring"
 		}
-		cpu.series, cpu.value = pct, fmt.Sprintf("%.1f", pct[len(pct)-1].v)
-		cpu.note = fmt.Sprintf("peak %.0f%%", peak)
-	} else if _, ok := latest(mCPU); ok {
-		cpu.value, cpu.note, cpu.missing = "…", "measuring", ""
 	}
 	mem := tile{label: "Memory", id: mMemory, color: colorInfo, missing: unreported, relative: true}
 	if v, ok := latest(mMemory); ok {
@@ -203,13 +206,15 @@ func (m Model) tiles(now time.Time) [][]tile {
 		mem.note = "peak " + bytesText(peak)
 	}
 	req := tile{label: "Requests", id: mRequests, unit: "/s", color: colorOK, missing: unreported}
-	if r := h.values(mRequests, now, window); len(r) > 0 {
-		req.series, req.value = r, countText(r[len(r)-1].v)
-		if v, ok := latest(mInFlight); ok {
-			req.note = countText(v) + " in flight"
+	if _, reported := latest(mRequests); reported {
+		if r := h.values(mRequests, now, window); len(r) > 0 {
+			req.series, req.value = r, countText(r[len(r)-1].v)
+			if v, ok := latest(mInFlight); ok {
+				req.note = countText(v) + " in flight"
+			}
+		} else {
+			req.value, req.note = "…", "measuring"
 		}
-	} else if _, ok := latest(mRequests); ok {
-		req.value, req.note, req.missing = "…", "measuring", ""
 	}
 	errs := tile{label: "Server errors", id: mErrors, color: colorDanger, missing: unreported}
 	if _, reported := latest(mErrors); reported {
@@ -590,6 +595,11 @@ func (m Model) updatedText() string {
 	}
 	if s.err != nil {
 		return dangerStyle.Render(text + " · couldn't refresh: " + describe(s.err).message)
+	}
+	for key, what := range map[string]string{keyStorage: "storage", keyMetrics: "history"} {
+		if o := m.cache.slots[key]; o != nil && o.err != nil {
+			return accentStyle.Render(text + " · " + what + " couldn't refresh: " + describe(o.err).message)
+		}
 	}
 	if age > 3*pollEvery {
 		return accentStyle.Render(text)
