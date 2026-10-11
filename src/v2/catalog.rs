@@ -2204,8 +2204,8 @@ async fn files_page(
         String,
         i64,
     );
-    let rows:Vec<FileRow>=sqlx::query_as(&format!("SELECT f.id,f.revision,f.library_id,f.bytes,f.duration_seconds,f.available,f.tracks_json,f.relative_path,l.binding_revision FROM media_files f JOIN libraries l ON l.id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE (?1 IS NULL OR e.item_id=?1) AND f.id>?2 AND {clause} ORDER BY f.id LIMIT ?"))
-        .bind(item).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows:Vec<FileRow>=sqlx::query_as(&format!("SELECT f.id,f.revision,f.library_id,f.bytes,f.duration_seconds,f.available,f.tracks_json,f.relative_path,l.binding_revision FROM media_files f JOIN libraries l ON l.id=f.library_id JOIN editions e ON e.id=f.edition_id WHERE (? IS NULL OR e.item_id=?) AND f.id>? AND {clause} ORDER BY f.id LIMIT ?"))
+        .bind(&item).bind(&item).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
     for (
         id,
