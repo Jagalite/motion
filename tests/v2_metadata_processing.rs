@@ -1496,7 +1496,7 @@ async fn preparation_admission_pins_identity_and_replays_once() {
     let op = format!("Bearer {OPERATOR}");
     let headers = [
         ("authorization", op.as_str()),
-        ("idempotency-key", "prepare-one"),
+        ("idempotency-key", "prepare-one-0000000000000000"),
     ];
     let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
     let first = f
@@ -1556,7 +1556,7 @@ async fn preparation_admission_pins_identity_and_replays_once() {
             Some(wrong),
             &[
                 ("authorization", &op),
-                ("idempotency-key", "wrong-timeline")
+                ("idempotency-key", "wrong-timeline-0000000000000000")
             ]
         )
         .await
@@ -1570,7 +1570,10 @@ async fn preparation_admission_pins_identity_and_replays_once() {
             "POST",
             "/api/v2/processing/preparations",
             Some(track),
-            &[("authorization", &op), ("idempotency-key", "wrong-track")]
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "wrong-track-0000000000000000")
+            ]
         )
         .await
         .status,
@@ -1601,7 +1604,10 @@ async fn schedules_preserve_disabled_rows_and_atomically_claim_logical_scans() {
             "POST",
             "/api/v2/schedules",
             Some(input.clone()),
-            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "schedule-one-0000000000000000"),
+            ],
         )
         .await;
     assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
@@ -1612,7 +1618,10 @@ async fn schedules_preserve_disabled_rows_and_atomically_claim_logical_scans() {
             "POST",
             "/api/v2/schedules",
             Some(input.clone()),
-            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "schedule-one-0000000000000000"),
+            ],
         )
         .await;
     assert_eq!(replay.body, first.body);
@@ -1670,7 +1679,7 @@ async fn backup_request_replay_publishes_one_verified_snapshot_with_asset_invent
     let op = format!("Bearer {OPERATOR}");
     let headers = [
         ("authorization", op.as_str()),
-        ("idempotency-key", "backup-one"),
+        ("idempotency-key", "backup-one-0000000000000000"),
     ];
     let body = json!({"include_generated_media":true});
     let first = f
@@ -1835,7 +1844,7 @@ async fn backup_retention_preserves_history_and_corrupt_recovery_fails_closed() 
                 Some(json!({"include_generated_media":false})),
                 &[
                     ("authorization", &op),
-                    ("idempotency-key", &format!("retention-{index}")),
+                    ("idempotency-key", &format!("retention-request-{index}")),
                 ],
             )
             .await;
@@ -1945,7 +1954,10 @@ async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
                 "POST",
                 "/api/v2/processing/preparations",
                 Some(input.clone()),
-                &[("authorization", who), ("idempotency-key", "shared-key")],
+                &[
+                    ("authorization", who),
+                    ("idempotency-key", "shared-key-0000000000000000"),
+                ],
             )
             .await;
         assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.body);
@@ -1960,7 +1972,10 @@ async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
             "POST",
             "/api/v2/processing/preparations",
             Some(hidden),
-            &[("authorization", &device), ("idempotency-key", "hidden")]
+            &[
+                ("authorization", &device),
+                ("idempotency-key", "hidden-0000000000000000")
+            ]
         )
         .await
         .status,
@@ -1993,7 +2008,10 @@ async fn preparation_scope_keys_and_first_video_hdr_are_enforced() {
             "POST",
             "/api/v2/processing/preparations",
             Some(hdr),
-            &[("authorization", &op), ("idempotency-key", "hdr-first")],
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "hdr-first-0000000000000000"),
+            ],
         )
         .await;
     assert_eq!(
