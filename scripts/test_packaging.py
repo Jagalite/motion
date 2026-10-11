@@ -57,6 +57,26 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(actual, inventory)
         self.assertTrue((extracted / 'motion/scripts/build.sh').stat().st_mode & 0o111)
 
+    def test_extracted_source_inventory_requires_original_bytes_and_membership(self):
+        root = self.cache / 'extracted'
+        root.mkdir()
+        (root / 'Cargo.toml').write_text('original')
+        manifest = {'source_files': {'Cargo.toml': hashlib.sha256(b'original').hexdigest()}}
+        with patch('package_app.ROOT', root):
+            self.assertEqual(source_inventory(manifest), manifest['source_files'])
+            (root / 'target').mkdir()
+            (root / 'target/output').write_text('generated')
+            self.assertEqual(source_inventory(manifest), manifest['source_files'])
+            archive = self.cache / 'reconstructed.tar.gz'
+            write_source_archive(archive, manifest['source_files'], manifest)
+            (root / 'Cargo.toml').write_text('changed')
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                source_inventory(manifest)
+            (root / 'Cargo.toml').write_text('original')
+            (root / 'new-build-input.py').write_text('unexpected')
+            with self.assertRaisesRegex(ValueError, 'membership'):
+                source_inventory(manifest)
+
     def test_embedded_input_changes_and_membership_block_source_publication(self):
         root = self.source_checkout()
         with patch('package_app.ROOT', root):
