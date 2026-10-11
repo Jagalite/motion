@@ -647,7 +647,10 @@ pub async fn commit_relocation(
     Ok(result)
 }
 
-pub(crate) type RelocationObservation = (Option<String>, Vec<(String, Option<String>)>);
+pub(crate) type RelocationObservation = (
+    Option<String>,
+    std::collections::BTreeMap<String, Option<String>>,
+);
 pub(crate) async fn observe_relocation(
     app: &App,
     plan: &core::RelocationPlan,
