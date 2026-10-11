@@ -96,7 +96,7 @@
   "limits": [
     "Ad hoc signing, not notarized.",
     "Seeded offline cache does not qualify M5 publication or reconciliation.",
-    "Muted synthetic media, no physical A/V or performance claim.",
-    "Final Chromium Next repetition was interrupted when the T3 preview host disconnected; no pass or product failure inferred. Prior Chromium receipts retain their recorded source scope."
-  ]
+    "Muted synthetic media, no physical A/V or performance claim."
+  ],
+  "chromium_next_receipt": "playable-next-2d2c006.json"
 }

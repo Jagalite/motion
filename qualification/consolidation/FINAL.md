@@ -269,3 +269,34 @@ The provider bytes retain the qualified `4d968b37…` identity.
 The final candidate is a qualified consolidation slice, not blanket M0–M4
 closure. Remaining milestone deliverables and accountable owners above are not
 waived. WebKit remains explicitly deferred by the user.
+
+
+### Chromium repetition and ordered integration closeout
+
+PR #19 merged to main at `a388733f96f434faaf3a64e8f9b0a685d2119e14` after
+all eight exact-head checks passed, including 32m15s of heavy tests. This completes
+the #14 → #17 → #19 sequence. #15 remains closed and fully preserved in #18.
+
+After T3 explicitly reported its preview host unavailable, the existing repository
+Chromium harness ran against the exact installed `2d2c006` server/provider:
+`chromium-player-2d2c006.json` records all 30 product checks passing. Its separate
+plain-video HLS diagnostic failed parsing; that raw-video experiment is not the
+Motion player and is not promoted to a pass. Motion's converted-title check passed.
+The standalone Chromium Next workflow also passed.
+
+The user then restored T3 connectivity. A fresh built-in Chromium run clicked the
+actual Next control, selected the ordered timeline, reached ready state and advanced
+playback from 3.805 to 5.995 seconds. `playable-next-2d2c006.json` contains both
+Chromium observations alongside Electron's passing check. This resolves the final
+Chromium Next repetition noted as incomplete above; the disconnected attempt is
+retained as historical context. WebKit remains explicitly deferred.
+
+Final installed acceptance now comprises the 13 package checks, 15 native/Go/TUI
+checks, 30 Electron checks, 30 Chromium checks, and public playable Next in all
+three recorded browser surfaces. Earlier no-history, revocation and cross-client
+handoff receipts retain their own exact-source bounds. Core/playback/client/provider
+implementation bytes are unchanged between those `2fa508f` receipts and `2d2c006`;
+the only production addition is the fenced catalog ordering endpoint, separately
+covered by its HTTP and browser workflow checks. Full M3 and expanded M4 gates
+remain assigned above; this closes the declared consolidation acceptance slice,
+not those broader milestones. Final-head CI remains the integration gate.

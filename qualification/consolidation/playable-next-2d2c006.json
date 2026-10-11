@@ -167,5 +167,40 @@
     "motion-playable-next.mjs": "f20c1733faaffa6d74e44780cd383e860e8e380607fbc26f163732d0c9c2dbb9",
     "motion-next-electron.cjs": "3cc6ab98d00863f7e184a3077d8ec6318a7bd57f27448003c05599c80ae216af"
   },
-  "scope": "Existing playable timelines in one reviewed merged work; broader cross-work episode hierarchy remains open. API preserves bindings/history and rejects stale retries. Electron clicks actual Next and advances selected conversion playback. T3 Chromium repeat interrupted by preview host disconnection."
+  "scope": "Existing playable timelines in one reviewed merged work; broader cross-work episode hierarchy remains open. API preserves bindings/history and rejects stale retries. Electron, repository Chromium and reconnected T3 Chromium click actual Next and advance selected conversion playback. Initial T3 host-disconnection attempt remains incomplete; later fresh attempt passed.",
+  "chromium_harness": {
+    "source_commit": "2d2c0065ec3fbebb0ca386725183e2048eb1e2db",
+    "kind": "installed-server-chromium-public-next",
+    "result": "passed",
+    "from": "294307f4-991d-4c49-a8cd-a9f6c9729f76",
+    "to": "a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+    "ready": {
+      "state": "ready",
+      "text": ""
+    },
+    "selected": {
+      "url": "/play/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+      "state": "ready",
+      "text": ""
+    },
+    "start": 0.82045,
+    "final": {
+      "time": 3.670079,
+      "status": "playing",
+      "mode": "native",
+      "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.8078.4 Safari/537.36"
+    }
+  },
+  "t3_chromium": {
+    "played": {
+      "advancing": true,
+      "from": 3.805262,
+      "logical": 6,
+      "mode": "native",
+      "to": 5.995222
+    },
+    "state": "ready",
+    "url": "/play/a434ac5d-6666-4ca7-8e35-c30a0c2a35a0",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) T3Code(Alpha)/0.0.45 Chrome/152.0.7977.130 Electron/44.4.2 Safari/537.36"
+  }
 }
