@@ -33,6 +33,7 @@ fn pin(tracks: &[&str], operation: Operation) -> Pin {
         operation,
         recipe_digest: operation.segmented().then(|| "h264-aac".into()),
         clip: None,
+        parts: vec![],
     }
 }
 

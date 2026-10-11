@@ -4144,6 +4144,20 @@ async fn interval_bindings_play_their_clip_of_the_file() {
         StatusCode::NOT_FOUND,
         "not_found",
     );
+    // A fresh plan for the changed interval is a different request: the first
+    // delivery's key cannot replay it.
+    let changed = plan("auto").await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-01"),
+            json!({"plan_token": changed.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
     // Bounds outside the probed file are never played.
     sqlx::query(
         "UPDATE version_files SET end_ms=90000 WHERE version_id IN \
@@ -4155,6 +4169,200 @@ async fn interval_bindings_play_their_clip_of_the_file() {
     .unwrap();
     assert_eq!(
         plan("auto").await.body["reason_codes"][0],
+        "source_unavailable"
+    );
+}
+
+/// A multipart version plays its parts in order as one timeline: only by a
+/// conversion, with the parts' summed duration, a position past the first
+/// part reaching the second, and a changed or incompatible part fencing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_versions_play_their_parts_in_order() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    for (name, video, tone) in [
+        ("a-part1.mp4", "testsrc2=size=320x240:rate=24", "440"),
+        ("b-part2.mp4", "testsrc2=size=320x240:rate=24,hflip", "880"),
+        ("c-other.mp4", "testsrc2=size=640x480:rate=24", "660"),
+    ] {
+        f.media(
+            name,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                video,
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency={tone}:sample_rate=44100"),
+                "-t",
+                "6",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+            ],
+        );
+    }
+    f.scan().await;
+    let file = |name: &str| {
+        let db = f.server.app.db.clone();
+        let name = name.to_owned();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT id,revision FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _) = file("a-part1.mp4").await;
+    let (second, second_revision) = file("b-part2.mp4").await;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    // Parts of one version belong to its edition (as a scan of a split film
+    // would record them).
+    sqlx::query(
+        "UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) \
+         WHERE relative_path IN ('b-part2.mp4','c-other.mp4')",
+    )
+    .bind(&first)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let bind_second = |file: String, revision: String| {
+        let db = f.server.app.db.clone();
+        let version = version.clone();
+        async move {
+            sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=2")
+                .bind(&version)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+            )
+            .bind(&version)
+            .bind(file)
+            .bind(revision)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    bind_second(second.clone(), second_revision.clone()).await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = |mode: &str, policy: &str| {
+        let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("original", "auto").await.body["reason_codes"][0],
+        "multipart_requires_conversion"
+    );
+    assert_eq!(
+        plan("auto", "require").await.body["reason_codes"][0],
+        "subtitle_multipart_unavailable"
+    );
+    let converted = plan("auto", "auto").await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["source"]["file_id"], first.as_str());
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-1"),
+            json!({"plan_token": converted.body["plan_token"], "start_ms": 7000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let duration = admitted.body["logical_duration_ms"].as_u64().unwrap();
+    assert!((11_900..=12_100).contains(&duration), "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 7000
+    })
+    .await;
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("multipart.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Logical 7.5 s is the second part at 1.5 s (mirrored), not the first.
+    let media = f.dir.path().join("media");
+    let delivered = gray_frame(&fragment, "0.5");
+    let second_part = mean_difference(&delivered, &gray_frame(&media.join("b-part2.mp4"), "1.5"));
+    let first_part = mean_difference(&delivered, &gray_frame(&media.join("a-part1.mp4"), "1.5"));
+    assert!(
+        second_part * 4 < first_part,
+        "second {second_part}, first {first_part}"
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    // The second part's binding changes: a plan signed before is refused.
+    let retained = plan("auto", "auto").await;
+    bind_second(second.clone(), "another-revision".into()).await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-2"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // A part with other streams (another picture size) cannot be concatenated.
+    let (other, other_revision) = file("c-other.mp4").await;
+    bind_second(other, other_revision).await;
+    assert_eq!(
+        plan("auto", "auto").await.body["reason_codes"][0],
         "source_unavailable"
     );
 }

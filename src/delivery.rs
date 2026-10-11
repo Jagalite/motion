@@ -146,6 +146,9 @@ struct Session {
     /// v1 (operator) deliveries, which v2 callers can never observe.
     owner: Option<Owner>,
     source: Source,
+    /// The validated sources of a multipart timeline's later parts, in order
+    /// (the first is `source`); empty for one file.
+    parts: Vec<Source>,
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -434,6 +437,7 @@ fn arguments(
     end_ms: Option<u64>,
     audio: Option<u32>,
     burn: Option<u32>,
+    concat: Option<&FsPath>,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
@@ -464,14 +468,16 @@ fn arguments(
         // and its media time is timeline time (the route requires a zero start).
         args.push("-copyts".into());
     }
-    args.extend(
-        [
-            // The validated source descriptor inherited as fd 3.
-            "-i",
-            "/dev/fd/3",
-        ]
-        .map(str::to_owned),
-    );
+    match concat {
+        // The parts of a multipart timeline, as listed (each an inherited
+        // validated descriptor).
+        Some(list) => {
+            args.extend(["-f", "concat", "-safe", "0", "-i"].map(str::to_owned));
+            args.push(list.to_string_lossy().into_owned());
+        }
+        // The validated source descriptor inherited as fd 3.
+        None => args.extend(["-i", "/dev/fd/3"].map(str::to_owned)),
+    }
     if start_ms > input_ms {
         let trim = start_ms - input_ms;
         args.push("-ss".into());
@@ -1156,9 +1162,15 @@ async fn run_generation(
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()));
     // Cancellation/timeout fences preparation, but a stalled filesystem operation
     // still owns capacity and prevents generation cleanup until it actually exits.
+    // A multipart timeline reads its parts through FFmpeg's concat demuxer:
+    // the first part is fd 3, the witness fd 4, later parts fd 5 onward.
+    let concat = (!pin.parts.is_empty()).then(|| directory.join("parts.ffconcat"));
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
+        let later = session.parts.clone();
+        let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
+        let concat = concat.clone();
         let floor = app.storage.settings.min_free_bytes;
         let late_app = app.clone();
         let late_session = session.clone();
@@ -1170,8 +1182,28 @@ async fn run_generation(
                 std::fs::create_dir_all(&directory)?;
                 crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
                 let input = source_valid(&source)?;
+                anyhow::ensure!(
+                    later.len() + 1 == durations.len().max(1),
+                    "part sources do not match the pin"
+                );
+                let later = later
+                    .iter()
+                    .map(source_valid)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                if let Some(concat) = &concat {
+                    let mut list = String::from("ffconcat version 1.0\n");
+                    for (i, duration) in durations.iter().enumerate() {
+                        let fd = if i == 0 { 3 } else { 4 + i };
+                        list.push_str(&format!(
+                            "file '/dev/fd/{fd}'\nduration {}.{:03}\n",
+                            duration / 1000,
+                            duration % 1000
+                        ));
+                    }
+                    std::fs::write(concat, list)?;
+                }
                 let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
-                anyhow::Ok((input, witness, held))
+                anyhow::Ok((input, later, witness, held))
             },
             move || {
                 stopped(&late_app, &late_session);
@@ -1185,7 +1217,7 @@ async fn run_generation(
         };
         prepared
     };
-    let (input, witness, held) = match prepared {
+    let (input, later, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             tracing::warn!(delivery=%session.id, generation, %error, "delivery generation not started");
@@ -1225,15 +1257,21 @@ async fn run_generation(
             pin.clip.map(|clip| clip.end_ms),
             audio,
             pinned_burn(&pin),
+            concat.as_deref(),
             &directory,
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    // fd 3: the validated source; fd 4: the execution witness.
+    // fd 3: the validated source; fd 4: the execution witness; fd 5 onward:
+    // the validated later parts of a multipart timeline.
     #[cfg(unix)]
-    execution::inherit(&mut supervisor, &[&input, &held.0]);
+    {
+        let mut inherited = vec![&input, &held.0];
+        inherited.extend(later.iter());
+        execution::inherit(&mut supervisor, &inherited);
+    }
     if stop.is_cancelled() {
         return stopped(&app, &session);
     }
@@ -2017,6 +2055,7 @@ fn pin(
         operation,
         recipe_digest: Some(recipe.into()),
         clip: None,
+        parts: vec![],
     }
 }
 
@@ -2132,6 +2171,7 @@ fn byte_pin(
         operation,
         recipe_digest: None,
         clip: None,
+        parts: vec![],
     }
 }
 
@@ -2311,6 +2351,8 @@ pub(crate) struct Planned {
     pub burn: Option<u32>,
     /// The interval of the file the planned timeline is.
     pub clip: Option<playscale_core::parts::Clip>,
+    /// Every part of a multipart timeline, in order; empty for one file.
+    pub parts: Vec<playscale_core::parts::PartPin>,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2468,6 +2510,7 @@ pub(crate) struct Selection {
     pub sidecar: Option<Sidecar>,
     pub burn: Option<u32>,
     pub clip: Option<playscale_core::parts::Clip>,
+    pub parts: Vec<playscale_core::parts::PartPin>,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2566,14 +2609,16 @@ pub(crate) async fn change_live(
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
             validate_burn(&file, selection.burn, pin.operation)?;
-            // The timeline's interval is fixed for the delivery.
-            if selection.clip != basis.clip {
+            // The timeline's interval and parts are fixed for the delivery.
+            if selection.clip != basis.clip || selection.parts != basis.parts {
                 return Err(ApiError::conflict(
                     "timeline_changed",
                     "The timeline's interval changed; create a new delivery",
                 ));
             }
-            if selection.clip.is_some() && pin.operation != Operation::VideoTranscode {
+            if (selection.clip.is_some() || !selection.parts.is_empty())
+                && pin.operation != Operation::VideoTranscode
+            {
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "route_unsupported",
@@ -2582,6 +2627,7 @@ pub(crate) async fn change_live(
             }
             let pin = Pin {
                 clip: selection.clip,
+                parts: selection.parts,
                 ..with_burn(
                     with_sidecar(pin, selection.sidecar.as_ref()),
                     selection.burn,
@@ -2834,11 +2880,25 @@ async fn admit_owned(
             Sha256::digest(
                 match &planned {
                     None => serde_json::to_vec(&r),
-                    // A sidecar or burned subtitle is part of the request too;
-                    // digests without one keep their earlier form.
-                    Some(p) if p.sidecar.is_none() && p.burn.is_none() => {
+                    // A sidecar or burned subtitle, an interval and multipart
+                    // parts are part of the request too; digests without any
+                    // keep their earlier form, so recorded receipts replay.
+                    Some(p)
+                        if p.sidecar.is_none()
+                            && p.burn.is_none()
+                            && p.clip.is_none()
+                            && p.parts.is_empty() =>
+                    {
                         serde_json::to_vec(&(&r, &p.owner, &p.version, p.route))
                     }
+                    Some(p) if p.clip.is_none() && p.parts.is_empty() => serde_json::to_vec(&(
+                        &r,
+                        &p.owner,
+                        &p.version,
+                        p.route,
+                        p.sidecar.as_ref().map(|s| (&s.name, &s.fingerprint)),
+                        p.burn,
+                    )),
                     Some(p) => serde_json::to_vec(&(
                         &r,
                         &p.owner,
@@ -2846,6 +2906,8 @@ async fn admit_owned(
                         p.route,
                         p.sidecar.as_ref().map(|s| (&s.name, &s.fingerprint)),
                         p.burn,
+                        p.clip,
+                        &p.parts,
                     )),
                 }
                 .expect("serializable request")
@@ -2945,14 +3007,37 @@ async fn admit_owned(
     // An interval is a clip of the file: only a conversion presents it, and
     // the delivery's logical duration is the interval's.
     let clip = planned.as_ref().and_then(|p| p.clip);
-    if clip.is_some() && operation != Operation::VideoTranscode {
+    let parts = planned
+        .as_ref()
+        .map(|p| p.parts.clone())
+        .unwrap_or_default();
+    if (clip.is_some() || !parts.is_empty()) && operation != Operation::VideoTranscode {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "route_unsupported",
             "An interval of a file is delivered only by a conversion",
         ));
     }
+    // Every later part must still be the pinned revision, available, in the
+    // first part's library (whose root its source is opened under).
+    let mut part_sources = Vec::new();
+    for part in parts.iter().skip(1) {
+        let row: Option<db::ItemRow> = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+            .bind(&part.file)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(row) =
+            row.filter(|r| r.revision == part.revision && r.library_id == file.library_id)
+        else {
+            return Err(ApiError::conflict(
+                "source_revision_changed",
+                "A part of the timeline changed; plan again",
+            ));
+        };
+        part_sources.push((row.relative_path, row.fingerprint));
+    }
     let duration_ms = match clip {
+        _ if !parts.is_empty() => Some(parts.iter().map(|p| p.duration_ms).sum()),
         Some(clip) => Some(clip.duration_ms()),
         None => file
             .duration_seconds
@@ -2982,6 +3067,7 @@ async fn admit_owned(
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
         Pin {
             clip,
+            parts: parts.clone(),
             ..with_burn(
                 with_sidecar(
                     if original {
@@ -3004,6 +3090,15 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        parts: part_sources
+            .into_iter()
+            .map(|(relative, fingerprint)| Source {
+                root: root.clone().into(),
+                relative: relative.into(),
+                root_identity: root_identity.clone(),
+                fingerprint,
+            })
+            .collect(),
         source: Source {
             root: root.into(),
             relative: file.relative_path.clone().into(),
@@ -3833,6 +3928,7 @@ mod tests {
                 operation: Operation::VideoTranscode,
                 recipe_digest: Some(RECIPE.into()),
                 clip: None,
+                parts: vec![],
             },
             0,
             Some(60_000),

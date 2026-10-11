@@ -32,6 +32,16 @@ impl Clip {
     }
 }
 
+/// One part of a multipart version as a plan and a delivery pin it: the
+/// exact file revision and its probed duration (which places the part on the
+/// timeline).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PartPin {
+    pub file: String,
+    pub revision: String,
+    pub duration_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Layout {
     /// The whole single file.

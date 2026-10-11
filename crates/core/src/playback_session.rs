@@ -109,6 +109,9 @@ pub struct SourceFacts {
     /// delivery, a stream copy and prepared renditions all present the whole
     /// file, so only a conversion of the interval can serve it.
     pub clipped: bool,
+    /// The timeline plays several files in order. Byte delivery, a copy and
+    /// a rendition each present one file, so only a conversion can serve it.
+    pub multipart: bool,
     /// Stored renditions of this original whose output and source revisions
     /// are both still the registered ones (`renditions::available`), in the
     /// adapter's preference order (newest first).
@@ -215,6 +218,7 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         available: source.available
             && byte
             && !source.clipped
+            && !source.multipart
             && !request.pinned_prepared
             && !failed(Route::Original, file_id),
         support: source.client_support,
@@ -228,6 +232,7 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         available: request.range
             && !request.burn_in
             && !source.clipped
+            && !source.multipart
             && p.carries_selection
             && !failed(Route::Prepared, &p.file),
         support: p.client_support,
@@ -245,6 +250,8 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         _ if !source.available => Plan::Blocked("source_unavailable"),
         _ if request.mode == Mode::Original => Plan::Blocked(if source.clipped {
             "interval_requires_conversion"
+        } else if source.multipart {
+            "multipart_requires_conversion"
         } else if request.burn_in {
             "subtitle_requires_conversion"
         } else if request.explicit_streams {
@@ -258,7 +265,8 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         _ if request.mode == Mode::Auto
             && source.within_budget
             && !request.burn_in
-            && !source.clipped =>
+            && !source.clipped
+            && !source.multipart =>
         {
             match source.copy {
                 StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
@@ -327,6 +335,10 @@ pub struct Claims {
     /// changed interval is a changed binding.
     #[serde(default)]
     pub clip: Option<crate::parts::Clip>,
+    /// Every part of a multipart version, in order (empty for one file). A
+    /// changed part or revision is a changed binding.
+    #[serde(default)]
+    pub parts: Vec<crate::parts::PartPin>,
     pub expires_at: i64,
 }
 
@@ -517,6 +529,7 @@ mod tests {
             copy: StreamCopy::Ineligible,
             hardware: Hardware::Unavailable,
             clipped: false,
+            multipart: false,
             prepared: vec![],
         }
     }
@@ -644,6 +657,7 @@ mod tests {
             audio: Some(0),
             subtitle: None,
             clip: None,
+            parts: vec![],
             expires_at: 100,
         }
     }
@@ -1199,6 +1213,21 @@ mod tests {
         assert_eq!(
             plan("f", &s, &range_only),
             Plan::Blocked("client_cannot_play_conversion")
+        );
+    }
+
+    #[test]
+    fn several_parts_are_served_only_by_a_conversion() {
+        let mut s = source(Support::Supported);
+        s.multipart = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("multipart_requires_conversion")
         );
     }
 }

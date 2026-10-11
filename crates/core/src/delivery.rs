@@ -202,6 +202,10 @@ pub struct Pin {
     /// file time `start_ms + t`); None plays the whole file.
     #[serde(default)]
     pub clip: Option<crate::parts::Clip>,
+    /// Every part of a multipart timeline, in order (the first is
+    /// `source_file`); empty for a single file.
+    #[serde(default)]
+    pub parts: Vec<crate::parts::PartPin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1098,6 +1102,7 @@ mod tests {
             operation: Operation::VideoTranscode,
             recipe_digest: Some("h264-aac".into()),
             clip: None,
+            parts: vec![],
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {

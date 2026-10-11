@@ -173,6 +173,7 @@ impl Model for Playback {
                     audio: Some(0),
                     subtitle: None,
                     clip: None,
+                    parts: vec![],
                     expires_at: s.now + TTL,
                 });
                 out.push(Effect::Planned);

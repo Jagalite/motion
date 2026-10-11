@@ -440,6 +440,117 @@ struct Bound {
     file: db::ItemRow,
     /// The interval of `file` the version binds (core `parts::layout`).
     clip: Option<playscale_core::parts::Clip>,
+    /// Every part of a multipart version in order (`file` is the first);
+    /// empty for a single file.
+    parts: Vec<playscale_core::parts::PartPin>,
+}
+
+/// Parts one multipart delivery can read: the delivery worker passes each as
+/// an inherited descriptor, beside the execution witness (8 at most).
+const MAX_PARTS: usize = 7;
+
+/// Whether two parts can be played as one stream: the same streams in the
+/// same order, with the same codecs and picture size.
+fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
+    let shape = |file: &db::ItemRow| -> Option<Vec<(String, String, Option<u32>, Option<u32>)>> {
+        let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+        Some(
+            tracks
+                .into_iter()
+                .filter(|t| matches!(t.kind.as_str(), "video" | "audio"))
+                .map(|t| (t.kind, t.codec, t.width, t.height))
+                .collect(),
+        )
+    };
+    shape(a).is_some_and(|a| shape(b).is_some_and(|b| a == b))
+}
+
+/// The first multipart original version bound to the timeline (or the pinned
+/// `version`, or whose first part is the pinned `file`) whose parts are all
+/// available at their bound revisions, in the first part's library (so its
+/// catalog scope is every part's), readable by `principal`, with probed
+/// durations (core `parts::layout`) and compatible streams.
+async fn multipart_of(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    timeline: &str,
+    version: Option<&str>,
+    file: Option<&str>,
+) -> Result<Option<Bound>, Problem> {
+    use playscale_core::parts::{BoundPart, Layout, PartPin, layout};
+    let versions: Vec<String> = sqlx::query_scalar(
+        "SELECT v.id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+         WHERE v.timeline_id=? AND v.origin='original' AND (? IS NULL OR v.id=?) AND (? IS NULL OR b.file_id=?) \
+         AND EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id LIMIT 100",
+    )
+    .bind(timeline)
+    .bind(version)
+    .bind(version)
+    .bind(file)
+    .bind(file)
+    .fetch_all(&mut *conn)
+    .await?;
+    'versions: for version in versions {
+        let bindings: Vec<(i64, String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT part,file_id,file_revision,start_ms,end_ms FROM version_files WHERE version_id=? ORDER BY part",
+        )
+        .bind(&version)
+        .fetch_all(&mut *conn)
+        .await?;
+        if bindings.len() > MAX_PARTS {
+            continue;
+        }
+        let mut rows = Vec::with_capacity(bindings.len());
+        let mut bound_parts = Vec::with_capacity(bindings.len());
+        for (part, file, revision, start, end) in &bindings {
+            let row: Option<db::ItemRow> = sqlx::query_as(
+                "SELECT * FROM catalog_files WHERE id=? AND generated=0 AND available=1 \
+                 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)",
+            )
+            .bind(file)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(row) = row.filter(|r| r.revision == *revision) else {
+                continue 'versions;
+            };
+            if !core::readable(principal, file_facts(conn, file).await?.as_ref())
+                || rows.first().is_some_and(|first: &db::ItemRow| {
+                    first.library_id != row.library_id || !compatible_parts(first, &row)
+                })
+            {
+                continue 'versions;
+            }
+            bound_parts.push(BoundPart {
+                part: u32::try_from(*part).unwrap_or(0),
+                file_duration_ms: row
+                    .duration_seconds
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .map(|d| (d * 1000.0) as u64),
+                start_ms: start.and_then(|v| u64::try_from(v).ok()),
+                end_ms: end.and_then(|v| u64::try_from(v).ok()),
+            });
+            rows.push(row);
+        }
+        let Ok(Layout::Parts(durations)) = layout(&bound_parts) else {
+            continue;
+        };
+        let parts = rows
+            .iter()
+            .zip(durations)
+            .map(|(row, duration_ms)| PartPin {
+                file: row.id.clone(),
+                revision: row.revision.clone(),
+                duration_ms,
+            })
+            .collect();
+        return Ok(Some(Bound {
+            version,
+            file: rows.swap_remove(0),
+            clip: None,
+            parts,
+        }));
+    }
+    Ok(None)
 }
 
 /// The layout of a single-part binding with these bounds on a file of this
@@ -508,6 +619,7 @@ async fn original_of(
             version,
             file,
             clip,
+            parts: vec![],
         }));
     }
     Ok(None)
@@ -549,6 +661,7 @@ async fn originals_of(
             version,
             file,
             clip,
+            parts: vec![],
         });
     }
     Ok(found)
@@ -574,6 +687,33 @@ async fn readable_prepared(
 
 /// Whether the version still binds the file to the timeline.
 async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
+    if !claims.parts.is_empty() {
+        // Exactly the pinned parts, at their revisions and durations, all in
+        // the first part's library.
+        let rows: Vec<(String, String, String, String, Option<f64>)> = sqlx::query_as(
+            "SELECT b.file_id,b.file_revision,f.revision,f.library_id,f.duration_seconds \
+             FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
+             WHERE v.id=? AND v.timeline_id=? AND b.start_ms IS NULL AND b.end_ms IS NULL ORDER BY b.part",
+        )
+        .bind(&claims.version)
+        .bind(&claims.timeline)
+        .fetch_all(conn)
+        .await?;
+        return Ok(rows.len() == claims.parts.len()
+            && claims.parts.first().is_some_and(|p| p.file == claims.file)
+            && rows.iter().zip(&claims.parts).all(
+                |((file, bound, revision, library, duration), pin)| {
+                    *file == pin.file
+                        && *bound == pin.revision
+                        && *revision == pin.revision
+                        && *library == rows[0].3
+                        && duration
+                            .filter(|d| d.is_finite() && *d > 0.0)
+                            .map(|d| (d * 1000.0) as u64)
+                            == Some(pin.duration_ms)
+                },
+            ));
+    }
     // The same single part with the same interval: a changed interval is a
     // changed binding.
     let bound: Option<(Option<i64>, Option<i64>, Option<f64>, i64)> = sqlx::query_as(
@@ -650,6 +790,7 @@ async fn prepared_of(
                 version,
                 file,
                 clip: None,
+                parts: vec![],
             });
         }
     }
@@ -915,15 +1056,30 @@ pub async fn plan(
     // Without an available original in scope, its revision-valid renditions
     // may still serve; the original then only keys them.
     let rendition_pin = input.version_id.as_deref().filter(|_| pinned_prepared);
-    let (bound, original_available, found) = match original_of(
+    // A single-file original first, then a multipart one.
+    let single = original_of(
         &mut conn,
         principal,
         &input.timeline_id,
         version_pin,
         original_pin,
     )
-    .await?
-    {
+    .await?;
+    let original = match single {
+        Some(bound) => Some(bound),
+        None if !pinned_prepared => {
+            multipart_of(
+                &mut conn,
+                principal,
+                &input.timeline_id,
+                version_pin,
+                original_pin,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let (bound, original_available, found) = match original {
         Some(bound) => (bound, true, None),
         // A client pin to an original that is not available in scope is never
         // compared or disclosed: it is simply unavailable.
@@ -1036,6 +1192,16 @@ pub async fn plan(
     }
     let audio = ca.or(a).or(default_audio);
     let explicit = cs.or(sub);
+    // Subtitle streams and sidecars belong to one file: a multipart timeline
+    // has no subtitle to deliver across its parts yet.
+    let multipart = !bound.parts.is_empty();
+    if multipart
+        && (explicit.is_some()
+            || sidecar_name.is_some()
+            || input.tracks.subtitle_policy == "require")
+    {
+        return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
     // An explicit choice (embedded or sidecar) conflicts with "off".
     if input.tracks.subtitle_policy == "off" && (explicit.is_some() || sidecar_name.is_some()) {
         return Err(Problem::invalid(
@@ -1052,8 +1218,10 @@ pub async fn plan(
     use playscale_core::components::{
         AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
     };
-    let automatic =
-        explicit.is_none() && sidecar_name.is_none() && input.tracks.subtitle_policy != "off";
+    let automatic = !multipart
+        && explicit.is_none()
+        && sidecar_name.is_none()
+        && input.tracks.subtitle_policy != "off";
     let require = input.tracks.subtitle_policy == "require";
     let candidates = if automatic {
         subtitle_candidates(
@@ -1280,6 +1448,7 @@ pub async fn plan(
         copy,
         hardware,
         clipped: bound.clip.is_some(),
+        multipart,
     };
     let request = core::Request {
         mode,
@@ -1379,6 +1548,7 @@ pub async fn plan(
             (None, None, None) => None,
         },
         clip: chosen.clip,
+        parts: chosen.parts.clone(),
         expires_at,
     };
     let mut warnings = vec![];
@@ -1748,6 +1918,7 @@ pub async fn create_delivery(
         sidecar: sidecar_of(&claims),
         burn: burned_subtitle(&claims),
         clip: claims.clip,
+        parts: claims.parts.clone(),
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -2076,6 +2247,7 @@ pub async fn change_delivery(
                     sidecar: sidecar_of(&claims),
                     burn: burned_subtitle(&claims),
                     clip: claims.clip,
+                    parts: claims.parts.clone(),
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
