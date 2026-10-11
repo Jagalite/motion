@@ -50,7 +50,8 @@ integration/release.
 | `packages/ui-bridge/player.js` delivery pacing | Playback owner's C06 heartbeat playhead contract | Pending interface integration and playback-only long conversion acceptance. |
 | Topcoat `/`, item and player pages; Electron host | Authorized production presentation service | Already opt-in through `--topcoat`; default cutover awaits replacement workflow and absence tests. |
 | Legacy `web/app.js`, `web/playback.js`, `web/session.js`, `/media/{id}` | Topcoat/player bridge and v2 media; integration router owner | Keep until cutover gates pass, then remove mounts/assets and prove no business behavior. |
-| `catalog_smoke.py`, `operations_smoke.py` | v2 metadata/artwork/scan/storage/backup; data/catalog owner | Current-server v1 callers; pending adapter integration and migration. |
+| `operations_smoke.py` | v2 catalog, timeline viewing and diagnostics; Clients | Converted; real-server backup/restore smoke passes all five checks, including rejection of the old operator token after restore. |
+| `catalog_smoke.py` | v2 metadata/artwork/scan; data/catalog owner | Current-server v1 caller; pending adapter integration and migration. |
 | `processing_smoke.py`, `video_profiles_smoke.py` | v2 recipes/preparations/jobs/events; preparation owner | Current-server v1 callers; preserve engine regressions while migrating. |
 | `viewing_smoke.py`, `reliability_smoke.py`, `smoke.py` | Canonical viewing + v2 storage/catalog; playback/data owners | Current-server v1 callers; pending authority/cutover integration. |
 | `test_package.py`, `upgrade_restore_check.py` | Exact installed v2 candidate; integration/release owner | Candidate traffic still needs migration; distinguish old-binary writes from candidate reads. |
@@ -144,3 +145,12 @@ and cumulative diff through `3352542`, with no actionable findings. The final
 PR records the final reviewed documentation SHA separately. Browser/Electron
 live playback and default cutover remain blocked; passing focused tests does not
 close this lane.
+
+The operations smoke now provisions catalog items and editions through v2 with
+idempotency keys, uses returned ETags for timeline viewing writes, and verifies
+restored identities, watched state and cursor exhaustion. All five real-process
+checks pass against the Kyoto-built server above. Public diagnostics now checks
+v2 health/epoch and counters; the retired v1 ffprobe/Demuxe diagnostic fields are
+not represented as v2 claims. Backup/restore still uses the operator filesystem
+tool, preserving its snapshot-integrity and non-overwrite checks. No production
+state rule changed.
