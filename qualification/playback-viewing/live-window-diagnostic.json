@@ -1,0 +1,645 @@
+{
+  "kind": "diagnostic_not_qualification",
+  "engine": "WebKit",
+  "server_sha256": "c438491e1ff31942190aefd9afacba5fc906e20f0b744c7c4ab9f00e20b31e0d",
+  "method": "Passive before/after observations around public element.open and element.seek in an isolated fixture",
+  "attempts": [
+    {
+      "outcome": "ready",
+      "observations": [
+        {
+          "method": "open",
+          "phase": "before",
+          "requested": [],
+          "current_time": null,
+          "seekable": null,
+          "live_seekable": null
+        },
+        {
+          "method": "open",
+          "phase": "after",
+          "requested": [],
+          "current_time": 12.007,
+          "seekable": [
+            {
+              "start": 0.1700000762939453,
+              "end": 12.170000076293945
+            }
+          ],
+          "live_seekable": {
+            "start": 0.19000005722045898,
+            "end": 12.190000057220459
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "before",
+          "requested": [
+            0.440000057220459
+          ],
+          "current_time": 12.007,
+          "seekable": [
+            {
+              "start": 0.1700000762939453,
+              "end": 12.170000076293945
+            }
+          ],
+          "live_seekable": {
+            "start": 0.19000005722045898,
+            "end": 12.190000057220459
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "after",
+          "requested": [
+            0.440000057220459
+          ],
+          "current_time": 0.4400001,
+          "seekable": [
+            {
+              "start": 0.2330000400543213,
+              "end": 12.233000040054321
+            }
+          ],
+          "live_seekable": {
+            "start": 0.23600006103515625,
+            "end": 12.236000061035156
+          }
+        }
+      ]
+    },
+    {
+      "outcome": "ready",
+      "observations": [
+        {
+          "method": "open",
+          "phase": "before",
+          "requested": [],
+          "current_time": null,
+          "seekable": null,
+          "live_seekable": null
+        },
+        {
+          "method": "open",
+          "phase": "after",
+          "requested": [],
+          "current_time": 12.0020001,
+          "seekable": [
+            {
+              "start": 0.05900001525878906,
+              "end": 12.059000015258789
+            }
+          ],
+          "live_seekable": {
+            "start": 0.08999991416931152,
+            "end": 12.089999914169312
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "before",
+          "requested": [
+            0.3399999141693115
+          ],
+          "current_time": 12.0020001,
+          "seekable": [
+            {
+              "start": 0.05900001525878906,
+              "end": 12.059000015258789
+            }
+          ],
+          "live_seekable": {
+            "start": 0.08999991416931152,
+            "end": 12.089999914169312
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "after",
+          "requested": [
+            0.3399999141693115
+          ],
+          "current_time": 0.3399999,
+          "seekable": [
+            {
+              "start": 0.1400001049041748,
+              "end": 12.140000104904175
+            }
+          ],
+          "live_seekable": {
+            "start": 0.14300012588500977,
+            "end": 12.14300012588501
+          }
+        }
+      ]
+    },
+    {
+      "outcome": "failed",
+      "observations": [
+        {
+          "method": "open",
+          "phase": "before",
+          "requested": [],
+          "current_time": null,
+          "seekable": null,
+          "live_seekable": null
+        },
+        {
+          "method": "open",
+          "phase": "after",
+          "requested": [],
+          "current_time": 4.007,
+          "seekable": [
+            {
+              "start": 0.06699991226196289,
+              "end": 4.066999912261963
+            }
+          ],
+          "live_seekable": {
+            "start": 0.09500002861022949,
+            "end": 4.0950000286102295
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "before",
+          "requested": [
+            0.3450000286102295
+          ],
+          "current_time": 4.007,
+          "seekable": [
+            {
+              "start": 0.06699991226196289,
+              "end": 4.066999912261963
+            }
+          ],
+          "live_seekable": {
+            "start": 0.09500002861022949,
+            "end": 4.0950000286102295
+          }
+        },
+        {
+          "method": "seek",
+          "phase": "after",
+          "requested": [
+            0.3450000286102295
+          ],
+          "current_time": 4.007,
+          "seekable": [
+            {
+              "start": 0.11800003051757812,
+              "end": 4.118000030517578
+            }
+          ],
+          "live_seekable": {
+            "start": 0.11999988555908203,
+            "end": 4.119999885559082
+          }
+        }
+      ]
+    }
+  ],
+  "bounded_settling_diagnostic": {
+    "wait_ms": 2000,
+    "qualification": false,
+    "attempts": [
+      {
+        "outcome": "ready",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 8.007,
+            "seekable": [
+              {
+                "start": 0.18199992179870605,
+                "end": 8.181999921798706
+              }
+            ],
+            "live_seekable": {
+              "start": 0.21599984169006348,
+              "end": 8.215999841690063
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "before",
+            "requested": [
+              0.4659998416900635
+            ],
+            "current_time": 8.007,
+            "seekable": [
+              {
+                "start": 0.18199992179870605,
+                "end": 8.181999921798706
+              }
+            ],
+            "live_seekable": {
+              "start": 0.21599984169006348,
+              "end": 8.215999841690063
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "after",
+            "requested": [
+              0.4659998416900635
+            ],
+            "current_time": 0.4659998,
+            "seekable": [
+              {
+                "start": 0.2669999599456787,
+                "end": 8.266999959945679
+              }
+            ],
+            "live_seekable": {
+              "start": 0.26999998092651367,
+              "end": 8.269999980926514
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "settled",
+            "requested": [
+              0.4659998416900635
+            ],
+            "current_time": 0.4659998,
+            "seekable": [
+              {
+                "start": 0.2669999599456787,
+                "end": 8.266999959945679
+              }
+            ],
+            "live_seekable": {
+              "start": 0.26999998092651367,
+              "end": 8.269999980926514
+            }
+          }
+        ]
+      },
+      {
+        "outcome": "failed",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 0,
+            "seekable": [],
+            "live_seekable": null
+          }
+        ]
+      },
+      {
+        "outcome": "ready",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 4.0010002,
+            "seekable": [
+              {
+                "start": 0.06700015068054199,
+                "end": 4.067000150680542
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09200000762939453,
+              "end": 4.0920000076293945
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "before",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 4.0010002,
+            "seekable": [
+              {
+                "start": 0.06700015068054199,
+                "end": 4.067000150680542
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09200000762939453,
+              "end": 4.0920000076293945
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "after",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 0.342,
+            "seekable": [
+              {
+                "start": 0.11700010299682617,
+                "end": 4.117000102996826
+              }
+            ],
+            "live_seekable": {
+              "start": 0.12000012397766113,
+              "end": 4.120000123977661
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "settled",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 0.342,
+            "seekable": [
+              {
+                "start": 0.11700010299682617,
+                "end": 4.117000102996826
+              }
+            ],
+            "live_seekable": {
+              "start": 0.12000012397766113,
+              "end": 4.120000123977661
+            }
+          }
+        ]
+      },
+      {
+        "outcome": "ready",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.06200003623962402,
+                "end": 4.062000036239624
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09100008010864258,
+              "end": 4.091000080108643
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "before",
+            "requested": [
+              0.3410000801086426
+            ],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.06200003623962402,
+                "end": 4.062000036239624
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09100008010864258,
+              "end": 4.091000080108643
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "after",
+            "requested": [
+              0.3410000801086426
+            ],
+            "current_time": 0.3410001,
+            "seekable": [
+              {
+                "start": 0.11699986457824707,
+                "end": 4.116999864578247
+              }
+            ],
+            "live_seekable": {
+              "start": 0.11999988555908203,
+              "end": 4.119999885559082
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "settled",
+            "requested": [
+              0.3410000801086426
+            ],
+            "current_time": 0.3410001,
+            "seekable": [
+              {
+                "start": 0.11699986457824707,
+                "end": 4.116999864578247
+              }
+            ],
+            "live_seekable": {
+              "start": 0.11999988555908203,
+              "end": 4.119999885559082
+            }
+          }
+        ]
+      },
+      {
+        "outcome": "ready",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 4.0019999,
+            "seekable": [
+              {
+                "start": 0.06099987030029297,
+                "end": 4.060999870300293
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09200000762939453,
+              "end": 4.0920000076293945
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "before",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 4.0019999,
+            "seekable": [
+              {
+                "start": 0.06099987030029297,
+                "end": 4.060999870300293
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09200000762939453,
+              "end": 4.0920000076293945
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "after",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 0.342,
+            "seekable": [
+              {
+                "start": 0.12599992752075195,
+                "end": 4.125999927520752
+              }
+            ],
+            "live_seekable": {
+              "start": 0.12899994850158691,
+              "end": 4.128999948501587
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "settled",
+            "requested": [
+              0.34200000762939453
+            ],
+            "current_time": 0.342,
+            "seekable": [
+              {
+                "start": 0.12599992752075195,
+                "end": 4.125999927520752
+              }
+            ],
+            "live_seekable": {
+              "start": 0.12899994850158691,
+              "end": 4.128999948501587
+            }
+          }
+        ]
+      },
+      {
+        "outcome": "failed",
+        "observations": [
+          {
+            "method": "open",
+            "phase": "before",
+            "requested": [],
+            "current_time": null,
+            "seekable": null,
+            "live_seekable": null
+          },
+          {
+            "method": "open",
+            "phase": "after",
+            "requested": [],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.06400012969970703,
+                "end": 4.064000129699707
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09599995613098145,
+              "end": 4.0959999561309814
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "before",
+            "requested": [
+              0.34599995613098145
+            ],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.06400012969970703,
+                "end": 4.064000129699707
+              }
+            ],
+            "live_seekable": {
+              "start": 0.09599995613098145,
+              "end": 4.0959999561309814
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "after",
+            "requested": [
+              0.34599995613098145
+            ],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.13400006294250488,
+                "end": 4.134000062942505
+              }
+            ],
+            "live_seekable": {
+              "start": 0.13700008392333984,
+              "end": 4.13700008392334
+            }
+          },
+          {
+            "method": "seek",
+            "phase": "settled",
+            "requested": [
+              0.34599995613098145
+            ],
+            "current_time": 4.0020001,
+            "seekable": [
+              {
+                "start": 0.13400006294250488,
+                "end": 4.134000062942505
+              }
+            ],
+            "live_seekable": {
+              "start": 0.13700008392333984,
+              "end": 4.13700008392334
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -114,7 +114,13 @@ records Chromium 30 passing / 1 failing product checks and WebKit 29 passing /
 2 failing checks: live audio switching in both, plus conversion-only startup
 in WebKit. Both corrected restart-position checks pass. Electron,
 installed-package playback, physical A/V, HDR fidelity and positive Next remain
-unqualified here. The clients lane received the concrete failure and receipts.
+unqualified here. The clients lane received the concrete failure and receipts. A focused
+[public-API diagnostic](live-window-diagnostic.json) captured an open resolving
+with empty seek ranges and a seek to 0.346 seconds, inside both reported ranges,
+resolving while the playhead remained at 4.002 seconds. It still had not reached
+the target after a two-second settling observation. Four of six settling trials
+passed and two failed. These diagnostics do not qualify playback or justify
+widening the position bound; a simple settling wait was not a sufficient repair.
 
 Fast CI at `b65524c` is green: [run 38113622580](https://github.com/Jagalite/motion/actions/runs/38113622580)
 (fmt, clippy, fast Rust tests, contract, JavaScript and Go). Later changes are
