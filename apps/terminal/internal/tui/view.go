@@ -142,7 +142,7 @@ func (m Model) header(width int) []string {
 	if m.sessionProblem() != nil {
 		return nil
 	}
-	count := func(key, one, many string) string {
+	exact := func(key, one, many string) string {
 		s := m.cache.slots[key]
 		if s == nil || s.data == nil {
 			return ""
@@ -167,6 +167,14 @@ func (m Model) header(width int) []string {
 			return plural(len(v), one, many)
 		}
 		return ""
+	}
+	// A list that stopped at the cap is counted as a lower bound.
+	count := func(key, one, many string) string {
+		n := exact(key, one, many)
+		if s := m.cache.slots[key]; n != "" && s.truncated {
+			return "first " + n
+		}
+		return n
 	}
 	var lines []string
 	switch m.route.page {
@@ -298,8 +306,15 @@ func (m Model) body(f frame) []string {
 		}
 		lines := strings.Split(m.table.View(), "\n")
 		_, rows, _ := m.tabular(f.inner)
+		position := ""
 		if len(rows) > len(m.table.Rows()) {
-			lines = append(lines, faintStyle.Render(fmt.Sprintf("%d–%d of %d", m.toff+1, m.toff+len(m.table.Rows()), len(rows))))
+			position = fmt.Sprintf("%d–%d of %d", m.toff+1, m.toff+len(m.table.Rows()), len(rows))
+		}
+		if s := m.cache.slots[m.tableKey()]; s != nil && s.truncated {
+			position = strings.TrimPrefix(position+" · only the first "+fmt.Sprint(len(rows))+" are shown", " · ")
+		}
+		if position != "" {
+			lines = append(lines, faintStyle.Render(position))
 		}
 		lines = append(lines, "")
 		for _, l := range words(m.detail(), f.inner) {

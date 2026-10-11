@@ -894,3 +894,11 @@ func TestRejectedActionSignsOut(t *testing.T) {
 		t.Fatalf("rejected action left views:\n%s", v)
 	}
 }
+
+func TestCappedTablesSayTheyArePartial(t *testing.T) {
+	m := start(t, &fake{jobs: listCap + 50}, 100, 24)
+	m = goTo(t, m, route{page: pageProcessing})
+	if v := m.View(); !strings.Contains(v, "first 2000 jobs") || !strings.Contains(v, "only the first 2000 are shown") {
+		t.Fatalf("truncation not shown:\n%s", v)
+	}
+}
