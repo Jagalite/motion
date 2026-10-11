@@ -52,13 +52,9 @@ def identity_failures(root, exceptions=None):
     return failures
 
 
-def check(root):
+def source_failures(root, names):
     failures = []
-    files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=root).split(b'\0')
-    for raw in files:
-        if not raw:
-            continue
-        name = raw.decode()
+    for name in names:
         path = root / name
         if not path.is_file():
             continue
@@ -72,6 +68,12 @@ def check(root):
         for host in PRIVATE_HOST.findall(data):
             if host not in (b'your-server.your-tailnet' + b'.ts.net',):
                 failures.append(f'{name}: private tailnet hostname')
+    return failures
+
+
+def check(root):
+    names = subprocess.check_output(['git', 'ls-files', '-z'], cwd=root).decode().split('\0')
+    failures = source_failures(root, filter(None, names))
     failures.extend(identity_failures(root))
     if failures:
         raise SystemExit('\n'.join(failures))

@@ -14,15 +14,22 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - migrations/**
-      - src/db.rs
-      - scripts/upgrade_restore_check.py
-      - scripts/integration_checks.py
-      - Cargo.lock
-      - rust-toolchain.toml
-      - packaging.lock.json
-      - scripts/package_app.py
-      - .github/workflows/**
+      - 'src/**'
+      - 'crates/**'
+      - 'tests/**'
+      - 'migrations/**'
+      - 'contracts/**'
+      - 'scripts/**'
+      - 'apps/**'
+      - 'packages/**'
+      - 'ui-assets/**'
+      - 'web/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'packaging.lock.json'
+      - 'config.example.json'
+      - '.github/workflows/**'
 
 permissions:
   contents: read

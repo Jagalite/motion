@@ -253,7 +253,7 @@ artifact, rather than merely changing its version label.
 
 ### 7.1 Required local build workflow for every agent
 
-**Run local builds through the shared Kyoto queue (`$KYOTO`). Build the
+**Run local builds through the shared Kyoto installation (`$KYOTO_SCRIPT`). Build the
 smallest affected target first; do not build the full application by default.**
 This applies to every lane and includes compilation triggered by test, client,
 packaging or other helper scripts.
@@ -287,14 +287,15 @@ Set `KYOTO` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
-python3 "$KYOTO" status
-python3 "$KYOTO" submit --cwd "$PWD" -- \
+python3 "$KYOTO_SCRIPT" status
+python3 "$KYOTO_SCRIPT" submit --cwd "$PWD" -- \
   cargo check --locked -p playscale-core --lib --target-dir "$PWD/target"
 ```
 
-Set the agent identity before submission. Adapt the target to the actual change;
+Set `KYOTO_SCRIPT` to the existing shared Kyoto executable on the build host;
+do not install a private queue. Set the agent identity before submission. Adapt the target to the actual change;
 do not copy a core check as validation for another lane. Inspect the returned job
-with `python3 "$KYOTO" show <job-id>` and retrieve
+with `python3 "$KYOTO_SCRIPT" show <job-id>` and retrieve
 output with `logs <job-id>`.
 
 ### 7.2 Integration gates and check inventory
@@ -368,6 +369,9 @@ change and the final PR diff as requested for this effort; record the reviewed S
 findings/disposition and affected reruns. Review approval is not runtime evidence.
 Register PRs with the coordinating thread where supported. Completion means the
 owned gate has implementation and evidence, not just that its PR merged.
+
+Current lane-4 implementation and integration gates are recorded in
+[the consolidation release ledger](qualification/consolidation/README.md).
 
 ## 9. Completion checklist
 
