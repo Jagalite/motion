@@ -29,6 +29,8 @@ struct Config {
     explicit_streams: bool,
     /// The selected subtitle must be burned into the video.
     burn_in: bool,
+    /// The timeline is an interval of the original file.
+    clipped: bool,
     hls: bool,
     /// The source fits the client's limits (copy keeps the source's size).
     within_budget: bool,
@@ -100,6 +102,7 @@ fn facts(c: &Config, copy: Option<Observed>) -> core::SourceFacts {
             HardwareFact::Busy => Hardware::Busy,
             HardwareFact::Available => Hardware::Available,
         },
+        clipped: c.clipped,
         prepared: vec![],
     }
 }
@@ -127,8 +130,8 @@ impl Model for Selection {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "playscale.route-selection".into(),
-            model_version: 3,
-            properties_version: 3,
+            model_version: 4,
+            properties_version: 4,
             codec_version: 1,
             build: include_str!("../src/playback_session.rs").into(),
         }
@@ -213,11 +216,13 @@ impl Model for Selection {
         let original_usable = c.mode != ModeFact::Convert
             && !c.explicit_streams
             && !c.burn_in
+            && !c.clipped
             && c.original_supported
             && c.within_budget
             && !failed(Route::Original);
         let copy_open = c.mode == ModeFact::Auto
             && !c.burn_in
+            && !c.clipped
             && c.hls
             && c.within_budget
             && c.copy.is_some_and(|r| !failed(r));
@@ -225,7 +230,9 @@ impl Model for Selection {
             Outcome::Ready(Route::Original)
         } else if c.mode == ModeFact::Original {
             Outcome::Blocked(
-                if c.burn_in {
+                if c.clipped {
+                    "interval_requires_conversion"
+                } else if c.burn_in {
                     "subtitle_requires_conversion"
                 } else if c.explicit_streams {
                     "stream_selection_requires_conversion"
@@ -295,6 +302,15 @@ impl Model for Selection {
                     ),
             ),
             check(
+                "an_interval_is_only_ever_converted",
+                !c.clipped
+                    || matches!(
+                        outcome,
+                        Outcome::Ready(Route::Transcode | Route::HardwareTranscode)
+                            | Outcome::Blocked(_)
+                    ),
+            ),
+            check(
                 "strict_original_never_streams_live",
                 c.mode != ModeFact::Original
                     || matches!(
@@ -323,7 +339,7 @@ impl Enumerate for Selection {
                         HardwareFact::Busy,
                         HardwareFact::Available,
                     ] {
-                        for bits in 0..128u8 {
+                        for bits in 0..=255u8 {
                             let bit = |i: u8| bits & (1 << i) != 0;
                             // Details only matter when a copy is named.
                             if copy.is_none() && bit(5) {
@@ -339,6 +355,7 @@ impl Enumerate for Selection {
                                 copy,
                                 details_qualify: bit(5),
                                 burn_in: bit(6),
+                                clipped: bit(7),
                                 hardware,
                             }));
                         }
@@ -404,7 +421,7 @@ fn route_selection_prefers_qualified_copies_observes_lazily_and_never_reoffers_f
     println!(
         "route-selection model: {} states, {} transitions; three modes, remux/audio-convert/no \
          copy, qualified or unqualified details, unavailable/busy/available hardware, burned \
-         subtitles, HLS, limits, conversion capability, explicit streams and client support, with repeated \
+         subtitles, intervals, HLS, limits, conversion capability, explicit streams and client support, with repeated \
          failure reports",
         report.states, report.transitions
     );

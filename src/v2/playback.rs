@@ -438,6 +438,32 @@ pub struct PlanInput {
 struct Bound {
     version: String,
     file: db::ItemRow,
+    /// The interval of `file` the version binds (core `parts::layout`).
+    clip: Option<playscale_core::parts::Clip>,
+}
+
+/// The layout of a single-part binding with these bounds on a file of this
+/// probed duration: None for the whole file, the interval otherwise. Bounds
+/// that cannot be verified are an error, never a guess.
+fn binding_clip(
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    duration_seconds: Option<f64>,
+) -> Result<Option<playscale_core::parts::Clip>, &'static str> {
+    use playscale_core::parts::{BoundPart, Layout, layout};
+    let bound = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+    match layout(&[BoundPart {
+        part: 1,
+        file_duration_ms: duration_seconds
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (d * 1000.0) as u64),
+        start_ms: bound(start_ms),
+        end_ms: bound(end_ms),
+    }])? {
+        Layout::Whole => Ok(None),
+        Layout::Interval(clip) => Ok(Some(clip)),
+        Layout::Parts(_) => Err("multipart_unavailable"),
+    }
 }
 
 /// The first available original bound to the timeline (or to `version`).
@@ -451,12 +477,12 @@ async fn original_of(
     version: Option<&str>,
     file: Option<&str>,
 ) -> Result<Option<Bound>, Problem> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT v.id,b.file_id,b.start_ms,b.end_ms FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 AND f.available=1 \
          AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
-         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+         AND b.file_revision=f.revision AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
          AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) ORDER BY v.id,b.file_id LIMIT 100",
     )
     .bind(timeline)
@@ -466,7 +492,7 @@ async fn original_of(
     .bind(file)
     .fetch_all(&mut *conn)
     .await?;
-    for (version, file) in rows {
+    for (version, file, start, end) in rows {
         if !core::readable(principal, file_facts(conn, &file).await?.as_ref()) {
             continue;
         }
@@ -474,7 +500,15 @@ async fn original_of(
             .bind(file)
             .fetch_one(&mut *conn)
             .await?;
-        return Ok(Some(Bound { version, file }));
+        // An interval whose bounds cannot be verified is not playable.
+        let Ok(clip) = binding_clip(start, end, file.duration_seconds) else {
+            continue;
+        };
+        return Ok(Some(Bound {
+            version,
+            file,
+            clip,
+        }));
     }
     Ok(None)
 }
@@ -488,12 +522,12 @@ async fn originals_of(
     version: Option<&str>,
     file: Option<&str>,
 ) -> Result<Vec<Bound>, Problem> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT v.id,b.file_id,b.start_ms,b.end_ms FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 \
          AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
-         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id,b.file_id",
+         AND b.file_revision=f.revision AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id,b.file_id",
     )
     .bind(timeline)
     .bind(version)
@@ -503,12 +537,19 @@ async fn originals_of(
     .fetch_all(&mut *conn)
     .await?;
     let mut found = Vec::with_capacity(rows.len());
-    for (version, file) in rows {
+    for (version, file, start, end) in rows {
         let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=?")
             .bind(file)
             .fetch_one(&mut *conn)
             .await?;
-        found.push(Bound { version, file });
+        let Ok(clip) = binding_clip(start, end, file.duration_seconds) else {
+            continue;
+        };
+        found.push(Bound {
+            version,
+            file,
+            clip,
+        });
     }
     Ok(found)
 }
@@ -533,8 +574,11 @@ async fn readable_prepared(
 
 /// Whether the version still binds the file to the timeline.
 async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
-    let bound: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id \
+    // The same single part with the same interval: a changed interval is a
+    // changed binding.
+    let bound: Option<(Option<i64>, Option<i64>, Option<f64>, i64)> = sqlx::query_as(
+        "SELECT b.start_ms,b.end_ms,f.duration_seconds,(SELECT count(*) FROM version_files o WHERE o.version_id=v.id) \
+         FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
          WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.part=1",
     )
     .bind(&claims.version)
@@ -542,7 +586,9 @@ async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Resu
     .bind(&claims.file)
     .fetch_optional(conn)
     .await?;
-    Ok(bound.is_some())
+    Ok(bound.is_some_and(|(start, end, duration, parts)| {
+        parts == 1 && binding_clip(start, end, duration).is_ok_and(|clip| clip == claims.clip)
+    }))
 }
 
 /// The original a pinned generated version renders, when `version` is one.
@@ -600,7 +646,11 @@ async fn prepared_of(
                 .bind(file)
                 .fetch_one(&mut *conn)
                 .await?;
-            found.push(Bound { version, file });
+            found.push(Bound {
+                version,
+                file,
+                clip: None,
+            });
         }
     }
     Ok(found)
@@ -1175,17 +1225,27 @@ pub async fn plan(
                 serde_json::from_str::<super::processing::Tracks>(&tracks).ok()
             })
             .map(|tracks| match tracks.audio_track_id {
-                // `a{n}`: the n-th audio stream of the source revision.
-                Some(id) => id.strip_prefix('a').and_then(|n| n.parse::<u32>().ok()),
-                // No selection: the recipe encodes the first audio stream.
-                None => default_audio,
+                // `a{n}`: the n-th audio stream of the source revision; an
+                // unreadable record describes nothing.
+                Some(id) => id
+                    .strip_prefix('a')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .map(Some)
+                    .ok_or(()),
+                // No selection: the recipe encodes the first audio stream,
+                // or none when the source has no audio.
+                None => Ok(default_audio),
             });
+        // A pinned version plays its own default streams (track and component
+        // pins were refused above).
         carries.push(
             !subtitle_selected
-                && match encoded {
-                    Some(encoded) => encoded.is_some() && encoded == audio,
-                    None => !audio_chosen,
-                },
+                && (pinned_prepared
+                    || match encoded {
+                        Some(Ok(encoded)) => encoded == audio,
+                        Some(Err(())) => false,
+                        None => !audio_chosen,
+                    }),
         );
     }
     let mut source = core::SourceFacts {
@@ -1219,6 +1279,7 @@ pub async fn plan(
         ),
         copy,
         hardware,
+        clipped: bound.clip.is_some(),
     };
     let request = core::Request {
         mode,
@@ -1234,6 +1295,8 @@ pub async fn plan(
         let core::StreamCopy::Unobserved(route) = source.copy else {
             return Err(Problem::internal("copy observation without a candidate"));
         };
+        // The probe queries the pool itself: hold no connection meanwhile.
+        drop(conn);
         // A probe failure, a full admission queue or an unqualified bitstream
         // leaves only conversion; admission observes the details again under
         // its own checks.
@@ -1245,6 +1308,7 @@ pub async fn plan(
             }
             _ => core::StreamCopy::Ineligible,
         };
+        conn = app.db.acquire().await?;
         decided = core::plan(&bound.file.id, &source, &request);
         if decided == core::Plan::Observe {
             return Err(Problem::internal(
@@ -1314,6 +1378,7 @@ pub async fn plan(
             (None, None, Some(index)) => Some(core::Subtitle::Bitmap(index)),
             (None, None, None) => None,
         },
+        clip: chosen.clip,
         expires_at,
     };
     let mut warnings = vec![];
@@ -1682,6 +1747,7 @@ pub async fn create_delivery(
         route: claims.route,
         sidecar: sidecar_of(&claims),
         burn: burned_subtitle(&claims),
+        clip: claims.clip,
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -2009,6 +2075,7 @@ pub async fn change_delivery(
                     subtitle: embedded_subtitle(&claims),
                     sidecar: sidecar_of(&claims),
                     burn: burned_subtitle(&claims),
+                    clip: claims.clip,
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )

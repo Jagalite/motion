@@ -198,6 +198,10 @@ pub struct Pin {
     pub tracks: Vec<String>,
     pub operation: Operation,
     pub recipe_digest: Option<String>,
+    /// The interval of the source file the timeline is (logical time `t` is
+    /// file time `start_ms + t`); None plays the whole file.
+    #[serde(default)]
+    pub clip: Option<crate::parts::Clip>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1093,6 +1097,7 @@ mod tests {
             tracks: tracks.iter().map(|t| (*t).into()).collect(),
             operation: Operation::VideoTranscode,
             recipe_digest: Some("h264-aac".into()),
+            clip: None,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {

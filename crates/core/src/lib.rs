@@ -18,6 +18,7 @@ pub mod metadata;
 pub mod nfo;
 pub mod offline;
 pub mod organization;
+pub mod parts;
 pub mod playback;
 pub mod playback_session;
 pub mod processing;

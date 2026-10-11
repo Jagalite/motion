@@ -425,10 +425,13 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
+/// FFmpeg arguments for a live generation reading the source from `start_ms`
+/// (file time) and, for an interval, stopping at `end_ms` (file time).
 fn arguments(
     operation: Operation,
     hardware: bool,
     start_ms: u64,
+    end_ms: Option<u64>,
     audio: Option<u32>,
     burn: Option<u32>,
     directory: &FsPath,
@@ -473,6 +476,12 @@ fn arguments(
         let trim = start_ms - input_ms;
         args.push("-ss".into());
         args.push(format!("{}.{:03}", trim / 1000, trim % 1000));
+    }
+    // An interval ends inside the file: the output stops at its end.
+    if let Some(end_ms) = end_ms {
+        let length = end_ms.saturating_sub(start_ms);
+        args.push("-t".into());
+        args.push(format!("{}.{:03}", length / 1000, length % 1000));
     }
     const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
     // A burned bitmap subtitle's canvas is scaled to the source video's size
@@ -1211,7 +1220,9 @@ async fn run_generation(
         .args(arguments(
             operation,
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
-            seek_ms,
+            // Logical time is file time offset by the interval's start.
+            seek_ms + pin.clip.map_or(0, |clip| clip.start_ms),
+            pin.clip.map(|clip| clip.end_ms),
             audio,
             pinned_burn(&pin),
             &directory,
@@ -2005,6 +2016,7 @@ fn pin(
         tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: Some(recipe.into()),
+        clip: None,
     }
 }
 
@@ -2119,6 +2131,7 @@ fn byte_pin(
         tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: None,
+        clip: None,
     }
 }
 
@@ -2296,6 +2309,8 @@ pub(crate) struct Planned {
     pub sidecar: Option<Sidecar>,
     /// An embedded bitmap subtitle burned into the converted video.
     pub burn: Option<u32>,
+    /// The interval of the file the planned timeline is.
+    pub clip: Option<playscale_core::parts::Clip>,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2452,6 +2467,7 @@ pub(crate) struct Selection {
     pub subtitle: Option<u32>,
     pub sidecar: Option<Sidecar>,
     pub burn: Option<u32>,
+    pub clip: Option<playscale_core::parts::Clip>,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2550,10 +2566,27 @@ pub(crate) async fn change_live(
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
             validate_burn(&file, selection.burn, pin.operation)?;
-            let pin = with_burn(
-                with_sidecar(pin, selection.sidecar.as_ref()),
-                selection.burn,
-            );
+            // The timeline's interval is fixed for the delivery.
+            if selection.clip != basis.clip {
+                return Err(ApiError::conflict(
+                    "timeline_changed",
+                    "The timeline's interval changed; create a new delivery",
+                ));
+            }
+            if selection.clip.is_some() && pin.operation != Operation::VideoTranscode {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "An interval of a file is delivered only by a conversion",
+                ));
+            }
+            let pin = Pin {
+                clip: selection.clip,
+                ..with_burn(
+                    with_sidecar(pin, selection.sidecar.as_ref()),
+                    selection.burn,
+                )
+            };
             (Some(basis), Some((timeline, pin)))
         }
     };
@@ -2909,10 +2942,23 @@ async fn admit_owned(
     validate_sidecar(&mut transaction, &file.id, sidecar).await?;
     let burn = planned.as_ref().and_then(|p| p.burn);
     validate_burn(&file, burn, operation)?;
-    let duration_ms = file
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (d * 1000.0) as u64);
+    // An interval is a clip of the file: only a conversion presents it, and
+    // the delivery's logical duration is the interval's.
+    let clip = planned.as_ref().and_then(|p| p.clip);
+    if clip.is_some() && operation != Operation::VideoTranscode {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "An interval of a file is delivered only by a conversion",
+        ));
+    }
+    let duration_ms = match clip {
+        Some(clip) => Some(clip.duration_ms()),
+        None => file
+            .duration_seconds
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (d * 1000.0) as u64),
+    };
     if duration_ms.is_none() && !original {
         return Err(ApiError::bad("Live conversion requires a probed duration"));
     }
@@ -2934,17 +2980,20 @@ async fn admit_owned(
         planned
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
-        with_burn(
-            with_sidecar(
-                if original {
-                    byte_pin(&file, r.audio_track, r.subtitle_track, operation)
-                } else {
-                    pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
-                },
-                sidecar,
-            ),
-            burn,
-        ),
+        Pin {
+            clip,
+            ..with_burn(
+                with_sidecar(
+                    if original {
+                        byte_pin(&file, r.audio_track, r.subtitle_track, operation)
+                    } else {
+                        pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+                    },
+                    sidecar,
+                ),
+                burn,
+            )
+        },
         r.start_ms,
         duration_ms,
         runtime.now_ms(),
@@ -3783,6 +3832,7 @@ mod tests {
                 tracks: tracks(None, None),
                 operation: Operation::VideoTranscode,
                 recipe_digest: Some(RECIPE.into()),
+                clip: None,
             },
             0,
             Some(60_000),

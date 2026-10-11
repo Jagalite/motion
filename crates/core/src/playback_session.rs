@@ -105,6 +105,10 @@ pub struct SourceFacts {
     /// A hardware encoder for the conversion. Its recipe has the same output
     /// bounds as the software one, so `conversion_within_budget` covers both.
     pub hardware: Hardware,
+    /// The timeline is an interval of the original (`parts::Clip`). Byte
+    /// delivery, a stream copy and prepared renditions all present the whole
+    /// file, so only a conversion of the interval can serve it.
+    pub clipped: bool,
     /// Stored renditions of this original whose output and source revisions
     /// are both still the registered ones (`renditions::available`), in the
     /// adapter's preference order (newest first).
@@ -210,6 +214,7 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         original: true,
         available: source.available
             && byte
+            && !source.clipped
             && !request.pinned_prepared
             && !failed(Route::Original, file_id),
         support: source.client_support,
@@ -222,6 +227,7 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         // A rendition carrying the selected streams honors an explicit choice.
         available: request.range
             && !request.burn_in
+            && !source.clipped
             && p.carries_selection
             && !failed(Route::Prepared, &p.file),
         support: p.client_support,
@@ -237,7 +243,9 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     match () {
         _ if request.pinned_prepared => Plan::Blocked("selected_version_unavailable"),
         _ if !source.available => Plan::Blocked("source_unavailable"),
-        _ if request.mode == Mode::Original => Plan::Blocked(if request.burn_in {
+        _ if request.mode == Mode::Original => Plan::Blocked(if source.clipped {
+            "interval_requires_conversion"
+        } else if request.burn_in {
             "subtitle_requires_conversion"
         } else if request.explicit_streams {
             "stream_selection_requires_conversion"
@@ -247,7 +255,11 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
         _ if !request.hls => Plan::Blocked("client_cannot_play_conversion"),
         // A copy keeps the source's video at its own size and bitrate. Convert
         // asks for converted video, so only Auto may choose a copy.
-        _ if request.mode == Mode::Auto && source.within_budget && !request.burn_in => {
+        _ if request.mode == Mode::Auto
+            && source.within_budget
+            && !request.burn_in
+            && !source.clipped =>
+        {
             match source.copy {
                 StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
                 StreamCopy::Unobserved(route) if !failed(route, file_id) => Plan::Observe,
@@ -311,6 +323,10 @@ pub struct Claims {
     pub audio: Option<u32>,
     /// The selected subtitle; None means no subtitle.
     pub subtitle: Option<Subtitle>,
+    /// The interval of the file the version binds, when it binds one. A
+    /// changed interval is a changed binding.
+    #[serde(default)]
+    pub clip: Option<crate::parts::Clip>,
     pub expires_at: i64,
 }
 
@@ -500,6 +516,7 @@ mod tests {
             conversion_within_budget: true,
             copy: StreamCopy::Ineligible,
             hardware: Hardware::Unavailable,
+            clipped: false,
             prepared: vec![],
         }
     }
@@ -626,6 +643,7 @@ mod tests {
             route: Route::Original,
             audio: Some(0),
             subtitle: None,
+            clip: None,
             expires_at: 100,
         }
     }
@@ -1146,5 +1164,41 @@ mod tests {
                 matches!(route, Route::Transcode | Route::HardwareTranscode)
             );
         }
+    }
+
+    #[test]
+    fn an_interval_is_served_only_by_a_conversion_of_it() {
+        let mut s = source(Support::Supported);
+        s.clipped = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        s.prepared = vec![PreparedFacts {
+            file: "p".into(),
+            client_support: Support::Supported,
+            within_budget: true,
+            carries_selection: true,
+        }];
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        s.hardware = Hardware::Available;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::HardwareTranscode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("interval_requires_conversion")
+        );
+        let mut range_only = request(Mode::Auto);
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
     }
 }

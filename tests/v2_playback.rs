@@ -3957,6 +3957,17 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
     assert_eq!(first.body["operation"], "video_transcode", "{}", first.body);
     assert_eq!(first.body["source"]["file_id"], source["file_id"]);
     assert_eq!(plan("auto", "a0").await.body["operation"], "original");
+    // Pinning the rendition's version plays its own default streams.
+    let version: String =
+        sqlx::query_scalar("SELECT version_id FROM version_files WHERE file_id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let mut pinned = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+    pinned["version_id"] = json!(version);
+    let pinned = f.post("/api/v2/playback/plans", &auth, None, pinned).await;
+    assert_eq!(pinned.body["operation"], "prepared", "{}", pinned.body);
     // The rendition really holds the second stream (22.05 kHz).
     let path: (String, String) = sqlx::query_as(
         "SELECT l.root,f.relative_path FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
@@ -3980,4 +3991,170 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
+}
+
+/// One gray frame of `path` at `at` seconds (320x240 sources).
+fn gray_frame(path: &Path, at: &str) -> Vec<u8> {
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", at, "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240, "{at}");
+    frame
+}
+
+fn mean_difference(a: &[u8], b: &[u8]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y) as u64)
+        .sum::<u64>()
+        / a.len() as u64
+}
+
+/// A version bound to an interval of its file is a timeline of that
+/// interval: only a conversion presents it, logical time zero is the
+/// interval's start, the delivery ends at its end, and a changed interval
+/// fences plans signed before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn interval_bindings_play_their_clip_of_the_file() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    two_audio_mp4(&f, "30");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    sqlx::query(
+        "UPDATE version_files SET start_ms=10000,end_ms=20000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let plan = |mode: &str| {
+        let input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("original").await.body["reason_codes"][0],
+        "interval_requires_conversion"
+    );
+    // Not the original bytes, nor an (eligible) copy: a conversion.
+    let converted = plan("auto").await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-01"),
+            json!({"plan_token": converted.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    assert_eq!(admitted.body["logical_duration_ms"], 10000);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("interval.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Logical 0.5 s is file 10.5 s, not file 0.5 s.
+    let source = f.dir.path().join("media/film.mp4");
+    let delivered = gray_frame(&fragment, "0.5");
+    let inside = mean_difference(&delivered, &gray_frame(&source, "10.5"));
+    let outside = mean_difference(&delivered, &gray_frame(&source, "0.5"));
+    assert!(inside * 4 < outside, "inside {inside}, outside {outside}");
+    // A seek within the interval: the generation ends at its end.
+    let seek = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("interval-seek-000001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":8000}),
+        )
+        .await;
+    assert_eq!(seek.status, StatusCode::ACCEPTED, "{}", seek.body);
+    let done = f
+        .until(&id, &auth, |d| {
+            d["pending"]["available_end_ms"].as_u64().unwrap_or(0) >= 9900
+                || d["pending"]["status"] == "failed"
+        })
+        .await;
+    let end = done["pending"]["available_end_ms"].as_u64().unwrap();
+    assert!((9900..=10100).contains(&end), "{done}");
+    let variant =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/2/variants/main/index.m3u8")).await)
+            .unwrap();
+    assert!(variant.contains("#EXT-X-ENDLIST"), "{variant}");
+    assert_eq!(
+        f.call("DELETE", &path, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    // The interval changes: a plan signed for the old one is refused.
+    let retained = plan("auto").await;
+    sqlx::query(
+        "UPDATE version_files SET end_ms=25000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-02"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // Bounds outside the probed file are never played.
+    sqlx::query(
+        "UPDATE version_files SET end_ms=90000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        plan("auto").await.body["reason_codes"][0],
+        "source_unavailable"
+    );
 }

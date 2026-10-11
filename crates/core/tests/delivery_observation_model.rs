@@ -36,6 +36,7 @@ impl Model for Observations {
             tracks: vec![],
             operation: Operation::Original,
             recipe_digest: None,
+            clip: None,
         };
         let (delivery, _) = Delivery::admit("t".into(), pin, 0, Some(1000), 0).unwrap();
         Ok(State { delivery, steps: 0 })
