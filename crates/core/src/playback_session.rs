@@ -154,6 +154,41 @@ pub struct PreparedFacts {
     pub carries_selection: bool,
 }
 
+/// Audio bitrate of every live conversion recipe (AAC stereo).
+pub const LIVE_AUDIO_BPS: u64 = 160_000;
+/// The lowest video rate a capped conversion is offered at.
+pub const MIN_CAPPED_VIDEO_BPS: u64 = 300_000;
+
+/// Encoder rate limits for a conversion capped at a client's peak bitrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateCap {
+    /// VBV maximum video rate, bits/s.
+    pub video_max_bps: u64,
+    /// VBV buffer, bits (one second at the maximum rate).
+    pub video_buffer_bits: u64,
+}
+
+/// Rate limits that keep a live conversion's peak bitrate within
+/// `max_bitrate_bps` over every window of at least `min_window_ms` (HLS
+/// measures peak bitrate over sets of segments lasting at least half the
+/// target duration). Over a window `w`, a VBV-constrained video stream carries
+/// at most `M*w + B` bits, so with `B` one second at `M` its rate is at most
+/// `M*(1 + 1000/w)`. The audio rate and a 5% container allowance come first.
+/// None when too little remains for video.
+pub fn rate_cap(max_bitrate_bps: u64, min_window_ms: u64) -> Option<RateCap> {
+    let video = (max_bitrate_bps.checked_mul(100)? / 105).checked_sub(LIVE_AUDIO_BPS)?;
+    let max = video.checked_mul(min_window_ms)? / (min_window_ms + 1000);
+    (max >= MIN_CAPPED_VIDEO_BPS).then_some(RateCap {
+        video_max_bps: max,
+        video_buffer_bits: max,
+    })
+}
+
+/// Whether a published segment honors a peak bitrate cap.
+pub fn within_cap(bytes: u64, duration_ms: u64, max_bitrate_bps: u64) -> bool {
+    bytes.saturating_mul(8_000) <= max_bitrate_bps.saturating_mul(duration_ms)
+}
+
 /// Whether a conversion whose output is at most `output_height` lines and, when
 /// capped, at most `output_max_bitrate` bits/s honors the requested limits. An
 /// uncapped (quality-targeted) encoder cannot promise any bitrate limit.
@@ -339,6 +374,9 @@ pub struct Claims {
     /// changed part or revision is a changed binding.
     #[serde(default)]
     pub parts: Vec<crate::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at (`rate_cap`); None uncapped.
+    #[serde(default)]
+    pub max_bitrate_bps: Option<u64>,
     pub expires_at: i64,
 }
 
@@ -658,6 +696,7 @@ mod tests {
             subtitle: None,
             clip: None,
             parts: vec![],
+            max_bitrate_bps: None,
             expires_at: 100,
         }
     }
@@ -1229,5 +1268,29 @@ mod tests {
             plan("f", &s, &request(Mode::Original)),
             Plan::Blocked("multipart_requires_conversion")
         );
+    }
+
+    #[test]
+    fn capped_conversions_keep_every_peak_window_within_the_limit() {
+        let window = 3_000;
+        let cap = rate_cap(2_000_000, window).unwrap();
+        // 2 Mb/s less 5% and the audio, then 3/4 for the one-second buffer.
+        assert_eq!(
+            cap.video_max_bps,
+            (2_000_000 * 100 / 105 - LIVE_AUDIO_BPS) * 3 / 4
+        );
+        assert_eq!(cap.video_buffer_bits, cap.video_max_bps);
+        // The worst window: the maximum rate plus the whole buffer, the audio
+        // and the container allowance stay within the cap.
+        let worst = (cap.video_max_bps * window / 1000 + cap.video_buffer_bits) * 1000 / window
+            + LIVE_AUDIO_BPS;
+        assert!(worst * 105 / 100 <= 2_000_000, "{worst}");
+        // Too little for video is refused, never squeezed.
+        assert_eq!(rate_cap(500_000, window), None);
+        assert!(rate_cap(700_000, window).is_some());
+        assert_eq!(rate_cap(0, window), None);
+        assert_eq!(rate_cap(u64::MAX, window), None);
+        assert!(within_cap(1_000_000, 4_000, 2_000_000));
+        assert!(!within_cap(1_000_001, 4_000, 2_000_000));
     }
 }

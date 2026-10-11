@@ -206,6 +206,10 @@ pub struct Pin {
     /// `source_file`); empty for a single file.
     #[serde(default)]
     pub parts: Vec<crate::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at
+    /// (`playback_session::rate_cap`); None uncapped.
+    #[serde(default)]
+    pub max_bitrate_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1103,6 +1107,7 @@ mod tests {
             recipe_digest: Some("h264-aac".into()),
             clip: None,
             parts: vec![],
+            max_bitrate_bps: None,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {

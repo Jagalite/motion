@@ -130,11 +130,16 @@ pub async fn capabilities(
                 routes.join(",")
             },
         ),
-        ("timeline_binding", "whole_single_part".into()),
-        ("subtitles", "embedded_plain_text_original_webvtt".into()),
-        ("components", "embedded_revision_bound".into()),
+        // Intervals and multipart versions are played by conversion only.
+        ("timeline_binding", "whole,interval,multipart".into()),
+        (
+            "subtitles",
+            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+        ),
+        ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
+        ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
         ("tickets", "file_or_delivery_generation_playback".into()),
-        ("unsupported", "automatic_subtitle_selection,sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_caps,adaptive_bitrate,cast".into()),
+        ("unsupported", "styled_subtitles,text_subtitles_on_live_routes,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,adaptive_bitrate,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

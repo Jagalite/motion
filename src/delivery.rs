@@ -42,6 +42,8 @@ pub const MAX_ADMISSIONS: usize = 32;
 pub const SEGMENT_SECONDS: u64 = 4;
 /// Pinned HLS target duration. Longer segments fail the generation.
 pub const TARGET_SECONDS: u64 = 6;
+/// The shortest window HLS peak bitrate is measured over: half the target.
+pub const PEAK_WINDOW_MS: u64 = TARGET_SECONDS * 1000 / 2;
 /// Free space a generation needs beyond the configured floor before it starts.
 /// Pacing and retention bound the segments it keeps; this covers them at the
 /// recipe's peak rate with margin.
@@ -438,6 +440,7 @@ fn arguments(
     audio: Option<u32>,
     burn: Option<u32>,
     concat: Option<&FsPath>,
+    cap: Option<playscale_core::playback_session::RateCap>,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
@@ -527,15 +530,22 @@ fn arguments(
                     "0",
                     "-realtime",
                     "1",
-                    "-b:v",
-                    "2500k",
-                    "-maxrate",
-                    "2500k",
-                    "-bufsize",
-                    "5000k",
                 ]
                 .map(str::to_owned),
             );
+            // A capped conversion targets and limits its rate to the cap's
+            // VBV settings; otherwise the recipe's 2.5 Mb/s.
+            let (rate, buffer) = cap.map_or(("2500k".to_owned(), "5000k".to_owned()), |c| {
+                (c.video_max_bps.to_string(), c.video_buffer_bits.to_string())
+            });
+            args.extend([
+                "-b:v".into(),
+                rate.clone(),
+                "-maxrate".into(),
+                rate,
+                "-bufsize".into(),
+                buffer,
+            ]);
         } else {
             args.extend(
                 [
@@ -543,6 +553,15 @@ fn arguments(
                 ]
                 .map(str::to_owned),
             );
+            // Capped CRF: quality-targeted below the cap's VBV limit.
+            if let Some(c) = cap {
+                args.extend([
+                    "-maxrate".into(),
+                    c.video_max_bps.to_string(),
+                    "-bufsize".into(),
+                    c.video_buffer_bits.to_string(),
+                ]);
+            }
         }
         args.push("-force_key_frames".into());
         args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
@@ -976,6 +995,7 @@ async fn observe(
     start_ms: u64,
     operation: Operation,
     copy_start: Option<u64>,
+    max_bitrate_bps: Option<u64>,
 ) -> bool {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -1011,6 +1031,21 @@ async fn observe(
         };
         if metadata.len() > MAX_SEGMENT_BYTES {
             tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), "segment exceeds the size cap");
+            let _ = apply(app, session, Input::Failed { generation });
+            return false;
+        }
+        // A capped conversion's peak bitrate is measured, not assumed: every
+        // segment long enough to count toward HLS peak bitrate (at least half
+        // the target duration) must be within the cap.
+        if let Some(cap) = max_bitrate_bps
+            && segment.duration_ms * 2 >= target_seconds(operation) * 1000
+            && !playscale_core::playback_session::within_cap(
+                metadata.len(),
+                segment.duration_ms,
+                cap,
+            )
+        {
+            tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), duration_ms = segment.duration_ms, cap, "segment exceeds the bitrate cap");
             let _ = apply(app, session, Input::Failed { generation });
             return false;
         }
@@ -1258,6 +1293,8 @@ async fn run_generation(
             audio,
             pinned_burn(&pin),
             concat.as_deref(),
+            pin.max_bitrate_bps
+                .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
             &directory,
         ))
         .stdin(Stdio::piped())
@@ -1381,6 +1418,7 @@ async fn run_generation(
                             start_ms,
                             operation,
                             copy_start,
+                            pin.max_bitrate_bps,
                         ),
                     ) => observed,
                 };
@@ -1426,6 +1464,7 @@ async fn run_generation(
                     start_ms,
                     operation,
                     copy_start,
+                    pin.max_bitrate_bps,
                 ),
             )
             .await;
@@ -1743,6 +1782,10 @@ pub struct GenerationView {
     pub subtitle_track: Option<u32>,
     /// WebVTT sidecar for the selected text subtitle, in timeline time.
     pub subtitles_url: Option<String>,
+    /// The peak bitrate a capped conversion keeps to (v2 manifests only).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub max_bitrate_bps: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1810,6 +1853,7 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                     .tracks
                     .iter()
                     .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok())),
+                max_bitrate_bps: g.pin.max_bitrate_bps,
             })
     };
     DeliveryView {
@@ -2056,6 +2100,7 @@ fn pin(
         recipe_digest: Some(recipe.into()),
         clip: None,
         parts: vec![],
+        max_bitrate_bps: None,
     }
 }
 
@@ -2172,6 +2217,7 @@ fn byte_pin(
         recipe_digest: None,
         clip: None,
         parts: vec![],
+        max_bitrate_bps: None,
     }
 }
 
@@ -2353,6 +2399,8 @@ pub(crate) struct Planned {
     pub clip: Option<playscale_core::parts::Clip>,
     /// Every part of a multipart timeline, in order; empty for one file.
     pub parts: Vec<playscale_core::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at.
+    pub max_bitrate_bps: Option<u64>,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2511,6 +2559,7 @@ pub(crate) struct Selection {
     pub burn: Option<u32>,
     pub clip: Option<playscale_core::parts::Clip>,
     pub parts: Vec<playscale_core::parts::PartPin>,
+    pub max_bitrate_bps: Option<u64>,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2625,9 +2674,20 @@ pub(crate) async fn change_live(
                     "An interval of a file is delivered only by a conversion",
                 ));
             }
+            if selection.max_bitrate_bps.is_some_and(|b| {
+                pin.operation != Operation::VideoTranscode
+                    || playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS).is_none()
+            }) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "A bitrate cap is kept only by a conversion with room for its video",
+                ));
+            }
             let pin = Pin {
                 clip: selection.clip,
                 parts: selection.parts,
+                max_bitrate_bps: selection.max_bitrate_bps,
                 ..with_burn(
                     with_sidecar(pin, selection.sidecar.as_ref()),
                     selection.burn,
@@ -2880,25 +2940,19 @@ async fn admit_owned(
             Sha256::digest(
                 match &planned {
                     None => serde_json::to_vec(&r),
-                    // A sidecar or burned subtitle, an interval and multipart
-                    // parts are part of the request too; digests without any
-                    // keep their earlier form, so recorded receipts replay.
+                    // A sidecar or burned subtitle, an interval, multipart parts
+                    // and a bitrate cap are part of the request too; digests
+                    // without any keep their earlier form, so recorded receipts
+                    // replay.
                     Some(p)
                         if p.sidecar.is_none()
                             && p.burn.is_none()
                             && p.clip.is_none()
-                            && p.parts.is_empty() =>
+                            && p.parts.is_empty()
+                            && p.max_bitrate_bps.is_none() =>
                     {
                         serde_json::to_vec(&(&r, &p.owner, &p.version, p.route))
                     }
-                    Some(p) if p.clip.is_none() && p.parts.is_empty() => serde_json::to_vec(&(
-                        &r,
-                        &p.owner,
-                        &p.version,
-                        p.route,
-                        p.sidecar.as_ref().map(|s| (&s.name, &s.fingerprint)),
-                        p.burn,
-                    )),
                     Some(p) => serde_json::to_vec(&(
                         &r,
                         &p.owner,
@@ -2908,6 +2962,7 @@ async fn admit_owned(
                         p.burn,
                         p.clip,
                         &p.parts,
+                        p.max_bitrate_bps,
                     )),
                 }
                 .expect("serializable request")
@@ -3011,6 +3066,18 @@ async fn admit_owned(
         .as_ref()
         .map(|p| p.parts.clone())
         .unwrap_or_default();
+    // A cap is a conversion's encoder setting; it must be one that can hold.
+    let max_bitrate_bps = planned.as_ref().and_then(|p| p.max_bitrate_bps);
+    if max_bitrate_bps.is_some_and(|b| {
+        operation != Operation::VideoTranscode
+            || playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS).is_none()
+    }) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "A bitrate cap is kept only by a conversion with room for its video",
+        ));
+    }
     if (clip.is_some() || !parts.is_empty()) && operation != Operation::VideoTranscode {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3068,6 +3135,7 @@ async fn admit_owned(
         Pin {
             clip,
             parts: parts.clone(),
+            max_bitrate_bps,
             ..with_burn(
                 with_sidecar(
                     if original {
@@ -3929,6 +3997,7 @@ mod tests {
                 recipe_digest: Some(RECIPE.into()),
                 clip: None,
                 parts: vec![],
+                max_bitrate_bps: None,
             },
             0,
             Some(60_000),

@@ -1439,11 +1439,13 @@ pub async fn plan(
             && delivery::live_transcodable(&bound.file, audio),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
+        // A requested cap is kept when the conversion can be capped at it
+        // with room for its video (core `rate_cap`).
         conversion_within_budget: core::conversion_fits(
             limit,
             max_bitrate,
             height.map(|h| h.min(delivery::LIVE_MAX_HEIGHT)),
-            None,
+            max_bitrate.filter(|b| core::rate_cap(*b, delivery::PEAK_WINDOW_MS).is_some()),
         ),
         copy,
         hardware,
@@ -1549,6 +1551,10 @@ pub async fn plan(
         },
         clip: chosen.clip,
         parts: chosen.parts.clone(),
+        // Only a conversion is capped; any other route was chosen within the
+        // limit without one.
+        max_bitrate_bps: max_bitrate
+            .filter(|_| matches!(route, Route::Transcode | Route::HardwareTranscode)),
         expires_at,
     };
     let mut warnings = vec![];
@@ -1919,6 +1925,7 @@ pub async fn create_delivery(
         burn: burned_subtitle(&claims),
         clip: claims.clip,
         parts: claims.parts.clone(),
+        max_bitrate_bps: claims.max_bitrate_bps,
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -2248,6 +2255,7 @@ pub async fn change_delivery(
                     burn: burned_subtitle(&claims),
                     clip: claims.clip,
                     parts: claims.parts.clone(),
+                    max_bitrate_bps: claims.max_bitrate_bps,
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
@@ -2450,7 +2458,9 @@ pub async fn master_playlist(
         "avc1.64001f".into()
     };
     let text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"{codecs}\"\n{}\n",
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"\n{}\n",
+        // A capped conversion's peak is its cap (measured per segment).
+        serving.max_bitrate_bps.unwrap_or(5_000_000),
         stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
     Ok((

@@ -38,6 +38,7 @@ impl Model for Observations {
             recipe_digest: None,
             clip: None,
             parts: vec![],
+            max_bitrate_bps: None,
         };
         let (delivery, _) = Delivery::admit("t".into(), pin, 0, Some(1000), 0).unwrap();
         Ok(State { delivery, steps: 0 })

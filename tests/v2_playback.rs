@@ -1829,10 +1829,11 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
     let mut capped = plan_input("default", &film, "convert", None, &["hls"]);
     capped["quality"]["max_bitrate_bps"] = json!("50000000");
     let capped = f.post("/api/v2/playback/plans", &auth, None, capped).await;
+    // A capped conversion keeps (and measures) the limit.
     assert_eq!(
-        capped.body["reason_codes"],
-        json!(["conversion_exceeds_quality_limit"]),
-        "an uncapped encoder cannot promise a bitrate"
+        capped.body["operation"], "video_transcode",
+        "{}",
+        capped.body
     );
 }
 
@@ -4365,4 +4366,114 @@ async fn multipart_versions_play_their_parts_in_order() {
         plan("auto", "auto").await.body["reason_codes"][0],
         "source_unavailable"
     );
+}
+
+/// A bitrate cap is kept by a capped conversion: byte delivery cannot promise
+/// a peak, the encoder is VBV-limited below the cap, every published segment
+/// is measured within it, and the manifest advertises it. A cap too small to
+/// leave room for video is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitrate_caps_are_kept_by_capped_conversions() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Random noise: several Mb/s uncapped at this size.
+    f.media(
+        "noise.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=640x360:rate=24,geq=random(1)*255:128:128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = |cap: &str| {
+        let mut input = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+        input["quality"]["max_bitrate_bps"] = json!(cap);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("400000").await.body["reason_codes"][0],
+        "conversion_exceeds_quality_limit"
+    );
+    let capped = plan("1000000").await;
+    assert_eq!(
+        capped.body["operation"], "video_transcode",
+        "{}",
+        capped.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("capped-delivery-0001"),
+            json!({"plan_token": capped.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 9_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let master =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
+    assert!(master.contains("BANDWIDTH=1000000,"), "{master}");
+    let variant =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await)
+            .unwrap();
+    let mut measured = 0;
+    let mut duration_ms = None;
+    for line in variant.lines() {
+        if let Some(seconds) = line.strip_prefix("#EXTINF:") {
+            let seconds: f64 = seconds.trim_end_matches(',').parse().unwrap();
+            duration_ms = Some((seconds * 1000.0) as u64);
+        } else if let (Some(ms), false) = (duration_ms.take(), line.starts_with('#')) {
+            let index = line.rsplit('/').next().unwrap();
+            let bytes = get(format!("/api/v2/streams/{id}/1/segments/{index}"))
+                .await
+                .len() as u64;
+            if ms >= 3_000 {
+                assert!(
+                    bytes * 8_000 <= 1_000_000 * ms,
+                    "segment {index}: {bytes} bytes in {ms} ms"
+                );
+                measured += 1;
+            }
+        }
+    }
+    assert!(measured >= 2, "{variant}");
 }
