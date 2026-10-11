@@ -2181,14 +2181,14 @@ pub async fn list_admin_files(
 async fn files_page(
     app: App,
     caller: Caller,
-    item: Option<String>,
+    mut item: Option<String>,
     q: PageQuery,
 ) -> Result<Response, Problem> {
     caller.require(Permission::CatalogRead)?;
     let mut tx = app.db.begin().await?;
     let scope = access::catalog_scope(&caller.principal);
     if let Some(id) = &item {
-        load_item(&mut tx, &scope, id, true).await?;
+        item = Some(load_item(&mut tx, &scope, id, true).await?.0.id);
     }
     let admin = item.is_none();
     let limit = q.limit()?;

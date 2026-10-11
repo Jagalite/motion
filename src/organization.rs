@@ -443,7 +443,7 @@ pub(crate) async fn facts_in(
         .map_err(OrgError::Storage)?;
     let metadata = playscale_core::metadata::resolve(&documents.docs);
     let watched: Vec<(bool, Option<bool>)> = sqlx::query_as(
-        "SELECT v.automatic_watched,v.manual_watched FROM timeline_viewing v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE v.profile_id=? AND e.item_id=? AND (? OR EXISTS(SELECT 1 FROM media_files f WHERE f.edition_id=e.id AND f.library_id IN (SELECT source_id FROM library_sources WHERE library_id IN (SELECT value FROM json_each(?)))))",
+        "SELECT v.automatic_watched,v.manual_watched FROM timeline_viewing v JOIN timelines t ON t.id=v.timeline_id JOIN editions e ON e.id=t.edition_id WHERE v.profile_id=? AND e.item_id=? AND (? OR EXISTS(SELECT 1 FROM media_versions mv WHERE mv.timeline_id=t.id AND EXISTS(SELECT 1 FROM version_files b WHERE b.version_id=mv.id) AND NOT EXISTS(SELECT 1 FROM version_files b JOIN media_files f ON f.id=b.file_id WHERE b.version_id=mv.id AND f.library_id NOT IN (SELECT source_id FROM library_sources WHERE library_id IN (SELECT value FROM json_each(?))))))",
     )
     .bind(profile)
     .bind(item)

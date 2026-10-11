@@ -39,6 +39,8 @@ applying any pending migration to an existing database.
 
 | 0036 | `0036_metadata_jobs.sql` | A02 data/catalog completion | durable local metadata refresh jobs and authorization witnesses |
 
+| 0037 | `0037_smart_collection_revisions.sql` | A02 data/catalog completion | durable invalidation of evaluated smart collections |
+
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`

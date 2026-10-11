@@ -1344,6 +1344,14 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
         collection.body
     );
     assert_eq!(collection.body["item_ids"], json!([]));
+    // A hidden cut in the same edition must not affect visible membership.
+    sqlx::query("INSERT INTO timelines(id,edition_id) VALUES ('hidden-cut','t-film')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_versions(id,timeline_id,label,origin,equivalence) VALUES ('hidden-version','hidden-cut','Hidden','original','declared'),('visible-version','t-film','Visible','original','declared')").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,file_id,file_revision,part) VALUES ('hidden-version','f2','r1',1),('visible-version','f1','r1',1)").execute(&f.app.db).await.unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,manual_watched) VALUES ('default','hidden-cut',1)").execute(&f.app.db).await.unwrap();
     // A legacy work row cannot affect canonical watched evaluation.
     sqlx::query("INSERT INTO viewing_state(profile_id,item_id,automatic_watched) VALUES ('default','film',1)").execute(&f.app.db).await.unwrap();
     let path = format!(
@@ -1354,6 +1362,7 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
         .call("GET", &path, None, &[("authorization", &device)])
         .await;
     assert_eq!(read.body["item_ids"], json!([]));
+    let before = read.headers["etag"].clone();
     let watched = f
         .call(
             "PUT",
@@ -1367,4 +1376,5 @@ async fn smart_members_use_authorized_canonical_timeline_watched_state() {
         .call("GET", &path, None, &[("authorization", &device)])
         .await;
     assert_eq!(read.body["item_ids"], json!(["film"]));
+    assert_ne!(before, read.headers["etag"]);
 }
