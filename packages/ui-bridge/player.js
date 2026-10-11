@@ -101,9 +101,9 @@ async function openGeneration(element, generation, position, origin) {
     let seek = target;
     if (Array.isArray(ranges) && !ranges.some(r => target >= r.start && target <= r.end)) {
       const near = ranges.find(r => Number.isFinite(r.start) && Number.isFinite(r.end)
-        && r.start > target && r.start + 0.25 <= target + 1 && r.start + 0.25 <= r.end);
+        && r.start > target && r.start < target + 1 && r.start < r.end);
       if (!near) throw new Error('Requested generation position is outside the live window.');
-      seek = near.start + 0.25;
+      seek = near.start + Math.min(0.25, (target + 1 - near.start) / 2, (near.end - near.start) / 2);
     }
     await element.seek(seek);
     if (Math.abs(element.player.state.currentTime - target) > 1)
