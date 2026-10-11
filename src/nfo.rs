@@ -186,8 +186,20 @@ async fn withdraw(
 /// each observation is published only if its source binding and file facts
 /// are unchanged at commit. Returns how many observations were published.
 pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize> {
-    type Row = (String, String, String, String, i64, String);
-    let files: Vec<Row> = sqlx::query_as(
+    let observed = observe_item(app, item).await?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let count = publish_refresh_in(&mut tx, item, &observed).await?;
+    tx.commit().await?;
+    Ok(count)
+}
+
+pub(crate) type RefreshRow = (String, String, String, String, i64, String);
+pub(crate) async fn observe_item(
+    app: &crate::App,
+    item: &str,
+) -> anyhow::Result<Vec<(RefreshRow, Sidecar)>> {
+    let files: Vec<RefreshRow> = sqlx::query_as(
         "SELECT f.id,f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision FROM media_files f JOIN editions e ON e.id=f.edition_id JOIN libraries l ON l.id=f.library_id WHERE e.item_id=? AND f.available=1 AND f.generated=0 AND l.enabled=1 ORDER BY f.id",
     )
     .bind(item)
@@ -221,18 +233,25 @@ pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize>
             .collect::<Vec<_>>()
     })
     .await?;
-    let _guard = app.jobs.lock().await;
-    let mut tx = crate::db::begin_write(&app.db).await?;
+    Ok(observed)
+}
+
+pub(crate) async fn publish_refresh_in(
+    tx: &mut SqliteConnection,
+    item: &str,
+    observed: &[(RefreshRow, Sidecar)],
+) -> anyhow::Result<usize> {
     let mut published = 0;
-    for ((file, relative, root, identity, binding, revision), sidecar) in &observed {
+    for ((file, relative, root, identity, binding, revision), sidecar) in observed {
         if matches!(sidecar, Sidecar::Unusable) {
             continue;
         }
         // The observation must still describe this file at this binding.
         let current: Option<(String, String, String, i64, String, bool)> = sqlx::query_as(
-            "SELECT f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+            "SELECT f.relative_path,l.root,l.root_identity,l.binding_revision,f.revision,f.available FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE l.enabled=1 AND f.id=? AND f.edition_id IN (SELECT id FROM editions WHERE item_id=?)",
         )
         .bind(file)
+        .bind(item)
         .fetch_optional(&mut *tx)
         .await?;
         let unchanged = current.is_some_and(|(p, r, i, b, v, available)| {
@@ -246,10 +265,9 @@ pub async fn refresh_item(app: &crate::App, item: &str) -> anyhow::Result<usize>
         if !unchanged {
             continue;
         }
-        publish(&mut tx, file, sidecar).await?;
+        publish(tx, file, sidecar).await?;
         published += 1;
     }
-    crate::search::refresh(&mut tx, 100).await?;
-    tx.commit().await?;
+    crate::search::refresh(tx, 100).await?;
     Ok(published)
 }

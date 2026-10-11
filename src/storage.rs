@@ -182,7 +182,7 @@ pub async fn record(app: &App, name: &str, error: Option<&str>) -> anyhow::Resul
 }
 pub async fn backup(app: &App) -> anyhow::Result<Snapshot> {
     let permit = Arc::new(app.storage.backup_io.clone().try_acquire_owned()?);
-    let result = make_snapshot(app, permit).await;
+    let result = make_snapshot(app, permit, None, false).await;
     record(
         app,
         "backup",
@@ -197,6 +197,8 @@ pub async fn backup(app: &App) -> anyhow::Result<Snapshot> {
 async fn make_snapshot(
     app: &App,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    requested: Option<String>,
+    include_generated: bool,
 ) -> anyhow::Result<Snapshot> {
     let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
         .fetch_one(&app.db)
@@ -205,13 +207,14 @@ async fn make_snapshot(
         .fetch_one(&app.db)
         .await?;
     let root = app.storage.root.join("backups");
-    let destination = root.join(format!(
+    let detailed = requested.is_some();
+    let destination = root.join(requested.unwrap_or(format!(
         "auto-{:020}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos(),
         new_id()
-    ));
+    )));
     let stage = destination.with_extension("partial");
     let prepare = stage.clone();
     let settings = app.storage.settings.clone();
@@ -261,8 +264,25 @@ async fn make_snapshot(
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success=1 ORDER BY version")
             .fetch_all(&mut check)
             .await?;
+    let assets: Vec<(String, i64)> = if detailed {
+        sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
+            .fetch_all(&mut check)
+            .await?
+    } else {
+        vec![]
+    };
+    let generated: Vec<(String, String, String, String, i64)> = if include_generated {
+        sqlx::query_as("SELECT f.id,f.revision,l.root,f.relative_path,f.bytes FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.generated=1 AND f.available=1 ORDER BY f.id LIMIT 100001").fetch_all(&mut check).await?
+    } else {
+        vec![]
+    };
+    anyhow::ensure!(
+        assets.len() <= 100_000 && generated.len() <= 100_000,
+        "backup inventory exceeds supported bound"
+    );
     check.close().await?;
     let keep = app.storage.settings.backups_keep;
+    let min_free = app.storage.settings.min_free_bytes;
     blocking(permit, move || {
         use sha2::{Digest, Sha256};
         let mut file = std::fs::File::open(&database)?;
@@ -283,8 +303,36 @@ async fn make_snapshot(
             bytes: file.metadata()?.len(),
             schema_versions: versions,
         };
+        let mut media = Vec::new();
+        if include_generated {
+            std::fs::create_dir(stage.join("generated"))?;
+            let required = generated.iter().try_fold(0u64,|n,(_,_,_,_,bytes)| n.checked_add((*bytes).max(0) as u64)).ok_or_else(||anyhow::anyhow!("generated inventory overflow"))?;
+            require_space(&stage, required, min_free)?;
+            for (id,revision,source_root,relative,expected_bytes) in generated {
+                anyhow::ensure!(!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()||b==b'-'||b==b'_'), "invalid generated identity");
+                let mut input = crate::scan::open_file(Path::new(&source_root),Path::new(&relative))?;
+                let name=format!("generated/{id}");
+                let mut output=std::fs::OpenOptions::new().create_new(true).write(true).open(stage.join(&name))?;
+                let mut hash=Sha256::new(); let mut bytes=0u64;
+                loop { let n=input.read(&mut buf)?; if n==0 {break;} bytes=bytes.checked_add(n as u64).ok_or_else(||anyhow::anyhow!("media size overflow"))?; anyhow::ensure!(bytes<=expected_bytes as u64,"generated file grew"); hash.update(&buf[..n]);output.write_all(&buf[..n])?; }
+                let digest=format!("{:x}",hash.finalize());
+                anyhow::ensure!(bytes==expected_bytes as u64 && digest==revision,"generated file changed");
+                output.sync_all()?;
+                media.push(serde_json::json!({"file_id":id,"file_revision":revision,"path":name,"bytes":bytes.to_string(),"sha256":digest}));
+            }
+            #[cfg(unix)]
+            std::fs::File::open(stage.join("generated"))?.sync_all()?;
+        }
+        let mut value=serde_json::to_value(&snapshot)?;
+        if detailed {
+        value["assets"]=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
+        value["include_generated_media"]=serde_json::json!(include_generated);
+        value["generated_media"]=serde_json::json!(media);
+        }
         let mut manifest = std::fs::File::create(stage.join("manifest.json"))?;
-        manifest.write_all(&serde_json::to_vec_pretty(&snapshot)?)?;
+        let manifest_bytes=serde_json::to_vec_pretty(&value)?;
+        anyhow::ensure!(manifest_bytes.len()<=16*1024*1024,"backup manifest too large");
+        manifest.write_all(&manifest_bytes)?;
         manifest.sync_all()?;
         #[cfg(unix)]
         std::fs::File::open(&stage)?.sync_all()?;
@@ -350,7 +398,7 @@ pub async fn prune_history(app: &App) -> anyhow::Result<()> {
     // Keep the most recent authoritative session to preserve the legacy-write barrier.
     sqlx::query("DELETE FROM playback_sessions WHERE id IN (SELECT id FROM playback_sessions WHERE updated_at<? AND status IN ('ended','stopped','superseded','invalidated') AND id NOT IN (SELECT session_id FROM viewing_state WHERE session_id IS NOT NULL) ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
     // Published rendition provenance stays in the catalog. Idempotency keys have this documented retention horizon.
-    sqlx::query("DELETE FROM processing_jobs WHERE id IN (SELECT id FROM processing_jobs WHERE updated_at<? AND cache_cleaned=1 AND phase IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM processing_jobs WHERE id IN (SELECT id FROM processing_jobs WHERE updated_at<? AND cache_cleaned=1 AND id NOT IN (SELECT job_id FROM preparations) AND phase IN ('completed','failed','cancelled') ORDER BY updated_at LIMIT 500)").bind(cutoff).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -362,6 +410,9 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             let _ = record(&app, "history", Some("history_prune_failed")).await;
         } else {
             let _ = record(&app, "history", None).await;
+        }
+        if let Err(error) = crate::v2::admin::run_backup(&app).await {
+            tracing::warn!(%error, "requested backup failed");
         }
         let interval = app.storage.settings.backup_interval_seconds;
         if interval == 0 {
@@ -475,6 +526,182 @@ impl Write for RollingLog {
         self.file.flush()
     }
 }
+/// Stable job destination makes a crash after rename but before DB acknowledgement
+/// recoverable. Never overwrite an existing completed snapshot.
+pub(crate) struct VerifiedBackup {
+    pub manifest_digest: String,
+    pub database_verified: bool,
+    pub inventory_complete: bool,
+    pub destination_durable: bool,
+}
+pub(crate) async fn requested_backup(
+    app: &App,
+    id: &str,
+    include_generated: bool,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> anyhow::Result<VerifiedBackup> {
+    let _maintenance = app.processing.maintenance.lock().await;
+    let name = format!("request-{id}");
+    let destination = app.storage.root.join("backups").join(&name);
+    if !destination.exists() {
+        let stage = destination.with_extension("partial");
+        let owned = stage.clone();
+        blocking(permit.clone(), move || {
+            if owned.exists() {
+                anyhow::ensure!(
+                    !std::fs::symlink_metadata(&owned)?.file_type().is_symlink()
+                        && std::fs::read(owned.join(".playscale-backup"))?
+                            == b"playscale-scheduled-v1",
+                    "unowned backup stage"
+                );
+                std::fs::remove_dir_all(owned)?;
+            }
+            Ok(())
+        })
+        .await?;
+        make_snapshot(app, permit.clone(), Some(name), include_generated).await?;
+    }
+    let verify = destination.clone();
+    let digest = blocking(permit.clone(), move || {
+        verify_requested_snapshot(&verify, include_generated)
+    })
+    .await?;
+    // Completeness is derived from the immutable snapshot, not from the list
+    // the manifest happens to contain. Omitted files must fail recovery.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(destination.join("playscale.sqlite3"))
+        .read_only(true);
+    let mut check = sqlx::SqliteConnection::connect_with(&options).await?;
+    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_all(&mut check)
+        .await?;
+    anyhow::ensure!(integrity == ["ok"], "backup integrity failed");
+    let assets: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id,length(bytes) FROM artwork_assets ORDER BY id LIMIT 100001")
+            .fetch_all(&mut check)
+            .await?;
+    let media: Vec<(String, String, i64)> = if include_generated {
+        sqlx::query_as("SELECT id,revision,bytes FROM media_files WHERE generated=1 AND available=1 ORDER BY id LIMIT 100001").fetch_all(&mut check).await?
+    } else {
+        vec![]
+    };
+    anyhow::ensure!(
+        assets.len() <= 100_000 && media.len() <= 100_000,
+        "backup inventory exceeds supported bound"
+    );
+    check.close().await?;
+    let expected_assets=serde_json::json!(assets.into_iter().map(|(id,bytes)|serde_json::json!({"asset_id":id,"bytes":bytes.to_string(),"storage":"database"})).collect::<Vec<_>>());
+    let expected_media=serde_json::json!(media.into_iter().map(|(id,revision,bytes)|serde_json::json!({"file_id":id,"file_revision":revision,"path":format!("generated/{id}"),"bytes":bytes.to_string(),"sha256":revision})).collect::<Vec<_>>());
+    blocking(permit, move || {
+        let manifest = read_backup_manifest(&destination)?;
+        let value: serde_json::Value = serde_json::from_slice(&manifest)?;
+        anyhow::ensure!(
+            format!("sha256:{}", crate::v2::sha256(&manifest)) == digest,
+            "manifest changed during recovery"
+        );
+        anyhow::ensure!(
+            value["assets"] == expected_assets && value["generated_media"] == expected_media,
+            "backup inventory incomplete"
+        );
+        // Re-establish durability even when the prior process died immediately
+        // after rename and before its parent-directory sync/acknowledgement.
+        std::fs::File::open(destination.join("manifest.json"))?.sync_all()?;
+        std::fs::File::open(destination.join("playscale.sqlite3"))?.sync_all()?;
+        #[cfg(unix)]
+        {
+            if include_generated {
+                std::fs::File::open(destination.join("generated"))?.sync_all()?;
+            }
+            std::fs::File::open(&destination)?.sync_all()?;
+            std::fs::File::open(destination.parent().unwrap())?.sync_all()?;
+        }
+        Ok(VerifiedBackup {
+            manifest_digest: digest,
+            database_verified: true,
+            inventory_complete: true,
+            destination_durable: true,
+        })
+    })
+    .await
+}
+fn verify_requested_snapshot(
+    destination: &Path,
+    include_generated: bool,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(destination)?
+            .file_type()
+            .is_symlink(),
+        "backup destination is a symlink"
+    );
+    let manifest = read_backup_manifest(destination)?;
+    let value: serde_json::Value = serde_json::from_slice(&manifest)?;
+    anyhow::ensure!(
+        value["include_generated_media"].as_bool() == Some(include_generated),
+        "backup input mismatch"
+    );
+    let hash_file = |path: &Path| -> anyhow::Result<(String, u64)> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut buf = [0; 65536];
+        let mut size = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            hash.update(&buf[..n]);
+        }
+        Ok((format!("{:x}", hash.finalize()), size))
+    };
+    let (digest, bytes) = hash_file(&destination.join("playscale.sqlite3"))?;
+    anyhow::ensure!(
+        value["sha256"].as_str() == Some(&digest) && value["bytes"].as_u64() == Some(bytes),
+        "backup database integrity changed"
+    );
+    for media in value["generated_media"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing inventory"))?
+    {
+        let id = media["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing media identity"))?;
+        anyhow::ensure!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid media identity"
+        );
+        let (digest, bytes) = hash_file(&destination.join("generated").join(id))?;
+        anyhow::ensure!(
+            media["sha256"].as_str() == Some(&digest)
+                && media["bytes"].as_str() == Some(&bytes.to_string()),
+            "backup media integrity changed"
+        );
+    }
+    Ok(format!("sha256:{:x}", Sha256::digest(manifest)))
+}
+
+fn read_backup_manifest(destination: &Path) -> anyhow::Result<Vec<u8>> {
+    let manifest_path = destination.join("manifest.json");
+    anyhow::ensure!(
+        std::fs::metadata(&manifest_path)?.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
+    let mut manifest = Vec::new();
+    std::fs::File::open(manifest_path)?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut manifest)?;
+    anyhow::ensure!(
+        manifest.len() <= 16 * 1024 * 1024,
+        "backup manifest too large"
+    );
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

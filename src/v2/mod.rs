@@ -2,6 +2,7 @@
 //! preconditions, idempotency records and pages. Access decisions are made by
 //! `playscale_core::access`; this module supplies stored facts and executes
 //! the decided effects inside one SQLite transaction.
+pub mod admin;
 pub mod auth;
 pub mod catalog;
 pub mod content;
@@ -13,6 +14,9 @@ pub mod libraries;
 pub mod metadata;
 pub mod organization;
 pub mod playback;
+pub mod processing;
+pub mod scans;
+pub mod schedules;
 pub mod system;
 pub mod viewing;
 
@@ -798,9 +802,13 @@ pub fn router() -> Router<App> {
         .merge(organization::routes())
         .merge(catalog::routes())
         .merge(libraries::routes())
+        .merge(scans::routes())
+        .merge(schedules::routes())
         .merge(jobs::routes())
+        .merge(admin::routes())
         .merge(metadata::routes())
         .merge(playback::routes())
+        .merge(processing::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

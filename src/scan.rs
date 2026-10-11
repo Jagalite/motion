@@ -734,10 +734,12 @@ async fn finish(
 }
 
 pub async fn worker(app: App, shutdown: CancellationToken) -> anyhow::Result<()> {
+    crate::metadata_jobs::recover(&app.db).await?;
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
         }
+        crate::metadata_jobs::run_one(&app).await?;
         let job = {
             let _guard = app.jobs.lock().await;
             let row = sqlx::query_as::<_, JobRow>(

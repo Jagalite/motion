@@ -167,3 +167,134 @@ impl SourceAdmission<'_> {
 pub fn queue_admits(active_jobs: i64) -> bool {
     active_jobs < 100
 }
+
+/// Current observations for a preparation's publication. Adapters must observe
+/// these in the same write transaction that acknowledges publication.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PreparationFacts {
+    pub requester_authorized: bool,
+    pub source_enabled: bool,
+    pub source_in_scope: bool,
+    pub exact_whole_timeline_binding: bool,
+    pub recipe_unchanged: bool,
+}
+impl PreparationFacts {
+    pub fn admit(&self) -> Result<(), &'static str> {
+        if !self.requester_authorized {
+            return Err("preparation_authorization_changed");
+        }
+        if !self.source_enabled || !self.source_in_scope {
+            return Err("preparation_source_unavailable");
+        }
+        if !self.exact_whole_timeline_binding {
+            return Err("preparation_timeline_changed");
+        }
+        if !self.recipe_unchanged {
+            return Err("preparation_recipe_changed");
+        }
+        Ok(())
+    }
+}
+
+pub struct RenditionFacts {
+    pub expired: bool,
+    pub phase: jobs::Phase,
+    pub source_current: bool,
+    pub binding_current: bool,
+    pub output_current: bool,
+}
+pub fn rendition_status(facts: &RenditionFacts) -> &'static str {
+    if facts.expired {
+        "expired"
+    } else if matches!(facts.phase, jobs::Phase::Failed | jobs::Phase::Cancelled) {
+        "failed"
+    } else if !facts.source_current || !facts.binding_current {
+        "stale"
+    } else if facts.phase == jobs::Phase::Completed {
+        if facts.output_current {
+            "ready"
+        } else {
+            "stale"
+        }
+    } else {
+        "pending"
+    }
+}
+
+pub fn finish_preparation(
+    state: &State,
+    result: &Completion,
+    facts: Option<&PreparationFacts>,
+) -> (State, Vec<Effect>) {
+    let mut observed = result.clone();
+    if facts.is_some_and(|f| f.admit().is_err()) {
+        observed.validated_output = None;
+    }
+    finish(state, &observed)
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+    #[test]
+    fn every_publication_fact_is_required_and_attempts_and_cancellation_are_fenced() {
+        for mask in 0..32 {
+            let facts = PreparationFacts {
+                requester_authorized: mask & 1 != 0,
+                source_enabled: mask & 2 != 0,
+                source_in_scope: mask & 4 != 0,
+                exact_whole_timeline_binding: mask & 8 != 0,
+                recipe_unchanged: mask & 16 != 0,
+            };
+            for phase in [
+                jobs::Phase::Running,
+                jobs::Phase::Cancelling,
+                jobs::Phase::Cancelled,
+            ] {
+                for attempt in [1, 2] {
+                    let state = State {
+                        job: Job { phase, attempt: 2 },
+                        source_revision: "source".into(),
+                        published_output: None,
+                    };
+                    let result = Completion {
+                        attempt,
+                        current_source_revision: Some("source".into()),
+                        validated_output: Some("output".into()),
+                    };
+                    let (next, effects) = finish_preparation(&state, &result, Some(&facts));
+                    let expected = mask == 31 && phase == jobs::Phase::Running && attempt == 2;
+                    assert_eq!(
+                        effects
+                            .iter()
+                            .filter(|e| matches!(e, Effect::Publish { .. }))
+                            .count(),
+                        usize::from(expected)
+                    );
+                    assert_eq!(
+                        next.published_output.as_deref(),
+                        expected.then_some("output")
+                    );
+                    let (duplicate, effects) = finish_preparation(&next, &result, Some(&facts));
+                    assert_eq!(duplicate, next);
+                    assert!(effects.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
+    fn ready_requires_current_source_binding_and_published_output() {
+        for bits in 0..8 {
+            assert_eq!(
+                rendition_status(&RenditionFacts {
+                    expired: false,
+                    phase: jobs::Phase::Completed,
+                    source_current: bits & 1 != 0,
+                    binding_current: bits & 2 != 0,
+                    output_current: bits & 4 != 0
+                }),
+                if bits == 7 { "ready" } else { "stale" }
+            );
+        }
+    }
+}

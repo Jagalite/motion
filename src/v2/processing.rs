@@ -1,0 +1,451 @@
+//! Preparation transport over the durable processing service. Publication uses
+//! the same persisted identity and current authorization under the writer lock.
+use super::{Body, PageQuery, Problem, Scope, auth::Caller, etag, idempotency_key, page};
+use crate::{App, db::begin_write};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use playscale_core::access::{self, Idempotent, Permission};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+pub fn routes() -> Router<App> {
+    Router::new()
+        .route("/processing/capabilities", get(capabilities))
+        .route("/processing/recipes", get(recipes))
+        .route("/processing/preparations", post(prepare))
+        .route("/processing/renditions", get(renditions))
+}
+
+pub(crate) fn recipe(id: &str) -> Option<Value> {
+    let (name, video, audio, height) = match id {
+        "remux_mp4" => ("MP4 stream copy", None, None, None),
+        "audio_aac" => ("MP4 with AAC audio", None, Some("aac"), None),
+        "h264720p" => ("H.264 720p", Some("h264"), Some("aac"), Some(720)),
+        _ => return None,
+    };
+    // Version describes the existing worker's complete fixed recipe semantics;
+    // changes to encoder arguments or validation require a version bump.
+    let semantics = match id {
+        "remux_mp4" => {
+            "v1;mp4;v0-copy;a-selected-copy;no-subtitles;no-data;metadata-strip;faststart"
+        }
+        "audio_aac" => {
+            "v1;mp4;v0-copy;a-selected-aac-192k;no-subtitles;no-data;metadata-strip;faststart"
+        }
+        _ => {
+            "v1;mp4;v0-libx264-veryfast-crf23-threads2;yuv420p;scale-min1280x720-aspect-even;a-selected-aac160k;no-subtitles;no-data;metadata-strip;faststart"
+        }
+    };
+    Some(
+        json!({"id":id,"digest":format!("sha256:{}",super::sha256(semantics.as_bytes())),"name":name,"purpose":"rendition","output_container":"mp4","video_codec":video,"audio_codec":audio,"max_height":height,"max_bitrate_bps":Value::Null,"allowed_backends":["software"],"qualification":"unqualified"}),
+    )
+}
+
+async fn recipes(
+    State(app): State<App>,
+    caller: Caller,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<super::Page<Value>>, Problem> {
+    caller.require(Permission::ProcessingRequest)?;
+    let limit = q.limit()?;
+    let after = q.after()?;
+    let rows = ["audio_aac", "h264720p", "remux_mp4"]
+        .into_iter()
+        .filter(|id| *id > after)
+        .map(|id| (id.into(), recipe(id).unwrap()))
+        .collect();
+    let mut tx = app.db.begin().await?;
+    let result = page(&mut tx, &caller.principal, rows, limit).await?;
+    tx.commit().await?;
+    Ok(Json(result))
+}
+
+async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Value>, Problem> {
+    caller.require(Permission::ProcessingRequest)?;
+    let _permit = app
+        .processing
+        .inspection
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "processing_inspection_busy",
+                "Processing inspection is busy",
+            )
+        })?;
+    let configured = app.processing.settings.ffmpeg.clone();
+    let digest = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let path = if configured.components().count() > 1 {
+            configured
+        } else {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|p| p.join(&configured))
+                .find(|p| p.is_file())
+                .ok_or_else(|| anyhow::anyhow!("FFmpeg executable unavailable"))?
+        };
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 65536];
+        loop {
+            let n = file.read(&mut bytes)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&bytes[..n]);
+        }
+        Ok(format!("sha256:{:x}", hash.finalize()))
+    })
+    .await
+    .map_err(Problem::internal)?
+    .map_err(|_| {
+        Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ffmpeg_unavailable",
+            "Configured FFmpeg executable cannot be read",
+        )
+    })?;
+    // Availability is an observation, not a qualification receipt. Probe a
+    // bounded encoder process; never infer hardware support from the OS.
+    let mut command = tokio::process::Command::new(&app.processing.settings.ffmpeg);
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=s=16x16:d=0.04",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+            "-vf",
+            "scale=16:16",
+            "-c:a",
+            "aac",
+            "-t",
+            "0.04",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let available = tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
+        .await
+        .is_ok_and(|r| r.is_ok_and(|s| s.success()));
+    Ok(Json(
+        json!({"ffmpeg_digest":digest,"pipelines":[{"id":"software_h264","decode":"ffmpeg","filters":["scale"],"encode":"libx264","backend":"software","available":available,"qualification":"unqualified","receipt_id":Value::Null}],"interactive_slots":0,"background_slots":1}),
+    ))
+}
+
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::deserialize(d)
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Tracks {
+    #[serde(deserialize_with = "nullable")]
+    pub audio_component_id: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub subtitle_component_id: Option<String>,
+    pub subtitle_policy: String,
+    #[serde(deserialize_with = "nullable")]
+    pub audio_track_id: Option<String>,
+    #[serde(deserialize_with = "nullable")]
+    pub subtitle_track_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRef {
+    file_id: String,
+    file_revision: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Input {
+    source: FileRef,
+    timeline_id: String,
+    recipe_id: String,
+    tracks: Tracks,
+}
+
+pub(crate) async fn exact_binding(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+    file: &str,
+    revision: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM version_files b JOIN media_versions v ON v.id=b.version_id JOIN timelines t ON t.id=v.timeline_id JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' AND f.edition_id=t.edition_id AND b.start_ms IS NULL AND b.end_ms IS NULL AND (SELECT count(*) FROM version_files p WHERE p.version_id=v.id)=1)").bind(timeline).bind(file).bind(revision).fetch_one(conn).await
+}
+
+pub(crate) async fn publication_facts(
+    conn: &mut sqlx::SqliteConnection,
+    job: &crate::processing::ProcessingJob,
+) -> anyhow::Result<Option<(String, playscale_core::processing::PreparationFacts)>> {
+    type Stored = (String, String, Option<String>, Option<String>, String);
+    let row:Option<Stored>=sqlx::query_as("SELECT p.timeline_id,p.recipe_digest,p.credential_hash,p.ingress_id,j.requester_id FROM preparations p JOIN processing_jobs j ON j.id=p.job_id WHERE p.job_id=?").bind(&job.id).fetch_optional(&mut *conn).await?;
+    let Some((timeline, digest, hash, ingress, owner)) = row else {
+        return Ok(None);
+    };
+    let principal = crate::metadata_jobs::principal(
+        conn,
+        &owner,
+        hash.as_deref(),
+        ingress.as_deref(),
+        Permission::ProcessingRequest,
+    )
+    .await
+    .ok();
+    let facts = super::content::file_facts(conn, &job.source_file_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e.code))?;
+    let source_in_scope = principal.as_ref().is_some_and(|p| {
+        facts.as_ref().is_some_and(|f| {
+            f.library_ids
+                .iter()
+                .any(|id| access::catalog_scope(p).library(id))
+        })
+    });
+    let enabled:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=? AND f.available=1 AND l.enabled=1 AND f.generated=0)").bind(&job.source_file_id).fetch_one(&mut *conn).await?;
+    let binding = exact_binding(conn, &timeline, &job.source_file_id, &job.source_revision).await?;
+    Ok(Some((
+        timeline,
+        playscale_core::processing::PreparationFacts {
+            requester_authorized: principal.is_some(),
+            source_enabled: enabled,
+            source_in_scope,
+            exact_whole_timeline_binding: binding,
+            recipe_unchanged: recipe(&job.recipe)
+                .is_some_and(|r| r["digest"].as_str() == Some(digest.as_str())),
+        },
+    )))
+}
+
+async fn prepare(
+    State(app): State<App>,
+    caller: Caller,
+    headers: HeaderMap,
+    body: Body<Input>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::ProcessingRequest)?;
+    let key = idempotency_key(&headers)?;
+    let input = body.value;
+    let recipe = recipe(&input.recipe_id)
+        .ok_or_else(|| Problem::invalid("unknown_recipe", "Select a listed recipe"))?;
+    if !matches!(
+        input.tracks.subtitle_policy.as_str(),
+        "off" | "auto" | "require"
+    ) {
+        return Err(Problem::invalid(
+            "invalid_subtitle_policy",
+            "Unknown subtitle policy",
+        ));
+    }
+    if input.tracks.audio_component_id.is_some()
+        || input.tracks.subtitle_component_id.is_some()
+        || input.tracks.subtitle_track_id.is_some()
+        || input.tracks.subtitle_policy != "off"
+    {
+        return Err(Problem::invalid(
+            "preparation_tracks_unsupported",
+            "Preparation currently requires subtitle_policy off and no component or subtitle selection",
+        ));
+    }
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::ProcessingRequest))
+        .await?;
+    let record = Scope {
+        principal: &principal.id,
+        operation: "createPreparation",
+        target: "",
+        key: &key,
+    };
+    let stored = record.load(&mut tx).await?;
+    if access::idempotency(
+        stored.as_ref().map(|s| &s.record),
+        &body.digest,
+        crate::now(),
+    )? == Idempotent::Replay
+    {
+        let stored = stored.unwrap();
+        let mut response = (stored.status, Json(stored.body)).into_response();
+        response
+            .headers_mut()
+            .insert("idempotent-replayed", HeaderValue::from_static("true"));
+        response.headers_mut().insert(header::ETAG, etag(1));
+        return Ok(response);
+    }
+    super::playback::readable_timeline(&mut tx, &principal, &input.timeline_id).await?;
+    let facts = super::content::file_facts(&mut tx, &input.source.file_id)
+        .await?
+        .ok_or_else(Problem::not_found)?;
+    if !facts
+        .library_ids
+        .iter()
+        .any(|id| access::catalog_scope(&principal).library(id))
+    {
+        return Err(Problem::not_found());
+    }
+    let source:crate::db::ItemRow=sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND generated=0 AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)").bind(&input.source.file_id).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+    playscale_core::processing::SourceAdmission {
+        revision: &source.revision,
+        duration: source.duration_seconds,
+    }
+    .check(&input.source.file_revision)
+    .map_err(|code| {
+        Problem::new(
+            StatusCode::CONFLICT,
+            code,
+            "Refresh the source and its probe",
+        )
+    })?;
+    if !exact_binding(
+        &mut tx,
+        &input.timeline_id,
+        &input.source.file_id,
+        &input.source.file_revision,
+    )
+    .await?
+    {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "preparation_timeline_mismatch",
+            "Preparation requires an exact whole-file original version on the requested timeline",
+        ));
+    }
+    let tracks: Vec<crate::db::Track> =
+        serde_json::from_str(&source.tracks_json).map_err(Problem::internal)?;
+    if input.recipe_id == "h264720p"
+        && !tracks.iter().find(|t| t.kind == "video").is_some_and(|t| {
+            t.kind == "video"
+                && t.width.is_some()
+                && t.height.is_some()
+                && !matches!(
+                    t.color_transfer.as_deref(),
+                    Some("smpte2084" | "arib-std-b67")
+                )
+        })
+    {
+        return Err(Problem::invalid(
+            "preparation_video_unsupported",
+            "H.264 preparation requires a probed SDR video stream with known dimensions",
+        ));
+    }
+    super::playback::track_index(
+        &input.tracks.audio_track_id,
+        'a',
+        tracks.iter().filter(|t| t.kind == "audio").count(),
+    )?;
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !playscale_core::processing::queue_admits(queued) {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "processing_limit",
+            "Processing queue is full",
+        ));
+    }
+    let id = crate::new_id();
+    sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id) VALUES (?,?,?,?,'software',?,'queued',?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(recipe["digest"].as_str().unwrap()).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
+    let value = super::jobs::row(&mut tx, &id, &principal).await?.wire();
+    record
+        .save(
+            &mut tx,
+            &body.digest,
+            StatusCode::ACCEPTED,
+            Some(&value),
+            None,
+        )
+        .await?;
+    tx.commit().await?;
+    let mut response = (StatusCode::ACCEPTED, Json(value)).into_response();
+    response.headers_mut().insert(header::ETAG, etag(1));
+    Ok(response)
+}
+
+async fn renditions(
+    State(app): State<App>,
+    caller: Caller,
+    Query(q): Query<PageQuery>,
+) -> Result<Json<super::Page<Value>>, Problem> {
+    caller.require(Permission::ProcessingRequest)?;
+    let mut tx = app.db.begin().await?;
+    let limit = q.limit()?;
+    let (clause, all, ids) =
+        super::scope_clause(&access::catalog_scope(&caller.principal), "f.library_id");
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        bool,
+    );
+    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let mut values = Vec::new();
+    for (
+        id,
+        timeline,
+        file,
+        revision,
+        digest,
+        phase,
+        resource_revision,
+        expired,
+        output,
+        output_revision,
+        current,
+        available,
+        source_available,
+    ) in rows
+    {
+        let binding = exact_binding(&mut tx, &timeline, &file, &revision).await?;
+        let status = playscale_core::processing::rendition_status(
+            &playscale_core::processing::RenditionFacts {
+                expired,
+                phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
+                source_current: source_available && current.as_deref() == Some(&revision),
+                binding_current: binding,
+                output_current: available,
+            },
+        );
+        let output = output.zip(output_revision).map(
+            |(file_id, file_revision)| json!({"file_id":file_id,"file_revision":file_revision}),
+        );
+        values.push((id.clone(),json!({"id":id,"revision":resource_revision.to_string(),"timeline_id":timeline,"source":{"file_id":file,"file_revision":revision},"output":output,"recipe_digest":digest,"job_id":id,"status":status})));
+    }
+    let result = page(&mut tx, &caller.principal, values, limit).await?;
+    tx.commit().await?;
+    Ok(Json(result))
+}

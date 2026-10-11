@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "73fe0e6e0223919ad84e613a206fc0d62101d8753d85729c6e0a57369c4dc3a5",
+  "checks": [
+    "v2_preparation_exact_replay",
+    "requested_timeline_publication",
+    "selected_second_audio_track",
+    "revision_pinned_output_bytes",
+    "backup_generated_media_manifest_and_bytes"
+  ],
+  "passed": 5,
+  "scope": "Real HTTP v2 preparation, FFmpeg, FFprobe and generated-media backup; no browser claim",
+  "source_commit": "e8c5628d9562ebcf3d81d8f444042b0c6d558dfd",
+  "harness": "scripts/v2_preparation_smoke.py"
+}

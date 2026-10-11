@@ -1614,3 +1614,475 @@ async fn reconciliation_replays_recheck_current_catalog_scope() {
         .await;
     problem(&denied, StatusCode::NOT_FOUND, "not_found");
 }
+
+#[tokio::test]
+async fn scans_are_atomic_idempotent_scoped_demands() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let path = format!("/api/v2/libraries/{}/scans", f.a);
+    let input = json!({"mode":"verify","require_complete":true});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "scan-admission-00001"),
+    ];
+    let first = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    assert_eq!(first.body["status"], "queued");
+    assert_eq!(first.body["sources"].as_array().unwrap().len(), 1);
+    let replay = f.call("POST", &path, Some(input), &h).await;
+    assert_eq!(replay.body, first.body);
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1);
+    let conflict = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"incremental","require_complete":true})),
+            &h,
+        )
+        .await;
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    let second = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":true})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-admission-00002"),
+            ],
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::ACCEPTED);
+    let cancel = format!(
+        "/api/v2/scans/{}/cancel",
+        first.body["id"].as_str().unwrap()
+    );
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "scan-cancel-00000001"),
+    ];
+    let cancelled = f.call("POST", &cancel, None, &h).await;
+    assert_eq!(cancelled.status, StatusCode::OK, "{}", cancelled.body);
+    assert_eq!(cancelled.body["status"], "cancelled");
+    assert_eq!(f.call("POST", &cancel, None, &h).await.body, cancelled.body);
+    let phase: String = sqlx::query_scalar("SELECT phase FROM jobs LIMIT 1")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(phase, "queued", "other demand still owns physical work");
+    let limited = f.device(&["catalog:read"], &[&f.a]).await;
+    assert_eq!(
+        f.call("GET", "/api/v2/scans", None, &[("authorization", &limited)])
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    let malformed = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":false,"source_ids":[f.a,f.a]})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-invalid-0000001"),
+            ],
+        )
+        .await;
+    assert_eq!(malformed.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let listed = f
+        .call(
+            "GET",
+            "/api/v2/scans?limit=1",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(listed.status, StatusCode::OK);
+    assert_eq!(listed.body["items"].as_array().unwrap().len(), 1);
+    assert!(listed.body["next_cursor"].is_string());
+}
+
+#[tokio::test]
+async fn scan_followup_reports_eligible_attempt_and_decimal_counters() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let path = format!("/api/v2/libraries/{}/scans", f.a);
+    let first = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-followup-00001"),
+            ],
+        )
+        .await;
+    let old = first.body["job_ids"][0].as_str().unwrap();
+    sqlx::query("UPDATE jobs SET phase='running',attempt=1,started_barrier=1 WHERE id=?")
+        .bind(old)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let next = f
+        .call(
+            "POST",
+            &path,
+            Some(json!({"mode":"verify","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-followup-00002"),
+            ],
+        )
+        .await;
+    assert_eq!(next.status, StatusCode::ACCEPTED, "{}", next.body);
+    assert_eq!(next.body["status"], "queued");
+    assert_ne!(next.body["job_ids"][0], old);
+    for field in [
+        "complete_directories",
+        "incomplete_directories",
+        "observed_files",
+        "verified_files",
+    ] {
+        assert_eq!(next.body["sources"][0][field], "0");
+    }
+}
+
+#[tokio::test]
+async fn public_structure_writes_preserve_revisions_and_retry_identity() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    f.item("film", "Film", &[(&f.a, "r1")]).await;
+    f.item("extra", "Extra", &[(&f.a, "r2")]).await;
+    let read = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let etag = read.headers["etag"].to_str().unwrap();
+    let input = json!({"edition_id":"film-ed","duration_ms":100000,"order_group_id":null,"order_position":null});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", etag),
+        ("idempotency-key", "timeline-create-00001"),
+    ];
+    let timeline = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/film/timelines",
+            Some(input.clone()),
+            &h,
+        )
+        .await;
+    assert_eq!(timeline.status, StatusCode::CREATED, "{}", timeline.body);
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/catalog/items/film/timelines",
+            Some(input),
+            &h
+        )
+        .await
+        .body,
+        timeline.body
+    );
+    let stale=f.call("POST","/api/v2/catalog/items/film/timelines",Some(json!({"edition_id":"film-ed","duration_ms":null,"order_group_id":null,"order_position":null})),&[("authorization",&auth),("if-match",etag),("idempotency-key","timeline-create-00002")]).await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/film/files",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    let file = &files.body["items"][0];
+    assert!(file["size_bytes"].is_string());
+    assert!(file.get("relative_path").is_none());
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-ed",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let id = timeline.body["id"].as_str().unwrap();
+    let version = json!({"timeline_id":id,"label":"Original","files":[{"file":{"file_id":file["id"],"file_revision":file["revision"]},"part":1,"start_ms":null,"end_ms":null}],"timeline_equivalence":"declared"});
+    let path = format!("/api/v2/catalog/timelines/{id}/versions");
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", timeline.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "version-create-000001"),
+    ];
+    let created = f.call("POST", &path, Some(version.clone()), &h).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(
+        f.call("POST", &path, Some(version), &h).await.body,
+        created.body
+    );
+    let stale_version=f.call("POST",&path,Some(json!({"timeline_id":id,"label":"Second","files":[{"file":{"file_id":file["id"],"file_revision":file["revision"]},"part":1,"start_ms":null,"end_ms":null}],"timeline_equivalence":"declared"})),&[("authorization",&auth),("if-match",timeline.headers["etag"].to_str().unwrap()),("idempotency-key","version-stale-0000001")]).await;
+    assert_eq!(stale_version.status, StatusCode::PRECONDITION_FAILED);
+    let admin = f
+        .call(
+            "GET",
+            "/api/v2/admin/files",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(admin.status, StatusCode::OK, "{}", admin.body);
+    assert!(admin.body["items"][0]["file"]["id"].is_string());
+    assert!(admin.body["items"][0]["relative_path"].is_string());
+    assert!(admin.body["items"][0]["binding_revision"].is_string());
+    let read = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/extra",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let relation=f.call("POST","/api/v2/catalog/items/extra/relationships",Some(json!({"source_item_id":"extra","target_item_id":"film","kind":"extra_of","position":null})),&[("authorization",&auth),("if-match",read.headers["etag"].to_str().unwrap()),("idempotency-key","relation-create-0001")]).await;
+    assert_eq!(relation.status, StatusCode::CREATED, "{}", relation.body);
+    let path = format!(
+        "/api/v2/catalog/relationships/{}",
+        relation.body["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        f.call("GET", &path, None, &[("authorization", &auth)])
+            .await
+            .body,
+        relation.body
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-0\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn source_relocation_preview_commit_and_retry_are_fenced() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    let source = f
+        .call(
+            "GET",
+            &format!("/api/v2/sources/{}", f.a),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let new_root = f._dir.path().join("relocated");
+    std::fs::create_dir(&new_root).unwrap();
+    let path = format!("/api/v2/sources/{}/relocation-plans", f.a);
+    let input = json!({"new_root_path":new_root});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("if-match", source.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "relocation-preview-01"),
+    ];
+    let preview = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(preview.status, StatusCode::OK, "{}", preview.body);
+    assert_eq!(
+        f.call("POST", &path, Some(input), &h).await.body,
+        preview.body
+    );
+    let path = format!("/api/v2/sources/{}/relocation", f.a);
+    let input = json!({"plan_token":preview.body["plan_token"]});
+    let h = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "relocation-commit-001"),
+    ];
+    let committed = f.call("POST", &path, Some(input.clone()), &h).await;
+    assert_eq!(committed.status, StatusCode::OK, "{}", committed.body);
+    assert_eq!(
+        f.call("POST", &path, Some(input.clone()), &h).await.body,
+        committed.body
+    );
+    let stale = f
+        .call(
+            "POST",
+            &path,
+            Some(input),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "relocation-commit-002"),
+            ],
+        )
+        .await;
+    assert_eq!(stale.status, StatusCode::CONFLICT, "{}", stale.body);
+}
+
+#[tokio::test]
+async fn restricted_source_manager_controls_demands_without_owning_shared_jobs() {
+    let f = Fixture::new().await;
+    let token = f.device(&["catalog:read", "sources:manage"], &[&f.a]).await;
+    let created = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.a),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-scan-001"),
+            ],
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    assert_eq!(created.body["job_ids"], json!([]));
+    let cancelled = f
+        .call(
+            "POST",
+            &format!(
+                "/api/v2/scans/{}/cancel",
+                created.body["id"].as_str().unwrap()
+            ),
+            None,
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-cancel-01"),
+            ],
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::OK);
+    assert_eq!(cancelled.body["status"], "cancelled");
+    assert_eq!(
+        f.call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"verify","require_complete":false})),
+            &[
+                ("authorization", &token),
+                ("idempotency-key", "restricted-hidden-01")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn public_timeline_order_writer_drives_next_resolver() {
+    let f = Fixture::new().await;
+    let op = bearer(OPERATOR);
+    f.item("ordered", "Ordered", &[(&f.a, "r1")]).await;
+    // Group provisioning is an existing service; timeline placement below uses
+    // the public writer, never an injected order_position.
+    let group = playscale::curation::create_order_group(
+        &f.app,
+        "ordered-ed",
+        "Release",
+        playscale::curation::OrderKind::Custom,
+    )
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for position in [1, 2] {
+        let item = f
+            .call(
+                "GET",
+                "/api/v2/catalog/items/ordered",
+                None,
+                &[("authorization", &op)],
+            )
+            .await;
+        let key = format!("ordered-timeline-{position:04}");
+        let created = f.call("POST", "/api/v2/catalog/items/ordered/timelines",
+            Some(json!({"edition_id":"ordered-ed","duration_ms":1000,"order_group_id":group,"order_position":position})),
+            &[("authorization", &op),("if-match",item.headers["etag"].to_str().unwrap()),("idempotency-key",&key)]).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        assert_eq!(created.body["order_position"], position);
+        ids.push(created.body["id"].as_str().unwrap().to_owned());
+    }
+    let next = f
+        .call(
+            "GET",
+            &format!("/api/v2/profiles/default/timelines/{}/next", ids[0]),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+    assert_eq!(next.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(next.body["items"][0]["id"], ids[1]);
+    let end = f
+        .call(
+            "GET",
+            &format!("/api/v2/profiles/default/timelines/{}/next", ids[1]),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(end.status, StatusCode::OK, "{}", end.body);
+    assert_eq!(end.body["items"], json!([]));
+}
+
+#[tokio::test]
+async fn file_inventory_filters_scope_before_pagination() {
+    let f = Fixture::new().await;
+    f.item("a-hidden", "Hidden", &[(&f.b, "hidden")]).await;
+    f.item("b-visible", "Visible", &[(&f.a, "visible")]).await;
+    let reader = f.device(&["catalog:read", "sources:manage"], &[&f.a]).await;
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/admin/files?limit=1",
+            None,
+            &[("authorization", &reader)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    assert_eq!(files.body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(files.body["items"][0]["file"]["id"], "b-visible-f0");
+    let files = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/b-visible/files",
+            None,
+            &[("authorization", &reader)],
+        )
+        .await;
+    assert_eq!(files.status, StatusCode::OK, "{}", files.body);
+    assert_eq!(files.body["items"][0]["id"], "b-visible-f0");
+    assert!(files.body["items"][0].get("relative_path").is_none());
+    assert_eq!(
+        f.call(
+            "GET",
+            "/api/v2/catalog/items/a-hidden/files",
+            None,
+            &[("authorization", &reader)]
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}

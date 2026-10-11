@@ -1,0 +1,57 @@
+{
+  "baseline_commit": "52491bf3e6ef323a33dd546687129bdb3b51d4d1",
+  "baseline_sha256": "64ab9dbf99d1c3f44ed3f0d835dfbc7e3d7d224c53e8f7bbc2cc5976fdef87e5",
+  "candidate_sha256": "26a0edfc529e9c955f887fbca5ad7a504978cdc31227c3b65c29472a758d0b4c",
+  "checks": {
+    "baseline_state_and_operator_backup": {
+      "observed": {
+        "item_id": "8a6026a7-3f8f-4426-aa31-57fb4969d5cb",
+        "file_id": "54ff4b15-375d-4e25-8a8a-bf02a7210413",
+        "title": "Upgrade Signal",
+        "library_ids": [
+          "9b2510b6-0dab-49c5-95b0-54a8d8936d8f"
+        ],
+        "media_sha256": "63d4d323c3549a6e42db3c02d0e1e145b5574072daa7a484c5d31bf833340b57",
+        "position_seconds": 1.25
+      },
+      "schema": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    },
+    "in_place_upgrade": {
+      "from": 9,
+      "to": 37,
+      "legacy_anonymous_status": 401,
+      "upgrade_backup": "pre-upgrade-9-to-37-1791690827-8b8f66aa-58e1-4e3a-a287-5d87aecf0e84.sqlite3"
+    },
+    "restart_is_not_an_upgrade": {
+      "upgrade_backups": 1,
+      "receipt_ids_unchanged": true
+    },
+    "baseline_refuses_newer_schema": {
+      "exit_code": 1,
+      "diagnostic": "migration 10 was previously applied but is missing"
+    },
+    "rollback_to_baseline": [
+      "operator_backup_via_candidate_restore",
+      "automatic_pre_upgrade_backup"
+    ],
+    "candidate_backup_restore": {
+      "schema_versions": [
+        37
+      ],
+      "restore_epoch_rotated": true
+    }
+  },
+  "candidate_source": "3f063312837ec77785e1a5a453670bc3fcd26962",
+  "harness_source": "901a781f6ce3ca1ad140530a02890dfa9d29a594",
+  "baseline_artifact": "Reused existing baseline artifact with matching baseline commit stamp; no local rebuild in this run."
+}

@@ -278,6 +278,9 @@ pub(crate) async fn merge_in_transaction(
             .execute(&mut **tx)
             .await?;
     }
+    for retired in &plan.retired {
+        sqlx::query("INSERT OR IGNORE INTO item_artwork_assets(item_id,asset_id) SELECT ?,asset_id FROM item_artwork_assets WHERE item_id=?").bind(&plan.target).bind(retired).execute(&mut **tx).await?;
+    }
     apply_merge(tx, &plan, &receipt.id).await?;
     crate::search::refresh(tx, 100).await?;
     Ok(receipt)
@@ -1043,7 +1046,19 @@ pub async fn create_timeline(
 ) -> Result<String, CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
-    let aggregate = expect_revision(&mut tx, item, expected_revision).await?;
+    let result = create_timeline_in(&mut tx, item, edition, expected_revision, duration_ms).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) async fn create_timeline_in(
+    tx: &mut SqliteConnection,
+    item: &str,
+    edition: &str,
+    expected_revision: u64,
+    duration_ms: Option<u64>,
+) -> Result<String, CurationError> {
+    let aggregate = expect_revision(tx, item, expected_revision).await?;
     if !aggregate.editions.iter().any(|e| e.id == edition) {
         return Err(
             IdentityError::InvalidBindings("edition belongs to another work".into()).into(),
@@ -1061,7 +1076,6 @@ pub async fn create_timeline(
         )
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(id)
 }
 
@@ -1078,13 +1092,26 @@ pub async fn create_version_explicit(
     }
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let result =
+        create_version_explicit_in(&mut tx, timeline, label, request, expected_revision).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) async fn create_version_explicit_in(
+    tx: &mut SqliteConnection,
+    timeline: &str,
+    label: &str,
+    request: &identity::VersionRequest,
+    expected_revision: u64,
+) -> Result<String, CurationError> {
     let (edition, item): (String, String) = sqlx::query_as(
         "SELECT t.edition_id,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
     )
     .bind(timeline)
     .fetch_one(&mut *tx)
     .await?;
-    let aggregate = expect_revision(&mut tx, &item, expected_revision).await?;
+    let aggregate = expect_revision(tx, &item, expected_revision).await?;
     let current = aggregate
         .editions
         .iter()
@@ -1160,8 +1187,7 @@ pub async fn create_version_explicit(
             .execute(&mut *tx)
             .await?;
     }
-    ensure_consistent(&mut tx).await?;
-    tx.commit().await?;
+    ensure_consistent(tx).await?;
     Ok(id)
 }
 
@@ -1208,6 +1234,19 @@ pub async fn place_timeline(
 ) -> Result<u64, CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let result =
+        place_timeline_in(&mut tx, timeline, group, position, expected_group_revision).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) async fn place_timeline_in(
+    tx: &mut SqliteConnection,
+    timeline: &str,
+    group: &str,
+    position: u32,
+    expected_group_revision: u64,
+) -> Result<u64, CurationError> {
     let (revision, owner): (i64, String) = sqlx::query_as(
         "SELECT g.revision,e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
     )
@@ -1223,7 +1262,7 @@ pub async fn place_timeline(
     .bind(timeline)
     .fetch_one(&mut *tx)
     .await?;
-    let ancestors = ancestors(&mut tx, &item).await?;
+    let ancestors = ancestors(tx, &item).await?;
     let occupied: BTreeMap<u32, String> = sqlx::query_as::<_, (i64, String)>(
         "SELECT order_position,id FROM timelines WHERE order_group_id=? AND order_position IS NOT NULL",
     )
@@ -1255,7 +1294,6 @@ pub async fn place_timeline(
         .bind(group)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(next)
 }
 
@@ -1278,8 +1316,20 @@ pub async fn create_relationship(
 ) -> Result<RelationshipView, CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    let result = create_relationship_in(&mut tx, source, target, kind, position).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) async fn create_relationship_in(
+    tx: &mut SqliteConnection,
+    source: &str,
+    target: &str,
+    kind: identity::RelationshipKind,
+    position: Option<u32>,
+) -> Result<RelationshipView, CurationError> {
     for id in [source, target] {
-        if load_aggregate(&mut tx, id).await?.is_none() {
+        if load_aggregate(tx, id).await?.is_none() {
             return Err(IdentityError::UnknownItem(id.into()).into());
         }
     }
@@ -1309,7 +1359,6 @@ pub async fn create_relationship(
         .bind(position.map(i64::from))
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(view)
 }
 
@@ -1320,6 +1369,16 @@ pub async fn delete_relationship(
 ) -> Result<(), CurationError> {
     let _guard = app.jobs.lock().await;
     let mut tx = crate::db::begin_write(&app.db).await?;
+    delete_relationship_in(&mut tx, id, expected_revision).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn delete_relationship_in(
+    tx: &mut SqliteConnection,
+    id: &str,
+    expected_revision: u64,
+) -> Result<(), CurationError> {
     let revision: i64 = sqlx::query_scalar("SELECT revision FROM item_relationships WHERE id=?")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -1331,7 +1390,6 @@ pub async fn delete_relationship(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(())
 }
 
