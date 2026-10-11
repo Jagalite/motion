@@ -202,3 +202,205 @@ fn legacy_repair_interleavings() {
         }
     }
 }
+
+mod preparation {
+    use super::*;
+    use playscale_core::{jobs, processing};
+    #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct State {
+        processing: processing::State,
+        facts: processing::PreparationFacts,
+        source_current: bool,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    enum Input {
+        Start,
+        Cancel,
+        Retry,
+        Recover,
+        Revoke,
+        Disable,
+        Hide,
+        Rebind,
+        RecipeChanged,
+        SourceChanged,
+        Finish,
+        StaleFinish,
+        RollbackFinish,
+    }
+    struct Preparation;
+    impl Model for Preparation {
+        type State = State;
+        type Input = Input;
+        type Output = u8;
+        fn metadata(&self) -> ModelMetadata {
+            ModelMetadata {
+                name: "motion.preparation-publication".into(),
+                model_version: 1,
+                properties_version: 1,
+                codec_version: 1,
+                build: include_str!("../src/processing.rs").into(),
+            }
+        }
+        fn initial_state(&self) -> Result<State, ModelError> {
+            Ok(State {
+                processing: processing::State {
+                    job: jobs::Job {
+                        phase: jobs::Phase::Queued,
+                        attempt: 0,
+                    },
+                    source_revision: "source".into(),
+                    published_output: None,
+                },
+                facts: processing::PreparationFacts {
+                    requester_authorized: true,
+                    source_enabled: true,
+                    source_in_scope: true,
+                    exact_whole_timeline_binding: true,
+                    recipe_unchanged: true,
+                },
+                source_current: true,
+            })
+        }
+        fn step(&self, s: &State, i: &Input) -> Result<Transition<State, u8>, ModelError> {
+            let mut n = s.clone();
+            let mut publications = 0;
+            match i {
+                Input::Revoke => n.facts.requester_authorized = false,
+                Input::Disable => n.facts.source_enabled = false,
+                Input::Hide => n.facts.source_in_scope = false,
+                Input::Rebind => n.facts.exact_whole_timeline_binding = false,
+                Input::RecipeChanged => n.facts.recipe_unchanged = false,
+                Input::SourceChanged => n.source_current = false,
+                Input::Start | Input::Cancel | Input::Retry | Input::Recover => {
+                    let input = match i {
+                        Input::Start => jobs::Input::Start,
+                        Input::Cancel => jobs::Input::Cancel,
+                        Input::Retry => jobs::Input::Retry,
+                        _ => jobs::Input::Recover,
+                    };
+                    n.processing.job = jobs::transition(&s.processing.job, input).0;
+                }
+                Input::Finish | Input::StaleFinish | Input::RollbackFinish => {
+                    let result = processing::Completion {
+                        attempt: if matches!(i, Input::StaleFinish) {
+                            s.processing.job.attempt.saturating_sub(1)
+                        } else {
+                            s.processing.job.attempt
+                        },
+                        current_source_revision: s.source_current.then(|| "source".into()),
+                        validated_output: Some("output".into()),
+                    };
+                    let (next, effects) =
+                        processing::finish_preparation(&s.processing, &result, Some(&s.facts));
+                    if !matches!(i, Input::RollbackFinish) {
+                        n.processing = next;
+                        publications = effects
+                            .iter()
+                            .filter(|e| matches!(e, jobs::Effect::Publish { .. }))
+                            .count() as u8;
+                    }
+                }
+            }
+            Ok(Transition::accepted(n, vec![publications]))
+        }
+        fn check_state(&self, s: &State) -> Result<Vec<Check>, ModelError> {
+            Ok(vec![if s.processing.published_output.is_none()
+                || s.processing.job.phase == jobs::Phase::Completed
+            {
+                Check::passed("published_output_is_terminal")
+            } else {
+                Check::failed(
+                    "published_output_is_terminal",
+                    "output published before terminal acknowledgement",
+                )
+            }])
+        }
+        fn check_transition(
+            &self,
+            s: &State,
+            i: &Input,
+            t: &TransitionRef<'_, State, u8>,
+        ) -> Result<Vec<Check>, ModelError> {
+            let expected = matches!(i, Input::Finish)
+                && s.processing.published_output.is_none()
+                && s.processing.job.phase == jobs::Phase::Running
+                && s.source_current
+                && s.facts.requester_authorized
+                && s.facts.source_enabled
+                && s.facts.source_in_scope
+                && s.facts.exact_whole_timeline_binding
+                && s.facts.recipe_unchanged;
+            let atomic = !matches!(i, Input::RollbackFinish) || t.state == s;
+            let ok = t.outputs == [u8::from(expected)] && atomic;
+            Ok(vec![if ok {
+                Check::passed("exact_once_current_authorized_publication_and_rollback")
+            } else {
+                Check::failed(
+                    "exact_once_current_authorized_publication_and_rollback",
+                    "wrong publication identity/count or partial commit",
+                )
+            }])
+        }
+    }
+    impl Enumerate for Preparation {
+        fn inputs(&self, s: &State) -> Result<Vec<Input>, ModelError> {
+            let mut inputs = vec![
+                Input::Cancel,
+                Input::Recover,
+                Input::Revoke,
+                Input::Disable,
+                Input::Hide,
+                Input::Rebind,
+                Input::RecipeChanged,
+                Input::SourceChanged,
+                Input::Finish,
+                Input::StaleFinish,
+                Input::RollbackFinish,
+            ];
+            if s.processing.job.attempt < 2 {
+                inputs.extend([Input::Start, Input::Retry]);
+            }
+            Ok(inputs)
+        }
+    }
+    impl ModelCodec for Preparation {
+        fn encode_state(&self, v: &State) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+        fn decode_state(&self, v: &[u8]) -> Result<State, ModelError> {
+            decode(v)
+        }
+        fn encode_input(&self, v: &Input) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+        fn decode_input(&self, v: &[u8]) -> Result<Input, ModelError> {
+            decode(v)
+        }
+        fn encode_output(&self, v: &u8) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+    }
+    #[test]
+    fn preparation_interleavings() {
+        let report = stateless::explore::enumerate(
+            &Preparation,
+            stateless::explore::SearchConfig {
+                max_states: 10000,
+                max_transitions: 100000,
+                max_depth: 30,
+            },
+        )
+        .unwrap();
+        assert!(report.failure.is_none(), "{:?}", report.failure);
+        assert_eq!(report.skipped_checks, 0);
+        assert_eq!(
+            report.termination,
+            stateless::explore::SearchTermination::GraphExhausted
+        );
+        println!(
+            "preparation: {} states, {} transitions",
+            report.states, report.transitions
+        );
+    }
+}

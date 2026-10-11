@@ -385,3 +385,20 @@ owned gate has implementation and evidence, not just that its PR merged.
       integrated revision; blocked/skipped/deferred cases remain visible.
 - [ ] Status documentation reflects the merged implementation and exact evidence.
 - [ ] M5/M6 requirements and explicit provider/platform deferrals remain tracked.
+
+### Data/catalog completion ownership update (PR #17)
+
+Data/catalog owns the missing `getProcessingCapabilities`, `listRecipes`,
+`createPreparation`, `listRenditions`, all five schedule operations,
+`getStorage`, `createBackup`, and `listBackups`. These are no longer unassigned
+cross-lane dependencies. Migrations 0038-0041 are allocated in MIGRATIONS.md;
+coordinate subsequent schema numbers with this lane and preserve prior files.
+
+The exact client interface and supported values are recorded in
+DATA_CATALOG_CLIENT_HANDOFF.md. Preparation and backup adapters reuse existing
+services, with durable request identities and publication/recovery checks.
+Scan and metadata-refresh schedules execute; preview/optimize scheduling and
+automated generated-cache restore remain explicit service gaps. Route inventory
+alone does not close M1/M3. Expanded adapter tests, real preparation acceptance,
+forward upgrade repair and scoped-smart regression evidence are being refreshed
+in qualification/data-catalog; prior receipts bind only their recorded commits.
