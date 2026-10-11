@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import tarfile
+import tomllib
 
 
 def sha(path):
@@ -35,15 +36,19 @@ def check(archive, manifest_path, work):
         for name, expected_hash in manifest['source_files'].items():
             if sha(root / name) != expected_hash:
                 raise ValueError(f'Source archive hash mismatch: {name}')
-        command = ['cargo', 'build', '--release', '--locked', '--workspace',
+        channel = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+        toolchain = ['rustup', 'run', channel]
+        command = [*toolchain, 'cargo', 'build', '--release', '--locked', '--workspace',
                    '--target-dir', str(work / 'target')]
         receipt['command'] = command
-        receipt['rustc'] = subprocess.check_output(['rustc', '-vV'], cwd=root, text=True)
+        receipt['rustc'] = subprocess.check_output([*toolchain, 'rustc', '-vV'], cwd=root, text=True)
         with (work / 'build.log').open('w') as log:
             subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, check=True)
         binary = work / 'target/release/playscale'
         receipt['binary_sha256'] = sha(binary)
-        receipt['version'] = subprocess.check_output([str(binary), '--version'], text=True).strip()
+        receipt['binary_smoke'] = '--help'
+        receipt['help_sha256'] = hashlib.sha256(
+            subprocess.check_output([str(binary), '--help'], cwd=root)).hexdigest()
         receipt['status'] = 'passed'
     finally:
         (work / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
