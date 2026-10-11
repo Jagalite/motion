@@ -129,6 +129,81 @@ async fn timeline_progress(db: &SqlitePool) -> anyhow::Result<()> {
     if done > 0 {
         return Ok(());
     }
+    // Retract only an untouched 0032 single-empty-cut fallback. Frozen
+    // attribution and the exact backfill image fence against newer authority.
+    type Suspect = (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        bool,
+        Option<bool>,
+        Option<String>,
+        i64,
+        f64,
+        bool,
+        Option<bool>,
+        i64,
+        bool,
+    );
+    let suspects: Vec<Suspect> = sqlx::query_as(
+        "SELECT a.profile_id,t.id,v.revision,v.manual_epoch,v.position_ms,v.automatic_watched,v.manual_watched,v.session_id,v.updated_at,coalesce(p.position_seconds,0),coalesce(l.automatic_watched,0),l.manual_watched,coalesce(p.updated_at,0),EXISTS(SELECT 1 FROM viewing_sessions s WHERE s.profile_id=a.profile_id AND s.timeline_id=t.id)
+         FROM legacy_progress_attribution a JOIN editions e ON e.item_id=a.item_id JOIN timelines t ON t.edition_id=e.id
+         JOIN timeline_viewing v ON v.profile_id=a.profile_id AND v.timeline_id=t.id
+         LEFT JOIN progress p ON p.profile_id=a.profile_id AND p.item_id=a.item_id
+         LEFT JOIN viewing_state l ON l.profile_id=a.profile_id AND l.item_id=a.item_id
+         WHERE a.outcome='orphaned' AND json_array_length(a.candidates_json)=1
+           AND json_extract(a.candidates_json,'$[0][0]')=t.id AND json_extract(a.candidates_json,'$[0][1]')=0")
+        .fetch_all(&mut *tx).await?;
+    let mut retracted = 0;
+    for (
+        profile,
+        timeline,
+        revision,
+        epoch,
+        position,
+        automatic,
+        manual,
+        session,
+        updated,
+        seconds,
+        old_automatic,
+        old_manual,
+        old_updated,
+        has_sessions,
+    ) in suspects
+    {
+        let current = View {
+            revision: revision as u64,
+            manual_epoch: epoch as u64,
+            position_ms: position as u64,
+            automatic_watched: automatic,
+            manual_watched: manual,
+            session,
+        };
+        let backfill = View {
+            position_ms: (seconds.max(0.0) * 1000.0).round() as u64,
+            automatic_watched: old_automatic,
+            manual_watched: old_manual,
+            ..View::default()
+        };
+        if updated == old_updated
+            && playscale_core::timeline_viewing::retract_unattributed_legacy(
+                &Attribution::Orphaned,
+                &current,
+                &backfill,
+                has_sessions,
+            )
+        {
+            sqlx::query("DELETE FROM timeline_viewing WHERE profile_id=? AND timeline_id=?")
+                .bind(profile)
+                .bind(timeline)
+                .execute(&mut *tx)
+                .await?;
+            retracted += 1;
+        }
+    }
     let rows: Vec<(String,String,f64,bool,Option<bool>,i64)> = sqlx::query_as(
         "SELECT a.profile_id,a.timeline_id,coalesce(p.position_seconds,0),coalesce(v.automatic_watched,0),v.manual_watched,coalesce(p.updated_at,0)
          FROM legacy_progress_attribution a
@@ -174,7 +249,9 @@ async fn timeline_progress(db: &SqlitePool) -> anyhow::Result<()> {
         .bind(new_id())
         .bind(REPAIR)
         .bind(now())
-        .bind(serde_json::json!({"imported":imported}).to_string())
+        .bind(
+            serde_json::json!({"imported":imported,"retracted_unattributed":retracted}).to_string(),
+        )
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;

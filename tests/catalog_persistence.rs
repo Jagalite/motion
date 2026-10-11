@@ -697,7 +697,8 @@ async fn restore_into_verifies_upgrades_and_refuses_existing_destinations() {
 
 #[tokio::test]
 async fn timeline_repair_handles_empty_cuts_existing_v2_and_reopen() {
-    for already_upgraded in [false, true] {
+    for scenario in 0..3 {
+        let already_upgraded = scenario > 0;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite");
         let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
@@ -724,15 +725,17 @@ async fn timeline_repair_handles_empty_cuts_existing_v2_and_reopen() {
             .await
             .unwrap();
             sqlx::query("INSERT INTO legacy_progress_attribution VALUES ('default','single','exact','only','[[\"only\",1],[\"empty-cut\",0]]','legacy')").execute(&old).await.unwrap();
-            // A canonical manual reset must win even at position zero.
-            sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,position_ms,automatic_watched,manual_watched,updated_at) VALUES ('default','only',4,2,0,0,0,99)").execute(&old).await.unwrap();
+            if scenario == 2 {
+                // A canonical manual reset must win even at position zero.
+                sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,position_ms,automatic_watched,manual_watched,updated_at) VALUES ('default','only',4,2,0,0,0,99)").execute(&old).await.unwrap();
+            }
             old.close().await;
         }
         let pool = db::connect(&path).await.unwrap();
         let row: (i64,i64,i64,Option<bool>,Option<String>) = sqlx::query_as("SELECT revision,manual_epoch,position_ms,manual_watched,session_id FROM timeline_viewing WHERE timeline_id='only'").fetch_one(&pool).await.unwrap();
         assert_eq!(
             row,
-            if already_upgraded {
+            if scenario == 2 {
                 (4, 2, 0, Some(false), None)
             } else {
                 (0, 0, 20000, Some(false), None)
@@ -755,4 +758,46 @@ async fn timeline_repair_handles_empty_cuts_existing_v2_and_reopen() {
             .unwrap();
         assert_eq!(retained, 3);
     }
+}
+
+#[tokio::test]
+async fn timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let old = db::connect_with(&path, &migrator(dir.path(), 9, None).await)
+        .await
+        .unwrap();
+    legacy_fixture(&old).await;
+    sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('empty-cut','empty','Empty')")
+        .execute(&old)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&old).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_repair BEFORE INSERT ON catalog_receipts WHEN NEW.kind='migration:timeline_progress_repair' BEGIN SELECT RAISE(ABORT,'injected repair failure'); END").execute(&old).await.unwrap();
+    assert!(playscale::upgrade::run(&old, None).await.is_err());
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT position_ms FROM timeline_viewing WHERE timeline_id='empty-cut'",
+    )
+    .fetch_one(&old)
+    .await
+    .unwrap();
+    assert_eq!(retained, 5000, "retraction rolls back with failed receipt");
+    sqlx::query("DROP TRIGGER fail_repair")
+        .execute(&old)
+        .await
+        .unwrap();
+    old.close().await;
+    let pool = db::connect(&path).await.unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM timeline_viewing WHERE timeline_id='empty-cut'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    let retained: f64 =
+        sqlx::query_scalar("SELECT position_seconds FROM progress WHERE item_id='empty'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, 5.0);
 }

@@ -63,6 +63,22 @@ impl View {
     }
 }
 
+/// Only an untouched SQL-backfill row may be retracted. Original legacy
+/// records remain recoverable; any canonical event/manual action wins.
+pub fn retract_unattributed_legacy(
+    attribution: &crate::identity::Attribution,
+    current: &View,
+    backfill: &View,
+    has_sessions: bool,
+) -> bool {
+    !matches!(attribution, crate::identity::Attribution::Exact { .. })
+        && !has_sessions
+        && current == backfill
+        && current.revision == 0
+        && current.manual_epoch == 0
+        && current.session.is_none()
+}
+
 /// One-time legacy import never takes authority from an existing v2 row, even
 /// a zero-position manual reset. Attribution is frozen by the identity upgrade.
 pub fn import_legacy(
