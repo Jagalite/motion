@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "source_archive_sha256": "1df4dbbf4dcd109c7efb31498f6917afcdff7da1fdaa0051d42796e5a7239b63",
+  "manifest_sha256": "7cbfc8549172e83d87a2d7c4eda006a4a8e2bce133cbd311ef75deff96263253",
+  "source_commit": "6047e9390d160c78e408a9f221df235dbb0832d0",
+  "source_dirty": false,
+  "status": "passed",
+  "command": [
+    "rustup",
+    "run",
+    "1.98.0",
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "--workspace",
+    "--target-dir",
+    "$WORK/target"
+  ],
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "compiler_selection": "RUSTC explicitly set to rustup which --toolchain 1.98.0 rustc",
+  "binary_sha256": "3870e1d6d758ca55c362bf342fcdbd26269efe3c4106025c17fe171d0141a3d8",
+  "binary_smoke": "--help",
+  "help_sha256": "55dae2d3cb8af2dd98c198a2bc06bf5789f07e0134d18d5947a11f12a9599887",
+  "cargo_recorded_compiler": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "kyoto_job": "e02266061a934b66b96fae5a7772b6fa",
+  "scope": "Extracted workspace release rebuild and CLI help smoke; not installed-package acceptance"
+}

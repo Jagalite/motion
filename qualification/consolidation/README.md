@@ -128,12 +128,25 @@ incorporated here. Review is source evidence, not runtime qualification.
   Homebrew 1.99.0. Running pinned Cargo and a separate pinned rustc diagnostic
   did not force Cargo's compiler selection. [Invalidated receipt](source-rebuild.json)
   preserves both the reported and actual compiler. A subsequent fix explicitly
-  sets `RUSTC` to `rustup which --toolchain 1.98.0 rustc`; fresh proof is required.
+  sets `RUSTC` to `rustup which --toolchain 1.98.0 rustc`.
+- `6047e93` fixes reconstruction compiler selection; `31e79bb` applies the same
+  binding to the actual package builder. GPT-6.1 Sol reviewed both commits, the
+  invalidated evidence commit `ba7d2b3`, and the cumulative diff through `31e79bb`,
+  with no remaining findings.
+- Corrected reconstruction job `e02266061a934b66b96fae5a7772b6fa` **passed**:
+  exit 0, 170.63 seconds, clean source `6047e93`, 385 input hashes verified,
+  release build of every workspace member and binary `--help` smoke successful.
+  Cargo's own `.rustc_info.json` confirms the same Rust 1.98.0 compiler as the
+  receipt. [Verified receipt](source-rebuild-verified.json) binds archive,
+  manifest, binary and compiler identities. This used the production archive
+  writer with a source-only manifest; complete bundle assembly is a separate CI
+  gate. `31e79bb` changes package compiler selection, not the Rust/asset inputs.
 - Superseded `14ef924` reconstruction submission
   `ec863f99a52a42e98271fda4bf0b98d9` was cancelled before admission. The shared
   scheduler initially held jobs for OS memory pressure, then admitted them.
 - At this record's creation, the PR's client, contract and publication checks
-  passed on `0339abe`; Rust fast tests and full CI were still running. Use the
+  passed on `31e79bb`, as did real-process integration/upgrade/restore; Rust fast
+  tests, heavy tests and package CI were still running. Use the
   [PR checks](https://github.com/Jagalite/motion/pull/14/checks) for current head
   status; do not reuse a cancelled or superseded run as final acceptance.
 - Combined-lane installation, browser/Electron and physical A/V are not qualified
