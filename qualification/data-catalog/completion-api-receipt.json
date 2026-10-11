@@ -1,0 +1,97 @@
+{
+  "production_source_commit": "e8c5628d9562ebcf3d81d8f444042b0c6d558dfd",
+  "test_fixture_commit": "77ebbb8f20e186dd340dfbee8e87e8ab8b157600",
+  "reviewed_commit": "77ebbb8f20e186dd340dfbee8e87e8ab8b157600",
+  "compiler": "Homebrew Rust 1.99.0; CI separately uses 1.98.0",
+  "compile_jobs": [
+    "9372c40a9a08436491edbe45d9f3c5ec",
+    "4f4f5cf3a7404fbd812ee036b5ed6568"
+  ],
+  "suites": [
+    {
+      "test": "catalog_persistence",
+      "binary_sha256": "09903bb02565de337a31f763857c945149341ef0f3ae390cf9ebed87c2118275",
+      "exit_code": 0,
+      "output": "\nrunning 13 tests\ntest merges_with_conflicting_identity_or_children_are_rejected ... ok\ntest newer_schema_is_refused_before_any_backup_or_change ... ok\ntest merge_sql_matches_core_application_and_is_fenced ... ok\ntest concurrent_commits_over_one_target_apply_exactly_once ... ok\ntest split_sql_matches_core_application_and_replay_is_rejected ... ok\ntest restore_into_verifies_upgrades_and_refuses_existing_destinations ... ok\ntest coverage_is_backfilled_for_demands_resolved_before_0022 ... ok\ntest failed_migration_keeps_old_schema_and_verified_backup_restores ... ok\ntest stale_merge_preview_is_rejected_after_any_structural_write ... ok\ntest upgrade_backs_up_preserves_ids_and_attributes_progress_without_guessing ... ok\ntest timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomically ... ok\ntest whole_timeline_split_matches_core_application ... ok\ntest timeline_repair_handles_empty_cuts_existing_v2_and_reopen ... ok\n\ntest result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s\n\n",
+      "passed": 13
+    },
+    {
+      "test": "v2_catalog",
+      "binary_sha256": "44288a96b4c448b6e80548ecc74a22304b5a97e761f007e941d9bf25f4bc4ff3",
+      "exit_code": 0,
+      "output": "\nrunning 15 tests\ntest file_inventory_filters_scope_before_pagination ... ok\ntest public_timeline_order_writer_drives_next_resolver ... ok\ntest reconciliation_replays_recheck_current_catalog_scope ... ok\ntest public_structure_writes_preserve_revisions_and_retry_identity ... ok\ntest restricted_source_manager_controls_demands_without_owning_shared_jobs ... ok\ntest retired_ids_resolve_to_their_live_work ... ok\ntest items_are_created_and_replaced_conditionally_and_idempotently ... ok\ntest editions_are_scoped_and_created_under_the_item_etag ... ok\ntest browse_search_and_read_apply_the_catalog_scope_in_the_query ... ok\ntest scan_followup_reports_eligible_attempt_and_decimal_counters ... ok\ntest merge_plans_are_reviewed_scoped_and_committed_once ... ok\ntest scans_are_atomic_idempotent_scoped_demands ... ok\ntest source_relocation_preview_commit_and_retry_are_fenced ... ok\ntest timeline_versions_filter_hidden_bindings_before_paging ... ok\ntest split_plans_move_versions_and_go_stale_on_change ... ok\n\ntest result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.59s\n\n",
+      "passed": 15
+    },
+    {
+      "test": "v2_organization_viewing",
+      "binary_sha256": "bd8b8a5197a8fc2c5ccf48ffd193df30ceac7ea793ea5347a1af5aa10e5edc89",
+      "exit_code": 0,
+      "output": "\nrunning 7 tests\ntest revocation_after_admission_is_enforced_inside_the_transaction ... ok\ntest replays_are_redacted_for_the_current_catalog_scope ... ok\ntest playlists_keep_entries_outside_the_scope_in_place ... ok\ntest smart_members_use_authorized_canonical_timeline_watched_state ... ok\ntest queues_round_trip_seeds_and_hide_the_current_entry_outside_the_scope ... ok\ntest saved_filters_are_profile_scoped_conditional_and_idempotent ... ok\ntest collections_validate_and_never_disclose_members_outside_the_scope ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.49s\n\n",
+      "passed": 7
+    },
+    {
+      "test": "contract",
+      "binary_sha256": "86acf35429e83c4e68b2a45e8ee86fe715ee4475fe16c63faebccc42066f9a3f",
+      "passed": 4,
+      "exit_code": 0,
+      "selector": null
+    },
+    {
+      "test": "publication",
+      "binary_sha256": "6b4f3ebf3afee50e5411914ae661572cbaef9e99c8a231fad13b1f46a87ce141",
+      "passed": 2,
+      "exit_code": 0,
+      "selector": "processing::publication_tests"
+    },
+    {
+      "test": "storage",
+      "binary_sha256": "6b4f3ebf3afee50e5411914ae661572cbaef9e99c8a231fad13b1f46a87ce141",
+      "passed": 2,
+      "exit_code": 0,
+      "selector": "storage::"
+    },
+    {
+      "test": "preparation_core",
+      "binary_sha256": "003d745e4397683a65693676e2c5bd52938a9d69da63ab4b1fdda568f4f65e2b",
+      "passed": 2,
+      "exit_code": 0,
+      "selector": "processing::preparation_tests"
+    },
+    {
+      "test": "legacy_import_and_preparation_model",
+      "binary_sha256": "7836e8cf401b36fb5d59bdc642cd84d5567cfb74db15b05703a34d1b5a876260",
+      "passed": 2,
+      "exit_code": 0,
+      "selector": null
+    },
+    {
+      "test": "v2_metadata_processing",
+      "source_commit": "77ebbb8f20e186dd340dfbee8e87e8ab8b157600",
+      "binary_sha256": "42adb02e2311426c9d8ba6bb5e7bb6208cc3ce1fcad495f8c1074f8e486ad99c",
+      "exit_code": 0,
+      "output": "\nrunning 17 tests\ntest match_presentation_uses_authorized_candidates_and_api_revision ... ok\ntest blocked_operations_are_not_routed ... ok\ntest artwork_upload_is_unselected_idempotent_and_selection_uses_item_etag ... ok\ntest backup_request_replay_publishes_one_verified_snapshot_with_asset_inventory ... ok\ntest interrupted_retention_retries_without_new_backup_request ... ok\ntest artwork_listing_and_asset_bytes_are_scoped ... ok\ntest backup_retention_preserves_history_and_corrupt_recovery_fails_closed ... ok\ntest match_replay_rechecks_current_file_visibility ... ok\ntest matching_uses_logical_library_membership_and_protects_shared_files ... ok\ntest empty_schedule_does_not_starve_healthy_library_and_fanout_is_resumable ... ok\ntest matches_create_replay_decide_and_scope ... ok\ntest metadata_refresh_failures_are_retryable_and_do_not_escape_worker ... ok\ntest preparation_admission_pins_identity_and_replays_once ... ok\ntest metadata_refresh_is_durable_replayable_and_cancelled_before_publication ... ok\ntest schedules_preserve_disabled_rows_and_atomically_claim_logical_scans ... ok\ntest preparation_scope_keys_and_first_video_hdr_are_enforced ... ok\ntest metadata_read_replace_preconditions_and_scope ... ok\n\ntest result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s\n\n",
+      "passed": 17
+    }
+  ],
+  "scope": "Focused local adapter/core/model tests, not whole-workspace or browser qualification",
+  "preparation_model": {
+    "states": 894,
+    "transitions": 10856,
+    "skipped": 0,
+    "termination": "GraphExhausted",
+    "bounds": {
+      "states": 10000,
+      "transitions": 100000,
+      "depth": 30,
+      "attempts": 2
+    }
+  },
+  "passed": 64,
+  "prior_http_checkpoint": {
+    "source": "ee842e4",
+    "compile_job": "58b6893e45ad4eed9d97f331191a5339",
+    "passed": 15,
+    "failed": 2,
+    "disposition": "Two incorrect 400 expectations corrected to contract 422 in 77ebbb8; production unchanged."
+  }
+}

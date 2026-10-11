@@ -283,6 +283,7 @@ packaging or other helper scripts.
   integration/release owner coordinates the necessary combined-tree and installed
   product runs; individual lanes do not repeat them for every commit.
 
+Set `KYOTO_SCRIPT` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
@@ -414,6 +415,7 @@ DATA_CATALOG_CLIENT_HANDOFF.md. Preparation and backup adapters reuse existing
 services, with durable request identities and publication/recovery checks.
 Scan and metadata-refresh schedules execute; preview/optimize scheduling and
 automated generated-cache restore remain explicit service gaps. Route inventory
-alone does not close M1/M3. Expanded adapter tests, real preparation acceptance,
-forward upgrade repair and scoped-smart regression evidence are being refreshed
-in qualification/data-catalog; prior receipts bind only their recorded commits.
+alone does not close M1/M3. Real HTTP preparation/backup acceptance,
+schema 9→41 upgrade repairs and scoped-smart regression checks pass; exact
+receipts are in qualification/data-catalog. Browser/client and combined-package
+acceptance remain separate gates; prior receipts bind only their recorded commits.
