@@ -63,7 +63,26 @@ pub fn router(facade: Arc<dyn UiQueryFacade>) -> topcoat::router::Router {
 /// Public, content-hashed static assets contain no request identity. Mount
 /// outside identity-dependent HTML middleware so immutable caching is retained.
 pub fn asset_router<S: Clone + Send + Sync + 'static>() -> AxumRouter<S> {
-    AxumRouter::new().route("/ui/{file}", get(ui_asset))
+    AxumRouter::new()
+        .route(assets::MANIFEST_URL, get(web_manifest))
+        .route("/ui/{file}", get(ui_asset))
+}
+
+/// Revalidated rather than immutable: its URL is stable across upgrades.
+pub async fn web_manifest() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/manifest+json"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+        ],
+        assets::manifest(),
+    )
+        .into_response()
 }
 
 /// Provider module URLs are stable across upgrades, unlike /ui content hashes.

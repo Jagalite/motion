@@ -70,6 +70,15 @@ async fn send(
     method: Method,
     uri: &str,
 ) -> (StatusCode, axum::http::HeaderMap, String) {
+    let (status, headers, body) = send_bytes(app, method, uri).await;
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn send_bytes(
+    app: &Router,
+    method: Method,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, axum::body::Bytes) {
     let response: Response = app
         .clone()
         .oneshot(
@@ -84,7 +93,7 @@ async fn send(
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, headers, String::from_utf8_lossy(&body).into_owned())
+    (status, headers, body)
 }
 
 /// No inline script, no event-handler attributes, no runtime/eval machinery.
@@ -273,14 +282,15 @@ async fn player_page_emits_a_stable_host_and_external_module() {
 async fn ui_assets_are_content_hashed_and_immutable() {
     let app = app(None, None);
     for asset in assets::all() {
-        let (status, headers, body) = get_page(&app, &asset.url()).await;
+        // Raw bytes: some assets (the icons) are binary.
+        let (status, headers, body) = send_bytes(&app, Method::GET, &asset.url()).await;
         assert_eq!(status, StatusCode::OK, "{}", asset.url());
         assert_eq!(headers[header::CONTENT_TYPE], asset.content_type);
         assert_eq!(
             headers[header::CACHE_CONTROL],
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(body.as_bytes(), asset.bytes);
+        assert_eq!(body.as_ref(), asset.bytes);
     }
     let (status, _, _) = get_page(&app, "/ui/bridge.000000000000.js").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "stale hash must not resolve");
@@ -500,4 +510,80 @@ async fn playback_without_viewing_permission_does_not_offer_writing_authority() 
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(r#"data-can-save-viewing="false""#));
     assert!(!html.contains(r#"data-can-save-viewing="true""#));
+}
+
+#[tokio::test]
+async fn phone_shell_installs_and_navigates_by_tabs() {
+    let viewer = app(Some(principal("everyone", VIEWER)), None);
+    let (status, _, home) = get_page(&viewer, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(home.contains("viewport-fit=cover"));
+    assert!(home.contains(&format!(
+        r#"<link rel="manifest" href="{}">"#,
+        assets::MANIFEST_URL
+    )));
+    assert!(home.contains(&format!(r#"href="{}""#, assets::TOUCH_ICON.url())));
+    let tabbar = &home[home.find(r#"<nav class="tabbar""#).expect("tab bar")..];
+    let tabbar = &tabbar[..tabbar.find("</nav>").unwrap()];
+    for link in ["/", "/libraries", "/search", "/profiles"] {
+        assert!(tabbar.contains(&format!(r#"href="{link}""#)), "{link}");
+    }
+    assert!(
+        !tabbar.contains(r#"href="/manage""#),
+        "viewer has nothing to manage"
+    );
+    assert!(tabbar.contains(r#"class="tab-link is-current" href="/" aria-current="page""#));
+    assert_strict_markup(&home);
+
+    let (status, _, libraries) = get_page(&viewer, "/libraries").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(libraries.contains(r#"href="/library/lib1""#) && libraries.contains("Films"));
+    assert!(libraries.contains(r#"class="tab-link is-current" href="/libraries""#));
+    let (status, _, _) = get_page(&viewer, "/manage").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (status, _, manage) = get_page(&admin, "/manage").await;
+    assert_eq!(status, StatusCode::OK);
+    for link in ["/matches", "/processing", "/sources", "/diagnostics"] {
+        assert!(
+            manage.contains(&format!(r#"<a class="list-row" href="{link}""#)),
+            "{link}"
+        );
+    }
+    assert!(manage.contains(r#"class="tab-link is-current" href="/manage""#));
+    let (_, _, sources) = get_page(&admin, "/sources").await;
+    assert!(sources.contains(r#"class="tab-link is-current" href="/manage""#));
+
+    // Phone CSS hides the app frame only around a rendered player
+    // (.shell:has(.player-page)), so a playback error keeps its navigation.
+    let (_, _, player) = get_page(&viewer, "/play/tl1").await;
+    assert!(player.contains(r#"class="player-page""#));
+    let (status, _, missing) = get_page(&viewer, "/play/nope").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !missing.contains(r#"class="player-page""#) && missing.contains(r#"<nav class="tabbar""#)
+    );
+}
+
+#[tokio::test]
+async fn web_manifest_names_this_builds_icons() {
+    let app = app(None, None);
+    let (status, headers, body) = get_page(&app, assets::MANIFEST_URL).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CONTENT_TYPE], "application/manifest+json");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(manifest["display"], "standalone");
+    assert_eq!(manifest["start_url"], "/");
+    for (icon, asset) in manifest["icons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([&assets::ICON_192, &assets::ICON_512])
+    {
+        assert_eq!(icon["src"], asset.url());
+        let (status, _, _) = get_page(&app, icon["src"].as_str().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
 }

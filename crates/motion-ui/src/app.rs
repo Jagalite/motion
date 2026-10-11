@@ -41,6 +41,8 @@ pub fn router(facade: Facade) -> Router {
         .page(item)
         .page(search)
         .page(play)
+        .page(library_index)
+        .page(manage)
         .page(crate::screens::profiles)
         .page(crate::screens::sources)
         .page(crate::screens::matches)
@@ -163,6 +165,12 @@ fn icon_path(name: &str) -> &'static str {
         }
         "profiles" => "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0",
         "diagnostics" => "M3 12h4l3-8 4 16 3-8h4",
+        "manage" => "M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4",
+        "pause" => "M8 5v14M16 5v14",
+        "volume" => "M4 9.5h3.5L12 5.5v13l-4.5-4H4zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11",
+        "next" => "M5 5.5v13l9-6.5zM18 5.5v13",
+        "back" => "M15 5l-7 7 7 7",
+        "chevron" => "M9 5l7 7-7 7",
         _ => "M12 12h.01",
     }
 }
@@ -195,6 +203,51 @@ async fn nav_link(
     })
 }
 
+#[component]
+async fn tab_link(
+    href: String,
+    label: &'static str,
+    icon_name: &'static str,
+    current: bool,
+) -> Result<impl View> {
+    Ok(view! {
+        <a class=(if current { "tab-link is-current" } else { "tab-link" }) href=(href.as_str())
+            aria-current=(if current { "page" } else { "false" })>
+            icon(name: icon_name)
+            <span class="tab-label">(label)</span>
+        </a>
+    })
+}
+
+struct ManageLink {
+    href: &'static str,
+    label: &'static str,
+    icon_name: &'static str,
+}
+
+/// Administrative screens this principal may open, in navigation order.
+fn manage_links(who: &UiPrincipal) -> Vec<ManageLink> {
+    [
+        ("catalog:write", "/matches", "Matches", "matches"),
+        (
+            "processing:request",
+            "/processing",
+            "Processing",
+            "processing",
+        ),
+        ("sources:manage", "/sources", "Sources", "sources"),
+        ("system:admin", "/diagnostics", "Diagnostics", "diagnostics"),
+    ]
+    .into_iter()
+    .filter(|(permission, ..)| who.can(permission))
+    .map(|(_, href, label, icon_name)| ManageLink {
+        href,
+        label,
+        icon_name,
+    })
+    .collect()
+}
+
 // --- Layout -----------------------------------------------------------------
 
 #[layout("/")]
@@ -213,6 +266,9 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
+    let can_manage = who
+        .as_ref()
+        .is_some_and(|who| !manage_links(who).is_empty());
     let initial = who
         .as_ref()
         .and_then(|who| who.profile_name.chars().next())
@@ -223,9 +279,16 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
         <html lang="en">
             <head>
                 <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width,initial-scale=1">
+                <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
                 <meta name="referrer" content="no-referrer">
                 <meta name="color-scheme" content="dark">
+                <meta name="theme-color" content="#191c1f">
+                <meta name="mobile-web-app-capable" content="yes">
+                <meta name="apple-mobile-web-app-capable" content="yes">
+                <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+                <meta name="apple-mobile-web-app-title" content="Motion">
+                <link rel="manifest" href=(assets::MANIFEST_URL)>
+                <link rel="apple-touch-icon" href=(assets::TOUCH_ICON.url())>
                 if let Some(who) = &who {
                     <meta name="motion-csrf" content=(who.csrf_token.as_str())>
                     <meta name="motion-server-epoch" content=(who.server_epoch.as_str())>
@@ -262,20 +325,11 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                         }
                                     </ul>
                                 }
-                                if who.can("catalog:write") || who.can("processing:request") || who.can("sources:manage") || who.can("system:admin") {
+                                if can_manage {
                                     <h2 class="nav-heading" id="nav-manage">"Manage"</h2>
                                     <ul class="nav-list" aria-labelledby="nav-manage">
-                                        if who.can("catalog:write") {
-                                            nav_link(href: href!(crate::screens::matches).resolve(cx), label: "Matches".to_string(), icon_name: "matches", current: path.starts_with("/matches"))
-                                        }
-                                        if who.can("processing:request") {
-                                            nav_link(href: href!(crate::screens::processing).resolve(cx), label: "Processing".to_string(), icon_name: "processing", current: path.starts_with("/processing"))
-                                        }
-                                        if who.can("sources:manage") {
-                                            nav_link(href: href!(crate::screens::sources).resolve(cx), label: "Sources".to_string(), icon_name: "sources", current: path.starts_with("/sources"))
-                                        }
-                                        if who.can("system:admin") {
-                                            nav_link(href: href!(crate::screens::diagnostics).resolve(cx), label: "Diagnostics".to_string(), icon_name: "diagnostics", current: path.starts_with("/diagnostics"))
+                                        for link in manage_links(who) {
+                                            nav_link(href: link.href.to_string(), label: link.label.to_string(), icon_name: link.icon_name, current: path.starts_with(link.href))
                                         }
                                     </ul>
                                 }
@@ -293,6 +347,12 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                         }
                         if let Some(who) = &who {
                             <header class="topbar">
+                                <a class="topbar-brand" href=(href!(home)) aria-label="Motion home">
+                                    <span class="brand-mark" aria-hidden="true">
+                                        <svg viewBox="0 0 24 24" focusable="false"><path d="M9 6.5v11l8.5-5.5z"></path></svg>
+                                    </span>
+                                    <span class="brand-name" aria-hidden="true">"Motion"</span>
+                                </a>
                                 <form role="search" class="search" method="get" action=(href!(search))>
                                     <label class="visually-hidden" for="global-search">"Search the catalog"</label>
                                     icon(name: "search")
@@ -311,7 +371,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     } else {
                                         <span class="profile">"Profile: " (who.profile_name.as_str())</span>
                                     }
-                                    <span class="avatar" aria-hidden="true">(initial.as_str())</span>
+                                    <a class="avatar" href=(href!(crate::screens::profiles)) aria-label=(format!("Profile: {}", who.profile_name))>(initial.as_str())</a>
                                 </div>
                             </header>
                         }
@@ -345,6 +405,21 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             )
                         </main>
                     </div>
+                    if who.is_some() {
+                        // Phone navigation: a fixed set of tabs, like a native app.
+                        // CSS shows either this or the sidebar, never both.
+                        <nav class="tabbar" aria-label="Tabs">
+                            tab_link(href: href!(home).resolve(cx), label: "Home", icon_name: "home", current: path == "/")
+                            tab_link(href: href!(library_index).resolve(cx), label: "Libraries", icon_name: "library",
+                                current: path.starts_with("/librar"))
+                            tab_link(href: href!(search).resolve(cx), label: "Search", icon_name: "search", current: path.starts_with("/search"))
+                            if can_manage {
+                                tab_link(href: href!(manage).resolve(cx), label: "Manage", icon_name: "manage",
+                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/diagnostics"].iter().any(|p| path.starts_with(p)))
+                            }
+                            tab_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profile", icon_name: "profiles", current: path.starts_with("/profiles"))
+                        </nav>
+                    }
                 </div>
             </body>
         </html>
@@ -471,6 +546,7 @@ async fn library(cx: &Cx) -> Result<impl View> {
     let degraded = view_model.library.availability == Availability::Degraded;
     let count = view_model.items.len();
     Ok(view! {
+        <a class="back-link" href=(href!(library_index))>icon(name: "back") "Libraries"</a>
         <header class="page-header">
             <h1 class="page-title">(view_model.library.name.as_str())</h1>
             <p class="page-count">(count) if count == 1 { " title" } else { " titles" }</p>
@@ -499,6 +575,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
         _ => "Entries",
     };
     Ok(view! {
+        <a class="back-link" href=(href!(home)) data-back="history">icon(name: "back") "Back"</a>
         <article class="detail">
             <div class=(format!("detail-backdrop {}", art_tone(&view_model.item.id))) aria-hidden="true"></div>
             <div class="detail-hero">
@@ -590,6 +667,12 @@ async fn search(cx: &Cx) -> Result<impl View> {
         format!("Results for “{}”", view_model.query)
     };
     Ok(view! {
+        <form role="search" class="search page-search" method="get" action=(href!(search))>
+            <label class="visually-hidden" for="page-search">"Search the catalog"</label>
+            icon(name: "search")
+            <input id="page-search" type="search" name="q" placeholder="Search titles" autocomplete="off"
+                enterkeyhint="search">
+        </form>
         <header class="page-header">
             <h1 class="page-title">(heading.as_str())</h1>
             if !view_model.query.is_empty() && !view_model.items.is_empty() {
@@ -597,12 +680,67 @@ async fn search(cx: &Cx) -> Result<impl View> {
             }
         </header>
         if view_model.query.is_empty() {
-            empty(message: "Type in the search box to find titles.")
+            empty(message: "Search by title.")
         } else if view_model.items.is_empty() {
             empty(message: "No titles match.")
         } else {
             item_grid(items: view_model.items, label: "Search results")
         }
+    })
+}
+
+#[page("/libraries")]
+async fn library_index(cx: &Cx) -> Result<impl View> {
+    let who = principal(cx)?;
+    let view_model = facade(cx).0.home(who).await.map_err(ui_error)?;
+    Ok(view! {
+        <h1 class="page-title">"Libraries"</h1>
+        if view_model.libraries.is_empty() {
+            empty(message: "No libraries yet.")
+        } else {
+            <ul class="list-rows" aria-label="Libraries">
+                for lib in view_model.libraries {
+                    <li>
+                        <a class="list-row" href=(href!(library, LibraryId(lib.id.as_str())))>
+                            <span class=(format!("list-art {}", art_tone(&lib.id))) aria-hidden="true">
+                                icon(name: library_icon(&lib.kind))
+                            </span>
+                            <span class="list-text">
+                                <span class="card-title">(lib.name.as_str())</span>
+                                <span class="card-meta">(kind_label(&lib.kind))
+                                    <span class="meta-sep" aria-hidden="true"></span>
+                                    (availability_text(lib.availability))
+                                </span>
+                            </span>
+                            icon(name: "chevron")
+                        </a>
+                    </li>
+                }
+            </ul>
+        }
+    })
+}
+
+/// The administrative screens as one list: the phone tab bar's Manage tab.
+#[page("/manage")]
+async fn manage(cx: &Cx) -> Result<impl View> {
+    let links = manage_links(principal(cx)?);
+    if links.is_empty() {
+        return Err(forbidden().into());
+    }
+    Ok(view! {
+        <h1 class="page-title">"Manage"</h1>
+        <ul class="list-rows" aria-label="Manage">
+            for link in links {
+                <li>
+                    <a class="list-row" href=(link.href)>
+                        <span class="list-art" aria-hidden="true">icon(name: link.icon_name)</span>
+                        <span class="list-text"><span class="card-title">(link.label)</span></span>
+                        icon(name: "chevron")
+                    </a>
+                </li>
+            }
+        </ul>
     })
 }
 
@@ -632,7 +770,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
     Ok(view! {
         <div class="player-page">
         <header class="player-header">
-            <a class="player-back" href=(href!(item, ItemId(view_model.item_id.as_str())))>"Back to title"</a>
+            <a class="player-back" href=(href!(item, ItemId(view_model.item_id.as_str()))) data-back="player">icon(name: "back") <span class="player-back-label">"Back to title"</span></a>
             <h1 class="player-title">(view_model.title.as_str())</h1>
         </header>
         <div id="motion-player" class="player-host"
@@ -655,27 +793,36 @@ async fn play(cx: &Cx) -> Result<impl View> {
             <p class="status-panel" role="status" data-state="loading">"Preparing playback…"</p>
         </div>
         <form id="motion-playback-controls" class="player-controls" aria-label="Playback controls">
-            <button type="button" data-player-action="play">"Play"</button>
-            <button type="button" data-player-action="pause">"Pause"</button>
-            <button type="button" data-player-action="mute">"Mute / unmute"</button>
-            <button type="button" data-player-action="next">"Next title"</button>
-            <label>"Position in seconds "<input name="position" type="number" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
-            <button type="submit">"Seek"</button>
-            <label>"Version "<select name="version"><option value="">"Automatic"</option>
-                for version in versions {
-                    <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
-                }
-            </select></label>
-            <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))
-                data-file-id=(view_model.audio_file.as_ref().map(|f| f.0.as_str()).unwrap_or(""))
-                data-file-revision=(view_model.audio_file.as_ref().map(|f| f.1.as_str()).unwrap_or(""))><option value="">"Default"</option>
-                for track in view_model.audio_tracks.iter() {
-                    <option value=(track.id.as_str())>(track.label.as_str())</option>
-                }
-            </select></label>
-            <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
-            <button type="button" data-player-action="quality">"Apply quality"</button>
-            <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+            <div class="player-actions">
+                <button type="button" data-player-action="play">icon(name: "play") <span>"Play"</span></button>
+                <button type="button" data-player-action="pause">icon(name: "pause") <span>"Pause"</span></button>
+                <button type="button" data-player-action="mute">icon(name: "volume") <span>"Mute / unmute"</span></button>
+                <button type="button" data-player-action="next">icon(name: "next") <span>"Next title"</span></button>
+                <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+            </div>
+            <details class="player-options">
+                <summary>"Playback options"</summary>
+                <div class="player-options-body">
+                    <div class="player-option-row">
+                        <label>"Position in seconds "<input name="position" type="number" inputmode="decimal" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
+                        <button type="submit">"Seek"</button>
+                    </div>
+                    <label>"Version "<select name="version"><option value="">"Automatic"</option>
+                        for version in versions {
+                            <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
+                        }
+                    </select></label>
+                    <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))
+                        data-file-id=(view_model.audio_file.as_ref().map(|f| f.0.as_str()).unwrap_or(""))
+                        data-file-revision=(view_model.audio_file.as_ref().map(|f| f.1.as_str()).unwrap_or(""))><option value="">"Default"</option>
+                        for track in view_model.audio_tracks.iter() {
+                            <option value=(track.id.as_str())>(track.label.as_str())</option>
+                        }
+                    </select></label>
+                    <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
+                    <button type="button" data-player-action="quality">"Apply quality"</button>
+                </div>
+            </details>
         </form>
         <script type="module" src=(assets::PLAYER.url())></script>
         <p id="motion-progress-status" role="status"></p>

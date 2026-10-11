@@ -5,7 +5,9 @@
 //      public API with CSRF, a stable idempotency key and If-Match, then
 //      reloads the server-rendered page;
 //   2. runs browser pairing from the sign-in page;
-//   3. switches the viewing profile among those the server rendered.
+//   3. switches the viewing profile among those the server rendered;
+//   4. lets "Back" links (a[data-back]) return through history, since an
+//      app installed to the home screen has no browser back button.
 
 const csrf = () => document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 const newKey = () => crypto.randomUUID().replaceAll('-', '');
@@ -179,4 +181,21 @@ document.addEventListener('change', event => {
   if (!(select instanceof HTMLSelectElement) || !select.dataset.profileSwitch) return;
   document.cookie = `${select.dataset.profileSwitch}=${encodeURIComponent(select.value)}; Path=/; SameSite=Strict`;
   location.reload();
+});
+
+// A back link uses history only when the entry right before this one is a
+// Motion page (the Navigation API lists only this origin's contiguous
+// entries), so it never leaves the app; otherwise it follows its href.
+function previousEntryIsMotion() {
+  const index = globalThis.navigation?.currentEntry?.index ?? -1;
+  if (index < 1) return false;
+  const previous = navigation.entries()[index - 1]?.url;
+  return Boolean(previous) && new URL(previous).origin === location.origin;
+}
+document.addEventListener('click', event => {
+  const link = event.target?.closest?.('a[data-back="history"]');
+  if (!link || event.defaultPrevented || event.button !== 0
+    || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || !previousEntryIsMotion()) return;
+  event.preventDefault();
+  history.back();
 });
