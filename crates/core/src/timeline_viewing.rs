@@ -346,17 +346,17 @@ mod tests {
         };
         assert_eq!((view.position_ms, session.sequence), (10_000, 1));
         assert_eq!(
-            record(&view, &session, &e1, &[e1.clone()], 90.0),
+            record(&view, &session, &e1, std::slice::from_ref(&e1), 90.0),
             Ok(Recorded::Duplicate)
         );
         let changed = event("e1", 1, 11_000, Status::Playing);
         assert_eq!(
-            record(&view, &session, &changed, &[e1.clone()], 90.0),
+            record(&view, &session, &changed, std::slice::from_ref(&e1), 90.0),
             Err(Error::EventConflict)
         );
         let reused = event("e1", 2, 11_000, Status::Playing);
         assert_eq!(
-            record(&view, &session, &reused, &[e1.clone()], 90.0),
+            record(&view, &session, &reused, std::slice::from_ref(&e1), 90.0),
             Err(Error::EventConflict)
         );
         assert_eq!(
@@ -453,7 +453,7 @@ mod tests {
             Err(Error::Superseded)
         );
         assert_eq!(
-            record(&o.view, &session, &e1, &[e1.clone()], 90.0),
+            record(&o.view, &session, &e1, std::slice::from_ref(&e1), 90.0),
             Ok(Recorded::Duplicate)
         );
         // A new session after the override starts in the new epoch.
