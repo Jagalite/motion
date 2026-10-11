@@ -68,9 +68,10 @@ def main():
             def renditions():
                 return api('GET','/processing/renditions?limit=200')['items']
             base=preparation('remux_mp4')
-            assert request(port,'POST','/api/v2/processing/preparations',base,{'Idempotency-Key':'anonymous'})[0]==401
-            first=submit('remux_mp4',key='same');assert submit('remux_mp4',key='same')['id']==first['id']
-            api('POST','/processing/preparations',preparation('audio_aac'),409,{'Idempotency-Key':'same'})
+            assert request(port,'POST','/api/v2/processing/preparations',base,{'Idempotency-Key':'processing-smoke-anonymous'})[0]==401
+            replay_key='processing-smoke-replay'
+            first=submit('remux_mp4',key=replay_key);assert submit('remux_mp4',key=replay_key)['id']==first['id']
+            api('POST','/processing/preparations',preparation('audio_aac'),409,{'Idempotency-Key':replay_key})
             for job in [first,submit('audio_aac'),submit()]:
                 row=terminal(job);assert row['phase']=='completed',row
                 rendition=next(v for v in renditions() if v['job_id']==job['id']);assert rendition['status']=='ready',rendition
