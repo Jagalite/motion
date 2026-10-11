@@ -1,5 +1,10 @@
 # Playback/viewing consolidation lane (2026-10-10)
 
+The continuation on the combined tree is tracked in [COMBINED.md](COMBINED.md).
+The source and evidence below are historical input-branch receipts, not combined
+acceptance. Explicit compiler-path provenance in the new receipt supersedes
+older toolchain claims based only on the cargo invocation.
+
 Owner: lane 2, branch `playback-viewing-completion`, base `2344d03`.
 Independent reviewer: GPT-6.1-Sol. Review and execution receipts are recorded below
 once completed; submission of a Kyoto job is not a passing check.

@@ -43,10 +43,17 @@ included upgrade/restore auto-merges and rendered epoch/write preconditions.
 - Packaging regressions: 12 pass.
 - OpenAPI structure: 97 paths, 146 operations, 148 schemas, 2,573 references.
 - YAML/JSON parity and formatting: pass.
-- Focused Rust `v2_organization_viewing` compilation: Kyoto job
-  `6c462d6feea44f32acb3a00c6dbac61d`, pending at record creation. Test execution,
-  combined upgrade/restore, package and browser/native qualification are separate
-  gates. Use the stacked PR's current checks and evidence, not input-branch passes.
+- Focused Rust `v2_organization_viewing`: initial compilation passed via Kyoto
+  `6c462d6feea44f32acb3a00c6dbac61d`, but execution failed seven of eight tests
+  before assertions because the merged fixture inserted `item_origins` twice.
+  `d32c046` removes the duplicate insert; GPT-6.1 Sol reviewed the fix without
+  remaining findings. Recompilation job `ab58d011c8ae452ca8ba1ed8408ebea0` passed
+  (exit 0), then all eight tests passed, including both lanes' watched-state
+  cases and scoped authorization. A hash-identical internal temporary executable
+  avoided the previously observed external-volume loader stall.
+- Combined upgrade/restore, package and browser/native qualification remain
+  separate gates. Use [PR #18](https://github.com/Jagalite/motion/pull/18/checks)
+  current checks and evidence, not input-branch passes.
 
 The served inventory now lists 124/146 operations. This is route inventory, not
 payload, authorization, workflow or product qualification.

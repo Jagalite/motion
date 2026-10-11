@@ -283,6 +283,7 @@ packaging or other helper scripts.
   integration/release owner coordinates the necessary combined-tree and installed
   product runs; individual lanes do not repeat them for every commit.
 
+Set `KYOTO_SCRIPT` to the shared installation's `kyoto.py` path in your environment.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
@@ -339,6 +340,18 @@ Use four bounded lanes. These are assignments to make, not agents already runnin
 | Playback/viewing (A06/A07/A08) | C02 playback service facts, C05/C06/C08, planning, tickets, generation and authority policies | Propose contract changes through A00; coordinate capability transport edits with the API owner and package/player decisions with clients/release. |
 | Clients (A10–A12) | All current client callers, Topcoat cutover, Go capability use, C07 player integration, real-client acceptance | No independent catalog or viewing authority; fixtures remain explicitly labeled. |
 | Integration/release (A00/A05/A14) | Contract/evidence ledger, C03/C09, CI, manifests, source/package reconstruction, final integration | Owns root manifests/lockfiles and shared-file integration; implementation lanes still own their regression tests. |
+
+Playback/viewing handoff for PR #16: the combined implementation and acceptance
+receipt is [qualification/playback-viewing/COMBINED.md](qualification/playback-viewing/COMBINED.md).
+It composes catalog `ee842e4` and clients `f883f19`, preserving authorization-scoped
+watched facts. Generation tickets, exact component pins, selected original-file
+text subtitles, pacing without history-write permission, restore identity and
+revocation have explicit policies and acceptance checks. Unsupported media cases
+remain named refusals; this is not a claim of full M4 format/platform coverage.
+[The caller contract](qualification/playback-viewing/CALLERS.md) coordinates epoch
+headers, heartbeats and legacy-writer retirement. Clients/integration still owns
+product-entry cutover, installed/native acceptance and public positive release-order
+provisioning before the global M2/M4 and one-writer gates can close.
 
 Before parallel edits, record named owners, owned paths, base commits and the
 interface/receipt each lane supplies. Assign one editor for shared router modules,
