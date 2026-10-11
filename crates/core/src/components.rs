@@ -86,6 +86,43 @@ pub fn embedded_track(
         .track_index
 }
 
+/// Where an explicit subtitle component occurs on one revision-bound file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubtitleOccurrence {
+    /// Embedded stream index (as probed).
+    Embedded(i64),
+    /// Sidecar file name next to the media file.
+    Sidecar(String),
+}
+
+/// Resolve an explicit subtitle component only on the chosen revision-bound
+/// file: its embedded track there, or its sidecar there. Occurrences on
+/// another version, file or revision never substitute.
+pub fn subtitle_occurrence(
+    components: &[Component],
+    id: &str,
+    version: &str,
+    file: &str,
+    revision: &str,
+) -> Option<SubtitleOccurrence> {
+    let mut found = components
+        .iter()
+        .find(|c| c.id == id && c.kind == Kind::Subtitle)?
+        .occurrences
+        .iter()
+        .filter(|o| o.version_id == version && o.file_id == file && o.file_revision == revision);
+    let o = found.next()?;
+    // One component has at most one occurrence per file; more is ambiguous.
+    if found.next().is_some() {
+        return None;
+    }
+    match (&o.sidecar, o.track_index) {
+        (Some(name), None) => Some(SubtitleOccurrence::Sidecar(name.clone())),
+        (None, Some(index)) => Some(SubtitleOccurrence::Embedded(index)),
+        _ => None,
+    }
+}
+
 /// Automatic language/role policy is not yet qualified. Never silently drop
 /// observed embedded captions when a caller requests that policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,5 +431,78 @@ mod tests {
         assert!(sidecar_subtitle("Movie", "Movie.en.director.srt").is_none());
         assert!(sidecar_subtitle("Movie", "Movie.en.nfo").is_none());
         assert_eq!(normalize_language(Some("und")), None);
+    }
+
+    #[test]
+    fn subtitle_pins_resolve_only_on_the_chosen_revision_bound_file() {
+        let occurrence =
+            |version: &str, file: &str, index: Option<i64>, sidecar: Option<&str>| Occurrence {
+                version_id: version.into(),
+                file_id: file.into(),
+                file_revision: format!("r-{file}"),
+                track_index: index,
+                sidecar: sidecar.map(Into::into),
+                default: false,
+            };
+        let component = |id: &str, kind, occurrences| Component {
+            id: id.into(),
+            kind,
+            language: Some("en".into()),
+            title: None,
+            roles: Roles::default(),
+            ordinal: 1,
+            occurrences,
+        };
+        let components = [
+            component(
+                "embedded",
+                Kind::Subtitle,
+                vec![
+                    occurrence("v1", "f1", Some(3), None),
+                    occurrence("v2", "f2", Some(2), None),
+                ],
+            ),
+            component(
+                "sidecar",
+                Kind::Subtitle,
+                vec![occurrence("v1", "f1", None, Some("film.en.srt"))],
+            ),
+            component(
+                "audio",
+                Kind::Audio,
+                vec![occurrence("v1", "f1", Some(1), None)],
+            ),
+            component(
+                "ambiguous",
+                Kind::Subtitle,
+                vec![
+                    occurrence("v1", "f1", Some(4), None),
+                    occurrence("v1", "f1", Some(5), None),
+                ],
+            ),
+        ];
+        let resolve = |id, version, file, revision| {
+            subtitle_occurrence(&components, id, version, file, revision)
+        };
+        assert_eq!(
+            resolve("embedded", "v1", "f1", "r-f1"),
+            Some(SubtitleOccurrence::Embedded(3))
+        );
+        assert_eq!(
+            resolve("embedded", "v2", "f2", "r-f2"),
+            Some(SubtitleOccurrence::Embedded(2))
+        );
+        assert_eq!(
+            resolve("sidecar", "v1", "f1", "r-f1"),
+            Some(SubtitleOccurrence::Sidecar("film.en.srt".into()))
+        );
+        // Another file, revision or version never substitutes.
+        assert_eq!(resolve("sidecar", "v2", "f2", "r-f2"), None);
+        assert_eq!(resolve("embedded", "v1", "f1", "stale"), None);
+        assert_eq!(resolve("embedded", "v2", "f1", "r-f1"), None);
+        // Audio components and ambiguous occurrences are not subtitles to pin.
+        assert_eq!(resolve("audio", "v1", "f1", "r-f1"), None);
+        assert_eq!(resolve("ambiguous", "v1", "f1", "r-f1"), None);
+        assert_eq!(resolve("missing", "v1", "f1", "r-f1"), None);
     }
 }

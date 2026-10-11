@@ -1722,7 +1722,7 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                     }
                 }),
                 subtitle_track: pinned_subtitle(&g.pin),
-                subtitles_url: (pinned_subtitle(&g.pin).is_some()
+                subtitles_url: (pins_subtitle(&g.pin)
                     && d.serves(n, app.processing.deliveries.now_ms()))
                 .then(|| format!("/api/v1/streams/{id}/{n}/subtitles.vtt")),
                 audio_track: g
@@ -1810,6 +1810,76 @@ fn pinned_subtitle(pin: &Pin) -> Option<u32> {
     pin.tracks
         .iter()
         .find_map(|t| t.strip_prefix("subtitle:").and_then(|i| i.parse().ok()))
+}
+
+const SIDECAR_TRACK: &str = "subtitle-sidecar:";
+
+/// A pinned plain-text sidecar: (fingerprint, file name).
+fn pinned_sidecar(pin: &Pin) -> Option<(&str, &str)> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix(SIDECAR_TRACK)?.split_once('/'))
+}
+
+/// Whether a generation delivers a selected subtitle (embedded or sidecar).
+fn pins_subtitle(pin: &Pin) -> bool {
+    pinned_subtitle(pin).is_some() || pinned_sidecar(pin).is_some()
+}
+
+/// Pin a sidecar subtitle in place of an absent embedded one. The pin names
+/// the sidecar's scanned fingerprint, so a changed file is never served.
+fn with_sidecar(mut pin: Pin, sidecar: Option<&Sidecar>) -> Pin {
+    if let Some(sidecar) = sidecar {
+        for track in &mut pin.tracks {
+            if track == "subtitle:none" {
+                *track = format!("{SIDECAR_TRACK}{}/{}", sidecar.fingerprint, sidecar.name);
+            }
+        }
+    }
+    pin
+}
+
+/// A selected plain-text sidecar subtitle of the delivered file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Sidecar {
+    pub name: String,
+    pub fingerprint: String,
+}
+
+/// The sidecar must still be the scanned, recognized plain-text sidecar of
+/// this file (same name and fingerprint). Checked inside the command's
+/// transaction; the file itself is revalidated when it is converted.
+async fn validate_sidecar(
+    conn: &mut sqlx::SqliteConnection,
+    file: &str,
+    sidecar: Option<&Sidecar>,
+) -> Result<(), ApiError> {
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+    if sidecar.name.contains('/') || sidecar.fingerprint.contains('/') {
+        return Err(ApiError::bad("Invalid sidecar subtitle"));
+    }
+    let format: Option<String> = sqlx::query_scalar(
+        "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=? AND fingerprint=?",
+    )
+    .bind(file)
+    .bind(&sidecar.name)
+    .bind(&sidecar.fingerprint)
+    .fetch_optional(conn)
+    .await?;
+    match format.as_deref() {
+        Some("srt" | "vtt") => Ok(()),
+        Some(_) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "Only plain-text (SRT, WebVTT) sidecars are delivered",
+        )),
+        None => Err(ApiError::conflict(
+            "source_revision_changed",
+            "The selected subtitle file changed; plan again",
+        )),
+    }
 }
 
 /// The selected subtitle stream must exist and be a text format (sidecar).
@@ -2142,6 +2212,8 @@ pub(crate) struct Planned {
     pub owner: Owner,
     pub version: String,
     pub route: Route,
+    /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
+    pub sidecar: Option<Sidecar>,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2296,6 +2368,7 @@ pub(crate) struct Selection {
     pub route: Route,
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
+    pub sidecar: Option<Sidecar>,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2392,6 +2465,8 @@ pub(crate) async fn change_live(
                     )
                 }
             };
+            validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
+            let pin = with_sidecar(pin, selection.sidecar.as_ref());
             (Some(basis), Some((timeline, pin)))
         }
     };
@@ -2731,6 +2806,8 @@ async fn admit_owned(
         )?;
     }
     validate_subtitle(&file, r.subtitle_track)?;
+    let sidecar = planned.as_ref().and_then(|p| p.sidecar.as_ref());
+    validate_sidecar(&mut transaction, &file.id, sidecar).await?;
     let duration_ms = file
         .duration_seconds
         .filter(|d| d.is_finite() && *d > 0.0)
@@ -2756,11 +2833,14 @@ async fn admit_owned(
         planned
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
-        if original {
-            byte_pin(&file, r.audio_track, r.subtitle_track, operation)
-        } else {
-            pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
-        },
+        with_sidecar(
+            if original {
+                byte_pin(&file, r.audio_track, r.subtitle_track, operation)
+            } else {
+                pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+            },
+            sidecar,
+        ),
         r.start_ms,
         duration_ms,
         runtime.now_ms(),
@@ -3237,82 +3317,53 @@ pub async fn subtitles(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    serve_subtitles(&app, &id, &generation, false).await
-}
-
-/// The v2 sidecar of a generation's selected subtitle, in that generation's
-/// media time (core `subtitles::shift_webvtt`): cue times minus the
-/// generation's `media_time_origin_ms`, so a live generation that starts
-/// mid-timeline presents its subtitles where its media presents its video.
-pub(crate) async fn subtitles_in_media_time(
-    app: &App,
-    id: &str,
-    generation: &str,
-) -> Result<Response, ApiError> {
-    serve_subtitles(app, id, generation, true).await
-}
-
-async fn serve_subtitles(
-    app: &App,
-    id: &str,
-    generation: &str,
-    media_time: bool,
-) -> Result<Response, ApiError> {
-    let app = app.clone();
-    let id = id.to_owned();
-    let generation = generation_number(generation)?;
+    let generation = generation_number(&generation)?;
     let pinned = |d: &Delivery, now| {
-        d.serves(generation, now) && pinned_subtitle(&d.generations[&generation].pin).is_some()
+        d.serves(generation, now) && pins_subtitle(&d.generations[&generation].pin)
     };
     let session = app.processing.deliveries.session(&id)?;
-    let index = {
+    let selected = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
         if !pinned(d, app.processing.deliveries.now_ms()) {
             return Err(ApiError::not_found());
         }
-        pinned_subtitle(&d.generations[&generation].pin).ok_or_else(ApiError::not_found)?
+        let pin = &d.generations[&generation].pin;
+        match (pinned_subtitle(pin), pinned_sidecar(pin)) {
+            (Some(index), _) => SubtitleSource::Embedded(index),
+            (None, Some((fingerprint, name))) => SubtitleSource::Sidecar(Sidecar {
+                name: name.to_owned(),
+                fingerprint: fingerprint.to_owned(),
+            }),
+            (None, None) => return Err(ApiError::not_found()),
+        }
+    };
+    let file_name = match &selected {
+        SubtitleSource::Embedded(index) => format!("subtitles-{index}.vtt"),
+        SubtitleSource::Sidecar(sidecar) => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{}/{}", sidecar.fingerprint, sidecar.name));
+            format!("subtitles-sidecar-{:x}.vtt", digest)
+        }
     };
     let path = app
         .processing
         .deliveries
         .root
         .join(&session.id)
-        .join(format!("subtitles-{index}.vtt"));
+        .join(file_name);
     // Convert (once) before taking a transfer permit, in a task that owns the
     // converter even if this request is cancelled.
     tokio::spawn(ensure_subtitles(
         app.clone(),
         session.clone(),
-        index,
+        selected,
         path.clone(),
     ))
     .await
     .map_err(ApiError::internal)??;
-    let (session, permit) = admit_stream(&app, &id, pinned).await?;
-    let origin = media_time
-        .then(|| {
-            let inner = session.inner.lock().unwrap();
-            inner
-                .delivery
-                .generations
-                .get(&generation)
-                .map(|g| g.media_time_origin_ms)
-        })
-        .flatten()
-        .unwrap_or(0);
-    if origin == 0 {
-        return streamed(permit, path, "text/vtt; charset=utf-8").await;
-    }
-    let shifted = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let text = std::fs::read_to_string(path).ok()?;
-        playscale_core::subtitles::shift_webvtt(&text, origin)
-    })
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(subtitles_unavailable)?;
-    Ok((stream_headers("text/vtt; charset=utf-8"), shifted).into_response())
+    let (_, permit) = admit_stream(&app, &id, pinned).await?;
+    streamed(permit, path, "text/vtt; charset=utf-8").await
 }
 
 /// Largest sidecar accepted from the converter.
@@ -3329,10 +3380,18 @@ fn subtitles_unavailable() -> ApiError {
 /// Produce the cached sidecar unless it exists. Waiters for the same delivery
 /// queue on its lock (no permits held); conversions share a small global slot
 /// pool; a converter that does not exit keeps both until it is reaped.
+/// What a generation's subtitle sidecar is converted from.
+enum SubtitleSource {
+    /// The n-th embedded subtitle stream of the delivered file.
+    Embedded(u32),
+    /// A plain-text sidecar next to the delivered file.
+    Sidecar(Sidecar),
+}
+
 async fn ensure_subtitles(
     app: App,
     session: Arc<Session>,
-    index: u32,
+    selected: SubtitleSource,
     path: PathBuf,
 ) -> Result<(), ApiError> {
     let _extraction = session.subtitles.lock().await;
@@ -3346,7 +3405,33 @@ async fn ensure_subtitles(
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
-    let source = session.source.clone();
+    // A sidecar is opened like the media file: under the same validated root,
+    // and only while its fingerprint is still the pinned one.
+    let (source, format, map) = match &selected {
+        SubtitleSource::Embedded(index) => (session.source.clone(), None, format!("0:s:{index}")),
+        SubtitleSource::Sidecar(sidecar) => {
+            let format = match sidecar
+                .name
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+            {
+                Some(e) if e == "srt" => "srt",
+                Some(e) if e == "vtt" => "webvtt",
+                _ => return Err(subtitles_unavailable()),
+            };
+            let source = Source {
+                relative: session
+                    .source
+                    .relative
+                    .parent()
+                    .unwrap_or(FsPath::new(""))
+                    .join(&sidecar.name),
+                fingerprint: sidecar.fingerprint.clone(),
+                ..session.source.clone()
+            };
+            (source, Some(format), "0:s:0".to_owned())
+        }
+    };
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
         tokio::task::spawn_blocking(move || source_valid(&source)),
@@ -3356,24 +3441,25 @@ async fn ensure_subtitles(
     .map_err(ApiError::internal)?;
     let input = opened
         .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
-    let map = format!("0:s:{index}");
+    let mut args = vec!["-v", "error", "-nostdin"];
+    if let Some(format) = format {
+        args.extend(["-f", format]);
+    }
+    args.extend([
+        "-i",
+        "/dev/fd/3",
+        "-map",
+        &map,
+        "-c:s",
+        "webvtt",
+        "-f",
+        "webvtt",
+        "pipe:1",
+    ]);
     let converted = run_descriptor(
         &app.processing.settings.ffmpeg,
         &input,
-        &[
-            "-v",
-            "error",
-            "-nostdin",
-            "-i",
-            "/dev/fd/3",
-            "-map",
-            &map,
-            "-c:s",
-            "webvtt",
-            "-f",
-            "webvtt",
-            "pipe:1",
-        ],
+        &args,
         MAX_SUBTITLE_BYTES,
         Duration::from_secs(120),
     )

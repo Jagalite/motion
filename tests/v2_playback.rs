@@ -2661,59 +2661,15 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
         .status,
         StatusCode::UNAUTHORIZED
     );
-    // A live conversion carries the selected subtitle too, served in the
-    // generation's media time: cue times minus its media time origin.
+    // Text subtitles are a byte-route sidecar: the supported players cannot
+    // attach external text to a live presentation.
     input["quality"]["mode"] = json!("convert");
     input["client"]["transports"] = json!(["hls"]);
-    let converted = f
-        .post("/api/v2/playback/plans", &auth, None, input.clone())
-        .await;
     assert_eq!(
-        converted.body["operation"], "video_transcode",
-        "{}",
-        converted.body
-    );
-    let live = f
-        .post(
-            "/api/v2/playback/delivery-sessions",
-            &auth,
-            Some("text-subtitle-live-delivery"),
-            json!({"plan_token":converted.body["plan_token"],"start_ms":2000}),
-        )
-        .await;
-    assert_eq!(live.status, StatusCode::CREATED, "{}", live.body);
-    let live_id = live.body["id"].as_str().unwrap().to_owned();
-    let ready = f
-        .until(&live_id, &auth, |d| {
-            d["active"]["subtitles_url"].is_string()
-        })
-        .await;
-    let origin = ready["active"]["media_time_origin_ms"].as_u64().unwrap();
-    assert!(origin > 1000 && origin < 3000, "{ready}");
-    let captions = f
-        .get(ready["active"]["subtitles_url"].as_str().unwrap(), &auth)
-        .await;
-    assert_eq!(captions.status, StatusCode::OK, "{}", captions.body);
-    let text = String::from_utf8(captions.bytes).unwrap();
-    let expected = format!(
-        "00:00:00.000 --> 00:00:0{}.{:03}",
-        (3000 - origin) / 1000,
-        (3000 - origin) % 1000
-    );
-    assert!(
-        text.contains(&expected) && text.contains("Selected caption"),
-        "{expected}\n{text}"
-    );
-    assert_eq!(
-        f.call(
-            "DELETE",
-            &format!("/api/v2/playback/delivery-sessions/{live_id}"),
-            None,
-            &[("authorization", &auth)]
-        )
-        .await
-        .status,
-        StatusCode::NO_CONTENT
+        f.post("/api/v2/playback/plans", &auth, None, input.clone())
+            .await
+            .body["reason_codes"][0],
+        "subtitle_conversion_unavailable"
     );
     input["quality"]["mode"] = json!("original");
     input["client"]["transports"] = json!(["http_range"]);
@@ -3309,5 +3265,200 @@ async fn hardware_conversion_is_planned_when_available_and_falls_back_to_softwar
     assert_eq!(
         advertised_routes(&f, &auth).await,
         "original,prepared,software_hls"
+    );
+}
+
+/// Sidecar subtitles are selected by component on exactly the planned file,
+/// pinned with their scanned fingerprint, converted to WebVTT from the
+/// validated sidecar for byte delivery, refused when styled or live, and never
+/// served after the sidecar changes until it is scanned again.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_subtitles_are_component_pinned_and_fingerprinted() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    let media = f.dir.path().join("media");
+    std::fs::write(
+        media.join("film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:03,000\nSidecar caption\n",
+    )
+    .unwrap();
+    std::fs::write(
+        media.join("film.fr.ass"),
+        "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:03.00,Default,Styled\n",
+    )
+    .unwrap();
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let sidecar = |name: &str| {
+        components
+            .iter()
+            .find(|c| {
+                c.occurrences
+                    .iter()
+                    .any(|o| o.sidecar.as_deref() == Some(name))
+            })
+            .unwrap()
+            .id
+            .clone()
+    };
+    let pinned = |component: &str, mode: &str, transports: &[&str]| {
+        let mut input = plan_input("default", &timeline, mode, None, transports);
+        input["tracks"]["subtitle_component_id"] = json!(component);
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input
+    };
+    let english = sidecar("film.en.srt");
+    // Styled sidecars are refused rather than flattened.
+    let styled = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&sidecar("film.fr.ass"), "auto", &["http_range"]),
+        )
+        .await;
+    assert_eq!(
+        styled.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    // "off" conflicts with an explicit sidecar.
+    let mut off = pinned(&english, "auto", &["http_range"]);
+    off["tracks"]["subtitle_policy"] = json!("off");
+    problem(
+        &f.post("/api/v2/playback/plans", &auth, None, off).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subtitle_policy_conflict",
+    );
+
+    // Byte delivery of the original with the sidecar as WebVTT.
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "original", "{}", plan.body);
+    assert_eq!(plan.body["tracks"]["subtitle_track_id"], Value::Null);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-original-01"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let url = admitted.body["active"]["subtitles_url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let captions = f.get(&url, &auth).await;
+    assert_eq!(captions.status, StatusCode::OK, "{}", captions.body);
+    let text = String::from_utf8(captions.bytes).unwrap();
+    assert!(
+        text.starts_with("WEBVTT")
+            && text.contains("00:01.000")
+            && text.contains("Sidecar caption"),
+        "{text}"
+    );
+
+    // A live conversion cannot carry a text sidecar.
+    let live = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "convert", &["hls"]),
+        )
+        .await;
+    assert_eq!(
+        live.body["reason_codes"][0], "subtitle_conversion_unavailable",
+        "{}",
+        live.body
+    );
+
+    // The sidecar changes on disk: a new delivery pinned to the scanned
+    // fingerprint is never served the new text.
+    std::fs::write(
+        media.join("film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:03,000\nEdited caption\n",
+    )
+    .unwrap();
+    let stale = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-stale-00001"),
+            json!({"plan_token": stale.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    problem(
+        &f.get(
+            admitted.body["active"]["subtitles_url"].as_str().unwrap(),
+            &auth,
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "source_revision_changed",
+    );
+    // After a rescan the new fingerprint is planned and served.
+    f.scan().await;
+    let fresh = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-fresh-00001"),
+            json!({"plan_token": fresh.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let text = String::from_utf8(
+        f.get(
+            admitted.body["active"]["subtitles_url"].as_str().unwrap(),
+            &auth,
+        )
+        .await
+        .bytes,
+    )
+    .unwrap();
+    assert!(text.contains("Edited caption"), "{text}");
+    // A plan signed against the old fingerprint is refused at admission.
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-stale-00002"),
+            json!({"plan_token": stale.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "source_revision_changed",
     );
 }

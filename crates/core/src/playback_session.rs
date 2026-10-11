@@ -257,6 +257,18 @@ fn transcode(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     }
 }
 
+/// A selected subtitle as a plan pins it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subtitle {
+    /// The zero-based embedded text subtitle stream of the pinned file,
+    /// delivered as WebVTT.
+    Text(u32),
+    /// A recognized plain-text sidecar of the pinned file, by name and the
+    /// fingerprint observed when it was scanned. A changed sidecar is refused.
+    Sidecar { name: String, fingerprint: String },
+}
+
 /// Everything a plan token pins. Signed by the adapter; never trusted unsigned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Claims {
@@ -269,8 +281,8 @@ pub struct Claims {
     pub route: Route,
     /// Zero-based audio stream among the source's audio streams; None omits audio.
     pub audio: Option<u32>,
-    /// Zero-based text subtitle stream; None means no subtitle.
-    pub subtitle: Option<u32>,
+    /// The selected subtitle; None means no subtitle.
+    pub subtitle: Option<Subtitle>,
     pub expires_at: i64,
 }
 

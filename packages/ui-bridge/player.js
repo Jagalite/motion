@@ -462,8 +462,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   try {
     await openGeneration(element, generation, position, location.origin);
     if (generation.subtitles_url) {
-      // The server serves each generation's subtitles in that generation's media time.
-      if (typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
+      if (generation.media_time_origin_ms !== 0 || typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
       await element.player.addTextTrack({src: new URL(generation.subtitles_url, location.origin).href, label: 'Selected subtitles', default: true});
     }
     if (preferences) {

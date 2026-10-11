@@ -11252,7 +11252,7 @@ components:
           - type: string
             maxLength: 4096
           - type: 'null'
-          description: Selected plain-text subtitle as WebVTT in this generation's media time (timeline time minus media_time_origin_ms). Clients must present it or refuse the plan.
+          description: Selected plain-text subtitle on original byte delivery, in timeline time. Clients must present it or refuse the plan.
         media_time_origin_ms:
           $ref: '#/components/schemas/Milliseconds'
         requested_start_ms:

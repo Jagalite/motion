@@ -944,19 +944,41 @@ pub async fn plan(
         playscale_core::components::Kind::Audio,
         "audio",
     );
-    let cs = component_index(
-        &input.tracks.subtitle_component_id,
-        playscale_core::components::Kind::Subtitle,
-        "subtitle",
-    );
+    // A subtitle component resolves to its embedded track or its sidecar on
+    // exactly the bound file and revision.
+    use playscale_core::components::{SubtitleOccurrence, subtitle_occurrence};
+    let (cs, sidecar_name) = match input.tracks.subtitle_component_id.as_deref() {
+        None => (None, None),
+        Some(id) => match subtitle_occurrence(
+            &components,
+            id,
+            &bound.version,
+            &bound.file.id,
+            &bound.file.revision,
+        ) {
+            Some(SubtitleOccurrence::Embedded(index)) => (
+                streams
+                    .iter()
+                    .filter(|t| t.kind == "subtitle")
+                    .position(|t| t.index == index)
+                    .map(|i| i as u32),
+                None,
+            ),
+            Some(SubtitleOccurrence::Sidecar(name)) => (None, Some(name)),
+            None => (None, None),
+        },
+    };
     if (input.tracks.audio_component_id.is_some() && ca.is_none())
-        || (input.tracks.subtitle_component_id.is_some() && cs.is_none())
+        || (input.tracks.subtitle_component_id.is_some() && cs.is_none() && sidecar_name.is_none())
     {
         return Ok(Json(blocked(&input, "component_unavailable")).into_response());
     }
     let a = track_index(&input.tracks.audio_track_id, 'a', audios)?;
     let sub = track_index(&input.tracks.subtitle_track_id, 's', subtitles)?;
-    if a.zip(ca).is_some_and(|(a, b)| a != b) || sub.zip(cs).is_some_and(|(a, b)| a != b) {
+    if a.zip(ca).is_some_and(|(a, b)| a != b)
+        || sub.zip(cs).is_some_and(|(a, b)| a != b)
+        || (sub.is_some() && sidecar_name.is_some())
+    {
         return Err(Problem::invalid(
             "track_component_conflict",
             "The track and component pins disagree",
@@ -964,7 +986,15 @@ pub async fn plan(
     }
     let audio = ca.or(a).or(default_audio);
     use playscale_core::components::{SubtitleSelection, select_subtitle};
+    // A sidecar pin is an explicit choice too: it conflicts with "off".
+    if sidecar_name.is_some() && input.tracks.subtitle_policy == "off" {
+        return Err(Problem::invalid(
+            "subtitle_policy_conflict",
+            "Explicit subtitles conflict with off",
+        ));
+    }
     let subtitle = match select_subtitle(&input.tracks.subtitle_policy, cs.or(sub), subtitles) {
+        _ if sidecar_name.is_some() => None,
         SubtitleSelection::Selected(index) => Some(index),
         SubtitleSelection::None => None,
         SubtitleSelection::Conflict => {
@@ -997,6 +1027,32 @@ pub async fn plan(
             return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
         }
     }
+    // A sidecar is pinned with the fingerprint it was scanned with; only plain
+    // text (SRT, WebVTT) is delivered.
+    let sidecar = match sidecar_name {
+        None => None,
+        Some(name) => {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT fingerprint,format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+            )
+            .bind(&bound.file.id)
+            .bind(&name)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match row {
+                Some((fingerprint, format))
+                    if matches!(format.as_str(), "srt" | "vtt")
+                        && input.client.subtitle_modes.iter().any(|m| m == "text") =>
+                {
+                    Some(delivery::Sidecar { name, fingerprint })
+                }
+                Some(_) => {
+                    return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
+                }
+                None => return Ok(Json(blocked(&input, "component_unavailable")).into_response()),
+            }
+        }
+    };
     let height = streams
         .iter()
         .find(|t| t.kind == "video")
@@ -1094,7 +1150,8 @@ pub async fn plan(
         // With a pinned rendition, track pins index that rendition's streams.
         tracks_pinned: tracks_pinned
             || input.tracks.audio_component_id.is_some()
-            || subtitle.is_some(),
+            || subtitle.is_some()
+            || sidecar.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
     let mut decided = core::plan(&bound.file.id, &source, &request);
@@ -1135,9 +1192,11 @@ pub async fn plan(
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
         core::Plan::Observe => return Err(Problem::internal("undecided plan")),
     };
-    // Selected text subtitles come from the original; a prepared rendition is
-    // another file (the core never chooses one when a subtitle is selected).
-    if subtitle.is_some() && route == Route::Prepared {
+    // Selected text subtitles are a WebVTT sidecar in timeline time, which the
+    // supported players attach only to byte delivery: Shaka refuses external
+    // text on a live (rolling HLS) presentation, and burning text in needs
+    // libass, which the bundled FFmpeg does not include.
+    if (subtitle.is_some() || sidecar.is_some()) && route != Route::Original {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
     let expires_at = now() + core::PLAN_TTL_SECONDS;
@@ -1150,7 +1209,14 @@ pub async fn plan(
         file_revision: chosen.file.revision.clone(),
         route,
         audio,
-        subtitle,
+        subtitle: match (subtitle, sidecar) {
+            (Some(index), _) => Some(core::Subtitle::Text(index)),
+            (None, Some(sidecar)) => Some(core::Subtitle::Sidecar {
+                name: sidecar.name,
+                fingerprint: sidecar.fingerprint,
+            }),
+            (None, None) => None,
+        },
         expires_at,
     };
     let mut warnings = vec![];
@@ -1260,6 +1326,23 @@ async fn may_probe(
     .map_err(plan_problem)
 }
 
+fn embedded_subtitle(claims: &Claims) -> Option<u32> {
+    match claims.subtitle {
+        Some(core::Subtitle::Text(index)) => Some(index),
+        _ => None,
+    }
+}
+
+fn sidecar_of(claims: &Claims) -> Option<delivery::Sidecar> {
+    match &claims.subtitle {
+        Some(core::Subtitle::Sidecar { name, fingerprint }) => Some(delivery::Sidecar {
+            name: name.clone(),
+            fingerprint: fingerprint.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn problem_to_api(p: &Problem) -> ApiError {
     ApiError::new(p.status, p.code, &p.detail)
 }
@@ -1360,13 +1443,14 @@ pub async fn create_delivery(
         start_ms: input.start_ms,
         audio_track: claims.audio,
         operation: None,
-        subtitle_track: claims.subtitle,
+        subtitle_track: embedded_subtitle(&claims),
         backend: None,
     };
     let planned = delivery::Planned {
         owner: owner.clone(),
         version: claims.version.clone(),
         route: claims.route,
+        sidecar: sidecar_of(&claims),
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -1691,7 +1775,8 @@ pub async fn change_delivery(
                 Some(delivery::Selection {
                     route: claims.route,
                     audio: claims.audio,
-                    subtitle: claims.subtitle,
+                    subtitle: embedded_subtitle(&claims),
+                    sidecar: sidecar_of(&claims),
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
@@ -1862,7 +1947,7 @@ pub async fn generation_subtitles(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
-    delivery::subtitles_in_media_time(&app, &id, &generation)
+    delivery::subtitles(State(app), Path((id, generation)))
         .await
         .map_err(stream_problem)
 }
