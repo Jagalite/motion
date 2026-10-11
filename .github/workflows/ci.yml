@@ -2,7 +2,9 @@ name: CI
 
 # The fast merge gate. Long-running suites (debug-build Stateless models, live
 # FFmpeg delivery, real-process integration, upgrade/restore and packaging)
-# run in ci-full.yml.
+# run in ci-full.yml on macOS. This gate runs on Linux: hosted macOS runners
+# queue for long periods, and nothing here needs macOS (VideoToolbox tests
+# skip without an encoder session; packaging stays on macOS in ci-full.yml).
 on:
   push:
     branches: [main]
@@ -23,7 +25,7 @@ env:
 jobs:
   rust:
     name: Rust (fmt, clippy, fast tests)
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +37,8 @@ jobs:
         # tests/server.rs requires ffprobe, and the delivery tests skip their
         # media checks without these tools; the runner image has neither.
         run: |
-          brew install ffmpeg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           ffmpeg -version | head -1
           ffprobe -version | head -1
       - uses: actions/cache@v4
@@ -60,7 +63,7 @@ jobs:
 
   contract:
     name: API contract (structure, JSON parity)
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
