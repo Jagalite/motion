@@ -431,6 +431,11 @@ async fn active(app: &App, job: &ProcessingJob, stop: &CancellationToken) -> any
         !stop.is_cancelled() && row.state()?.executing(job.attempt.try_into()?),
         "processing interrupted"
     );
+    let mut tx = app.db.begin().await?;
+    if let Some((_, facts)) = crate::v2::processing::publication_facts(&mut tx, &row).await? {
+        facts.admit().map_err(anyhow::Error::msg)?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 // One permit for the entire attempt; clones remain held by blocking filesystem operations.
@@ -710,11 +715,22 @@ async fn convert(
         "-i",
     ])
     .arg(directory.join("input"));
+    let selected: Option<String> =
+        sqlx::query_scalar("SELECT tracks_json FROM preparations WHERE job_id=?")
+            .bind(&job.id)
+            .fetch_optional(&app.db)
+            .await?;
+    let selected: Option<crate::v2::processing::Tracks> =
+        selected.as_deref().map(serde_json::from_str).transpose()?;
+    let audio = selected
+        .and_then(|tracks| tracks.audio_track_id)
+        .map(|id| format!("0:a:{}", &id[1..]))
+        .unwrap_or_else(|| "0:a:0?".into());
     cmd.args([
         "-map",
         "0:v:0?",
         "-map",
-        "0:a:0?",
+        &audio,
         "-sn",
         "-dn",
         "-map_metadata",
@@ -870,18 +886,30 @@ async fn finish(
     result: Option<(scan::Found, String)>,
 ) -> anyhow::Result<()> {
     let _lock = app.jobs.lock().await;
-    let current = load(app, &job.id).await?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let current: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&job.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let preparation = crate::v2::processing::publication_facts(&mut tx, &current).await?;
     let source: Option<(String, String)> =
-        sqlx::query_as("SELECT revision,edition_id FROM media_files WHERE id=? AND available=1")
+        sqlx::query_as("SELECT revision,edition_id FROM media_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
             .bind(&job.source_file_id)
-            .fetch_optional(&app.db)
+            .fetch_optional(&mut *tx)
             .await?;
     let previous = playscale_core::processing::State {
         job: current.state()?,
         source_revision: current.source_revision.clone(),
         published_output: current.output_file_id.clone(),
     };
-    let output_id = result.as_ref().map(|_| new_id());
+    let output_id = result
+        .as_ref()
+        .filter(|_| {
+            preparation
+                .as_ref()
+                .is_none_or(|(_, facts)| facts.admit().is_ok())
+        })
+        .map(|_| new_id());
     let (next, effects) = playscale_core::processing::finish(
         &previous,
         &playscale_core::processing::Completion {
@@ -894,7 +922,6 @@ async fn finish(
         return Ok(());
     }
     let next = next.job;
-    let mut tx = crate::db::begin_write(&app.db).await?;
     let mut output = None;
     if effects.iter().any(|e| matches!(e, Effect::Publish { .. })) {
         let (found, library) = result.unwrap();
@@ -926,7 +953,13 @@ async fn finish(
                 },
             )
             .collect();
-        let (timeline, equivalence) = match playscale_core::identity::rendition_placement(&pinned) {
+        let placement = preparation.as_ref().map_or_else(
+            || playscale_core::identity::rendition_placement(&pinned),
+            |(timeline, _)| playscale_core::identity::RenditionPlacement::Join {
+                timeline: timeline.clone(),
+            },
+        );
+        let (timeline, equivalence) = match placement {
             playscale_core::identity::RenditionPlacement::Join { timeline } => {
                 (timeline, playscale_core::identity::Equivalence::Declared)
             }

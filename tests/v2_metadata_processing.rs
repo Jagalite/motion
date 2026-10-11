@@ -1489,3 +1489,108 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
         "completed"
     );
 }
+
+#[tokio::test]
+async fn preparation_admission_pins_identity_and_replays_once() {
+    let f = Fixture::new().await;
+    sqlx::query("UPDATE media_files SET duration_seconds=10 WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "prepare-one"),
+    ];
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    assert_eq!(first.body["kind"], "rendition");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let mut changed = input.clone();
+    changed["recipe_id"] = json!("audio_aac");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(changed),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM preparations")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert_eq!(list.body["items"][0]["status"], "pending");
+    let mut wrong = input.clone();
+    wrong["timeline_id"] = json!("ed-film-b");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(wrong),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "wrong-timeline")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let mut track = input;
+    track["tracks"]["audio_track_id"] = json!("a9");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(track),
+            &[("authorization", &op), ("idempotency-key", "wrong-track")]
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    sqlx::query("UPDATE media_files SET revision='replaced' WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.body["items"][0]["status"], "stale");
+}

@@ -23,7 +23,7 @@ pub fn routes() -> Router<App> {
         .route("/jobs/{id}/retry", post(retry))
 }
 #[derive(sqlx::FromRow)]
-struct Row {
+pub(crate) struct Row {
     id: String,
     revision: i64,
     kind: String,
@@ -34,7 +34,7 @@ struct Row {
     requester_id: String,
 }
 impl Row {
-    fn wire(&self) -> Value {
+    pub(crate) fn wire(&self) -> Value {
         json!({"id":self.id,"revision":self.revision.to_string(),"kind":self.kind,"phase":self.phase,"attempt_generation":self.attempt.to_string(),"progress":Value::Null,"error_code":self.error.as_ref().map(|_|"worker_failed"),"result_ids":self.result_id.iter().collect::<Vec<_>>(),"requester_id":self.requester_id})
     }
     fn response(&self) -> Response {
@@ -44,7 +44,7 @@ impl Row {
         r
     }
 }
-async fn row(
+pub(crate) async fn row(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
     principal: &access::Principal,
