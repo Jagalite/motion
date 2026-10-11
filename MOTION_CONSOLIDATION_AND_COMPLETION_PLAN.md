@@ -253,7 +253,7 @@ artifact, rather than merely changing its version label.
 
 ### 7.1 Required local build workflow for every agent
 
-**Run local builds through `/Volumes/seed1/Projects/kyoto/kyoto.py`. Build the
+**Run local builds through the shared Kyoto queue (`$KYOTO`). Build the
 smallest affected target first; do not build the full application by default.**
 This applies to every lane and includes compilation triggered by test, client,
 packaging or other helper scripts.
@@ -286,14 +286,14 @@ packaging or other helper scripts.
 Example from the agent's own worktree, for a core-library change:
 
 ```sh
-python3 /Volumes/seed1/Projects/kyoto/kyoto.py status
-python3 /Volumes/seed1/Projects/kyoto/kyoto.py submit --cwd "$PWD" -- \
+python3 "$KYOTO" status
+python3 "$KYOTO" submit --cwd "$PWD" -- \
   cargo check --locked -p playscale-core --lib --target-dir "$PWD/target"
 ```
 
 Set the agent identity before submission. Adapt the target to the actual change;
 do not copy a core check as validation for another lane. Inspect the returned job
-with `python3 /Volumes/seed1/Projects/kyoto/kyoto.py show <job-id>` and retrieve
+with `python3 "$KYOTO" show <job-id>` and retrieve
 output with `logs <job-id>`.
 
 ### 7.2 Integration gates and check inventory
