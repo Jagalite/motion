@@ -18,6 +18,7 @@ createDelivery
 createEdition
 createLibrary
 createMatch
+createOrderGroup
 createPairing
 createPlaylist
 createPreparation
@@ -100,6 +101,7 @@ listContinueWatching
 listDevices
 listItemEditions
 listItemFiles
+listItemOrderGroups
 listItemRelationships
 listItemTimelines
 listJobs

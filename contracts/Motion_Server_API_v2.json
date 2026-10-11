@@ -4048,6 +4048,187 @@
         }
       }
     },
+    "/api/v2/catalog/items/{item_id}/order-groups": {
+      "parameters": [
+        {
+          "name": "item_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "listItemOrderGroups",
+        "summary": "List item order groups",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "List item order groups.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderGroupPage"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "catalog:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ]
+      },
+      "post": {
+        "operationId": "createOrderGroup",
+        "summary": "Create an order group under the item aggregate ETag",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "Create an order group under the item aggregate ETag.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderGroup"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          }
+        },
+        "x-required-permission": "catalog:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderGroupInput"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v2/catalog/relationships/{relationship_id}": {
       "parameters": [
         {
@@ -15251,6 +15432,74 @@
           "order_position"
         ]
       },
+      "OrderGroupInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "edition_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "aired",
+              "dvd",
+              "absolute",
+              "custom"
+            ]
+          }
+        },
+        "required": [
+          "edition_id",
+          "name",
+          "kind"
+        ]
+      },
+      "OrderGroup": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "item_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "edition_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "aired",
+              "dvd",
+              "absolute",
+              "custom"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "item_id",
+          "edition_id",
+          "name",
+          "kind"
+        ]
+      },
       "TimelineInput": {
         "type": "object",
         "additionalProperties": false,
@@ -19128,6 +19377,42 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Timeline"
+            },
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "event_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "read_revision",
+          "event_cursor"
+        ],
+        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
+      },
+      "OrderGroupPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OrderGroup"
             },
             "maxItems": 200
           },

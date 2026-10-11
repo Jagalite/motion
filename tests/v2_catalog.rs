@@ -1991,20 +1991,143 @@ async fn restricted_source_manager_controls_demands_without_owning_shared_jobs()
 }
 
 #[tokio::test]
+async fn order_group_writer_rejects_foreign_editions_and_outside_scope() {
+    let f = Fixture::new().await;
+    f.item("visible", "Visible", &[(&f.a, "r-visible")]).await;
+    f.item("hidden", "Hidden", &[(&f.b, "r-hidden")]).await;
+    f.item(
+        "mixed",
+        "Mixed",
+        &[(&f.a, "r-mixed-a"), (&f.b, "r-mixed-b")],
+    )
+    .await;
+    let op = bearer(OPERATOR);
+    let device = f.device(&["catalog:read", "catalog:write"], &[&f.a]).await;
+    let reader = f.device(&["catalog:read"], &[&f.a]).await;
+    for (item, edition, auth, expected) in [
+        ("visible", "hidden-ed", op.as_str(), StatusCode::NOT_FOUND),
+        (
+            "hidden",
+            "hidden-ed",
+            device.as_str(),
+            StatusCode::NOT_FOUND,
+        ),
+        ("mixed", "mixed-ed", device.as_str(), StatusCode::FORBIDDEN),
+        (
+            "visible",
+            "visible-ed",
+            reader.as_str(),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let current = f
+            .call(
+                "GET",
+                &format!("/api/v2/catalog/items/{item}"),
+                None,
+                &[("authorization", &op)],
+            )
+            .await;
+        let result = f
+            .call(
+                "POST",
+                &format!("/api/v2/catalog/items/{item}/order-groups"),
+                Some(json!({"edition_id":edition,"name":"Release","kind":"custom"})),
+                &[
+                    ("authorization", auth),
+                    ("if-match", current.headers["etag"].to_str().unwrap()),
+                    ("idempotency-key", "scope-order-group-01"),
+                ],
+            )
+            .await;
+        assert_eq!(result.status, expected, "{}", result.body);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM order_groups")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn public_timeline_order_writer_drives_next_resolver() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
     f.item("ordered", "Ordered", &[(&f.a, "r1")]).await;
-    // Group provisioning is an existing service; timeline placement below uses
-    // the public writer, never an injected order_position.
-    let group = playscale::curation::create_order_group(
-        &f.app,
-        "ordered-ed",
-        "Release",
-        playscale::curation::OrderKind::Custom,
-    )
-    .await
-    .unwrap();
+    f.item("retired-order", "Retired", &[]).await;
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('order-alias','catalog:merge',0,'{}')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_aliases VALUES ('retired-order','ordered','order-alias')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    let item = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/ordered",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    let input = json!({"edition_id":"ordered-ed","name":"Release","kind":"custom"});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("if-match", item.headers["etag"].to_str().unwrap()),
+        ("idempotency-key", "ordered-group-0001"),
+    ];
+    let created = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/retired-order/order-groups",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/ordered/order-groups",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{}", replay.body);
+    assert_eq!(replay.body, created.body);
+    assert_eq!(created.body["item_id"], "ordered");
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let stale = f
+        .call(
+            "POST",
+            "/api/v2/catalog/items/ordered/order-groups",
+            Some(input),
+            &[
+                ("authorization", &op),
+                ("if-match", item.headers["etag"].to_str().unwrap()),
+                ("idempotency-key", "ordered-group-0002"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{}",
+        stale.body
+    );
+    let groups = f
+        .call(
+            "GET",
+            "/api/v2/catalog/items/ordered/order-groups",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(groups.status, StatusCode::OK, "{}", groups.body);
+    assert_eq!(groups.body["items"], json!([created.body]));
+    let group = created.body["id"].as_str().unwrap().to_owned();
     let mut ids = Vec::new();
     for position in [1, 2] {
         let item = f
