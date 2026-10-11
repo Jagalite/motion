@@ -331,6 +331,9 @@ tool unavailability and hardware skips never count as media qualification.
 
 ## 8. Work ownership and integration order
 
+For the post-consolidation M4 continuation, use [section 10](#10-m4-playback-expansion-work-lane).
+The four lanes below describe the original consolidation assignments.
+
 Use four bounded lanes. These are assignments to make, not agents already running.
 
 | Lane | Owns | Boundary |
@@ -419,7 +422,6 @@ schema 9→41 upgrade repairs and scoped-smart regression checks pass; exact
 receipts are in qualification/data-catalog. Browser/client and combined-package
 acceptance remain separate gates; prior receipts bind only their recorded commits.
 
-
 ### Clients continuation status (PR #15)
 
 The Clients tree composes catalog `69e0ff4` and playback `0621762`. Current
@@ -455,3 +457,107 @@ deployment, final legacy-route removal and absence tests, combined CI, installed
 acceptance and milestone evidence. See
 [the final gate ledger](qualification/consolidation/FINAL.md). Merging the lane
 PRs does not close a milestone. Historical lane receipts keep their exact scope.
+
+## 10. M4 playback expansion work lane
+
+**Status:** Ready to start alongside UI/UX design. This is an assignment, not a
+claim that an agent is running or that the remaining features are implemented.
+Baseline: merged main `8d6dd7f` (PRs #18/#19 integrated). Start from current main
+and record the actual input SHA; do not resume an obsolete pre-merge lane branch.
+
+### 10.1 Objective and existing baseline
+
+Extend the existing v2 playback service to the remaining media routes and formats
+from architecture sections 10.5–10.6. Preserve the working original/prepared/live
+SDR paths, exact component selection, generation tickets, timeline history,
+no-history-write pacing, restart/restore behavior and revocation cleanup.
+
+Read [the final consolidation ledger](qualification/consolidation/FINAL.md) first.
+It records passing installed package, Electron/Chromium player and playable Next
+checks for their exact artifacts. Earlier live-startup failures remain historical
+evidence; do not automatically treat them as unresolved on the qualified deployment.
+[V2_PLAYBACK.md](V2_PLAYBACK.md) is a source map, but some historical status prose
+is stale; verify each gap against current code and the newer receipts.
+
+### 10.2 Ownership and parallel design boundary
+
+- One M4 implementation owner covers A06/A07 with A08: core planning/selection,
+  execution and delivery adapters, playback HTTP contracts and focused regressions.
+  Likely paths include `crates/core/src/`, `src/delivery.rs`, `src/processing.rs`,
+  `src/v2/playback.rs`, media/subtitle adapters and their tests. Inspect actual
+  modules before recording exact owned paths; this is not blanket ownership of core.
+- Coordinate shared contract YAML/JSON, routers and capability fields with the
+  API/integration owner. Data/catalog retains schema-number allocation, version
+  bindings and preparation publication interfaces. Never edit applied migrations.
+- UI design can proceed independently on layouts, typography and browsing screens.
+  Give its owner a concise contract for available routes, track/subtitle choices,
+  quality options, progress and refusal/error states. Agree on one editor for
+  `packages/playback`, `packages/ui-bridge/player.js` and production player views.
+  M4 supplies the functional wiring and tests; visual redesign stays with UI.
+- Provider assets, native-tool pins, root lockfiles and package manifests require
+  integration/release coordination. Changing provider bytes invalidates affected
+  prior player receipts. Keep a dedicated worktree and isolated build target.
+- Downloads/offline reconciliation, cast receivers, previews/marker authoring,
+  music/photos and general platform expansion remain M5/M6 work. M4 must not
+  silently absorb them or claim that they are complete.
+
+### 10.3 Work packages and implementation order
+
+| ID | Deliverable | Required implementation boundary and focused proof |
+|---|---|---|
+| M4-00 | Current capability and parity inventory | Record original, remux/copy, audio-only conversion, software/hardware conversion, prepared, multipart/interval, subtitles, HDR and ABR as implemented, qualified, unsupported or missing. Map existing engine behavior to v2 planning and client exposure. Record fixtures, dependencies, owners and intended support; do not rebuild features already present. |
+| M4-01 | Route selection, remux and hardware | Expose eligible copy/remux and audio-only routes; integrate supported hardware encoding with explicit availability observations and bounded resource admission. Core decides compatibility, exact selected tracks, bitrate/HDR constraints and permitted fallback. Test unavailable/failed hardware, cancellation, stale completion, far seek and capacity release; advertised support must match the actual route. |
+| M4-02 | Component continuity and subtitle delivery | Carry selected components through prepared outputs and generation changes using exact source/output mappings. Extend sidecars, converted playback, styled/bitmap subtitles and burn-in by declared route. Preserve off/forced/SDH/language roles, offsets and attachment/font ownership. Test same-language alternatives, missing/stale occurrences, source replacement and authorization; never substitute the first track. Burn-in requires a video transform. |
+| M4-03 | Multipart and interval timelines | Plan known ordered parts and explicit episode intervals. Model logical duration, part boundaries, transport time origins, clipping, seeks and resume against one selected timeline. Test boundary seeks, missing/replaced parts, cancellation and restart. Refuse unknown split points; never infer episode boundaries from episode count or transfer progress between unrelated cuts. |
+| M4-04 | HDR and bounded quality policy | Define preserve-HDR versus tone-map-to-SDR routes from observed source/client/tool capabilities. Implement the chosen color/tone-map path and real bitrate constraints before advertising them. Test unknown/unsupported capabilities and explicit refusals. Keep physical display/color fidelity as a release gate; successful encoding does not prove faithful HDR output. |
+| M4-05 | Adaptive bitrate increment | Implement genuine multi-rendition delivery only after single-route timing, selection and resource policies are stable. Define aligned variants, component identity, switching, aggregate encoder/storage budgets and generation retirement. Test rendition switches under bandwidth changes and stale/revoked access. Manual prepared-file switching is not ABR. Architecture section 10.5 treats this as a later increment; record an explicit release deferral if it is outside the first supported matrix. |
+
+Start with M4-00, then agree the route/selection interfaces before M4-01/M4-02.
+M4-03 can progress against those frozen interfaces in disjoint files; M4-04 depends
+on route and component policy. Keep M4-05 last. Work packages do not automatically
+mean five concurrent agents: the M4 owner must allocate paths and integration
+order before parallel implementation. Do not wait for finished visual designs.
+
+### 10.4 Core rules and validation policy
+
+Keep route eligibility, component/part identity, timeline mapping, generation and
+attempt ownership, resource limits, cancellation and publication validity in the
+production core wherever practical. Adapters report codec/tool/device/file facts,
+execute I/O and enforce transaction ordering. Extend Stateless against those same
+production decisions; cover stale/duplicate events, replacement, rollback and
+recovery with explicit effect identities and counts. Real SQL/process/media tests
+remain necessary for adapter behavior.
+
+Follow section 7.1: builds use the shared Kyoto scheduler through the host-configured
+`KYOTO_SCRIPT`; use the smallest affected crate/test target first. No routine full
+application or package rebuild per edit. Run focused correctness and regression
+checks while implementing and have GPT-6.1-Sol review commits and the final PR diff.
+
+Per the user's development/release split, defer the exhaustive browser/native,
+hardware/physical A/V, performance and final installed-package matrix to release
+qualification. This does not waive focused checks of new rules or permit a known
+authorization, migration or data-loss defect to be labeled a qualification task.
+Record every deferred check with its owner, required host/fixture and exact expected
+outcome. Keep existing evidence and failures; do not promote old receipts to new
+provider or executable bytes.
+
+### 10.5 Agent handoff and completion gates
+
+Create `qualification/m4-expansion/README.md` when implementation starts. Maintain
+one row per work package with source SHA, API/client changes, supported/refused
+matrix, focused checks, review findings and release-only checks. Link it from the
+consolidation ledger. This path is a deliverable to create, not existing evidence.
+
+- **Implementation complete for a declared slice:** production core/adapters and
+  public API/client wiring exist; focused regressions and review pass; capability
+  reporting is truthful; prior supported playback is preserved; remaining work
+  has explicit owners. Name the slice and every deferred work package.
+- **Release qualified:** the exact delivered server/provider/tools/package passes
+  the declared original/prepared/live, track/subtitle, multipart/interval, seek,
+  recovery, revocation and resource matrix. Repeat affected Chromium/Electron and
+  installed checks after changes; WebKit remains explicitly deferred unless scope
+  changes. Qualify hardware/physical HDR only on suitable devices, and measure
+  performance against architecture section 21.3's budgets with a frozen workload.
+- **Full M4 closure:** reconcile the complete milestone against these receipts and
+  the parity inventory. A narrow format slice, explicit refusal, merged PR or
+  deferred ABR increment must not be presented as complete broad playback parity.
