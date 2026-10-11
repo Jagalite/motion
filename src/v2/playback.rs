@@ -994,146 +994,103 @@ pub async fn plan(
         ));
     }
     let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
     // Without an explicit choice, "auto" and "require" select by the profile's
     // languages and subtitle mode (core `automatic_subtitle`); never the first
-    // track and never another language.
-    let (subtitle, sidecar_name) = if explicit.is_some()
-        || sidecar_name.is_some()
-        || input.tracks.subtitle_policy == "off"
-    {
-        (explicit, sidecar_name)
+    // track and never another language. "require" is strict and decided
+    // before the route; "auto" only adds what the planned route presents.
+    use playscale_core::components::{
+        AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
+    };
+    let automatic =
+        explicit.is_none() && sidecar_name.is_none() && input.tracks.subtitle_policy != "off";
+    let require = input.tracks.subtitle_policy == "require";
+    let candidates = if automatic {
+        subtitle_candidates(
+            &mut conn,
+            &components,
+            &bound,
+            &streams,
+            accepts_text,
+            accepts_burned,
+        )
+        .await?
     } else {
-        use playscale_core::components::{
-            AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
-        };
-        let preferences = legacy::prefs(&app, &input.profile_id)
-            .await
-            .map_err(problem)?
-            .preferences;
-        let mut options = Vec::new();
-        let mut choices = Vec::new();
-        for component in components
+        vec![]
+    };
+    let preferences = if automatic {
+        Some(
+            legacy::prefs(&app, &input.profile_id)
+                .await
+                .map_err(problem)?
+                .preferences,
+        )
+    } else {
+        None
+    };
+    let audio_language = audio.and_then(|a| {
+        streams
             .iter()
-            .filter(|c| c.kind == playscale_core::components::Kind::Subtitle)
-        {
-            let deliverable;
-            let choice = match subtitle_occurrence(
-                &components,
-                &component.id,
-                &bound.version,
-                &bound.file.id,
-                &bound.file.revision,
-            ) {
-                Some(SubtitleOccurrence::Embedded(index)) => {
-                    let Some((position, track)) = streams
-                        .iter()
-                        .filter(|t| t.kind == "subtitle")
-                        .enumerate()
-                        .find(|(_, t)| t.index == index)
-                    else {
-                        continue;
-                    };
-                    deliverable = (playscale_core::delivery::sidecar_subtitle(&track.codec)
-                        && accepts("text"))
-                        || (playscale_core::delivery::burnable_subtitle(&track.codec)
-                            && accepts("burned"));
-                    (Some(position as u32), None)
-                }
-                Some(SubtitleOccurrence::Sidecar(name)) => {
-                    let format: Option<String> = sqlx::query_scalar(
-                        "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
-                    )
-                    .bind(&bound.file.id)
-                    .bind(&name)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-                    deliverable =
-                        matches!(format.as_deref(), Some("srt" | "vtt")) && accepts("text");
-                    (None, Some(name))
-                }
-                None => continue,
-            };
-            options.push(SubtitleOption {
-                language: component.language.clone(),
-                roles: component.roles.clone(),
-                deliverable,
-            });
-            choices.push(choice);
-        }
-        let audio_language = audio.and_then(|a| {
-            streams
-                .iter()
-                .filter(|t| t.kind == "audio")
-                .nth(a as usize)
-                .and_then(|t| t.language.as_deref())
-        });
+            .filter(|t| t.kind == "audio")
+            .nth(a as usize)
+            .and_then(|t| t.language.clone())
+    });
+    // Choose among the candidates; with a route, only those it presents.
+    let choose = |route: Option<Route>| -> AutomaticSubtitle {
+        let Some(preferences) = &preferences else {
+            return AutomaticSubtitle::None;
+        };
+        let options: Vec<SubtitleOption> = candidates
+            .iter()
+            .map(|c| SubtitleOption {
+                language: c.language.clone(),
+                roles: c.roles.clone(),
+                deliverable: c.deliverable
+                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned)),
+            })
+            .collect();
         let mode = match preferences.subtitle_mode.as_str() {
             "always" => SubtitleMode::Always,
             "forced" => SubtitleMode::Forced,
             "off" => SubtitleMode::Off,
             _ => SubtitleMode::ForeignAudio,
         };
-        match automatic_subtitle(
-            input.tracks.subtitle_policy == "require",
+        automatic_subtitle(
+            route.is_none(),
             mode,
-            audio_language,
+            audio_language.as_deref(),
             &preferences.audio_languages,
             &preferences.subtitle_languages,
             &options,
-        ) {
+        )
+    };
+    let (subtitle, sidecar_name) = match () {
+        _ if !automatic => (explicit, sidecar_name),
+        _ if require => match choose(None) {
             AutomaticSubtitle::None => (None, None),
-            AutomaticSubtitle::Selected(i) => choices.swap_remove(i),
+            AutomaticSubtitle::Selected(i) => candidates[i].choice.clone(),
             AutomaticSubtitle::Unavailable => {
                 return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
             }
             AutomaticSubtitle::Ambiguous => {
                 return Ok(Json(blocked(&input, "subtitle_selection_ambiguous")).into_response());
             }
-        }
+        },
+        _ => (None, None),
     };
-    // A text subtitle is delivered as WebVTT to a client that presents text;
-    // a bitmap one is burned into converted video for a client that accepts
-    // burned subtitles. Anything else is refused, never substituted.
-    let mut burn = None;
-    if let Some(index) = subtitle {
-        let codec = &streams
-            .iter()
-            .filter(|t| t.kind == "subtitle")
-            .nth(index as usize)
-            .unwrap()
-            .codec;
-        if playscale_core::delivery::burnable_subtitle(codec) && accepts("burned") {
-            burn = Some(index);
-        } else if !(playscale_core::delivery::sidecar_subtitle(codec) && accepts("text")) {
-            return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
-        }
-    }
-    let subtitle = subtitle.filter(|_| burn.is_none());
-    // A sidecar is pinned with the fingerprint it was scanned with; only plain
-    // text (SRT, WebVTT) is delivered.
-    let sidecar = match sidecar_name {
-        None => None,
-        Some(name) => {
-            let row: Option<(String, String)> = sqlx::query_as(
-                "SELECT fingerprint,format FROM sidecar_subtitles WHERE file_id=? AND name=?",
-            )
-            .bind(&bound.file.id)
-            .bind(&name)
-            .fetch_optional(&mut *conn)
-            .await?;
-            match row {
-                Some((fingerprint, format))
-                    if matches!(format.as_str(), "srt" | "vtt")
-                        && input.client.subtitle_modes.iter().any(|m| m == "text") =>
-                {
-                    Some(delivery::Sidecar { name, fingerprint })
-                }
-                Some(_) => {
-                    return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
-                }
-                None => return Ok(Json(blocked(&input, "component_unavailable")).into_response()),
-            }
-        }
+    let (subtitle, sidecar, burn) = match resolve_subtitle(
+        &mut conn,
+        &bound.file,
+        &streams,
+        accepts_text,
+        accepts_burned,
+        subtitle,
+        sidecar_name,
+    )
+    .await?
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
     let height = streams
         .iter()
@@ -1193,13 +1150,52 @@ pub async fn plan(
         delivery::HardwareState::Busy => core::Hardware::Busy,
         delivery::HardwareState::Available => core::Hardware::Available,
     };
+    // Which renditions present exactly the selected streams. A playscale
+    // preparation records the source audio it encoded (its only audio); that
+    // record applies only to a rendition of this file and revision. Others
+    // carry the selection only when no audio was chosen.
+    let audio_chosen = input.tracks.audio_track_id.is_some()
+        || input.tracks.audio_component_id.is_some()
+        || audio != default_audio;
+    let subtitle_selected = subtitle.is_some() || sidecar.is_some() || burn.is_some();
+    let mut carries = Vec::with_capacity(prepared.len());
+    for p in &prepared {
+        let recorded: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT r.source_file_id,r.source_revision,p.tracks_json FROM renditions r \
+             JOIN preparations p ON p.job_id=r.external_id WHERE r.file_id=? AND r.source='playscale'",
+        )
+        .bind(&p.file.id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let encoded = recorded
+            .filter(|(file, revision, _)| {
+                *file == bound.file.id && *revision == bound.file.revision
+            })
+            .and_then(|(_, _, tracks)| {
+                serde_json::from_str::<super::processing::Tracks>(&tracks).ok()
+            })
+            .map(|tracks| match tracks.audio_track_id {
+                // `a{n}`: the n-th audio stream of the source revision.
+                Some(id) => id.strip_prefix('a').and_then(|n| n.parse::<u32>().ok()),
+                // No selection: the recipe encodes the first audio stream.
+                None => default_audio,
+            });
+        carries.push(
+            !subtitle_selected
+                && match encoded {
+                    Some(encoded) => encoded.is_some() && encoded == audio,
+                    None => !audio_chosen,
+                },
+        );
+    }
     let mut source = core::SourceFacts {
         available: original_available && bound.file.available,
         client_support: client_support(&bound.file, &input.client, audio, require_sdr),
         within_budget: fits_budget(&bound.file, limit, max_bitrate),
         prepared: prepared
             .iter()
-            .map(|p| core::PreparedFacts {
+            .zip(&carries)
+            .map(|(p, &carries_selection)| core::PreparedFacts {
                 file: p.file.id.clone(),
                 client_support: client_support(
                     &p.file,
@@ -1208,6 +1204,7 @@ pub async fn plan(
                     require_sdr,
                 ),
                 within_budget: fits_budget(&p.file, limit, max_bitrate),
+                carries_selection,
             })
             .collect(),
         transcodable: input.quality.hdr_policy != "reject_conversion"
@@ -1229,12 +1226,6 @@ pub async fn plan(
         hls: input.client.transports.iter().any(|t| t == "hls"),
         explicit_streams: audio != default_audio,
         pinned_prepared,
-        // With a pinned rendition, track pins index that rendition's streams.
-        tracks_pinned: tracks_pinned
-            || input.tracks.audio_component_id.is_some()
-            || subtitle.is_some()
-            || sidecar.is_some()
-            || burn.is_some(),
         burn_in: burn.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
@@ -1243,7 +1234,6 @@ pub async fn plan(
         let core::StreamCopy::Unobserved(route) = source.copy else {
             return Err(Problem::internal("copy observation without a candidate"));
         };
-        drop(conn);
         // A probe failure, a full admission queue or an unqualified bitstream
         // leaves only conversion; admission observes the details again under
         // its own checks.
@@ -1280,9 +1270,31 @@ pub async fn plan(
     // supported players attach only to byte delivery: Shaka refuses external
     // text on a live (rolling HLS) presentation, and burning text in needs
     // libass, which the bundled FFmpeg does not include.
-    if (subtitle.is_some() || sidecar.is_some()) && route != Route::Original {
+    if (subtitle.is_some() || sidecar.is_some()) && !core::presents_subtitle(route, false) {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
+    // "auto" adds a subtitle only if the planned route presents it; otherwise
+    // the plan proceeds without one, as it would with no subtitles at all.
+    let (subtitle, sidecar, burn) = match automatic && !require {
+        true => match choose(Some(route)) {
+            AutomaticSubtitle::Selected(i) => {
+                let (embedded, name) = candidates[i].choice.clone();
+                resolve_subtitle(
+                    &mut conn,
+                    &chosen.file,
+                    &streams,
+                    accepts_text,
+                    accepts_burned,
+                    embedded,
+                    name,
+                )
+                .await?
+                .unwrap_or((None, None, None))
+            }
+            _ => (None, None, None),
+        },
+        false => (subtitle, sidecar, burn),
+    };
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -1409,6 +1421,132 @@ async fn may_probe(
         },
     )
     .map_err(plan_problem)
+}
+
+/// A subtitle on the planned file that automatic selection may choose.
+struct SubtitleCandidate {
+    language: Option<String>,
+    roles: playscale_core::components::Roles,
+    /// (embedded subtitle position, sidecar name), as an explicit pin.
+    choice: (Option<u32>, Option<String>),
+    /// Presented by burning it into converted video (a bitmap).
+    burned: bool,
+    /// This client can be given it on some route.
+    deliverable: bool,
+}
+
+/// The timeline's subtitle components that occur on exactly the bound file
+/// and revision: embedded tracks and sidecars.
+async fn subtitle_candidates(
+    conn: &mut sqlx::SqliteConnection,
+    components: &[playscale_core::components::Component],
+    bound: &Bound,
+    streams: &[db::Track],
+    accepts_text: bool,
+    accepts_burned: bool,
+) -> Result<Vec<SubtitleCandidate>, Problem> {
+    use playscale_core::components::{Kind, SubtitleOccurrence, subtitle_occurrence};
+    let mut out = Vec::new();
+    for component in components.iter().filter(|c| c.kind == Kind::Subtitle) {
+        let (choice, burned, deliverable) = match subtitle_occurrence(
+            components,
+            &component.id,
+            &bound.version,
+            &bound.file.id,
+            &bound.file.revision,
+        ) {
+            Some(SubtitleOccurrence::Embedded(index)) => {
+                let Some((position, track)) = streams
+                    .iter()
+                    .filter(|t| t.kind == "subtitle")
+                    .enumerate()
+                    .find(|(_, t)| t.index == index)
+                else {
+                    continue;
+                };
+                let text = playscale_core::delivery::sidecar_subtitle(&track.codec);
+                let bitmap = playscale_core::delivery::burnable_subtitle(&track.codec);
+                (
+                    (Some(position as u32), None),
+                    bitmap && accepts_burned,
+                    (text && accepts_text) || (bitmap && accepts_burned),
+                )
+            }
+            Some(SubtitleOccurrence::Sidecar(name)) => {
+                let format: Option<String> = sqlx::query_scalar(
+                    "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+                )
+                .bind(&bound.file.id)
+                .bind(&name)
+                .fetch_optional(&mut *conn)
+                .await?;
+                (
+                    (None, Some(name)),
+                    false,
+                    matches!(format.as_deref(), Some("srt" | "vtt")) && accepts_text,
+                )
+            }
+            None => continue,
+        };
+        out.push(SubtitleCandidate {
+            language: component.language.clone(),
+            roles: component.roles.clone(),
+            choice,
+            burned,
+            deliverable,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve a subtitle choice on `file`: an embedded text subtitle for a
+/// client that presents text, an embedded bitmap one burned for a client that
+/// accepts burned subtitles, or a plain-text sidecar pinned with the
+/// fingerprint it was scanned with. Anything else is a blocked reason, never
+/// a substitute.
+async fn resolve_subtitle(
+    conn: &mut sqlx::SqliteConnection,
+    file: &db::ItemRow,
+    streams: &[db::Track],
+    accepts_text: bool,
+    accepts_burned: bool,
+    embedded: Option<u32>,
+    sidecar: Option<String>,
+) -> Result<Result<(Option<u32>, Option<delivery::Sidecar>, Option<u32>), &'static str>, Problem> {
+    if let Some(index) = embedded {
+        let codec = &streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(index as usize)
+            .ok_or_else(|| Problem::internal("selected subtitle stream missing"))?
+            .codec;
+        return Ok(
+            if playscale_core::delivery::burnable_subtitle(codec) && accepts_burned {
+                Ok((None, None, Some(index)))
+            } else if playscale_core::delivery::sidecar_subtitle(codec) && accepts_text {
+                Ok((Some(index), None, None))
+            } else {
+                Err("subtitle_format_unsupported")
+            },
+        );
+    }
+    let Some(name) = sidecar else {
+        return Ok(Ok((None, None, None)));
+    };
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT fingerprint,format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+    )
+    .bind(&file.id)
+    .bind(&name)
+    .fetch_optional(conn)
+    .await?;
+    Ok(match row {
+        Some((fingerprint, format)) if matches!(format.as_str(), "srt" | "vtt") && accepts_text => {
+            Ok((None, Some(delivery::Sidecar { name, fingerprint }), None))
+        }
+        Some(_) => Err("subtitle_format_unsupported"),
+        None => Err("component_unavailable"),
+    })
 }
 
 fn embedded_subtitle(claims: &Claims) -> Option<u32> {

@@ -114,7 +114,6 @@ fn request(c: &Config, failed: &[Route]) -> core::Request {
         hls: c.hls,
         explicit_streams: c.explicit_streams,
         pinned_prepared: false,
-        tracks_pinned: c.burn_in,
         burn_in: c.burn_in,
         failed: failed.iter().map(|r| r.candidate_id(FILE)).collect(),
     }

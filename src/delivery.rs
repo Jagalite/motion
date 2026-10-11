@@ -477,12 +477,13 @@ fn arguments(
     const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
     // A burned bitmap subtitle's canvas is scaled to the source video's size
     // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
-    // overlaid before the output is scaled, so nothing is cropped.
+    // overlaid before the output is scaled, so nothing is cropped. In
+    // scale2ref, iw/ih name the reference (video) size on FFmpeg 6.1 through 8.
     match burn {
         Some(index) => {
             args.push("-filter_complex".into());
             args.push(format!(
-                "[0:s:{index}][0:v:0]scale2ref=w=rw:h=rh[sub][base];\
+                "[0:s:{index}][0:v:0]scale2ref=w=iw:h=ih[sub][base];\
                  [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));

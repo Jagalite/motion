@@ -3826,6 +3826,26 @@ async fn automatic_subtitles_follow_profile_languages_and_roles() {
         chosen.body
     );
     assert_eq!(chosen.body["operation"], "original");
+    // A client that can only take a conversion cannot be given text
+    // subtitles: auto plays without them, require refuses.
+    let mut live = plan_input("default", &timeline, "auto", None, &["hls"]);
+    live["tracks"]["subtitle_policy"] = json!("auto");
+    let converted = f
+        .post("/api/v2/playback/plans", &auth, None, live.clone())
+        .await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["tracks"]["subtitle_track_id"], Value::Null);
+    live["tracks"]["subtitle_policy"] = json!("require");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, live)
+            .await
+            .body["reason_codes"][0],
+        "subtitle_conversion_unavailable"
+    );
     // Forced mode: only a forced track in the audio's language (none here).
     prefer("forced", &["en"], &["en"]).await;
     let none = plan("auto").await;
@@ -3852,4 +3872,112 @@ async fn automatic_subtitles_follow_profile_languages_and_roles() {
         plan("auto").await.body["tracks"]["subtitle_track_id"],
         Value::Null
     );
+}
+
+/// A prepared rendition presents the source audio it was prepared from. It
+/// serves a plan whose selected audio is exactly that stream of the same
+/// source revision, by byte delivery, and never one that selects another.
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    // Prepare a remux of the second audio stream (22.05 kHz).
+    let operator = bearer(OPERATOR);
+    let prepared = f
+        .post(
+            "/api/v2/processing/preparations",
+            &operator,
+            Some("prepare-second-audio-0001"),
+            json!({"source": source, "timeline_id": timeline, "recipe_id": "remux_mp4",
+                "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                    "subtitle_policy": "off", "audio_track_id": "a1", "subtitle_track_id": null}}),
+        )
+        .await;
+    assert_eq!(prepared.status, StatusCode::ACCEPTED, "{}", prepared.body);
+    let job = prepared.body["id"].as_str().unwrap().to_owned();
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(playscale::processing::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let phase: String = sqlx::query_scalar("SELECT phase FROM processing_jobs WHERE id=?")
+                .bind(&job)
+                .fetch_one(&f.server.app.db)
+                .await
+                .unwrap();
+            if phase == "completed" {
+                break;
+            }
+            assert!(
+                !["failed", "cancelled"].contains(&phase.as_str()),
+                "{phase}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("preparation did not complete");
+    stop.cancel();
+    let _ = worker.await;
+    let rendition: String =
+        sqlx::query_scalar("SELECT file_id FROM renditions WHERE external_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let plan = |mode: &str, audio: &str| {
+        let input = pinned_plan_input(
+            "default",
+            &timeline,
+            mode,
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // The second audio stream, explicitly chosen: the rendition carries it.
+    let second = plan("auto", "a1").await;
+    assert_eq!(second.body["operation"], "prepared", "{}", second.body);
+    assert_eq!(second.body["source"]["file_id"], rendition.as_str());
+    let second = plan("convert", "a1").await;
+    assert_eq!(second.body["operation"], "prepared", "{}", second.body);
+    // The default first stream: the rendition does not carry it.
+    let first = plan("convert", "a0").await;
+    assert_eq!(first.body["operation"], "video_transcode", "{}", first.body);
+    assert_eq!(first.body["source"]["file_id"], source["file_id"]);
+    assert_eq!(plan("auto", "a0").await.body["operation"], "original");
+    // The rendition really holds the second stream (22.05 kHz).
+    let path: (String, String) = sqlx::query_as(
+        "SELECT l.root,f.relative_path FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+    )
+    .bind(&rendition)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(Path::new(&path.0).join(&path.1))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
 }

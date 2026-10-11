@@ -140,6 +140,11 @@ pub struct PreparedFacts {
     pub file: String,
     pub client_support: Support,
     pub within_budget: bool,
+    /// Byte delivery of this rendition presents exactly the selected streams:
+    /// no subtitle is selected, and its one audio stream was prepared from the
+    /// selected audio of the same source revision (or, for a rendition whose
+    /// source audio is not recorded, no audio was chosen explicitly).
+    pub carries_selection: bool,
 }
 
 /// Whether a conversion whose output is at most `output_height` lines and, when
@@ -167,9 +172,6 @@ pub struct Request {
     /// The client pinned the prepared rendition's version: nothing else may
     /// serve the plan.
     pub pinned_prepared: bool,
-    /// The client pinned revision-local source tracks. A rendition has its own
-    /// streams, so it cannot honor them.
-    pub tracks_pinned: bool,
     /// The selected subtitle can only be presented burned into the video (a
     /// bitmap subtitle for a client that accepts burned subtitles). Burn-in
     /// is a video transform: only a conversion can deliver it.
@@ -217,7 +219,11 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     }];
     candidates.extend(source.prepared.iter().map(|p| Candidate {
         original: false,
-        available: byte && !request.tracks_pinned && !failed(Route::Prepared, &p.file),
+        // A rendition carrying the selected streams honors an explicit choice.
+        available: request.range
+            && !request.burn_in
+            && p.carries_selection
+            && !failed(Route::Prepared, &p.file),
         support: p.client_support,
         matches_recipe: true,
         within_budget: p.within_budget,
@@ -278,6 +284,17 @@ pub enum Subtitle {
     /// The zero-based embedded bitmap subtitle stream (PGS, DVD, DVB) of the
     /// pinned file, burned into converted video.
     Bitmap(u32),
+}
+
+/// Whether a route presents a subtitle delivered this way: a text subtitle is
+/// a WebVTT sidecar, which the supported players attach only to byte delivery
+/// of the original; a burned one is a video transform, so only a conversion.
+pub fn presents_subtitle(route: Route, burned: bool) -> bool {
+    if burned {
+        matches!(route, Route::Transcode | Route::HardwareTranscode)
+    } else {
+        route == Route::Original
+    }
 }
 
 /// Everything a plan token pins. Signed by the adapter; never trusted unsigned.
@@ -501,7 +518,6 @@ mod tests {
             hls: true,
             explicit_streams: false,
             pinned_prepared: false,
-            tracks_pinned: false,
             burn_in: false,
             failed: vec![],
         }
@@ -770,6 +786,7 @@ mod tests {
             file: "g".into(),
             client_support: support,
             within_budget: true,
+            carries_selection: true,
         };
         let with = |original, p: Option<PreparedFacts>| SourceFacts {
             prepared: p.into_iter().collect(),
@@ -807,12 +824,18 @@ mod tests {
             ..request(Mode::Convert)
         };
         assert_eq!(plan("f", &ready, &failed), Plan::Ready(Route::Transcode));
-        // A byte route cannot honor an explicit stream choice.
+        // The original's byte route cannot honor an explicit stream choice,
+        // nor can a rendition that does not carry it.
         let explicit = Request {
             explicit_streams: true,
             ..request(Mode::Convert)
         };
-        assert_eq!(plan("f", &ready, &explicit), Plan::Ready(Route::Transcode));
+        let mut without = ready.clone();
+        without.prepared[0].carries_selection = false;
+        assert_eq!(
+            plan("f", &without, &explicit),
+            Plan::Ready(Route::Transcode)
+        );
         // A pinned prepared version is never widened to another route.
         let pinned = Request {
             pinned_prepared: true,
@@ -858,13 +881,21 @@ mod tests {
             ..source(Support::Unsupported)
         };
         assert_eq!(plan("f", &two, &request(Mode::Convert)), Plan::Prepared(1));
-        // Pinned source tracks are never served by a rendition's own streams.
-        let pinned_tracks = Request {
-            tracks_pinned: true,
-            ..request(Mode::Convert)
-        };
+        // A rendition that does not carry the selected streams never serves
+        // them; one that does serves an explicit choice by byte delivery.
+        let mut other_audio = ready.clone();
+        other_audio.prepared[0].carries_selection = false;
         assert_eq!(
-            plan("f", &ready, &pinned_tracks),
+            plan("f", &other_audio, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        let explicit = Request {
+            explicit_streams: true,
+            ..request(Mode::Auto)
+        };
+        assert_eq!(plan("f", &ready, &explicit), Plan::Prepared(0));
+        assert_eq!(
+            plan("f", &other_audio, &explicit),
             Plan::Ready(Route::Transcode)
         );
     }
@@ -1072,7 +1103,6 @@ mod tests {
         s.copy = StreamCopy::Eligible(Route::Remux);
         let mut burn = request(Mode::Auto);
         burn.burn_in = true;
-        burn.tracks_pinned = true;
         assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::Transcode));
         s.hardware = Hardware::Available;
         assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
@@ -1093,9 +1123,28 @@ mod tests {
             file: "p".into(),
             client_support: Support::Supported,
             within_budget: true,
+            carries_selection: true,
         }];
         assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
         s.transcodable = false;
         assert_eq!(plan("f", &s, &burn), Plan::Blocked("no_live_route"));
+    }
+
+    #[test]
+    fn subtitles_are_presented_only_by_routes_that_can_deliver_them() {
+        for route in [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::Transcode,
+            Route::HardwareTranscode,
+        ] {
+            assert_eq!(presents_subtitle(route, false), route == Route::Original);
+            assert_eq!(
+                presents_subtitle(route, true),
+                matches!(route, Route::Transcode | Route::HardwareTranscode)
+            );
+        }
     }
 }
