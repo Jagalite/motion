@@ -88,6 +88,7 @@ def main():
                     return wait_for(lambda: (j if (j:=api('GET','/api/v2/jobs/'+backup['job_id']))['phase'] in ('completed','failed','cancelled') else None),45)
                 for _ in range(3): assert backup_request()['phase']=='completed'
                 wait_for(lambda:sum(b['status']=='ready' for b in api('GET','/api/v2/admin/backups')['items'])==2,40)
+                wait_for(lambda:len(list((state/'backups').glob('request-*/manifest.json')))==2,40)
                 checks.append('durable_requested_snapshot_retention')
                 # Mount removal must fail the scan without publishing an empty catalog.
                 media.rename(root/'offline')
