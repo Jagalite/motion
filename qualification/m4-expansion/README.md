@@ -1,166 +1,165 @@
 # M4 playback expansion ledger
 
-Owner: M4 implementation lane (A06/A07 with A08). Branch `m4-playback-expansion`.
-Input: main `db0d05c`. Work started from `8d6dd7f`, the baseline named in
-plan section 10, and was rebased onto `db0d05c`. That rebase changed only UI,
-prototype and plan files, none of which this lane touches. Independent
-reviewer: GPT-6.1 Sol. This ledger records implementation slices and their
-evidence. It does not record release qualification or M4 closure.
+Owner: M4 implementation lane (A06/A07 with A08). Branch
+`m4-playback-expansion`, PR #22. Input: main `b5d9ced`. Work started from
+`8d6dd7f`, the baseline named in plan section 10, and was rebased onto
+`db0d05c` and then `b5d9ced`. Those rebases brought in UI, prototype, plan and
+dependency changes. The only dependency change this lane uses is Statelessness
+0.2.0, and the models were rerun under it. Independent reviewer: GPT-6.1 Sol.
 
-**Declared slice:** M4-00 inventory and the first M4-01 increment, which plans
-the live stream-copy routes (remux, audio conversion) in v2. Deferred: hardware
-routes (rest of M4-01), M4-02, M4-03, M4-04 and M4-05, each owned by this lane
-as listed below.
+This ledger records implementation slices and their evidence. It is not
+release qualification and not M4 closure.
+
+**Declared slices:**
+- **M4-00:** the inventory.
+- **M4-01:** stream copy and VideoToolbox conversions in v2.
+- **M4-02:** sidecar subtitles, bitmap burn-in, automatic subtitle policy and
+  rendition audio continuity.
+- **M4-03:** intervals and multipart versions.
+- **M4-04:** bitrate caps.
+
+**Explicit deferrals:**
+- **M4-04:** HDR tone mapping. No available FFmpeg has the filters it needs
+  (below).
+- **M4-05:** adaptive bitrate, as a release deferral.
+- **Subtitles:** text subtitles on live routes and text burn-in.
+
+SHAs below are on the current branch, after the rebase onto `b5d9ced`.
 
 ## M4-00 capability and parity inventory
 
-States: **implemented** means code and focused tests exist at the recorded
-source. **Qualified** means a release receipt for exact delivered bytes exists.
-**Refused** means the route reports an explicit unsupported response.
-**Missing** means no implementation exists.
+States:
+- **Implemented:** code and focused server tests exist at the recorded source.
+- **Qualified:** a release receipt exists for the exact delivered bytes.
+- **Refused:** the route reports an explicit unsupported response.
+- **Missing:** no implementation exists.
 
-| Capability | Engine (v1 / delivery adapter) | v2 planning and client exposure | State / evidence | Next owner action |
-|---|---|---|---|---|
-| Original byte ranges | Yes | `original` route; browser-default streams; one byte range | Implemented; Chromium/Electron installed receipts in [FINAL](../consolidation/FINAL.md) | Keep |
-| Prepared renditions | Processing recipes `remux_mp4`, `audio_aac`, `h264720p`, `video_profile` (software; VideoToolbox for video recipes on macOS) | `prepared` route; default streams only; explicit track/component pins refused | Implemented; prepared plans in profile receipt `67c5b39` | M4-02: component mapping for rendition pins |
-| Live software transcode | `hls-fmp4-h264-720p-aac-stereo-v1` | `video_transcode`; at most 720p; any bitrate cap refused | Implemented; live-player receipts in FINAL | Keep |
-| Live remux (stream copy) | `hls-fmp4-copy-h264-copy-aac-v1`, behind `processing.experimental_copy_routes` | **This slice:** `remux` in Auto when enabled, after the details probe | Implemented server-side; browser playback of copied streams not qualified | Release: Chromium/Electron check (below) |
-| Live audio-only conversion | `hls-fmp4-copy-h264-aac-stereo-v1`, same flag | **This slice:** `audio_convert` in Auto when enabled | As remux | As remux |
-| Live hardware transcode | `hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1`; v1 `backend` field; macOS only; never falls back to software | Not planned in v2 | Implemented in v1 (`videotoolbox_live_transcode_uses_the_hardware_encoder`); missing from v2 | M4-01 next increment: core availability observation and bounded admission |
-| Multipart versions | Not in delivery | Refused: whole single-part bindings only | Missing | M4-03 |
-| Interval (multi-episode) bindings | Not in delivery | Refused | Missing | M4-03 |
-| Embedded plain-text subtitles | WebVTT extraction from the revision-bound original | Original route only; `subtitles_url` | Implemented | M4-02: live/prepared routes |
-| Sidecar, styled (ASS/SSA), bitmap subtitles, burn-in | None | Refused | Missing | M4-02 |
-| Automatic forced/SDH/language subtitle policy | None | `auto` refused when captions exist | Missing | M4-02 |
-| HDR preserve | Byte routes deliver PQ/HLG unchanged to clients that report HDR support | `hdr_policy`; unsupported/unknown clients refused | Implemented (attempt only; no display-fidelity receipt) | M4-04 |
-| HDR tone-map to SDR | None; every live route refuses HDR | Refused (`hdr_unsupported` / `no_live_route`) | Missing | M4-04 |
-| Bitrate caps | Transcode is CRF; byte-route VBR peaks unknown | Any `max_bitrate_bps` refuses every route | Refused | M4-04 |
-| Adaptive bitrate (multi-rendition) | None (one `main` variant) | Not advertised | Missing | M4-05, last; may become a release deferral |
+"Before" is the input main. "After" is this branch. Nothing new here is
+qualified; the release checks are listed below.
 
-Fixtures used here are generated by FFmpeg `lavfi` in the tests. The repository
-has no stored media fixtures. HDR, multipart, bitmap/styled subtitle and
-hardware fixtures do not exist yet. Each work package that needs one adds it.
+| Capability | Before | After (state / v2 exposure) |
+|---|---|---|
+| Original byte ranges | Implemented; Chromium/Electron receipts in [FINAL](../consolidation/FINAL.md) | Unchanged |
+| Prepared renditions | Default streams only; any track pin excluded every rendition | Implemented: a rendition serves a plan when it carries exactly the selected audio (recorded preparation audio of the same source revision); a pinned rendition version plays its own defaults |
+| Live software transcode | ≤720p; any bitrate cap refused | Implemented: capped conversions keep a client peak bitrate (VBV, measured over every HLS peak window) |
+| Live remux / audio-only conversion | v1 only, behind `processing.experimental_copy_routes` | Implemented in v2 Auto when enabled (off by default): core-decided, details observed lazily; exact-keyframe seeks fixed |
+| Live hardware transcode | v1 only | Implemented in v2 when `processing.experimental_live_hardware` (off by default): available/busy/unavailable observed; a failed or busy session converts in software |
+| Interval (multi-episode) bindings | Refused | Implemented: conversion of the interval only; logical time from the interval start |
+| Multipart versions | Refused | Implemented: conversion only; parts decoded and joined (concat filter), each held to its pinned duration; ≤7 parts, one library, same picture size and audio roles; no subtitles |
+| Embedded plain-text subtitles | Original byte route only; `require` took the first track | Original byte route only (WebVTT); `require` and `auto` choose by profile languages and roles |
+| SRT/WebVTT sidecar subtitles | Refused | Implemented on original byte delivery, component-pinned and fingerprint-checked |
+| Bitmap subtitles (PGS, DVD, DVB) | Refused | Implemented as burn-in on conversions for clients listing `burned`; canvas scaled to the video; 20 s lookback for cues active at a start |
+| Styled subtitles (ASS/SSA), text on live routes, text burn-in | Refused | Still refused. Live text: Shaka 5.2.11 refuses external text on a live presentation. Text burn-in: needs libass, absent from the bundled and host FFmpeg |
+| HDR preserve | Byte delivery to clients reporting HDR support | Unchanged (attempt, not a display-fidelity receipt) |
+| HDR tone-map to SDR | Refused | Still refused (deferral below) |
+| Adaptive bitrate | Missing | Release deferral (below) |
+
+Fixtures are generated in the tests: FFmpeg `lavfi` media, a byte-level PGS
+stream, and SRT, ASS and noise sources. The repository stores no media
+fixtures. There is no HDR fixture with tone-mapping ground truth.
 
 ## Work packages
 
-| ID | Source SHA | API / client changes | Supported / refused | Focused checks | Review | Release-only checks |
-|---|---|---|---|---|---|---|
-| M4-00 | `b9407a3` and this update | None | Matrix above | Code inspection against main `8d6dd7f` | GPT-6.1 Sol final PR diff (finding 4 below) | None |
-| M4-01a seek fix | `ae38d86` | None | Copies starting within 132 ms after a keyframe no longer fail | Core `copy_seeks_late_enough_to_reach_the_chosen_keyframe_and_never_the_next`; v1 `tests/delivery.rs` 12/12 | GPT-6.1 Sol: no findings (the audio start trade-off is recorded) | None |
-| M4-01b v2 copy routes | `64af9f5` | Plans may return `operation: remux` / `audio_convert` with `transport: hls` (existing contract enums). Capabilities `routes` gains `stream_copy_hls` only when enabled. No contract or client file changes | Auto + HLS + within limits + qualified H.264 details. Convert, Original, a failed copy, unqualified details or a disabled server get conversion or the existing refusal | Core unit tests (101); Stateless `route_selection_model`; `tests/v2_playback.rs` 12/12 including `stream_copy_routes_are_planned_observed_and_fall_back_to_conversion`; `fmp4` unit tests 7/7 | GPT-6.1 Sol on `64af9f5`: three P2 findings, all fixed in `c9f99d7` (below) | Chromium/Electron copied-stream playback, then enabling by default |
-| M4-01c hardware | — | — | — | — | — | — |
-| M4-02 | — | — | — | — | — | — |
-| M4-03 | — | — | — | — | — | — |
-| M4-04 | — | — | — | — | — | — |
-| M4-05 | — | — | — | — | — | — |
+| ID | Source SHAs | API / client changes | Supported / refused | Focused checks | Review (GPT-6.1 Sol) |
+|---|---|---|---|---|---|
+| M4-00 | ledger | None | Inventory above | Code inspection | Final PR diff |
+| M4-01 copy | `fdc70b6`, `c1b74e9`, `678fcf7`, `3dcb7a2` | Plans may return `remux` / `audio_convert` (existing enums); capabilities list `stream_copy_hls` when enabled; copied `CODECS` derived from each copy's init segment | Auto + HLS + within limits + qualified H.264 details; Convert, Original, failures, unqualified details or a disabled server convert or refuse | Core `copy_seek`, `copy_operation`; route-selection model; `stream_copy_routes_are_planned_observed_and_fall_back_to_conversion`; v1 `tests/delivery.rs` | 3 P2 (CODECS, probe bounds, probe ownership) and 1 P2 (authorize before probe), all fixed |
+| M4-01 hardware | `2da18bd`, `6ef3b65` | Candidate prefix `h`; capabilities list `hardware_hls` when enabled and available | Available, unfailed session first; busy, unavailable or failed falls back to software; a plan signed before hardware was disabled cannot admit | `hardware_conversion_is_planned_when_available_and_falls_back_to_software` with `MOTION_REQUIRE_VIDEOTOOLBOX=1` (Apple encoder, no libx264 SEI; replan to software; capacity release; disabled restart) | 2 P2 (probe under the writer, enablement recheck), fixed |
+| M4-02 subtitles | `c2aedf8`, `24a6686`, `38332a8`, `c06d4c2`, `abb45a6`, `f7e4d61` | Plan claims carry `Text`, `Sidecar{name,fingerprint}` or `Bitmap`; the client `burned` mode is honored; no contract or client file changes | See inventory | Core `subtitle_occurrence`, `automatic_subtitle`, `same_language`, `presents_subtitle`; HTTP sidecar, bitmap burn-in (decoded output), automatic selection, plain-text tests | P1 (live text unsupported by the player): live text reverted. P2s on transfer permits, digest, in-place edits, canvas, seek lookback, FFmpeg 6.1 compatibility, route-aware auto: all fixed |
+| M4-02 renditions | `f7e4d61`, `8c732b5` | None | Rendition with the selected audio (or pinned version) by byte delivery; others convert | Core `carries_selection`; HTTP test with a real preparation of `a1` | 3 P2 (pinned version, audio-less, pool), fixed |
+| M4-03 intervals | `8c732b5`, `e03488f` | Plans and pins carry the clip; `interval_requires_conversion` | Conversion only; out-of-file or unprobed bounds unavailable; a changed interval fences plans | Core `parts::layout`; model property; HTTP interval test (decoded frame at file 10.5 s, end-of-interval `ENDLIST`, fences, key reuse) | 1 P2 (digest), fixed |
+| M4-03 multipart | `e03488f`, `5ca4766`, `5525506`, `6c1d504` | Plans and pins carry `parts`; `multipart_requires_conversion`, `subtitle_multipart_unavailable` | See inventory | Core `parts::locate`; model property; HTTP multipart test (Matroska part, part-2 frame after a seek, incompatible parts, live part change fails the delivery) and boundary test | 4 P2, then 3 P2, then 2 P2 (time bases, positions, audio identity, revalidation, boundaries, SAR, flags, A/V sync, canvas), all fixed |
+| M4-04 caps | `0843d72`, `cfc18d0` | `bitrate_caps` capability; master `BANDWIDTH` is the cap | A conversion with at least 300 kb/s of video after audio and overhead; byte routes, copies and renditions still refuse caps | Core `rate_cap`, `peak_within_cap`; HTTP test on an ~18 Mb/s noise source capped at 1 Mb/s | 1 P2 (windows, fixed); 1 P2 (digest forms) not applicable: the only shipped form is preserved |
+| M4-04 HDR | none | None | Tone mapping refused | `scale_vt` measured: retags PQ without tone mapping (mean luma unchanged) | n/a |
+| M4-05 | none | None | Not advertised | n/a | n/a |
 
-### Review findings on `64af9f5` and their disposition (fixed in `c9f99d7`)
+## Correctness boundary
 
-1. **Copied-stream CODECS.** The master playlist advertised the transcode
-   recipe's `avc1.64001f,mp4a.40.2` for copied output. Copy generations now
-   derive CODECS from their own init segment (`avcC` profile, constraints and
-   level; `esds` AAC object type). Output that cannot be described is an error.
-   The HTTP test asserts Main profile, level 3.0 and AAC-LC.
-2. **Unbounded probes.** Plan and replan probes now hold a delivery
-   admission slot (`MAX_ADMISSIONS`, shared with admissions). A full queue
-   makes planning fall back to conversion and makes a copy replan fail with
-   `admission_busy`. No test saturates the queue.
-3. **Probe cleanup on cancellation.** These probes now run in an owned task,
-   as admission probes do, so the probe's deadline, kill and reap survive a
-   client disconnect.
-
-Reran after the fixes: `tests/v2_playback.rs` 12/12; fmp4 7/7. GPT-6.1 Sol
-reviewed `c9f99d7` with no findings.
-
-### Final PR-diff review and its disposition (fixed in `40619dd`)
-
-4. **Probe before authorization.** Copy probes for admission and replan ran
-   before the transaction rechecked the plan. A retained plan from a device
-   that had lost permission or scope could therefore trigger source work. A
-   read-only preflight (`may_probe`) now repeats the caller, delivery-control
-   and core `reauthorize` checks before any probe. Transaction-local
-   reauthorization and exact-retry replay are unchanged. The HTTP test admits
-   a retained `audio_convert` plan after scope removal and expects 404. That
-   proves the refusal, not the absence of a probe; the absence follows from
-   code order. GPT-6.1 Sol reviewed `40619dd` with no findings.
-
-## M4-01b correctness boundary
-
-**Core (`playback_session::plan`, `delivery::copy_operation`, `copy_seek`):**
-- Route preference and its permitted fallbacks.
-- Which copy operation the selected streams name.
-- Whether observed details qualify the copy.
-- Whether a copy stays within client limits: it keeps the source size and an unknown peak bitrate.
-- When details must be observed (`Plan::Observe`).
-- The FFmpeg seek target that reaches the chosen keyframe.
+**Core (`crates/core`) decides:**
+- `playback_session::plan`:
+  - route order and permitted fallbacks (byte → rendition → copy →
+    hardware → software);
+  - which routes may serve an interval, multipart, burned or capped request;
+  - when copy details must be observed;
+  - `presents_subtitle`, `rate_cap`, `within_cap`, `peak_within_cap`.
+- `delivery`: `copy_operation`, `live_route_supported`, `copy_start`,
+  `copy_seek` and `burnable_subtitle`.
+- `components`: `subtitle_occurrence`, `automatic_subtitle`, `same_language`.
+- `parts`: `layout` and `locate`.
 
 **Adapters:**
-- Report stream facts and the server setting.
-- Probe details only when the core asks.
-- Map a probe failure to "ineligible", so a probe error never blocks conversion.
-- Re-observe details at admission and at replan, then recheck the core rule with them.
-- Verify segment 0's measured start.
+- Supply observations: stream facts, probes, sidecar fingerprints, hardware
+  availability and capacity, preparation records, part rows.
+- Recheck those facts inside the admission and replan transactions.
+- Execute effects through FFmpeg.
 
-Admission still rechecks every pinned fact (`playback_session::admit`). A copy
-plan's details are observed again at admission rather than trusted from the plan.
+**Adapter checks against measured output:**
+- copied stream start;
+- independent segments;
+- copied codecs;
+- per-window peak bitrate;
+- sidecar fingerprint before and after conversion;
+- live revalidation of every part.
 
-Stateless (`crates/core/tests/route_selection_model.rs`) explores the complete
-graph:
+**Stateless coverage (`route_selection_model`):** it exhausts 28,689 states
+and 43,032 transitions. Its expected outcomes are stated independently, across:
 - 3 modes;
-- no copy, remux or audio conversion;
-- qualified or unqualified details;
-- HLS, client limits, conversion capability, explicit streams and original support;
-- repeated failure reports, with an observation only when requested.
+- copy kinds and details;
+- unavailable, busy and available hardware;
+- burn-in, intervals and multipart;
+- HLS, client limits, conversion capability, explicit streams and original
+  support;
+- repeated failure reports.
 
-It checks:
-- every plan against an independently stated preference order;
-- a failed candidate is never offered again;
-- a copy needs Auto, HLS, limits and observed qualified details;
-- conversion waits until an open copy is observed or fails;
-- strict Original never streams live;
-- each failure is recorded once and details are observed at most once.
+The playback-session and delivery models pass unchanged.
 
-Gaps: prepared renditions are covered by unit tests, not by this model. The
-model does not cover the adapter probe itself; the HTTP test covers it.
+**Gaps:**
+- Prepared renditions, subtitles and caps are not in that model; unit and
+  HTTP tests cover them.
+- Adapter probes, filters and segment measurement are covered by HTTP tests,
+  not models.
 
 ## Build and test receipts
 
-Builds ran through the shared Kyoto queue with Rust 1.98, in this worktree's
-own target directory. Tests ran from the compiled binaries on macOS arm64 with
-host FFmpeg.
+Builds ran through the shared Kyoto queue with Rust 1.98, in this worktree's own
+target directory. Tests ran from the compiled binaries on macOS arm64, with
+host FFmpeg 8.1.2 and VideoToolbox available. The final receipts are at
+`6c1d504`. Compilation was through Kyoto (`0b29c0e6e2d14c599e351d42df9618e4`,
+`abf1f55f5fc443b8a51d2cd45d1f024a`):
 
-| Kyoto job | Command | Source | Result |
-|---|---|---|---|
-| `6a02fcc955ad425d8ddc84618a591fb3` | core lib test compile | pre-commit `64af9f5` content | ok. 100 core unit tests passed |
-| `205b0036d7c94fadb515572eeba7a4d3` | `v2_playback` + `delivery` test compile | `ae38d86` + `64af9f5` content | ok. v2 12/12, v1 delivery 12/12, core 101 |
-| `5cf58b59ef7344519dd6f12642f911cc` | Stateless model compile | `64af9f5` content (model fixed after it, see below) | ok. Route selection model: 1,297 states, 1,944 transitions, graph exhausted. Playback-session model passed. |
-| `b558efcfbd3143b486c7729a9b3d6e9a` | `playscale --lib` + `v2_playback` test compile | `c9f99d7` | ok. v2 12/12, fmp4 7/7 |
-| `8100c00754974af8999c8b4fec128185` | `cargo clippy -D warnings` (CI allow-list), core + server lib, three test targets | `c9f99d7` | ok |
-| `f3f9063203ae482196bbdfb89bd46dc0` | `v2_playback` test compile | `40619dd` | ok. v2 12/12 |
-| `4e7edbab009443469da7e61beed6c419` | `cargo clippy -D warnings` (as above) | `40619dd` | ok |
+| Suite | Result |
+|---|---|
+| `playscale-core` lib | 113 passed |
+| `route_selection_model` | Graph exhausted, 28,689 states |
+| `playback_session_model`, `delivery_model`, `delivery_observation_model` | Passed (Statelessness 0.2.0) |
+| `tests/v2_playback.rs` | 21/21 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
+| `tests/delivery.rs` | 12/12 |
+| `tests/access_api.rs` | 32/32 |
+| JavaScript | 54/54 (no client files changed) |
+| Contract checks | Pass (contract unchanged against main) |
+| Pinned clippy, `-p playscale-core -p playscale --all-targets` (CI allow-list) | Clean, Kyoto `82c05a76904d4a3ea2061b55440fc19f` |
+| `cargo fmt --check`, contract checks | Pass |
 
-Model fix before commit: the first route-selection run hit its depth bound
-because an unused ghost list grew on every repeated plan. The list was removed
-and the rerun exhausted the graph.
+## Deferred work and release checks
 
-Rebase receipt: the commits were reviewed and tested at their pre-rebase SHAs
-(`d1e1f09`, `4133aaa`, `c7ceb28`, `6d6e92e`). Their content is unchanged under
-the SHAs recorded above. Kyoto `a2e29a324e074b809f8e3ce1586e864d` compiled
-`v2_playback` on the rebased tree, and it passed 12/12.
+| Item | Owner | Requirement / expected outcome |
+|---|---|---|
+| Copied-stream, hardware-output and burned-subtitle playback | Clients + integration/release | Chromium and Electron on the qualified player: startup, far seek, audio switch and A/V sync. Required before `experimental_copy_routes` or `experimental_live_hardware` default on |
+| Copied-stream audio start | Integration/release | After a seek within 132 ms of a keyframe, audio may start up to 132 ms after video |
+| Capped and multipart/interval playback in players | Clients + integration/release | Seek across part boundaries; correct logical duration; `BANDWIDTH`-based startup |
+| HDR tone mapping | Integration/release (native tools), then this lane | Add zimg (`zscale`) or libplacebo to the bundled FFmpeg. Then implement a tone-mapped conversion gated on the observed filter, and qualify on suitable HDR/SDR displays. Until then HDR conversion stays refused |
+| Text subtitles on live routes / text burn-in | Clients (live text tracks), integration/release (libass) | Either an HLS subtitle rendition the provider plays live, or libass in the bundled FFmpeg |
+| Styled (ASS/SSA) subtitles | This lane after libass | Burn-in with fonts from attachments |
+| Subtitles on multipart versions | This lane | A per-part subtitle source joined on the timeline |
+| Bitmap cues older than the lookback | This lane | A cue displayed more than 20 s before a start is not restored |
+| Preparation by audio component | Data/catalog + this lane | Preparation still refuses component pins; clients pin `a{n}` with the exact source |
+| **M4-05 adaptive bitrate** | This lane, after the single-route matrix is qualified | Release deferral (plan 10.3). Design: one FFmpeg process per generation encoding aligned variants. It would use `-var_stream_map`: split the picture, force shared keyframes, cap every variant. Each variant would be verified (independent segments, peak windows) and segment *n* reported only when every variant has it. Each variant's `BANDWIDTH` would be its cap, and a generation would reserve both execution units. The contract's `variants/{variant_id}` routes already allow it. Manual prepared-file switching is not ABR |
+| Physical A/V and performance budgets | Integration/release | Section 21.3 budgets with a frozen workload; WebKit remains deferred |
 
-## Deferred release checks
+## Known pre-existing gaps found during this lane
 
-| Check | Owner | Host / fixture | Expected outcome |
-|---|---|---|---|
-| Copied-stream playback | Clients + integration/release | Chromium and Electron on the qualified player; Main/High H.264 with B-frames (negative decode times), AAC and AC-3 sources | Startup, far seek and audio switch play without A/V offset beyond the existing live tolerance. Required before `experimental_copy_routes` defaults on |
-| Copied-stream physical A/V | Integration/release | Suitable display/audio host | Audio may start up to 132 ms after video for a seek within 132 ms of a keyframe; no other gap |
-| Installed package with copy enabled | Integration/release | Relocated one-app package | Capabilities advertise `stream_copy_hls`; the plan → delivery → stream path works |
-
-WebKit remains deferred, as recorded in FINAL.
-
-## Known pre-existing gaps found during this slice
-
-- Transcode manifests advertise a static `avc1.64001f` (High, level 3.1).
-  The recipe caps height at 720 but keeps the source frame rate, and libx264
-  picks level 3.2 for 720p above 30 fps, so that string can understate the
-  level. Owner: M4-04 (bounded quality policy). Copy routes are not affected.
+Transcode manifests advertise a static `avc1.64001f` (High, level 3.1). The
+recipe caps height at 720 but keeps the source frame rate, so 720p sources
+above 30 fps encode at level 3.2. Copy routes derive their codecs from output
+instead. Owner: this lane, with the player matrix, since changing
+transcode manifest text affects existing player receipts.
