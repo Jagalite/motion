@@ -1159,8 +1159,14 @@ async fn retired_routes_are_absent_in_every_mode_without_state_mutation() {
         let (_, device) = f.pair(&["default"], &["catalog:read"]).await;
         let (_, admin) = f.pair(&[], &["system:admin"]).await;
         let capabilities = f
-            .call("GET", "/api/v2/system/capabilities", None, &[])
+            .call(
+                "GET",
+                "/api/v2/system/capabilities",
+                None,
+                &[("authorization", &bearer(OPERATOR))],
+            )
             .await;
+        assert_eq!(capabilities.status, 200);
         let access = capabilities.body["features"]
             .as_array()
             .unwrap()

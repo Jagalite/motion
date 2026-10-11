@@ -200,10 +200,10 @@ async fn planner_preferences_conversion_reuse_and_active_job() {
         f.json("GET", pref_path, None, false).await.1["preferences"]["conversion_recipe"],
         "h264720p"
     );
-    let (_, spec) = f.json("GET", "/api/v1/openapi.json", None, false).await;
-    assert!(
-        spec["paths"]["/api/v1/profiles/{profile}/items/{id}/playback-plan"]["post"].is_object()
-    );
+    // Historical service semantics above remain covered, but the retired
+    // service router does not publish a public compatibility contract.
+    let (status, _) = f.json("GET", "/api/v1/openapi.json", None, false).await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]
