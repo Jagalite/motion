@@ -1,5 +1,5 @@
 /* Gallery chrome: deliberately neutral so it never competes with a concept. */
-:root { --gallery-h: 76px; }
+:root { --gallery-h: 0px; }
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; }
 body { min-height: 100dvh; }

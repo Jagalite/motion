@@ -398,6 +398,7 @@
   }
 
   function renderChrome() {
+    if (!chrome) return;
     const c = concept();
     chrome.querySelector('.g-concepts').innerHTML = concepts.map((x, i) => `
       <button type="button" class="g-concept" data-concept="${x.id}" aria-pressed="${x.id === c.id}" title="${esc(x.name)} (key ${i + 1})">
@@ -414,7 +415,7 @@
     t.textContent = state.infoOpen ? 'Hide rationale' : 'Show rationale';
     syncChromeHeight();
   }
-  chrome.addEventListener('click', e => {
+  if (chrome) chrome.addEventListener('click', e => {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.concept) switchConcept(b.dataset.concept);
@@ -422,9 +423,9 @@
     else if (b.classList.contains('g-info-toggle')) { state.infoOpen = !state.infoOpen; persist(); renderChrome(); }
   });
   function syncChromeHeight() {
-    document.documentElement.style.setProperty('--gallery-h', chrome.offsetHeight + 'px');
+    document.documentElement.style.setProperty('--gallery-h', (chrome ? chrome.offsetHeight : 0) + 'px');
   }
-  new ResizeObserver(syncChromeHeight).observe(chrome);
+  if (chrome) new ResizeObserver(syncChromeHeight).observe(chrome);
 
   function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 

@@ -30,7 +30,7 @@ so alternative directions can be prototyped side by side later.
 | --- | --- |
 | `data.js` | Mock library (23 titles), procedural poster/backdrop SVG, query/sort helpers |
 | `app.js` | State, hash routing, screen switcher, delegated actions, mock player engine |
-| `gallery.css` | Neutral prototype chrome only |
+| `gallery.css` | Base reset and screen-reader utilities |
 | `concepts/marquee.js/.css` | The Marquee concept: four screens rendered as HTML strings |
 
 ## Concept contract
@@ -93,5 +93,5 @@ updates elements with bindings (see below).
 `#stage` also gets `data-playing="true|false"` and `data-idle="true|false"`
 (3s without input while playing), so player chrome can auto-hide in CSS.
 
-The gallery bar height is exposed as `--gallery-h`. Sticky or fixed concept
+`--gallery-h` is the height of any shell chrome above the stage (currently 0). Sticky or fixed concept
 chrome should offset by it, and full-height screens use `calc(100dvh - var(--gallery-h))`.
