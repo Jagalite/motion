@@ -33,11 +33,12 @@ pub async fn recover(db: &SqlitePool) -> anyhow::Result<()> {
     tx.commit().await?;
     Ok(())
 }
-async fn principal(
+pub(crate) async fn principal(
     tx: &mut SqliteConnection,
     id: &str,
     hash: Option<&str>,
     ingress: Option<&str>,
+    permission: Permission,
 ) -> Result<Principal, Problem> {
     let p = if let Some(hash) = hash {
         let stored = auth::load_credential(tx, hash)
@@ -54,8 +55,8 @@ async fn principal(
     } else {
         return Err(Problem::not_found());
     };
-    if !p.allows(Permission::CatalogWrite) {
-        return Err(access::AccessError::Forbidden(Permission::CatalogWrite).into());
+    if !p.allows(permission) {
+        return Err(access::AccessError::Forbidden(permission).into());
     }
     Ok(p)
 }
@@ -98,7 +99,15 @@ pub async fn run_one(app: &App) -> anyhow::Result<bool> {
         phase: serde_json::from_value(serde_json::json!(phase))?,
         attempt: current.try_into()?,
     };
-    let permitted = match principal(&mut tx, &owner, hash.as_deref(), ingress.as_deref()).await {
+    let permitted = match principal(
+        &mut tx,
+        &owner,
+        hash.as_deref(),
+        ingress.as_deref(),
+        Permission::CatalogWrite,
+    )
+    .await
+    {
         Ok(p) => {
             crate::v2::catalog::curatable_item(&mut tx, &access::catalog_scope(&p), &item, false)
                 .await

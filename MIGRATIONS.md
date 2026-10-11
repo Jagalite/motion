@@ -41,6 +41,12 @@ applying any pending migration to an existing database.
 
 | 0037 | `0037_smart_collection_revisions.sql` | A02 data/catalog completion | durable invalidation of evaluated smart collections |
 
+| 0038 | `0038_completion_api_state.sql` | Data/catalog PR #17 | durable preparation identity |
+| 0039 | `0039_logical_schedules.sql` | Data/catalog PR #17 | logical schedules and rendition representation invalidation |
+| 0040 | `0040_backup_requests.sql` | Data/catalog PR #17 | durable backup jobs and receipts |
+
+| 0041 | `0041_schedule_dispatch_progress.sql` | Data/catalog PR #17 | bounded resumable metadata schedule fanout |
+
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`

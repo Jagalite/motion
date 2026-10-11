@@ -431,6 +431,11 @@ async fn active(app: &App, job: &ProcessingJob, stop: &CancellationToken) -> any
         !stop.is_cancelled() && row.state()?.executing(job.attempt.try_into()?),
         "processing interrupted"
     );
+    let mut tx = app.db.begin().await?;
+    if let Some((_, facts)) = crate::v2::processing::publication_facts(&mut tx, &row).await? {
+        facts.admit().map_err(anyhow::Error::msg)?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 // One permit for the entire attempt; clones remain held by blocking filesystem operations.
@@ -710,11 +715,22 @@ async fn convert(
         "-i",
     ])
     .arg(directory.join("input"));
+    let selected: Option<String> =
+        sqlx::query_scalar("SELECT tracks_json FROM preparations WHERE job_id=?")
+            .bind(&job.id)
+            .fetch_optional(&app.db)
+            .await?;
+    let selected: Option<crate::v2::processing::Tracks> =
+        selected.as_deref().map(serde_json::from_str).transpose()?;
+    let audio = selected
+        .and_then(|tracks| tracks.audio_track_id)
+        .map(|id| format!("0:a:{}", &id[1..]))
+        .unwrap_or_else(|| "0:a:0?".into());
     cmd.args([
         "-map",
         "0:v:0?",
         "-map",
-        "0:a:0?",
+        &audio,
         "-sn",
         "-dn",
         "-map_metadata",
@@ -870,11 +886,16 @@ async fn finish(
     result: Option<(scan::Found, String)>,
 ) -> anyhow::Result<()> {
     let _lock = app.jobs.lock().await;
-    let current = load(app, &job.id).await?;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let current: ProcessingJob = sqlx::query_as("SELECT * FROM processing_jobs WHERE id=?")
+        .bind(&job.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let preparation = crate::v2::processing::publication_facts(&mut tx, &current).await?;
     let source: Option<(String, String)> =
-        sqlx::query_as("SELECT revision,edition_id FROM media_files WHERE id=? AND available=1")
+        sqlx::query_as("SELECT revision,edition_id FROM media_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
             .bind(&job.source_file_id)
-            .fetch_optional(&app.db)
+            .fetch_optional(&mut *tx)
             .await?;
     let previous = playscale_core::processing::State {
         job: current.state()?,
@@ -882,19 +903,19 @@ async fn finish(
         published_output: current.output_file_id.clone(),
     };
     let output_id = result.as_ref().map(|_| new_id());
-    let (next, effects) = playscale_core::processing::finish(
+    let (next, effects) = playscale_core::processing::finish_preparation(
         &previous,
         &playscale_core::processing::Completion {
             attempt: job.attempt.try_into()?,
             current_source_revision: source.as_ref().map(|s| s.0.clone()),
             validated_output: output_id.clone(),
         },
+        preparation.as_ref().map(|(_, facts)| facts),
     );
     if next == previous && effects.is_empty() {
         return Ok(());
     }
     let next = next.job;
-    let mut tx = crate::db::begin_write(&app.db).await?;
     let mut output = None;
     if effects.iter().any(|e| matches!(e, Effect::Publish { .. })) {
         let (found, library) = result.unwrap();
@@ -926,7 +947,13 @@ async fn finish(
                 },
             )
             .collect();
-        let (timeline, equivalence) = match playscale_core::identity::rendition_placement(&pinned) {
+        let placement = preparation.as_ref().map_or_else(
+            || playscale_core::identity::rendition_placement(&pinned),
+            |(timeline, _)| playscale_core::identity::RenditionPlacement::Join {
+                timeline: timeline.clone(),
+            },
+        );
+        let (timeline, equivalence) = match placement {
             playscale_core::identity::RenditionPlacement::Join { timeline } => {
                 (timeline, playscale_core::identity::Equivalence::Declared)
             }
@@ -1421,6 +1448,127 @@ pub async fn capabilities(State(app): State<App>) -> Result<Json<Capabilities>, 
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preparation_publication_observes_current_source_binding_and_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
+        let library = db::add_library(&pool, "fixture", dir.path()).await.unwrap();
+        sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO editions(id,item_id,label) VALUES ('edition','item','Original')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available) VALUES ('source','edition',?,'source.mp4','source-revision','stamp',1,'[]',1)").bind(&library.id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,attempt,created_at,updated_at) VALUES ('job','source','source-revision','h264720p','software','key','running',1,0,0)").execute(&pool).await.unwrap();
+        let app = App {
+            health: Arc::new(crate::operations::Health::new(false)),
+            db: pool,
+            admin_token: Arc::new("test".into()),
+            origin: Arc::new("http://localhost".into()),
+            authority: Arc::new("localhost".into()),
+            ffprobe: Arc::new("ffprobe".into()),
+            jobs: Arc::new(tokio::sync::Mutex::new(())),
+            streams: Arc::new(Semaphore::new(1)),
+            event_streams: Arc::new(Semaphore::new(1)),
+            storage: Arc::new(crate::storage::Runtime::new(
+                dir.path().to_owned(),
+                Default::default(),
+            )),
+            processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
+            access: Arc::new(crate::v2::Runtime::new(
+                playscale_core::access::AccessMode::TrustedHousehold,
+                crate::v2::auth::random_key(),
+            )),
+        };
+
+        sqlx::query("UPDATE processing_jobs SET requester_id='operator' WHERE id='job'")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO timelines(id,edition_id) VALUES ('requested','edition')")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO media_versions(id,timeline_id,origin,equivalence) VALUES ('original','requested','original','declared')").execute(&app.db).await.unwrap();
+        sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES ('original',1,'source','source-revision')").execute(&app.db).await.unwrap();
+        let digest = crate::v2::processing::recipe("h264720p").unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json) VALUES ('job','requested',?,'{}')").bind(digest).execute(&app.db).await.unwrap();
+        for invalid in ["source", "binding", "requester"] {
+            sqlx::query("UPDATE processing_jobs SET phase='running',attempt=1,output_file_id=NULL,requester_id='operator' WHERE id='job'").execute(&app.db).await.unwrap();
+            sqlx::query("UPDATE media_files SET available=1 WHERE id='source'")
+                .execute(&app.db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE version_files SET start_ms=NULL WHERE version_id='original'")
+                .execute(&app.db)
+                .await
+                .unwrap();
+            match invalid {
+                "source" => {
+                    sqlx::query("UPDATE media_files SET available=0 WHERE id='source'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+                "binding" => {
+                    sqlx::query("UPDATE version_files SET start_ms=1 WHERE version_id='original'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+                _ => {
+                    sqlx::query("UPDATE processing_jobs SET requester_id='revoked' WHERE id='job'")
+                        .execute(&app.db)
+                        .await
+                        .unwrap();
+                }
+            }
+            let job = load(&app, "job").await.unwrap();
+            let found = scan::Found {
+                relative: "job/1/output.mp4".into(),
+                title: "Output".into(),
+                revision: "output-revision".into(),
+                fingerprint: "stamp".into(),
+                bytes: 1,
+                duration: Some(1.0),
+                tracks: vec![],
+                reused: false,
+                nfo: crate::nfo::Sidecar::Absent,
+            };
+            finish(&app, &job, Some((found, library.id.clone())))
+                .await
+                .unwrap();
+            assert_eq!(
+                load(&app, "job").await.unwrap().phase,
+                "failed",
+                "{invalid}"
+            );
+            let count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM media_files WHERE generated=1")
+                    .fetch_one(&app.db)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0);
+        }
+        sqlx::query(
+            "UPDATE processing_jobs SET phase='failed',cache_cleaned=1,updated_at=0 WHERE id='job'",
+        )
+        .execute(&app.db)
+        .await
+        .unwrap();
+        crate::storage::prune_history(&app).await.unwrap();
+        assert!(
+            load(&app, "job").await.is_ok(),
+            "preparation provenance survives history pruning"
+        );
+    }
     #[tokio::test]
     async fn publication_is_atomic_and_duplicate_stale_completions_are_noops() {
         let dir = tempfile::tempdir().unwrap();

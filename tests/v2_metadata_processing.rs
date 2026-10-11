@@ -1080,11 +1080,7 @@ async fn artwork_listing_and_asset_bytes_are_scoped() {
 async fn blocked_operations_are_not_routed() {
     let f = Fixture::new().await;
     let op = bearer(OPERATOR);
-    for (method, path) in [
-        ("GET", "/api/v2/processing/capabilities"),
-        ("GET", "/api/v2/schedules"),
-        ("POST", "/api/v2/admin/imports"),
-    ] {
+    for (method, path) in [("POST", "/api/v2/admin/imports")] {
         let reply = f.call(method, path, None, &auth(&op)).await;
         assert!(
             matches!(
@@ -1488,4 +1484,444 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
             .body["phase"],
         "completed"
     );
+}
+
+#[tokio::test]
+async fn preparation_admission_pins_identity_and_replays_once() {
+    let f = Fixture::new().await;
+    sqlx::query("UPDATE media_files SET duration_seconds=10 WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "prepare-one"),
+    ];
+    let input = json!({"source":{"file_id":"file-a","file_revision":"rev-a"},"timeline_id":"ed-film-a","recipe_id":"remux_mp4","tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off","audio_track_id":null,"subtitle_track_id":null}});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    assert_eq!(first.body["kind"], "rendition");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(input.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    assert_eq!(replay.headers["idempotent-replayed"], "true");
+    let mut changed = input.clone();
+    changed["recipe_id"] = json!("audio_aac");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(changed),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM preparations")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1);
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert_eq!(list.body["items"][0]["status"], "pending");
+    let mut wrong = input.clone();
+    wrong["timeline_id"] = json!("ed-film-b");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(wrong),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "wrong-timeline")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    let mut track = input;
+    track["tracks"]["audio_track_id"] = json!("a9");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(track),
+            &[("authorization", &op), ("idempotency-key", "wrong-track")]
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    sqlx::query("UPDATE media_files SET revision='replaced' WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/processing/renditions",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.body["items"][0]["status"], "stale");
+}
+
+#[tokio::test]
+async fn schedules_preserve_disabled_rows_and_atomically_claim_logical_scans() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let input = json!({"library_id":f.library,"task":"scan","interval_seconds":60,"enabled":true});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/schedules",
+            Some(input.clone()),
+            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let id = first.body["id"].as_str().unwrap();
+    let path = format!("/api/v2/schedules/{id}");
+    let replay = f
+        .call(
+            "POST",
+            "/api/v2/schedules",
+            Some(input.clone()),
+            &[("authorization", &op), ("idempotency-key", "schedule-one")],
+        )
+        .await;
+    assert_eq!(replay.body, first.body);
+    sqlx::query("UPDATE api_schedules SET next_run=0 WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let mut disabled = input.clone();
+    disabled["enabled"] = json!(false);
+    let updated = f
+        .call(
+            "PUT",
+            &path,
+            Some(disabled),
+            &[("authorization", &op), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.body);
+    assert_eq!(updated.body["enabled"], false);
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &op), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &op), ("if-match", "\"r-2\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn backup_request_replay_publishes_one_verified_snapshot_with_asset_inventory() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "backup-one"),
+    ];
+    let body = json!({"include_generated_media":true});
+    let first = f
+        .call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let replay = f
+        .call("POST", "/api/v2/admin/backups", Some(body), &headers)
+        .await;
+    assert_eq!(first.body, replay.body);
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(json!({"include_generated_media":false})),
+            &headers
+        )
+        .await
+        .status,
+        StatusCode::CONFLICT
+    );
+    assert!(playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    let list = f
+        .call(
+            "GET",
+            "/api/v2/admin/backups",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(list.body["items"][0]["status"], "ready", "{}", list.body);
+    let id = first.body["id"].as_str().unwrap();
+    let manifest = std::fs::read(
+        f.app
+            .storage
+            .root
+            .join("backups")
+            .join(format!("request-{id}"))
+            .join("manifest.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        list.body["items"][0]["manifest_digest"],
+        format!("sha256:{:x}", Sha256::digest(&manifest))
+    );
+    let value: Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(value["include_generated_media"], true);
+    assert!(value["assets"].is_array());
+    // Lost acknowledgement: repeat the running attempt against the immutable path.
+    sqlx::query("UPDATE backup_jobs SET phase='running',manifest_digest=NULL WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert_eq!(
+        std::fs::read_dir(f.app.storage.root.join("backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let storage = f
+        .call(
+            "GET",
+            "/api/v2/admin/storage",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(storage.status, StatusCode::OK, "{}", storage.body);
+    assert!(
+        storage.body["database_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn empty_schedule_does_not_starve_healthy_library_and_fanout_is_resumable() {
+    let f = Fixture::new().await;
+    sqlx::query("INSERT INTO catalog_libraries(id,name,kind) VALUES ('empty','Empty','mixed')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    for (id, library, task) in [
+        ("empty-schedule", "empty", "scan"),
+        ("healthy-schedule", f.library.as_str(), "scan"),
+    ] {
+        sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id) VALUES (?,?,?,60,1,0,'operator')").bind(id).bind(library).bind(task).execute(&f.app.db).await.unwrap();
+    }
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    let enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM api_schedules WHERE id='empty-schedule'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert!(!enabled);
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM scan_requests WHERE library_id=?")
+        .bind(&f.library)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(requests, 1);
+    // A full library pass is split into durable 200-item claims.
+    for index in 0..201 {
+        f.work(
+            &format!("batch-{index:03}"),
+            "Batch",
+            &f.library,
+            &format!("batch-{index:03}.mp4"),
+            "rev",
+        )
+        .await;
+    }
+    sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id) VALUES ('metadata',?,'metadata_refresh',60,1,0,'operator')").bind(&f.library).execute(&f.app.db).await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    let first: i64 = sqlx::query_scalar("SELECT count(*) FROM metadata_jobs")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(first, 200);
+    let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_dispatch_progress")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(progress, 1);
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM metadata_jobs")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(total, 203);
+    let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_dispatch_progress")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(progress, 0);
+}
+
+#[tokio::test]
+async fn backup_retention_preserves_history_and_corrupt_recovery_fails_closed() {
+    let mut f = Fixture::new().await;
+    Arc::get_mut(&mut f.app.storage)
+        .unwrap()
+        .settings
+        .backups_keep = 1;
+    let op = format!("Bearer {OPERATOR}");
+    let mut ids = vec![];
+    for index in 0..2 {
+        let result = f
+            .call(
+                "POST",
+                "/api/v2/admin/backups",
+                Some(json!({"include_generated_media":false})),
+                &[
+                    ("authorization", &op),
+                    ("idempotency-key", &format!("retention-{index}")),
+                ],
+            )
+            .await;
+        assert_eq!(result.status, StatusCode::ACCEPTED);
+        let id = result.body["id"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE backup_jobs SET created_at=? WHERE id=?")
+            .bind(index)
+            .bind(&id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        assert!(playscale::v2::admin::run_backup(&f.app).await.unwrap());
+        ids.push(id);
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM backup_jobs")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    assert!(
+        !f.app
+            .storage
+            .root
+            .join("backups")
+            .join(format!("request-{}", ids[0]))
+            .exists()
+    );
+    let path = f
+        .app
+        .storage
+        .root
+        .join("backups")
+        .join(format!("request-{}", ids[1]))
+        .join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["assets"] = json!([{"asset_id":"invented","bytes":"1","storage":"database"}]);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    sqlx::query("UPDATE backup_jobs SET phase='running',manifest_digest=NULL WHERE id=?")
+        .bind(&ids[1])
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::v2::admin::run_backup(&f.app).await.unwrap();
+    let phase: String = sqlx::query_scalar("SELECT phase FROM backup_jobs WHERE id=?")
+        .bind(&ids[1])
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(phase, "failed");
+}
+
+#[tokio::test]
+async fn interrupted_retention_retries_without_new_backup_request() {
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let response = f
+        .call(
+            "POST",
+            "/api/v2/admin/backups",
+            Some(json!({"include_generated_media":false})),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "retention-restart"),
+            ],
+        )
+        .await;
+    let id = response.body["id"].as_str().unwrap();
+    playscale::v2::admin::run_backup(&f.app).await.unwrap();
+    let path = f
+        .app
+        .storage
+        .root
+        .join("backups")
+        .join(format!("request-{id}"));
+    assert!(path.exists());
+    sqlx::query("UPDATE backup_jobs SET error='backup_expired' WHERE id=?")
+        .bind(id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert!(!playscale::v2::admin::run_backup(&f.app).await.unwrap());
+    assert!(!path.exists());
+    let error: String = sqlx::query_scalar("SELECT error FROM backup_jobs WHERE id=?")
+        .bind(id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(error, "backup_reclaimed");
 }

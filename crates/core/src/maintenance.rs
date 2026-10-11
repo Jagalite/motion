@@ -71,3 +71,20 @@ pub fn retention_cutoff(now: i64, retention: u64) -> i64 {
 pub fn playback_cutoff(now: i64) -> i64 {
     now.saturating_sub(3600)
 }
+
+/// Snapshot publication is acknowledged only after bytes and complete inventory
+/// have been verified and the current requester is still authorized.
+pub struct BackupReceiptFacts {
+    pub requester_authorized: bool,
+    pub database_verified: bool,
+    pub inventory_complete: bool,
+    pub destination_durable: bool,
+}
+impl BackupReceiptFacts {
+    pub fn publishable(&self) -> bool {
+        self.requester_authorized
+            && self.database_verified
+            && self.inventory_complete
+            && self.destination_durable
+    }
+}

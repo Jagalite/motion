@@ -158,7 +158,7 @@ async fn classify(
             owner.map_or(Resource::Administrative, Resource::Profile)
         }
         "devices" => Resource::Device(id.clone()),
-        "scan" | "processing" => {
+        "scan" | "processing" | "job" => {
             let requester:Option<String>=sqlx::query_scalar("SELECT requester_id FROM api_jobs WHERE id=?")
                 .bind(id).fetch_optional(conn).await?;
             requester.map_or(Resource::Administrative, |requester|Resource::Job{requester})
