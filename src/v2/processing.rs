@@ -21,7 +21,7 @@ pub fn routes() -> Router<App> {
         .route("/processing/renditions", get(renditions))
 }
 
-fn recipe(id: &str) -> Option<Value> {
+pub(crate) fn recipe(id: &str) -> Option<Value> {
     let (name, video, audio, height) = match id {
         "remux_mp4" => ("MP4 stream copy", None, None, None),
         "audio_aac" => ("MP4 with AAC audio", None, Some("aac"), None),
@@ -67,6 +67,18 @@ async fn recipes(
 
 async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Value>, Problem> {
     caller.require(Permission::ProcessingRequest)?;
+    let _permit = app
+        .processing
+        .inspection
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "processing_inspection_busy",
+                "Processing inspection is busy",
+            )
+        })?;
     let configured = app.processing.settings.ffmpeg.clone();
     let digest = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
