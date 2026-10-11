@@ -3,7 +3,6 @@
 The first supported target is native macOS arm64. Nothing is published.
 """
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -20,8 +19,10 @@ import tomllib
 from check_publication import source_failures
 from build_media_tools import assert_portable, build, digest, download
 from package_desktop import assemble_shell, sign_shell, go_notices
-from build_motion_provider import build as build_provider, SHAKA, CORE_HASH
+from build_motion_provider import build as build_provider, SHAKA
 from package_privacy import assert_private_paths_absent, public_tar_member
+
+from npm_demuxe import npm_archive
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,23 +79,6 @@ def write_source_archive(destination, inputs, provenance=None):
             archive.addfile(public_tar_member(member), io.BytesIO(contents))
 
 
-def npm_archive(lock, cache):
-    spec = lock['demuxe']
-    archive = cache / f"demuxe-{spec['version']}.tgz"
-    if not archive.exists():
-        subprocess.run(['npm', 'pack', f"demuxe@{spec['version']}", '--ignore-scripts',
-                        '--registry=https://registry.npmjs.org/',
-                        '--pack-destination', str(cache), '--json'], check=True)
-    algorithm, expected = spec['integrity'].split('-', 1)
-    if algorithm != 'sha512':
-        raise ValueError('Expected npm SHA-512 integrity')
-    with archive.open('rb') as source:
-        actual = base64.b64encode(hashlib.file_digest(source, 'sha512').digest()).decode()
-    if actual != expected or digest(archive) != spec['sha256']:
-        raise ValueError('Demuxe npm archive integrity mismatch')
-    return archive
-
-
 def assemble(output, cache, tools, jobs, provider=None, source_manifest=None):
     provenance = json.loads(source_manifest.read_text()) if source_manifest else None
     inputs = source_inventory(provenance)
@@ -105,13 +89,12 @@ def assemble(output, cache, tools, jobs, provider=None, source_manifest=None):
         raise ValueError('Output already exists; choose a new destination')
     output.parent.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
-    if lock['demuxe']['sha256'] != CORE_HASH:
-        raise ValueError('Player lock does not match the derivative builder')
+    core_archive = npm_archive(lock, cache)
     if provider is None:
         provider = output.parent / (output.name + '-provider')
         build_provider(provider, cache, output.parent / (output.name + '-provider-source'))
     deployment = json.loads((provider / 'playscale-package.json').read_text())
-    expected_inputs = {'core': CORE_HASH, 'shaka_source': SHAKA['sha256'],
+    expected_inputs = {'core': lock['demuxe']['sha256'], 'shaka_source': SHAKA['sha256'],
                        'patch': digest(ROOT / 'vendor/shaka/motion-paced.patch'),
                        'builder': digest(ROOT / 'scripts/build_motion_provider.py')}
     if deployment.get('inputs') != expected_inputs or deployment.get('deployment') != 'motion-paced-derivative':
@@ -211,6 +194,7 @@ Redistribute the source companion alongside the application archive.
         sources = stage / 'sources'
         sources.mkdir()
         write_source_archive(sources / 'motion-source.tar.gz', inputs, provenance)
+        shutil.copy2(core_archive, sources / lock['demuxe']['archive'])
         for spec in [lock['ffmpeg'], lock['x264'], SHAKA]:
             shutil.copy2(download(spec, cache), sources / spec['archive'])
         (sources / 'scripts').mkdir()
@@ -226,8 +210,8 @@ fetch dependencies). No original checkout or Git metadata is needed to rebuild.
 The complete checkout includes terminal/desktop sources and their lockfiles;
 both clients are installed in Motion.app. Build the Go client with go build
 -trimpath -buildvcs=false ./cmd/motion from apps/terminal. Electron is the exact
-checksum-pinned runtime in packaging.lock.json. The vendored local Demuxe core
-and all recorded corresponding source inputs are included under vendor/demuxe.
+checksum-pinned runtime in packaging.lock.json. The published npm Demuxe archive
+is included beside this README and pinned in packaging.lock.json.
 Run scripts/build_motion_provider.py to reconstruct the derivative player.
 To assemble the complete package outside Git, run scripts/package_app.py with
 --source-manifest /path/to/original/Motion/motion-package.json and the normal
@@ -238,7 +222,8 @@ FFmpeg and x264 are unmodified pinned source archives. media-build-receipt.json
 records exact configure/make commands and compiler/environment. On macOS arm64,
 from this sources folder run:
   python3 scripts/build_media_tools.py --cache . --output build
-The Demuxe input is a local candidate, distinct from the same-numbered npm release.
+The Demuxe input is the integrity-verified npm release; Motion applies its
+provider configuration and paced-HLS adapter changes during assembly.
 The Shaka source archive and Motion patch reproduce its derivative assets.
 Motion application code is MIT; dependency source archives retain their licenses.
 ''')

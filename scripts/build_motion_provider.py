@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -13,11 +12,10 @@ import tempfile
 
 from build_media_tools import download, digest
 from install_demuxe import extract
+from npm_demuxe import npm_archive
 from package_privacy import assert_private_paths_absent
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = ROOT / 'vendor/demuxe/demuxe-core-1.1.1-candidate.tgz'
-CORE_HASH = '4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274'
 SHAKA = {'url': 'https://codeload.github.com/shaka-project/shaka-player/tar.gz/refs/tags/v5.2.11',
          'archive': 'shaka-v5.2.11.tar.gz',
          'sha256': '360910cf83bfcd792867eec040af6ab2387822bd2c726b4e4ef2774635b16801'}
@@ -39,10 +37,11 @@ def implementation_identity(artifacts, backend):
 def build(output, cache, source):
     if output.exists() or source.exists():
         raise ValueError('Choose fresh output and source-build directories')
-    if digest(CORE) != CORE_HASH:
-        raise ValueError('Vendored core archive changed')
+    lock = json.loads((ROOT / 'packaging.lock.json').read_text())
+    core = npm_archive(lock, cache)
+    core_hash = lock['demuxe']['sha256']
     patch = ROOT / 'vendor/shaka/motion-paced.patch'
-    inputs = {'core': CORE_HASH, 'shaka_source': SHAKA['sha256'], 'patch': digest(patch),
+    inputs = {'core': core_hash, 'shaka_source': SHAKA['sha256'], 'patch': digest(patch),
               'builder': digest(Path(__file__))}
     archive = download(SHAKA, cache)
     source.mkdir(parents=True)
@@ -56,10 +55,10 @@ def build(output, cache, source):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.motion-provider-', dir=output.parent) as temp:
         stage = Path(temp) / 'deployment'
-        metadata = extract(CORE, stage)
-        if metadata['name'] != 'demuxe' or metadata['version'] != '1.1.1':
+        metadata = extract(core, stage)
+        if metadata['name'] != 'demuxe' or metadata['version'] != lock['demuxe']['version']:
             raise ValueError('Unexpected core package identity')
-        # The package is a source-visible, locally assembled core, not npm 1.1.1.
+        # Apply Motion adaptations to the integrity-verified npm release.
         backend = stage / 'web/generated/internal/shaka-backend.js'
         before = backend.read_text()
         anchor = 'player.configure({ streaming: { observeQualityChanges: true'
@@ -97,7 +96,7 @@ def build(output, cache, source):
                        env={**os.environ, 'MOTION_PROVIDER_BACKEND': str(backend)}, check=True)
         providers = [{'id': name, 'implementationIdentity': 'demuxe-browser-v1',
                       'technology': 'browser-native', 'delivery': ['browser', 'application-bundle'],
-                      'applicationBuild': 'motion-demuxe-core-' + CORE_HASH,
+                      'applicationBuild': 'motion-demuxe-core-' + core_hash,
                       'offers': [{'capability': capability, 'version': 1, 'profile': profile}]}
                      for name, capability, profile in [
                          ('browser-original', 'media.present.original', 'selected-source'),
@@ -115,19 +114,24 @@ def build(output, cache, source):
         # Keep the runtime's exact-identity admission check. This derivative gets
         # its own inventory; product qualification is recorded separately.
         inventory = stage / 'web/generated/internal/provider-build.js'
-        text, count = re.subn(r'("shaka-adaptive":")[^"]+', lambda m: m[1] + identity, inventory.read_text())
-        if count != 1:
-            raise ValueError('Missing exact provider identity slot')
-        inventory.write_text(text)
+        expected = 'export const providerDeploymentEnabled = false;'
+        original = inventory.read_text()
+        identities = 'export const qualifiedProviderIdentities = Object.freeze({});'
+        if original.count(expected) != 1 or original.count(identities) != 1 or original.count('export const bundledShakaIncluded = true;') != 1:
+            raise ValueError('Unexpected npm provider build configuration')
+        inventory.write_text(original.replace(expected, 'export const providerDeploymentEnabled = true;')
+                             .replace('export const bundledShakaIncluded = true;', 'export const bundledShakaIncluded = false;')
+                             .replace(identities, 'export const qualifiedProviderIdentities = Object.freeze('
+                                      + json.dumps({p['id']: p['implementationIdentity'] for p in providers}) + ');'))
         notices = stage / 'licenses/shaka'
-        notices.mkdir(parents=True)
+        notices.mkdir(parents=True, exist_ok=True)
         shutil.copy2(upstream / 'LICENSE', notices / 'LICENSE')
         shutil.copy2(patch, notices / 'motion-paced.patch')
         (notices / 'MODIFICATIONS.txt').write_text('Motion derivative of Shaka 5.2.11: opt-in retained manifest bounds for paced conversions. The Demuxe Shaka adapter opts into paced HLS and starts generation preparation at media time zero. See motion-paced.patch and scripts/build_motion_provider.py in the source companion.\n')
-        if inputs != {'core': digest(CORE), 'shaka_source': digest(archive),
+        if inputs != {'core': digest(core), 'shaka_source': digest(archive),
                       'patch': digest(patch), 'builder': digest(Path(__file__))}:
             raise ValueError('Build inputs changed during compilation')
-        receipt = {'name': 'demuxe', 'version': '1.1.1', 'archive_sha256': CORE_HASH,
+        receipt = {'name': 'demuxe', 'version': lock['demuxe']['version'], 'archive_sha256': core_hash,
                    'deployment': 'motion-paced-derivative', 'runtime_ownership': 'per-player',
                    'upstream_release': False, 'qualification': 'candidate',
                    'inputs': inputs, 'provider_identity': identity, 'build_command': BUILD,

@@ -193,6 +193,10 @@ class PackagingTests(unittest.TestCase):
         spec = {'version': '1.0.0', 'sha256': hashlib.sha256(b'package').hexdigest(),
                 'integrity': 'sha512-' + base64.b64encode(hashlib.sha512(b'package').digest()).decode()}
         self.assertEqual(npm_archive({'demuxe': spec}, self.cache), archive)
+        spec['sha256'] = '0' * 64
+        with self.assertRaisesRegex(ValueError, 'integrity mismatch'):
+            npm_archive({'demuxe': spec}, self.cache)
+        spec['sha256'] = hashlib.sha256(b'package').hexdigest()
         spec['integrity'] = 'sha512-wrong'
         with self.assertRaisesRegex(ValueError, 'integrity mismatch'):
             npm_archive({'demuxe': spec}, self.cache)

@@ -103,3 +103,7 @@ jobs:
         run: go test ./...
       - name: Package source inventory regressions
         run: python3 scripts/test_packaging.py
+      - name: Published npm player assembly (fixture Shaka assets)
+        env:
+          MOTION_NPM_TEST_CACHE: ${{ runner.temp }}/motion-npm
+        run: python3 scripts/test_motion_provider.py

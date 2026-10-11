@@ -17,7 +17,7 @@ python3 scripts/test_package.py artifacts/release/Motion-macos-arm64.tar.gz \
   --work artifacts/package-test
 ```
 
-The builder gets **Demuxe 1.0.0 from npm**, verifies its pinned integrity/hash,
+The builder gets **Demuxe 1.1.1 from npm**, verifies its pinned integrity/hash,
 builds FFmpeg 8.0 and x264 from checksum-pinned sources, and packages FFmpeg,
 FFprobe, the Rust server, web UI, player assets, and license materials. Inputs
 are recorded in `packaging.lock.json`; application input hashes and an installed
@@ -50,15 +50,13 @@ qualification against the resulting package.
 For development, install FFmpeg/FFprobe on PATH and obtain the pinned npm player:
 
 ```sh
-mkdir -p artifacts/npm
-npm pack demuxe@1.0.0 --ignore-scripts --pack-destination artifacts/npm
-python3 scripts/install_demuxe.py artifacts/npm/demuxe-1.0.0.tgz \
-  --output web/vendor/demuxe-npm-1.0.0
-cargo run --locked -- --demuxe-dir web/vendor/demuxe-npm-1.0.0 --library /path/to/media
+python3 scripts/build_motion_provider.py --cache artifacts/npm \
+  --source-build artifacts/shaka-npm-1.1.1 --output web/vendor/demuxe-npm-1.1.1
+cargo run --locked -- --demuxe-dir web/vendor/demuxe-npm-1.1.1 --library /path/to/media
 ```
 
-The installer requires a new output directory. Existing development deployments
-are preserved. Source builds retain their original local `data/` default.
+The provider builder requires new output and source-build directories. Existing
+development deployments are preserved. Source builds retain their original local `data/` default.
 
 Open **http://127.0.0.1:8787**. Registration and an initial scan run for each
 `--library`; repeat the option for more roots. The webpage includes folder/scan
@@ -66,17 +64,17 @@ administration using the token in `data/admin-token` (created with mode 0600 on 
 Use the exact configured hostname. Local data defaults to `data/`; put it on a local
 disk outside media roots. One process may own a data directory.
 
-Demuxe 1.0.0 is the currently pinned npm distribution and includes its upstream
-engine assets. The installer preserves that deployment and its licensing materials.
-Modular Demuxe packages instead receive an explicit browser-only provider manifest.
-Each install records archive and installed-file hashes in `playscale-package.json`.
+Demuxe 1.1.1 is the pinned npm distribution. The builder verifies both archive
+checksums, preserves upstream licensing materials, and adds Motion's provider
+manifest and paced-HLS adaptations. Build and asset hashes are recorded in
+`playscale-package.json`. The Shaka build requires Node, Python, and Java.
 
 `web/demuxe.js` supports the published per-player API. If a future package provides
 both `DemuxeRuntime` and `demuxe-player.runtime`, it uses one document-owned runtime
-and retries failed initialization. **The npm 1.0.0 package has no shared-runtime
-cache API**; no cross-player Wasm compilation reuse is claimed for this package.
-Pin and qualify a newer npm package before enabling that release capability.
-Run `DEMUXE_DIR=/path/to/installed/player node --test scripts/test_demuxe_bundle.mjs`
+and retries failed initialization. Motion packaging retains per-player ownership
+and applies its paced-HLS adaptations to the integrity-pinned npm release. No cross-player Wasm
+compilation reuse is claimed for that deployment.
+Run `DEMUXE_DIR=/path/to/installed/player DEMUXE_RUNTIME_OWNERSHIP=per-player node --test scripts/test_demuxe_bundle.mjs`
 to verify installed files and exports. Set `REQUIRE_SHARED_RUNTIME=1` when qualifying
 a package that must provide that API.
 

@@ -4,9 +4,10 @@
   "demuxe": {
     "name": "demuxe",
     "version": "1.1.1",
-    "source_kind": "vendored-core-candidate",
-    "archive": "vendor/demuxe/demuxe-core-1.1.1-candidate.tgz",
-    "sha256": "4c5ef3bc8ee8413406590545cbbdef6249bd6fb4ce96e6ce8338da1a22b51274"
+    "source_kind": "npm",
+    "archive": "demuxe-1.1.1.tgz",
+    "integrity": "sha512-N5nTihp2E7yQiwIcBkch0oiFNaJU/wLV/KrZ5pPSoow2Vpz3kME9kFjDo2Qap0coHCYyeqWu4VQq4cpjCbjZIw==",
+    "sha256": "40b66848483e338e10bf2928f83bf6d8e854413186c9517f6143f722c8b13f7f"
   },
   "ffmpeg": {
     "url": "https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz",
