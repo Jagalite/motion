@@ -159,7 +159,6 @@ progress::-moz-progress-bar { background: var(--accent); }
 .version-summary { grid-column: 1 / -1; color: var(--muted); font-size: .85rem; }
 
 /* --- Player -------------------------------------------------------------- */
-.player-page { max-width: 80rem; margin: 0 auto; }
 .player-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
 .player-back { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); text-decoration: none; font-weight: 600; white-space: nowrap; }
 .player-back::before { content: "‹"; font-size: 1.4rem; line-height: 1; }
@@ -168,11 +167,6 @@ progress::-moz-progress-bar { background: var(--accent); }
 .player-host { position: relative; background: #000; aspect-ratio: 16 / 9; border-radius: var(--radius-lg); overflow: hidden; box-shadow: 0 16px 48px rgba(0, 0, 0, .55); }
 .player-host demuxe-player { position: absolute; inset: 0; width: 100%; height: 100%; }
 .player-host .status-panel { position: absolute; inset: auto 1rem 1rem 1rem; background: rgba(20, 22, 24, .85); }
-.player-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; margin-top: 1rem; padding: .85rem 1rem; background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius-lg); }
-.player-controls label { display: inline-flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .875rem; }
-.player-controls input[type="number"] { width: 6.5rem; }
-.player-controls button[data-player-action="play"] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
-.player-controls output { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 700; color: var(--accent); }
 #motion-progress-status { color: var(--muted); font-size: .875rem; min-height: 1.3em; }
 
 /* --- Admin screens: tables, rows, facts ---------------------------------- */
@@ -224,7 +218,6 @@ main > form, main section > form { margin-bottom: 1rem; }
   .detail-hero { grid-template-columns: 1fr; gap: 1.25rem; }
   .detail-poster { width: 9.5rem; }
   .detail-backdrop { left: -1rem; right: -1rem; }
-  .player-controls output { margin-left: 0; }
 }
 @media (prefers-reduced-motion: no-preference) {
   .poster-frame, .wide-frame, .library-card .art { transition: outline-color .12s ease, transform .15s ease; }
@@ -252,3 +245,44 @@ form.command label { display: inline-flex; align-items: center; gap: .45rem; col
 .cast-avatar { position: relative; display: grid; place-items: center; width: 5.5rem; height: 5.5rem; border-radius: 50%; overflow: hidden; font-weight: 800; font-size: 1.4rem; color: rgba(255, 255, 255, .85); margin-bottom: .4rem; }
 .cast-name { font-weight: 600; font-size: .875rem; }
 .cast-role { color: var(--muted); font-size: .8rem; }
+
+/* --- Player (Marquee) ----------------------------------------------------
+   The stage is cinematic and dark. Demuxe owns the overlay on the byte-range
+   route; Motion's transport row appears only when Demuxe's controls are off. */
+.player-page { max-width: 96rem; }
+.player-stage { position: relative; margin: 0 -2rem; padding: 0 2rem 1.25rem; background: radial-gradient(120% 80% at 50% 0%, #2a2f34 0%, var(--bg) 70%); }
+.player-stage .player-host { max-height: calc(100vh - 12rem); margin: 0 auto; border-radius: var(--radius-lg); }
+.player-controls { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1.25rem; padding: .75rem 1rem; background: var(--raised); border: 1px solid var(--line); border-radius: var(--radius-lg); }
+.player-transport { display: none; align-items: center; gap: .35rem; }
+.player-page:has(#motion-player[data-transport]:not([data-transport="http_range"])) .player-transport { display: inline-flex; }
+.icon-button { display: inline-grid; place-items: center; width: 2.6rem; height: 2.6rem; padding: 0; border-radius: 50%; background: transparent; border: 1px solid transparent; color: var(--fg); }
+.icon-button:hover { background: rgba(255, 255, 255, .08); border-color: transparent; }
+.icon-button.is-primary { width: 3rem; height: 3rem; background: var(--accent); color: var(--accent-fg); }
+.icon-button.is-primary:hover { background: var(--accent-hover); }
+.icon-button.is-primary .icon { fill: currentColor; stroke: none; }
+.icon-button .when-playing, .icon-button .when-paused { display: inline-grid; }
+.icon-button .when-playing { display: none; }
+.player-page:has(#motion-player[data-status="playing"]) .when-playing { display: inline-grid; }
+.player-page:has(#motion-player[data-status="playing"]) .when-paused { display: none; }
+.icon-button.is-primary .when-playing .icon { fill: none; stroke: currentColor; stroke-width: 2.6; }
+.player-position { margin-left: 0; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--muted); font-size: .875rem; }
+.player-goto { display: inline-flex; align-items: center; gap: .4rem; margin-left: auto; }
+.player-goto label { color: var(--muted); font-size: .875rem; display: inline-flex; align-items: center; gap: .35rem; }
+.player-goto input { width: 5.5rem; }
+.player-goto button[type="submit"] { background: var(--raised-2); color: var(--fg); border-color: var(--line-strong); font-weight: 600; }
+.text-button { display: inline-flex; align-items: center; gap: .45rem; background: transparent; border-color: var(--line-strong); font-weight: 600; }
+.text-button .icon { width: 1.05rem; height: 1.05rem; }
+.player-settings { position: relative; }
+.player-settings > summary { list-style: none; display: inline-flex; align-items: center; gap: .45rem; padding: .45rem .75rem; border: 1px solid var(--line-strong); border-radius: var(--radius); cursor: pointer; font-weight: 600; }
+.player-settings > summary::-webkit-details-marker { display: none; }
+.player-settings[open] > summary { border-color: var(--accent); color: var(--accent); }
+.settings-panel { position: absolute; right: 0; bottom: calc(100% + .5rem); z-index: 10; display: grid; gap: .75rem; min-width: 18rem; padding: 1rem; background: var(--raised-2); border: 1px solid var(--line-strong); border-radius: var(--radius-lg); box-shadow: 0 16px 40px rgba(0, 0, 0, .5); }
+.settings-panel label { display: grid; gap: .3rem; color: var(--muted); font-size: .8rem; font-weight: 600; }
+.settings-panel select { width: 100%; color: var(--fg); }
+.button-accent { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
+@media (max-width: 44rem) {
+  .player-stage { margin: 0 -1rem; padding: 0 0 1rem; }
+  .player-stage .player-host { border-radius: 0; }
+  .player-goto { margin-left: 0; }
+  .settings-panel { right: auto; left: 0; }
+}

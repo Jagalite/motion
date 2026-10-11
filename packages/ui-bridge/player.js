@@ -377,8 +377,12 @@ async function recoverViewing(data, current) {
 function observeViewing(element, generation, writer, current) {
   let last = 0;
   let previous;
+  // Presentation hints for the page chrome only: the active transport decides
+  // whether Demuxe's own controls are shown, the status drives the toggle.
+  host.dataset.transport = generation.transport;
   return element.player.subscribe(observation => {
     if (!current()) return;
+    host.dataset.status = observation.status;
     const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
     const output = document.getElementById('motion-position');
     if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
@@ -843,6 +847,14 @@ function close({unloading = false} = {}) {
   return state.closing;
 }
 
+/** A relative logical seek target in ms, kept within the title; null if invalid. */
+function stepTarget(nowMs, deltaMs, durationMs) {
+  if (!Number.isFinite(nowMs)) return null;
+  let target = Math.max(0, Math.round(nowMs + deltaMs));
+  if (durationMs > 0) target = Math.min(target, durationMs);
+  return Number.isSafeInteger(target) ? target : null;
+}
+
 const controls = document.getElementById('motion-playback-controls');
 controls?.addEventListener('submit', event => {
   event.preventDefault();
@@ -853,12 +865,23 @@ controls?.addEventListener('submit', event => {
   void changePlayback({kind: 'seek', position_ms: position});
 });
 controls?.addEventListener('click', event => {
-  const action = event.target?.dataset?.playerAction;
+  // Buttons may contain icons; resolve the action from the nearest control.
+  const action = event.target?.closest?.('[data-player-action]')?.dataset?.playerAction;
   // While a playback change is in progress the current player is fenced.
   if (!action || !state.element || state.changing) return;
   void (async () => {
     if (action === 'play') await state.element.play();
     if (action === 'pause') await state.element.pause();
+    if (action === 'toggle') {
+      if (state.element.player.state.status === 'playing') await state.element.pause();
+      else await state.element.play();
+    }
+    if (action === 'back' || action === 'forward') {
+      // A logical seek through the generation API, like the position form.
+      const now = Math.round(state.element.player.state.currentTime * 1000 + state.generation.media_time_origin_ms);
+      const target = stepTarget(now, action === 'back' ? -10000 : 10000, Number(host.dataset.durationMs));
+      if (target !== null) await changePlayback({kind: 'seek', position_ms: target});
+    }
     if (action === 'mute') await state.element.setMuted(!state.element.muted);
     if (action === 'next') { const owner = state.epoch; await playNext(() => owner === state.epoch); }
     if (action === 'quality') {

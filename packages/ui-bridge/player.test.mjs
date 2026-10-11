@@ -416,3 +416,14 @@ test('live generation opens without VOD startTime and verifies the public seek',
   await openGeneration(element, {transport: 'http_range', media_url: '/file.mp4', media_time_origin_ms: 0}, 42500, 'http://localhost');
   assert.equal(calls[0][1].startTime, 42.5);
 });
+
+test('relative seeks step ten seconds and stay within the title', () => {
+  const {stepTarget} = runInNewContext(source.replace('export {close, maintainLease};', '({stepTarget});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  assert.equal(stepTarget(30000, 10000, 60000), 40000);
+  assert.equal(stepTarget(55000, 10000, 60000), 60000, 'forward stops at the end');
+  assert.equal(stepTarget(4000, -10000, 60000), 0, 'back stops at the start');
+  assert.equal(stepTarget(30000, 10000, 0), 40000, 'an unknown duration does not clamp');
+  assert.equal(stepTarget(NaN, 10000, 60000), null);
+});

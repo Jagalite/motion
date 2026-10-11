@@ -97,6 +97,9 @@ fn kind_label(kind: &str) -> &str {
         "episode" => "Episode",
         "movies" => "Movies",
         "shows" | "television" | "tv" => "TV shows",
+        "video" => "Video",
+        "music" | "audio" => "Music",
+        "photo" | "photos" => "Photos",
         other => other,
     }
 }
@@ -163,6 +166,14 @@ fn icon_path(name: &str) -> &'static str {
         }
         "profiles" => "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0",
         "diagnostics" => "M3 12h4l3-8 4 16 3-8h4",
+        "pause" => "M8 5v14M16 5v14",
+        "back10" => "M4 12a8 8 0 1 0 2.3-5.7M4 4v4h4M10 10v5M13 10h2v5h-2z",
+        "forward10" => "M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4M9 10v5M12 10h2v5h-2z",
+        "volume" => "M4 9v6h4l5 4V5L8 9zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12",
+        "next" => "M6 5l9 7-9 7zM18 5v14",
+        "settings" => {
+            "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"
+        }
         _ => "M12 12h.01",
     }
 }
@@ -693,6 +704,10 @@ async fn search(cx: &Cx) -> Result<impl View> {
 
 /// Emits a stable player host. The external playback module owns everything
 /// inside `#motion-player`; this page is never partially re-rendered.
+///
+/// The transport group is shown only when Demuxe's own controls are off (live
+/// HLS); on the byte-range route Demuxe's overlay offers the same actions. The
+/// bridge reports the active transport and status as `data-*` on the host.
 #[page("/play/{timeline_id}")]
 async fn play(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
@@ -720,6 +735,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             <a class="player-back" href=(href!(item, ItemId(view_model.item_id.as_str())))>"Back to title"</a>
             <h1 class="player-title">(view_model.title.as_str())</h1>
         </header>
+        <div class="player-stage">
         <div id="motion-player" class="player-host"
             data-motion-player="v1"
             data-timeline-id=(view_model.timeline_id.as_str())
@@ -739,28 +755,42 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-demuxe-base=(assets::DEMUXE_BASE)>
             <p class="status-panel" role="status" data-state="loading">"Preparing playback…"</p>
         </div>
+        </div>
         <form id="motion-playback-controls" class="player-controls" aria-label="Playback controls">
-            <button type="button" data-player-action="play">"Play"</button>
-            <button type="button" data-player-action="pause">"Pause"</button>
-            <button type="button" data-player-action="mute">"Mute / unmute"</button>
-            <button type="button" data-player-action="next">"Next title"</button>
-            <label>"Position in seconds "<input name="position" type="number" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
-            <button type="submit">"Seek"</button>
-            <label>"Version "<select name="version"><option value="">"Automatic"</option>
-                for version in versions {
-                    <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
-                }
-            </select></label>
-            <label>"Audio "<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))
-                data-file-id=(view_model.audio_file.as_ref().map(|f| f.0.as_str()).unwrap_or(""))
-                data-file-revision=(view_model.audio_file.as_ref().map(|f| f.1.as_str()).unwrap_or(""))><option value="">"Default"</option>
-                for track in view_model.audio_tracks.iter() {
-                    <option value=(track.id.as_str())>(track.label.as_str())</option>
-                }
-            </select></label>
-            <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
-            <button type="button" data-player-action="quality">"Apply quality"</button>
-            <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+            <div class="player-transport" role="group" aria-label="Transport">
+                <button type="button" class="icon-button" data-player-action="back" aria-label="Back 10 seconds">icon(name: "back10")</button>
+                <button type="button" class="icon-button is-primary" data-player-action="toggle" aria-label="Play or pause">
+                    <span class="when-paused">icon(name: "play")</span>
+                    <span class="when-playing">icon(name: "pause")</span>
+                </button>
+                <button type="button" class="icon-button" data-player-action="forward" aria-label="Forward 10 seconds">icon(name: "forward10")</button>
+                <button type="button" class="icon-button" data-player-action="mute" aria-label="Mute or unmute">icon(name: "volume")</button>
+            </div>
+            <output id="motion-position" class="player-position" aria-live="off">(clock(view_model.resume_ms))</output>
+            <div class="player-goto">
+                <label>"Go to "<input name="position" type="number" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)>" s"</label>
+                <button type="submit">"Go"</button>
+            </div>
+            <button type="button" class="text-button" data-player-action="next">icon(name: "next") "Next title"</button>
+            <details class="player-settings">
+                <summary>icon(name: "settings") "Playback settings"</summary>
+                <div class="settings-panel">
+                    <label>"Version"<select name="version"><option value="">"Automatic"</option>
+                        for version in versions {
+                            <option value=(version.id.as_str()) disabled=(version.availability != Availability::Available)>(version.label.as_str())</option>
+                        }
+                    </select></label>
+                    <label>"Audio"<select name="audio" data-version=(view_model.audio_version.as_deref().unwrap_or(""))
+                        data-file-id=(view_model.audio_file.as_ref().map(|f| f.0.as_str()).unwrap_or(""))
+                        data-file-revision=(view_model.audio_file.as_ref().map(|f| f.1.as_str()).unwrap_or(""))><option value="">"Default"</option>
+                        for track in view_model.audio_tracks.iter() {
+                            <option value=(track.id.as_str())>(track.label.as_str())</option>
+                        }
+                    </select></label>
+                    <label>"Quality"<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
+                    <button type="button" class="button-accent" data-player-action="quality">"Apply"</button>
+                </div>
+            </details>
         </form>
         <script type="module" src=(assets::PLAYER.url())></script>
         <p id="motion-progress-status" role="status"></p>
