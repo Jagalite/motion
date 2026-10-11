@@ -5,7 +5,7 @@ exclude = ["research/framework-review"]
 resolver = "2"
 
 [workspace.dependencies]
-stateless = { package = "statelessness", version = "=0.1.1" }
+stateless = { package = "statelessness", version = "=0.2.0" }
 
 [package]
 name = "playscale"
