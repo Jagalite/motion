@@ -218,3 +218,13 @@ owns expanded multipart/interval, hardware/copy, subtitle and HDR/ABR format
 gates. Online metadata, M5/M6 and WebKit remain explicitly deferred under the
 plan/user scope. Passing these receipts or merging the four lanes does not close
 unmet milestone gates.
+
+
+Supplemental receipts: `catalog-workflow-2fa508f.json` records local metadata
+correction surviving a v2 rescan and canonical watched smart-collection results.
+Its fileless Next resolver check is explicitly not playable Next acceptance.
+`integration-a476c0e.json` binds the successful 14-check real-process CI job and
+schema-9-to-41 upgrade/restore to its source and binary. Restart preserves the
+upgrade receipt, the old binary rejects schema 41, both rollback methods work,
+and candidate restore rotates the epoch. These passes do not qualify later
+ordering changes or the still-pending heavy/package jobs.

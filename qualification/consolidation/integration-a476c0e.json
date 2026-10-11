@@ -1,0 +1,142 @@
+{
+  "source_commit": "a476c0e0bec0cf8a2ab1fcdbc141fa5cc27074ff",
+  "run_url": "https://github.com/Jagalite/motion/actions/runs/38147820272",
+  "job_url": "https://github.com/Jagalite/motion/actions/runs/38147820272/job/114494767865",
+  "result": "passed",
+  "scope": "Real-process integration and schema-9 upgrade/restore. Does not qualify later catalog-order code or unfinished heavy/package jobs.",
+  "integration": {
+    "raw_receipt_sha256": "73b0de33087baa88963e151acbb832512c588d48d5abd43ef3d575b7e07d0503",
+    "receipt": {
+      "binary_sha256": "1a44d25dddd72075925010cd9e2ef1228a1830baf612d45e77372d285f76cd43",
+      "results": [
+        {
+          "check": "smoke",
+          "exit": 0,
+          "seconds": 5.3
+        },
+        {
+          "check": "operations",
+          "exit": 0,
+          "seconds": 9.8
+        },
+        {
+          "check": "catalog",
+          "exit": 0,
+          "seconds": 0.9
+        },
+        {
+          "check": "viewing",
+          "exit": 0,
+          "seconds": 10.8
+        },
+        {
+          "check": "processing",
+          "exit": 0,
+          "seconds": 64.5
+        },
+        {
+          "check": "reliability",
+          "exit": 0,
+          "seconds": 152.7
+        },
+        {
+          "check": "video_profiles",
+          "exit": 0,
+          "seconds": 5.4
+        },
+        {
+          "check": "backup_tool",
+          "exit": 0,
+          "seconds": 0.1
+        },
+        {
+          "check": "packaging_helpers",
+          "exit": 0,
+          "seconds": 0.6
+        },
+        {
+          "check": "provider_identity",
+          "exit": 0,
+          "seconds": 0.1
+        },
+        {
+          "check": "demuxe_integration",
+          "exit": 0,
+          "seconds": 0.4
+        },
+        {
+          "check": "web_playback",
+          "exit": 0,
+          "seconds": 0.1
+        },
+        {
+          "check": "web_session",
+          "exit": 0,
+          "seconds": 0.0
+        },
+        {
+          "check": "web_native_handoff",
+          "exit": 0,
+          "seconds": 0.1
+        }
+      ]
+    }
+  },
+  "upgrade-restore": {
+    "raw_receipt_sha256": "201b2b8a82e44298f172cd8ed6ec8160a1da57750e810f352e923d35c976a236",
+    "receipt": {
+      "baseline_commit": "52491bf3e6ef323a33dd546687129bdb3b51d4d1",
+      "baseline_sha256": "41bdd49784d50cceaed0036718f2feee89bc461ef7a495567ea9df068725e4d9",
+      "candidate_sha256": "1a44d25dddd72075925010cd9e2ef1228a1830baf612d45e77372d285f76cd43",
+      "checks": {
+        "baseline_state_and_operator_backup": {
+          "observed": {
+            "item_id": "995cab08-418a-4345-b849-0c65cc330e8b",
+            "file_id": "20a16d54-feca-446a-b773-0a60f4044bca",
+            "title": "Upgrade Signal",
+            "library_ids": [
+              "90b8bd62-3862-4a0b-b9d6-ae5d66d804dc"
+            ],
+            "media_sha256": "c85f1ca1701b5045cad6baf93260c6dd3fefcd2d96bdf5c153fd6ffb608d2bd8",
+            "position_seconds": 1.25
+          },
+          "schema": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ]
+        },
+        "in_place_upgrade": {
+          "from": 9,
+          "to": 41,
+          "candidate_anonymous_status": 401,
+          "upgrade_backup": "pre-upgrade-9-to-41-1791730061-4d054f13-c854-48fd-84ce-f231ad9bd072.sqlite3"
+        },
+        "restart_is_not_an_upgrade": {
+          "upgrade_backups": 1,
+          "receipt_ids_unchanged": true
+        },
+        "baseline_refuses_newer_schema": {
+          "exit_code": 1,
+          "diagnostic": "migration 10 was previously applied but is missing"
+        },
+        "rollback_to_baseline": [
+          "operator_backup_via_candidate_restore",
+          "automatic_pre_upgrade_backup"
+        ],
+        "candidate_backup_restore": {
+          "schema_versions": [
+            41
+          ],
+          "restore_epoch_rotated": true
+        }
+      }
+    }
+  }
+}

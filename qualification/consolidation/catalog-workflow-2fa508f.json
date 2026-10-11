@@ -1,0 +1,134 @@
+{
+  "source_commit": "2fa508f528ffc95a8ed52576190c60995d005569",
+  "correctedItem": "2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+  "title": "Qualified Signal Film",
+  "scans": [
+    {
+      "id": "261b9eb2-ae0c-4431-ba90-f4f635304ad3",
+      "status": "complete"
+    }
+  ],
+  "timelines": [
+    "5d6af7f0-8367-4b94-b151-05500373fbaf",
+    "a5343b26-d2a7-4c83-be68-3bb531a964f8"
+  ],
+  "next": [
+    "a5343b26-d2a7-4c83-be68-3bb531a964f8"
+  ],
+  "smartCollection": "30248e52-0c3b-4cf3-b510-55f8d997700a",
+  "smartMembers": [
+    "b234098c-b2a5-4e8c-a6f3-77ed74b937a7"
+  ],
+  "calls": [
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/metadata",
+      "status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/metadata/contributions/local",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/libraries",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/libraries/3497c4b9-8318-48c3-bd79-acfefc5f0b46/scans",
+      "status": 202
+    },
+    {
+      "method": "GET",
+      "path": "/scans/261b9eb2-ae0c-4431-ba90-f4f635304ad3",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/scans/261b9eb2-ae0c-4431-ba90-f4f635304ad3",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/scans/261b9eb2-ae0c-4431-ba90-f4f635304ad3",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/editions",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/order-groups",
+      "status": 201
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/files",
+      "status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/timelines",
+      "status": 201
+    },
+    {
+      "method": "GET",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/catalog/items/2cb2dd75-3c46-41b8-975d-e47b6ab9ea2c/timelines",
+      "status": 201
+    },
+    {
+      "method": "GET",
+      "path": "/profiles/default/timelines/5d6af7f0-8367-4b94-b151-05500373fbaf/next",
+      "status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/catalog/filters",
+      "status": 201
+    },
+    {
+      "method": "POST",
+      "path": "/collections",
+      "status": 201
+    },
+    {
+      "method": "GET",
+      "path": "/collections/30248e52-0c3b-4cf3-b510-55f8d997700a",
+      "status": 200
+    }
+  ],
+  "result": "passed_with_declared_scope",
+  "limits": [
+    "Order resolver uses fileless timelines; this is not playable Next acceptance. Existing-file attachment to another timeline correctly refuses unknown overlapping intervals."
+  ],
+  "qualification_scope": [
+    "Local metadata correction survives a v2 rescan",
+    "Watched smart collection query reflects canonical viewing state",
+    "The timeline-order resolver in this receipt uses fileless timelines and is not playable Next evidence"
+  ],
+  "server_binary_sha256": "5b8dde0eaba4894b4d5adbd09e5dc95e74fcad6d0e18c679364d0f7209b72062"
+}
