@@ -370,3 +370,41 @@ async fn failed_publication_cannot_acknowledge_or_consume_a_sequence() {
         serde_json::from_slice(&std::fs::read(dir.path().join("events.json")).unwrap()).unwrap();
     assert_eq!(history, vec![event]);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
+    let (dir, manifest) = fixture();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let relocated = tempfile::tempdir().unwrap();
+    let moved = relocated.path().join("cache");
+    std::fs::rename(dir.path(), &moved).unwrap();
+    std::fs::create_dir(dir.path()).unwrap();
+    let event = OfflineEvent {
+        scope: manifest.scope.clone(),
+        media: manifest.downloads[0].identity.clone(),
+        event_id: "pinned-directory".into(),
+        device_sequence: "1".into(),
+        position_ms: 1000,
+        status: "paused".into(),
+    };
+    let (app, cookie) = authenticated(cache).await;
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "/cache/events",
+            &cookie,
+            Some(serde_json::to_value(&event).unwrap())
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(!dir.path().join("events.json").exists());
+    let history: Vec<OfflineEvent> =
+        serde_json::from_slice(&std::fs::read(moved.join("events.json")).unwrap()).unwrap();
+    assert_eq!(history, vec![event]);
+    drop(app);
+    assert!(Cache::open(&moved).is_ok());
+}

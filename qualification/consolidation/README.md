@@ -83,9 +83,16 @@ approval. PR completion and release/milestone acceptance are separate decisions.
 
 ## Correctness boundary
 
-These changes govern build input integrity and CI scheduling. They introduce no
-application state transition or viewing/delivery policy, so no production core or
-Stateless model changes are warranted. Filesystem/Git inventory and subprocess
+Build changes govern input integrity and CI scheduling. The Linux CI failure also
+required a cache adapter repair: `cap-std` supplies an `O_PATH` directory handle,
+which Linux refuses to fsync. A separate readable handle, checked for matching
+device/inode identity, now makes the rename durable. Admission/duplicate/sequence
+decisions remain in the existing production `core::offline` policy; in-memory
+publication still follows file sync, rename and directory sync. No core rule or
+Stateless transition changed. Existing exact-order, duplicate, reopen and failed
+publication tests cover domain decisions and effect ordering; a new filesystem
+regression verifies that replacing the original pathname cannot redirect writes.
+These filesystem descriptor and durability decisions belong in the adapter. Filesystem/Git inventory and subprocess
 execution stay in build adapters. Regression tests exercise the actual inventory
 and archive writer; source reconstruction separately checks adapter conformance.
 Domain models and their exploration bounds remain the implementation lanes' work.
@@ -151,3 +158,12 @@ incorporated here. Review is source evidence, not runtime qualification.
   status; do not reuse a cancelled or superseded run as final acceptance.
 - Combined-lane installation, browser/Electron and physical A/V are not qualified
   by this source-reconstruction receipt. Other lanes' inputs remain pending.
+
+### Final-head CI defect found during qualification
+
+The Linux fast job on `d0307cb` failed two cache durability tests with HTTP 409
+instead of 200. The same adapter was present in the baseline; no test was disabled.
+A matching uncommitted fix already existed in the `fix-cache-dir-fsync-linux`
+worktree. Its narrowly scoped patch was reused here while leaving that worktree
+unchanged, with an additional directory-replacement regression. Local compilation
+and Linux/macOS CI must pass on the repaired head before accepting this fix.
