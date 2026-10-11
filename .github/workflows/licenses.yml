@@ -9,7 +9,9 @@ permissions:
 
 jobs:
   notices:
-    runs-on: macos-14
+    # Linux: the checks read Git history and cargo metadata only; the notice
+    # target below stays the shipped macOS arm64 build.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
