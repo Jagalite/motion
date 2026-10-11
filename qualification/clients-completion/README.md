@@ -244,3 +244,35 @@ for investigation. No exact provider deployment is qualified for release yet.
 Release-order provisioning and dynamic video-profile recipe selection are missing
 public interfaces. Integration handoffs are on PR #14 and #17. Default cutover,
 legacy removal, positive Next and provider release handoff remain gated.
+
+### Schema-41 and playback-contract composition
+
+The current tree composes catalog `ee842e4`, playback `0621762` and the combined
+origin-fixture correction at `782c00f`. GPT-6.1 Sol reviewed the merges and
+`df7d9e4` without actionable findings. All 76 JavaScript playback/bridge/desktop
+tests and formatting checks pass. This does not replace real-client acceptance.
+
+The `f9b4763` application built successfully through Kyoto
+`bad3fce311c347ed8b77247e56f04cef`; frozen binary SHA-256 is
+`f740686f28baa41e5dedb7fef0fd40d3687716827d384d42b61e103d7108ec94`.
+Its dedicated preparation smoke passes five real HTTP/FFmpeg checks, including
+second-audio selection and generated-media backup byte equality. Processing
+stress completed 13 independent checks before a harness source-selection error;
+that error is corrected in `f8ea0f6`. The run also found an extra generated-store
+logical library, which remains a product failure. A later run timed out in its
+first encode; neither run qualifies the complete stress suite. Reliability timed
+out awaiting a requested backup and remains failed; `df7d9e4` adds last-job and
+server-log diagnostics for the next run.
+
+The live-window intersection build `38db68c` passed Kyoto
+`3daeb868b7364cb68441ec34b1dd3f95`; its frozen binary SHA-256 is
+`365e728b296d5f34e856508eba16dc2eb1da3bf1b9ad48744f5a988e20391a45`.
+The updated combined build is tracked separately as
+`facb0c99c69a4e63ab3f4f3e4d49bcaa` and is not yet qualified.
+
+Electron's retained 409 response was `source_revision_changed`: source bytes
+still had the same SHA-256, but the fixture ctime changed after scanning. The
+server correctly fenced that fingerprint. The process responsible for the
+metadata change is not established. New browser/Electron runs use isolated
+system-temp fixtures without weakening source validation. Release assets remain
+unqualified; archive hashes alone are not a release receipt.
