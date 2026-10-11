@@ -465,11 +465,12 @@ fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
                 .iter()
                 .filter(|t| t.kind == "audio")
                 .map(|t| {
+                    // Absent disposition flags mean false, as in components.
                     (
                         playscale_core::components::normalize_language(t.language.as_deref()),
-                        t.forced,
-                        t.hearing_impaired,
-                        t.commentary,
+                        Some(t.forced.unwrap_or(false)),
+                        Some(t.hearing_impaired.unwrap_or(false)),
+                        Some(t.commentary.unwrap_or(false)),
                     )
                 })
                 .collect(),

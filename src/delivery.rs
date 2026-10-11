@@ -442,7 +442,7 @@ fn arguments(
     end_ms: Option<u64>,
     audio: Option<u32>,
     burn: Option<u32>,
-    parts: Option<&[(u32, u64)]>,
+    parts: Option<&[(u32, u64, u64)]>,
     cap: Option<playscale_core::playback_session::RateCap>,
     directory: &FsPath,
 ) -> Vec<String> {
@@ -473,7 +473,7 @@ fn arguments(
         // seeks to its offset, the later parts play from their beginning.
         // Each is an inherited validated descriptor.
         Some(parts) => {
-            for (fd, seek) in parts {
+            for (fd, seek, _) in parts {
                 if *seek > 0 {
                     args.extend(["-ss".to_owned(), at(*seek)]);
                 }
@@ -509,16 +509,25 @@ fn arguments(
     // overlaid before the output is scaled, so nothing is cropped. In
     // scale2ref, iw/ih name the reference (video) size on FFmpeg 6.1 through 8.
     // Multipart: each part's decoded frames are normalized and joined by the
-    // concat filter, so the parts' container time bases never meet.
+    // concat filter, so the parts' container time bases never meet. Each part
+    // lasts exactly its pinned (remaining) duration: its picture and sound
+    // are extended (last frame, silence) and cut to it, so playback crosses a
+    // boundary where seeking (core `parts::locate`) places it. Anamorphic
+    // pictures are resampled to square pixels rather than relabeled.
     let joined = parts.map(|parts| {
         let mut graph = String::new();
         let mut inputs = String::new();
-        for i in 0..parts.len() {
-            graph.push_str(&format!("[{i}:v:0]format=yuv420p,setsar=1[v{i}];"));
+        for (i, (_, _, length)) in parts.iter().enumerate() {
+            let length = format!("{}.{:03}", length / 1000, length % 1000);
+            graph.push_str(&format!(
+                "[{i}:v:0]setpts=PTS-STARTPTS,scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
+                 format=yuv420p,tpad=stop_mode=clone:stop=-1,trim=duration={length}[v{i}];"
+            ));
             inputs.push_str(&format!("[v{i}]"));
             if let Some(audio) = audio {
                 graph.push_str(&format!(
-                    "[{i}:a:{audio}]aresample=48000,aformat=channel_layouts=stereo[a{i}];"
+                    "[{i}:a:{audio}]asetpts=PTS-STARTPTS,aresample=48000,\
+                     aformat=channel_layouts=stereo,apad,atrim=duration={length}[a{i}];"
                 ));
                 inputs.push_str(&format!("[a{i}]"));
             }
@@ -1258,7 +1267,7 @@ async fn run_generation(
     // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
     // (core `parts::locate`) seeks to its offset; later parts follow whole.
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-    let part_inputs: Option<Vec<(u32, u64)>> = if durations.is_empty() {
+    let part_inputs: Option<Vec<(u32, u64, u64)>> = if durations.is_empty() {
         None
     } else {
         let Some((first, offset)) = playscale_core::parts::locate(&durations, start_ms) else {
@@ -1269,7 +1278,8 @@ async fn run_generation(
             (first..durations.len())
                 .map(|i| {
                     let fd = if i == 0 { 3 } else { 4 + i as u32 };
-                    (fd, if i == first { offset } else { 0 })
+                    let seek = if i == first { offset } else { 0 };
+                    (fd, seek, durations[i] - seek)
                 })
                 .collect(),
         )

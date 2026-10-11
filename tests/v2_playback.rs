@@ -4537,3 +4537,150 @@ async fn bitrate_caps_are_kept_by_capped_conversions() {
     }
     assert!(measured >= 2, "{variant}");
 }
+
+/// A part plays for exactly its pinned duration even when the streams the
+/// delivery joins are shorter than its container: continuous playback crosses
+/// the boundary where seeking places it.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_boundaries_follow_pinned_part_durations() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Two seconds of picture in a three-second first part.
+    f.media(
+        "a-short.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "2",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.media(
+        "b-long.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "testsrc2=size=320x240:rate=24,hflip",
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "sine=frequency=880:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let ids: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id,revision,relative_path FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.server.app.db)
+            .await
+            .unwrap();
+    let (first, second, second_revision) = (&ids[0].0, &ids[1].0, &ids[1].1);
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+        .bind(first)
+        .bind(second)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(second)
+    .bind(second_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-boundary-1"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 5_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let joined = f.dir.path().join("joined.mp4");
+    std::fs::write(
+        &joined,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/1.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let second_part = gray_frame(&f.dir.path().join("media/b-long.mp4"), "0.5");
+    // Logical 3.5 s is the second part at 0.5 s; at 2.5 s the first part's
+    // last picture still holds.
+    let after = mean_difference(&gray_frame(&joined, "3.5"), &second_part);
+    let before = mean_difference(&gray_frame(&joined, "2.5"), &second_part);
+    assert!(after * 4 < before, "after {after}, before {before}");
+}
