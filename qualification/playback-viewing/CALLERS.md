@@ -17,7 +17,9 @@ never replace an old outbox's header with a freshly fetched value.
 
 Generation responses now include nullable `subtitles_url`. The bridge consumes
 selected original-file WebVTT; other clients must attach it or explicitly refuse
-a selected subtitle. An HLS ticket is propagated to every manifest child URL.
+a selected subtitle. Unpinned automatic forced/foreign-audio selection is
+explicitly unavailable when embedded captions are observed; `off`, an explicit
+track/component, or `require` choosing the first embedded track are supported. An HLS ticket is propagated to every manifest child URL.
 Ticket-only players still require an authenticated controller for heartbeats and
 changes. A ticket is not a lease renewal capability.
 
@@ -26,9 +28,10 @@ changes. A ticket is not a lease renewal capability.
 Clients/integration must compose and accept the Topcoat product-entry cutover
 before removing `save_progress`, `viewing::watched`, `viewing::start`,
 `viewing::event` and legacy preference writer mounts in `src/api.rs`.
-The legacy default web UI still calls these routes. Current-server
-`scripts/smoke.py`, `viewing_smoke.py`, `reliability_smoke.py` and
-`test_package.py` also retain legacy viewing/progress traffic at this snapshot.
+The legacy default web UI still calls these routes. The composed clients lane has migrated `scripts/smoke.py` and
+`viewing_smoke.py` to v2, including observed epochs and restart outbox checks.
+`reliability_smoke.py` and `test_package.py` still retain legacy viewing/progress
+traffic at this snapshot.
 Migrate their setup and assertions to reviewed public v2 routes before retirement;
 do not mark their existing passes as v2 acceptance. The old-binary portions of
 `upgrade_restore_check.py` and `client_playback_upgrade.mjs` are the historical

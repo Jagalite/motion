@@ -65,8 +65,8 @@ function observedCapability(shared) {
   };
 }
 
-// Preference vocabulary differs from the planning contract. Automatic retains
-// the server's forced/foreign-audio policy; always is an explicit requirement.
+// Preference vocabulary differs from the planning contract. Automatic selection
+// may be explicitly refused; always requires the first or explicitly selected caption.
 function subtitlePolicy(preference) {
   if (preference === 'off') return 'off';
   if (preference === 'always') return 'require';
