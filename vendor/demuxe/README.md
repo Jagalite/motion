@@ -1,4 +1,10 @@
-# Exact local Demuxe core input
+# Historical local Demuxe core input
+
+Current builds fetch the published npm archive pinned in `packaging.lock.json`.
+The files here are retained as provenance for older qualification receipts; they
+are no longer inputs to `scripts/build_motion_provider.py`.
+
+The following describes that historical candidate.
 
 This is the Apache-2.0, provider-independent core candidate assembled by upstream
 Demuxe on 2026-10-08. It is **not** the npm or GitHub release named 1.1.1. Its
@@ -18,7 +24,7 @@ Motion uses explicit per-player ownership for this candidate. It does not expose
 the later component runtime-injection contract. Shared-runtime tests must not be
 marked passed or skipped without recording this selected ownership policy.
 
-`scripts/build_motion_provider.py` extracts this exact core, compiles the patched
+The previous `scripts/build_motion_provider.py` extracted this exact core, compiled the patched
 Shaka source, and records a new asset closure/runtime identity. It modifies the
 Shaka backend configuration and provider inventory explicitly. The generated
 receipt remains `candidate` until separate product qualification succeeds.
