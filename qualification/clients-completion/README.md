@@ -109,6 +109,26 @@ DEMUXE_DIR=<deployment> REQUIRE_SHARED_RUNTIME=1 node --test scripts/test_demuxe
 
 Compilation and build-bearing acceptance commands must run through the shared
 Kyoto queue per consolidation plan section 7.1. Server build submitted as
-`8c74cd1dfb494ee2a9bbb67e9b62e827`, isolated target directory, source with bridge
-commit `a44eb7d`; initially deferred by host memory pressure. A queued job is not
-build or runtime evidence.
+`8c74cd1dfb494ee2a9bbb67e9b62e827` succeeded (exit 0, 138.9 seconds after
+queue admission), isolated target directory, unchanged build inputs from bridge
+commit `a44eb7d`. Binary SHA-256:
+`f878c08082aa5f0903ad3e769500608fecf7c4043224097f697cacac80ef6fab`.
+
+At `4da064c`, `scripts/v2_playback_smoke.py` passed restricted pairing/catalog
+reads, original bytes/ranges, ordered events/exact retry and seek activation.
+It then **failed** at `POST /api/v2/processing/preparations` with HTTP 404.
+The later preparation/live/recovery checks did not run.
+A separate [real-server dependency preflight](dependency-preflight.json) also
+confirms both `catalog.v2` and `playback.v2` are reported disabled/unimplemented
+at this base, so the Go player correctly remains gated. This is concrete evidence
+of the missing adapter, not a passing smoke run.
+
+The retained browser-only Demuxe 1.1.0 deployment (core archive
+`ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f`)
+passed all three installed-package tests with `REQUIRE_SHARED_RUNTIME=1`.
+It lacks Shaka and therefore does not close C07.
+
+Go compilation job `76a1df47796b4dc0810075520631a680` failed before compilation
+because the multi-package output directory did not exist. After creating it,
+replacement job `f5acb77e345341598518fa960489f6e1` was queued. Final status and
+test execution must be recorded before claiming Go/real-server CLI acceptance.

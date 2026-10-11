@@ -1,0 +1,30 @@
+{
+  "kind": "dependency-preflight",
+  "binary_sha256": "f878c08082aa5f0903ad3e769500608fecf7c4043224097f697cacac80ef6fab",
+  "capabilities_status": 200,
+  "features": [
+    {
+      "id": "catalog.v2",
+      "implemented": false,
+      "enabled": false,
+      "qualification": "unqualified",
+      "limits": {},
+      "receipt_ids": []
+    },
+    {
+      "id": "playback.v2",
+      "implemented": false,
+      "enabled": false,
+      "qualification": "unqualified",
+      "limits": {},
+      "receipt_ids": []
+    }
+  ],
+  "preparation_status": 404,
+  "source_commit": "4da064c62d0d09213933c36214124614bfc2b3a3",
+  "dirty_paths": [
+    "qualification/clients-completion/README.md"
+  ],
+  "result": "blocked",
+  "scope": "Real server dependency preflight; not playback qualification"
+}
