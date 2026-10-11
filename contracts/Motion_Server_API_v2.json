@@ -4447,6 +4447,113 @@
         "x-required-permission": "catalog:read"
       }
     },
+    "/api/v2/catalog/timelines/{timeline_id}/order": {
+      "parameters": [
+        {
+          "name": "timeline_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "placeTimelineInOrder",
+        "summary": "Place an existing playable timeline in an explicit order",
+        "description": "Fences the timeline with If-Match and the destination group with expected_group_revision. The caller must be authorized for the timeline, destination group owner and any previous group owner. Preserves media bindings and viewing history. Returns the updated timeline ETag; read listOrderGroups for resulting group revisions. A stale retry fails its precondition rather than replaying a prior response.",
+        "tags": [
+          "catalog"
+        ],
+        "x-owner": "A01",
+        "x-milestone": "M3",
+        "x-status": "implementation_target",
+        "x-required-permission": "catalog:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "order_group_id",
+                  "order_position",
+                  "expected_group_revision"
+                ],
+                "properties": {
+                  "order_group_id": {
+                    "$ref": "#/components/schemas/Id"
+                  },
+                  "order_position": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  },
+                  "expected_group_revision": {
+                    "$ref": "#/components/schemas/Revision"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated timeline; media bindings and history identity preserved.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Timeline"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        }
+      }
+    },
     "/api/v2/catalog/timelines/{timeline_id}/versions": {
       "parameters": [
         {

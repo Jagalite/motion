@@ -52,6 +52,10 @@ pub fn routes() -> Router<App> {
         )
         .route("/catalog/timelines/{timeline_id}", get(get_timeline))
         .route(
+            "/catalog/timelines/{timeline_id}/order",
+            axum::routing::put(place_timeline),
+        )
+        .route(
             "/catalog/timelines/{timeline_id}/versions",
             get(list_versions).post(create_version),
         )
@@ -1909,6 +1913,72 @@ pub struct TimelineInput {
     order_group_id: Option<String>,
     order_position: Option<u32>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineOrderInput {
+    order_group_id: String,
+    order_position: u32,
+    expected_group_revision: String,
+}
+
+/// Place an existing playable timeline without changing its media bindings or
+/// history identity. The writer transaction fences both timeline and group and
+/// supplies current ancestry/occupancy to the production core placement policy.
+pub async fn place_timeline(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<TimelineOrderInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogWrite)?;
+    let expected = if_match(&headers)?;
+    let input = body.value;
+    let expected_group = revision_text("expected_group_revision", &input.expected_group_revision)?;
+    let _guard = app.jobs.lock().await;
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::CatalogWrite))
+        .await?;
+    let scope = access::catalog_scope(&principal);
+    let timeline: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(Problem::not_found)?;
+    curatable_item(&mut tx, &scope, &timeline.item_id, false).await?;
+    // Leaving a group also mutates its revision; scope every affected owner.
+    for group in std::iter::once(&input.order_group_id).chain(timeline.order_group_id.iter()) {
+        let owner: String = sqlx::query_scalar(
+            "SELECT e.item_id FROM order_groups g JOIN editions e ON e.id=g.edition_id WHERE g.id=?",
+        ).bind(group).fetch_optional(&mut *tx).await?.ok_or_else(Problem::not_found)?;
+        curatable_item(&mut tx, &scope, &owner, false).await?;
+    }
+    access::revise(timeline.revision as u64, expected, true)?;
+    crate::curation::place_timeline_in(
+        &mut tx,
+        &id,
+        &input.order_group_id,
+        input.order_position,
+        expected_group,
+    )
+    .await
+    .map_err(curation_problem)?;
+    let row: TimelineRow = sqlx::query_as(
+        "SELECT t.*,e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let revision = row.revision as u64;
+    let value = timeline_body(&mut tx, &scope, row).await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, &value, revision))
+}
+
 pub async fn create_timeline(
     State(app): State<App>,
     caller: Caller,

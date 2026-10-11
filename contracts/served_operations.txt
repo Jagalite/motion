@@ -143,3 +143,4 @@ selectArtwork
 setWatchedState
 subscribeEvents
 uploadArtwork
+placeTimelineInOrder
