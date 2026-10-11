@@ -657,6 +657,7 @@ async fn managed_storage_never_becomes_a_public_library() {
             .oneshot(
                 axum::http::Request::builder()
                     .uri(path)
+                    .header("host", "127.0.0.1:8787")
                     .header("Authorization", "Bearer test-secret-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),

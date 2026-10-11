@@ -319,15 +319,6 @@ async fn add_library_kind(
 
 /// Register the result of an admitted filesystem inspection. Runtime callers
 /// serialize this operation with relocation using App.jobs.
-pub(crate) async fn add_verified_library(
-    db: &SqlitePool,
-    name: &str,
-    root: &str,
-    identity: &str,
-) -> anyhow::Result<Library> {
-    add_verified_library_kind(db, name, root, identity, false).await
-}
-
 async fn add_verified_library_kind(
     db: &SqlitePool,
     name: &str,
