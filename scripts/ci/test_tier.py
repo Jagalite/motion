@@ -3,8 +3,8 @@
 fast: every test target except FULL_ONLY, plus unit and doc tests. This is
       the pull-request merge gate (ci.yml).
 full: only FULL_ONLY, the long-running suites (ci-full.yml: pushes to main,
-      nightly, on demand, and pull requests touching migrations, the
-      lockfile, packaging or workflows).
+      nightly, on demand, and pull requests touching production source,
+      models/tests, clients, contracts, build inputs or workflows).
 
 Together the tiers cover `cargo test --workspace`. A target is full-only when
 it explores a large Stateless graph in an unoptimized build or drives real

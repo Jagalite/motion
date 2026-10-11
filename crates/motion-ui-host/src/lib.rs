@@ -47,6 +47,10 @@ pub struct CacheManifest {
 
 pub struct Cache {
     directory: Dir,
+    /// A readable handle to the same directory, used only to make renames
+    /// durable. On Linux cap-std opens `directory` with O_PATH, and fsync on an
+    /// O_PATH descriptor fails with EBADF.
+    durable: std::fs::File,
     _lock: std::fs::File,
     manifest: CacheManifest,
     history: Mutex<Vec<OfflineEvent>>,
@@ -69,6 +73,18 @@ fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
 impl Cache {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+        let durable = std::fs::File::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (a, b) = (directory.dir_metadata()?, durable.metadata()?);
+            ensure!(
+                b.is_dir()
+                    && cap_std::fs::MetadataExt::dev(&a) == b.dev()
+                    && cap_std::fs::MetadataExt::ino(&a) == b.ino(),
+                "cache directory changed while opening"
+            );
+        }
         let lock = directory
             .open_with(
                 "events.lock",
@@ -167,6 +183,7 @@ impl Cache {
         }
         Ok(Self {
             directory,
+            durable,
             _lock: lock,
             manifest,
             history: Mutex::new(history),
@@ -216,7 +233,7 @@ impl Cache {
                     file.sync_all()?;
                     self.directory
                         .rename(&name, &self.directory, "events.json")?;
-                    self.directory.try_clone()?.into_std_file().sync_all()?;
+                    self.durable.sync_all()?;
                     Ok(())
                 })();
                 if published.is_err() {

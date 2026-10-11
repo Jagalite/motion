@@ -15,7 +15,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 
+from check_publication import source_failures
 from build_media_tools import assert_portable, build, digest, download
 from package_privacy import assert_private_paths_absent, public_tar_member
 
@@ -23,11 +25,41 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def source_inventory():
-    paths = [ROOT / name for name in ('Cargo.toml', 'Cargo.lock', 'crates/core/Cargo.toml')]
-    for folder, pattern in [('src', '*.rs'), ('crates/core/src', '*.rs'), ('migrations', '*.sql')]:
-        paths.extend((ROOT / folder).rglob(pattern))
-    paths.extend(p for p in (ROOT / 'web').iterdir() if p.is_file())
-    return {str(p.relative_to(ROOT)): digest(p) for p in sorted(paths)}
+    """Capture the complete checkout, including new nonignored build inputs.
+
+    Git's ignore rules exclude targets, downloaded assets and local credentials.
+    Fail on missing files and symlinks instead of silently omitting inputs or
+    capturing bytes outside the checkout. This also includes every workspace
+    member, embedded asset, fixture, lockfile and build/verification recipe.
+    """
+    names = subprocess.check_output(
+        ['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+        cwd=ROOT).decode().split('\0')
+    result = {}
+    for name in sorted(set(names) - {''}):
+        path = ROOT / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f'Source input is missing or not a regular file: {name}')
+        result[name] = digest(path)
+    failures = source_failures(ROOT, result)
+    if failures:
+        raise ValueError('Source publication privacy check failed: ' + '; '.join(failures))
+    return result
+
+
+def write_source_archive(destination, inputs):
+    # Recheck membership as well as hashes: additions and removals matter too.
+    if inputs != source_inventory():
+        raise ValueError('Application source changed after compilation')
+    with tarfile.open(destination, 'w:gz') as archive:
+        for name, expected in inputs.items():
+            contents = (ROOT / name).read_bytes()
+            if hashlib.sha256(contents).hexdigest() != expected:
+                raise ValueError(f'Application source changed after compilation: {name}')
+            member = tarfile.TarInfo('motion/' + name)
+            member.size = len(contents)
+            member.mode = 0o755 if (ROOT / name).stat().st_mode & 0o111 else 0o644
+            archive.addfile(public_tar_member(member), io.BytesIO(contents))
 
 
 def npm_archive(lock, cache):
@@ -48,6 +80,7 @@ def npm_archive(lock, cache):
 
 
 def assemble(output, cache, tools, jobs):
+    inputs = source_inventory()
     lock = json.loads((ROOT / 'packaging.lock.json').read_text())
     if (platform.system(), platform.machine()) != ('Darwin', 'arm64'):
         raise ValueError('This builder currently supports native macOS arm64 only')
@@ -72,15 +105,19 @@ def assemble(output, cache, tools, jobs):
         assert_portable(binary)
     if set(receipt['binaries']) != {'ffmpeg', 'ffprobe'}:
         raise ValueError('Media receipt must contain exactly ffmpeg and ffprobe')
-    inputs = source_inventory()
-    rust_env = {**os.environ}
+    if inputs != source_inventory():
+        raise ValueError('Application source changed during dependency preparation')
+    channel = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+    compiler = subprocess.check_output(
+        ['rustup', 'which', '--toolchain', channel, 'rustc'], cwd=ROOT, text=True).strip()
+    rust_env = {**os.environ, 'RUSTC': compiler}
     # Override inherited compiler flags so all local paths use public prefixes.
     rust_env.pop('RUSTFLAGS', None)
     rust_env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join([
         f'--remap-path-prefix={Path.home()}=/build/cargo',
         f'--remap-path-prefix={ROOT}=/build/motion',
     ])
-    subprocess.run(['cargo', 'build', '--release', '--locked', '--target-dir', str(ROOT / 'target'),
+    subprocess.run(['rustup', 'run', channel, 'cargo', 'build', '--release', '--locked', '--target-dir', str(ROOT / 'target'),
                     '--jobs', str(jobs)], cwd=ROOT, env=rust_env, check=True)
     if inputs != source_inventory():
         raise ValueError('Application source changed during compilation; retry the build')
@@ -140,15 +177,7 @@ This local build is not Developer ID signed or notarized.
 ''')
         sources = stage / 'sources'
         sources.mkdir()
-        with tarfile.open(sources / 'motion-source.tar.gz', 'w:gz') as source_archive:
-            for name in [*inputs, 'LICENSE']:
-                contents = (ROOT / name).read_bytes()
-                if name in inputs and hashlib.sha256(contents).hexdigest() != inputs[name]:
-                    raise ValueError(f'Application source changed after compilation: {name}')
-                member = tarfile.TarInfo('motion/' + name)
-                member.size = len(contents)
-                member.mode = 0o644
-                source_archive.addfile(member, io.BytesIO(contents))
+        write_source_archive(sources / 'motion-source.tar.gz', inputs)
         for spec in [lock['ffmpeg'], lock['x264'], *lock['demuxe_sources']]:
             shutil.copy2(download(spec, cache), sources / spec['archive'])
         (sources / 'scripts').mkdir()
@@ -156,7 +185,13 @@ This local build is not Developer ID signed or notarized.
             shutil.copy2(ROOT / 'scripts' / script, sources / 'scripts' / script)
         shutil.copy2(ROOT / 'packaging.lock.json', sources / 'packaging.lock.json')
         shutil.copy2(tools / 'build-receipt.json', sources / 'media-build-receipt.json')
-        (sources / 'README.txt').write_text('''Corresponding dependency sources for this Motion build.
+        (sources / 'README.txt').write_text('''Corresponding application and dependency sources for this Motion build.
+Extract motion-source.tar.gz and, from its motion directory, run:
+  cargo build --release --locked --workspace
+The pinned Rust toolchain and Cargo dependencies must be available (Cargo may
+fetch dependencies). No original checkout or Git metadata is needed to rebuild.
+The complete checkout includes terminal/desktop sources and their lockfiles;
+those clients are not yet installed by this server package.
 FFmpeg and x264 are unmodified pinned source archives. media-build-receipt.json
 records exact configure/make commands and compiler/environment. On macOS arm64,
 from this sources folder run:
@@ -168,7 +203,7 @@ Motion application code is MIT; dependency source archives retain their licenses
                     'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                     'source_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT)),
                     'source_files': inputs,
-                    'rustc': subprocess.check_output(['rustc', '-vV'], text=True),
+                    'rustc': subprocess.check_output([compiler, '-vV'], text=True),
                     'packaging_lock_sha256': digest(ROOT / 'packaging.lock.json'),
                     'demuxe': {**lock['demuxe'], 'deployment': deployment['deployment'], 'shared_runtime': False},
                     'media_tools': receipt,

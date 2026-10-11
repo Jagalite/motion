@@ -80,3 +80,26 @@ jobs:
         run: '"$RUNNER_TEMP/contract/bin/python" scripts/check_contract.py'
       - name: JSON form matches YAML (Ruby)
         run: ruby scripts/contract_json.rb --check
+
+  clients:
+    name: Client controllers, desktop host and Go terminal
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/terminal/go.mod
+          cache-dependency-path: apps/terminal/go.sum
+      - name: Playback, UI bridge and desktop host regressions
+        run: node --test packages/playback/*.test.mjs packages/ui-bridge/*.test.mjs apps/desktop/test/*.test.mjs
+      - name: Terminal regressions
+        working-directory: apps/terminal
+        run: go test ./...
+      - name: Package source inventory regressions
+        run: python3 scripts/test_packaging.py

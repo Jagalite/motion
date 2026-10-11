@@ -37,9 +37,16 @@ jobs:
           cargo test --locked -p playscale --lib config::tests
       - name: Build self-contained package and source companion
         run: python3 scripts/package_app.py --output artifacts/release
+      - name: Rebuild the extracted application source companion
+        run: >-
+          python3 scripts/check_source_companion.py
+          --source-archive artifacts/release/sources/motion-source.tar.gz
+          --manifest artifacts/release/Motion/motion-package.json
+          --work artifacts/source-rebuild
       - name: Test extracted package without development tools
         run: python3 scripts/test_package.py artifacts/release/Motion-macos-arm64.tar.gz --work artifacts/package-test
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: Motion-macos-arm64
           path: |
@@ -47,4 +54,6 @@ jobs:
             artifacts/release/Motion-sources.tar
             artifacts/release/SHA256SUMS
             artifacts/package-test/receipt.json
+            artifacts/source-rebuild/receipt.json
+            artifacts/source-rebuild/build.log
           compression-level: 0
