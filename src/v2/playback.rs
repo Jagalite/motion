@@ -985,31 +985,110 @@ pub async fn plan(
         ));
     }
     let audio = ca.or(a).or(default_audio);
-    use playscale_core::components::{SubtitleSelection, select_subtitle};
-    // A sidecar pin is an explicit choice too: it conflicts with "off".
-    if sidecar_name.is_some() && input.tracks.subtitle_policy == "off" {
+    let explicit = cs.or(sub);
+    // An explicit choice (embedded or sidecar) conflicts with "off".
+    if input.tracks.subtitle_policy == "off" && (explicit.is_some() || sidecar_name.is_some()) {
         return Err(Problem::invalid(
             "subtitle_policy_conflict",
             "Explicit subtitles conflict with off",
         ));
     }
-    let subtitle = match select_subtitle(&input.tracks.subtitle_policy, cs.or(sub), subtitles) {
-        _ if sidecar_name.is_some() => None,
-        SubtitleSelection::Selected(index) => Some(index),
-        SubtitleSelection::None => None,
-        SubtitleSelection::Conflict => {
-            return Err(Problem::invalid(
-                "subtitle_policy_conflict",
-                "Explicit subtitles conflict with off",
-            ));
+    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+    // Without an explicit choice, "auto" and "require" select by the profile's
+    // languages and subtitle mode (core `automatic_subtitle`); never the first
+    // track and never another language.
+    let (subtitle, sidecar_name) = if explicit.is_some()
+        || sidecar_name.is_some()
+        || input.tracks.subtitle_policy == "off"
+    {
+        (explicit, sidecar_name)
+    } else {
+        use playscale_core::components::{
+            AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
+        };
+        let preferences = legacy::prefs(&app, &input.profile_id)
+            .await
+            .map_err(problem)?
+            .preferences;
+        let mut options = Vec::new();
+        let mut choices = Vec::new();
+        for component in components
+            .iter()
+            .filter(|c| c.kind == playscale_core::components::Kind::Subtitle)
+        {
+            let deliverable;
+            let choice = match subtitle_occurrence(
+                &components,
+                &component.id,
+                &bound.version,
+                &bound.file.id,
+                &bound.file.revision,
+            ) {
+                Some(SubtitleOccurrence::Embedded(index)) => {
+                    let Some((position, track)) = streams
+                        .iter()
+                        .filter(|t| t.kind == "subtitle")
+                        .enumerate()
+                        .find(|(_, t)| t.index == index)
+                    else {
+                        continue;
+                    };
+                    deliverable = (playscale_core::delivery::sidecar_subtitle(&track.codec)
+                        && accepts("text"))
+                        || (playscale_core::delivery::burnable_subtitle(&track.codec)
+                            && accepts("burned"));
+                    (Some(position as u32), None)
+                }
+                Some(SubtitleOccurrence::Sidecar(name)) => {
+                    let format: Option<String> = sqlx::query_scalar(
+                        "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+                    )
+                    .bind(&bound.file.id)
+                    .bind(&name)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    deliverable =
+                        matches!(format.as_deref(), Some("srt" | "vtt")) && accepts("text");
+                    (None, Some(name))
+                }
+                None => continue,
+            };
+            options.push(SubtitleOption {
+                language: component.language.clone(),
+                roles: component.roles.clone(),
+                deliverable,
+            });
+            choices.push(choice);
         }
-        SubtitleSelection::Unavailable => {
-            return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
-        }
-        SubtitleSelection::AutomaticUnsupported => {
-            return Ok(
-                Json(blocked(&input, "automatic_subtitle_selection_unavailable")).into_response(),
-            );
+        let audio_language = audio.and_then(|a| {
+            streams
+                .iter()
+                .filter(|t| t.kind == "audio")
+                .nth(a as usize)
+                .and_then(|t| t.language.as_deref())
+        });
+        let mode = match preferences.subtitle_mode.as_str() {
+            "always" => SubtitleMode::Always,
+            "forced" => SubtitleMode::Forced,
+            "off" => SubtitleMode::Off,
+            _ => SubtitleMode::ForeignAudio,
+        };
+        match automatic_subtitle(
+            input.tracks.subtitle_policy == "require",
+            mode,
+            audio_language,
+            &preferences.audio_languages,
+            &preferences.subtitle_languages,
+            &options,
+        ) {
+            AutomaticSubtitle::None => (None, None),
+            AutomaticSubtitle::Selected(i) => choices.swap_remove(i),
+            AutomaticSubtitle::Unavailable => {
+                return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
+            }
+            AutomaticSubtitle::Ambiguous => {
+                return Ok(Json(blocked(&input, "subtitle_selection_ambiguous")).into_response());
+            }
         }
     };
     // A text subtitle is delivered as WebVTT to a client that presents text;
@@ -1023,7 +1102,6 @@ pub async fn plan(
             .nth(index as usize)
             .unwrap()
             .codec;
-        let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
         if playscale_core::delivery::burnable_subtitle(codec) && accepts("burned") {
             burn = Some(index);
         } else if !(playscale_core::delivery::sidecar_subtitle(codec) && accepts("text")) {

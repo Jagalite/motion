@@ -2545,12 +2545,13 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
     let mut automatic = input.clone();
     automatic["tracks"]["subtitle_track_id"] = Value::Null;
     automatic["tracks"]["subtitle_policy"] = json!("auto");
-    assert_eq!(
-        f.post("/api/v2/playback/plans", &auth, None, automatic)
-            .await
-            .body["reason_codes"][0],
-        "automatic_subtitle_selection_unavailable"
-    );
+    // Automatic selection never takes a caption of unknown language: the
+    // plan proceeds without subtitles.
+    let automatic = f
+        .post("/api/v2/playback/plans", &auth, None, automatic)
+        .await;
+    assert_eq!(automatic.body["status"], "ready", "{}", automatic.body);
+    assert_eq!(automatic.body["tracks"]["subtitle_track_id"], Value::Null);
     let plan = f
         .post("/api/v2/playback/plans", &auth, None, input.clone())
         .await;
@@ -3697,4 +3698,123 @@ async fn bitmap_subtitles_are_burned_into_conversions_only() {
         )
         .await;
     assert_eq!(closed.status, StatusCode::NO_CONTENT);
+}
+
+/// Without an explicit pin, subtitles follow the profile: foreign audio gets
+/// full subtitles in a preferred language (plain over forced), forced mode
+/// takes only a forced track in the audio's language, and "require" refuses
+/// rather than substitute another language or the first track.
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_subtitles_follow_profile_languages_and_roles() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let srt = f.dir.path().join("captions.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nCaption\n").unwrap();
+    // French audio; s0 forced English, s1 full English.
+    f.media(
+        "film.mp4",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:a:0",
+            "language=fre",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-disposition:s:0",
+            "forced",
+            "-metadata:s:s:1",
+            "language=eng",
+            "-disposition:s:1",
+            "0",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let prefer = |mode: &str, audio: &[&str], subtitles: &[&str]| {
+        let (mode, audio, subtitles) = (mode.to_owned(), json!(audio), json!(subtitles));
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+            let mut document = prefs.body.clone();
+            document["subtitle_mode"] = json!(mode);
+            document["audio_languages"] = audio;
+            document["subtitle_languages"] = subtitles;
+            let replaced = f
+                .call(
+                    "PUT",
+                    "/api/v2/profiles/default/preferences",
+                    Some(document),
+                    &[
+                        ("authorization", &auth),
+                        ("if-match", prefs.headers["etag"].to_str().unwrap()),
+                    ],
+                )
+                .await;
+            assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+        }
+    };
+    let plan = |policy: &str| {
+        let mut input = plan_input("default", &timeline, "auto", None, &["http_range"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // French audio is foreign to an English profile: full English subtitles.
+    prefer("foreign_audio", &["en"], &["en"]).await;
+    let chosen = plan("auto").await;
+    assert_eq!(
+        chosen.body["tracks"]["subtitle_track_id"], "s1",
+        "{}",
+        chosen.body
+    );
+    assert_eq!(chosen.body["operation"], "original");
+    // Forced mode: only a forced track in the audio's language (none here).
+    prefer("forced", &["en"], &["en"]).await;
+    let none = plan("auto").await;
+    assert_eq!(none.body["status"], "ready", "{}", none.body);
+    assert_eq!(none.body["tracks"]["subtitle_track_id"], Value::Null);
+    // A French-speaking profile hears French audio: forced subtitles only,
+    // and there is no forced French track.
+    prefer("foreign_audio", &["fr"], &["fr"]).await;
+    assert_eq!(
+        plan("auto").await.body["tracks"]["subtitle_track_id"],
+        Value::Null
+    );
+    // Require: preferred languages only.
+    assert_eq!(
+        plan("require").await.body["reason_codes"][0],
+        "subtitle_unavailable"
+    );
+    prefer("off", &[], &["de", "en"]).await;
+    assert_eq!(
+        plan("require").await.body["tracks"]["subtitle_track_id"],
+        "s1"
+    );
+    assert_eq!(
+        plan("auto").await.body["tracks"]["subtitle_track_id"],
+        Value::Null
+    );
 }
