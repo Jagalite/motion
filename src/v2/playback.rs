@@ -1221,6 +1221,37 @@ impl delivery::AdmissionAuthority for PlanAuthority {
     }
 }
 
+/// Read-only preflight before a copy plan causes source work (a details
+/// probe): the caller re-derived from current credential state, control of
+/// `delivery` when replanning one, and every pinned fact except expiry (core
+/// `reauthorize`). The command repeats these checks in its write transaction;
+/// this only keeps a retained token from probing a source its holder can no
+/// longer reach.
+async fn may_probe(
+    app: &App,
+    caller: &Caller,
+    claims: &Claims,
+    delivery: Option<&str>,
+) -> Result<(), Problem> {
+    let mut conn = app.db.acquire().await?;
+    let principal = caller.reauthorize(&mut conn, None).await?;
+    if let Some(id) = delivery {
+        controlled_by(app, &mut conn, &principal, id).await?;
+    }
+    let facts = file_facts(&mut conn, &claims.file).await?;
+    let bound = still_bound(&mut conn, claims).await?;
+    core::reauthorize(
+        claims,
+        &core::Observed {
+            principal: &principal,
+            file: facts.as_ref(),
+            bound,
+            now: now(),
+        },
+    )
+    .map_err(plan_problem)
+}
+
 fn problem_to_api(p: &Problem) -> ApiError {
     ApiError::new(p.status, p.code, &p.detail)
 }
@@ -1307,6 +1338,12 @@ pub async fn create_delivery(
     let claims = open(&app, &input.plan_token)?;
     if claims.principal != caller.principal.id {
         return Err(invalid_plan());
+    }
+    // A copy admission probes the source before its transaction; refuse a
+    // plan whose holder can no longer reach the source first. Admission
+    // rechecks everything, including for an exact retry.
+    if matches!(claims.route, Route::Remux | Route::AudioConvert) {
+        may_probe(&app, &caller, &claims, None).await?;
     }
     let owner = owner_of(&claims);
     let request = delivery::CreateRequest {
@@ -1545,9 +1582,12 @@ pub async fn change_delivery(
             if app.processing.settings.experimental_copy_routes =>
         {
             match open(&app, plan_token) {
+                // Without a passing preflight nothing is probed: a new change
+                // is then refused by the transaction's own checks.
                 Ok(claims)
                     if claims.principal == caller.principal.id
-                        && matches!(claims.route, Route::Remux | Route::AudioConvert) =>
+                        && matches!(claims.route, Route::Remux | Route::AudioConvert)
+                        && may_probe(&app, &caller, &claims, Some(&id)).await.is_ok() =>
                 {
                     Some(delivery::observe_copy_details(&app, &claims.file).await)
                 }

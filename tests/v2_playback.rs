@@ -2770,7 +2770,7 @@ async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
     copyable_mkv(&f, "film.mkv", "3.0");
     f.scan().await;
     let (timeline, _) = f.timeline().await;
-    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let (device, auth) = f.device(&["default"], PLAYER).await;
     let source = f.source().await;
     let file = source["file_id"].as_str().unwrap().to_owned();
     let caps = f.get("/api/v2/system/capabilities", &auth).await;
@@ -2981,6 +2981,28 @@ async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
         )
         .await;
     assert_eq!(exhausted.body["reason_codes"][0], "all_candidates_failed");
+
+    // A retained copy plan never reaches the source once its holder's scope
+    // no longer includes it: refused before any probe or admission.
+    let retained = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &[]),
+        )
+        .await;
+    assert_eq!(retained.body["operation"], "audio_convert");
+    f.policy(&device, &[], PLAYER, "\"r-2\"").await;
+    let refused = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-revoked-copy-1"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.body);
 
     // Copy-route capacity is released with the delivery.
     tokio::time::timeout(Duration::from_secs(30), async {
