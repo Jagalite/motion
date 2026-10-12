@@ -752,6 +752,7 @@ pub fn router() -> Router<App> {
         .route("/openapi.json", get(system::openapi))
         .route("/system/health", get(system::health))
         .route("/admin/diagnostics", get(system::diagnostics))
+        .route("/admin/metrics", get(system::metrics))
         .route("/system/capabilities", get(system::capabilities))
         .route("/me", get(identity::me))
         .route("/auth/pairings", post(identity::create_pairing))
