@@ -4897,10 +4897,11 @@ async fn multipart_audio_follows_the_component_in_every_part() {
     }
     let f = Fixture::new().await;
     // "Stereo" is 440 Hz and "Director" 880 Hz in both parts, in opposite
-    // stream orders; both English with no roles.
+    // stream orders; both English with no roles. Matroska keeps stream
+    // titles (MP4 drops them, which would make the two indistinguishable).
     for (name, first, second) in [
-        ("a-part.mp4", ("Stereo", "440"), ("Director", "880")),
-        ("b-part.mp4", ("Director", "880"), ("Stereo", "440")),
+        ("a-part.mkv", ("Stereo", "440"), ("Director", "880")),
+        ("b-part.mkv", ("Director", "880"), ("Stereo", "440")),
     ] {
         let (a, b) = (
             format!("sine=frequency={}:sample_rate=48000", first.1),
