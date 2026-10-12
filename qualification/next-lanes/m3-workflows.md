@@ -1,7 +1,7 @@
 # Lane N1 — M3 library workflows ledger
 
 Plan: `MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md` section 11.2.
-Worktree `/Volumes/seed1/Projects/motion-m3-workflows`, branch `m3-workflows`.
+Branch `m3-workflows` (dedicated lane worktree).
 Starting SHA: `c6d6e266c76f0ea7ec1274bca10e30f9b4bdf658` (origin/main, 2026-10-11).
 
 This ledger keeps implementation, missing wiring, unsupported cases, focused
