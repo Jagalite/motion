@@ -141,13 +141,14 @@ was updated to read either format.
 
 ## 7. Deferred release checks
 
-- Electron run of the agent inside the desktop host against a remote HTTPS
-  server, followed by Demuxe playback of the agent-published root. The existing
-  `run-offline.mjs` proves Demuxe playback from a cache root, but its root is a
-  synthetic fixture.
-- Installed-package run (packaged `motion-ui-host` used as the cache tool),
-  long-duration and large-file (multi-GB) transfer, interrupted network, and a
-  physical out-of-space volume.
-- Multiple profiles and servers on one device with the root picker.
-- Restored-server recovery flow (C08).
-- Independent GPT-6.1 Sol review: not available to this session; requested in the PR.
+| Check | Exact fixture | Owner |
+|---|---|---|
+| Electron agent inside the desktop host against a remote HTTPS server, then Demuxe playback of the agent-published root (not a synthetic root) | `run-download-workflow.mjs` media (12 s H.264/AAC MP4, 320x180) published by the agent; `run-offline.mjs` driven against `currentRoot(offline-cache)` | A11/A12 with A13 |
+| Installed-package run: packaged `motion-ui-host` as the cache tool, `userData/offline-cache` roots | Release package bytes from A14; same fixture as above | A14 (release) with A13 |
+| Large-file and long-duration transfer, interrupted network, resume across app restart | ≥ 4 GiB MP4 original on a remote server; network cut at ~50 % twice; app quit mid-transfer | A13 |
+| Physical out-of-space during publication | Volume with free space smaller than the media plus 1 GiB headroom | A13 |
+| Multiple accounts, profiles and servers on one device with an offline root picker | Two servers × two profiles, one download each | A11/A12 (picker UI) with A13 |
+| Restored or replaced server recovery | Backup taken before an offline session, restored after it; device reconnects | A02/A07 (C08) with A13 |
+| Server retention of `offline_events` | 10,000+ events per device and profile | A13 with A02 |
+| Device transfer-state reporting (`transferring`, `verified_local`, `failed`) | Requires a new contract operation | A00 (contract) with A13 |
+| Independent GPT-6.1 Sol review of the commits and final diff | This PR | Lane owner; not available to the implementing session |
