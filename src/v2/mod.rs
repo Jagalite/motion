@@ -12,6 +12,7 @@ pub mod identity;
 pub mod jobs;
 pub mod libraries;
 pub mod metadata;
+pub mod monitor;
 pub mod organization;
 pub mod playback;
 pub mod processing;
@@ -807,6 +808,7 @@ pub fn router() -> Router<App> {
         .merge(schedules::routes())
         .merge(jobs::routes())
         .merge(admin::routes())
+        .merge(monitor::routes())
         .merge(metadata::routes())
         .merge(playback::routes())
         .merge(processing::routes())

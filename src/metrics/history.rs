@@ -21,7 +21,7 @@ const STORAGE_INTERVAL_SECONDS: u64 = 60;
 const PRUNE_LIMIT: i64 = 4_096;
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(3);
 
-const SERIES: [(&str, &str, &str); 15] = [
+const SERIES: [(&str, &str, &str); 18] = [
     ("process.cpu_seconds_total", "counter", "seconds"),
     ("process.resident_bytes", "gauge", "bytes"),
     ("process.open_files", "gauge", "count"),
@@ -37,6 +37,9 @@ const SERIES: [(&str, &str, &str); 15] = [
     ("storage.asset_bytes", "gauge", "bytes"),
     ("storage.temporary_bytes", "gauge", "bytes"),
     ("storage.free_bytes", "gauge", "bytes"),
+    ("playback.sessions_active", "gauge", "count"),
+    ("playback.bytes_sent_total", "counter", "bytes"),
+    ("playback.transcodes_active", "gauge", "count"),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -333,6 +336,7 @@ async fn sample(app: &App, pool: &SqlitePool, run_id: &str, writes: &Writes) -> 
     };
     tx.commit().await?;
     let at = now_millis();
+    let playback = app.processing.deliveries.playback_counts();
     let mut values = vec![
         (
             "process.cpu_seconds_total",
@@ -348,6 +352,16 @@ async fn sample(app: &App, pool: &SqlitePool, run_id: &str, writes: &Writes) -> 
         ),
         ("jobs.queued", queued.to_string()),
         ("jobs.running", running.to_string()),
+        ("playback.sessions_active", playback.0.to_string()),
+        (
+            "playback.bytes_sent_total",
+            app.processing
+                .deliveries
+                .bytes_sent
+                .load(Ordering::Relaxed)
+                .to_string(),
+        ),
+        ("playback.transcodes_active", playback.1.to_string()),
         (
             "db.busy_total",
             crate::v2::system::DB_BUSY_COUNT
@@ -713,7 +727,7 @@ mod tests {
         .validate(now)
         .unwrap();
         let history = read_pool(&pool, window, now).await.unwrap();
-        assert_eq!(history.series.len(), 15);
+        assert_eq!(history.series.len(), 18);
         let counters = &history
             .series
             .iter()

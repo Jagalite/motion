@@ -15,6 +15,7 @@ use axum::{
 };
 use playscale_core::{
     delivery::{self as core, Delivery, Effect, Input, Operation, Pin},
+    playback_monitor as monitor,
     playback_session::{Owner, Route},
     work::Class,
 };
@@ -108,6 +109,20 @@ pub struct Runtime {
     /// Concurrent subtitle conversions (each reads the whole source once).
     subtitle_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
+    /// Bytes sent to clients for all deliveries since this process started.
+    pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+    /// Ended v2 deliveries whose history row is not yet written: waiting for
+    /// responses still being sent, or for a failed write to be retried.
+    finishing: Mutex<Vec<Finishing>>,
+}
+
+/// An ended delivery's monitoring, kept until its history row commits.
+struct Finishing {
+    id: String,
+    telemetry: Arc<crate::playback_monitor::Telemetry>,
+    mode: &'static str,
+    duration_ms: Option<u64>,
+    ended_ms: u64,
 }
 
 #[derive(Clone)]
@@ -166,6 +181,8 @@ struct Session {
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
+    /// Observed transfer and playback, for administrator monitoring only.
+    telemetry: Arc<crate::playback_monitor::Telemetry>,
 }
 
 impl Runtime {
@@ -178,6 +195,8 @@ impl Runtime {
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: Arc::default(),
+            finishing: Mutex::default(),
         }
     }
     /// Monotonic milliseconds for lease and drain deadlines.
@@ -198,6 +217,23 @@ impl Runtime {
     }
     pub fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+    /// Live v2 (owned) deliveries and how many of them transcode.
+    pub fn playback_counts(&self) -> (usize, usize) {
+        let sessions = self.sessions.lock().unwrap();
+        let owned = sessions.values().filter(|s| s.owner.is_some());
+        let mut total = 0;
+        let mut transcodes = 0;
+        for session in owned {
+            total += 1;
+            if crate::playback_monitor::mode(current_operation(
+                &session.inner.lock().unwrap().delivery,
+            )) == "transcode"
+            {
+                transcodes += 1;
+            }
+        }
+        (total, transcodes)
     }
     /// Live (encoding, byte-route) deliveries. A delivery whose generations
     /// include a segmented one counts as encoding.
@@ -258,9 +294,40 @@ fn transition_locked(
     input: &Input,
 ) -> Result<Delivery, core::Error> {
     let (next, effects) = core::transition(&inner.delivery, input)?;
+    // Monitoring follows the reducer's decisions: the playhead it accepted,
+    // and the step that ended playback with its reason.
+    let stopping = app
+        .processing
+        .deliveries
+        .stopping
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let ended = monitor::end_reason(&inner.delivery, input, &next, stopping);
+    if let Some((generation, sequence, position)) =
+        monitor::accepted_playhead(&inner.delivery, &next)
+    {
+        session.telemetry.playhead(generation, sequence, position);
+    }
+    if let Some(reason) = ended {
+        session.telemetry.end(reason);
+    }
+    // Generations are cleaned up before a delivery leaves memory; the mode
+    // its history keeps is the last one its active generation had while it
+    // was live (a retiring generation never replaces it).
+    if !next.status.fenced()
+        && let Some(generation) = next.active.and_then(|g| next.generations.get(&g))
+    {
+        session
+            .telemetry
+            .set_mode(crate::playback_monitor::mode(generation.pin.operation));
+    }
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
-        persist(app, session, &next);
+        persist(
+            app,
+            session,
+            &next,
+            ended.filter(|_| session.owner.is_some()),
+        );
     }
     inner.delivery = next.clone();
     dispatch(app, session, inner, effects);
@@ -272,14 +339,25 @@ const RECORD_RETENTION_SECONDS: i64 = 7 * 86_400;
 
 /// Record the delivery's state for diagnostics and restart recovery. Written
 /// when its status or generations change; a newer revision is never replaced.
-fn persist(app: &App, session: &Session, d: &Delivery) {
+fn persist(app: &App, session: &Session, d: &Delivery, ended: Option<monitor::EndReason>) {
     let app = app.clone();
     let id = session.id.clone();
     let file_id = session.file_id.clone();
     let file_revision = session.revision.clone();
     let d = d.clone();
     tokio::spawn(async move {
-        if let Err(error) = record(&app.db, &id, &file_id, &file_revision, &d).await {
+        let result = async {
+            record(&app.db, &id, &file_id, &file_revision, &d).await?;
+            // Why playback ended, for recovery after a crash. An acknowledged
+            // close records it in its own transaction (`close_live`).
+            if let Some(reason) = ended {
+                let mut conn = app.db.acquire().await?;
+                crate::playback_monitor::record_end(&mut conn, &id, reason).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
             tracing::warn!(?error, "could not record delivery state");
         }
     });
@@ -1869,18 +1947,50 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
 /// Tick every session; forget sessions whose workers and files are gone.
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut ticks: u64 = 0;
     loop {
         tokio::select! {
             _ = stop.cancelled() => {
                 app.processing.deliveries.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
-                let _admission = app.processing.deliveries.admission.lock().await;
+                // One budget for recording, draining and retrying, inside the
+                // time the process gives this worker.
+                let stopped = crate::playback_monitor::wall_ms();
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(
+                    monitor::SHUTDOWN_DRAIN_MS + monitor::SHUTDOWN_RETRY_MS,
+                );
+                // Admission refuses new deliveries once stopping; waiting for an
+                // admission in progress is bounded like everything else here.
+                let _admission = tokio::time::timeout_at(deadline, app.processing.deliveries.admission.lock()).await;
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
-                    if let Ok(state) = apply(&app, &session, Input::Close)
-                        && let Err(error) = record(&app.db, &session.id, &session.file_id, &session.revision, &state).await
-                    {
-                        tracing::warn!(?error, "could not record delivery shutdown");
+                    // Closing is in memory; recording it waits for the
+                    // database only until the deadline (recovery fences a
+                    // delivery whose close was not recorded).
+                    if let Ok(state) = apply(&app, &session, Input::Close) {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            record(&app.db, &session.id, &session.file_id, &session.revision, &state),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(?error, "could not record delivery shutdown"),
+                            Err(_) => tracing::warn!("delivery shutdown not recorded before the deadline"),
+                        }
                     }
+                    finishing(&app, &session, stopped);
+                }
+                // Graceful HTTP shutdown is still sending responses: wait for
+                // them briefly, and keep retrying failed writes. Rows left
+                // after that are finished by startup recovery with the
+                // reason recorded.
+                loop {
+                    settle(&app, Some(deadline)).await;
+                    let queued = app.processing.deliveries.finishing.lock().unwrap().len();
+                    if !monitor::keep_finishing(queued, stopped, crate::playback_monitor::wall_ms()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 return Ok(());
             }
@@ -1895,12 +2005,23 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             .values()
             .cloned()
             .collect();
+        ticks += 1;
+        let mut monitored = Vec::new();
         for session in sessions {
             revalidate(&app, &session).await;
             let now = app.processing.deliveries.now_ms();
             let Ok(state) = apply(&app, &session, Input::Tick { now_ms: now }) else {
                 continue;
             };
+            session.telemetry.tick();
+            if session.owner.is_some() && !state.status.fenced() {
+                monitored.push(crate::playback_monitor::Live {
+                    id: session.id.clone(),
+                    telemetry: session.telemetry.clone(),
+                    status: state.status,
+                    mode: crate::playback_monitor::mode(current_operation(&state)),
+                });
+            }
             if state.status.fenced() && state.generations.is_empty() {
                 if let Err(error) = record(
                     &app.db,
@@ -1917,6 +2038,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                     );
                     continue;
                 }
+                finishing(&app, &session, crate::playback_monitor::wall_ms());
                 app.processing
                     .deliveries
                     .sessions
@@ -1935,7 +2057,266 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 }
             }
         }
+        settle(&app, None).await;
+        // Monitoring writes are observations: a failure is logged and retried
+        // on the next flush, never allowed to affect delivery.
+        if ticks.is_multiple_of(5)
+            && let Err(error) = {
+                monitored.extend(draining(&app));
+                crate::playback_monitor::flush(&app.db, &monitored).await
+            }
+        {
+            tracing::warn!(
+                code = "playback_monitor_flush_failed",
+                ?error,
+                "playback monitoring not recorded"
+            );
+        }
+        if ticks.is_multiple_of(60)
+            && let Err(error) = crate::playback_monitor::prune(&app.db).await
+        {
+            tracing::warn!(
+                code = "playback_monitor_prune_failed",
+                ?error,
+                "playback history not pruned"
+            );
+        }
     }
+}
+
+/// Hand an ended v2 delivery's monitoring to `settle` as it leaves memory.
+fn finishing(app: &App, session: &Session, ended_ms: u64) {
+    if session.owner.is_none() {
+        return;
+    }
+    let duration_ms = session.inner.lock().unwrap().delivery.duration_ms;
+    app.processing
+        .deliveries
+        .finishing
+        .lock()
+        .unwrap()
+        .push(Finishing {
+            id: session.id.clone(),
+            telemetry: session.telemetry.clone(),
+            mode: session.telemetry.mode(),
+            duration_ms,
+            ended_ms,
+        });
+}
+
+/// Write the history rows of ended deliveries once their responses are done
+/// or the drain allowance passed. A row whose write fails stays queued with
+/// its telemetry and is retried next time. While stopping, every attempt is
+/// bounded by `deadline`, so a busy database cannot outlast the time the
+/// process gives this worker.
+async fn settle(app: &App, deadline: Option<tokio::time::Instant>) {
+    let wall = crate::playback_monitor::wall_ms();
+    let ready: Vec<_> = app
+        .processing
+        .deliveries
+        .finishing
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            monitor::settled(
+                f.telemetry.open_responses(),
+                f.ended_ms,
+                wall,
+                deadline.is_some(),
+            )
+        })
+        .map(|f| (f.id.clone(), f.telemetry.clone(), f.mode))
+        .collect();
+    for (id, telemetry, mode) in ready {
+        let write = async {
+            let mut tx = crate::db::begin_write(&app.db).await?;
+            crate::playback_monitor::finish(
+                &mut tx,
+                &id,
+                &telemetry,
+                mode,
+                monitor::EndReason::Closed,
+            )
+            .await?;
+            tx.commit().await
+        };
+        let result = match deadline {
+            None => write.await.map_err(|e| e.to_string()),
+            Some(deadline) => {
+                // A short attempt, so a failure leaves time to retry.
+                let attempt = deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_millis(500));
+                match tokio::time::timeout(attempt, write).await {
+                    Ok(result) => result.map_err(|e| e.to_string()),
+                    Err(_) => Err("timed out".into()),
+                }
+            }
+        };
+        match result {
+            Ok(()) => app
+                .processing
+                .deliveries
+                .finishing
+                .lock()
+                .unwrap()
+                .retain(|f| f.id != id),
+            Err(error) => tracing::warn!(
+                code = "playback_monitor_finish_failed",
+                %error,
+                "playback history not finished; retrying"
+            ),
+        }
+    }
+}
+
+/// Ended deliveries still draining, as the periodic flush writes them: their
+/// status is closing until their history row is finished.
+fn draining(app: &App) -> Vec<crate::playback_monitor::Live> {
+    app.processing
+        .deliveries
+        .finishing
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|f| crate::playback_monitor::Live {
+            id: f.id.clone(),
+            telemetry: f.telemetry.clone(),
+            status: playscale_core::delivery::Status::Closing,
+            mode: f.mode,
+        })
+        .collect()
+}
+
+/// The operation producing a delivery's bytes: its active generation's, else
+/// its newest.
+fn current_operation(d: &Delivery) -> playscale_core::delivery::Operation {
+    d.active
+        .and_then(|g| d.generations.get(&g))
+        .or_else(|| d.generations.values().next_back())
+        .map_or(playscale_core::delivery::Operation::Original, |g| {
+            g.pin.operation
+        })
+}
+
+/// A live v2 delivery, as the administrator monitor shows it.
+pub(crate) struct Monitored {
+    pub id: String,
+    pub status: playscale_core::delivery::Status,
+    pub mode: &'static str,
+    pub duration_ms: Option<u64>,
+    pub telemetry: Arc<crate::playback_monitor::Telemetry>,
+}
+
+/// Every live v2 delivery, newest first.
+pub(crate) fn monitored(app: &App) -> Vec<Monitored> {
+    let sessions: Vec<_> = app
+        .processing
+        .deliveries
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    let mut out: Vec<Monitored> = sessions
+        .iter()
+        .filter_map(|s| {
+            s.owner.as_ref()?;
+            let inner = s.inner.lock().unwrap();
+            Some(Monitored {
+                id: s.id.clone(),
+                status: inner.delivery.status,
+                mode: crate::playback_monitor::mode(current_operation(&inner.delivery)),
+                duration_ms: inner.delivery.duration_ms,
+                telemetry: s.telemetry.clone(),
+            })
+        })
+        .collect();
+    // Ended, but still sending responses or awaiting their history write.
+    out.extend(
+        app.processing
+            .deliveries
+            .finishing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| Monitored {
+                id: f.id.clone(),
+                status: playscale_core::delivery::Status::Closing,
+                mode: f.mode,
+                duration_ms: f.duration_ms,
+                telemetry: f.telemetry.clone(),
+            }),
+    );
+    out.sort_by(|a, b| {
+        b.telemetry
+            .started_ms
+            .cmp(&a.telemetry.started_ms)
+            .then(a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Reserve a stream response against its live delivery as the request is
+/// admitted, before any preparation is awaited: a close meanwhile then waits
+/// for it, and its bytes are counted (`count`).
+pub(crate) fn transfer(app: &App, id: &str) -> Option<crate::playback_monitor::Transfer> {
+    // Under the map lock: eviction removes a delivery under it before its
+    // history can be written, so a reservation either precedes eviction (and
+    // the write waits for it) or finds no delivery.
+    let sessions = app.processing.deliveries.sessions.lock().unwrap();
+    sessions
+        .get(id)
+        .map(|session| crate::playback_monitor::Transfer::begin(session.telemetry.clone()))
+}
+
+/// Count a response's bytes into the transfer reserved for it.
+pub(crate) fn count(
+    transfer: Option<crate::playback_monitor::Transfer>,
+    response: Response,
+) -> Response {
+    match transfer {
+        Some(transfer) => transfer.wrap(response),
+        None => response,
+    }
+}
+
+/// Reserve a direct file read against the reader's live delivery of that
+/// file and of the revision it serves: direct play fetches the file's own
+/// URL, which names its delivery and pins its revision. Without a name only
+/// an unambiguous delivery is used; otherwise nothing is counted (a
+/// download, or a client reading without a delivery).
+pub(crate) fn file_transfer(
+    app: &App,
+    principal: &str,
+    file_id: &str,
+    served_revision: &str,
+    named: Option<&str>,
+) -> Option<crate::playback_monitor::Transfer> {
+    // Selected and reserved under the map lock, like `transfer`.
+    let sessions = app.processing.deliveries.sessions.lock().unwrap();
+    let live: Vec<&Arc<Session>> = sessions
+        .values()
+        .filter(|s| {
+            s.owner
+                .as_ref()
+                .is_some_and(|o| o.principal == principal && o.file == file_id)
+                && !s.inner.lock().unwrap().delivery.status.fenced()
+        })
+        .collect();
+    let candidates: Vec<(&str, &str)> = live
+        .iter()
+        .filter_map(|s| {
+            let owner = s.owner.as_ref()?;
+            Some((s.id.as_str(), owner.file_revision.as_str()))
+        })
+        .collect();
+    let id = monitor::attribute(named, served_revision, &candidates)?;
+    live.iter()
+        .find(|s| s.id == id)
+        .map(|s| crate::playback_monitor::Transfer::begin(s.telemetry.clone()))
 }
 
 /// Live output never resumes after a restart. Encoders of the previous process
@@ -1955,6 +2336,8 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
     )
     .fetch_all(&mut *transaction)
     .await?;
+    // Monitoring rows of the previous process end as interrupted.
+    crate::playback_monitor::recover(&mut transaction).await?;
     for (id, state) in live {
         let delivery: Delivery = serde_json::from_str(&state)?;
         // Workers died with the old process; their files are handled below.
@@ -2727,6 +3110,8 @@ pub(crate) struct Planned {
     pub owner: Owner,
     pub version: String,
     pub route: Route,
+    /// Where the requesting client connected from, for monitoring only.
+    pub network: &'static str,
     /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
     pub sidecar: Option<Sidecar>,
     /// An embedded bitmap subtitle burned into the converted video.
@@ -2878,14 +3263,23 @@ pub(crate) async fn close_live(
     let session = app.processing.deliveries.session(id)?;
     let state = apply(app, &session, Input::Close).map_err(error)?;
     record(
-        conn,
+        &mut *conn,
         &session.id,
         &session.file_id,
         &session.revision,
         &state,
     )
     .await
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+    // The acknowledged close and why playback ended commit together.
+    if session.owner.is_some()
+        && let Some(reason) = session.telemetry.ended()
+    {
+        crate::playback_monitor::record_end(conn, &session.id, reason)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(())
 }
 
 /// Exact streams for a planned replan. The source file stays the delivery's.
@@ -3601,6 +3995,15 @@ async fn admit_owned(
             copy_peaks: HashMap::new(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
+        telemetry: Arc::new({
+            let telemetry = crate::playback_monitor::Telemetry::new(
+                planned.as_ref().map_or("unknown", |p| p.network),
+                Some(r.start_ms),
+                runtime.bytes_sent.clone(),
+            );
+            telemetry.set_mode(crate::playback_monitor::mode(current_operation(&delivery)));
+            telemetry
+        }),
     });
     // Byte routes run no encoder and do not consume encoding delivery slots.
     let (encoding, bytes) = runtime.counts();
@@ -3633,6 +4036,21 @@ async fn admit_owned(
             .bind(crate::now())
             .execute(&mut *transaction)
             .await?;
+        // The monitoring row commits with the admission it describes.
+        crate::playback_monitor::start(
+            &mut transaction,
+            crate::playback_monitor::Started {
+                delivery_id: &session.id,
+                principal_id: &owner.principal,
+                profile_id: &owner.profile,
+                timeline_id: &owner.timeline,
+                version_id: version,
+                file_id: &owner.file,
+                mode: crate::playback_monitor::mode(current_operation(&delivery)),
+            },
+            &session.telemetry,
+        )
+        .await?;
     }
     if let Some(identity) = identity {
         sqlx::query("INSERT INTO delivery_admissions(principal,request_key,request_digest,delivery_id,acknowledgement_json,created_at) VALUES (?,?,?,?,?,?)")
@@ -3652,9 +4070,22 @@ async fn admit_owned(
         return Err(error.into());
     }
     // No await between durable admission and registration/dispatch. The owned
-    // task survives a dropped HTTP waiter; shutdown serializes on admission.
+    // task survives a dropped HTTP waiter; shutdown serializes on admission,
+    // but only until its deadline: publication checks stopping under the map
+    // lock shutdown snapshots under, so a delivery is either published before
+    // that snapshot (and closed by it) or never published. An unpublished
+    // admission is fenced by startup recovery, like one a crash interrupted.
     {
         let mut sessions = runtime.sessions.lock().unwrap();
+        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(sessions);
+            let _ = std::fs::remove_dir(&directory);
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_stopping",
+                "Delivery admission is closed",
+            ));
+        }
         dispatch(app, &session, &mut session.inner.lock().unwrap(), effects);
         sessions.insert(session.id.clone(), session.clone());
     }

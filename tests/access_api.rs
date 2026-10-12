@@ -2572,7 +2572,7 @@ async fn metrics_history_is_admin_only_and_advertised_with_limits() {
     assert_eq!(history.status, StatusCode::OK, "{}", history.body);
     assert_eq!(history.body["interval_seconds"], 10);
     assert_eq!(history.body["retention_seconds"], 86400);
-    assert_eq!(history.body["series"].as_array().unwrap().len(), 15);
+    assert_eq!(history.body["series"].as_array().unwrap().len(), 18);
     let actual: std::collections::BTreeSet<_> = history.body["series"]
         .as_array()
         .unwrap()
@@ -2603,6 +2603,9 @@ async fn metrics_history_is_admin_only_and_advertised_with_limits() {
             ("storage.asset_bytes", "gauge", "bytes"),
             ("storage.temporary_bytes", "gauge", "bytes"),
             ("storage.free_bytes", "gauge", "bytes"),
+            ("playback.sessions_active", "gauge", "count"),
+            ("playback.bytes_sent_total", "counter", "bytes"),
+            ("playback.transcodes_active", "gauge", "count"),
         ])
     );
     assert!(

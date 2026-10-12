@@ -1096,6 +1096,8 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
     assert_eq!(ready["pending"]["status"], "ready", "{ready}");
     let start = ready["pending"]["available_start_ms"].as_u64().unwrap();
     assert!(start <= 60000 && ready["pending"]["available_end_ms"].as_u64().unwrap() > 60000);
+    let live_mode = monitored(&f, &id).await["mode"].clone();
+    assert_ne!(live_mode, "direct");
     let closed = f
         .call("DELETE", &path, None, &[("authorization", &auth)])
         .await;
@@ -1106,6 +1108,9 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         StatusCode::NOT_FOUND,
         "not_found",
     );
+    // History keeps how the bytes were produced after the generations that
+    // produced them are cleaned up.
+    assert_eq!(finished(&f, &id).await["mode"], live_mode);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5537,4 +5542,382 @@ async fn recovery_keeps_an_adaptive_encoders_two_execution_units() {
     .expect("the adaptive encoder's units were not released");
     assert!(single.exists());
     drop(single_held);
+}
+
+/// The administrator's view of a delivery, once it lists it.
+async fn monitored(f: &Fixture, id: &str) -> Value {
+    let reply = f
+        .get("/api/v2/admin/playback/sessions", &bearer(OPERATOR))
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    reply.body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["delivery_id"] == id)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Wait for a finished history entry for `id`.
+async fn finished(f: &Fixture, id: &str) -> Value {
+    for _ in 0..300 {
+        let reply = f
+            .get(
+                "/api/v2/admin/playback/history?limit=200",
+                &bearer(OPERATOR),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+        if let Some(entry) = reply.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["delivery_id"] == id)
+        {
+            return entry.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("delivery {id} never reached playback history");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let mut f = Fixture::new().await;
+    two_audio_mp4(&f, "20");
+    f.scan().await;
+    let (timeline, item) = f.timeline().await;
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+
+    // Administrators only, on both endpoints.
+    for path in [
+        "/api/v2/admin/playback/sessions",
+        "/api/v2/admin/playback/history",
+    ] {
+        problem(
+            &f.get(path, &auth).await,
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        );
+        let anonymous = f.call("GET", path, None, &[]).await;
+        assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    }
+    let capabilities = f.get("/api/v2/system/capabilities", &auth).await;
+    let feature = capabilities.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "admin.playback_sessions")
+        .cloned()
+        .unwrap();
+    assert_eq!(feature["enabled"], true);
+    assert_eq!(feature["limits"]["history_retention_days"], "90");
+
+    let d = admit_original(&f, &auth, &timeline, "monitor-delivery-0001", 0).await;
+    let id = d["id"].as_str().unwrap().to_owned();
+    let listed = monitored(&f, &id).await;
+    assert_eq!(listed["device"]["id"], device);
+    assert_eq!(listed["device"]["name"], "Living room");
+    assert_eq!(listed["profile"]["id"], "default");
+    assert_eq!(listed["item"]["id"], item);
+    assert_eq!(listed["timeline_id"], timeline);
+    assert_eq!(listed["mode"], "direct");
+    // In-process requests carry no peer address.
+    assert_eq!(listed["client_network"], "unknown");
+    assert_eq!(listed["bytes_sent"], "0");
+
+    // Bytes through the delivery's own content route (a range) and through the
+    // file URL direct play uses, attributed to this principal's delivery.
+    let generation = d["active"]["generation"].as_str().unwrap().to_owned();
+    let ranged = f
+        .call(
+            "GET",
+            &format!("/api/v2/streams/{id}/{generation}/content"),
+            None,
+            &[("authorization", &auth), ("range", "bytes=0-4095")],
+        )
+        .await;
+    assert_eq!(ranged.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.bytes.len(), 4096);
+    let media = d["active"]["media_url"].as_str().unwrap().to_owned();
+    let whole = f
+        .call("GET", &media, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(whole.status, StatusCode::OK);
+    let expected = 4096 + whole.bytes.len() as u64;
+    // Another principal's reads of the same file are not this delivery's.
+    let (_, other) = f.device(&["default"], PLAYER).await;
+    let foreign = f
+        .call("GET", &media, None, &[("authorization", &other)])
+        .await;
+    assert_eq!(foreign.status, StatusCode::OK);
+    // Direct-play URLs name their delivery, so a second delivery of the same
+    // file on the same device is charged only for its own reads, and a read
+    // that names none is not guessed between them.
+    assert!(media.contains(&format!("delivery={id}")), "{media}");
+    let twin = admit_original(&f, &auth, &timeline, "monitor-delivery-0003", 0).await;
+    let twin_id = twin["id"].as_str().unwrap().to_owned();
+    let twin_media = twin["active"]["media_url"].as_str().unwrap().to_owned();
+    let read = f
+        .call(
+            "GET",
+            &twin_media,
+            None,
+            &[("authorization", &auth), ("range", "bytes=0-999")],
+        )
+        .await;
+    assert_eq!(read.status, StatusCode::PARTIAL_CONTENT);
+    let unnamed = media.split("&delivery=").next().unwrap().to_owned();
+    let ambiguous = f
+        .call("GET", &unnamed, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(ambiguous.status, StatusCode::OK);
+    assert_eq!(monitored(&f, &twin_id).await["bytes_sent"], "1000");
+    // A response still being sent when its delivery closes: the session shows
+    // as closing (and administrators are told) until the response is done,
+    // and its bytes reach history.
+    let twin_generation = twin["active"]["generation"].as_str().unwrap().to_owned();
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v2/streams/{twin_id}/{twin_generation}/content"
+                ))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let hints = |f: &Fixture, id: String| {
+        let db = f.server.app.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM change_events WHERE topic='playback_sessions' AND resource_id=? AND kind='changed'",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let before = hints(&f, twin_id.clone()).await;
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{twin_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    let mut announced = false;
+    for _ in 0..100 {
+        if monitored(&f, &twin_id).await["status"] == "closing"
+            && hints(&f, twin_id.clone()).await > before
+        {
+            announced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        announced,
+        "a draining session is shown and announced as closing"
+    );
+    let twin_rest = held.into_body().collect().await.unwrap().to_bytes().len();
+    let entry = finished(&f, &twin_id).await;
+    assert_eq!(entry["bytes_sent"], (1000 + twin_rest).to_string());
+
+    // A playhead from the player.
+    let beat = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/heartbeat"),
+            &auth,
+            None,
+            json!({"active_generation": generation, "playhead": {"sequence": "1", "position_ms": 1500}}),
+        )
+        .await;
+    assert_eq!(beat.status, StatusCode::OK, "{:?}", beat.body);
+    // A conflicting report (same sequence, another position) is refused by
+    // the delivery and changes nothing the administrator sees.
+    let conflict = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/heartbeat"),
+            &auth,
+            None,
+            json!({"active_generation": generation, "playhead": {"sequence": "1", "position_ms": 9000}}),
+        )
+        .await;
+    assert_ne!(conflict.status, StatusCode::OK);
+    let listed = monitored(&f, &id).await;
+    assert_eq!(listed["bytes_sent"], expected.to_string());
+    assert_eq!(listed["position_ms"], 1500);
+    assert!(["playing", "paused", "starting"].contains(&listed["status"].as_str().unwrap()));
+
+    // Change hints exist for the session (administrative topic).
+    let hints: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM change_events WHERE topic='playback_sessions' AND resource_id=?",
+    )
+    .bind(&id)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    assert!(hints >= 1);
+
+    // Closing ends the session; its history keeps the final counters.
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.body);
+    let entry = finished(&f, &id).await;
+    assert_eq!(entry["end_reason"], "closed");
+    assert_eq!(entry["bytes_sent"], expected.to_string());
+    assert_eq!(entry["device"]["name"], "Living room");
+    assert_eq!(entry["item"]["id"], item);
+    assert_eq!(entry["start_position_ms"], 0);
+    assert_eq!(entry["end_position_ms"], 1500);
+    assert!(monitored(&f, &id).await.is_null());
+
+    // Filters select by device, profile and item; bad input is refused.
+    let mine = f
+        .get(
+            &format!("/api/v2/admin/playback/history?device_id={device}&item_id={item}"),
+            &bearer(OPERATOR),
+        )
+        .await;
+    // This delivery and its twin, both closed.
+    assert_eq!(mine.body["items"].as_array().unwrap().len(), 2);
+    let none = f
+        .get(
+            "/api/v2/admin/playback/history?profile_id=kids",
+            &bearer(OPERATOR),
+        )
+        .await;
+    assert!(none.body["items"].as_array().unwrap().is_empty());
+    for bad in ["?since=yesterday", "?limit=0", "?cursor=x", "?unknown=1"] {
+        let reply = f
+            .get(
+                &format!("/api/v2/admin/playback/history{bad}"),
+                &bearer(OPERATOR),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}: {:?}",
+            reply.body
+        );
+    }
+
+    // A delivery live when the process stops ends as interrupted, with the
+    // counters last written (every few seconds while live).
+    let d = admit_original(&f, &auth, &timeline, "monitor-delivery-0002", 0).await;
+    let second = d["id"].as_str().unwrap().to_owned();
+    let generation = d["active"]["generation"].as_str().unwrap().to_owned();
+    let read = f
+        .call(
+            "GET",
+            &format!("/api/v2/streams/{second}/{generation}/content"),
+            None,
+            &[("authorization", &auth), ("range", "bytes=0-9999")],
+        )
+        .await;
+    assert_eq!(read.bytes.len(), 10_000);
+    for _ in 0..80 {
+        let written: i64 = sqlx::query_scalar(
+            "SELECT bytes_sent FROM playback_monitor_sessions WHERE delivery_id=?",
+        )
+        .bind(&second)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+        if written == 10_000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // A response still being sent when the server stops (graceful HTTP
+    // shutdown keeps sending it) is waited for: its bytes reach history.
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v2/streams/{second}/{generation}/content"))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    // A clean stop finishes live sessions as server_stopped.
+    f.server.stop.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let draining: Option<i64> =
+        sqlx::query_scalar("SELECT ended_at FROM playback_monitor_sessions WHERE delivery_id=?")
+            .bind(&second)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(draining, None, "history waits for the open response");
+    let rest = held.into_body().collect().await.unwrap().to_bytes().len() as i64;
+    assert!(rest > 0);
+    let mut reason: Option<String> = None;
+    for _ in 0..100 {
+        reason = sqlx::query_scalar(
+            "SELECT end_reason FROM playback_monitor_sessions WHERE delivery_id=? AND ended_at IS NOT NULL",
+        )
+        .bind(&second)
+        .fetch_optional(&f.server.app.db)
+        .await
+        .unwrap()
+        .flatten();
+        if reason.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(reason.as_deref(), Some("server_stopped"));
+    let sent: i64 =
+        sqlx::query_scalar("SELECT bytes_sent FROM playback_monitor_sessions WHERE delivery_id=?")
+            .bind(&second)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(sent, 10_000 + rest, "the drained response is counted");
+    // An abrupt stop never finishes the row: startup recovery does, keeping a
+    // reason recorded with an ending decision (the twin was closed before the
+    // crash) and otherwise as interrupted.
+    sqlx::query(
+        "UPDATE playback_monitor_sessions SET ended_at=NULL,end_reason=NULL WHERE delivery_id=?",
+    )
+    .bind(&second)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE playback_monitor_sessions SET ended_at=NULL,end_reason='closed' WHERE delivery_id=?",
+    )
+    .bind(&twin_id)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    f.restart().await;
+    let entry = finished(&f, &second).await;
+    assert_eq!(entry["end_reason"], "interrupted");
+    assert_eq!(entry["bytes_sent"], (10_000 + rest).to_string());
+    assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
 }
