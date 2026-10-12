@@ -76,7 +76,8 @@ export function wireEvent(event) {
  * @param {(url: string, init: {range: string|null, signal: AbortSignal}) => Promise<Response>} options.fetchMedia
  * @param {(root: string, scope: object, args: string[], input?: string) => Promise<any>} options.cache
  */
-export function createDownloadAgent({base, identity, api, fetchMedia, cache, quota, headroom = 1024 ** 3, status = () => {}, signal}) {
+export function createDownloadAgent({base, identity, api, fetchMedia, cache, quota, headroom = 1024 ** 3, status = () => {}, signal,
+  stallMs = 60_000}) {
   mkdirSync(base, {recursive: true, mode: 0o700});
   const index = join(base, 'roots.json');
   const scopeFor = profile_id => ({...identity, profile_id});
@@ -176,24 +177,40 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (have < size) {
       const ticket = await api('/api/v2/content-access', {method: 'POST', idempotent: true,
         body: {purpose: 'download', delivery_id: null, generation: null, file: null, download_id: download.id, ttl_seconds: 3600}});
-      const response = await fetchMedia(ticket.url, {range: have > 0 ? `bytes=${have}-` : null, signal});
-      if (response.status === 206) {
-        const start = Number(/^bytes (\d+)-/.exec(response.headers.get('content-range') ?? '')?.[1]);
-        if (start !== have) {
-          truncateSync(staged, 0); // Restart from zero on the next pass.
-          throw new Error('The server resumed the transfer from an unexpected offset');
+      // An inactivity deadline (not a total one: large transfers are slow but
+      // steady) covers the response headers and every body chunk. A stalled
+      // transfer fails alone and resumes from its staged bytes next pass.
+      const stalled = new AbortController();
+      let timer;
+      const alive = () => { clearTimeout(timer); timer = setTimeout(() => stalled.abort(new Error('The transfer stalled')), stallMs); };
+      const transferSignal = signal ? AbortSignal.any([signal, stalled.signal]) : stalled.signal;
+      alive();
+      try {
+        const response = await fetchMedia(ticket.url, {range: have > 0 ? `bytes=${have}-` : null, signal: transferSignal});
+        if (response.status === 206) {
+          const start = Number(/^bytes (\d+)-/.exec(response.headers.get('content-range') ?? '')?.[1]);
+          if (start !== have) {
+            truncateSync(staged, 0); // Restart from zero on the next pass.
+            throw new Error('The server resumed the transfer from an unexpected offset');
+          }
+        } else if (response.status === 200) {
+          have = 0; // The server sent the whole file; start over.
+        } else {
+          throw new Error(`The server refused the transfer (${response.status})`);
         }
-      } else if (response.status === 200) {
-        have = 0; // The server sent the whole file; start over.
-      } else {
-        throw new Error(`The server refused the transfer (${response.status})`);
+        let written = have;
+        const bounded = new Transform({transform(chunk, _encoding, done) {
+          alive();
+          written += chunk.length;
+          done(written > size ? new Error('The transfer is larger than its manifest') : null, chunk);
+        }});
+        await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream(staged, {flags: have > 0 ? 'a' : 'w', mode: 0o600}), {signal: transferSignal});
+      } catch (error) {
+        if (stalled.signal.aborted && !signal?.aborted) throw stalled.signal.reason;
+        throw error;
+      } finally {
+        clearTimeout(timer);
       }
-      let written = have;
-      const bounded = new Transform({transform(chunk, _encoding, done) {
-        written += chunk.length;
-        done(written > size ? new Error('The transfer is larger than its manifest') : null, chunk);
-      }});
-      await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream(staged, {flags: have > 0 ? 'a' : 'w', mode: 0o600}), {signal});
     }
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.

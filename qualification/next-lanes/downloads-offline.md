@@ -227,6 +227,15 @@ the round-9 commit:
 |---|---|---|
 | S26 (P2) | The snapshot reserve was admitted on the cache volume, but the host created playback snapshots in the system temporary directory, possibly on another volume | Fixed. The host creates its anonymous playback snapshot inside the cache directory, so admission and snapshot use the same filesystem. The host unit test checks that the snapshot is anonymous in the given directory. |
 
+**Round 10** (at `4804aa4`, reviewed against `main` after the merge) raised
+three P2 findings and no P1. All three are fixed in the round-10 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S27 (P2) | On a timeline without a curated duration, an event naming an unknown or foreign download had no effective duration, so position checks were skipped | Fixed. Such an event has no target and is rejected (`not_found`, consuming its sequence). `tests/v2_downloads.rs` covers a foreign download ID. |
+| S28 (P2) | Recoverable crash-leftover blobs were not counted against the quota | Fixed. `Store::usage` counts every blob on disk once, plus staged bytes. A store test covers a leftover blocking admission. |
+| S29 (P2) | A media response that stopped producing bytes blocked the agent indefinitely | Fixed. An inactivity deadline (60 s, reset per chunk; not a total timeout) covers headers and body. A stalled transfer fails alone and resumes from its staged bytes next pass. Agent test covers it. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

@@ -829,7 +829,8 @@ async fn prior(
 /// duration, the effective duration is the one the event's own download (the
 /// copy that was played) was authorized with: the probed duration of its
 /// pinned original. A download of another device, profile or timeline
-/// supplies nothing.
+/// supplies nothing, and an event without an effective duration has no
+/// target (`not_found`).
 async fn target(
     conn: &mut SqliteConnection,
     principal: &Principal,
@@ -859,9 +860,14 @@ async fn target(
         .fetch_optional(&mut *conn)
         .await?,
     };
+    // Without an effective duration the event cannot be validated (an
+    // unknown or foreign download names none): it is not reconcilable here.
+    let Some(duration) = duration.filter(|d| *d > 0) else {
+        return Ok(None);
+    };
     Ok(Some(Target {
         timeline_revision: revision as u64,
-        duration_ms: duration.filter(|d| *d > 0).map(|d| d as u64),
+        duration_ms: Some(duration as u64),
     }))
 }
 

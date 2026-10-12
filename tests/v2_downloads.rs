@@ -902,11 +902,16 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
         e["timeline_revision"] = json!(revision);
         e["download_id"] = json!(played);
     }
+    // Naming no download of this device, profile and timeline leaves no
+    // effective duration: the event cannot be validated and is rejected.
+    let mut foreign = event(3, &timeline, ("0", "0"), 0, "ended");
+    foreign["timeline_revision"] = json!(revision);
+    foreign["download_id"] = json!("not-this-devices-download");
     let reply = f
         .call(
             "POST",
             "/api/v2/offline/sync",
-            Some(json!({"device_id":device,"events":[beyond, completed]})),
+            Some(json!({"device_id":device,"events":[beyond, completed, foreign]})),
             &[
                 ("authorization", &auth),
                 ("x-motion-viewing-epoch", &history),
@@ -918,7 +923,8 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
         outcomes(&reply),
         vec![
             ("rejected".into(), json!("invalid_position")),
-            ("applied".into(), Value::Null)
+            ("applied".into(), Value::Null),
+            ("rejected".into(), json!("not_found"))
         ]
     );
     let viewing = f

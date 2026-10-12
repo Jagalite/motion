@@ -413,3 +413,18 @@ fn blobs_of_ended_demands_left_by_a_crash_are_collected() {
     store.collect().unwrap();
     assert!(!orphan.exists());
 }
+
+#[test]
+fn recoverable_leftovers_count_against_the_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let store = Store::open(&root, &scope()).unwrap();
+    // A verified blob a crash left before its manifest entry was written.
+    std::fs::write(
+        root.join("blobs").join(entry("d1", b"0123456789").sha256),
+        b"0123456789",
+    )
+    .unwrap();
+    assert_eq!(store.usage().unwrap(), 10);
+    assert!(!store.admits_transfer(1, 10, 0).unwrap());
+}

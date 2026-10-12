@@ -161,14 +161,13 @@ impl Store {
         Ok(ids)
     }
 
-    /// Published bytes (each blob once) plus staged partial transfers.
+    /// Bytes on disk: every blob (each digest once) plus staged partial transfers.
     pub fn usage(&self) -> anyhow::Result<u64> {
-        let mut seen = std::collections::HashSet::new();
+        // Every blob on disk once (shared digests are one file), including
+        // verified crash leftovers a ready demand may still recover.
         let mut used = 0u64;
-        for d in &self.manifest.downloads {
-            if seen.insert(&d.sha256) {
-                used = used.saturating_add(d.size);
-            }
+        for entry in self.blobs.entries()? {
+            used = used.saturating_add(entry?.metadata()?.len());
         }
         for entry in self.staging.entries()? {
             used = used.saturating_add(entry?.metadata()?.len());

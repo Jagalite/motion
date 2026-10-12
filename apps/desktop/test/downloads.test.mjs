@@ -373,3 +373,18 @@ test('a failed transfer defers collection so its verified blob can still be reco
   await agent.pass();
   assert.ok(!fake.calls.some(c => c[1] === 'collect'));
 });
+
+test('a stalled transfer fails alone and keeps its staged bytes for resume', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, stallMs: 50,
+    api: async path => path.endsWith('/manifest') ? manifest('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async (_url, {signal}) => ({status: 200, headers: new Headers(), body: new ReadableStream({
+      start(controller) { controller.enqueue(media.subarray(0, 8)); },
+      pull() { return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason))); },
+    })})});
+  const target = agent.root('default');
+  await assert.rejects(agent.transfer({id: 'd1'}, target), /stalled/);
+  assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.part')), media.subarray(0, 8));
+  assert.ok(!fake.calls.some(c => c[1] === 'publish'));
+});
