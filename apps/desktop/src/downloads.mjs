@@ -86,11 +86,16 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     return {path: join(base, name), name, scope};
   }
 
-  /** The roots this server, principal and device own (one per profile). */
-  function ownedRoots() {
+  /** Every cache root on this device, whoever it belongs to. */
+  function managedRoots() {
     return Object.entries(readJson(index, {}))
-      .filter(([name, scope]) => ours(scope) && rootName(scope) === name && existsSync(join(base, name, 'manifest.json')))
+      .filter(([name, scope]) => rootName(scope) === name && existsSync(join(base, name, 'manifest.json')))
       .map(([name, scope]) => ({path: join(base, name), name, scope}));
+  }
+
+  /** The roots this server, principal and device own (one per profile); only these are ever removed. */
+  function ownedRoots() {
+    return managedRoots().filter(root => ours(root.scope));
   }
 
   /**
@@ -148,9 +153,10 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return true;
     }
     if (have > size) { truncateSync(staged, 0); have = 0; }
-    // One device budget across every owned root (profile), not one per root.
+    // One device budget across every managed root: other profiles, and
+    // roots kept from other servers or credentials, not one budget per root.
     let elsewhere = 0;
-    for (const other of ownedRoots()) {
+    for (const other of managedRoots()) {
       if (other.name !== target.name) elsewhere += Number((await cache(other.path, other.scope, ['status'])).usage);
     }
     const remaining = Math.max(0, quota - elsewhere);

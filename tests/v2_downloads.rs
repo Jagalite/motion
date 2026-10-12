@@ -332,6 +332,35 @@ async fn downloads_pin_exact_originals_and_grant_only_their_bytes() {
     );
     assert_eq!(f.count("SELECT count(*) FROM downloads").await, 0);
 
+    // An explicitly requested version is honoured (filtered before any bound).
+    let version: String =
+        sqlx::query_scalar("SELECT v.id FROM media_versions v WHERE v.timeline_id=?")
+            .bind(&timeline)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    let mut pinned = input(&device, &timeline);
+    pinned["version_id"] = json!(version);
+    let explicit = f
+        .post("/api/v2/downloads", &auth, "download-key-0010", pinned)
+        .await;
+    assert_eq!(explicit.status, StatusCode::ACCEPTED, "{:?}", explicit.body);
+    let explicit_id = explicit.body["id"].as_str().unwrap().to_owned();
+    let gone = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/downloads/{explicit_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    sqlx::query("DELETE FROM downloads WHERE id=?")
+        .bind(&explicit_id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
     let created = f
         .post(
             "/api/v2/downloads",

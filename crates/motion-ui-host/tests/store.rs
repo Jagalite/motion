@@ -324,15 +324,19 @@ fn a_crashed_publication_is_recovered_without_another_transfer() {
     std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
     assert!(store.recover(entry("d1", media)).unwrap());
     assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
-    // A corrupted leftover is refused, not published.
+    // A corrupted leftover is discarded, not published, so the download can
+    // be transferred afresh.
     let other = b"another title";
-    std::fs::write(
-        root.join("blobs").join(entry("d2", other).sha256),
-        b"corrupt",
-    )
-    .unwrap();
-    assert!(store.recover(entry("d2", other)).is_err());
+    let leftover = root.join("blobs").join(entry("d2", other).sha256);
+    std::fs::write(&leftover, b"corrupt").unwrap();
+    assert!(!store.recover(entry("d2", other)).unwrap());
+    assert!(!leftover.exists());
     assert_eq!(store.manifest().downloads.len(), 1);
+    stage(&root, "d2", other);
+    assert_eq!(
+        store.publish(entry("d2", other)).unwrap(),
+        Publication::Published
+    );
 }
 
 #[test]

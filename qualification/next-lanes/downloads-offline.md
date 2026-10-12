@@ -179,6 +179,15 @@ fixed in the round-3 commit:
 | S13 (P2) | The agent's index files were renamed without a directory fsync | Fixed. `current.json` and `roots.json` are synced through their directory after rename. |
 | S14 (P2) | Valid catalog titles over 1,024 UTF-8 bytes could never be cached | Fixed. The cached display title is shortened on a character boundary. Agent test covers it. |
 
+**Round 4** (at `41358b5`) raised three P2 findings and no P1. All three are
+fixed in the round-4 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S15 (P2) | Roots kept from other servers or credentials were outside the quota | Fixed. Usage is summed over every managed root on the device, and removal is still limited to owned roots. Agent test covers it. |
+| S16 (P2) | A corrupt crash-leftover blob made `recover` fail on every pass | Fixed. `Store::recover` verifies first, discards invalid bytes no published entry references, and returns `false`, so the next transfer proceeds. The real-filesystem test now re-transfers and publishes afterwards. |
+| S17 (P2) | A requested version beyond the first 100 candidates, or eligible originals crowded out by unsupported ones, were refused | Fixed. The requested version is filtered in SQL before the bound, and whole single-part available originals sort first within a 500-row window. A server test covers an explicit version. A timeline with more than 500 versions, all ineligible ahead of an eligible one, is not possible under this ordering; a timeline with more than 500 unreadable eligible originals is not separately tested. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

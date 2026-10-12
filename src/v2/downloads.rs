@@ -299,8 +299,12 @@ async fn candidates(
     conn: &mut SqliteConnection,
     principal: &Principal,
     timeline: &str,
+    version: Option<&str>,
     timeline_duration: Option<i64>,
 ) -> Result<Vec<Candidate>, Problem> {
+    // A requested version is filtered before the bound. Without one, whole
+    // single-part available originals come first, so unsupported or
+    // unavailable versions cannot crowd an eligible one out of the window.
     let rows: Vec<CandidateRow> = sqlx::query_as(
         "SELECT v.id,f.id,f.revision,b.file_revision,v.origin,f.generated,\
          (SELECT count(*) FROM version_files o WHERE o.version_id=v.id),\
@@ -308,9 +312,13 @@ async fn candidates(
          (f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1)),\
          f.relative_path,f.bytes,f.duration_seconds \
          FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
-         JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? ORDER BY v.id,f.id LIMIT 100",
+         JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND (? IS NULL OR v.id=?) \
+         ORDER BY (v.origin='original' AND f.generated=0 AND f.available=1 AND b.start_ms IS NULL AND b.end_ms IS NULL \
+         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1)) DESC,v.id,f.id LIMIT 500",
     )
     .bind(timeline)
+    .bind(version)
+    .bind(version)
     .fetch_all(&mut *conn)
     .await?;
     let mut found = Vec::with_capacity(rows.len());
@@ -404,7 +412,14 @@ pub async fn create(
             .bind(&input.timeline_id)
             .fetch_one(&mut *tx)
             .await?;
-    let found = candidates(&mut tx, &principal, &input.timeline_id, timeline_duration).await?;
+    let found = candidates(
+        &mut tx,
+        &principal,
+        &input.timeline_id,
+        input.version_id.as_deref(),
+        timeline_duration,
+    )
+    .await?;
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM downloads WHERE device_id=? AND principal_id=? AND state='ready'",
     )

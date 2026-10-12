@@ -402,6 +402,22 @@ impl Store {
         if staged_exists || !blob_exists {
             return Ok(false);
         }
+        let mut blob = self.blobs.open(&entry.sha256)?;
+        if Self::verify(&mut blob, entry.size, &entry.sha256).is_err() {
+            drop(blob);
+            // Invalid leftover bytes are discarded (unless another published
+            // entry still names them) so the next pass transfers afresh.
+            if !self
+                .manifest
+                .downloads
+                .iter()
+                .any(|d| d.sha256 == entry.sha256)
+            {
+                self.blobs.remove_file(&entry.sha256)?;
+                self.blobs_sync.sync_all()?;
+            }
+            return Ok(false);
+        }
         self.publish(entry)?;
         Ok(true)
     }

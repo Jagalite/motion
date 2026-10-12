@@ -290,9 +290,15 @@ test('the quota is one device budget across every profile root', async () => {
   const kids = agent.root('kids');
   mkdirSync(kids.path, {recursive: true});
   writeFileSync(join(kids.path, 'manifest.json'), '{}');
-  fake.state(kids.path).downloads.push({identity: {download_id: 'k1'}, size: 15});
+  fake.state(kids.path).downloads.push({identity: {download_id: 'k1'}, size: 10});
+  // A root kept from another server counts against the same device budget.
+  const foreign = createDownloadAgent({base, identity: {...identity, server_id: 'other-server'}, cache, quota: 30,
+    api: async () => assert.fail('unused'), fetchMedia: async () => assert.fail('unused')}).root('default');
+  mkdirSync(foreign.path, {recursive: true});
+  writeFileSync(join(foreign.path, 'manifest.json'), '{}');
+  fake.state(foreign.path).downloads.push({identity: {download_id: 'x1'}, size: 5});
   assert.equal(await agent.transfer({id: 'd1'}, agent.root('default')), false);
-  assert.deepEqual(admits[0].slice(3, 5), ['--quota', '15'], 'the other profile already holds 15 of 30');
+  assert.deepEqual(admits[0].slice(3, 5), ['--quota', '15'], 'another profile (10) and another server (5) already hold 15 of 30');
   assert.match(statuses[0], /Not enough space/);
 });
 
