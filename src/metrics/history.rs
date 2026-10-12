@@ -298,7 +298,14 @@ pub async fn prune(pool: &SqlitePool, run_id: &str, now: i64) -> Result<(), sqlx
     tx.commit().await
 }
 
-async fn sample(app: &App, pool: &SqlitePool, run_id: &str) -> anyhow::Result<()> {
+/// The sampler's own writes, one at a time. They share the fail-fast pool, so
+/// without this the sampler, its storage sampler and retention pruning would
+/// make one another skip a sample at startup. Any other writer still makes a
+/// sample fail at once (`writer_pool`).
+#[derive(Clone, Default)]
+struct Writes(std::sync::Arc<tokio::sync::Mutex<()>>);
+
+async fn sample(app: &App, pool: &SqlitePool, run_id: &str, writes: &Writes) -> anyhow::Result<()> {
     let process = app
         .health
         .metrics
@@ -351,6 +358,7 @@ async fn sample(app: &App, pool: &SqlitePool, run_id: &str) -> anyhow::Result<()
     if let Some(value) = process.system.open_files {
         values.push(("process.open_files", value));
     }
+    let _turn = writes.0.lock().await;
     record_observations(pool, run_id, at, values, &failures).await
 }
 
@@ -394,6 +402,7 @@ async fn storage_sample(
     app: &App,
     pool: &SqlitePool,
     run_id: &str,
+    writes: &Writes,
     stop: &CancellationToken,
 ) -> anyhow::Result<()> {
     let (database_bytes, asset_bytes, generated) = tokio::time::timeout(SAMPLE_TIMEOUT, async {
@@ -442,6 +451,7 @@ async fn storage_sample(
     if let Some(value) = free {
         values.push(("storage.free_bytes", value.to_string()));
     }
+    let _turn = writes.0.lock().await;
     record(pool, run_id, now_millis(), &values).await?;
     Ok(())
 }
@@ -476,7 +486,13 @@ fn bounded_cache_bytes(root: PathBuf, stop: &CancellationToken) -> anyhow::Resul
     Ok(total)
 }
 
-async fn storage_worker(app: App, pool: SqlitePool, run_id: String, stop: CancellationToken) {
+async fn storage_worker(
+    app: App,
+    pool: SqlitePool,
+    run_id: String,
+    writes: Writes,
+    stop: CancellationToken,
+) {
     let mut tick = tokio::time::interval(Duration::from_secs(STORAGE_INTERVAL_SECONDS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -488,7 +504,7 @@ async fn storage_worker(app: App, pool: SqlitePool, run_id: String, stop: Cancel
         tokio::select! {
             biased;
             _ = stop.cancelled() => break,
-            result = storage_sample(&app,&pool,&run_id,&stop) => {
+            result = storage_sample(&app,&pool,&run_id,&writes,&stop) => {
                 if result.is_err() { tracing::warn!(code="metrics_storage_sample_skipped", "Operational storage sample skipped"); }
             }
         }
@@ -499,6 +515,7 @@ async fn storage_worker(app: App, pool: SqlitePool, run_id: String, stop: Cancel
 /// observation only. Initialization is retried without changing server health.
 pub async fn worker(app: App, stop: CancellationToken) {
     let run_id = crate::new_id();
+    let writes = Writes::default();
     let mut tick = tokio::time::interval(Duration::from_secs(INTERVAL_SECONDS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_prune = None;
@@ -533,13 +550,14 @@ pub async fn worker(app: App, stop: CancellationToken) {
                 app.clone(),
                 pool.clone(),
                 run_id.clone(),
+                writes.clone(),
                 stop.clone(),
             )));
         }
         let result = tokio::select! {
             biased;
             _ = stop.cancelled() => break,
-            result = tokio::time::timeout(SAMPLE_TIMEOUT, sample(&app,&pool,&run_id)) => result,
+            result = tokio::time::timeout(SAMPLE_TIMEOUT, sample(&app,&pool,&run_id,&writes)) => result,
         };
         if !matches!(result, Ok(Ok(()))) {
             tracing::warn!(
@@ -550,7 +568,11 @@ pub async fn worker(app: App, stop: CancellationToken) {
         let now = crate::now();
         if last_prune.is_none_or(|last| now >= last + STORAGE_INTERVAL_SECONDS as i64) {
             if !matches!(
-                tokio::time::timeout(SAMPLE_TIMEOUT, prune(&pool, &run_id, now)).await,
+                tokio::time::timeout(SAMPLE_TIMEOUT, async {
+                    let _turn = writes.0.lock().await;
+                    prune(&pool, &run_id, now).await
+                })
+                .await,
                 Ok(Ok(()))
             ) {
                 tracing::warn!(
@@ -731,6 +753,39 @@ mod tests {
                 .points
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_samplers_own_writes_take_turns_on_the_fail_fast_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turns.sqlite3");
+        // Kept open: a pool closing in the background checkpoints under an
+        // exclusive lock (see `database`), which is not what this tests.
+        let _setup = database(&path).await;
+        let sampler = writer_pool(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let writes = Writes::default();
+        let tasks: Vec<_> = (0..24)
+            .map(|i| {
+                let (sampler, writes) = (sampler.clone(), writes.clone());
+                tokio::spawn(async move {
+                    let _turn = writes.0.lock().await;
+                    record(
+                        &sampler,
+                        "run",
+                        1_800_000_000_000 + i,
+                        &[("http.requests_total", i.to_string())],
+                    )
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("a sampler write never fails another");
+        }
     }
 
     #[tokio::test]
