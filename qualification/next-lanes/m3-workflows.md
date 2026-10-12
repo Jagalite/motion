@@ -130,8 +130,22 @@ the plan commits only on click with a per-token key; JSON-in-attribute escaping;
 no `style=` attributes; same-origin asset URLs under COEP; `list_all` cursor
 handling; and request bodies matching the src/v2 handlers.
 
-GPT-6.1 Sol review is required by the plan. It is not available from this
-agent and is **outstanding**.
+### GPT-6.1 Sol review
+
+Run with `codex exec review` at high reasoning effort in a read-only sandbox.
+
+**Round 1** reviewed the full branch against main at `d582b2c` and raised four P2 findings, all fixed in `570d7b9`:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S1 | Smart collections spent the /organize title-read budget on members the page never shows. More than 300 matches made the page unavailable | Fixed. Smart members are not expanded |
+| S2 | A relocation preview answered after the folder field was edited was still shown with a live Apply button | Fixed. Each edit advances a per-form generation and a stale answer is discarded with "The form changed while checking". Bridge test covers that interleaving |
+| S3 | A merge-retired URL resolved for the item read, but the metadata and artwork reads used the alias and failed | Fixed. Section reads use the resolved live ID. The end-to-end test merges the second title into the first and opens the retired ID's manage page; it asserts that Details and Artwork work and that every form names the live ID |
+| S4 | A single interval binding (double episode) was offered as a whole-file preparation source, which `exact_binding` always refuses | Fixed. Only bindings with null `start_ms` and `end_ms` are offered. No dedicated test: covered by code inspection against `processing::exact_binding` |
+
+**Round 2** reviewed `570d7b9`: "No actionable regressions were identified in the changes or their affected callers."
+
+Round 1 also re-ran the bridge tests (14/14); round 2 re-ran them after the fix (15/15). Sol did not run the Rust suites (read-only); they were run here (receipts below).
 
 ## 6. Deferred release checks
 
@@ -151,7 +165,12 @@ agent and is **outstanding**.
 All on this worktree at the starting SHA plus the lane diff, 2026-10-12, darwin-arm64,
 toolchain 1.98.0. Compilation ran through kyoto; tests ran outside it (kyoto does not run tests).
 
-Final state after the review fixes:
+After the Sol fixes (`570d7b9`): compose 21 passed; m3_workflows 1 passed
+(now including the merge-alias step); `access_api topcoat presentation` 8
+passed (kyoto 33efb408); bridge 15 passed; clippy with CI flags clean (kyoto
+ecc71deb).
+
+Earlier, after the first review's fixes:
 
 | Command | Kyoto job | Result |
 |---|---|---|
