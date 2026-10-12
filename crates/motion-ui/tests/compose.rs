@@ -708,3 +708,43 @@ async fn collections_page_creates_and_edits_with_exact_bodies() {
     let (status, _, _) = get_page(&viewer, "/organize").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn downloads_are_requested_and_cancelled_through_public_operations() {
+    let viewer = app(Some(principal("everyone", VIEWER)), None);
+    let (status, _, _) = get_page(&viewer, "/downloads").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, _, item) = get_page(&viewer, "/item/item1").await;
+    assert!(
+        !item.contains("/api/v2/downloads"),
+        "no download action without downloads:manage"
+    );
+
+    let mut permissions = VIEWER.to_vec();
+    permissions.push("downloads:manage");
+    let saver = app(Some(principal("everyone", &permissions)), None);
+    let (status, _, page) = get_page(&saver, "/downloads").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_strict_markup(&page);
+    assert!(page.contains(r#"data-command="DELETE /api/v2/downloads/download1""#));
+    assert!(page.contains("Ready to save"));
+    let (_, _, home) = get_page(&saver, "/").await;
+    assert!(home.contains(r#"href="/downloads""#));
+    let (_, _, item) = get_page(&saver, "/item/item1").await;
+    // Hidden until the desktop host reveals it; the body carries every
+    // required DownloadInput field for this device, profile and timeline.
+    let action = &item[item.find("data-desktop-only").expect("download action")..];
+    let action = &action[..action.find("</form>").unwrap()];
+    assert!(action.contains(r#"hidden"#));
+    assert!(action.contains(r#"data-command="POST /api/v2/downloads" data-idempotent="true""#));
+    for field in [
+        r#"name="device_id" data-type="text" value="p1""#,
+        r#"name="profile_id" data-type="text" value="everyone""#,
+        r#"name="timeline_id" data-type="text" value="tl1""#,
+        r#"name="version_id" data-type="json" value="null""#,
+        r#"name="recipe_id" data-type="json" value="null""#,
+        r#"name="tracks" data-type="json""#,
+    ] {
+        assert!(action.contains(field), "{field}");
+    }
+}

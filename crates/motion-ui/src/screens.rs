@@ -502,6 +502,79 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
     })
 }
 
+// --- Downloads ---------------------------------------------------------------
+
+fn size_text(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.0} MB", b as f64 / (1u64 << 20) as f64),
+        b => format!("{} KB", b.div_ceil(1024)),
+    }
+}
+
+/// This device's download demands. The desktop host transfers ready ones and
+/// removes local copies of cancelled or expired ones when it next connects.
+#[page("/downloads")]
+pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
+    let who = principal(cx)?;
+    let rows = facade(cx).0.downloads(who).await.map_err(ui_error)?;
+    Ok(view! {
+        <h1>"Downloads"</h1>
+        <p class="muted">"The Motion desktop app saves ready downloads on this device and keeps offline progress until it is reconciled here. Cancelling removes the device copy the next time the app connects; it cannot reach copies on disconnected devices."</p>
+        if rows.is_empty() {
+            empty(message: "Nothing is saved for offline viewing.")
+        } else {
+            <div class="table-scroll" role="region" aria-label="Downloads" tabindex="0"><table>
+                <caption class="visually-hidden">"Downloads"</caption>
+                <thead><tr><th scope="col">"Title"</th><th scope="col">"State"</th><th scope="col">"Size"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
+                <tbody>
+                    for row in rows {
+                        <tr>
+                            <td>if row.title.is_empty() { <span class="muted">"Unavailable title"</span> } else { (row.title.as_str()) }</td>
+                            <td>(match row.state.as_str() {
+                                "ready" => "Ready to save",
+                                "expired" => "Expired — the source changed",
+                                "cancelled" => "Cancelled",
+                                _ => "Unknown",
+                            })</td>
+                            <td>(size_text(row.size_bytes))</td>
+                            <td>
+                                if row.state != "cancelled" {
+                                    command_form(command: format!("DELETE /api/v2/downloads/{}", row.id), label: "Cancel", class: Some("command inline"))
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table></div>
+        }
+    })
+}
+
+/// Request a device-owned download of one timeline's original. Shown only in
+/// the desktop host, which performs the transfer; the server decides whether
+/// the timeline can be downloaded and explains any refusal.
+#[component]
+pub(crate) async fn download_form(
+    device_id: String,
+    profile_id: String,
+    timeline_id: String,
+) -> Result<impl View> {
+    let tracks = r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"auto","audio_track_id":null,"subtitle_track_id":null}"#;
+    Ok(view! {
+        <div class="download-action" data-desktop-only="true" hidden=(true)>
+            command_form(command: "POST /api/v2/downloads".to_string(), label: "Save for offline", idempotent: true, class: Some("command inline"),
+                <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id)>
+                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id)>
+                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id)>
+                <input type="hidden" name="version_id" data-type=(kind(Field::Json)) value="null">
+                <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
+                <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
+            )
+        </div>
+    })
+}
+
 // --- Diagnostics -------------------------------------------------------------
 
 #[page("/diagnostics")]

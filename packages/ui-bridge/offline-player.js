@@ -19,10 +19,12 @@ function flush() {
   flushing ??= (async () => {
     while (pending || latest) {
       if (!pending) {
-        pending = {...latest, scope: context.scope, media: context.media, event_id: crypto.randomUUID().replaceAll('-', ''), device_sequence: context.next_sequence};
+        pending = {...latest, scope: context.scope, media: context.media, event_id: crypto.randomUUID().replaceAll('-', ''), device_sequence: context.next_sequence,
+          device_time: new Date().toISOString()};
         latest = null;
       }
-      // Exact event identity survives retries; no clock arbitrates authority.
+      // Exact event identity (including its recorded device time) survives
+      // retries; no clock arbitrates authority.
       const ack = await request('/cache/events', pending);
       if (ack.event_id !== pending.event_id || ack.device_sequence !== pending.device_sequence) throw new Error('Invalid local progress acknowledgement');
       context.next_sequence = ack.next_sequence;

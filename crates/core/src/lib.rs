@@ -6,6 +6,7 @@ pub mod components;
 pub mod delivery;
 pub mod delivery_admission;
 pub mod demands;
+pub mod downloads;
 pub mod events;
 pub mod execution_deadline;
 pub mod identity;

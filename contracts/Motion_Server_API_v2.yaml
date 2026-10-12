@@ -12277,6 +12277,11 @@ components:
           $ref: '#/components/schemas/Id'
         timeline_revision:
           $ref: '#/components/schemas/Revision'
+        title:
+          type: string
+          maxLength: 1024
+        duration_ms:
+          $ref: '#/components/schemas/Milliseconds'
         files:
           type: array
           items:
@@ -12290,9 +12295,15 @@ components:
       - download_id
       - timeline_id
       - timeline_revision
+      - title
+      - duration_ms
       - files
       - viewing_revision
       - manual_epoch
+      description: Exact pinned files and the device's viewing base. Offline events carry viewing_revision
+        and manual_epoch as their base; read the manifest again after reconciling to rebase later events.
+        The supported slice is one complete original media file whose SHA-256 digest the device verifies
+        before publication.
     OfflineEvent:
       type: object
       additionalProperties: false
@@ -12349,6 +12360,9 @@ components:
       - events
     OfflineEventResult:
       type: object
+      description: applied and history_only (with the reason code) and rejected events other than sequence_gap
+        and event_conflict consume their device sequence; duplicate reports an exact retry and its original
+        outcome in code. sequence_gap and event_conflict consume nothing.
       additionalProperties: false
       properties:
         event_id:

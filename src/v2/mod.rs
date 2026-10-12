@@ -7,6 +7,7 @@ pub mod auth;
 pub mod catalog;
 pub mod content;
 pub mod cors;
+pub mod downloads;
 pub mod events;
 pub mod identity;
 pub mod jobs;
@@ -809,6 +810,7 @@ pub fn router() -> Router<App> {
         .merge(metadata::routes())
         .merge(playback::routes())
         .merge(processing::routes())
+        .merge(downloads::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

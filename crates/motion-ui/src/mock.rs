@@ -440,6 +440,20 @@ impl UiQueryFacade for MockUiQueryFacade {
         })
     }
 
+    fn downloads<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>> {
+        Box::pin(async move {
+            if !who.can("downloads:manage") {
+                return Err(UiError::Denied);
+            }
+            Ok(vec![DownloadRow {
+                id: "download1".into(),
+                title: "Arrival".into(),
+                state: "ready".into(),
+                size_bytes: 1_500_000_000,
+            }])
+        })
+    }
+
     fn diagnostics<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>> {
         Box::pin(async move {
             if !who.can("system:admin") {

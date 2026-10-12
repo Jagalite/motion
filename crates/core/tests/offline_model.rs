@@ -14,6 +14,22 @@ enum Input {
     ForeignProfile,
     StaleManifest,
     Restart,
+    /// The server acknowledged every retained event.
+    AcknowledgeAll,
+    /// The server acknowledged only the oldest retained event.
+    AcknowledgeOne,
+    /// An acknowledgement beyond anything this log wrote (restored server).
+    ForeignAcknowledge,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Log {
+    base: u64,
+    events: Vec<OfflineEvent>,
+}
+impl Log {
+    fn next(&self) -> u64 {
+        self.base + self.events.len() as u64 + 1
+    }
 }
 struct Offline;
 fn scope() -> CacheScope {
@@ -34,14 +50,16 @@ fn media() -> DownloadIdentity {
         base_manual_epoch: "3".into(),
     }
 }
-fn event(s: &[OfflineEvent], i: &Input) -> OfflineEvent {
+fn event(log: &Log, i: &Input) -> OfflineEvent {
+    let s = &log.events;
     let mut e = OfflineEvent {
         scope: scope(),
         media: media(),
-        event_id: format!("event{}", s.len() + 1),
-        device_sequence: (s.len() + 1).to_string(),
+        event_id: format!("event{}", log.next()),
+        device_sequence: log.next().to_string(),
         position_ms: if matches!(i, Input::Rewind) { 0 } else { 100 },
         status: "paused".into(),
+        device_time: None,
     };
     match i {
         Input::Duplicate | Input::AlterDuplicate => {
@@ -52,12 +70,20 @@ fn event(s: &[OfflineEvent], i: &Input) -> OfflineEvent {
                 e.position_ms = if e.position_ms == 50 { 0 } else { 50 };
             }
         }
-        Input::Gap => e.device_sequence = (s.len() + 2).to_string(),
+        Input::Gap => e.device_sequence = (log.next() + 1).to_string(),
         Input::ForeignProfile => e.scope.profile_id = "other".into(),
         Input::StaleManifest => e.media.base_manual_epoch = "0".into(),
         _ => {}
     }
     e
+}
+fn acknowledgement(s: &Log, i: &Input) -> Option<u64> {
+    match i {
+        Input::AcknowledgeAll => Some(s.next() - 1),
+        Input::AcknowledgeOne => Some(s.base + u64::from(!s.events.is_empty())),
+        Input::ForeignAcknowledge => Some(s.next()),
+        _ => None,
+    }
 }
 fn check(name: &'static str, ok: bool) -> Check {
     if ok {
@@ -67,28 +93,32 @@ fn check(name: &'static str, ok: bool) -> Check {
     }
 }
 impl Model for Offline {
-    type State = Vec<OfflineEvent>;
+    type State = Log;
     type Input = Input;
     type Output = bool;
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-client-log".into(),
-            model_version: 1,
-            properties_version: 1,
+            model_version: 2,
+            properties_version: 2,
             codec_version: 1,
             build: include_str!("../src/offline.rs").into(),
         }
     }
     fn initial_state(&self) -> Result<Self::State, ModelError> {
-        Ok(vec![])
+        Ok(Log {
+            base: 0,
+            events: vec![],
+        })
     }
     fn check_state(&self, s: &Self::State) -> Result<Vec<Check>, ModelError> {
         Ok(vec![check(
-            "offline.bounded_consecutive_log",
-            s.len() <= 4
-                && s.iter()
+            "offline.bounded_consecutive_log_after_base",
+            s.events.len() <= 4
+                && s.events
+                    .iter()
                     .enumerate()
-                    .all(|(i, e)| e.device_sequence == (i + 1).to_string()),
+                    .all(|(i, e)| e.device_sequence == (s.base + i as u64 + 1).to_string()),
         )])
     }
     fn step(
@@ -100,10 +130,20 @@ impl Model for Offline {
         if matches!(i, Input::Restart) {
             return Ok(Transition::accepted(next, vec![]));
         }
+        if let Some(through) = acknowledgement(s, i) {
+            let compacted = offline::compact(s.base, &s.events, through);
+            if let Some((base, events)) = &compacted {
+                next = Log {
+                    base: *base,
+                    events: events.clone(),
+                };
+            }
+            return Ok(Transition::accepted(next, vec![compacted.is_some()]));
+        }
         let e = event(s, i);
-        let decision = offline::admit(s, &e, &scope(), &media(), 100, 4);
+        let decision = offline::admit(s.base, &s.events, &e, &scope(), &media(), 100, 4);
         if decision == Admission::Append {
-            next.push(e);
+            next.events.push(e);
         }
         Ok(Transition::accepted(
             next,
@@ -117,16 +157,37 @@ impl Model for Offline {
         n: &TransitionRef<'_, Self::State, bool>,
     ) -> Result<Vec<Check>, ModelError> {
         let append = match i {
-            Input::Forward | Input::Rewind => s.len() < 4,
-            Input::Duplicate | Input::AlterDuplicate => s.is_empty(),
+            Input::Forward | Input::Rewind => s.events.len() < 4,
+            Input::Duplicate | Input::AlterDuplicate => s.events.is_empty(),
             _ => false,
         };
-        let accept = append || matches!(i, Input::Duplicate) && !s.is_empty();
         let mut expected = s.clone();
+        let accept = match i {
+            Input::AcknowledgeAll => {
+                expected = Log {
+                    base: s.next() - 1,
+                    events: vec![],
+                };
+                true
+            }
+            Input::AcknowledgeOne => {
+                if !s.events.is_empty() {
+                    expected.base += 1;
+                    expected.events.remove(0);
+                }
+                true
+            }
+            Input::ForeignAcknowledge => false,
+            _ => append || matches!(i, Input::Duplicate) && !s.events.is_empty(),
+        };
         if append {
-            expected.push(event(s, i));
+            expected.events.push(event(s, i));
         }
         Ok(vec![
+            check(
+                "offline.compaction_never_renumbers",
+                n.state.next() >= s.next() && n.state.base >= s.base,
+            ),
             check("offline.exact_event_and_count", n.state == &expected),
             check(
                 "offline.required_acceptance_and_rejection",
@@ -139,6 +200,7 @@ impl Model for Offline {
             check(
                 "offline.identity_and_causality",
                 n.state
+                    .events
                     .iter()
                     .all(|e| e.scope == scope() && e.media == media()),
             ),
@@ -156,6 +218,9 @@ impl Enumerate for Offline {
             Input::ForeignProfile,
             Input::StaleManifest,
             Input::Restart,
+            Input::AcknowledgeAll,
+            Input::AcknowledgeOne,
+            Input::ForeignAcknowledge,
         ])
     }
 }
@@ -208,13 +273,13 @@ fn offline_log_bounded_fault_interleavings() {
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
     println!(
-        "Offline log: {} cases, {} transitions; 4 records; forward/rewind, exact/altered duplicate, sequence gap, foreign scope, stale epoch, restart; three transition properties",
+        "Offline log: {} cases, {} transitions; 4 retained records; forward/rewind, exact/altered duplicate, sequence gap, foreign scope, stale epoch, restart, full/partial/foreign acknowledgement compaction; four transition properties",
         report.cases, report.transitions
     );
 }
 #[test]
 fn checks_detect_lost_valid_events() {
-    let s = vec![];
+    let s = Offline.initial_state().unwrap();
     let mutation = Transition::accepted(s.clone(), vec![false]);
     assert!(
         Offline
@@ -223,4 +288,29 @@ fn checks_detect_lost_valid_events() {
             .iter()
             .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
     );
+}
+#[test]
+fn checks_detect_renumbering_and_foreign_erasure() {
+    let mut s = Offline.initial_state().unwrap();
+    s.events.push(event(&s, &Input::Forward));
+    let reset = Transition::accepted(Offline.initial_state().unwrap(), vec![true]);
+    let erased = Transition::accepted(
+        Log {
+            base: 1,
+            events: vec![],
+        },
+        vec![true],
+    );
+    for (input, mutation) in [
+        (Input::AcknowledgeAll, reset),
+        (Input::ForeignAcknowledge, erased),
+    ] {
+        assert!(
+            Offline
+                .check_transition(&s, &input, &mutation.as_ref())
+                .unwrap()
+                .iter()
+                .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
+        );
+    }
 }

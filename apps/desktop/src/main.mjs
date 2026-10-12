@@ -1,6 +1,7 @@
 import {app, BrowserWindow, WebContentsView, ipcMain, session, safeStorage} from 'electron';
 import {readFileSync, writeFileSync, mkdirSync, existsSync} from 'node:fs';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID} from 'node:crypto';
+import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {isAbsolute, join, resolve} from 'node:path';
 import {createOwnedServer} from './owned.mjs';
@@ -8,6 +9,7 @@ import {createOutboxStore} from './outbox.mjs';
 import {restoreViewing} from './recovery.mjs';
 import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities, boundedJson} from './policy.mjs';
+import {createDownloadAgent, currentRoot} from './downloads.mjs';
 
 if (app.isPackaged) app.setName('Motion');
 const explicitUserData = app.commandLine.getSwitchValue('user-data-dir');
@@ -24,6 +26,7 @@ let selectedSession;
 let outboxContext;
 const outboxes = () => createOutboxStore(join(app.getPath('userData'), 'viewing-outbox'), safeStorage);
 let monitor;
+let downloads;
 let ownedServer;
 let offlineHost;
 let contentMode = null;
@@ -54,9 +57,35 @@ function saveCredential(selected, value) {
   writeFileSync(credentialFile(selected), safeStorage.encryptString(value), {mode: 0o600});
 }
 
+const hostBinary = () => app.isPackaged ? join(process.resourcesPath, 'motion-ui-host')
+  : resolve(process.env.MOTION_UI_HOST_BINARY || fileURLToPath(new URL('../../../target/debug/motion-ui-host', import.meta.url)));
+const cacheBase = () => app.isPackaged ? join(app.getPath('userData'), 'offline-cache')
+  : resolve(process.env.MOTION_CACHE_DIR || join(app.getPath('userData'), 'offline-cache'));
+const downloadQuota = () => Number(process.env.MOTION_DOWNLOAD_QUOTA_BYTES) > 0 ? Number(process.env.MOTION_DOWNLOAD_QUOTA_BYTES) : 256 * 1024 ** 3;
+
+/** One cache-tool command; it holds the cache's exclusive lock while it runs. */
+function runCache(root, scope, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(hostBinary(), ['cache', '--cache-dir', root, '--scope', JSON.stringify(scope), ...args], {stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true});
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { output += chunk; if (output.length > 4 * 1024 * 1024) child.kill('SIGKILL'); });
+    child.once('error', reject);
+    child.once('exit', code => {
+      let value;
+      try { value = JSON.parse(output); } catch { return reject(new Error('The offline cache tool failed')); }
+      if (code === 0) resolve(value); else reject(new Error(value.error ?? 'The offline cache tool failed'));
+    });
+    child.stdin.end(input ?? '');
+  });
+}
+
 async function detach() {
   clearTimeout(monitor);
   monitor = null;
+  downloads?.abort();
+  await downloads?.running?.catch(() => {});
+  downloads = null;
   const previous = content;
   const previousSession = selectedSession;
   const previousOutbox = outboxContext;
@@ -128,6 +157,8 @@ async function connectOwned(input, owner, locallyOwned = false) {
   // known and its records have been encrypted. Never reuse old credentials.
   await ses.clearStorageData({storages: ['cookies']});
   secureSession(ses, selected.origin);
+  // Reveals desktop-only actions (device downloads); never an authorization input.
+  if (!ses.getUserAgent().includes('MotionDesktop/')) ses.setUserAgent(`${ses.getUserAgent()} MotionDesktop/1`);
   const request = async (path, options = {}) => {
     if (!current()) throw new Error('Connection changed');
     const response = await ses.fetch(`${selected.origin}${path}`, {redirect: 'error', cache: 'no-store',
@@ -177,6 +208,44 @@ async function connectOwned(input, owner, locallyOwned = false) {
       if (current()) monitor = setTimeout(inspect, 10000);
     };
     monitor = setTimeout(inspect, 10000);
+    const principal = browserSession.principal;
+    if (principal.device_id && principal.permissions?.includes('downloads:manage')) {
+      const controller = new AbortController();
+      const api = async (path, {method = 'GET', body, idempotent = false} = {}) => {
+        if (!current()) throw new Error('Connection changed');
+        const response = await ses.fetch(`${selected.origin}${path}`, {method, redirect: 'error', cache: 'no-store',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
+          headers: {Origin: selected.origin, 'X-CSRF-Token': browserSession.csrf_token,
+            ...(body === undefined ? {} : {'Content-Type': 'application/json'}),
+            ...(idempotent ? {'Idempotency-Key': randomUUID().replaceAll('-', '')} : {})},
+          body: body === undefined ? undefined : JSON.stringify(body)});
+        if (!response.ok) {
+          const error = new Error(`Server request failed (${response.status})`);
+          error.status = response.status;
+          throw error;
+        }
+        return response.status === 204 ? null : boundedJson(response, 4 * 1024 * 1024);
+      };
+      const agent = createDownloadAgent({base: cacheBase(), api, cache: runCache, quota: downloadQuota(), signal: controller.signal,
+        identity: {server_id: selected.serverId, principal_id: principal.id, device_id: principal.device_id},
+        fetchMedia: (url, {range, signal}) => {
+          if (!url.startsWith('/api/v2/media/')) throw new Error('Unexpected transfer location');
+          return ses.fetch(`${selected.origin}${url}`, {redirect: 'error', cache: 'no-store', signal, headers: range ? {Range: range} : {}});
+        },
+        status: message => { if (current()) window.webContents.send('motion:status', message); }});
+      const state = {abort: () => controller.abort(), running: null};
+      const run = async () => {
+        if (!current() || controller.signal.aborted) return;
+        state.running = agent.pass().catch(error => {
+          if (!controller.signal.aborted && current()) window.webContents.send('motion:status', `Downloads paused: ${error.message}`);
+        });
+        await state.running;
+        if (!controller.signal.aborted) state.timer = setTimeout(run, 60000);
+      };
+      state.abort = () => { controller.abort(); clearTimeout(state.timer); };
+      downloads = state;
+      void run();
+    }
     return selected;
   } catch (error) {
     if (current()) await detach();
@@ -191,11 +260,11 @@ function openDownloads() {
   return serialize(async owner => {
     await detach();
     if (owner !== epoch) throw new Error('Offline startup cancelled');
-    offlineHost ??= createOwnedServer({presentationOnly: true,
-      executable: app.isPackaged ? join(process.resourcesPath, 'motion-ui-host') : resolve(process.env.MOTION_UI_HOST_BINARY || fileURLToPath(new URL('../../../target/debug/motion-ui-host', import.meta.url))),
-      dataDir: app.isPackaged ? join(app.getPath('userData'), 'offline-cache') : resolve(process.env.MOTION_CACHE_DIR || join(app.getPath('userData'), 'offline-cache')),
+    const dataDir = currentRoot(cacheBase());
+    if (offlineHost && offlineHost.dataDir !== dataDir) { await offlineHost.stop(); offlineHost = null; }
+    offlineHost ??= Object.assign(createOwnedServer({presentationOnly: true, executable: hostBinary(), dataDir,
       demuxeDir: app.isPackaged ? join(process.resourcesPath, 'assets', 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
-    });
+    }), {dataDir});
     return attachOwnedServer(offlineHost, () => owner === epoch, async local => {
       const ses = session.fromPartition(`motion-offline-${local.helperEpoch}`, {cache: false});
       secureSession(ses, local.origin);

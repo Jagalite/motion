@@ -14,13 +14,15 @@ The included file adapter consumes A13-style cache fixtures through this interna
 protocol version 1. This is an integration port, not a new public `/api/v2` API or
 a completed A13 download/reconciliation service.
 
-A cache root contains `manifest.json`, `blobs/<lowercase SHA-256>`, and the helper's
-`events.lock` and `events.json`. One root identifies one server, principal,
-profile and device. A13 must publish complete manifests and blobs atomically and
-hold the event lock when consuming/replacing the local log. Do not reset or
-renumber device sequences when synchronizing history. The current log retains
-all events and stops at 10,000 events/8 MiB; compaction needs an explicit A13
-acknowledged-sequence protocol before implementation.
+A cache root contains `manifest.json`, `blobs/<lowercase SHA-256>`, `staging/`,
+and the helper's `events.lock` and `events.json`. One root identifies one server,
+principal, profile and device. Every writer holds the exclusive `events.lock`, so
+the cache writer never runs beside the presentation host or another writer.
+`events.json` is `{"base_sequence":"N","events":[...]}`: consecutive events after
+the highest sequence the server acknowledged. A log written before compaction
+existed is a bare event array and reads as base 0. Device sequences are never
+reset or renumbered. The log stops at 10,000 retained events/8 MiB until the
+server acknowledges and the device compacts them.
 
 The manifest is the serialized `CacheManifest` in `src/lib.rs`:
 
@@ -49,12 +51,40 @@ range reads. Only receipt-listed, checksum-verified player assets are served.
 The host rejects public catalog routes, wrong Host/Origin, unauthenticated reads,
 bootstrap replay, foreign event scopes and altered duplicate event identities.
 
+Entries may carry `resume_position_ms`: the server position recorded when the
+download was last rebased, used after acknowledged events were compacted.
+
+## Cache writer
+
+`motion-ui-host cache --cache-dir ROOT --scope JSON <command>` is the one-shot
+writer used by the desktop download agent (`apps/desktop/src/downloads.mjs`). It
+prints one JSON result; a failure prints `{"error": ...}` and exits non-zero.
+
+| Command | Effect |
+|---|---|
+| `status` | manifest, byte usage, retained event count and next sequence |
+| `admit --incoming --quota --headroom` | whether a transfer fits the quota and leaves free headroom (`offline::admits_transfer`) |
+| `publish` (entry on stdin) | verify `staging/<download_id>.part` size and SHA-256, rename it into `blobs/`, fsync, then replace the manifest; mismatches discard the staged bytes |
+| `remove --download-id` | drop the entry and staged bytes; collect unreferenced blobs |
+| `events` | the retained log |
+| `acknowledge --through N` | compact through the server's `next_device_sequence - 1` (`offline::compact`); refuses acknowledgements beyond the local log |
+| `rebase --download-id --viewing-revision --manual-epoch [--resume-position-ms]` | pin later events to the server state read after reconciliation |
+
+Publication order is blob rename and directory fsync, then manifest replacement
+and directory fsync. A crash between them leaves an unreferenced blob: the next
+publication of that download verifies it in place, and any later write collects
+blobs no entry references. Repeating a completed publication is a no-op.
+`crates/motion-ui-host/tests/store.rs` covers these on a real filesystem,
+including a write failure (read-only `blobs/`) that leaves the manifest unchanged.
+Out-of-space is enforced by `admit` before a transfer starts; a physical ENOSPC
+during publication is a write failure of the same kind but is not separately
+exercised.
+
 Limits: 500 manifest entries, 2 MiB manifest, 64 GiB per media snapshot, 256 MiB
 verified player assets, and one admitted snapshot per helper. Snapshot admission
 requires 512 MiB free headroom and a second copy of the selected media. This
-adapter supports the listed complete MP4/WebM/audio files; multipart media,
-subtitle/artwork sidecars, transfer/resume/quota management and server-side causal
-reconciliation remain A13 integration work. No cached data grants server viewing
+adapter supports the listed complete MP4/WebM/audio files; multipart media and
+subtitle/artwork sidecars are refused by the server and reported by the agent. No cached data grants server viewing
 authority, and disconnected copies cannot be remotely erased.
 
 ## Correctness and persistence
@@ -68,14 +98,15 @@ validates the retained sequence; failures never silently rebase events.
 The browser queues observations every five seconds and on status changes. A
 controlled close must finish the final local append before the native host stops.
 An unexpected crash can lose observations not yet acknowledged; acknowledged
-records survive. Delivery to the authoritative server and `history_only` merge
-semantics are outside this helper.
+records survive. Delivery to the authoritative server is the desktop agent's
+job (`POST /api/v2/offline/sync`); the server decides `applied`, `history_only`,
+`duplicate` and `rejected` in `playscale_core::downloads::reconcile`.
 
 ## Development and verification
 
 ```sh
 cargo test -p playscale-core --test offline_model -- --nocapture
-cargo test -p motion-ui-host --test cache
+cargo test -p motion-ui-host --test cache --test store
 cargo test -p motion-ui
 node --test apps/desktop/test/*.test.mjs
 node apps/desktop/test/run-offline.mjs

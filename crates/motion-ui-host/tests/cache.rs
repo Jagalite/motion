@@ -5,7 +5,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use motion_ui::offline::CachedDownload;
-use motion_ui_host::{Cache, CacheManifest, Host};
+use motion_ui_host::{Cache, CacheManifest, EventLog, Host};
 use playscale_core::offline::{CacheScope, DownloadIdentity, OfflineEvent};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -38,6 +38,7 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
             sha256: digest,
             size: 10,
             content_type: "video/mp4".into(),
+            resume_position_ms: None,
         }],
     };
     std::fs::write(
@@ -225,6 +226,7 @@ async fn ordered_events_are_durable_exact_and_never_rebased() {
         device_sequence: "1".into(),
         position_ms: 5000,
         status: "paused".into(),
+        device_time: None,
     };
     {
         let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
@@ -272,8 +274,10 @@ async fn ordered_events_are_durable_exact_and_never_rebased() {
             StatusCode::CONFLICT
         );
     }
-    let history: Vec<OfflineEvent> =
-        serde_json::from_slice(&std::fs::read(dir.path().join("events.json")).unwrap()).unwrap();
+    let history =
+        serde_json::from_slice::<EventLog>(&std::fs::read(dir.path().join("events.json")).unwrap())
+            .unwrap()
+            .events;
     assert_eq!(history, vec![event]);
     let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
     let (_, _, body) = request(
@@ -324,6 +328,7 @@ async fn failed_publication_cannot_acknowledge_or_consume_a_sequence() {
         device_sequence: "1".into(),
         position_ms: 1000,
         status: "paused".into(),
+        device_time: None,
     };
     // Real rename failure, before the in-memory log is published.
     std::fs::create_dir(dir.path().join("events.json")).unwrap();
@@ -366,8 +371,10 @@ async fn failed_publication_cannot_acknowledge_or_consume_a_sequence() {
     );
     assert_eq!(a.0, StatusCode::OK);
     assert_eq!(b.0, StatusCode::OK);
-    let history: Vec<OfflineEvent> =
-        serde_json::from_slice(&std::fs::read(dir.path().join("events.json")).unwrap()).unwrap();
+    let history =
+        serde_json::from_slice::<EventLog>(&std::fs::read(dir.path().join("events.json")).unwrap())
+            .unwrap()
+            .events;
     assert_eq!(history, vec![event]);
 }
 
@@ -387,6 +394,7 @@ async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
         device_sequence: "1".into(),
         position_ms: 1000,
         status: "paused".into(),
+        device_time: None,
     };
     let (app, cookie) = authenticated(cache).await;
     assert_eq!(
@@ -402,8 +410,10 @@ async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
         StatusCode::OK
     );
     assert!(!dir.path().join("events.json").exists());
-    let history: Vec<OfflineEvent> =
-        serde_json::from_slice(&std::fs::read(moved.join("events.json")).unwrap()).unwrap();
+    let history =
+        serde_json::from_slice::<EventLog>(&std::fs::read(moved.join("events.json")).unwrap())
+            .unwrap()
+            .events;
     assert_eq!(history, vec![event]);
     drop(app);
     assert!(Cache::open(&moved).is_ok());
