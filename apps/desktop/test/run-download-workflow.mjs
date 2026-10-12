@@ -11,7 +11,7 @@ import {execFileSync} from 'node:child_process';
 import {createHash, randomUUID} from 'node:crypto';
 import {mkdirSync, mkdtempSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join, resolve} from 'node:path';
+import {basename, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn} from 'node:child_process';
 import {createOwnedServer} from '../src/owned.mjs';
@@ -206,7 +206,7 @@ try {
 }
 const receipt = {passed: !failure, failure: failure ?? null, checks, server_sha256: server.sha256, host_sha256: host.sha256,
   media_sha256: sha(mediaBytes), commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim(),
-  recorded_at: new Date().toISOString(), artifacts: work,
+  recorded_at: new Date().toISOString(), artifacts: `$TMPDIR/${basename(work)}`,
   limitations: ['Node runner without Electron: playback is represented by verified range reads and the offline player\'s event protocol.',
     'One device, one profile, one complete MP4 original; macOS arm64 debug binaries.']};
 const file = join(root, 'qualification/next-lanes/download-workflow.json');

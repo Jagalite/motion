@@ -47,7 +47,8 @@ applying any pending migration to an existing database.
 
 | 0041 | `0041_schedule_dispatch_progress.sql` | Data/catalog PR #17 | bounded resumable metadata schedule fanout |
 | 0042 | — | PR #29 (admin metrics) | proposed by an open PR; not allocated here |
-| 0043 | `0043_offline_downloads.sql` | A13 (N3 downloads) | device downloads, download ticket link, offline sequences/events/lineage |
+| 0043 | — | PR #32 (admin playback monitoring) | proposed by an open PR; not allocated here |
+| 0044 | `0044_offline_downloads.sql` | A13 (N3 downloads, PR #31) | device downloads, download ticket link, offline sequences/events/lineage |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 

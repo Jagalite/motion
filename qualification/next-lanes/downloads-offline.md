@@ -1,7 +1,7 @@
 # Lane N3 — Managed downloads and offline reconciliation (M5) ledger
 
 Plan: `MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md` section 11.4.
-Worktree `/Volumes/seed1/Projects/motion-m5-downloads`, branch `m5-downloads`.
+Branch `m5-downloads` (PR #31), stacked on `m3-workflows` (PR #30).
 Starting SHA: `c6d6e266c76f0ea7ec1274bca10e30f9b4bdf658` (origin/main, 2026-10-11).
 
 This ledger separates implementation, missing wiring, unsupported cases,

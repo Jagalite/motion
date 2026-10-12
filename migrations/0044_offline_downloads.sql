@@ -1,6 +1,6 @@
 -- A13: device-owned offline downloads and offline viewing reconciliation
--- (playscale_core::downloads). 0042 is proposed by PR #29; this lane takes
--- 0043 so neither renumbers. Expiry is derived from current revisions and
+-- (playscale_core::downloads). 0042 is proposed by PR #29 and 0043 by PR #32;
+-- this lane takes 0044 so none renumbers. Expiry is derived from current revisions and
 -- never stored. Transfer progress is device-owned and not recorded here.
 
 CREATE TABLE downloads (
