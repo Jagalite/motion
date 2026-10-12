@@ -113,12 +113,42 @@ pub async fn capabilities(
     ]);
     let mut playback = feature("playback.v2", true, true);
     playback.limits = BTreeMap::from([
-        ("routes", "original,prepared,software_hls".into()),
-        ("timeline_binding", "whole_single_part".into()),
-        ("subtitles", "embedded_plain_text_original_webvtt".into()),
-        ("components", "embedded_revision_bound".into()),
+        (
+            "routes",
+            // Live routes are advertised only where the server admits them.
+            {
+                let mut routes = vec!["original", "prepared"];
+                if app.processing.settings.experimental_copy_routes {
+                    routes.push("stream_copy_hls");
+                }
+                routes.push("software_hls");
+                if crate::delivery::hardware_live(&app).await
+                    != crate::delivery::HardwareState::Unavailable
+                {
+                    routes.push("hardware_hls");
+                }
+                routes.join(",")
+            },
+        ),
+        // Intervals and multipart versions are played by conversion only.
+        ("timeline_binding", "whole,interval,multipart".into()),
+        (
+            "subtitles",
+            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,text_hls_rendition_on_live_routes_for_hls_text_clients,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+        ),
+        ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
+        ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
         ("tickets", "file_or_delivery_generation_playback".into()),
-        ("unsupported", "automatic_subtitle_selection,sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_caps,adaptive_bitrate,cast".into()),
+        (
+            "adaptive_bitrate",
+            if app.processing.settings.experimental_adaptive_bitrate {
+                "software_conversion:720p_3000000,360p_800000"
+            } else {
+                "disabled"
+            }
+            .into(),
+        ),
+        ("unsupported", "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

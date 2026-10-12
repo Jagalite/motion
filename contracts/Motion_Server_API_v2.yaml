@@ -11126,7 +11126,8 @@ components:
             - styled
             - bitmap
             - burned
-          maxItems: 4
+            - hls_text
+          maxItems: 5
         hdr:
           type: string
           enum:
@@ -11437,7 +11438,7 @@ components:
           - type: string
             maxLength: 4096
           - type: 'null'
-          description: Selected plain-text subtitle on original byte delivery, in timeline time. Clients must present it or refuse the plan.
+          description: Selected plain-text subtitle. With http_range transport, a WebVTT sidecar of the original in timeline time. With hls transport (offered only to clients listing hls_text), the playlist of the master playlist's in-manifest SUBTITLES rendition, whose WebVTT segments are in the generation's media time; clients select that rendition's track. Clients must present it or refuse the plan.
         media_time_origin_ms:
           $ref: '#/components/schemas/Milliseconds'
         requested_start_ms:

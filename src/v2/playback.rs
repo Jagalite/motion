@@ -109,6 +109,10 @@ pub fn routes() -> Router<App> {
 
 /// The only HLS variant a live generation publishes.
 const VARIANT: &str = "main";
+/// The low variant of an adaptive generation.
+const LOW_VARIANT: &str = delivery::LOW_VARIANT;
+/// The subtitle rendition of a live generation with a text subtitle.
+const SUBTITLE_VARIANT: &str = "subtitles";
 
 /// Map a shared-service error onto the v2 problem vocabulary.
 fn problem(e: ApiError) -> Problem {
@@ -438,6 +442,153 @@ pub struct PlanInput {
 struct Bound {
     version: String,
     file: db::ItemRow,
+    /// The interval of `file` the version binds (core `parts::layout`).
+    clip: Option<playscale_core::parts::Clip>,
+    /// Every part of a multipart version in order (`file` is the first);
+    /// empty for a single file.
+    parts: Vec<playscale_core::parts::PartPin>,
+}
+
+/// A version part as bound: part, file, bound revision, start, end.
+type PartBinding = (i64, String, String, Option<i64>, Option<i64>);
+/// A single-part binding: start, end, file duration (s), parts in the version.
+type SingleBinding = (Option<i64>, Option<i64>, Option<f64>, i64);
+/// A bound part now: file, bound revision, current revision, library, duration (s).
+type BoundPartRow = (String, String, String, String, Option<f64>);
+
+/// Parts one multipart delivery can read: the delivery worker passes each as
+/// an inherited descriptor, beside the execution witness (8 at most).
+const MAX_PARTS: usize = 7;
+
+/// Whether two parts can be played as one timeline: the delivery decodes each
+/// part's first video stream and joins them on one canvas, so the pictures
+/// must have the same (known) coded size. Audio is matched by component
+/// identity per part when the plan is made (`components::per_file_tracks`),
+/// not by position. Codecs and containers may differ.
+fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
+    let size = |file: &db::ItemRow| -> Option<(u32, u32)> {
+        let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+        let video = tracks.iter().find(|t| t.kind == "video")?;
+        video.width.zip(video.height)
+    };
+    size(a).is_some_and(|first| size(b) == Some(first))
+}
+
+/// The first multipart original version bound to the timeline (or the pinned
+/// `version`, or whose first part is the pinned `file`) whose parts are all
+/// available at their bound revisions, in the first part's library (so its
+/// catalog scope is every part's), readable by `principal`, with probed
+/// durations (core `parts::layout`) and compatible streams.
+async fn multipart_of(
+    conn: &mut sqlx::SqliteConnection,
+    principal: &Principal,
+    timeline: &str,
+    version: Option<&str>,
+    file: Option<&str>,
+) -> Result<Option<Bound>, Problem> {
+    use playscale_core::parts::{BoundPart, Layout, PartPin, layout};
+    let versions: Vec<String> = sqlx::query_scalar(
+        "SELECT v.id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+         WHERE v.timeline_id=? AND v.origin='original' AND (? IS NULL OR v.id=?) AND (? IS NULL OR b.file_id=?) \
+         AND EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id LIMIT 100",
+    )
+    .bind(timeline)
+    .bind(version)
+    .bind(version)
+    .bind(file)
+    .bind(file)
+    .fetch_all(&mut *conn)
+    .await?;
+    'versions: for version in versions {
+        let bindings: Vec<PartBinding> = sqlx::query_as(
+            "SELECT part,file_id,file_revision,start_ms,end_ms FROM version_files WHERE version_id=? ORDER BY part",
+        )
+        .bind(&version)
+        .fetch_all(&mut *conn)
+        .await?;
+        if bindings.len() > MAX_PARTS {
+            continue;
+        }
+        let mut rows = Vec::with_capacity(bindings.len());
+        let mut bound_parts = Vec::with_capacity(bindings.len());
+        for (part, file, revision, start, end) in &bindings {
+            let row: Option<db::ItemRow> = sqlx::query_as(
+                "SELECT * FROM catalog_files WHERE id=? AND generated=0 AND available=1 \
+                 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)",
+            )
+            .bind(file)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(row) = row.filter(|r| r.revision == *revision) else {
+                continue 'versions;
+            };
+            // Every part must pass the core live-conversion rule itself (no
+            // HDR: there is no tone mapping), not only the first.
+            if !core::readable(principal, file_facts(conn, file).await?.as_ref())
+                || !delivery::live_transcodable(&row, None)
+                || rows.first().is_some_and(|first: &db::ItemRow| {
+                    first.library_id != row.library_id || !compatible_parts(first, &row)
+                })
+            {
+                continue 'versions;
+            }
+            bound_parts.push(BoundPart {
+                part: u32::try_from(*part).unwrap_or(0),
+                file_duration_ms: row
+                    .duration_seconds
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .map(|d| (d * 1000.0) as u64),
+                start_ms: start.and_then(|v| u64::try_from(v).ok()),
+                end_ms: end.and_then(|v| u64::try_from(v).ok()),
+            });
+            rows.push(row);
+        }
+        let Ok(Layout::Parts(durations)) = layout(&bound_parts) else {
+            continue;
+        };
+        let parts = rows
+            .iter()
+            .zip(durations)
+            .map(|(row, duration_ms)| PartPin {
+                file: row.id.clone(),
+                revision: row.revision.clone(),
+                duration_ms,
+                // Set from the plan's audio component (`multipart_audio`).
+                audio: None,
+            })
+            .collect();
+        return Ok(Some(Bound {
+            version,
+            file: rows.swap_remove(0),
+            clip: None,
+            parts,
+        }));
+    }
+    Ok(None)
+}
+
+/// The layout of a single-part binding with these bounds on a file of this
+/// probed duration: None for the whole file, the interval otherwise. Bounds
+/// that cannot be verified are an error, never a guess.
+fn binding_clip(
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+    duration_seconds: Option<f64>,
+) -> Result<Option<playscale_core::parts::Clip>, &'static str> {
+    use playscale_core::parts::{BoundPart, Layout, layout};
+    let bound = |v: Option<i64>| v.and_then(|v| u64::try_from(v).ok());
+    match layout(&[BoundPart {
+        part: 1,
+        file_duration_ms: duration_seconds
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (d * 1000.0) as u64),
+        start_ms: bound(start_ms),
+        end_ms: bound(end_ms),
+    }])? {
+        Layout::Whole => Ok(None),
+        Layout::Interval(clip) => Ok(Some(clip)),
+        Layout::Parts(_) => Err("multipart_unavailable"),
+    }
 }
 
 /// The first available original bound to the timeline (or to `version`).
@@ -451,12 +602,12 @@ async fn original_of(
     version: Option<&str>,
     file: Option<&str>,
 ) -> Result<Option<Bound>, Problem> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT v.id,b.file_id,b.start_ms,b.end_ms FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 AND f.available=1 \
          AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
-         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+         AND b.file_revision=f.revision AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
          AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) ORDER BY v.id,b.file_id LIMIT 100",
     )
     .bind(timeline)
@@ -466,7 +617,7 @@ async fn original_of(
     .bind(file)
     .fetch_all(&mut *conn)
     .await?;
-    for (version, file) in rows {
+    for (version, file, start, end) in rows {
         if !core::readable(principal, file_facts(conn, &file).await?.as_ref()) {
             continue;
         }
@@ -474,7 +625,16 @@ async fn original_of(
             .bind(file)
             .fetch_one(&mut *conn)
             .await?;
-        return Ok(Some(Bound { version, file }));
+        // An interval whose bounds cannot be verified is not playable.
+        let Ok(clip) = binding_clip(start, end, file.duration_seconds) else {
+            continue;
+        };
+        return Ok(Some(Bound {
+            version,
+            file,
+            clip,
+            parts: vec![],
+        }));
     }
     Ok(None)
 }
@@ -488,12 +648,12 @@ async fn originals_of(
     version: Option<&str>,
     file: Option<&str>,
 ) -> Result<Vec<Bound>, Problem> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT v.id,b.file_id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT v.id,b.file_id,b.start_ms,b.end_ms FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id \
          WHERE v.timeline_id=? AND v.origin='original' AND f.generated=0 \
          AND (? IS NULL OR v.id=?) AND (? IS NULL OR f.id=?) \
-         AND b.file_revision=f.revision AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id,b.file_id",
+         AND b.file_revision=f.revision AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) ORDER BY v.id,b.file_id",
     )
     .bind(timeline)
     .bind(version)
@@ -503,12 +663,20 @@ async fn originals_of(
     .fetch_all(&mut *conn)
     .await?;
     let mut found = Vec::with_capacity(rows.len());
-    for (version, file) in rows {
+    for (version, file, start, end) in rows {
         let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=?")
             .bind(file)
             .fetch_one(&mut *conn)
             .await?;
-        found.push(Bound { version, file });
+        let Ok(clip) = binding_clip(start, end, file.duration_seconds) else {
+            continue;
+        };
+        found.push(Bound {
+            version,
+            file,
+            clip,
+            parts: vec![],
+        });
     }
     Ok(found)
 }
@@ -533,8 +701,45 @@ async fn readable_prepared(
 
 /// Whether the version still binds the file to the timeline.
 async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Result<bool, Problem> {
-    let bound: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM media_versions v JOIN version_files b ON b.version_id=v.id \
+    if !claims.parts.is_empty() {
+        // Exactly the pinned parts and nothing else: every binding of the
+        // version, whole files only, at their revisions and durations, all in
+        // the first part's library.
+        let rows: Vec<BoundPartRow> = sqlx::query_as(
+            "SELECT b.file_id,b.file_revision,coalesce(f.revision,''),coalesce(f.library_id,''),f.duration_seconds \
+             FROM media_versions v JOIN version_files b ON b.version_id=v.id LEFT JOIN catalog_files f ON f.id=b.file_id \
+             WHERE v.id=? AND v.timeline_id=? AND b.start_ms IS NULL AND b.end_ms IS NULL ORDER BY b.part",
+        )
+        .bind(&claims.version)
+        .bind(&claims.timeline)
+        .fetch_all(&mut *conn)
+        .await?;
+        let bindings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM version_files WHERE version_id=?")
+                .bind(&claims.version)
+                .fetch_one(conn)
+                .await?;
+        return Ok(rows.len() == claims.parts.len()
+            && bindings == claims.parts.len() as i64
+            && claims.parts.first().is_some_and(|p| p.file == claims.file)
+            && rows.iter().zip(&claims.parts).all(
+                |((file, bound, revision, library, duration), pin)| {
+                    *file == pin.file
+                        && *bound == pin.revision
+                        && *revision == pin.revision
+                        && *library == rows[0].3
+                        && duration
+                            .filter(|d| d.is_finite() && *d > 0.0)
+                            .map(|d| (d * 1000.0) as u64)
+                            == Some(pin.duration_ms)
+                },
+            ));
+    }
+    // The same single part with the same interval: a changed interval is a
+    // changed binding.
+    let bound: Option<SingleBinding> = sqlx::query_as(
+        "SELECT b.start_ms,b.end_ms,f.duration_seconds,(SELECT count(*) FROM version_files o WHERE o.version_id=v.id) \
+         FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN catalog_files f ON f.id=b.file_id \
          WHERE v.id=? AND v.timeline_id=? AND b.file_id=? AND b.part=1",
     )
     .bind(&claims.version)
@@ -542,7 +747,9 @@ async fn still_bound(conn: &mut sqlx::SqliteConnection, claims: &Claims) -> Resu
     .bind(&claims.file)
     .fetch_optional(conn)
     .await?;
-    Ok(bound.is_some())
+    Ok(bound.is_some_and(|(start, end, duration, parts)| {
+        parts == 1 && binding_clip(start, end, duration).is_ok_and(|clip| clip == claims.clip)
+    }))
 }
 
 /// The original a pinned generated version renders, when `version` is one.
@@ -600,7 +807,12 @@ async fn prepared_of(
                 .bind(file)
                 .fetch_one(&mut *conn)
                 .await?;
-            found.push(Bound { version, file });
+            found.push(Bound {
+                version,
+                file,
+                clip: None,
+                parts: vec![],
+            });
         }
     }
     Ok(found)
@@ -865,15 +1077,30 @@ pub async fn plan(
     // Without an available original in scope, its revision-valid renditions
     // may still serve; the original then only keys them.
     let rendition_pin = input.version_id.as_deref().filter(|_| pinned_prepared);
-    let (bound, original_available, found) = match original_of(
+    // A single-file original first, then a multipart one.
+    let single = original_of(
         &mut conn,
         principal,
         &input.timeline_id,
         version_pin,
         original_pin,
     )
-    .await?
-    {
+    .await?;
+    let original = match single {
+        Some(bound) => Some(bound),
+        None if !pinned_prepared => {
+            multipart_of(
+                &mut conn,
+                principal,
+                &input.timeline_id,
+                version_pin,
+                original_pin,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let (mut bound, original_available, found) = match original {
         Some(bound) => (bound, true, None),
         // A client pin to an original that is not available in scope is never
         // compared or disclosed: it is simply unavailable.
@@ -944,59 +1171,183 @@ pub async fn plan(
         playscale_core::components::Kind::Audio,
         "audio",
     );
-    let cs = component_index(
-        &input.tracks.subtitle_component_id,
-        playscale_core::components::Kind::Subtitle,
-        "subtitle",
-    );
+    // A subtitle component resolves to its embedded track or its sidecar on
+    // exactly the bound file and revision.
+    use playscale_core::components::{SubtitleOccurrence, subtitle_occurrence};
+    let (cs, sidecar_name) = match input.tracks.subtitle_component_id.as_deref() {
+        None => (None, None),
+        Some(id) => match subtitle_occurrence(
+            &components,
+            id,
+            &bound.version,
+            &bound.file.id,
+            &bound.file.revision,
+        ) {
+            Some(SubtitleOccurrence::Embedded(index)) => (
+                streams
+                    .iter()
+                    .filter(|t| t.kind == "subtitle")
+                    .position(|t| t.index == index)
+                    .map(|i| i as u32),
+                None,
+            ),
+            Some(SubtitleOccurrence::Sidecar(name)) => (None, Some(name)),
+            None => (None, None),
+        },
+    };
     if (input.tracks.audio_component_id.is_some() && ca.is_none())
-        || (input.tracks.subtitle_component_id.is_some() && cs.is_none())
+        || (input.tracks.subtitle_component_id.is_some() && cs.is_none() && sidecar_name.is_none())
     {
         return Ok(Json(blocked(&input, "component_unavailable")).into_response());
     }
     let a = track_index(&input.tracks.audio_track_id, 'a', audios)?;
     let sub = track_index(&input.tracks.subtitle_track_id, 's', subtitles)?;
-    if a.zip(ca).is_some_and(|(a, b)| a != b) || sub.zip(cs).is_some_and(|(a, b)| a != b) {
+    if a.zip(ca).is_some_and(|(a, b)| a != b)
+        || sub.zip(cs).is_some_and(|(a, b)| a != b)
+        || (sub.is_some() && sidecar_name.is_some())
+    {
         return Err(Problem::invalid(
             "track_component_conflict",
             "The track and component pins disagree",
         ));
     }
     let audio = ca.or(a).or(default_audio);
-    use playscale_core::components::{SubtitleSelection, select_subtitle};
-    let subtitle = match select_subtitle(&input.tracks.subtitle_policy, cs.or(sub), subtitles) {
-        SubtitleSelection::Selected(index) => Some(index),
-        SubtitleSelection::None => None,
-        SubtitleSelection::Conflict => {
-            return Err(Problem::invalid(
-                "subtitle_policy_conflict",
-                "Explicit subtitles conflict with off",
-            ));
-        }
-        SubtitleSelection::Unavailable => {
-            return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
-        }
-        SubtitleSelection::AutomaticUnsupported => {
-            return Ok(
-                Json(blocked(&input, "automatic_subtitle_selection_unavailable")).into_response(),
-            );
-        }
-    };
-    if let Some(index) = subtitle {
-        let codec = &streams
-            .iter()
-            .filter(|t| t.kind == "subtitle")
-            .nth(index as usize)
-            .unwrap()
-            .codec;
-        if !matches!(
-            codec.as_str(),
-            "subrip" | "srt" | "webvtt" | "mov_text" | "text"
-        ) || !input.client.subtitle_modes.iter().any(|m| m == "text")
-        {
-            return Ok(Json(blocked(&input, "subtitle_format_unsupported")).into_response());
+    // A multipart timeline plays the selected audio component in every part:
+    // each part's own occurrence of it, never the first part's position.
+    if let Some(audio) = audio.filter(|_| !bound.parts.is_empty()) {
+        match multipart_audio(&mut conn, &components, &bound, &streams, audio).await? {
+            Some(per_part) => {
+                for (part, ordinal) in bound.parts.iter_mut().zip(per_part) {
+                    part.audio = Some(ordinal);
+                }
+            }
+            None => {
+                return Ok(Json(blocked(&input, "multipart_audio_unavailable")).into_response());
+            }
         }
     }
+    let explicit = cs.or(sub);
+    // Subtitle streams and sidecars belong to one file: a multipart timeline
+    // has no subtitle to deliver across its parts yet.
+    let multipart = !bound.parts.is_empty();
+    if multipart
+        && (explicit.is_some()
+            || sidecar_name.is_some()
+            || input.tracks.subtitle_policy == "require")
+    {
+        return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
+    // An explicit choice (embedded or sidecar) conflicts with "off".
+    if input.tracks.subtitle_policy == "off" && (explicit.is_some() || sidecar_name.is_some()) {
+        return Err(Problem::invalid(
+            "subtitle_policy_conflict",
+            "Explicit subtitles conflict with off",
+        ));
+    }
+    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
+    // The client selects an in-manifest HLS subtitle rendition on a live
+    // presentation (an external track there is refused by the player).
+    let live_text = accepts_text && accepts("hls_text");
+    // Without an explicit choice, "auto" and "require" select by the profile's
+    // languages and subtitle mode (core `automatic_subtitle`); never the first
+    // track and never another language. "require" is strict and decided
+    // before the route; "auto" only adds what the planned route presents.
+    use playscale_core::components::{
+        AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
+    };
+    let automatic = !multipart
+        && explicit.is_none()
+        && sidecar_name.is_none()
+        && input.tracks.subtitle_policy != "off";
+    let require = input.tracks.subtitle_policy == "require";
+    let candidates = if automatic {
+        subtitle_candidates(
+            &mut conn,
+            &components,
+            &bound,
+            &streams,
+            accepts_text,
+            accepts_burned,
+        )
+        .await?
+    } else {
+        vec![]
+    };
+    let preferences = if automatic {
+        Some(
+            legacy::prefs(&app, &input.profile_id)
+                .await
+                .map_err(problem)?
+                .preferences,
+        )
+    } else {
+        None
+    };
+    let audio_language = audio.and_then(|a| {
+        streams
+            .iter()
+            .filter(|t| t.kind == "audio")
+            .nth(a as usize)
+            .and_then(|t| t.language.clone())
+    });
+    // Choose among the candidates; with a route, only those it presents.
+    let choose = |route: Option<Route>| -> AutomaticSubtitle {
+        let Some(preferences) = &preferences else {
+            return AutomaticSubtitle::None;
+        };
+        let options: Vec<SubtitleOption> = candidates
+            .iter()
+            .map(|c| SubtitleOption {
+                language: c.language.clone(),
+                roles: c.roles.clone(),
+                deliverable: c.deliverable
+                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text)),
+            })
+            .collect();
+        let mode = match preferences.subtitle_mode.as_str() {
+            "always" => SubtitleMode::Always,
+            "forced" => SubtitleMode::Forced,
+            "off" => SubtitleMode::Off,
+            _ => SubtitleMode::ForeignAudio,
+        };
+        automatic_subtitle(
+            route.is_none(),
+            mode,
+            audio_language.as_deref(),
+            &preferences.audio_languages,
+            &preferences.subtitle_languages,
+            &options,
+        )
+    };
+    let (subtitle, sidecar_name) = match () {
+        _ if !automatic => (explicit, sidecar_name),
+        _ if require => match choose(None) {
+            AutomaticSubtitle::None => (None, None),
+            AutomaticSubtitle::Selected(i) => candidates[i].choice.clone(),
+            AutomaticSubtitle::Unavailable => {
+                return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
+            }
+            AutomaticSubtitle::Ambiguous => {
+                return Ok(Json(blocked(&input, "subtitle_selection_ambiguous")).into_response());
+            }
+        },
+        _ => (None, None),
+    };
+    let (subtitle, sidecar, burn) = match resolve_subtitle(
+        &mut conn,
+        &bound.file,
+        &streams,
+        accepts_text,
+        accepts_burned,
+        subtitle,
+        sidecar_name,
+    )
+    .await?
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
+    };
     let height = streams
         .iter()
         .find(|t| t.kind == "video")
@@ -1041,13 +1392,76 @@ pub async fn plan(
             ));
         }
     }
-    let source = core::SourceFacts {
+    // A copy is named from stream facts now; its bitstream details are
+    // observed only if the core would choose it (`Plan::Observe`).
+    let copy = match delivery::copy_candidate(&app, &bound.file, audio)
+        .and_then(Route::copy)
+        .filter(|_| input.quality.hdr_policy != "reject_conversion")
+    {
+        Some(route) => core::StreamCopy::Unobserved(route),
+        None => core::StreamCopy::Ineligible,
+    };
+    let hardware = match delivery::hardware_live(&app).await {
+        delivery::HardwareState::Unavailable => core::Hardware::Unavailable,
+        delivery::HardwareState::Busy => core::Hardware::Busy,
+        delivery::HardwareState::Available => core::Hardware::Available,
+    };
+    // Which renditions present exactly the selected streams. A playscale
+    // preparation records the source audio it encoded (its only audio); that
+    // record applies only to a rendition of this file and revision. Others
+    // carry the selection only when no audio was chosen.
+    let audio_chosen = input.tracks.audio_track_id.is_some()
+        || input.tracks.audio_component_id.is_some()
+        || audio != default_audio;
+    let subtitle_selected = subtitle.is_some() || sidecar.is_some() || burn.is_some();
+    let mut carries = Vec::with_capacity(prepared.len());
+    for p in &prepared {
+        let recorded: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT r.source_file_id,r.source_revision,p.tracks_json FROM renditions r \
+             JOIN preparations p ON p.job_id=r.external_id WHERE r.file_id=? AND r.source='playscale'",
+        )
+        .bind(&p.file.id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let encoded = recorded
+            .filter(|(file, revision, _)| {
+                *file == bound.file.id && *revision == bound.file.revision
+            })
+            .and_then(|(_, _, tracks)| {
+                serde_json::from_str::<super::processing::Tracks>(&tracks).ok()
+            })
+            .map(|tracks| match tracks.audio_track_id {
+                // `a{n}`: the n-th audio stream of the source revision; an
+                // unreadable record describes nothing.
+                Some(id) => id
+                    .strip_prefix('a')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .map(Some)
+                    .ok_or(()),
+                // No selection: the recipe encodes the first audio stream,
+                // or none when the source has no audio.
+                None => Ok(default_audio),
+            });
+        // A pinned version plays its own default streams (track and component
+        // pins were refused above).
+        carries.push(
+            !subtitle_selected
+                && (pinned_prepared
+                    || match encoded {
+                        Some(Ok(encoded)) => encoded == audio,
+                        Some(Err(())) => false,
+                        None => !audio_chosen,
+                    }),
+        );
+    }
+    let mut source = core::SourceFacts {
         available: original_available && bound.file.available,
         client_support: client_support(&bound.file, &input.client, audio, require_sdr),
         within_budget: fits_budget(&bound.file, limit, max_bitrate),
         prepared: prepared
             .iter()
-            .map(|p| core::PreparedFacts {
+            .zip(&carries)
+            .map(|(p, &carries_selection)| core::PreparedFacts {
                 file: p.file.id.clone(),
                 client_support: client_support(
                     &p.file,
@@ -1056,18 +1470,25 @@ pub async fn plan(
                     require_sdr,
                 ),
                 within_budget: fits_budget(&p.file, limit, max_bitrate),
+                carries_selection,
             })
             .collect(),
         transcodable: input.quality.hdr_policy != "reject_conversion"
             && delivery::live_transcodable(&bound.file, audio),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
+        // A requested cap is kept when the conversion can be capped at it
+        // with room for its video (core `rate_cap`).
         conversion_within_budget: core::conversion_fits(
             limit,
             max_bitrate,
             height.map(|h| h.min(delivery::LIVE_MAX_HEIGHT)),
-            None,
+            max_bitrate.filter(|b| core::rate_cap(*b, delivery::PEAK_WINDOW_MS).is_some()),
         ),
+        copy,
+        hardware,
+        clipped: bound.clip.is_some(),
+        multipart,
     };
     let request = core::Request {
         mode,
@@ -1075,14 +1496,37 @@ pub async fn plan(
         hls: input.client.transports.iter().any(|t| t == "hls"),
         explicit_streams: audio != default_audio,
         pinned_prepared,
-        // With a pinned rendition, track pins index that rendition's streams.
-        tracks_pinned: tracks_pinned
-            || input.tracks.audio_component_id.is_some()
-            || subtitle.is_some(),
+        burn_in: burn.is_some(),
         failed: input.failed_candidate_ids.clone(),
     };
+    let mut decided = core::plan(&bound.file.id, &source, &request);
+    if decided == core::Plan::Observe {
+        let core::StreamCopy::Unobserved(route) = source.copy else {
+            return Err(Problem::internal("copy observation without a candidate"));
+        };
+        // The probe queries the pool itself: hold no connection meanwhile.
+        drop(conn);
+        // A probe failure, a full admission queue or an unqualified bitstream
+        // leaves only conversion; admission observes the details again under
+        // its own checks.
+        source.copy = match delivery::observe_copy_details(&app, &bound.file.id).await {
+            Ok(details)
+                if delivery::copy_supported(&bound.file, audio, route.operation(), &details) =>
+            {
+                core::StreamCopy::Eligible(route)
+            }
+            _ => core::StreamCopy::Ineligible,
+        };
+        conn = app.db.acquire().await?;
+        decided = core::plan(&bound.file.id, &source, &request);
+        if decided == core::Plan::Observe {
+            return Err(Problem::internal(
+                "copy observation did not decide the plan",
+            ));
+        }
+    }
     // A prepared plan pins the chosen rendition and plays its default streams.
-    let (route, chosen, audio) = match core::plan(&bound.file.id, &source, &request) {
+    let (route, chosen, audio) = match decided {
         core::Plan::Ready(route) => (route, bound, audio),
         core::Plan::Prepared(i) => {
             let p = prepared
@@ -1093,10 +1537,40 @@ pub async fn plan(
             (Route::Prepared, p, audio)
         }
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
+        core::Plan::Observe => return Err(Problem::internal("undecided plan")),
     };
-    if subtitle.is_some() && route != Route::Original {
+    // Selected text subtitles are a WebVTT sidecar with byte delivery of the
+    // original, or an HLS subtitle rendition on a live route for a client that
+    // selects in-manifest live text. Shaka refuses an external text track on a
+    // live presentation, and burning text in needs libass, which the bundled
+    // FFmpeg does not include.
+    if (subtitle.is_some() || sidecar.is_some())
+        && !core::presents_subtitle(route, false, live_text)
+    {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
+    // "auto" adds a subtitle only if the planned route presents it; otherwise
+    // the plan proceeds without one, as it would with no subtitles at all.
+    let (subtitle, sidecar, burn) = match automatic && !require {
+        true => match choose(Some(route)) {
+            AutomaticSubtitle::Selected(i) => {
+                let (embedded, name) = candidates[i].choice.clone();
+                resolve_subtitle(
+                    &mut conn,
+                    &chosen.file,
+                    &streams,
+                    accepts_text,
+                    accepts_burned,
+                    embedded,
+                    name,
+                )
+                .await?
+                .unwrap_or((None, None, None))
+            }
+            _ => (None, None, None),
+        },
+        false => (subtitle, sidecar, burn),
+    };
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -1107,7 +1581,28 @@ pub async fn plan(
         file_revision: chosen.file.revision.clone(),
         route,
         audio,
-        subtitle,
+        subtitle: match (subtitle, sidecar, burn) {
+            (Some(index), _, _) => Some(core::Subtitle::Text(index)),
+            (None, Some(sidecar), _) => Some(core::Subtitle::Sidecar {
+                name: sidecar.name,
+                fingerprint: sidecar.fingerprint,
+            }),
+            (None, None, Some(index)) => Some(core::Subtitle::Bitmap(index)),
+            (None, None, None) => None,
+        },
+        clip: chosen.clip,
+        parts: chosen.parts.clone(),
+        // Only a conversion is capped; any other route was chosen within the
+        // limit without one.
+        max_bitrate_bps: max_bitrate
+            .filter(|_| matches!(route, Route::Transcode | Route::HardwareTranscode)),
+        adaptive: core::adaptive(
+            app.processing.settings.experimental_adaptive_bitrate,
+            route,
+            max_bitrate,
+            burn.is_some(),
+            !chosen.parts.is_empty(),
+        ),
         expires_at,
     };
     let mut warnings = vec![];
@@ -1127,7 +1622,7 @@ pub async fn plan(
         "operation": serde_json::to_value(route.operation()).map_err(Problem::internal)?,
         "reason_codes": [],
         "warnings": warnings,
-        "tracks": tracks_json(&input.tracks, audio, subtitle),
+        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn)),
     }))
     .into_response())
 }
@@ -1186,6 +1681,244 @@ impl delivery::AdmissionAuthority for PlanAuthority {
     }
 }
 
+/// Read-only preflight before a copy plan causes source work (a details
+/// probe): the caller re-derived from current credential state, control of
+/// `delivery` when replanning one, and every pinned fact except expiry (core
+/// `reauthorize`). The command repeats these checks in its write transaction;
+/// this only keeps a retained token from probing a source its holder can no
+/// longer reach.
+async fn may_probe(
+    app: &App,
+    caller: &Caller,
+    claims: &Claims,
+    delivery: Option<&str>,
+) -> Result<(), Problem> {
+    let mut conn = app.db.acquire().await?;
+    let principal = caller.reauthorize(&mut conn, None).await?;
+    if let Some(id) = delivery {
+        controlled_by(app, &mut conn, &principal, id).await?;
+    }
+    let facts = file_facts(&mut conn, &claims.file).await?;
+    let bound = still_bound(&mut conn, claims).await?;
+    core::reauthorize(
+        claims,
+        &core::Observed {
+            principal: &principal,
+            file: facts.as_ref(),
+            bound,
+            now: now(),
+        },
+    )
+    .map_err(plan_problem)
+}
+
+/// The audio stream ordinal, in each part of a multipart binding, of the
+/// component that the first part's audio stream `audio` belongs to. None when
+/// that component has no single occurrence in some part.
+async fn multipart_audio(
+    conn: &mut sqlx::SqliteConnection,
+    components: &[playscale_core::components::Component],
+    bound: &Bound,
+    streams: &[db::Track],
+    audio: u32,
+) -> Result<Option<Vec<u32>>, Problem> {
+    use playscale_core::components::{Kind, component_of, per_file_tracks};
+    let Some(index) = streams
+        .iter()
+        .filter(|t| t.kind == "audio")
+        .nth(audio as usize)
+        .map(|t| t.index)
+    else {
+        return Ok(None);
+    };
+    let Some(component) = component_of(
+        components,
+        Kind::Audio,
+        &bound.version,
+        &bound.file.id,
+        &bound.file.revision,
+        index,
+    ) else {
+        return Ok(None);
+    };
+    let files: Vec<(&str, &str)> = bound
+        .parts
+        .iter()
+        .map(|p| (p.file.as_str(), p.revision.as_str()))
+        .collect();
+    let Some(tracks) = per_file_tracks(component, &bound.version, &files) else {
+        return Ok(None);
+    };
+    let mut ordinals = Vec::with_capacity(tracks.len());
+    for (part, track) in bound.parts.iter().zip(tracks) {
+        let json: String = sqlx::query_scalar("SELECT tracks_json FROM catalog_files WHERE id=?")
+            .bind(&part.file)
+            .fetch_one(&mut *conn)
+            .await?;
+        let part_streams: Vec<db::Track> =
+            serde_json::from_str(&json).map_err(Problem::internal)?;
+        let Some(ordinal) = part_streams
+            .iter()
+            .filter(|t| t.kind == "audio")
+            .position(|t| t.index == track)
+        else {
+            return Ok(None);
+        };
+        ordinals.push(ordinal as u32);
+    }
+    Ok(Some(ordinals))
+}
+
+/// A subtitle on the planned file that automatic selection may choose.
+struct SubtitleCandidate {
+    language: Option<String>,
+    roles: playscale_core::components::Roles,
+    /// (embedded subtitle position, sidecar name), as an explicit pin.
+    choice: (Option<u32>, Option<String>),
+    /// Presented by burning it into converted video (a bitmap).
+    burned: bool,
+    /// This client can be given it on some route.
+    deliverable: bool,
+}
+
+/// The timeline's subtitle components that occur on exactly the bound file
+/// and revision: embedded tracks and sidecars.
+async fn subtitle_candidates(
+    conn: &mut sqlx::SqliteConnection,
+    components: &[playscale_core::components::Component],
+    bound: &Bound,
+    streams: &[db::Track],
+    accepts_text: bool,
+    accepts_burned: bool,
+) -> Result<Vec<SubtitleCandidate>, Problem> {
+    use playscale_core::components::{Kind, SubtitleOccurrence, subtitle_occurrence};
+    let mut out = Vec::new();
+    for component in components.iter().filter(|c| c.kind == Kind::Subtitle) {
+        let (choice, burned, deliverable) = match subtitle_occurrence(
+            components,
+            &component.id,
+            &bound.version,
+            &bound.file.id,
+            &bound.file.revision,
+        ) {
+            Some(SubtitleOccurrence::Embedded(index)) => {
+                let Some((position, track)) = streams
+                    .iter()
+                    .filter(|t| t.kind == "subtitle")
+                    .enumerate()
+                    .find(|(_, t)| t.index == index)
+                else {
+                    continue;
+                };
+                let text = playscale_core::delivery::sidecar_subtitle(&track.codec);
+                let bitmap = playscale_core::delivery::burnable_subtitle(&track.codec);
+                (
+                    (Some(position as u32), None),
+                    bitmap && accepts_burned,
+                    (text && accepts_text) || (bitmap && accepts_burned),
+                )
+            }
+            Some(SubtitleOccurrence::Sidecar(name)) => {
+                let format: Option<String> = sqlx::query_scalar(
+                    "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+                )
+                .bind(&bound.file.id)
+                .bind(&name)
+                .fetch_optional(&mut *conn)
+                .await?;
+                (
+                    (None, Some(name)),
+                    false,
+                    matches!(format.as_deref(), Some("srt" | "vtt")) && accepts_text,
+                )
+            }
+            None => continue,
+        };
+        out.push(SubtitleCandidate {
+            language: component.language.clone(),
+            roles: component.roles.clone(),
+            choice,
+            burned,
+            deliverable,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve a subtitle choice on `file`: an embedded text subtitle for a
+/// client that presents text, an embedded bitmap one burned for a client that
+/// accepts burned subtitles, or a plain-text sidecar pinned with the
+/// fingerprint it was scanned with. Anything else is a blocked reason, never
+/// a substitute.
+async fn resolve_subtitle(
+    conn: &mut sqlx::SqliteConnection,
+    file: &db::ItemRow,
+    streams: &[db::Track],
+    accepts_text: bool,
+    accepts_burned: bool,
+    embedded: Option<u32>,
+    sidecar: Option<String>,
+) -> Result<Result<(Option<u32>, Option<delivery::Sidecar>, Option<u32>), &'static str>, Problem> {
+    if let Some(index) = embedded {
+        let codec = &streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(index as usize)
+            .ok_or_else(|| Problem::internal("selected subtitle stream missing"))?
+            .codec;
+        return Ok(
+            if playscale_core::delivery::burnable_subtitle(codec) && accepts_burned {
+                Ok((None, None, Some(index)))
+            } else if playscale_core::delivery::sidecar_subtitle(codec) && accepts_text {
+                Ok((Some(index), None, None))
+            } else {
+                Err("subtitle_format_unsupported")
+            },
+        );
+    }
+    let Some(name) = sidecar else {
+        return Ok(Ok((None, None, None)));
+    };
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT fingerprint,format FROM sidecar_subtitles WHERE file_id=? AND name=?",
+    )
+    .bind(&file.id)
+    .bind(&name)
+    .fetch_optional(conn)
+    .await?;
+    Ok(match row {
+        Some((fingerprint, format)) if matches!(format.as_str(), "srt" | "vtt") && accepts_text => {
+            Ok((None, Some(delivery::Sidecar { name, fingerprint }), None))
+        }
+        Some(_) => Err("subtitle_format_unsupported"),
+        None => Err("component_unavailable"),
+    })
+}
+
+fn embedded_subtitle(claims: &Claims) -> Option<u32> {
+    match claims.subtitle {
+        Some(core::Subtitle::Text(index)) => Some(index),
+        _ => None,
+    }
+}
+
+fn burned_subtitle(claims: &Claims) -> Option<u32> {
+    match claims.subtitle {
+        Some(core::Subtitle::Bitmap(index)) => Some(index),
+        _ => None,
+    }
+}
+
+fn sidecar_of(claims: &Claims) -> Option<delivery::Sidecar> {
+    match &claims.subtitle {
+        Some(core::Subtitle::Sidecar { name, fingerprint }) => Some(delivery::Sidecar {
+            name: name.clone(),
+            fingerprint: fingerprint.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn problem_to_api(p: &Problem) -> ApiError {
     ApiError::new(p.status, p.code, &p.detail)
 }
@@ -1224,7 +1957,13 @@ fn generation_json(delivery: &str, owner: &Owner, g: &delivery::GenerationView) 
         "status": g.status,
         "media_url": media_url,
         "manifest_url": manifest_url,
-        "subtitles_url": g.subtitles_url.as_ref().map(|_| format!("/api/v2/streams/{}/{}/subtitles.vtt", segment(delivery), g.generation)),
+        // Byte delivery: a WebVTT sidecar. A live generation: its in-manifest
+        // HLS subtitle rendition's playlist (the client selects that track).
+        "subtitles_url": g.subtitles_url.as_ref().map(|_| if hls {
+            format!("/api/v2/streams/{}/{}/variants/{SUBTITLE_VARIANT}/index.m3u8", segment(delivery), g.generation)
+        } else {
+            format!("/api/v2/streams/{}/{}/subtitles.vtt", segment(delivery), g.generation)
+        }),
         "media_time_origin_ms": g.media_time_origin_ms,
         "requested_start_ms": g.requested_start_ms,
         "available_start_ms": g.available_start_ms,
@@ -1275,6 +2014,12 @@ pub async fn create_delivery(
     if claims.principal != caller.principal.id {
         return Err(invalid_plan());
     }
+    // A copy admission probes the source before its transaction; refuse a
+    // plan whose holder can no longer reach the source first. Admission
+    // rechecks everything, including for an exact retry.
+    if matches!(claims.route, Route::Remux | Route::AudioConvert) {
+        may_probe(&app, &caller, &claims, None).await?;
+    }
     let owner = owner_of(&claims);
     let request = delivery::CreateRequest {
         file_id: claims.file.clone(),
@@ -1282,7 +2027,7 @@ pub async fn create_delivery(
         start_ms: input.start_ms,
         audio_track: claims.audio,
         operation: None,
-        subtitle_track: claims.subtitle,
+        subtitle_track: embedded_subtitle(&claims),
         backend: None,
     };
     let planned = delivery::Planned {
@@ -1290,6 +2035,12 @@ pub async fn create_delivery(
         version: claims.version.clone(),
         route: claims.route,
         network: network.0,
+        sidecar: sidecar_of(&claims),
+        burn: burned_subtitle(&claims),
+        clip: claims.clip,
+        parts: claims.parts.clone(),
+        max_bitrate_bps: claims.max_bitrate_bps,
+        adaptive: claims.adaptive,
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -1505,6 +2256,39 @@ pub async fn change_delivery(
     body: Body<DeliveryChange>,
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
+    // A stream-copy replan needs the source's bitstream details: observe them
+    // before the write transaction. A probe failure is reported only for a new
+    // change, after an exact retry had the chance to replay.
+    let copy_probe = match &body.value {
+        DeliveryChange::Replan { plan_token, .. }
+            if app.processing.settings.experimental_copy_routes =>
+        {
+            match open(&app, plan_token) {
+                // Without a passing preflight nothing is probed: a new change
+                // is then refused by the transaction's own checks.
+                Ok(claims)
+                    if claims.principal == caller.principal.id
+                        && matches!(claims.route, Route::Remux | Route::AudioConvert)
+                        && may_probe(&app, &caller, &claims, Some(&id)).await.is_ok() =>
+                {
+                    Some(delivery::observe_copy_details(&app, &claims.file).await)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    // A hardware replan checks availability inside the write transaction from
+    // the cached probe only: warm it here, after the same preflight.
+    if let DeliveryChange::Replan { plan_token, .. } = &body.value
+        && app.processing.settings.experimental_live_hardware
+        && let Ok(claims) = open(&app, plan_token)
+        && claims.principal == caller.principal.id
+        && claims.route == Route::HardwareTranscode
+        && may_probe(&app, &caller, &claims, Some(&id)).await.is_ok()
+    {
+        delivery::hardware_live(&app).await;
+    }
     let (mut tx, principal, owner) = command(&app, &caller, &id).await?;
     let durable = Scope {
         principal: &principal.id,
@@ -1581,7 +2365,14 @@ pub async fn change_delivery(
                 Some(delivery::Selection {
                     route: claims.route,
                     audio: claims.audio,
-                    subtitle: claims.subtitle,
+                    subtitle: embedded_subtitle(&claims),
+                    sidecar: sidecar_of(&claims),
+                    burn: burned_subtitle(&claims),
+                    clip: claims.clip,
+                    parts: claims.parts.clone(),
+                    max_bitrate_bps: claims.max_bitrate_bps,
+                    adaptive: claims.adaptive,
+                    copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
         }
@@ -1774,14 +2565,70 @@ pub async fn master_playlist(
         .flatten()
         .find(|g| g.generation == generation && g.transport == "hls" && g.manifest_url.is_some())
         .ok_or_else(Problem::not_found)?;
-    // The pinned recipe: H.264 (<= 720p) with optional AAC stereo.
-    let codecs = if serving.audio_track.is_some() {
-        "avc1.64001f,mp4a.40.2"
+    // A stream copy keeps the source's H.264 profile/level and AAC object
+    // type: describe its own output. A transcode keeps its recipe's existing
+    // description (H.264 High, AAC-LC stereo).
+    // An adaptive ladder describes each variant from its own init segment.
+    let (codecs, size) =
+        if matches!(serving.operation.as_str(), "remux" | "audio_convert") || serving.adaptive {
+            delivery::init_codecs(&app, &id, &generation, None)
+                .await
+                .map_err(stream_problem)?
+                .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
+        } else if serving.audio_track.is_some() {
+            ("avc1.64001f,mp4a.40.2".into(), None)
+        } else {
+            ("avc1.64001f".into(), None)
+        };
+    // Ladder rungs carry their sizes so a client can tell them apart.
+    let resolution = |size: Option<(u32, u32)>| {
+        size.filter(|_| serving.adaptive)
+            .map_or(String::new(), |(w, h)| format!(",RESOLUTION={w}x{h}"))
+    };
+    // A selected text subtitle is an in-manifest SUBTITLES rendition that
+    // mirrors the media segments (the client selects it as a live track).
+    let (rendition, group) = if serving.subtitles_url.is_some() {
+        (
+            format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Selected subtitles\",DEFAULT=YES,AUTOSELECT=YES,URI=\"{}\"\n",
+                stream_link(&format!("variants/{SUBTITLE_VARIANT}/index.m3u8"), &params)
+            ),
+            ",SUBTITLES=\"subs\"",
+        )
     } else {
-        "avc1.64001f"
+        (String::new(), "")
+    };
+    // The low rung of an adaptive ladder, capped and described from its own
+    // output.
+    let low = if serving.adaptive {
+        let (codecs, size) = delivery::init_codecs(&app, &id, &generation, Some(LOW_VARIANT))
+            .await
+            .map_err(stream_problem)?
+            .ok_or_else(|| Problem::internal("low variant codecs could not be described"))?;
+        format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{}{group}\n{}\n",
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            resolution(size),
+            stream_link(&format!("variants/{LOW_VARIANT}/index.m3u8"), &params)
+        )
+    } else {
+        String::new()
     };
     let text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=5000000,CODECS=\"{codecs}\"\n{}\n",
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n{rendition}#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{}{group}\n{}\n{low}",
+        // A capped conversion's peak is its cap (measured per window). A copy
+        // keeps the source's rate: declare the higher of its probed average
+        // and the peak measured so far over published windows (an estimate,
+        // not a guarantee, for a copy).
+        serving.max_bitrate_bps.unwrap_or(
+            if matches!(serving.operation.as_str(), "remux" | "audio_convert") {
+                delivery::copied_rate(&app, &id, &generation)
+                    .map_or(5_000_000, |rate| rate.max(5_000_000))
+            } else {
+                5_000_000
+            },
+        ),
+        resolution(size),
         stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
     let response = (
@@ -1804,6 +2651,29 @@ pub async fn variant_playlist(
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
+    if variant == LOW_VARIANT {
+        return delivery::low_playlist(
+            &app,
+            &id,
+            &generation,
+            |i| stream_link(&format!("../../segments/{LOW_VARIANT}-{i}.m4s"), &params),
+            &stream_link("init.mp4", &params),
+        )
+        .await
+        .map(|response| delivery::count(transfer, response))
+        .map_err(stream_problem);
+    }
+    if variant == SUBTITLE_VARIANT {
+        return delivery::subtitle_playlist(&app, &id, &generation, |i| {
+            stream_link(
+                &format!("../../segments/{SUBTITLE_VARIANT}-{i}.vtt"),
+                &params,
+            )
+        })
+        .await
+        .map(|response| delivery::count(transfer, response))
+        .map_err(stream_problem);
+    }
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -1827,6 +2697,12 @@ pub async fn init_segment(
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
+    if variant == LOW_VARIANT {
+        return delivery::low_init(&app, &id, &generation)
+            .await
+            .map(|response| delivery::count(transfer, response))
+            .map_err(stream_problem);
+    }
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -1844,7 +2720,27 @@ pub async fn media_segment(
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
     let transfer = delivery::transfer(&app, &id);
-    delivery::segment(State(app.clone()), Path((id.clone(), generation, segment)))
+    if let Some(index) = segment
+        .strip_prefix(&format!("{SUBTITLE_VARIANT}-"))
+        .and_then(|s| s.strip_suffix(".vtt"))
+    {
+        let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
+        return delivery::subtitle_segment(&app, &id, &generation, index)
+            .await
+            .map(|response| delivery::count(transfer, response))
+            .map_err(stream_problem);
+    }
+    if let Some(index) = segment
+        .strip_prefix(&format!("{LOW_VARIANT}-"))
+        .and_then(|s| s.strip_suffix(".m4s"))
+    {
+        let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
+        return delivery::low_segment(&app, &id, &generation, index)
+            .await
+            .map(|response| delivery::count(transfer, response))
+            .map_err(stream_problem);
+    }
+    delivery::segment(State(app), Path((id, generation, segment)))
         .await
         .map(|response| delivery::count(transfer, response))
         .map_err(stream_problem)
