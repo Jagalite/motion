@@ -169,6 +169,16 @@ fixed in the round-2 commit:
 | S9 (P2) | `EPIPE` on the cache tool's stdin could crash the desktop process | Fixed. A stdin error rejects the operation; the next pass retries. |
 | S10 (P2) | A blob verified before a crash was not recovered until space for a second copy was admitted | Fixed. `cache recover` (`Store::recover`) re-verifies and publishes such a blob before any admission or transfer. Store and agent tests cover it. |
 
+**Round 3** (at `7f869d2`) raised four P2 findings and no P1. All four are
+fixed in the round-3 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S11 (P2) | After `downloads:manage` was removed, cached copies stayed openable forever | Fixed. On connect without the permission, or on a 403 from the download list, the agent withdraws every owned copy and staged transfer. Unsynchronized events are kept and nothing is transferred. Agent test covers it. |
+| S12 (P2) | Each profile root received the whole quota | Fixed. Admission passes the quota minus the usage of the device's other owned roots, so it is one device budget. The decision is still `offline::admits_transfer`. Agent test covers it. |
+| S13 (P2) | The agent's index files were renamed without a directory fsync | Fixed. `current.json` and `roots.json` are synced through their directory after rename. |
+| S14 (P2) | Valid catalog titles over 1,024 UTF-8 bytes could never be cached | Fixed. The cached display title is shortened on a character boundary. Agent test covers it. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

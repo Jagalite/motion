@@ -7,7 +7,7 @@
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
 import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeSync, createWriteStream} from 'node:fs';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 
@@ -25,6 +25,21 @@ function writeAtomically(path, value) {
   const fd = openSync(temporary, 'wx', 0o600);
   try { writeSync(fd, JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
   renameSync(temporary, path);
+  // The rename is durable only once its directory is synced.
+  const directory = openSync(dirname(path), 'r');
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+}
+
+/** The cache stores titles of at most 1,024 UTF-8 bytes; shorten on a character boundary. */
+export function cacheTitle(title) {
+  const encoder = new TextEncoder();
+  if (encoder.encode(title).length <= 1024) return title;
+  let shortened = '';
+  for (const character of title) {
+    if (encoder.encode(`${shortened}${character}…`).length > 1024) break;
+    shortened += character;
+  }
+  return `${shortened}…`;
 }
 
 function readJson(path, fallback) {
@@ -71,6 +86,29 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     return {path: join(base, name), name, scope};
   }
 
+  /** The roots this server, principal and device own (one per profile). */
+  function ownedRoots() {
+    return Object.entries(readJson(index, {}))
+      .filter(([name, scope]) => ours(scope) && rootName(scope) === name && existsSync(join(base, name, 'manifest.json')))
+      .map(([name, scope]) => ({path: join(base, name), name, scope}));
+  }
+
+  /**
+   * The device lost `downloads:manage`: remove every owned copy and staged
+   * transfer. Unsynchronized events are kept; nothing is transferred.
+   */
+  async function withdraw() {
+    let removed = 0;
+    for (const target of ownedRoots()) {
+      const {manifest, staged} = await cache(target.path, target.scope, ['status']);
+      for (const id of new Set([...manifest.downloads.map(d => d.identity.download_id), ...staged])) {
+        await cache(target.path, target.scope, ['remove', '--download-id', id]);
+        removed++;
+      }
+    }
+    if (removed > 0) status('Downloads were removed from this device because it may no longer keep them. Offline progress was kept.');
+  }
+
   async function listDownloads() {
     const items = [];
     let cursor = null;
@@ -100,7 +138,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
-      title: manifest.title, duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType});
+      title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType});
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     // A publication that crashed after verifying its blob needs no new
@@ -110,7 +148,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return true;
     }
     if (have > size) { truncateSync(staged, 0); have = 0; }
-    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(quota), '--headroom', String(headroom)]);
+    // One device budget across every owned root (profile), not one per root.
+    let elsewhere = 0;
+    for (const other of ownedRoots()) {
+      if (other.name !== target.name) elsewhere += Number((await cache(other.path, other.scope, ['status'])).usage);
+    }
+    const remaining = Math.max(0, quota - elsewhere);
+    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(remaining), '--headroom', String(headroom)]);
     if (!admitted.admitted) {
       status(`Not enough space to save "${manifest.title}". Free space or remove downloads, then reconnect.`);
       return false;
@@ -203,7 +247,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
 
   /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */
   async function pass() {
-    const downloads = await listDownloads();
+    let downloads;
+    try { downloads = await listDownloads(); }
+    catch (error) {
+      // A definitive authorization refusal withdraws local copies.
+      if (error.status === 403) return withdraw();
+      throw error;
+    }
     const profiles = new Set(downloads.map(d => d.profile_id));
     for (const [name, scope] of Object.entries(readJson(index, {}))) if (ours(scope) && rootName(scope) === name) profiles.add(scope.profile_id);
     let current = null;
@@ -244,5 +294,5 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (current) writeAtomically(join(base, 'current.json'), {root: current});
   }
 
-  return {pass, root, transfer, reconcile};
+  return {pass, root, transfer, reconcile, withdraw};
 }

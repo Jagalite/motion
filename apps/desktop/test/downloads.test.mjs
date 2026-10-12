@@ -4,7 +4,7 @@ import {mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
-import {createDownloadAgent, currentRoot, rootName, wireEvent} from '../src/downloads.mjs';
+import {cacheTitle, createDownloadAgent, currentRoot, rootName, wireEvent} from '../src/downloads.mjs';
 
 const identity = {server_id: 'server', principal_id: 'device1', device_id: 'device1'};
 const media = Buffer.from('0123456789abcdefghij');
@@ -26,7 +26,7 @@ function fakeCache() {
     mkdirSync(join(root, 'staging'), {recursive: true});
     const s = state(root);
     switch (args[0]) {
-      case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads},
+      case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads}, usage: String(s.downloads.reduce((n, d) => n + (d.size ?? 0), 0)),
         staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5))};
       case 'admit': return {admitted: Number(args[2]) <= 1000};
       case 'publish': {
@@ -274,4 +274,50 @@ test('a refused sync keeps its events but never blocks removal', async () => {
   assert.equal(fake.state(target.path).events.length, 1, 'events are retained');
   assert.equal(fake.state(target.path).downloads.length, 0, 'the no-longer-visible copy is removed');
   assert.match(statuses[0], /not_found/);
+});
+
+test('the quota is one device budget across every profile root', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const admits = [];
+  const cache = async (root, scope, args, input) => {
+    if (args[0] === 'admit') { admits.push(args); return {admitted: Number(args[2]) <= Number(args[4])}; }
+    return fake.cache(root, scope, args, input);
+  };
+  const statuses = [];
+  const agent = createDownloadAgent({base, identity, cache, quota: 30, status: m => statuses.push(m),
+    api: async () => manifest('d1'), fetchMedia: async () => assert.fail('no transfer')});
+  const kids = agent.root('kids');
+  mkdirSync(kids.path, {recursive: true});
+  writeFileSync(join(kids.path, 'manifest.json'), '{}');
+  fake.state(kids.path).downloads.push({identity: {download_id: 'k1'}, size: 15});
+  assert.equal(await agent.transfer({id: 'd1'}, agent.root('default')), false);
+  assert.deepEqual(admits[0].slice(3, 5), ['--quota', '15'], 'the other profile already holds 15 of 30');
+  assert.match(statuses[0], /Not enough space/);
+});
+
+test('losing downloads:manage withdraws every owned copy but keeps offline progress', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async () => { throw Object.assign(new Error('forbidden'), {status: 403, code: 'forbidden'}); }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  fake.state(target.path).downloads.push({identity: {download_id: 'd1'}});
+  fake.state(target.path).events = [event(1)];
+  await agent.pass();
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  assert.equal(fake.state(target.path).events.length, 1);
+  assert.match(statuses[0], /removed from this device/);
+});
+
+test('long titles are shortened to the cache bound on a character boundary', () => {
+  const title = '映'.repeat(400); // 1,200 UTF-8 bytes, within the catalog's 500 characters.
+  const cached = cacheTitle(title);
+  assert.ok(new TextEncoder().encode(cached).length <= 1024);
+  assert.ok(cached.endsWith('…') && !cached.includes('\uFFFD'));
+  assert.equal(cacheTitle('Short'), 'Short');
 });

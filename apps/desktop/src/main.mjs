@@ -213,7 +213,8 @@ async function connectOwned(input, owner, locallyOwned = false) {
     };
     monitor = setTimeout(inspect, 10000);
     const principal = browserSession.principal;
-    if (principal.device_id && principal.permissions?.includes('downloads:manage')) {
+    if (principal.device_id) {
+      const permitted = principal.permissions?.includes('downloads:manage');
       const controller = new AbortController();
       const api = async (path, {method = 'GET', body, idempotent = false, headers = {}} = {}) => {
         if (!current()) throw new Error('Connection changed');
@@ -250,7 +251,11 @@ async function connectOwned(input, owner, locallyOwned = false) {
       };
       state.abort = () => { controller.abort(); clearTimeout(state.timer); };
       downloads = state;
-      void run();
+      // Without downloads:manage the device keeps no copies (events stay).
+      if (permitted) void run();
+      else state.running = agent.withdraw().catch(error => {
+        if (current()) window.webContents.send('motion:status', `Downloads could not be removed: ${error.message}`);
+      });
     }
     return selected;
   } catch (error) {

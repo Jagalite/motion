@@ -14,9 +14,9 @@
   "server_sha256": "11bbb3b67571977a41d187d1e725e7490405c23e29ff3c55769e7525bd5d3fb4",
   "host_sha256": "083686dc669fc21ca2cd9041b46a282ed75c07bd521d432374494eeca500d9bf",
   "media_sha256": "f7c5cb6b947171872df862cd2639ecac03b454e09ae3a9d73d7d43e6d0b4e27d",
-  "commit": "586d2a0b76b5ef7db2e2fb197fcea61d71489eb6",
-  "recorded_at": "2026-10-12T19:10:39.613Z",
-  "artifacts": "$TMPDIR/motion-download-workflow-PeI376",
+  "commit": "7f869d20b10bfb90c3606c3238c1f67698d2b96d",
+  "recorded_at": "2026-10-12T19:20:42.534Z",
+  "artifacts": "$TMPDIR/motion-download-workflow-2dL6i8",
   "limitations": [
     "Node runner without Electron: playback is represented by verified range reads and the offline player's event protocol.",
     "One device, one profile, one complete MP4 original; macOS arm64 debug binaries."
