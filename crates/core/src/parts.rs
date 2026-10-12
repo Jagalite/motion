@@ -42,8 +42,19 @@ pub struct PartPin {
     pub duration_ms: u64,
     /// The zero-based audio stream of this part that carries the selected
     /// audio component (`components::per_file_tracks`); None plays no audio.
-    #[serde(default)]
+    /// Omitted when absent, so pins without it serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<u32>,
+}
+
+/// Whether two multipart layouts are the same timeline: the same files,
+/// revisions and durations in the same order. The selected audio may differ
+/// (a replan may switch tracks); the layout may not.
+pub fn same_layout(a: &[PartPin], b: &[PartPin]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.file == b.file && a.revision == b.revision && a.duration_ms == b.duration_ms
+        })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,5 +241,29 @@ mod tests {
         assert_eq!(locate(&durations, 2_999), Some((1, 1_999)));
         assert_eq!(locate(&durations, 3_000), Some((2, 0)));
         assert_eq!(locate(&durations, 3_500), None);
+    }
+
+    #[test]
+    fn layouts_compare_parts_not_audio_selection() {
+        let pin = |file: &str, audio| PartPin {
+            file: file.into(),
+            revision: "r".into(),
+            duration_ms: 1_000,
+            audio,
+        };
+        assert!(same_layout(
+            &[pin("a", Some(0)), pin("b", Some(1))],
+            &[pin("a", Some(1)), pin("b", Some(0))]
+        ));
+        assert!(!same_layout(&[pin("a", None)], &[pin("b", None)]));
+        assert!(!same_layout(
+            &[pin("a", None)],
+            &[pin("a", None), pin("b", None)]
+        ));
+        // Absent audio serializes as before the field existed.
+        assert_eq!(
+            serde_json::to_string(&pin("a", None)).unwrap(),
+            r#"{"file":"a","revision":"r","duration_ms":1000}"#
+        );
     }
 }

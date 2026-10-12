@@ -2779,8 +2779,11 @@ pub(crate) async fn change_live(
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
             validate_burn(&file, selection.burn, pin.operation)?;
-            // The timeline's interval and parts are fixed for the delivery.
-            if selection.clip != basis.clip || selection.parts != basis.parts {
+            // The timeline's interval and part layout are fixed for the
+            // delivery; the selected audio in each part may change.
+            if selection.clip != basis.clip
+                || !playscale_core::parts::same_layout(&selection.parts, &basis.parts)
+            {
                 return Err(ApiError::conflict(
                     "timeline_changed",
                     "The timeline's interval changed; create a new delivery",

@@ -5063,5 +5063,38 @@ async fn multipart_audio_follows_the_component_in_every_part() {
         (860..=900).contains(&one) && (860..=900).contains(&two),
         "{one} {two}"
     );
+    // A live multipart delivery can switch to the other component by replan.
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["hls"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("mp-audio-switch-0001"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| d["active"]["status"] == "active")
+        .await;
+    let mut switch = plan_input("default", &timeline, "auto", None, &["hls"]);
+    switch["tracks"]["audio_component_id"] = json!(director);
+    let switch = f.post("/api/v2/playback/plans", &auth, None, switch).await;
+    let staged = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("mp-audio-switch-0002"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":switch.body["plan_token"],"position_ms":5000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
     let _ = first_revision;
 }
