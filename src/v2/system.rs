@@ -113,14 +113,54 @@ pub async fn capabilities(
     ]);
     let mut playback = feature("playback.v2", true, true);
     playback.limits = BTreeMap::from([
-        ("routes", "original,prepared,software_hls".into()),
-        ("timeline_binding", "whole_single_part".into()),
-        ("subtitles", "embedded_plain_text_original_webvtt".into()),
-        ("components", "embedded_revision_bound".into()),
+        (
+            "routes",
+            // Live routes are advertised only where the server admits them.
+            {
+                let mut routes = vec!["original", "prepared"];
+                if app.processing.settings.experimental_copy_routes {
+                    routes.push("stream_copy_hls");
+                }
+                routes.push("software_hls");
+                if crate::delivery::hardware_live(&app).await
+                    != crate::delivery::HardwareState::Unavailable
+                {
+                    routes.push("hardware_hls");
+                }
+                routes.join(",")
+            },
+        ),
+        // Intervals and multipart versions are played by conversion only.
+        ("timeline_binding", "whole,interval,multipart".into()),
+        (
+            "subtitles",
+            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,text_hls_rendition_on_live_routes_for_hls_text_clients,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+        ),
+        ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
+        ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
         ("tickets", "file_or_delivery_generation_playback".into()),
-        ("unsupported", "automatic_subtitle_selection,sidecar_bitmap_styled_subtitles,subtitle_conversion,prepared_track_pins,multipart,interval,hdr_conversion,bitrate_caps,adaptive_bitrate,cast".into()),
+        (
+            "adaptive_bitrate",
+            if app.processing.settings.experimental_adaptive_bitrate {
+                "software_conversion:720p_3000000,360p_800000"
+            } else {
+                "disabled"
+            }
+            .into(),
+        ),
+        ("unsupported", "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
+    ]);
+    let mut sessions = feature("admin.playback_sessions", true, true);
+    sessions.limits = BTreeMap::from([(
+        "history_retention_days",
+        crate::playback_monitor::RETENTION_DAYS.to_string(),
+    )]);
+    let mut metrics = feature("admin.metrics", true, true);
+    metrics.limits = BTreeMap::from([
+        ("interval_seconds", "10".into()),
+        ("retention_seconds", "86400".into()),
     ]);
     let features = vec![
         api,
@@ -137,6 +177,8 @@ pub async fn capabilities(
         feature("events.scoped_stream", true, true),
         feature("catalog.v2", true, true),
         playback,
+        metrics,
+        sessions,
     ];
     let mut runtime_hashes = BTreeMap::new();
     if let Some(hash) = app
@@ -174,6 +216,16 @@ pub(crate) static DB_BUSY_COUNT: std::sync::atomic::AtomicU64 =
 
 pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
     caller.require(playscale_core::access::Permission::SystemAdmin)?;
+    // Process measurements are optional: when they cannot be taken (the
+    // reader is busy or the platform call failed) the rest of diagnostics
+    // still answers, with `process: null`, rather than failing as a whole.
+    let process = match app.health.metrics.snapshot().await {
+        Ok(process) => Some(process),
+        Err(code) => {
+            tracing::warn!(code, "Process measurements are temporarily unavailable");
+            None
+        }
+    };
     let mut tx = app.db.begin().await?;
     caller
         .reauthorize(
@@ -194,7 +246,52 @@ pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Respo
         "active_deliveries":app.processing.deliveries.active_sessions().to_string(),
         "queued_jobs":queued.to_string(),"running_jobs":running.to_string(),
         "db_busy_count":DB_BUSY_COUNT.load(Ordering::Relaxed).to_string(),
-        "worker_errors":errors
+        "worker_errors":errors,
+        "process":process
     }))
     .into_response())
+}
+
+pub async fn metrics(
+    State(app): State<App>,
+    caller: Caller,
+    query: Result<
+        axum::extract::Query<crate::metrics::history::HistoryQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Result<Response, Problem> {
+    use playscale_core::access::Permission::SystemAdmin;
+    caller.require(SystemAdmin)?;
+    let query = query
+        .map_err(|_| Problem::bad("invalid_metrics_query", "Invalid metrics query"))?
+        .0;
+    let now = crate::now();
+    let window = query.validate(now).map_err(|_| {
+        Problem::bad(
+            "invalid_metrics_query",
+            "since must be RFC 3339 and step_seconds an integer of at least 10",
+        )
+    })?;
+    let mut tx = app.db.begin().await?;
+    caller.reauthorize(&mut tx, Some(SystemAdmin)).await?;
+    tx.commit().await?;
+    let history = crate::metrics::history::read(&app, window, now)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                code = "metrics_read_failed",
+                "Metrics history is temporarily unavailable"
+            );
+            Problem::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "metrics_read_failed",
+                "Metrics history is temporarily unavailable",
+            )
+        })?;
+    // Read the credential again after the potentially longer history read,
+    // without keeping an application DB transaction open across that work.
+    let mut tx = app.db.begin().await?;
+    caller.reauthorize(&mut tx, Some(SystemAdmin)).await?;
+    tx.commit().await?;
+    Ok(Json(history).into_response())
 }

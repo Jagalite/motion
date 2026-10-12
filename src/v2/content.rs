@@ -349,6 +349,9 @@ pub async fn revoke(
 pub struct MediaParams {
     revision: Option<String>,
     ticket: Option<String>,
+    /// The delivery a direct-play URL belongs to: attribution for
+    /// administrator monitoring only, never authorization.
+    delivery: Option<String>,
 }
 
 type TicketRow = (String, String, String, String, Option<String>, i64, bool);
@@ -387,6 +390,8 @@ pub async fn file_content(
 ) -> Result<Response, Problem> {
     let mut conn = app.db.acquire().await?;
     let facts = file_facts(&mut conn, &file_id).await?;
+    // Who is reading, to attribute direct-play bytes to their live delivery.
+    let reader: Option<String>;
     if let Some(token) = &params.ticket {
         if token.contains(".delivery.") {
             return Err(TicketError::TicketInvalid.into());
@@ -412,6 +417,7 @@ pub async fn file_content(
         };
         let principal =
             ticket_principal(&mut conn, &principal_id, credential_hash.as_deref()).await;
+        reader = Some(principal_id.clone());
         core::admit_file_ticket(
             &ticket,
             &file_id,
@@ -424,25 +430,46 @@ pub async fn file_content(
         drop(conn);
         let caller = auth::resolve(&app, &method, &headers).await?;
         core::admit_file_bytes(&caller.principal, facts.as_ref())?;
+        reader = Some(caller.principal.id.clone());
     }
+    // Only reads pinned to a revision are attributed: a delivery's media URL
+    // always pins its own, and serving refuses any other. Reserved before
+    // serving, so a close meanwhile waits for this response.
+    let transfer = match (&reader, &params.revision) {
+        (Some(principal), Some(revision)) => crate::delivery::file_transfer(
+            &app,
+            principal,
+            &file_id,
+            revision,
+            params.delivery.as_deref(),
+        ),
+        _ => None,
+    };
     let query = media::MediaQuery {
         revision: params.revision,
     };
-    media::serve(State(app), Path(file_id), Query(query), method, headers)
-        .await
-        .map_err(|e| {
-            let (status, code, _) = e.parts();
-            let code = match code {
-                "source_revision_changed" => "source_revision_changed",
-                "source_unavailable" => "source_unavailable",
-                "stream_limit" => "stream_limit",
-                "not_found" => "not_found",
-                _ => "media_unavailable",
-            };
-            let mut problem = Problem::new(status, code, "The media could not be served");
-            if status == StatusCode::SERVICE_UNAVAILABLE {
-                problem.retry_after = Some(1);
-            }
-            problem
-        })
+    media::serve(
+        State(app.clone()),
+        Path(file_id),
+        Query(query),
+        method,
+        headers,
+    )
+    .await
+    .map(|response| crate::delivery::count(transfer, response))
+    .map_err(|e| {
+        let (status, code, _) = e.parts();
+        let code = match code {
+            "source_revision_changed" => "source_revision_changed",
+            "source_unavailable" => "source_unavailable",
+            "stream_limit" => "stream_limit",
+            "not_found" => "not_found",
+            _ => "media_unavailable",
+        };
+        let mut problem = Problem::new(status, code, "The media could not be served");
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            problem.retry_after = Some(1);
+        }
+        problem
+    })
 }

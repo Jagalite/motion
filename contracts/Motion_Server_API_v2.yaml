@@ -7018,6 +7018,180 @@ paths:
         '503':
           $ref: '#/components/responses/E503'
       x-required-permission: system:admin
+  /api/v2/admin/metrics:
+    get:
+      operationId: getMetrics
+      summary: Read bounded operational metrics history
+      tags:
+      - administration
+      x-owner: A14
+      x-milestone: M1
+      x-status: implementation_target
+      x-required-permission: system:admin
+      description: >-
+        Redacted process, HTTP, workload, and storage observations retained in SQLite across
+        server restarts. Samples are attempted every 10 seconds for 24 hours; unavailable
+        observations and failed samples produce gaps. Storage observations may be sampled
+        every 60 seconds, without interpolation. No per-sample events are emitted.
+        The server may increase the requested bucket width to bound each series to 2000
+        points. Buckets are anchored to the Unix epoch in UTC. Gauge buckets select the last
+        sample. Counter buckets select the last sample independently within each server
+        epoch, and counter series also retain the first actual sample of each server epoch,
+        to make resets visible; no synthetic zero is inserted.
+        At most the newest 12000 raw observations per series are considered; if excessive
+        restarts still exceed the response cap, only the newest 2000 selected points
+        are returned. Such restart churn can truncate the oldest retained history.
+        interval_seconds reports the native 10-second sampling interval,
+        not the effective bucket width. Points retain their original observation timestamps.
+      parameters:
+      - name: since
+        in: query
+        required: false
+        description: >-
+          Inclusive RFC 3339 timestamp with an explicit UTC offset. Defaults to the
+          retention start (request time minus 86400 seconds); older values are clamped
+          to that floor. A future value returns empty point arrays. Invalid input is 400.
+        schema:
+          $ref: '#/components/schemas/Timestamp'
+      - name: step_seconds
+        in: query
+        required: false
+        description: >-
+          Requested bucket width in whole seconds, at least the native sample interval.
+          Defaults to 10; the server may increase it to enforce the point cap.
+          Malformed, fractional, negative, too-small, or values outside the unsigned
+          64-bit range are 400.
+        schema:
+          type: integer
+          minimum: 10
+          default: 10
+      responses:
+        '200':
+          description: Bounded operational metrics history, ordered oldest to newest per series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsHistory'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+  /api/v2/admin/playback/sessions:
+    get:
+      operationId: listPlaybackSessions
+      summary: List live playback sessions
+      tags:
+      - administration
+      x-owner: A14
+      x-milestone: M1
+      x-status: implementation_target
+      x-required-permission: system:admin
+      description: >-
+        Live v2 deliveries, newest first: who (device and profile), what (item, timeline,
+        version), how (direct, remux or transcode) and how fast. Transfer counters are
+        measured where response bytes are handed to the connection; direct play through the
+        file content URL is attributed to the requesting principal's live delivery for that
+        file. client_network classifies the requesting client's connection without exposing
+        its address. Observations only: no field authorizes or drives playback. At most 500
+        sessions are listed; truncated reports more. Changes are hinted on the event stream
+        as resource_type playback_session (administrators only), at most once per session
+        every few seconds and never per byte.
+      responses:
+        '200':
+          description: Live playback sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaybackSessionList'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+  /api/v2/admin/playback/history:
+    get:
+      operationId: listPlaybackHistory
+      summary: List finished playback sessions
+      tags:
+      - administration
+      x-owner: A14
+      x-milestone: M1
+      x-status: implementation_target
+      x-required-permission: system:admin
+      description: >-
+        Finished playback sessions, newest first, retained 90 days and at most 100000 rows.
+        A session of a process that stopped without finishing it ends as interrupted, at its
+        last recorded activity, with its last recorded counters (written every few seconds).
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+      - name: device_id
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+      - name: profile_id
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+      - name: item_id
+        in: query
+        required: false
+        description: An item, or a parent item (a season or series) of the items played.
+        schema:
+          $ref: '#/components/schemas/Id'
+      - name: since
+        in: query
+        required: false
+        description: Inclusive RFC 3339 lower bound on ended_at.
+        schema:
+          $ref: '#/components/schemas/Timestamp'
+      responses:
+        '200':
+          description: A page of finished playback sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaybackHistoryPage'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
   /api/v2/admin/storage:
     get:
       operationId: getStorage
@@ -7382,6 +7556,12 @@ paths:
       - name: revision
         in: query
         required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - name: delivery
+        in: query
+        description: The delivery this direct-play read belongs to, as its media_url names it. Attribution
+          for administrator playback monitoring only; it never authorizes a read.
         schema:
           $ref: '#/components/schemas/Id'
       - name: Range
@@ -9263,6 +9443,11 @@ components:
           $ref: '#/components/schemas/Digest'
         features:
           type: array
+          description: >-
+            Caller-visible feature status. admin.metrics is implemented and enabled,
+            advertising operational history with limits interval_seconds = "10" and
+            retention_seconds = "86400". Its absence means history is unavailable
+            to this caller.
           items:
             $ref: '#/components/schemas/Feature'
           maxItems: 200
@@ -10941,7 +11126,8 @@ components:
             - styled
             - bitmap
             - burned
-          maxItems: 4
+            - hls_text
+          maxItems: 5
         hdr:
           type: string
           enum:
@@ -11252,7 +11438,7 @@ components:
           - type: string
             maxLength: 4096
           - type: 'null'
-          description: Selected plain-text subtitle on original byte delivery, in timeline time. Clients must present it or refuse the plan.
+          description: Selected plain-text subtitle. With http_range transport, a WebVTT sidecar of the original in timeline time. With hls transport (offered only to clients listing hls_text), the playlist of the master playlist's in-manifest SUBTITLES rendition, whose WebVTT segments are in the generation's media time; clients select that rendition's track. Clients must present it or refuse the plan.
         media_time_origin_ms:
           $ref: '#/components/schemas/Milliseconds'
         requested_start_ms:
@@ -12542,6 +12728,13 @@ components:
           $ref: '#/components/schemas/UInt64'
         db_busy_count:
           $ref: '#/components/schemas/UInt64'
+        process:
+          description: >-
+            Null when process measurements could not be taken for this response;
+            the other diagnostics are still reported.
+          anyOf:
+          - $ref: '#/components/schemas/ProcessMetrics'
+          - type: 'null'
         worker_errors:
           type: array
           items:
@@ -12556,6 +12749,377 @@ components:
       - running_jobs
       - db_busy_count
       - worker_errors
+      - process
+    ProcessMetrics:
+      type: object
+      additionalProperties: false
+      description: >-
+        Current server-process observations and HTTP counters since process start.
+        All potentially large or fractional values are decimal strings. Unsupported
+        optional process observations are null. Failure to obtain a required process
+        observation returns 503 with code process_metrics_unavailable. No executable paths,
+        command lines, environment values, or raw operating-system output are exposed.
+      properties:
+        pid:
+          $ref: '#/components/schemas/UInt64'
+        cpu_seconds_total:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'
+          description: Cumulative user plus system CPU time consumed by this process, in seconds.
+        resident_bytes:
+          $ref: '#/components/schemas/UInt64'
+        virtual_bytes:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        open_files:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        threads:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        cpu_count:
+          $ref: '#/components/schemas/UInt64'
+          description: Logical CPUs visible to the process.
+        requests_total:
+          $ref: '#/components/schemas/UInt64'
+          description: >-
+            Completed external HTTP requests across all v2 routes and presentation routes.
+            Completion occurs when the response body ends or is dropped; cancellation before
+            a response exists only releases in-flight. Internal presentation reads are not counted twice.
+        request_errors_total:
+          $ref: '#/components/schemas/UInt64'
+          description: Completed HTTP requests whose response status is at least 500.
+        requests_in_flight:
+          $ref: '#/components/schemas/UInt64'
+          description: HTTP requests currently being handled, including response bodies still streaming.
+      required:
+      - pid
+      - cpu_seconds_total
+      - resident_bytes
+      - virtual_bytes
+      - open_files
+      - threads
+      - cpu_count
+      - requests_total
+      - request_errors_total
+      - requests_in_flight
+    PlaybackParty:
+      type: object
+      additionalProperties: false
+      description: A device or profile; name is null when it no longer exists.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          anyOf:
+          - type: string
+            maxLength: 256
+          - type: 'null'
+      required:
+      - id
+      - name
+    PlaybackItem:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        title:
+          type: string
+          maxLength: 1024
+        kind:
+          type: string
+          enum: [unclassified, movie, series, season, episode]
+        parent_title:
+          description: The containing season or series, if any.
+          anyOf:
+          - type: string
+            maxLength: 1024
+          - type: 'null'
+      required:
+      - id
+      - title
+      - kind
+      - parent_title
+    PlaybackVersion:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        label:
+          anyOf:
+          - type: string
+            maxLength: 256
+          - type: 'null'
+      required:
+      - id
+      - label
+    PlaybackSession:
+      type: object
+      additionalProperties: false
+      description: >-
+        A live delivery. Byte counts and rates are decimal strings (bytes, bytes per
+        second); throughput_bps averages the last 10 whole seconds, average_bps the whole
+        session, peak_bps the highest throughput observed. stalls counts episodes of
+        playing without the position advancing for 15 seconds.
+      properties:
+        delivery_id:
+          $ref: '#/components/schemas/Id'
+        viewing_session_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        status:
+          type: string
+          enum: [starting, buffering, playing, paused, stalled, closing]
+        device:
+          $ref: '#/components/schemas/PlaybackParty'
+        profile:
+          $ref: '#/components/schemas/PlaybackParty'
+        item:
+          anyOf:
+          - $ref: '#/components/schemas/PlaybackItem'
+          - type: 'null'
+        timeline_id:
+          $ref: '#/components/schemas/Id'
+        version:
+          $ref: '#/components/schemas/PlaybackVersion'
+        mode:
+          type: string
+          enum: [direct, remux, transcode]
+        client_network:
+          type: string
+          enum: [local, private, remote, unknown]
+        started_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_activity_at:
+          $ref: '#/components/schemas/Timestamp'
+        position_ms:
+          anyOf:
+          - $ref: '#/components/schemas/Milliseconds'
+          - type: 'null'
+        duration_ms:
+          anyOf:
+          - $ref: '#/components/schemas/Milliseconds'
+          - type: 'null'
+        bytes_sent:
+          $ref: '#/components/schemas/UInt64'
+        throughput_bps:
+          $ref: '#/components/schemas/UInt64'
+        average_bps:
+          $ref: '#/components/schemas/UInt64'
+        peak_bps:
+          $ref: '#/components/schemas/UInt64'
+        watched_ms:
+          $ref: '#/components/schemas/Milliseconds'
+        stalls:
+          type: integer
+          minimum: 0
+      required: [delivery_id, viewing_session_id, status, device, profile, item, timeline_id, version, mode, client_network, started_at, last_activity_at, position_ms, duration_ms, bytes_sent, throughput_bps, average_bps, peak_bps, watched_ms, stalls]
+    PlaybackSessionList:
+      type: object
+      additionalProperties: false
+      properties:
+        sampled_at:
+          $ref: '#/components/schemas/Timestamp'
+        truncated:
+          type: boolean
+        sessions:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/PlaybackSession'
+      required:
+      - sampled_at
+      - truncated
+      - sessions
+    PlaybackHistoryEntry:
+      type: object
+      additionalProperties: false
+      description: >-
+        A finished session. watched_ms counts forward play no faster than real time, so
+        seeks are excluded. average_bps is bytes_sent over the session's duration.
+      properties:
+        delivery_id:
+          $ref: '#/components/schemas/Id'
+        device:
+          $ref: '#/components/schemas/PlaybackParty'
+        profile:
+          $ref: '#/components/schemas/PlaybackParty'
+        item:
+          anyOf:
+          - $ref: '#/components/schemas/PlaybackItem'
+          - type: 'null'
+        timeline_id:
+          $ref: '#/components/schemas/Id'
+        version:
+          $ref: '#/components/schemas/PlaybackVersion'
+        mode:
+          type: string
+          enum: [direct, remux, transcode]
+        client_network:
+          type: string
+          enum: [local, private, remote, unknown]
+        started_at:
+          $ref: '#/components/schemas/Timestamp'
+        ended_at:
+          $ref: '#/components/schemas/Timestamp'
+        end_reason:
+          type: string
+          enum: [closed, lease_expired, error, server_stopped, interrupted]
+        watched_ms:
+          $ref: '#/components/schemas/Milliseconds'
+        start_position_ms:
+          anyOf:
+          - $ref: '#/components/schemas/Milliseconds'
+          - type: 'null'
+        end_position_ms:
+          anyOf:
+          - $ref: '#/components/schemas/Milliseconds'
+          - type: 'null'
+        bytes_sent:
+          $ref: '#/components/schemas/UInt64'
+        average_bps:
+          $ref: '#/components/schemas/UInt64'
+        peak_bps:
+          $ref: '#/components/schemas/UInt64'
+        stalls:
+          type: integer
+          minimum: 0
+      required: [delivery_id, device, profile, item, timeline_id, version, mode, client_network, started_at, ended_at, end_reason, watched_ms, start_position_ms, end_position_ms, bytes_sent, average_bps, peak_bps, stalls]
+    PlaybackHistoryPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/PlaybackHistoryEntry'
+        next_cursor:
+          anyOf:
+          - type: string
+            maxLength: 2048
+          - type: 'null'
+        read_revision:
+          type: string
+        event_cursor:
+          type: string
+      required:
+      - items
+      - next_cursor
+      - read_revision
+      - event_cursor
+    MetricsHistory:
+      type: object
+      additionalProperties: false
+      properties:
+        sampled_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: >-
+            Newest persisted observation within retention at or before request time,
+            in UTC, independent of since. Falls back to request time when no retained
+            observation exists.
+        interval_seconds:
+          type: integer
+          const: 10
+          description: Native sample interval; actual point spacing can be larger or irregular.
+        retention_seconds:
+          type: integer
+          const: 86400
+        series:
+          type: array
+          minItems: 18
+          maxItems: 18
+          description: >-
+            Exactly one entry for every MetricSeries ID, including entries with no points.
+            Missing observations are omitted rather than represented as zero or interpolated.
+          items:
+            $ref: '#/components/schemas/MetricSeries'
+      required:
+      - sampled_at
+      - interval_seconds
+      - retention_seconds
+      - series
+    MetricSeries:
+      type: object
+      additionalProperties: false
+      description: >-
+        process.cpu_seconds_total is a counter in seconds; http.requests_total,
+        http.request_errors_total, jobs.failed_total, and db.busy_total are counters in count;
+        playback.bytes_sent_total is a counter in bytes (all deliveries' bytes sent to
+        clients); playback.sessions_active and playback.transcodes_active count live v2
+        deliveries and those transcoding.
+        process.resident_bytes and all storage series are gauges in bytes; the remaining
+        series are gauges in count. Counters are process-local and reset on server restart;
+        retained history includes observations from earlier server epochs. jobs.failed_total
+        counts distinct failed jobs observed from the same bounded sources as diagnostics
+        worker_errors. Its first sample is zero before observing failed jobs; later samples
+        count each observed source/job identity once per process lifetime.
+      properties:
+        id:
+          type: string
+          enum:
+          - process.cpu_seconds_total
+          - process.resident_bytes
+          - process.open_files
+          - http.requests_total
+          - http.request_errors_total
+          - http.requests_in_flight
+          - deliveries.active
+          - jobs.queued
+          - jobs.running
+          - jobs.failed_total
+          - db.busy_total
+          - storage.database_bytes
+          - storage.asset_bytes
+          - storage.temporary_bytes
+          - storage.free_bytes
+          - playback.sessions_active
+          - playback.bytes_sent_total
+          - playback.transcodes_active
+        kind:
+          type: string
+          enum:
+          - gauge
+          - counter
+        unit:
+          type: string
+          enum:
+          - seconds
+          - bytes
+          - count
+        points:
+          type: array
+          maxItems: 2000
+          description: >-
+            Observations ordered by timestamp from oldest to newest, retaining their original
+            timestamps after downsampling. Unavailable values have no point; an entirely
+            unavailable series has an empty points array.
+          items:
+            $ref: '#/components/schemas/MetricPoint'
+      required:
+      - id
+      - kind
+      - unit
+      - points
+    MetricPoint:
+      type: object
+      additionalProperties: false
+      properties:
+        t:
+          $ref: '#/components/schemas/Timestamp'
+        v:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'
+          description: Nonnegative decimal string; fractional values occur for CPU seconds.
+      required:
+      - t
+      - v
     StorageReport:
       type: object
       additionalProperties: false

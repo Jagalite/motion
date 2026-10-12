@@ -113,6 +113,9 @@ fn resource_type(topic: &str) -> &str {
         "organization" => "organization",
         "queues" => "profile_queue",
         "matches" => "match",
+        // Administrative: classify() leaves the topic unclassified, which
+        // only system:admin principals are disclosed.
+        "playback_sessions" => "playback_session",
         other => other,
     }
 }

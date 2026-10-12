@@ -2543,6 +2543,427 @@ async fn diagnostics_are_admin_only_and_do_not_expose_worker_output() {
 }
 
 #[tokio::test]
+async fn metrics_history_is_admin_only_and_advertised_with_limits() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    for path in ["/api/v2/admin/metrics", "/api/v2/admin/diagnostics"] {
+        assert_eq!(
+            f.call("GET", path, None, &[]).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let (_, token) = f.pair(&[], &["catalog:read"]).await;
+    for path in ["/api/v2/admin/metrics", "/api/v2/admin/diagnostics"] {
+        assert_eq!(
+            f.call("GET", path, None, &[("authorization", &bearer(&token))])
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let operator = bearer(OPERATOR);
+    let history = f
+        .call(
+            "GET",
+            "/api/v2/admin/metrics",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(history.status, StatusCode::OK, "{}", history.body);
+    assert_eq!(history.body["interval_seconds"], 10);
+    assert_eq!(history.body["retention_seconds"], 86400);
+    assert_eq!(history.body["series"].as_array().unwrap().len(), 18);
+    let actual: std::collections::BTreeSet<_> = history.body["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["id"].as_str().unwrap(),
+                s["kind"].as_str().unwrap(),
+                s["unit"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        std::collections::BTreeSet::from([
+            ("process.cpu_seconds_total", "counter", "seconds"),
+            ("process.resident_bytes", "gauge", "bytes"),
+            ("process.open_files", "gauge", "count"),
+            ("http.requests_total", "counter", "count"),
+            ("http.request_errors_total", "counter", "count"),
+            ("http.requests_in_flight", "gauge", "count"),
+            ("deliveries.active", "gauge", "count"),
+            ("jobs.queued", "gauge", "count"),
+            ("jobs.running", "gauge", "count"),
+            ("jobs.failed_total", "counter", "count"),
+            ("db.busy_total", "counter", "count"),
+            ("storage.database_bytes", "gauge", "bytes"),
+            ("storage.asset_bytes", "gauge", "bytes"),
+            ("storage.temporary_bytes", "gauge", "bytes"),
+            ("storage.free_bytes", "gauge", "bytes"),
+            ("playback.sessions_active", "gauge", "count"),
+            ("playback.bytes_sent_total", "counter", "bytes"),
+            ("playback.transcodes_active", "gauge", "count"),
+        ])
+    );
+    assert!(
+        history.body["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["points"] == json!([]))
+    );
+    let caps = f
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(caps.status, StatusCode::OK, "{}", caps.body);
+    let feature = caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "admin.metrics")
+        .unwrap();
+    assert_eq!(feature["implemented"], true);
+    assert_eq!(feature["enabled"], true);
+    assert_eq!(
+        feature["limits"],
+        json!({"interval_seconds":"10","retention_seconds":"86400"})
+    );
+}
+
+#[tokio::test]
+async fn metrics_query_validation_returns_problems() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    for query in [
+        "since=not-a-date",
+        "since=2026-02-30T00:00:00Z",
+        "since=2026-10-11",
+        "step_seconds=9",
+        "step_seconds=0",
+        "step_seconds=-10",
+        "step_seconds=10.5",
+        "step_seconds=18446744073709551616",
+        "step_seconds=x",
+        "step_seconds=10&step_seconds=20",
+    ] {
+        let response = f
+            .call(
+                "GET",
+                &format!("/api/v2/admin/metrics?{query}"),
+                None,
+                &[("authorization", &operator)],
+            )
+            .await;
+        problem(&response, StatusCode::BAD_REQUEST, "invalid_metrics_query");
+    }
+    for query in [
+        "since=1970-01-01T00:00:00Z",
+        "since=2099-01-01T00:00:00Z",
+        "since=2026-10-11T12:30:01.123%2B05:30&step_seconds=60",
+        "step_seconds=10",
+    ] {
+        let response = f
+            .call(
+                "GET",
+                &format!("/api/v2/admin/metrics?{query}"),
+                None,
+                &[("authorization", &operator)],
+            )
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{query}: {}",
+            response.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn process_diagnostics_and_http_counters_track_external_requests_once() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let before = f.app.health.metrics.http_snapshot();
+    assert_eq!(before.requests_total, 0);
+    assert_eq!(before.requests_in_flight, 0);
+    let diagnostics = f
+        .call(
+            "GET",
+            "/api/v2/admin/diagnostics",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(diagnostics.status, StatusCode::OK, "{}", diagnostics.body);
+    let p = &diagnostics.body["process"];
+    assert_eq!(p["pid"], std::process::id().to_string());
+    assert!(
+        p["cpu_seconds_total"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+            >= 0.0
+    );
+    assert!(
+        p["resident_bytes"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    assert!(p["cpu_count"].as_str().unwrap().parse::<u64>().unwrap() > 0);
+    for optional in ["virtual_bytes", "open_files", "threads"] {
+        assert!(p[optional].is_null() || p[optional].as_str().unwrap().parse::<u64>().is_ok());
+    }
+    assert_eq!(p["requests_total"], "0");
+    assert_eq!(p["request_errors_total"], "0");
+    assert_eq!(p["requests_in_flight"], "1");
+    assert_eq!(f.app.health.metrics.http_snapshot().requests_total, 1);
+    assert_eq!(f.app.health.metrics.http_snapshot().requests_in_flight, 0);
+
+    // The real presentation performs internal v2 reads; it is still one HTTP request.
+    assert_eq!(
+        f.call("GET", "/", None, &[("authorization", &operator)])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(f.app.health.metrics.http_snapshot().requests_total, 2);
+    assert_eq!(
+        f.call("GET", "/api/v2/admin/metrics", None, &[])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(f.app.health.metrics.http_snapshot().requests_total, 3);
+    assert_eq!(f.app.health.metrics.http_snapshot().request_errors_total, 0);
+
+    // Real SQLite failure through the real router, not a synthetic response.
+    sqlx::query("DROP TABLE server_identity")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let failed = f.call("GET", "/api/v2/system/health", None, &[]).await;
+    assert_eq!(failed.status, StatusCode::INTERNAL_SERVER_ERROR);
+    let after = f.app.health.metrics.http_snapshot();
+    assert_eq!(after.requests_total, 4);
+    assert_eq!(after.request_errors_total, 1);
+    assert_eq!(after.requests_in_flight, 0);
+}
+
+#[tokio::test]
+async fn request_counter_tracks_body_lifetime_and_releases_on_drop() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let response = f
+        .raw(f.request("GET", "/api/v2/system/health", None, &[]))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending = f.app.health.metrics.http_snapshot();
+    assert_eq!(pending.requests_total, 0);
+    assert_eq!(pending.requests_in_flight, 1);
+    drop(response);
+    let complete = f.app.health.metrics.http_snapshot();
+    assert_eq!(complete.requests_total, 1);
+    assert_eq!(complete.requests_in_flight, 0);
+    assert_eq!(complete.request_errors_total, 0);
+}
+
+#[tokio::test]
+async fn metrics_history_orders_downsamples_and_preserves_restart_counters() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    let operator = bearer(OPERATOR);
+    let base = playscale::now() / 60 * 60 - 120;
+    // Insert deliberately out of order. Native samples stay sparse; the
+    // endpoint must not invent missing descriptor or storage observations.
+    for (series, run, seconds, value) in [
+        ("process.resident_bytes", "before", 30, "9007199254740995"),
+        ("http.requests_total", "before", 10, "100"),
+        ("process.resident_bytes", "before", 10, "9007199254740993"),
+        ("http.requests_total", "before", 30, "120"),
+        ("http.requests_total", "after", 40, "0"),
+        ("http.requests_total", "after", 50, "3"),
+        ("storage.free_bytes", "after", 50, "7000000"),
+        ("http.requests_total", "expired", -86400, "999"),
+    ] {
+        sqlx::query(
+            "INSERT INTO operational_metrics(series_id,run_id,sampled_at,value) VALUES (?,?,?,?)",
+        )
+        .bind(series)
+        .bind(run)
+        .bind((base + seconds) * 1000)
+        .bind(value)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    }
+    // Reopen the actual SQLite file and replace all process-lifetime metrics.
+    f.app.db.close().await;
+    f.app.db = db::connect(&f._dir.path().join("db.sqlite")).await.unwrap();
+    f.app.health = Arc::new(playscale::operations::Health::new(false));
+    let response = f
+        .call(
+            "GET",
+            "/api/v2/admin/metrics?step_seconds=60",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let series = response.body["series"].as_array().unwrap();
+    let points = |id: &str| {
+        series.iter().find(|s| s["id"] == id).unwrap()["points"]
+            .as_array()
+            .unwrap()
+    };
+    let gauges = points("process.resident_bytes");
+    assert_eq!(gauges.len(), 1);
+    assert_eq!(gauges[0]["v"], "9007199254740995");
+    let counters = points("http.requests_total");
+    assert_eq!(
+        counters
+            .iter()
+            .map(|p| p["v"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["100", "120", "0", "3"]
+    );
+    assert!(
+        counters
+            .windows(2)
+            .all(|p| p[0]["t"].as_str() < p[1]["t"].as_str())
+    );
+    assert_eq!(points("storage.free_bytes").len(), 1);
+    assert!(points("process.open_files").is_empty());
+    assert_eq!(
+        series
+            .iter()
+            .find(|s| s["id"] == "http.requests_total")
+            .unwrap()["kind"],
+        "counter"
+    );
+    assert_eq!(
+        series
+            .iter()
+            .find(|s| s["id"] == "process.resident_bytes")
+            .unwrap()["unit"],
+        "bytes"
+    );
+    let since = playscale::v2::timestamp(base + 30).replace('Z', ".001Z");
+    let recent = f
+        .call(
+            "GET",
+            &format!("/api/v2/admin/metrics?since={since}&step_seconds=10"),
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert_eq!(recent.status, StatusCode::OK, "{}", recent.body);
+    let counters = recent.body["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "http.requests_total")
+        .unwrap()["points"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        counters
+            .iter()
+            .map(|p| p["v"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0", "3"]
+    );
+}
+
+#[tokio::test]
+async fn metrics_background_sampler_persists_real_observations_across_runtime_restart() {
+    let mut f = Fixture::new(AccessMode::Restricted).await;
+    sqlx::query("INSERT INTO jobs(id,library_id,phase,created_at,error) VALUES ('observed-failure',?,'failed',0,'private worker output')")
+        .bind(&f.library).execute(&f.app.db).await.unwrap();
+    for expected in ["1", "0"] {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(playscale::metrics::history::worker(
+            f.app.clone(),
+            stop.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let latest: Option<String> = sqlx::query_scalar("SELECT value FROM operational_metrics WHERE series_id='jobs.failed_total' ORDER BY sampled_at DESC,id DESC LIMIT 1")
+                    .fetch_optional(&f.app.db).await.unwrap();
+                if latest.as_deref() == Some(expected) { break; }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.expect("background sampler must persist its first observation");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if expected == "1" {
+            sqlx::query("DELETE FROM jobs WHERE id='observed-failure'")
+                .execute(&f.app.db)
+                .await
+                .unwrap();
+            if let Some(pool) = f.app.health.metrics.history.get() {
+                pool.close().await;
+            }
+            f.app.db.close().await;
+            f.app.db = db::connect(&f._dir.path().join("db.sqlite")).await.unwrap();
+            f.app.health = Arc::new(playscale::operations::Health::new(false));
+        }
+    }
+    let response = f
+        .call(
+            "GET",
+            "/api/v2/admin/metrics?step_seconds=86400",
+            None,
+            &[("authorization", &bearer(OPERATOR))],
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let series = response.body["series"].as_array().unwrap();
+    let failures = series
+        .iter()
+        .find(|s| s["id"] == "jobs.failed_total")
+        .unwrap()["points"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        failures
+            .iter()
+            .map(|p| p["v"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["0", "1", "0"]
+    );
+    for id in [
+        "process.cpu_seconds_total",
+        "process.resident_bytes",
+        "http.requests_total",
+        "jobs.queued",
+        "jobs.running",
+        "deliveries.active",
+        "db.busy_total",
+    ] {
+        assert!(
+            !series.iter().find(|s| s["id"] == id).unwrap()["points"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert!(!response.body.to_string().contains("private worker output"));
+}
+
+#[tokio::test]
 async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);

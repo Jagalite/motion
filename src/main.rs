@@ -167,6 +167,28 @@ async fn run() -> anyhow::Result<()> {
     // a server that is already answering requests, skipping graceful shutdown.
     let shutdown_requested = shutdown_signal()?;
     let shutdown = CancellationToken::new();
+    // Observability failures never fail the job supervisor or HTTP server.
+    let metrics_app = app.clone();
+    let metrics_stop = shutdown.clone();
+    let mut metrics = tokio::spawn(async move {
+        let mut task = tokio::spawn(playscale::metrics::history::worker(
+            metrics_app,
+            metrics_stop.clone(),
+        ));
+        tokio::select! {
+            result = &mut task => {
+                if !metrics_stop.is_cancelled() {
+                    tracing::warn!(code = "metrics_worker_stopped", panicked = result.is_err(),
+                        "Operational metrics worker stopped");
+                }
+            }
+            _ = metrics_stop.cancelled() => {
+                if tokio::time::timeout(std::time::Duration::from_secs(1), &mut task).await.is_err() {
+                    task.abort();
+                }
+            }
+        }
+    });
     app.health
         .worker_running
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -206,9 +228,14 @@ async fn run() -> anyhow::Result<()> {
     }
     let stop_http = shutdown.clone();
     let mut http = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(stop_http.cancelled_owned())
-            .await
+        // Peer addresses classify a playback client's network for monitoring
+        // (local, private or remote); they are not stored or exposed.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(stop_http.cancelled_owned())
+        .await
     });
     if let Some(fd) = cli.ready_fd {
         let (server_id, _) = playscale::v2::system::server_identity(&app)
@@ -249,6 +276,12 @@ async fn run() -> anyhow::Result<()> {
         .shutting_down
         .store(true, std::sync::atomic::Ordering::Relaxed);
     shutdown.cancel();
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut metrics)
+        .await
+        .is_err()
+    {
+        metrics.abort();
+    }
     if !worker.is_finished()
         && tokio::time::timeout(std::time::Duration::from_secs(5), &mut worker)
             .await
