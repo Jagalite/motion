@@ -46,11 +46,18 @@ impl Server {
     /// over the same directory is a restart: deliveries are recovered as
     /// interrupted; viewing state is durable.
     async fn start(dir: &Path, key: [u8; 32]) -> Self {
+        Self::start_with(dir, key, Default::default()).await
+    }
+
+    async fn start_with(
+        dir: &Path,
+        key: [u8; 32],
+        settings: playscale::processing::Settings,
+    ) -> Self {
         let db = db::connect(&dir.join("db.sqlite")).await.unwrap();
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let mut processing =
-            playscale::processing::Runtime::new(dir.join("cache"), Default::default());
+        let mut processing = playscale::processing::Runtime::new(dir.join("cache"), settings);
         processing.supervisor = env!("CARGO_BIN_EXE_playscale").into();
         let app = App {
             health: Arc::new(playscale::operations::Health::new(false)),
@@ -142,6 +149,18 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_settings(Default::default()).await
+    }
+
+    async fn with_copy_routes(copy_routes: bool) -> Self {
+        Self::with_settings(playscale::processing::Settings {
+            experimental_copy_routes: copy_routes,
+            ..Default::default()
+        })
+        .await
+    }
+
+    async fn with_settings(settings: playscale::processing::Settings) -> Self {
         // The first launch of a freshly linked supervisor can be slow (macOS
         // assessment); warm it untimed so leases are not consumed by it.
         let warm = Command::new(env!("CARGO_BIN_EXE_playscale"))
@@ -153,7 +172,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("media")).unwrap();
         let key = playscale::v2::auth::random_key();
-        let server = Server::start(dir.path(), key).await;
+        let server = Server::start_with(dir.path(), key, settings).await;
         let library = db::add_library(&server.app.db, "Movies", &dir.path().join("media"))
             .await
             .unwrap()
@@ -172,8 +191,13 @@ impl Fixture {
 
     /// Stop this server and start another over the same state.
     async fn restart(&mut self) {
+        let settings = self.server.app.processing.settings.clone();
+        self.restart_with(settings).await;
+    }
+
+    async fn restart_with(&mut self, settings: playscale::processing::Settings) {
         self.server.stop.cancel();
-        self.server = Server::start(self.dir.path(), self.key).await;
+        self.server = Server::start_with(self.dir.path(), self.key, settings).await;
     }
 
     fn media(&self, name: &str, args: &[&str]) {
@@ -1805,10 +1829,11 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
     let mut capped = plan_input("default", &film, "convert", None, &["hls"]);
     capped["quality"]["max_bitrate_bps"] = json!("50000000");
     let capped = f.post("/api/v2/playback/plans", &auth, None, capped).await;
+    // A capped conversion keeps (and measures) the limit.
     assert_eq!(
-        capped.body["reason_codes"],
-        json!(["conversion_exceeds_quality_limit"]),
-        "an uncapped encoder cannot promise a bitrate"
+        capped.body["operation"], "video_transcode",
+        "{}",
+        capped.body
     );
 }
 
@@ -2521,12 +2546,13 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
     let mut automatic = input.clone();
     automatic["tracks"]["subtitle_track_id"] = Value::Null;
     automatic["tracks"]["subtitle_policy"] = json!("auto");
-    assert_eq!(
-        f.post("/api/v2/playback/plans", &auth, None, automatic)
-            .await
-            .body["reason_codes"][0],
-        "automatic_subtitle_selection_unavailable"
-    );
+    // Automatic selection never takes a caption of unknown language: the
+    // plan proceeds without subtitles.
+    let automatic = f
+        .post("/api/v2/playback/plans", &auth, None, automatic)
+        .await;
+    assert_eq!(automatic.body["status"], "ready", "{}", automatic.body);
+    assert_eq!(automatic.body["tracks"]["subtitle_track_id"], Value::Null);
     let plan = f
         .post("/api/v2/playback/plans", &auth, None, input.clone())
         .await;
@@ -2637,6 +2663,9 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
         .status,
         StatusCode::UNAUTHORIZED
     );
+    // A live route carries a text subtitle only for a client that selects an
+    // in-manifest subtitle rendition (an external track on a live
+    // presentation is refused by the player).
     input["quality"]["mode"] = json!("convert");
     input["client"]["transports"] = json!(["hls"]);
     assert_eq!(
@@ -2645,6 +2674,138 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
             .body["reason_codes"][0],
         "subtitle_conversion_unavailable"
     );
+    let mut live_text = input.clone();
+    live_text["client"]["subtitle_modes"] = json!(["text", "hls_text"]);
+    // The rendition's segment 0 of a conversion admitted at `start_ms`, with
+    // the generation's media time origin.
+    let rendition = |input: Value, start_ms: u64, key: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let plan = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+            let admitted = f
+                .post(
+                    "/api/v2/playback/delivery-sessions",
+                    &auth,
+                    Some(key),
+                    json!({"plan_token": plan.body["plan_token"], "start_ms": start_ms}),
+                )
+                .await;
+            assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+            let id = admitted.body["id"].as_str().unwrap().to_owned();
+            let ready = f
+                .until(&id, &auth, |d| {
+                    d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start_ms
+                })
+                .await;
+            let url = ready["active"]["subtitles_url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                url,
+                format!("/api/v2/streams/{id}/1/variants/subtitles/index.m3u8")
+            );
+            let auth = &auth;
+            let get = |path: String| async move {
+                let reply = f.call("GET", &path, None, &[("authorization", auth)]).await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                String::from_utf8(reply.bytes).unwrap()
+            };
+            let master = get(format!("/api/v2/streams/{id}/1/master.m3u8")).await;
+            assert!(
+                master.contains("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\"")
+                    && master.contains("URI=\"variants/subtitles/index.m3u8\"")
+                    && master.contains(",SUBTITLES=\"subs\"\n"),
+                "{master}"
+            );
+            // The window may advance between two reads of a live generation:
+            // compare the rendition with a media playlist unchanged around it.
+            let (media, subtitles) = loop {
+                let media = get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await;
+                let subtitles = get(url.clone()).await;
+                if get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await == media {
+                    break (media, subtitles);
+                }
+            };
+            // The rendition mirrors the media playlist's window and durations.
+            let entries = |text: &str| -> Vec<String> {
+                text.lines()
+                    .filter(|l| l.starts_with("#EXTINF") || l.starts_with("#EXT-X-MEDIA-SEQUENCE"))
+                    .map(str::to_owned)
+                    .collect()
+            };
+            assert_eq!(entries(&subtitles), entries(&media), "{subtitles}");
+            assert!(
+                subtitles.contains("../../segments/subtitles-0.vtt"),
+                "{subtitles}"
+            );
+            let segment = get(format!("/api/v2/streams/{id}/1/segments/subtitles-0.vtt")).await;
+            let origin = ready["active"]["media_time_origin_ms"].as_u64().unwrap();
+            // Opt-in: write the server's exact HLS output (same layout) for a
+            // player check outside this test (scripts/check_hls_subtitles.mjs).
+            if let Some(dir) = std::env::var_os("MOTION_DUMP_HLS") {
+                let dir = std::path::Path::new(&dir).join(key);
+                let base = format!("/api/v2/streams/{id}/1");
+                let mut files = vec![
+                    "master.m3u8".to_owned(),
+                    "variants/main/index.m3u8".into(),
+                    "variants/main/init.mp4".into(),
+                    "variants/subtitles/index.m3u8".into(),
+                ];
+                for line in media.lines().chain(subtitles.lines()) {
+                    if let Some(name) = line.strip_prefix("../../") {
+                        files.push(name.to_owned());
+                    }
+                }
+                for name in files {
+                    let reply = f
+                        .call(
+                            "GET",
+                            &format!("{base}/{name}"),
+                            None,
+                            &[("authorization", auth)],
+                        )
+                        .await;
+                    assert_eq!(reply.status, StatusCode::OK, "{name}");
+                    let path = dir.join(&name);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, reply.bytes).unwrap();
+                }
+            }
+            (segment, origin)
+        }
+    };
+    // From 2 s: the 1-3 s caption is at 0 to (3 s - origin) in media time.
+    let (segment, origin) = rendition(live_text.clone(), 2000, "live-text-rendition-1").await;
+    let expected = format!(
+        "00:00:00.000 --> 00:00:0{}.{:03}\nSelected caption",
+        (3000 - origin) / 1000,
+        (3000 - origin) % 1000
+    );
+    assert!(
+        segment.starts_with("WEBVTT") && segment.contains(&expected),
+        "{expected}\n{segment}"
+    );
+    // An interval binding starting at 0.5 s: media time is file time minus
+    // the interval start, so the caption is at 0.5 to 2.5 s.
+    sqlx::query("UPDATE version_files SET start_ms=500,end_ms=9000")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let mut interval = live_text.clone();
+    interval["quality"]["mode"] = json!("auto");
+    let (segment, origin) = rendition(interval, 0, "live-text-rendition-2").await;
+    assert_eq!(origin, 0);
+    assert!(
+        segment.contains("00:00:00.500 --> 00:00:02.500\nSelected caption"),
+        "{segment}"
+    );
+    sqlx::query("UPDATE version_files SET start_ms=NULL,end_ms=NULL")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
     input["quality"]["mode"] = json!("original");
     input["client"]["transports"] = json!(["http_range"]);
     input["tracks"]["subtitle_policy"] = json!("off");
@@ -2680,4 +2841,2700 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
             "subtitle_format_unsupported"
         );
     }
+}
+
+/// A source eligible for stream copy: Main-profile H.264 with B-frames and a
+/// 2 s GOP, an AAC track (44.1 kHz) and an AC-3 track (48 kHz), every stream
+/// starting at zero. `level` overrides the H.264 level_idc.
+fn copyable_mkv(f: &Fixture, name: &str, level: &str) {
+    f.media(
+        name,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=880:sample_rate=48000",
+            "-t",
+            "60",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-profile:v",
+            "main",
+            "-level:v",
+            level,
+            "-g",
+            "48",
+            "-keyint_min",
+            "48",
+            "-sc_threshold",
+            "0",
+            "-c:a:0",
+            "aac",
+            "-c:a:1",
+            "ac3",
+        ],
+    );
+}
+
+/// Streams of an init segment followed by one media segment.
+fn fragment_streams(f: &Fixture, name: &str, init: Vec<u8>, segment: Vec<u8>) -> Vec<Value> {
+    let fragment = f.dir.path().join(name);
+    std::fs::write(&fragment, [init, segment].concat()).unwrap();
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_streams", "-of", "json"])
+        .arg(&fragment)
+        .output()
+        .unwrap();
+    let streams: Value = serde_json::from_slice(&probe.stdout).unwrap();
+    streams["streams"].as_array().unwrap().clone()
+}
+
+/// Copy routes the server admits are planned over the production router: the
+/// core asks for bitstream details before choosing one, a copy keeps the
+/// source video and timestamps from the preceding keyframe, a planned replan
+/// can move between copy routes, failures fall back to conversion, Convert
+/// never copies, and unqualified details or a disabled server only convert.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_copy_routes_are_planned_observed_and_fall_back_to_conversion() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    copyable_mkv(&f, "film.mkv", "3.0");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let file = source["file_id"].as_str().unwrap().to_owned();
+    let caps = f.get("/api/v2/system/capabilities", &auth).await;
+    let playback = caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        playback["limits"]["routes"], "original,prepared,stream_copy_hls,software_hls",
+        "{playback}"
+    );
+    let plan = |mode: &str, audio: &str, failed: &[String]| {
+        let mut input = pinned_plan_input(
+            "default",
+            &timeline,
+            mode,
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        input["failed_candidate_ids"] = json!(failed);
+        input
+    };
+    let original = format!("o-{file}");
+
+    // The original byte route still wins when it can honor the request.
+    let direct = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a0", &[]),
+        )
+        .await;
+    assert_eq!(direct.body["operation"], "original", "{}", direct.body);
+    // After the client reports the original failed, the AAC track is copied.
+    let remux = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a0", std::slice::from_ref(&original)),
+        )
+        .await;
+    assert_eq!(remux.status, StatusCode::OK, "{}", remux.body);
+    assert_eq!(remux.body["operation"], "remux", "{}", remux.body);
+    assert_eq!(remux.body["transport"], "hls");
+    assert_eq!(remux.body["candidate_id"], format!("r-{file}"));
+    // Convert asks for converted video: never a copy.
+    let convert = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("convert", "a0", &[]),
+        )
+        .await;
+    assert_eq!(
+        convert.body["operation"], "video_transcode",
+        "{}",
+        convert.body
+    );
+
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-remux-000001"),
+            json!({"plan_token": remux.body["plan_token"], "start_ms": 31000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 31000
+        })
+        .await;
+    assert_eq!(ready["active"]["operation"], "remux", "{ready}");
+    // Segment 0 starts at the source keyframe before the request (2 s GOP).
+    assert_eq!(ready["active"]["available_start_ms"], 30000, "{ready}");
+    let base = format!("/api/v2/streams/{id}/1");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    // The master playlist describes the copied output itself: Main profile
+    // (0x4d), level 3.0 (0x1e) and AAC-LC, not the transcode recipe.
+    let master = String::from_utf8(get(format!("{base}/master.m3u8")).await).unwrap();
+    let codecs = master
+        .split("CODECS=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap();
+    assert!(
+        codecs.starts_with("avc1.4d") && codecs.ends_with("1e,mp4a.40.2"),
+        "{master}"
+    );
+    let variant = String::from_utf8(get(format!("{base}/variants/main/index.m3u8")).await).unwrap();
+    assert!(variant.contains("#EXT-X-TARGETDURATION:12\n"), "{variant}");
+    let streams = fragment_streams(
+        &f,
+        "remux.mp4",
+        get(format!("{base}/variants/main/init.mp4")).await,
+        get(format!("{base}/segments/0.m4s")).await,
+    );
+    let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+    assert_eq!(video["profile"], "Main", "video was re-encoded");
+    let audio: Vec<_> = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0]["codec_name"], "aac");
+    assert_eq!(audio[0]["sample_rate"], "44100", "the selected first track");
+
+    // Switching to the AC-3 track replans to an audio conversion that still
+    // copies the video.
+    let converted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &[]),
+        )
+        .await;
+    assert_eq!(
+        converted.body["operation"], "audio_convert",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["candidate_id"], format!("c-{file}"));
+    let staged = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("replan-audio-convert-1"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":converted.body["plan_token"],"position_ms":12000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    assert_eq!(staged.body["pending"]["operation"], "audio_convert");
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["pending"]["status"] == "ready" || d["pending"]["status"] == "failed"
+        })
+        .await;
+    assert_eq!(ready["pending"]["status"], "ready", "{ready}");
+    assert_eq!(ready["pending"]["available_start_ms"], 12000, "{ready}");
+    let base = format!("/api/v2/streams/{id}/2");
+    let streams = fragment_streams(
+        &f,
+        "audio-convert.mp4",
+        get(format!("{base}/variants/main/init.mp4")).await,
+        get(format!("{base}/segments/0.m4s")).await,
+    );
+    let video = streams.iter().find(|s| s["codec_type"] == "video").unwrap();
+    assert_eq!(video["profile"], "Main", "video was re-encoded");
+    let audio: Vec<_> = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0]["codec_name"], "aac");
+    assert_eq!(
+        audio[0]["sample_rate"], "48000",
+        "the converted second track"
+    );
+    let closed = f
+        .call("DELETE", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+
+    // A failed copy falls back to conversion; a failed conversion ends it.
+    let copy_failed = vec![original.clone(), format!("c-{file}")];
+    let fallback = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &copy_failed),
+        )
+        .await;
+    assert_eq!(
+        fallback.body["operation"], "video_transcode",
+        "{}",
+        fallback.body
+    );
+    let mut all_failed = copy_failed.clone();
+    all_failed.push(format!("t-{file}"));
+    let exhausted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &all_failed),
+        )
+        .await;
+    assert_eq!(exhausted.body["reason_codes"][0], "all_candidates_failed");
+
+    // A retained copy plan never reaches the source once its holder's scope
+    // no longer includes it: refused before any probe or admission.
+    let retained = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan("auto", "a1", &[]),
+        )
+        .await;
+    assert_eq!(retained.body["operation"], "audio_convert");
+    f.policy(&device, &[], PLAYER, "\"r-2\"").await;
+    let refused = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-revoked-copy-1"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.body);
+
+    // Copy-route capacity is released with the delivery.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("copy route capacity was not released");
+
+    // Observed details that do not qualify (level 5.2) leave only conversion.
+    let g = Fixture::with_copy_routes(true).await;
+    copyable_mkv(&g, "film.mkv", "5.2");
+    g.scan().await;
+    let (timeline, _) = g.timeline().await;
+    let (_, auth) = g.device(&["default"], PLAYER).await;
+    let source = g.source().await;
+    let unqualified = g
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned_plan_input(
+                "default",
+                &timeline,
+                "auto",
+                "a1",
+                &["http_range", "hls"],
+                &source,
+            ),
+        )
+        .await;
+    assert_eq!(
+        unqualified.body["operation"], "video_transcode",
+        "{}",
+        unqualified.body
+    );
+
+    // A server without copy routes neither advertises nor plans them.
+    let h = Fixture::new().await;
+    copyable_mkv(&h, "film.mkv", "3.0");
+    h.scan().await;
+    let (timeline, _) = h.timeline().await;
+    let (_, auth) = h.device(&["default"], PLAYER).await;
+    let source = h.source().await;
+    let disabled = h
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned_plan_input(
+                "default",
+                &timeline,
+                "auto",
+                "a1",
+                &["http_range", "hls"],
+                &source,
+            ),
+        )
+        .await;
+    assert_eq!(
+        disabled.body["operation"], "video_transcode",
+        "{}",
+        disabled.body
+    );
+    let caps = h.get("/api/v2/system/capabilities", &auth).await;
+    let playback = caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        playback["limits"]["routes"],
+        "original,prepared,software_hls"
+    );
+}
+
+/// The routes a server advertises in its playback capability.
+async fn advertised_routes(f: &Fixture, auth: &str) -> Value {
+    let caps = f.get("/api/v2/system/capabilities", auth).await;
+    caps.body["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "playback.v2")
+        .unwrap()["limits"]["routes"]
+        .clone()
+}
+
+/// Hardware conversion is planned as its own candidate when VideoToolbox is
+/// enabled, available and admissible; it runs Apple's encoder, a planned
+/// replan can move the delivery to software, a failed hardware candidate falls
+/// back to software, and both sessions are released on close.
+#[tokio::test(flavor = "multi_thread")]
+async fn hardware_conversion_is_planned_when_available_and_falls_back_to_software() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let mut f = Fixture::with_settings(playscale::processing::Settings {
+        experimental_live_hardware: true,
+        ..Default::default()
+    })
+    .await;
+    if !playscale::processing::videotoolbox_available(&f.server.app).await {
+        assert!(
+            std::env::var_os("MOTION_REQUIRE_VIDEOTOOLBOX").is_none(),
+            "MOTION_REQUIRE_VIDEOTOOLBOX is set but the VideoToolbox probe failed"
+        );
+        eprintln!("SKIPPED: no VideoToolbox encoder session on this host");
+        return;
+    }
+    two_audio_mp4(&f, "120");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let file = f.source().await["file_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        advertised_routes(&f, &auth).await,
+        "original,prepared,software_hls,hardware_hls"
+    );
+    let plan = |failed: &[String]| {
+        let mut input = plan_input("default", &timeline, "convert", None, &["hls"]);
+        input["failed_candidate_ids"] = json!(failed);
+        input
+    };
+    let hardware = f
+        .post("/api/v2/playback/plans", &auth, None, plan(&[]))
+        .await;
+    assert_eq!(hardware.status, StatusCode::OK, "{}", hardware.body);
+    assert_eq!(hardware.body["operation"], "video_transcode");
+    assert_eq!(hardware.body["candidate_id"], format!("h-{file}"));
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-hardware-0001"),
+            json!({"plan_token": hardware.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let segment = |generation: &str| {
+        let auth = auth.clone();
+        let f = &f;
+        let path = format!("/api/v2/streams/{id}/{generation}/segments/0.m4s");
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    // libx264 writes its settings into an SEI message; VideoToolbox does not.
+    let x264 = |bytes: &[u8]| bytes.windows(4).any(|w| w == b"x264");
+    assert!(
+        !x264(&segment("1").await),
+        "hardware output came from libx264"
+    );
+    assert_eq!(f.server.app.processing.hardware.snapshot().used, 1);
+
+    // The client moves the delivery to software with a new plan.
+    let software = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan(&[format!("h-{file}")]),
+        )
+        .await;
+    assert_eq!(
+        software.body["candidate_id"],
+        format!("t-{file}"),
+        "{}",
+        software.body
+    );
+    let staged = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("replan-to-software-1"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":software.body["plan_token"],"position_ms":30000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["pending"]["status"] == "ready" || d["pending"]["status"] == "failed"
+        })
+        .await;
+    assert_eq!(ready["pending"]["status"], "ready", "{ready}");
+    assert!(
+        x264(&segment("2").await),
+        "software output must come from libx264"
+    );
+    let exhausted = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan(&[format!("h-{file}"), format!("t-{file}")]),
+        )
+        .await;
+    assert_eq!(exhausted.body["reason_codes"][0], "all_candidates_failed");
+    let closed = f
+        .call("DELETE", &path, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.hardware.snapshot().used != 0
+            || f.server.app.processing.execution.snapshot().used != 0
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("hardware and CPU capacity were not released");
+
+    // A hardware plan signed before a restart that disabled live hardware
+    // cannot start an encoder.
+    let retained = f
+        .post("/api/v2/playback/plans", &auth, None, plan(&[]))
+        .await;
+    assert_eq!(retained.body["candidate_id"], format!("h-{file}"));
+    f.restart_with(Default::default()).await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("admit-disabled-hw-1"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "playback_unavailable",
+    );
+    assert_eq!(
+        advertised_routes(&f, &auth).await,
+        "original,prepared,software_hls"
+    );
+}
+
+/// Sidecar subtitles are selected by component on exactly the planned file,
+/// pinned with their scanned fingerprint, converted to WebVTT from the
+/// validated sidecar for byte delivery, refused when styled or live, and never
+/// served after the sidecar changes until it is scanned again.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_subtitles_are_component_pinned_and_fingerprinted() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    let media = f.dir.path().join("media");
+    std::fs::write(
+        media.join("film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:03,000\nSidecar caption\n",
+    )
+    .unwrap();
+    std::fs::write(
+        media.join("film.fr.ass"),
+        "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:01.00,0:00:03.00,Default,Styled\n",
+    )
+    .unwrap();
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let sidecar = |name: &str| {
+        components
+            .iter()
+            .find(|c| {
+                c.occurrences
+                    .iter()
+                    .any(|o| o.sidecar.as_deref() == Some(name))
+            })
+            .unwrap()
+            .id
+            .clone()
+    };
+    let pinned = |component: &str, mode: &str, transports: &[&str]| {
+        let mut input = plan_input("default", &timeline, mode, None, transports);
+        input["tracks"]["subtitle_component_id"] = json!(component);
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input
+    };
+    let english = sidecar("film.en.srt");
+    // Styled sidecars are refused rather than flattened.
+    let styled = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&sidecar("film.fr.ass"), "auto", &["http_range"]),
+        )
+        .await;
+    assert_eq!(
+        styled.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    // "off" conflicts with an explicit sidecar.
+    let mut off = pinned(&english, "auto", &["http_range"]);
+    off["tracks"]["subtitle_policy"] = json!("off");
+    problem(
+        &f.post("/api/v2/playback/plans", &auth, None, off).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subtitle_policy_conflict",
+    );
+
+    // Byte delivery of the original with the sidecar as WebVTT.
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "original", "{}", plan.body);
+    assert_eq!(plan.body["tracks"]["subtitle_track_id"], Value::Null);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-original-01"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    // The same key with another subtitle choice is a different request.
+    let plain = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["http_range"]),
+        )
+        .await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-original-01"),
+            json!({"plan_token": plain.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
+    let url = admitted.body["active"]["subtitles_url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let captions = f.get(&url, &auth).await;
+    assert_eq!(captions.status, StatusCode::OK, "{}", captions.body);
+    let text = String::from_utf8(captions.bytes).unwrap();
+    assert!(
+        text.starts_with("WEBVTT")
+            && text.contains("00:01.000")
+            && text.contains("Sidecar caption"),
+        "{text}"
+    );
+
+    // A live conversion cannot carry a text sidecar.
+    let live = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "convert", &["hls"]),
+        )
+        .await;
+    assert_eq!(
+        live.body["reason_codes"][0], "subtitle_conversion_unavailable",
+        "{}",
+        live.body
+    );
+
+    // The sidecar changes on disk: a new delivery pinned to the scanned
+    // fingerprint is never served the new text.
+    std::fs::write(
+        media.join("film.en.srt"),
+        "1\n00:00:01,000 --> 00:00:03,000\nEdited caption\n",
+    )
+    .unwrap();
+    let stale = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-stale-00001"),
+            json!({"plan_token": stale.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    problem(
+        &f.get(
+            admitted.body["active"]["subtitles_url"].as_str().unwrap(),
+            &auth,
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "source_revision_changed",
+    );
+    // After a rescan the new fingerprint is planned and served.
+    f.scan().await;
+    let fresh = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            pinned(&english, "auto", &["http_range"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-fresh-00001"),
+            json!({"plan_token": fresh.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let text = String::from_utf8(
+        f.get(
+            admitted.body["active"]["subtitles_url"].as_str().unwrap(),
+            &auth,
+        )
+        .await
+        .bytes,
+    )
+    .unwrap();
+    assert!(text.contains("Edited caption"), "{text}");
+    // A plan signed against the old fingerprint is refused at admission.
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("sidecar-stale-00002"),
+            json!({"plan_token": stale.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "source_revision_changed",
+    );
+}
+
+/// A minimal PGS (`.sup`) stream: one opaque white `w`x`h` box at (`x`, `y`)
+/// on a `width`x`height` canvas, shown from `start_ms` until `end_ms`.
+fn pgs_box(
+    width: u16,
+    height: u16,
+    (x, y, w, h): (u16, u16, u16, u16),
+    start_ms: u32,
+    end_ms: u32,
+) -> Vec<u8> {
+    let segment = |pts_ms: u32, kind: u8, payload: &[u8]| {
+        let mut out = b"PG".to_vec();
+        out.extend((pts_ms * 90).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.push(kind);
+        out.extend((payload.len() as u16).to_be_bytes());
+        out.extend(payload);
+        out
+    };
+    let be = |v: u16| v.to_be_bytes();
+    let window = [&[1u8, 0][..], &be(x), &be(y), &be(w), &be(h)].concat();
+    let mut rle = Vec::new();
+    for _ in 0..h {
+        rle.extend([
+            0x00,
+            0xC0 | (w >> 8) as u8,
+            (w & 0xff) as u8,
+            0x01,
+            0x00,
+            0x00,
+        ]);
+    }
+    let mut ods = vec![0, 0, 0, 0xC0];
+    ods.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+    ods.extend(be(w));
+    ods.extend(be(h));
+    ods.extend(&rle);
+    let pcs = |number: u16, state: u8, objects: bool| {
+        let mut p = [
+            &be(width)[..],
+            &be(height),
+            &[0x10],
+            &be(number),
+            &[state, 0, 0],
+        ]
+        .concat();
+        if objects {
+            p.extend([1, 0, 0, 0, 0]);
+            p.extend(be(x));
+            p.extend(be(y));
+        } else {
+            p.push(0);
+        }
+        p
+    };
+    [
+        segment(start_ms, 0x16, &pcs(0, 0x80, true)),
+        segment(start_ms, 0x17, &window),
+        segment(start_ms, 0x14, &[0, 0, 1, 235, 128, 128, 255]),
+        segment(start_ms, 0x15, &ods),
+        segment(start_ms, 0x80, &[]),
+        segment(end_ms, 0x16, &pcs(1, 0x00, false)),
+        segment(end_ms, 0x17, &window),
+        segment(end_ms, 0x80, &[]),
+    ]
+    .concat()
+}
+
+/// A bitmap subtitle is burned into a conversion for a client that accepts
+/// burned subtitles: never offered on byte delivery, a copy or to a client
+/// that does not accept it, and the decoded output carries the subpicture.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_subtitles_are_burned_into_conversions_only() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    two_audio_mp4(&f, "20");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("box.sup");
+    // A 640x480 canvas on 320x240 video: the box maps to (40, 40, 240, 60).
+    std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 0, 10000)).unwrap();
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let input = |mode: &str, modes: &[&str]| {
+        let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        input["source"] = source.clone();
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(modes);
+        input
+    };
+    let plan = |body| f.post("/api/v2/playback/plans", &auth, None, body);
+    assert_eq!(
+        plan(input("auto", &["text"])).await.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    assert_eq!(
+        plan(input("original", &["text", "burned"])).await.body["reason_codes"][0],
+        "subtitle_requires_conversion"
+    );
+    // Auto skips the original and the (eligible) copy for a conversion.
+    let burned = plan(input("auto", &["text", "burned"])).await;
+    assert_eq!(
+        burned.body["operation"], "video_transcode",
+        "{}",
+        burned.body
+    );
+    assert_eq!(burned.body["tracks"]["subtitle_track_id"], "s0");
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-subtitle-001"),
+            json!({"plan_token": burned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+        })
+        .await;
+    // Burned, not a sidecar.
+    assert_eq!(ready["active"]["subtitles_url"], Value::Null, "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    // Mean luma inside the box (inset from its edges) and below it, `at`
+    // seconds into a generation's first segment.
+    let means = |generation_id: String, at: &'static str| {
+        let get = &get;
+        let f = &f;
+        async move {
+            let base_url = format!("/api/v2/streams/{generation_id}");
+            let fragment = f
+                .dir
+                .path()
+                .join(format!("burned-{}.mp4", generation_id.replace('/', "-")));
+            std::fs::write(
+                &fragment,
+                [
+                    get(format!("{base_url}/variants/main/init.mp4")).await,
+                    get(format!("{base_url}/segments/0.m4s")).await,
+                ]
+                .concat(),
+            )
+            .unwrap();
+            let frame = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&fragment)
+                .args([
+                    "-ss",
+                    at,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(frame.len(), 320 * 240);
+            let mean = |x0: usize, y0: usize| {
+                let mut sum = 0usize;
+                for y in y0..y0 + 40 {
+                    sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                        .iter()
+                        .map(|&p| p as usize)
+                        .sum::<usize>();
+                }
+                sum / (220 * 40)
+            };
+            (mean(50, 50), mean(50, 150))
+        }
+    };
+    // From the start (FFmpeg presents a subpicture from just after the first
+    // frame on): the box, scaled from its larger canvas, is white.
+    let (inside, below) = means(format!("{id}/1"), "1").await;
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    // Starting at 8 s, inside the 0-10 s cue: the cue is still drawn although
+    // its display set precedes the start (2 s GOP: input seeking skips it).
+    let later = plan(input("auto", &["text", "burned"])).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-subtitle-002"),
+            json!({"plan_token": later.body["plan_token"], "start_ms": 8000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 8000
+        })
+        .await;
+    assert_eq!(ready["active"]["media_time_origin_ms"], 8000, "{ready}");
+    let (inside, below) = means(format!("{id}/1"), "0.5").await;
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+}
+
+/// Without an explicit pin, subtitles follow the profile: foreign audio gets
+/// full subtitles in a preferred language (plain over forced), forced mode
+/// takes only a forced track in the audio's language, and "require" refuses
+/// rather than substitute another language or the first track.
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_subtitles_follow_profile_languages_and_roles() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "10");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let srt = f.dir.path().join("captions.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nCaption\n").unwrap();
+    // French audio; s0 forced English, s1 full English.
+    f.media(
+        "film.mp4",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-map",
+            "0:v",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1",
+            "-map",
+            "2",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:a:0",
+            "language=fre",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-disposition:s:0",
+            "forced",
+            "-metadata:s:s:1",
+            "language=eng",
+            "-disposition:s:1",
+            "0",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let prefer = |mode: &str, audio: &[&str], subtitles: &[&str]| {
+        let (mode, audio, subtitles) = (mode.to_owned(), json!(audio), json!(subtitles));
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+            let mut document = prefs.body.clone();
+            document["subtitle_mode"] = json!(mode);
+            document["audio_languages"] = audio;
+            document["subtitle_languages"] = subtitles;
+            let replaced = f
+                .call(
+                    "PUT",
+                    "/api/v2/profiles/default/preferences",
+                    Some(document),
+                    &[
+                        ("authorization", &auth),
+                        ("if-match", prefs.headers["etag"].to_str().unwrap()),
+                    ],
+                )
+                .await;
+            assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+        }
+    };
+    let plan = |policy: &str| {
+        let mut input = plan_input("default", &timeline, "auto", None, &["http_range"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // French audio is foreign to an English profile: full English subtitles.
+    prefer("foreign_audio", &["en"], &["en"]).await;
+    let chosen = plan("auto").await;
+    assert_eq!(
+        chosen.body["tracks"]["subtitle_track_id"], "s1",
+        "{}",
+        chosen.body
+    );
+    assert_eq!(chosen.body["operation"], "original");
+    // A client that can only take a conversion cannot be given text
+    // subtitles: auto plays without them, require refuses.
+    let mut live = plan_input("default", &timeline, "auto", None, &["hls"]);
+    live["tracks"]["subtitle_policy"] = json!("auto");
+    let converted = f
+        .post("/api/v2/playback/plans", &auth, None, live.clone())
+        .await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["tracks"]["subtitle_track_id"], Value::Null);
+    live["tracks"]["subtitle_policy"] = json!("require");
+    assert_eq!(
+        f.post("/api/v2/playback/plans", &auth, None, live)
+            .await
+            .body["reason_codes"][0],
+        "subtitle_conversion_unavailable"
+    );
+    // Forced mode: only a forced track in the audio's language (none here).
+    prefer("forced", &["en"], &["en"]).await;
+    let none = plan("auto").await;
+    assert_eq!(none.body["status"], "ready", "{}", none.body);
+    assert_eq!(none.body["tracks"]["subtitle_track_id"], Value::Null);
+    // A French-speaking profile hears French audio: forced subtitles only,
+    // and there is no forced French track.
+    prefer("foreign_audio", &["fr"], &["fr"]).await;
+    assert_eq!(
+        plan("auto").await.body["tracks"]["subtitle_track_id"],
+        Value::Null
+    );
+    // Require: preferred languages only.
+    assert_eq!(
+        plan("require").await.body["reason_codes"][0],
+        "subtitle_unavailable"
+    );
+    prefer("off", &[], &["de", "en"]).await;
+    assert_eq!(
+        plan("require").await.body["tracks"]["subtitle_track_id"],
+        "s1"
+    );
+    assert_eq!(
+        plan("auto").await.body["tracks"]["subtitle_track_id"],
+        Value::Null
+    );
+}
+
+/// A prepared rendition presents the source audio it was prepared from. It
+/// serves a plan whose selected audio is exactly that stream of the same
+/// source revision, by byte delivery, and never one that selects another.
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    // Prepare a remux of the second audio stream (22.05 kHz).
+    let operator = bearer(OPERATOR);
+    let prepared = f
+        .post(
+            "/api/v2/processing/preparations",
+            &operator,
+            Some("prepare-second-audio-0001"),
+            json!({"source": source, "timeline_id": timeline, "recipe_id": "remux_mp4",
+                "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                    "subtitle_policy": "off", "audio_track_id": "a1", "subtitle_track_id": null}}),
+        )
+        .await;
+    assert_eq!(prepared.status, StatusCode::ACCEPTED, "{}", prepared.body);
+    let job = prepared.body["id"].as_str().unwrap().to_owned();
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(playscale::processing::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let phase: String = sqlx::query_scalar("SELECT phase FROM processing_jobs WHERE id=?")
+                .bind(&job)
+                .fetch_one(&f.server.app.db)
+                .await
+                .unwrap();
+            if phase == "completed" {
+                break;
+            }
+            assert!(
+                !["failed", "cancelled"].contains(&phase.as_str()),
+                "{phase}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("preparation did not complete");
+    stop.cancel();
+    let _ = worker.await;
+    let rendition: String =
+        sqlx::query_scalar("SELECT file_id FROM renditions WHERE external_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let plan = |mode: &str, audio: &str| {
+        let input = pinned_plan_input(
+            "default",
+            &timeline,
+            mode,
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // The second audio stream, explicitly chosen: the rendition carries it.
+    let second = plan("auto", "a1").await;
+    assert_eq!(second.body["operation"], "prepared", "{}", second.body);
+    assert_eq!(second.body["source"]["file_id"], rendition.as_str());
+    let second = plan("convert", "a1").await;
+    assert_eq!(second.body["operation"], "prepared", "{}", second.body);
+    // The default first stream: the rendition does not carry it.
+    let first = plan("convert", "a0").await;
+    assert_eq!(first.body["operation"], "video_transcode", "{}", first.body);
+    assert_eq!(first.body["source"]["file_id"], source["file_id"]);
+    assert_eq!(plan("auto", "a0").await.body["operation"], "original");
+    // Pinning the rendition's version plays its own default streams.
+    let version: String =
+        sqlx::query_scalar("SELECT version_id FROM version_files WHERE file_id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let mut pinned = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+    pinned["version_id"] = json!(version);
+    let pinned = f.post("/api/v2/playback/plans", &auth, None, pinned).await;
+    assert_eq!(pinned.body["operation"], "prepared", "{}", pinned.body);
+    // The rendition really holds the second stream (22.05 kHz).
+    let path: (String, String) = sqlx::query_as(
+        "SELECT l.root,f.relative_path FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+    )
+    .bind(&rendition)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=sample_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(Path::new(&path.0).join(&path.1))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
+}
+
+/// One gray frame of `path` at `at` seconds (320x240 sources).
+fn gray_frame(path: &Path, at: &str) -> Vec<u8> {
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", at, "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240, "{at}");
+    frame
+}
+
+fn mean_difference(a: &[u8], b: &[u8]) -> u64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| x.abs_diff(*y) as u64)
+        .sum::<u64>()
+        / a.len() as u64
+}
+
+/// A version bound to an interval of its file is a timeline of that
+/// interval: only a conversion presents it, logical time zero is the
+/// interval's start, the delivery ends at its end, and a changed interval
+/// fences plans signed before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn interval_bindings_play_their_clip_of_the_file() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    two_audio_mp4(&f, "30");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    sqlx::query(
+        "UPDATE version_files SET start_ms=10000,end_ms=20000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let plan = |mode: &str| {
+        let input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("original").await.body["reason_codes"][0],
+        "interval_requires_conversion"
+    );
+    // Not the original bytes, nor an (eligible) copy: a conversion.
+    let converted = plan("auto").await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-01"),
+            json!({"plan_token": converted.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    assert_eq!(admitted.body["logical_duration_ms"], 10000);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/playback/delivery-sessions/{id}");
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("interval.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Logical 0.5 s is file 10.5 s, not file 0.5 s.
+    let source = f.dir.path().join("media/film.mp4");
+    let delivered = gray_frame(&fragment, "0.5");
+    let inside = mean_difference(&delivered, &gray_frame(&source, "10.5"));
+    let outside = mean_difference(&delivered, &gray_frame(&source, "0.5"));
+    assert!(inside * 4 < outside, "inside {inside}, outside {outside}");
+    // A seek within the interval: the generation ends at its end.
+    let seek = f
+        .post(
+            &format!("{path}/changes"),
+            &auth,
+            Some("interval-seek-000001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":8000}),
+        )
+        .await;
+    assert_eq!(seek.status, StatusCode::ACCEPTED, "{}", seek.body);
+    let done = f
+        .until(&id, &auth, |d| {
+            d["pending"]["available_end_ms"].as_u64().unwrap_or(0) >= 9900
+                || d["pending"]["status"] == "failed"
+        })
+        .await;
+    let end = done["pending"]["available_end_ms"].as_u64().unwrap();
+    assert!((9900..=10100).contains(&end), "{done}");
+    let variant =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/2/variants/main/index.m3u8")).await)
+            .unwrap();
+    assert!(variant.contains("#EXT-X-ENDLIST"), "{variant}");
+    assert_eq!(
+        f.call("DELETE", &path, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+    // The interval changes: a plan signed for the old one is refused.
+    let retained = plan("auto").await;
+    sqlx::query(
+        "UPDATE version_files SET end_ms=25000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-02"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // A fresh plan for the changed interval is a different request: the first
+    // delivery's key cannot replay it.
+    let changed = plan("auto").await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("interval-delivery-01"),
+            json!({"plan_token": changed.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "idempotency_conflict",
+    );
+    // Bounds outside the probed file are never played.
+    sqlx::query(
+        "UPDATE version_files SET end_ms=90000 WHERE version_id IN \
+         (SELECT id FROM media_versions WHERE timeline_id=?)",
+    )
+    .bind(&timeline)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(
+        plan("auto").await.body["reason_codes"][0],
+        "source_unavailable"
+    );
+}
+
+/// A multipart version plays its parts in order as one timeline: only by a
+/// conversion, with the parts' summed duration, a position past the first
+/// part reaching the second, and a changed or incompatible part fencing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_versions_play_their_parts_in_order() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    // The second part is Matroska (another container and time base); the
+    // others differ in picture size or audio language.
+    for (name, video, tone, language) in [
+        ("a-part1.mp4", "testsrc2=size=320x240:rate=24", "440", "eng"),
+        (
+            "b-part2.mkv",
+            "testsrc2=size=320x240:rate=24,hflip",
+            "880",
+            "eng",
+        ),
+        ("c-other.mp4", "testsrc2=size=640x480:rate=24", "660", "eng"),
+        (
+            "d-language.mp4",
+            "testsrc2=size=320x240:rate=24",
+            "660",
+            "jpn",
+        ),
+    ] {
+        let tone = format!("sine=frequency={tone}:sample_rate=44100");
+        let language = format!("language={language}");
+        f.media(
+            name,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                video,
+                "-f",
+                "lavfi",
+                "-i",
+                &tone,
+                "-t",
+                "6",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                &language,
+            ],
+        );
+    }
+    f.scan().await;
+    let file = |name: &str| {
+        let db = f.server.app.db.clone();
+        let name = name.to_owned();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT id,revision FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _) = file("a-part1.mp4").await;
+    let (second, second_revision) = file("b-part2.mkv").await;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    // Parts of one version belong to its edition (as a scan of a split film
+    // would record them).
+    sqlx::query(
+        "UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) \
+         WHERE relative_path IN ('b-part2.mkv','c-other.mp4','d-language.mp4')",
+    )
+    .bind(&first)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let bind_second = |file: String, revision: String| {
+        let db = f.server.app.db.clone();
+        let version = version.clone();
+        async move {
+            sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=2")
+                .bind(&version)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+            )
+            .bind(&version)
+            .bind(file)
+            .bind(revision)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    bind_second(second.clone(), second_revision.clone()).await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = |mode: &str, policy: &str| {
+        let mut input = plan_input("default", &timeline, mode, None, &["http_range", "hls"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("original", "auto").await.body["reason_codes"][0],
+        "multipart_requires_conversion"
+    );
+    assert_eq!(
+        plan("auto", "require").await.body["reason_codes"][0],
+        "subtitle_multipart_unavailable"
+    );
+    let converted = plan("auto", "auto").await;
+    assert_eq!(
+        converted.body["operation"], "video_transcode",
+        "{}",
+        converted.body
+    );
+    assert_eq!(converted.body["source"]["file_id"], first.as_str());
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-1"),
+            json!({"plan_token": converted.body["plan_token"], "start_ms": 7000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let duration = admitted.body["logical_duration_ms"].as_u64().unwrap();
+    assert!((11_900..=12_100).contains(&duration), "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 7000
+    })
+    .await;
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("multipart.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Logical 7.5 s is the second part at 1.5 s (mirrored), not the first.
+    let media = f.dir.path().join("media");
+    let delivered = gray_frame(&fragment, "0.5");
+    let second_part = mean_difference(&delivered, &gray_frame(&media.join("b-part2.mkv"), "1.5"));
+    let first_part = mean_difference(&delivered, &gray_frame(&media.join("a-part1.mp4"), "1.5"));
+    assert!(
+        second_part * 4 < first_part,
+        "second {second_part}, first {first_part}"
+    );
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    // The second part's binding changes: a plan signed before is refused.
+    let retained = plan("auto", "auto").await;
+    bind_second(second.clone(), "another-revision".into()).await;
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-2"),
+            json!({"plan_token": retained.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // A part of another picture size, or whose audio is another language at
+    // the same position, cannot join the timeline.
+    // A part of another picture size cannot join the timeline; a part without
+    // the selected audio component (only Japanese audio) cannot play it.
+    for (name, reason) in [
+        ("c-other.mp4", "source_unavailable"),
+        ("d-language.mp4", "multipart_audio_unavailable"),
+    ] {
+        let (other, other_revision) = file(name).await;
+        bind_second(other, other_revision).await;
+        assert_eq!(
+            plan("auto", "auto").await.body["reason_codes"][0],
+            reason,
+            "{name}"
+        );
+    }
+    // A later part with HDR video is never converted without tone mapping.
+    bind_second(second.clone(), second_revision.clone()).await;
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
+        .bind(&second)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    let mut hdr: Value = serde_json::from_str(&tracks).unwrap();
+    for track in hdr.as_array_mut().unwrap() {
+        if track["kind"] == "video" {
+            track["color_transfer"] = json!("smpte2084");
+        }
+    }
+    let set_tracks = |value: String| {
+        let db = f.server.app.db.clone();
+        let second = second.clone();
+        async move {
+            sqlx::query("UPDATE media_files SET tracks_json=? WHERE id=?")
+                .bind(value)
+                .bind(second)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+    };
+    set_tracks(hdr.to_string()).await;
+    assert_eq!(
+        plan("auto", "auto").await.body["reason_codes"][0],
+        "source_unavailable"
+    );
+    set_tracks(tracks).await;
+    // A clipped binding added after a plan was signed fences that plan.
+    let signed = plan("auto", "auto").await;
+    assert_eq!(
+        signed.body["operation"], "video_transcode",
+        "{}",
+        signed.body
+    );
+    let (other, other_revision) = file("c-other.mp4").await;
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision,start_ms,end_ms) VALUES (?,3,?,?,0,1000)")
+        .bind(&version)
+        .bind(&other)
+        .bind(&other_revision)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-4"),
+            json!({"plan_token": signed.body["plan_token"], "start_ms": 0}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=3")
+        .bind(&version)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    // From the start, every part plays: the Matroska part's own time base does
+    // not truncate the timeline.
+    let whole = plan("auto", "auto").await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-delivery-3"),
+            json!({"plan_token": whole.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    // A later part changes while the delivery is live: its generation fails.
+    let seek = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("multipart-seek-00001"),
+            json!({"kind":"seek","expected_generation":"1","position_ms":1000}),
+        )
+        .await;
+    assert_eq!(seek.status, StatusCode::ACCEPTED, "{}", seek.body);
+    sqlx::query("UPDATE media_files SET revision='rescanned' WHERE id=?")
+        .bind(&second)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    // Like a changed single source: every current generation fails.
+    let fenced = f.until(&id, &auth, |d| d["status"] == "failed").await;
+    assert_eq!(fenced["status"], "failed", "{fenced}");
+}
+
+/// A bitrate cap is kept by a capped conversion: byte delivery cannot promise
+/// a peak, the encoder is VBV-limited below the cap, every published segment
+/// is measured within it, and the manifest advertises it. A cap too small to
+/// leave room for video is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitrate_caps_are_kept_by_capped_conversions() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Random noise: several Mb/s uncapped at this size.
+    f.media(
+        "noise.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=640x360:rate=24,geq=random(1)*255:128:128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = |cap: &str| {
+        let mut input = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+        input["quality"]["max_bitrate_bps"] = json!(cap);
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    assert_eq!(
+        plan("400000").await.body["reason_codes"][0],
+        "conversion_exceeds_quality_limit"
+    );
+    let capped = plan("1000000").await;
+    assert_eq!(
+        capped.body["operation"], "video_transcode",
+        "{}",
+        capped.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("capped-delivery-0001"),
+            json!({"plan_token": capped.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 9_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let master =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
+    assert!(master.contains("BANDWIDTH=1000000,"), "{master}");
+    let variant =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await)
+            .unwrap();
+    let mut measured = 0;
+    let mut duration_ms = None;
+    for line in variant.lines() {
+        if let Some(seconds) = line.strip_prefix("#EXTINF:") {
+            let seconds: f64 = seconds.trim_end_matches(',').parse().unwrap();
+            duration_ms = Some((seconds * 1000.0) as u64);
+        } else if let (Some(ms), false) = (duration_ms.take(), line.starts_with('#')) {
+            let index = line.rsplit('/').next().unwrap();
+            let bytes = get(format!("/api/v2/streams/{id}/1/segments/{index}"))
+                .await
+                .len() as u64;
+            if ms >= 3_000 {
+                assert!(
+                    bytes * 8_000 <= 1_000_000 * ms,
+                    "segment {index}: {bytes} bytes in {ms} ms"
+                );
+                measured += 1;
+            }
+        }
+    }
+    assert!(measured >= 2, "{variant}");
+}
+
+/// A part plays for exactly its pinned duration even when the streams the
+/// delivery joins are shorter than its container: continuous playback crosses
+/// the boundary where seeking places it.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_boundaries_follow_pinned_part_durations() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Two seconds of picture in a three-second first part whose sound starts
+    // half a second in; the third part has anamorphic (8:9) pixels.
+    f.media(
+        "a-short.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "2",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-itsoffset",
+            "0.5",
+            "-f",
+            "lavfi",
+            "-t",
+            "2.5",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.media(
+        "b-long.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "testsrc2=size=320x240:rate=24,hflip",
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "sine=frequency=880:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.media(
+        "c-anamorphic.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "testsrc2=size=320x240:rate=24,setsar=8/9",
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            "sine=frequency=660:sample_rate=44100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let ids: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id,revision,relative_path FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.server.app.db)
+            .await
+            .unwrap();
+    let (first, second, second_revision) = (&ids[0].0, &ids[1].0, &ids[1].1);
+    let (third, third_revision) = (&ids[2].0, &ids[2].1);
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id IN (?,?)")
+        .bind(first)
+        .bind(second)
+        .bind(third)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(second)
+    .bind(second_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,3,?,?)",
+    )
+    .bind(&version)
+    .bind(third)
+    .bind(third_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-boundary-1"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 8_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let joined = f.dir.path().join("joined.mp4");
+    std::fs::write(
+        &joined,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/1.m4s")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/2.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // The first part's sound still starts half a second in.
+    let pcm = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&joined)
+        .args([
+            "-map", "0:a", "-f", "s16le", "-ac", "1", "-ar", "48000", "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let onset = pcm
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|s| i16::from_le_bytes(*s).unsigned_abs() > 1000)
+        .unwrap() as f64
+        / 48_000.0;
+    assert!((0.45..0.56).contains(&onset), "audio onset {onset}");
+    let second_part = gray_frame(&f.dir.path().join("media/b-long.mp4"), "0.5");
+    // Logical 3.5 s is the second part at 0.5 s; at 2.5 s the first part's
+    // last picture still holds.
+    let after = mean_difference(&gray_frame(&joined, "3.5"), &second_part);
+    let before = mean_difference(&gray_frame(&joined, "2.5"), &second_part);
+    assert!(after * 4 < before, "after {after}, before {before}");
+}
+
+/// A copy keeps the source's rate, so its manifest declares that rate (the
+/// higher of the probed average and the measured peak), not the transcode's.
+#[tokio::test(flavor = "multi_thread")]
+async fn copied_manifests_declare_the_source_rate() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_copy_routes(true).await;
+    // Noise: about 18 Mb/s of H.264 and AAC in Matroska (every stream starts at
+    // zero), so the original is copyable.
+    f.media(
+        "noise.mkv",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=640x360:rate=24,geq=random(1)*255:128:128",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let file = source["file_id"].as_str().unwrap().to_owned();
+    let mut input = plan_input("default", &timeline, "auto", None, &["http_range", "hls"]);
+    input["failed_candidate_ids"] = json!([format!("o-{file}")]);
+    let copy = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    assert_eq!(copy.body["operation"], "remux", "{}", copy.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("copied-rate-000001"),
+            json!({"plan_token": copy.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 8_000
+    })
+    .await;
+    let master = f
+        .get(&format!("/api/v2/streams/{id}/1/master.m3u8"), &auth)
+        .await;
+    let master = String::from_utf8(master.bytes).unwrap();
+    let bandwidth: u64 = master
+        .split("BANDWIDTH=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(bandwidth > 10_000_000, "{master}");
+}
+
+/// The dominant tone (Hz) of a mono 48 kHz PCM window, by zero crossings.
+fn tone(pcm: &[i16]) -> u64 {
+    let crossings = pcm.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count() as u64;
+    crossings * 48_000 / 2 / pcm.len() as u64
+}
+
+/// A multipart version whose parts order two same-language, same-role audio
+/// alternatives differently still plays the selected one in every part: each
+/// part's own occurrence of the component, never the first part's position.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_audio_follows_the_component_in_every_part() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // "Stereo" is 440 Hz and "Director" 880 Hz in both parts, in opposite
+    // stream orders; both English with no roles. Matroska keeps stream
+    // titles (MP4 drops them, which would make the two indistinguishable).
+    for (name, first, second) in [
+        ("a-part.mkv", ("Stereo", "440"), ("Director", "880")),
+        ("b-part.mkv", ("Director", "880"), ("Stereo", "440")),
+    ] {
+        let (a, b) = (
+            format!("sine=frequency={}:sample_rate=48000", first.1),
+            format!("sine=frequency={}:sample_rate=48000", second.1),
+        );
+        let (ta, tb) = (format!("title={}", first.0), format!("title={}", second.0));
+        f.media(
+            name,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                &a,
+                "-f",
+                "lavfi",
+                "-i",
+                &b,
+                "-t",
+                "4",
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:a:0",
+                &ta,
+                "-metadata:s:a:1",
+                "language=eng",
+                "-metadata:s:a:1",
+                &tb,
+            ],
+        );
+    }
+    f.scan().await;
+    let ids: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,revision FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.server.app.db)
+            .await
+            .unwrap();
+    let ((first, first_revision), (second, second_revision)) = (ids[0].clone(), ids[1].clone());
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+        .bind(&first)
+        .bind(&second)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(&second)
+    .bind(&second_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let director = components
+        .iter()
+        .find(|c| c.title.as_deref() == Some("Director"))
+        .unwrap()
+        .id
+        .clone();
+    // Delivered tones in the first part (logical 1-2 s) and the second (5-6 s).
+    let deliver = |input: Value, key: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let plan = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+            let admitted = f
+                .post(
+                    "/api/v2/playback/delivery-sessions",
+                    &auth,
+                    Some(key),
+                    json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+                )
+                .await;
+            assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+            let id = admitted.body["id"].as_str().unwrap().to_owned();
+            let done = f
+                .until(&id, &auth, |d| {
+                    d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 7_900
+                        || d["active"]["status"] == "failed"
+                })
+                .await;
+            assert_ne!(done["active"]["status"], "failed", "{done}");
+            let mut bytes = Vec::new();
+            for path in ["variants/main/init.mp4", "segments/0.m4s", "segments/1.m4s"] {
+                let reply = f
+                    .call(
+                        "GET",
+                        &format!("/api/v2/streams/{id}/1/{path}"),
+                        None,
+                        &[("authorization", &auth)],
+                    )
+                    .await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                bytes.extend(reply.bytes);
+            }
+            let joined = f.dir.path().join(format!("{key}.mp4"));
+            std::fs::write(&joined, bytes).unwrap();
+            let pcm = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&joined)
+                .args([
+                    "-map", "0:a", "-f", "s16le", "-ac", "1", "-ar", "48000", "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            let pcm: Vec<i16> = pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
+                .collect();
+            (tone(&pcm[48_000..96_000]), tone(&pcm[240_000..288_000]))
+        }
+    };
+    // The default (first) audio of part one is "Stereo": 440 Hz throughout.
+    let (one, two) = deliver(
+        plan_input("default", &timeline, "auto", None, &["hls"]),
+        "mp-audio-default-1",
+    )
+    .await;
+    assert!(
+        (420..=460).contains(&one) && (420..=460).contains(&two),
+        "{one} {two}"
+    );
+    // The "Director" component: 880 Hz throughout.
+    let mut pinned = plan_input("default", &timeline, "auto", None, &["hls"]);
+    pinned["tracks"]["audio_component_id"] = json!(director);
+    let (one, two) = deliver(pinned, "mp-audio-director-1").await;
+    assert!(
+        (860..=900).contains(&one) && (860..=900).contains(&two),
+        "{one} {two}"
+    );
+    // A live multipart delivery can switch to the other component by replan.
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "auto", None, &["hls"]),
+        )
+        .await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("mp-audio-switch-0001"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| d["active"]["status"] == "active")
+        .await;
+    let mut switch = plan_input("default", &timeline, "auto", None, &["hls"]);
+    switch["tracks"]["audio_component_id"] = json!(director);
+    let switch = f.post("/api/v2/playback/plans", &auth, None, switch).await;
+    let staged = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("mp-audio-switch-0002"),
+            json!({"kind":"replan","expected_generation":"1","plan_token":switch.body["plan_token"],"position_ms":5000}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    let _ = first_revision;
+}
+
+/// An uncapped software conversion on a server with adaptive bitrate enabled
+/// is a two-rung ladder: a capped main (at most 720p) and a capped low (at
+/// most 360p) variant from one encode, segments aligned and published only
+/// when both have them, each rung described and capped from its own output,
+/// holding both execution units. A client cap keeps a single variant.
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_conversions_publish_aligned_capped_variants() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let mut f = Fixture::with_settings(playscale::processing::Settings {
+        experimental_adaptive_bitrate: true,
+        ..Default::default()
+    })
+    .await;
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "20",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let caps = advertised_routes(&f, &auth).await;
+    assert_eq!(caps, "original,prepared,software_hls");
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "convert", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0001"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 19_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base = format!("/api/v2/streams/{id}/1");
+    let master = String::from_utf8(get(format!("{base}/master.m3u8")).await).unwrap();
+    let rungs: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-STREAM-INF"))
+        .collect();
+    assert_eq!(rungs.len(), 2, "{master}");
+    assert!(
+        rungs[0].starts_with("#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1."),
+        "{master}"
+    );
+    assert!(
+        rungs[1].starts_with("#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS=\"avc1."),
+        "{master}"
+    );
+    // Each rung names its size, read from its own output.
+    assert!(rungs[0].contains(",RESOLUTION=1280x720"), "{master}");
+    assert!(rungs[1].contains(",RESOLUTION=640x360"), "{master}");
+    assert!(
+        master.contains("variants/main/index.m3u8") && master.contains("variants/low/index.m3u8")
+    );
+    let main = String::from_utf8(get(format!("{base}/variants/main/index.m3u8")).await).unwrap();
+    let low = String::from_utf8(get(format!("{base}/variants/low/index.m3u8")).await).unwrap();
+    let entries = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| {
+                l.starts_with("#EXTINF")
+                    || l.starts_with("#EXT-X-MEDIA-SEQUENCE")
+                    || l.starts_with("#EXT-X-ENDLIST")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(entries(&low), entries(&main), "{low}");
+    // Each rung's picture, and the low rung's measured rate.
+    let probe = |name: &str, init: Vec<u8>, segment: Vec<u8>| {
+        let path = f.dir.path().join(name);
+        std::fs::write(&path, [init, segment].concat()).unwrap();
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let main_init = get(format!("{base}/variants/main/init.mp4")).await;
+    let low_init = get(format!("{base}/variants/low/init.mp4")).await;
+    assert_eq!(
+        probe(
+            "main.mp4",
+            main_init,
+            get(format!("{base}/segments/0.m4s")).await
+        ),
+        "720"
+    );
+    assert_eq!(
+        probe(
+            "low.mp4",
+            low_init,
+            get(format!("{base}/segments/low-0.m4s")).await
+        ),
+        "360"
+    );
+    let mut duration_ms = None;
+    for line in low.lines() {
+        if let Some(seconds) = line.strip_prefix("#EXTINF:") {
+            duration_ms =
+                Some((seconds.trim_end_matches(',').parse::<f64>().unwrap() * 1000.0) as u64);
+        } else if let (Some(ms), Some(name)) =
+            (duration_ms.take(), line.strip_prefix("../../segments/"))
+        {
+            let bytes = get(format!("{base}/segments/{name}")).await.len() as u64;
+            if ms >= 3_000 {
+                assert!(
+                    bytes * 8_000 <= 800_000 * ms,
+                    "{name}: {bytes} bytes in {ms} ms"
+                );
+            }
+        }
+    }
+    // Opt-in: the exact output, for scripts/check_hls_subtitles.mjs --abr.
+    if let Some(dir) = std::env::var_os("MOTION_DUMP_HLS") {
+        let dir = std::path::Path::new(&dir).join("adaptive-ladder");
+        let mut files = vec![
+            "master.m3u8".to_owned(),
+            "variants/main/index.m3u8".into(),
+            "variants/main/init.mp4".into(),
+            "variants/low/index.m3u8".into(),
+            "variants/low/init.mp4".into(),
+        ];
+        for line in main.lines().chain(low.lines()) {
+            if let Some(name) = line.strip_prefix("../../") {
+                files.push(name.to_owned());
+            }
+        }
+        for name in files {
+            let path = dir.join(&name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, get(format!("{base}/{name}")).await).unwrap();
+        }
+    }
+    // The low rung is served under the same ownership as the main one: another
+    // device of the same profile cannot read it, and it retires with its
+    // delivery.
+    let low_segment = low
+        .lines()
+        .find_map(|l| l.strip_prefix("../../"))
+        .unwrap()
+        .to_owned();
+    let low_paths = [
+        format!("{base}/variants/low/index.m3u8"),
+        format!("{base}/variants/low/init.mp4"),
+        format!("{base}/{low_segment}"),
+    ];
+    let (_, stranger) = f.device(&["default"], PLAYER).await;
+    for path in &low_paths {
+        let reply = f
+            .call("GET", path, None, &[("authorization", &stranger)])
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("adaptive capacity was not released");
+    for path in &low_paths {
+        let reply = f.call("GET", path, None, &[("authorization", &auth)]).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    // A client cap keeps one capped variant.
+    let mut capped = plan_input("default", &timeline, "convert", None, &["hls"]);
+    capped["quality"]["max_bitrate_bps"] = json!("2000000");
+    let capped = f.post("/api/v2/playback/plans", &auth, None, capped).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0002"),
+            json!({"plan_token": capped.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let master =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
+    assert_eq!(master.matches("#EXT-X-STREAM-INF").count(), 1, "{master}");
+    assert!(master.contains("BANDWIDTH=2000000,"), "{master}");
+    // A ladder plan signed before a restart that disabled ladders cannot
+    // start one.
+    let ladder = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "convert", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(ladder.status, StatusCode::OK, "{}", ladder.body);
+    f.restart_with(Default::default()).await;
+    let refused = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0003"),
+            json!({"plan_token": ladder.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    problem(
+        &refused,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "route_unsupported",
+    );
+}
+
+#[tokio::test]
+async fn recovery_keeps_an_adaptive_encoders_two_execution_units() {
+    let mut f = Fixture::new().await;
+    let root = f.server.app.processing.deliveries.root.clone();
+    // Encoders that outlive the server: a single-variant generation and an
+    // adaptive one (its low variant directory precedes its witness).
+    let single = root.join("single").join("1");
+    let ladder = root.join("ladder").join("1");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::create_dir_all(ladder.join("low")).unwrap();
+    let (_, single_held) = playscale::execution::Witness::create(&single.join(".owner")).unwrap();
+    let (_, ladder_held) = playscale::execution::Witness::create(&ladder.join(".owner")).unwrap();
+    f.restart().await;
+    assert_eq!(f.server.app.processing.execution.snapshot().used, 3);
+    drop(ladder_held);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 1 || ladder.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the adaptive encoder's units were not released");
+    assert!(single.exists());
+    drop(single_held);
 }

@@ -15,6 +15,9 @@ struct World {
     now: u64,
 }
 
+// A model input value: its size is irrelevant, and boxing would obscure the
+// generated inputs.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum Step {
     Delivery(Input),
@@ -32,6 +35,10 @@ fn pin(tracks: &[&str], operation: Operation) -> Pin {
         tracks: tracks.iter().map(|t| (*t).into()).collect(),
         operation,
         recipe_digest: operation.segmented().then(|| "h264-aac".into()),
+        clip: None,
+        parts: vec![],
+        max_bitrate_bps: None,
+        adaptive: false,
     }
 }
 
@@ -161,6 +168,13 @@ impl stateless::Generate for Deliveries {
     }
 }
 
+/// FNV-1a (64-bit) of a source text.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn error_name(e: Error) -> String {
     format!("{e:?}")
 }
@@ -175,10 +189,12 @@ impl Model for Deliveries {
             model_version: 2,
             properties_version: 2,
             codec_version: 2,
+            // The source's digest: the source itself exceeds a trace's
+            // string limit.
             build: format!(
-                "{}:{}",
+                "{}:{:016x}",
                 env!("CARGO_PKG_VERSION"),
-                include_str!("../src/delivery.rs")
+                fnv1a(include_str!("../src/delivery.rs"))
             ),
         }
     }

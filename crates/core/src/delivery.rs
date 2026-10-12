@@ -110,12 +110,54 @@ pub fn copy_start(
     (end_ms <= segment || fits_target(end_ms - segment, target_s)).then_some(start)
 }
 
+/// How far before an input seek target FFmpeg may begin reading: for a
+/// container that seeks by decode time, when some video has B-frame delay, it
+/// seeks 3/23 s (130.43 ms) early. Rounded up, plus 1 ms for keyframe times
+/// truncated to whole milliseconds.
+pub const COPY_SEEK_EARLY_MS: u64 = 132;
+
+/// The input seek target that starts a stream copy at the chosen keyframe
+/// (`copy_start`) for a request at `requested_ms`: at least
+/// `COPY_SEEK_EARLY_MS` after the keyframe, so an early seek still reaches it,
+/// and before the next keyframe, so an exact seek never passes it. None when
+/// the next keyframe is too close to tell them apart.
+pub fn copy_seek(keyframes_ms: &[u64], keyframe_ms: u64, requested_ms: u64) -> Option<u64> {
+    let target = requested_ms.max(keyframe_ms + COPY_SEEK_EARLY_MS);
+    keyframes_ms
+        .iter()
+        .filter(|k| **k > keyframe_ms)
+        .min()
+        .is_none_or(|next| target < *next)
+        .then_some(target)
+}
+
 /// Text subtitle codecs that can be delivered as a WebVTT sidecar in timeline
 /// time, on any route, without losing meaning. ASS/SSA are excluded: WebVTT
 /// drops their positioning, fonts and effects, which can merge signs with
 /// dialogue. Bitmap subtitles (PGS, DVD, DVB) need burn-in, not yet offered.
 pub fn sidecar_subtitle(codec: &str) -> bool {
     matches!(codec, "subrip" | "srt" | "mov_text" | "webvtt" | "text")
+}
+
+/// The stream-copy operation these streams would use, judged from stream facts
+/// alone: remux when the selected audio is AAC (or omitted), audio conversion
+/// otherwise. None when no bitstream details could make a copy eligible. The
+/// details still decide (`live_route_supported`); this only names the
+/// candidate before they are observed.
+pub fn copy_operation(s: &SourceStreams<'_>) -> Option<Operation> {
+    (!s.hdr && s.video == Some("h264") && s.starts_at_zero && s.eight_bit_420).then(|| {
+        if s.audio.is_none_or(|a| a == "aac") {
+            Operation::Remux
+        } else {
+            Operation::AudioConvert
+        }
+    })
+}
+
+/// Bitmap subtitle codecs that a conversion can burn into the video (an
+/// overlay of decoded subpictures; no text rendering needed).
+pub fn burnable_subtitle(codec: &str) -> bool {
+    matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle")
 }
 
 /// Whether a live segmented route can serve these streams. Stream copy is only
@@ -125,19 +167,17 @@ pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool
     if s.hdr || s.video.is_none() {
         return false;
     }
-    let copy = s.video == Some("h264")
-        && s.starts_at_zero
-        && s.eight_bit_420
-        && s.details.is_some_and(|d| {
-            COPY_PROFILES.contains(&d.profile)
-                && (1..=COPY_MAX_LEVEL).contains(&d.level)
-                && d.progressive
-                && !d.rotated
-        });
+    let details = s.details.is_some_and(|d| {
+        COPY_PROFILES.contains(&d.profile)
+            && (1..=COPY_MAX_LEVEL).contains(&d.level)
+            && d.progressive
+            && !d.rotated
+    });
     match operation {
         Operation::VideoTranscode => true,
-        Operation::Remux => copy && s.audio.is_none_or(|a| a == "aac"),
-        Operation::AudioConvert => copy && s.audio.is_some_and(|a| a != "aac"),
+        Operation::Remux | Operation::AudioConvert => {
+            details && copy_operation(s) == Some(operation)
+        }
         Operation::Original | Operation::Prepared => false,
     }
 }
@@ -158,6 +198,22 @@ pub struct Pin {
     pub tracks: Vec<String>,
     pub operation: Operation,
     pub recipe_digest: Option<String>,
+    /// The interval of the source file the timeline is (logical time `t` is
+    /// file time `start_ms + t`); None plays the whole file.
+    #[serde(default)]
+    pub clip: Option<crate::parts::Clip>,
+    /// Every part of a multipart timeline, in order (the first is
+    /// `source_file`); empty for a single file.
+    #[serde(default)]
+    pub parts: Vec<crate::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at
+    /// (`playback_session::rate_cap`); None uncapped.
+    #[serde(default)]
+    pub max_bitrate_bps: Option<u64>,
+    /// An adaptive conversion: a capped low variant beside the main one
+    /// (`playback_session::adaptive`). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adaptive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -207,6 +263,11 @@ pub struct Segment {
 pub struct Retained {
     pub index: u32,
     pub until_ms: u64,
+    /// Logical interval the segment covered (for its subtitle segment).
+    #[serde(default)]
+    pub start_ms: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -651,11 +712,13 @@ impl Delivery {
             }
             let evicted = g.segments.remove(0);
             total -= head;
-            g.available_start_ms += head;
             g.retained.push(Retained {
                 index: evicted.index,
                 until_ms: now_ms.saturating_add(head).saturating_add(longest),
+                start_ms: g.available_start_ms,
+                duration_ms: head,
             });
+            g.available_start_ms += head;
         }
     }
 
@@ -1016,6 +1079,49 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
 
 /// Media playlist for a serving segmented generation. A rolling window is never
 /// labelled as a complete VOD playlist; ENDLIST follows only the final segment.
+/// The logical interval (start, duration) of a generation's segment that is
+/// advertised or still retained; None for any other index.
+pub fn segment_interval(generation: &Generation, index: u32) -> Option<(u64, u64)> {
+    let mut start = generation.available_start_ms;
+    for s in &generation.segments {
+        if s.index == index {
+            return Some((start, s.duration_ms));
+        }
+        start += s.duration_ms;
+    }
+    generation
+        .retained
+        .iter()
+        .find(|r| r.index == index)
+        .map(|r| (r.start_ms, r.duration_ms))
+}
+
+/// The subtitle rendition's playlist of a live generation: the same window,
+/// sequence numbers, durations and end as its media playlist, one WebVTT
+/// segment per media segment.
+pub fn subtitle_playlist(generation: &Generation, segment_uri: impl Fn(u32) -> String) -> String {
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+        generation.target_duration_s,
+        generation
+            .segments
+            .first()
+            .map_or(generation.next_segment, |s| s.index)
+    );
+    for s in &generation.segments {
+        out.push_str(&format!(
+            "#EXTINF:{}.{:03},\n{}\n",
+            s.duration_ms / 1000,
+            s.duration_ms % 1000,
+            segment_uri(s.index)
+        ));
+    }
+    if generation.complete {
+        out.push_str("#EXT-X-ENDLIST\n");
+    }
+    out
+}
+
 pub fn media_playlist(
     generation: &Generation,
     segment_uri: impl Fn(u32) -> String,
@@ -1053,6 +1159,10 @@ mod tests {
             tracks: tracks.iter().map(|t| (*t).into()).collect(),
             operation: Operation::VideoTranscode,
             recipe_digest: Some("h264-aac".into()),
+            clip: None,
+            parts: vec![],
+            max_bitrate_bps: None,
+            adaptive: false,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {
@@ -1314,6 +1424,15 @@ mod tests {
         assert!(!d.fetchable(1, 7, 84_000) && d.fetchable(1, 14, 84_000));
         let text = media_playlist(g, |i| format!("s/{i}"), "init.mp4");
         assert!(text.contains("#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:14\n"));
+        // Subtitle segments mirror the media window, and every advertised or
+        // retained segment keeps its logical interval.
+        let subtitles = subtitle_playlist(g, |i| format!("t/{i}.vtt"));
+        assert!(subtitles.contains("#EXT-X-MEDIA-SEQUENCE:14\n#EXTINF:4.000,\nt/14.vtt\n"));
+        assert!(!subtitles.contains("EXT-X-MAP") && !subtitles.contains("ENDLIST"));
+        assert_eq!(segment_interval(g, 14), Some((56_000, 4_000)));
+        assert_eq!(segment_interval(g, 15), Some((60_000, 4_000)));
+        assert_eq!(segment_interval(g, 7), Some((28_000, 4_000)));
+        assert_eq!(segment_interval(g, 20), None);
         assert!(!text.contains("ENDLIST") && !text.contains("PLAYLIST-TYPE"));
         // A completion that skips a report fails rather than ending early.
         let skipped = Input::Completed {
@@ -1511,6 +1630,53 @@ mod tests {
             Operation::Remux,
             &detail("Constrained Baseline", 31, true, false)
         ));
+        // The candidate is named before details are observed, never decided by it.
+        let unobserved = |s: SourceStreams<'static>| SourceStreams { details: None, ..s };
+        assert_eq!(
+            copy_operation(&unobserved(h264_aac)),
+            Some(Operation::Remux)
+        );
+        assert_eq!(
+            copy_operation(&unobserved(streams(Some("h264"), None, false))),
+            Some(Operation::Remux)
+        );
+        assert_eq!(
+            copy_operation(&unobserved(h264_ac3)),
+            Some(Operation::AudioConvert)
+        );
+        for never in [
+            hevc,
+            offset,
+            ten_bit,
+            streams(Some("h264"), Some("aac"), true),
+        ] {
+            assert_eq!(copy_operation(&never), None);
+        }
+        // With details, copy_operation names exactly the supported copy route.
+        for s in [h264_aac, h264_ac3] {
+            let op = copy_operation(&s).unwrap();
+            assert!(live_route_supported(op, &s));
+        }
+    }
+
+    #[test]
+    fn copy_seeks_late_enough_to_reach_the_chosen_keyframe_and_never_the_next() {
+        let keyframes = [10_000, 12_000, 12_100, 14_000];
+        // A request on a keyframe seeks past FFmpeg's early-seek allowance.
+        assert_eq!(copy_seek(&keyframes, 10_000, 10_000), Some(10_132));
+        assert_eq!(copy_seek(&keyframes, 10_000, 10_050), Some(10_132));
+        // A later request already lies beyond it.
+        assert_eq!(copy_seek(&keyframes, 10_000, 11_999), Some(11_999));
+        assert_eq!(copy_seek(&keyframes, 14_000, 20_000), Some(20_000));
+        // The next keyframe is within the allowance: no seek isolates this one.
+        assert_eq!(copy_seek(&keyframes, 12_000, 12_000), None);
+        assert_eq!(copy_seek(&keyframes, 12_000, 12_050), None);
+        // An early seek of at most 130.43 ms from the target never precedes the
+        // keyframe, even with sub-millisecond keyframe times.
+        for keyframe in [0, 10_000, 14_000] {
+            let target = copy_seek(&keyframes, keyframe, keyframe).unwrap();
+            assert!(target * 1000 - 130_435 >= keyframe * 1000 + 999);
+        }
     }
 
     #[test]
