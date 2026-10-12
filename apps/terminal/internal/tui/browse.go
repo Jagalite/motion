@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -329,6 +330,24 @@ func (m *Model) titles(c *canvas, key string, items []api.CatalogItem, empty str
 }
 
 func (m *Model) home(c *canvas) {
+	if items, ok := data[[]api.CatalogItem](*m, keyCatalog); ok {
+		review, offline := 0, 0
+		for _, i := range items {
+			if needsReview(i) {
+				review++
+			}
+			if i.Availability != "available" {
+				offline++
+			}
+		}
+		libraries, _ := data[[]api.Library](*m, keyLibraries)
+		cw := (c.width - 6) / 4
+		c.add(strip(c.width,
+			stat("Titles", strconv.Itoa(len(items)), "in the catalog", colorInfo, cw),
+			stat("Needs review", strconv.Itoa(review), "to confirm", colorAccent, cw),
+			stat("Offline", strconv.Itoa(offline), "can't play", colorDanger, cw),
+			stat("Libraries", strconv.Itoa(len(libraries)), "visible", colorOK, c.width-6-3*cw))...)
+	}
 	head := c.heading("Continue watching", "")
 	if lines, ok := m.pending(keyContinue, "what's in progress"); ok {
 		if s := m.cache.slots[keyContinue]; s != nil && s.err != nil {
@@ -362,12 +381,63 @@ func (m *Model) home(c *canvas) {
 		c.add(m.empty("No libraries yet.")...)
 		return
 	}
-	cards := make([]card, len(libraries))
-	for n, l := range libraries {
-		cards[n] = card{id: l.ID, title: clean(l.Name), label: libraryIcon(l.Kind), progress: -1, act: action{library: l.ID}}
-		cards[n].meta = kindLabel(clean(l.Kind)) + " · " + availabilityText(l.Availability)
+	// Each library is a panel: its titles, what needs review and how much
+	// is available, from the catalog (when it has loaded).
+	items, counted := data[[]api.CatalogItem](*m, keyCatalog)
+	type tally struct{ titles, review, offline int }
+	tallies := map[string]*tally{}
+	for _, l := range libraries {
+		tallies[l.ID] = &tally{}
 	}
-	c.cards(cards, cardShape{w: 22, h: 3}, head)
+	for _, i := range items {
+		for _, id := range i.LibraryIDs {
+			if t := tallies[id]; t != nil {
+				t.titles++
+				if needsReview(i) {
+					t.review++
+				}
+				if i.Availability != "available" {
+					t.offline++
+				}
+			}
+		}
+	}
+	const gap = 2
+	cols := max(1, min(3, (c.width+gap)/(34+gap)))
+	w := (c.width - gap*(cols-1)) / cols
+	for start := 0; start < len(libraries); start += cols {
+		end := min(start+cols, len(libraries))
+		var blocks [][]string
+		var widths []int
+		top := len(c.lines)
+		for i := start; i < end; i++ {
+			l := libraries[i]
+			focused := c.focused()
+			c.elems = append(c.elems, elem{top: top, bottom: top + 4, head: head, row: c.row, x: (i - start) * (w + gap), act: action{library: l.ID}})
+			t := tallies[l.ID]
+			body := []string{mutedStyle.Render(kindLabel(clean(l.Kind))), faintStyle.Render("counting titles…"), ""}
+			if counted {
+				body[1] = fgStyle.Render(plural(t.titles, "title", "titles"))
+				if t.review > 0 {
+					body[1] += accentStyle.Render(fmt.Sprintf("  %d need review", t.review))
+				}
+				frac := 1.0
+				if t.titles > 0 {
+					frac = float64(t.titles-t.offline) / float64(t.titles)
+				}
+				body[2] = bar(frac, max(w-20, 4), colorOK) + faintStyle.Render(" available")
+			}
+			edge, accent := colorPanelLine, colorFG
+			if focused {
+				edge, accent = colorAccent, colorAccent
+			}
+			blocks = append(blocks, framed(libraryIcon(l.Kind)+" "+clean(l.Name), availabilityDot(l.Availability), accent, edge, body, w))
+			widths = append(widths, w)
+		}
+		c.add(side(blocks, widths, gap)...)
+		c.row++
+		head = len(c.lines)
+	}
 }
 
 func (m *Model) playable(p itemPage) bool {

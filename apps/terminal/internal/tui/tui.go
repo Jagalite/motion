@@ -118,6 +118,8 @@ type Model struct {
 	window  int
 	beat    int
 	anim    *springs
+	// opened is when the console started listening for change hints.
+	opened time.Time
 	// blurred is set while the terminal reports it does not have focus:
 	// polling slows and animation pauses until it returns.
 	blurred bool
@@ -150,7 +152,7 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 		search: search, help: h, table: tbl, vp: viewport.New(),
 		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
 		cancelling: map[string]bool{}, stream: "connecting",
-		metrics: newHistory(), bars: map[string]*progress.Model{}, anim: newSprings(),
+		metrics: newHistory(), bars: map[string]*progress.Model{}, anim: newSprings(), opened: time.Now(),
 		// The console opens with the sidebar focused; tab moves to the page.
 		focus: focusNav,
 	}
@@ -357,11 +359,21 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 		}
 		switch msg.key {
+		case keyLibraries:
+			if libraries, ok := msg.data.([]api.Library); ok && msg.err == nil {
+				m.cache.shelves = libraries
+			} else if revoked(msg.err) {
+				m.cache.shelves = nil
+			}
 		case keyDiagnostics, keyStorage, keyMetrics:
 			if revoked(msg.err) {
 				m.forgetMetrics() // the server withdrew access to what was shown
 			}
 		case keySession:
+			if me := m.me(); me != nil {
+				shape := *me
+				m.cache.shape = &shape
+			}
 			if !m.admin() {
 				m.forgetMetrics()
 			}
@@ -600,6 +612,11 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 // page passed over quickly are superseded and cancelled like any other.
 func (m *Model) navKey(msg tea.KeyPressMsg) tea.Cmd {
 	entries := m.navEntries()
+	// Move from the entry of the page on screen, so a sidebar that changed
+	// shape (libraries loaded, permissions known) never skips a page.
+	if i := m.navIndex(); entries[min(m.navSel, len(entries)-1)].route != m.section() && i >= 0 {
+		m.navSel = i
+	}
 	moved := true
 	switch {
 	case key.Matches(msg, keys.Up):
@@ -758,7 +775,7 @@ func (m *Model) signedOut(err error) {
 	}
 	m.cache.seq++
 	m.cache.slots[keySession] = &slot{request: m.cache.seq, err: err}
-	m.cache.viewer = ""
+	m.cache.viewer, m.cache.shape, m.cache.shelves = "", nil, nil
 	m.forgetMetrics()
 	m.bars = map[string]*progress.Model{}
 	m.focus, m.history, m.confirm = focusContent, nil, ""

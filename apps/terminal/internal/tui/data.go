@@ -97,6 +97,12 @@ type cache struct {
 	// viewer is the profile that continue-watching and viewing reads were
 	// issued for; a change re-queries them.
 	viewer string
+	// shape is the last principal seen, used only to keep the sidebar's
+	// entries steady while a reset reloads the session. Access is still
+	// decided by the server on every request; sign-out clears it.
+	shape *api.Principal
+	// shelves is the last library list, kept for the same reason.
+	shelves []api.Library
 }
 
 type loaded struct {

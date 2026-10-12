@@ -206,8 +206,13 @@ var colorPanelLine = lipgloss.Color("#43474a")
 // panel frames lines in a rounded border with a title set into the top
 // edge, and an optional value at its right, in the style of btop.
 func panel(title, value string, accent color.Color, lines []string, width int) []string {
+	return framed(title, value, accent, colorPanelLine, lines, width)
+}
+
+// framed is a panel with a chosen border color: the accent marks focus.
+func framed(title, value string, accent, edge color.Color, lines []string, width int) []string {
 	inner := max(width-4, 1)
-	border := lipgloss.NewStyle().Foreground(colorPanelLine)
+	border := lipgloss.NewStyle().Foreground(edge)
 	head := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(" " + title + " ")
 	right := ""
 	if value != "" {

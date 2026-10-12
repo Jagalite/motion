@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
 	"errors"
 	"fmt"
@@ -118,17 +119,27 @@ func (m *Model) sync() {
 	case kindTable:
 		// The table is given only the visible window of rows, so its own
 		// scrolling never applies and the selection is always on screen.
-		cols, rows, _ := m.tabular(f.inner)
-		// Room for the header, a position line and the wrapped row detail.
+		cols, rows, _ := m.tabular(f.inner - 4)
 		m.tsel = min(max(m.tsel, 0), max(len(rows)-1, 0))
-		detail := len(words(m.detail(), f.inner))
-		visible := min(len(rows), max(f.body-3-detail, 1))
+		// Room for the stat strip, the panel's border, header and position
+		// line, and the detail panel.
+		chrome := len(m.tableStrip(f.inner)) + len(m.tableDetail(f.inner)) + 4
+		visible := min(len(rows), max(f.body-chrome, 1))
 		m.toff = min(max(m.toff, m.tsel-visible+1, 0), m.tsel)
+		window := append([]table.Row(nil), rows[m.toff:min(m.toff+visible, len(rows))]...)
+		if i := m.tsel - m.toff; i >= 0 && i < len(window) {
+			// The selected row is drawn plain so the selection style reads.
+			plain := make(table.Row, len(window[i]))
+			for c, cell := range window[i] {
+				plain[c] = ansi.Strip(cell)
+			}
+			window[i] = plain
+		}
 		m.table.SetRows(nil)
 		m.table.SetColumns(cols)
-		m.table.SetRows(rows[m.toff:min(m.toff+visible, len(rows))])
+		m.table.SetRows(window)
 		m.table.SetHeight(visible + 1)
-		m.table.SetWidth(f.inner)
+		m.table.SetWidth(f.inner - 4)
 		m.table.SetCursor(m.tsel - m.toff)
 	case kindText:
 		follow := m.vp.AtBottom()
@@ -190,7 +201,7 @@ func (m Model) header(width int) []string {
 	case pageItem:
 		return m.refreshProblem(width)
 	case pageHome:
-		lines = m.titled("Home", "")
+		lines = m.titled("Browse", "")
 	case pageLibrary:
 		lines = m.titled(m.title(m.route), count("library:"+m.route.id, "title", "titles"))
 	case pageCatalog:
@@ -344,8 +355,8 @@ func (m Model) body(f frame) []string {
 		if len(m.table.Rows()) == 0 {
 			return m.empty(m.tableEmpty())
 		}
-		lines := strings.Split(m.table.View(), "\n")
-		_, rows, _ := m.tabular(f.inner)
+		table := strings.Split(m.table.View(), "\n")
+		_, rows, _ := m.tabular(f.inner - 4)
 		position := ""
 		if len(rows) > len(m.table.Rows()) {
 			position = fmt.Sprintf("%d–%d of %d", m.toff+1, m.toff+len(m.table.Rows()), len(rows))
@@ -353,14 +364,12 @@ func (m Model) body(f frame) []string {
 		if s := m.cache.slots[m.tableKey()]; s != nil && s.truncated {
 			position = strings.TrimPrefix(position+" · only the first "+fmt.Sprint(len(rows))+" are shown", " · ")
 		}
+		lines := m.tableStrip(f.inner)
 		if position != "" {
-			lines = append(lines, faintStyle.Render(position))
+			position = faintStyle.Render(position)
 		}
-		lines = append(lines, "")
-		for _, l := range words(m.detail(), f.inner) {
-			lines = append(lines, mutedStyle.Render(l))
-		}
-		return lines
+		lines = append(lines, panel(m.listTitle(), position, m.tableAccent(), table, f.inner)...)
+		return append(lines, m.tableDetail(f.inner)...)
 	}
 	return strings.Split(m.vp.View(), "\n")
 }

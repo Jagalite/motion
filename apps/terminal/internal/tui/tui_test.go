@@ -815,7 +815,7 @@ func TestTableSelectionStaysVisibleAndNarrowRowsKeepEveryField(t *testing.T) {
 		t.Fatalf("selection scrolled away:\n%s", v)
 	}
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 44, Height: 20})
-	if v := screen(m); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by d1") {
+	if v := screen(m); !strings.Contains(v, "job-029") || !strings.Contains(v, "Requested by d1") || !strings.Contains(v, "source_offline") {
 		t.Fatalf("narrow table lost the selected job's fields:\n%s", v)
 	}
 }
@@ -915,7 +915,7 @@ func TestEditedSearchNeverShowsOlderResults(t *testing.T) {
 func TestNarrowScanDetailRepeatsDroppedColumns(t *testing.T) {
 	m := start(t, &fake{permissions: []string{api.PermSourcesManage}}, 44, 20)
 	m = goTo(t, m, route{page: pageScans})
-	if v := screen(m); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0") || !strings.Contains(v, "verified") {
+	if v := screen(m); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0") || !strings.Contains(v, "yes") {
 		t.Fatalf("scan detail lost dropped fields:\n%s", v)
 	}
 }
@@ -1273,5 +1273,24 @@ func TestUnfocusedTerminalSlowsPollingAndTitleSummarises(t *testing.T) {
 	}
 	if title := m.View().WindowTitle; !strings.HasPrefix(title, "Motion · srv") || !strings.Contains(title, "running") {
 		t.Fatalf("title %q", title)
+	}
+}
+
+func TestSidebarKeepsItsShapeWhileAResetReloads(t *testing.T) {
+	m := start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 120, 40)
+	before := len(m.navEntries())
+	m = goTo(t, m, route{page: pageDevices})
+	m.focus = focusNav
+	m, _ = update(t, m, eventMsg(api.Event{Kind: "reset", ResourceType: "stream"})) // session reloading
+	if got := len(m.navEntries()); got != before {
+		t.Fatalf("sidebar changed shape during the reload: %d -> %d", before, got)
+	}
+	m = press(t, m, "down")
+	if m.route.page != pageProfiles {
+		t.Fatalf("down from Devices opened %+v", m.route)
+	}
+	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
+	if m.cache.shape != nil {
+		t.Fatal("sign-out kept the principal's shape")
 	}
 }

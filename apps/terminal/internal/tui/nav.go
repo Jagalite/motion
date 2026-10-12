@@ -30,7 +30,7 @@ type route struct {
 func (r route) keys() []string {
 	switch r.page {
 	case pageHome:
-		return []string{keyLibraries, keyContinue}
+		return []string{keyLibraries, keyContinue, keyCatalog}
 	case pageLibrary:
 		return []string{"library:" + r.id}
 	case pageItem:
@@ -76,6 +76,9 @@ type navEntry struct {
 // known; the server still decides every request.
 func (m Model) navEntries() []navEntry {
 	me := m.me()
+	if me == nil && m.sessionProblem() == nil {
+		me = m.cache.shape // reloading: keep the sidebar steady
+	}
 	allows := func(p string) bool { return me != nil && me.Allows(p) }
 	entries := []navEntry{
 		{group: "Monitor", label: "Overview", icon: "◉", route: route{page: pageOverview}},
@@ -91,7 +94,10 @@ func (m Model) navEntries() []navEntry {
 		navEntry{group: "Monitor", label: "Server", icon: "◈", route: route{page: pageServer}},
 		navEntry{group: "Library", label: "Browse", icon: "⌂", route: route{page: pageHome}},
 	)
-	libraries, _ := data[[]api.Library](m, keyLibraries)
+	libraries, ok := data[[]api.Library](m, keyLibraries)
+	if !ok && m.sessionProblem() == nil {
+		libraries = m.cache.shelves // reloading: keep the sidebar steady
+	}
 	for _, l := range libraries {
 		entries = append(entries, navEntry{group: "Library", label: clean(l.Name), icon: libraryIcon(l.Kind), route: route{page: pageLibrary, id: l.ID}})
 	}

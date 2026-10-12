@@ -639,54 +639,6 @@ func (e logEntry) render(now time.Time) string {
 	return line
 }
 
-// processLines describes the server process for the Server page.
-func (m Model) processLines(width int) []string {
-	d, ok := data[api.Diagnostics](m, keyDiagnostics)
-	if !ok || !m.admin() {
-		return nil
-	}
-	lines := []string{titleStyle.Render("Process"), "", row("Uptime", uptime(d.UptimeSeconds))}
-	if p := d.Process; p != nil {
-		opt := func(label string, v *string, format func(float64) string) {
-			if f, ok := parse(v); ok {
-				lines = append(lines, row(label, format(f.v)))
-			}
-		}
-		opt("PID", p.PID, func(f float64) string { return strconv.FormatFloat(f, 'f', 0, 64) })
-		opt("Memory", p.ResidentBytes, bytesText)
-		opt("Virtual memory", p.VirtualBytes, bytesText)
-		opt("Threads", p.Threads, countText)
-		opt("Open files", p.OpenFiles, countText)
-		opt("CPUs", p.CPUCount, countText)
-		opt("CPU time", p.CPUSecondsTotal, func(f float64) string { return (time.Duration(f) * time.Second).String() })
-		opt("Requests", p.RequestsTotal, countText)
-		opt("Server errors", p.RequestErrorsTotal, countText)
-		opt("In flight", p.RequestsInFlight, countText)
-	} else {
-		lines = append(lines, row("Host metrics", faintStyle.Render("not reported by this server")))
-	}
-	lines = append(lines,
-		row("Active deliveries", clean(d.ActiveDeliveries)),
-		row("Jobs", clean(d.RunningJobs)+" running · "+clean(d.QueuedJobs)+" queued"),
-		row("Database busy", clean(d.DBBusyCount)+" since start"))
-	if s, ok := data[api.StorageReport](m, keyStorage); ok {
-		// Reservations are space held back (free-space policy and pending
-		// outputs), not data; they are listed but not added to what Motion uses.
-		lines = append(lines, "", titleStyle.Render("Storage"), "")
-		for _, part := range []struct {
-			label string
-			v     *string
-		}{{"Database", &s.DatabaseBytes}, {"Assets", &s.AssetBytes}, {"Temporary", &s.TemporaryBytes}, {"Reserved", &s.ReservedBytes}, {"Free", s.FreeBytes}} {
-			if f, ok := parse(part.v); ok {
-				lines = append(lines, row(part.label, bytesText(f.v)))
-			} else {
-				lines = append(lines, row(part.label, faintStyle.Render("unknown")))
-			}
-		}
-	}
-	return append(lines, "")
-}
-
 // liveDot pulses while updates are live.
 func (m Model) liveDot() string {
 	if m.beat%2 == 0 {
