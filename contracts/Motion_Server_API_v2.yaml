@@ -7558,6 +7558,12 @@ paths:
         required: true
         schema:
           $ref: '#/components/schemas/Id'
+      - name: delivery
+        in: query
+        description: The delivery this direct-play read belongs to, as its media_url names it. Attribution
+          for administrator playback monitoring only; it never authorizes a read.
+        schema:
+          $ref: '#/components/schemas/Id'
       - name: Range
         in: header
         schema:

@@ -15,6 +15,7 @@ use axum::{
 };
 use playscale_core::{
     delivery::{self as core, Delivery, Effect, Input, Operation, Pin},
+    playback_monitor as monitor,
     playback_session::{Owner, Route},
     work::Class,
 };
@@ -104,6 +105,18 @@ pub struct Runtime {
     stopping: std::sync::atomic::AtomicBool,
     /// Bytes sent to clients for all deliveries since this process started.
     pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
+    /// Ended v2 deliveries whose history row is not yet written: waiting for
+    /// responses still being sent, or for a failed write to be retried.
+    finishing: Mutex<Vec<Finishing>>,
+}
+
+/// An ended delivery's monitoring, kept until its history row commits.
+struct Finishing {
+    id: String,
+    telemetry: Arc<crate::playback_monitor::Telemetry>,
+    mode: &'static str,
+    duration_ms: Option<u64>,
+    ended_ms: u64,
 }
 
 #[derive(Clone)]
@@ -162,6 +175,7 @@ impl Runtime {
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: Arc::default(),
+            finishing: Mutex::default(),
         }
     }
     /// Monotonic milliseconds for lease and drain deadlines.
@@ -259,9 +273,30 @@ fn transition_locked(
     input: &Input,
 ) -> Result<Delivery, core::Error> {
     let (next, effects) = core::transition(&inner.delivery, input)?;
+    // Monitoring follows the reducer's decisions: the playhead it accepted,
+    // and the step that ended playback with its reason.
+    let stopping = app
+        .processing
+        .deliveries
+        .stopping
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let ended = monitor::end_reason(&inner.delivery, input, &next, stopping);
+    if let Some((generation, sequence, position)) =
+        monitor::accepted_playhead(&inner.delivery, &next)
+    {
+        session.telemetry.playhead(generation, sequence, position);
+    }
+    if let Some(reason) = ended {
+        session.telemetry.end(reason);
+    }
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
-        persist(app, session, &next);
+        persist(
+            app,
+            session,
+            &next,
+            ended.filter(|_| session.owner.is_some()),
+        );
     }
     inner.delivery = next.clone();
     dispatch(app, session, inner, effects);
@@ -273,14 +308,25 @@ const RECORD_RETENTION_SECONDS: i64 = 7 * 86_400;
 
 /// Record the delivery's state for diagnostics and restart recovery. Written
 /// when its status or generations change; a newer revision is never replaced.
-fn persist(app: &App, session: &Session, d: &Delivery) {
+fn persist(app: &App, session: &Session, d: &Delivery, ended: Option<monitor::EndReason>) {
     let app = app.clone();
     let id = session.id.clone();
     let file_id = session.file_id.clone();
     let file_revision = session.revision.clone();
     let d = d.clone();
     tokio::spawn(async move {
-        if let Err(error) = record(&app.db, &id, &file_id, &file_revision, &d).await {
+        let result = async {
+            record(&app.db, &id, &file_id, &file_revision, &d).await?;
+            // Why playback ended, for recovery after a crash. An acknowledged
+            // close records it in its own transaction (`close_live`).
+            if let Some(reason) = ended {
+                let mut conn = app.db.acquire().await?;
+                crate::playback_monitor::record_end(&mut conn, &id, reason).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = result {
             tracing::warn!(?error, "could not record delivery state");
         }
     });
@@ -1453,14 +1499,15 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 let _admission = app.processing.deliveries.admission.lock().await;
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
-                    session.telemetry.end("server_stopped");
                     if let Ok(state) = apply(&app, &session, Input::Close)
                         && let Err(error) = record(&app.db, &session.id, &session.file_id, &session.revision, &state).await
                     {
                         tracing::warn!(?error, "could not record delivery shutdown");
                     }
-                    finish_monitoring(&app, &session).await;
+                    finishing(&app, &session);
                 }
+                // Responses are being cut: write every history row now.
+                settle(&app, true).await;
                 return Ok(());
             }
             _ = tick.tick() => {}
@@ -1479,23 +1526,10 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
         for session in sessions {
             revalidate(&app, &session).await;
             let now = app.processing.deliveries.now_ms();
-            // The reducer decides expiry; this only notes which decision
-            // ended the delivery, for its history.
-            let expiring = {
-                let d = &session.inner.lock().unwrap().delivery;
-                !d.status.fenced() && now >= d.lease_expires_ms
-            };
             let Ok(state) = apply(&app, &session, Input::Tick { now_ms: now }) else {
                 continue;
             };
             session.telemetry.tick();
-            if state.status.fenced() {
-                if state.status == playscale_core::delivery::Status::Failed {
-                    session.telemetry.end("error");
-                } else if expiring {
-                    session.telemetry.end("lease_expired");
-                }
-            }
             if session.owner.is_some() && !state.status.fenced() {
                 monitored.push((session.id.clone(), session.telemetry.clone()));
             }
@@ -1515,7 +1549,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                     );
                     continue;
                 }
-                finish_monitoring(&app, &session).await;
+                finishing(&app, &session);
                 app.processing
                     .deliveries
                     .sessions
@@ -1534,6 +1568,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 }
             }
         }
+        settle(&app, false).await;
         // Monitoring writes are observations: a failure is logged and retried
         // on the next flush, never allowed to affect delivery.
         if ticks.is_multiple_of(5)
@@ -1557,23 +1592,69 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     }
 }
 
-/// Finish a v2 delivery's monitoring row before it leaves memory.
-async fn finish_monitoring(app: &App, session: &Session) {
+/// Hand an ended v2 delivery's monitoring to `settle` as it leaves memory.
+fn finishing(app: &App, session: &Session) {
     if session.owner.is_none() {
         return;
     }
-    let result = async {
-        let mut tx = crate::db::begin_write(&app.db).await?;
-        crate::playback_monitor::finish(&mut tx, &session.id, &session.telemetry, "closed").await?;
-        tx.commit().await
-    }
-    .await;
-    if let Err(error) = result {
-        tracing::warn!(
-            code = "playback_monitor_finish_failed",
-            ?error,
-            "playback history not finished"
-        );
+    let (mode, duration_ms) = {
+        let d = &session.inner.lock().unwrap().delivery;
+        (
+            crate::playback_monitor::mode(current_operation(d)),
+            d.duration_ms,
+        )
+    };
+    app.processing
+        .deliveries
+        .finishing
+        .lock()
+        .unwrap()
+        .push(Finishing {
+            id: session.id.clone(),
+            telemetry: session.telemetry.clone(),
+            mode,
+            duration_ms,
+            ended_ms: crate::playback_monitor::wall_ms(),
+        });
+}
+
+/// Write the history rows of ended deliveries once their responses are done
+/// (or the drain allowance passed, or `now` at shutdown). A row whose write
+/// fails stays queued with its telemetry and is retried on the next tick.
+async fn settle(app: &App, now: bool) {
+    let wall = crate::playback_monitor::wall_ms();
+    let ready: Vec<_> = app
+        .processing
+        .deliveries
+        .finishing
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| now || monitor::settled(f.telemetry.open_responses(), f.ended_ms, wall))
+        .map(|f| (f.id.clone(), f.telemetry.clone()))
+        .collect();
+    for (id, telemetry) in ready {
+        let result = async {
+            let mut tx = crate::db::begin_write(&app.db).await?;
+            crate::playback_monitor::finish(&mut tx, &id, &telemetry, monitor::EndReason::Closed)
+                .await?;
+            tx.commit().await
+        }
+        .await;
+        match result {
+            Ok(()) => app
+                .processing
+                .deliveries
+                .finishing
+                .lock()
+                .unwrap()
+                .retain(|f| f.id != id),
+            Err(error) => tracing::warn!(
+                code = "playback_monitor_finish_failed",
+                ?error,
+                "playback history not finished; retrying"
+            ),
+        }
     }
 }
 
@@ -1622,6 +1703,22 @@ pub(crate) fn monitored(app: &App) -> Vec<Monitored> {
             })
         })
         .collect();
+    // Ended, but still sending responses or awaiting their history write.
+    out.extend(
+        app.processing
+            .deliveries
+            .finishing
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| Monitored {
+                id: f.id.clone(),
+                status: playscale_core::delivery::Status::Closing,
+                mode: f.mode,
+                duration_ms: f.duration_ms,
+                telemetry: f.telemetry.clone(),
+            }),
+    );
     out.sort_by(|a, b| {
         b.telemetry
             .started_ms
@@ -1639,17 +1736,18 @@ pub(crate) fn counted(app: &App, id: &str, response: Response) -> Response {
     }
 }
 
-/// Count a direct file read into the live delivery this principal holds for
-/// that file: direct play fetches the file's own URL, not a stream route, so
-/// this is how its bytes are attributed. With no such delivery nothing is
-/// counted (a download, or a client reading without a delivery).
+/// Count a direct file read into the reader's live delivery of that file:
+/// direct play fetches the file's own URL, which names its delivery. Without
+/// a name only an unambiguous delivery is used; otherwise nothing is counted
+/// (a download, or a client reading without a delivery).
 pub(crate) fn counted_file(
     app: &App,
     principal: &str,
     file_id: &str,
+    named: Option<&str>,
     response: Response,
 ) -> Response {
-    let telemetry = app
+    let live: Vec<Arc<Session>> = app
         .processing
         .deliveries
         .sessions
@@ -1662,7 +1760,11 @@ pub(crate) fn counted_file(
                 .is_some_and(|o| o.principal == principal && o.file == file_id)
                 && !s.inner.lock().unwrap().delivery.status.fenced()
         })
-        .max_by_key(|s| s.telemetry.started_ms)
+        .cloned()
+        .collect();
+    let ids: Vec<&str> = live.iter().map(|s| s.id.as_str()).collect();
+    let telemetry = monitor::attribute(named, &ids)
+        .and_then(|id| live.iter().find(|s| s.id == id))
         .map(|s| s.telemetry.clone());
     match telemetry {
         Some(telemetry) => crate::playback_monitor::Counted::wrap(response, telemetry),
@@ -2293,9 +2395,6 @@ pub(crate) fn heartbeat_live(
     observation: Option<(u64, u64)>,
 ) -> Result<DeliveryView, ApiError> {
     let session = app.processing.deliveries.session(id)?;
-    if let Some((_, position_ms)) = observation {
-        session.telemetry.playhead(position_ms);
-    }
     let d = apply(
         app,
         &session,
@@ -2360,17 +2459,25 @@ pub(crate) async fn close_live(
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<(), ApiError> {
     let session = app.processing.deliveries.session(id)?;
-    session.telemetry.end("closed");
     let state = apply(app, &session, Input::Close).map_err(error)?;
     record(
-        conn,
+        &mut *conn,
         &session.id,
         &session.file_id,
         &session.revision,
         &state,
     )
     .await
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+    // The acknowledged close and why playback ended commit together.
+    if session.owner.is_some()
+        && let Some(reason) = session.telemetry.ended()
+    {
+        crate::playback_monitor::record_end(conn, &session.id, reason)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(())
 }
 
 /// Exact streams for a planned replan. The source file stays the delivery's.

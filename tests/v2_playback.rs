@@ -2794,6 +2794,28 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
         .call("GET", &media, None, &[("authorization", &other)])
         .await;
     assert_eq!(foreign.status, StatusCode::OK);
+    // Direct-play URLs name their delivery, so a second delivery of the same
+    // file on the same device is charged only for its own reads, and a read
+    // that names none is not guessed between them.
+    assert!(media.contains(&format!("delivery={id}")), "{media}");
+    let twin = admit_original(&f, &auth, &timeline, "monitor-delivery-0003", 0).await;
+    let twin_id = twin["id"].as_str().unwrap().to_owned();
+    let twin_media = twin["active"]["media_url"].as_str().unwrap().to_owned();
+    let read = f
+        .call(
+            "GET",
+            &twin_media,
+            None,
+            &[("authorization", &auth), ("range", "bytes=0-999")],
+        )
+        .await;
+    assert_eq!(read.status, StatusCode::PARTIAL_CONTENT);
+    let unnamed = media.split("&delivery=").next().unwrap().to_owned();
+    let ambiguous = f
+        .call("GET", &unnamed, None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(ambiguous.status, StatusCode::OK);
+    assert_eq!(monitored(&f, &twin_id).await["bytes_sent"], "1000");
 
     // A playhead from the player.
     let beat = f
@@ -2805,6 +2827,17 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
         )
         .await;
     assert_eq!(beat.status, StatusCode::OK, "{:?}", beat.body);
+    // A conflicting report (same sequence, another position) is refused by
+    // the delivery and changes nothing the administrator sees.
+    let conflict = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/heartbeat"),
+            &auth,
+            None,
+            json!({"active_generation": generation, "playhead": {"sequence": "1", "position_ms": 9000}}),
+        )
+        .await;
+    assert_ne!(conflict.status, StatusCode::OK);
     let listed = monitored(&f, &id).await;
     assert_eq!(listed["bytes_sent"], expected.to_string());
     assert_eq!(listed["position_ms"], 1500);
@@ -2829,7 +2862,7 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
             &[("authorization", &auth)],
         )
         .await;
-    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    assert_eq!(closed.status, StatusCode::NO_CONTENT, "{:?}", closed.body);
     let entry = finished(&f, &id).await;
     assert_eq!(entry["end_reason"], "closed");
     assert_eq!(entry["bytes_sent"], expected.to_string());
@@ -2901,19 +2934,22 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     let mut reason: Option<String> = None;
     for _ in 0..100 {
         reason = sqlx::query_scalar(
-            "SELECT end_reason FROM playback_monitor_sessions WHERE delivery_id=?",
+            "SELECT end_reason FROM playback_monitor_sessions WHERE delivery_id=? AND ended_at IS NOT NULL",
         )
         .bind(&second)
-        .fetch_one(&f.server.app.db)
+        .fetch_optional(&f.server.app.db)
         .await
-        .unwrap();
+        .unwrap()
+        .flatten();
         if reason.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(reason.as_deref(), Some("server_stopped"));
-    // An abrupt stop never finishes the row: startup recovery does.
+    // An abrupt stop never finishes the row: startup recovery does, keeping a
+    // reason recorded with an ending decision (the twin was closed before the
+    // crash) and otherwise as interrupted.
     sqlx::query(
         "UPDATE playback_monitor_sessions SET ended_at=NULL,end_reason=NULL WHERE delivery_id=?",
     )
@@ -2921,8 +2957,16 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     .execute(&f.server.app.db)
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE playback_monitor_sessions SET ended_at=NULL,end_reason='closed' WHERE delivery_id=?",
+    )
+    .bind(&twin_id)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
     f.restart().await;
     let entry = finished(&f, &second).await;
     assert_eq!(entry["end_reason"], "interrupted");
     assert_eq!(entry["bytes_sent"], "10000");
+    assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
 }

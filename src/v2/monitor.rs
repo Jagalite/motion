@@ -202,8 +202,12 @@ async fn history(
                         "since must be an RFC 3339 timestamp",
                     )
                 })?
-                .unix_timestamp()
-                .saturating_mul(1000),
+                .unix_timestamp_nanos()
+                // Whole milliseconds at or after the bound: sessions are
+                // timed in milliseconds, so none before it is included.
+                .saturating_add(999_999)
+                .div_euclid(1_000_000)
+                .clamp(0, i64::MAX as i128) as i64,
         ),
         None => None,
     };
@@ -225,7 +229,8 @@ async fn history(
     let rows: Vec<Row> = sqlx::query_as(&format!(
         "{SELECT} WHERE ps.ended_at IS NOT NULL \
          AND (?1 IS NULL OR ps.principal_id=?1) AND (?2 IS NULL OR ps.profile_id=?2) \
-         AND (?3 IS NULL OR e.item_id=?3 OR s.parent_id=?3) AND (?4 IS NULL OR ps.ended_at>=?4) \
+         AND (?3 IS NULL OR e.item_id=?3 OR s.parent_id=?3 \
+              OR EXISTS (SELECT 1 FROM item_structure g WHERE g.item_id=s.parent_id AND g.parent_id=?3)) AND (?4 IS NULL OR ps.ended_at>=?4) \
          AND (?5 IS NULL OR ps.ended_at<?5 OR (ps.ended_at=?5 AND ps.delivery_id<?6)) \
          ORDER BY ps.ended_at DESC, ps.delivery_id DESC LIMIT ?7"
     ))

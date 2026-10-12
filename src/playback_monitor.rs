@@ -11,18 +11,19 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
 
 use axum::body::{Body, Bytes};
 use http_body::Body as HttpBody;
+use playscale_core::playback_monitor::{
+    EndReason, Observation, Persisted, RowIdentity, Snapshot, Viewing, Watch,
+};
 
 /// Seconds of transfer averaged into the current throughput.
 pub const WINDOW_SECONDS: u64 = 10;
-/// A playing session whose position has not moved for this long is stalled.
-pub const STALL_MS: u64 = 15_000;
 /// Finished sessions are retained this long.
 pub const RETENTION_DAYS: i64 = 90;
 const RETENTION_ROWS: i64 = 100_000;
@@ -91,7 +92,7 @@ pub fn mode(operation: playscale_core::delivery::Operation) -> &'static str {
     }
 }
 
-fn wall_ms() -> u64 {
+pub(crate) fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -134,21 +135,10 @@ impl Window {
     }
 }
 
-#[derive(Default)]
-struct Watch {
-    /// Last observed (position, wall time).
-    last: Option<(u64, u64)>,
-    /// Wall time the position last moved forward.
-    advanced_at: Option<u64>,
-    start_position: Option<u64>,
-    watched_ms: u64,
-    /// The latest viewing-session status the player recorded, if any.
-    viewing: Option<String>,
-    stalled: bool,
-    stalls: u64,
-}
-
-/// One delivery's observed playback and transfer.
+/// One delivery's observed playback and transfer. What observations mean
+/// (ordering, watched time, stall episodes, what a history row still needs)
+/// is decided by `playscale_core::playback_monitor`; this holds the state
+/// and supplies the clock.
 pub struct Telemetry {
     pub started_ms: u64,
     pub network: &'static str,
@@ -157,9 +147,11 @@ pub struct Telemetry {
     last_activity_ms: AtomicU64,
     window: Mutex<Window>,
     watch: Mutex<Watch>,
-    end: OnceLock<&'static str>,
-    /// Counters already written to the history row, to skip idle flushes.
-    flushed: Mutex<(u64, u64, u64, Option<String>)>,
+    end: OnceLock<EndReason>,
+    /// What the history row is known to hold.
+    persisted: Mutex<Persisted>,
+    /// Counted responses still being sent.
+    open: AtomicUsize,
     /// Bytes counted into the process-wide total.
     total: Arc<AtomicU64>,
 }
@@ -177,7 +169,7 @@ pub struct Reading {
     pub stalls: u64,
     pub stalled: bool,
     pub advanced_recently: bool,
-    pub viewing: Option<String>,
+    pub viewing: Option<Viewing>,
     pub last_activity_ms: u64,
 }
 
@@ -194,12 +186,10 @@ impl Telemetry {
                 second: now / 1000,
                 ..Default::default()
             }),
-            watch: Mutex::new(Watch {
-                start_position,
-                ..Default::default()
-            }),
+            watch: Mutex::new(Watch::new(start_position)),
             end: OnceLock::new(),
-            flushed: Mutex::new((u64::MAX, 0, 0, None)),
+            persisted: Mutex::new(Persisted::default()),
+            open: AtomicUsize::new(0),
             total,
         }
     }
@@ -216,68 +206,53 @@ impl Telemetry {
         self.window.lock().unwrap().add(now / 1000, n);
     }
 
-    /// A playhead the client reported. Watched time accrues only for forward
-    /// movement no faster than real time (plus slack), so seeks do not count.
-    pub fn playhead(&self, position_ms: u64) {
+    /// A playhead the delivery reducer accepted.
+    pub fn playhead(&self, generation: u64, sequence: u64, position_ms: u64) {
         let now = wall_ms();
-        self.last_activity_ms.store(now, Ordering::Relaxed);
-        let mut w = self.watch.lock().unwrap();
-        if w.start_position.is_none() {
-            w.start_position = Some(position_ms);
+        if self.watch.lock().unwrap().observe(Observation::Playhead {
+            generation,
+            sequence,
+            position_ms,
+            now_ms: now,
+        }) {
+            self.last_activity_ms.store(now, Ordering::Relaxed);
         }
-        if let Some((last, at)) = w.last
-            && position_ms > last
-        {
-            let moved = position_ms - last;
-            let elapsed = now.saturating_sub(at);
-            if moved <= elapsed.saturating_mul(3) / 2 + 2_000 {
-                w.watched_ms = w.watched_ms.saturating_add(moved);
-            }
-            w.advanced_at = Some(now);
-        }
-        w.last = Some((position_ms, now));
     }
 
-    /// The player's viewing status, read with the periodic flush.
-    pub fn viewing(&self, status: Option<String>, position_ms: Option<u64>) {
-        if let Some(position) = position_ms {
-            let mut w = self.watch.lock().unwrap();
-            if w.last.is_none_or(|(last, _)| last != position) {
-                drop(w);
-                self.playhead(position);
-                w = self.watch.lock().unwrap();
-            }
-            w.viewing = status;
-        } else {
-            self.watch.lock().unwrap().viewing = status;
-        }
+    /// The delivery's newest viewing row, read with the periodic flush.
+    pub fn viewing(&self, row: RowIdentity, status: Viewing, position_ms: u64) {
+        self.watch.lock().unwrap().observe(Observation::Viewing {
+            row,
+            status,
+            position_ms,
+            now_ms: wall_ms(),
+        });
     }
 
     /// Advance once a second: roll the throughput window, track the peak and
-    /// detect stalls (playing, but the position has not moved for STALL_MS).
+    /// detect stalls.
     pub fn tick(&self) {
         let now = wall_ms();
         let rate = self.window.lock().unwrap().rate(now / 1000);
         self.peak_bps.fetch_max(rate, Ordering::Relaxed);
-        let mut w = self.watch.lock().unwrap();
-        let playing = w.viewing.as_deref() == Some("playing");
-        let since = w
-            .advanced_at
-            .or(w.last.map(|(_, at)| at))
-            .unwrap_or(self.started_ms);
-        let stalled = playing && now.saturating_sub(since) >= STALL_MS;
-        if stalled && !w.stalled {
-            w.stalls += 1;
-        }
-        w.stalled = stalled;
+        self.watch
+            .lock()
+            .unwrap()
+            .observe(Observation::Tick { now_ms: now });
     }
 
-    /// Record why the delivery ended; the first reason wins.
-    pub fn end(&self, reason: &'static str) {
+    /// Record why the delivery ended, as the reducer step that fenced it
+    /// decided. Only that step has a reason; the first is kept regardless.
+    pub fn end(&self, reason: EndReason) {
         let _ = self.end.set(reason);
     }
-    pub fn ended(&self) -> Option<&'static str> {
+    pub fn ended(&self) -> Option<EndReason> {
         self.end.get().copied()
+    }
+
+    /// Counted responses still being sent.
+    pub fn open_responses(&self) -> usize {
+        self.open.load(Ordering::Acquire)
     }
 
     pub fn read(&self) -> Reading {
@@ -291,34 +266,28 @@ impl Telemetry {
             throughput_bps: throughput,
             average_bps: bytes / elapsed,
             peak_bps: self.peak_bps.load(Ordering::Relaxed).max(throughput),
-            position_ms: w.last.map(|(p, _)| p),
-            start_position_ms: w.start_position,
+            position_ms: w.position_ms,
+            start_position_ms: w.start_position_ms,
             watched_ms: w.watched_ms,
             stalls: w.stalls,
             stalled: w.stalled,
-            advanced_recently: w
-                .advanced_at
-                .is_some_and(|at| now.saturating_sub(at) < STALL_MS),
-            viewing: w.viewing.clone(),
+            advanced_recently: w.advanced_recently(now),
+            viewing: w.viewing,
             last_activity_ms: self.last_activity_ms.load(Ordering::Relaxed),
         }
     }
 
-    /// Whether the history row is behind, and remember what will be written.
-    fn changed(&self, r: &Reading) -> bool {
-        let status = Some(status_of_reading(r).to_string());
-        let mut f = self.flushed.lock().unwrap();
-        let next = (r.bytes_sent, r.watched_ms, r.stalls, status);
-        if *f == next {
-            return false;
+    fn snapshot(r: &Reading) -> Snapshot {
+        Snapshot {
+            bytes_sent: r.bytes_sent,
+            peak_bps: r.peak_bps,
+            watched_ms: r.watched_ms,
+            stalls: r.stalls,
+            position_ms: r.position_ms,
+            last_activity_ms: r.last_activity_ms,
+            status: status(None, r).to_string(),
         }
-        *f = next;
-        true
     }
-}
-
-fn status_of_reading(r: &Reading) -> &'static str {
-    status(None, r)
 }
 
 /// The monitor's status for a session: the delivery's own state first, then
@@ -334,11 +303,11 @@ pub fn status(delivery: Option<playscale_core::delivery::Status>, r: &Reading) -
     if r.stalled {
         return "stalled";
     }
-    match r.viewing.as_deref() {
-        Some("playing") => "playing",
-        Some("paused" | "stopped" | "ended" | "superseded") => "paused",
-        _ if r.advanced_recently => "playing",
-        _ => "paused",
+    match r.viewing {
+        Some(Viewing::Playing) => "playing",
+        Some(_) => "paused",
+        None if r.advanced_recently => "playing",
+        None => "paused",
     }
 }
 
@@ -355,7 +324,15 @@ impl Counted {
         response: axum::response::Response,
         telemetry: Arc<Telemetry>,
     ) -> axum::response::Response {
+        telemetry.open.fetch_add(1, Ordering::AcqRel);
         response.map(|body| Body::new(Counted { body, telemetry }))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        // Sent in full, or abandoned by the client: either way, done.
+        self.telemetry.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -427,9 +404,10 @@ async fn announce(
     .map(|_| ())
 }
 
-/// Fold the players' viewing status into live telemetry, then write the
-/// counters of every session that changed. Hints go out only when a
-/// session's status changed, at most once per flush (every few seconds).
+/// Fold the players' viewing rows into live telemetry, then write every
+/// session whose history row is behind. A snapshot counts as written only
+/// once its transaction commits; after a failure the rows stay due and the
+/// next flush retries them. Hints go out only when a session's status changed.
 pub async fn flush(
     db: &sqlx::SqlitePool,
     live: &[(String, Arc<Telemetry>)],
@@ -439,57 +417,88 @@ pub async fn flush(
     }
     let mut conn = db.acquire().await?;
     for (id, telemetry) in live {
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT status,position_ms FROM viewing_sessions WHERE delivery_id=? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        let row: Option<(String, i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT id,revision,status,position_ms,updated_at FROM viewing_sessions WHERE delivery_id=? ORDER BY updated_at DESC, id DESC, revision DESC LIMIT 1",
         )
         .bind(id)
         .fetch_optional(&mut *conn)
         .await?;
-        if let Some((status, position)) = row {
-            telemetry.viewing(Some(status), u64::try_from(position).ok());
+        if let Some((row, revision, status, position, updated)) = row
+            && let Some(status) = Viewing::parse(&status)
+        {
+            let identity = (
+                u64::try_from(updated).unwrap_or(0),
+                row,
+                u64::try_from(revision).unwrap_or(0),
+            );
+            telemetry.viewing(identity, status, u64::try_from(position).unwrap_or(0));
         }
     }
     drop(conn);
-    let mut changed = Vec::new();
-    for (id, telemetry) in live {
-        let reading = telemetry.read();
-        let before = telemetry.flushed.lock().unwrap().3.clone();
-        if telemetry.changed(&reading) {
-            let status_changed = before.as_deref() != Some(status_of_reading(&reading));
-            changed.push((id, reading, status_changed));
-        }
-    }
-    if changed.is_empty() {
+    let due: Vec<_> = live
+        .iter()
+        .filter_map(|(id, telemetry)| {
+            let snapshot = Telemetry::snapshot(&telemetry.read());
+            let due = telemetry.persisted.lock().unwrap().due(&snapshot)?;
+            Some((id, telemetry, due))
+        })
+        .collect();
+    if due.is_empty() {
         return Ok(());
     }
     let mut tx = crate::db::begin_write(db).await?;
-    for (id, r, status_changed) in &changed {
+    for (id, _, due) in &due {
+        let s = &due.snapshot;
         sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=? WHERE delivery_id=? AND ended_at IS NULL")
-            .bind(r.bytes_sent as i64).bind(r.peak_bps as i64).bind(r.watched_ms as i64)
-            .bind(r.stalls as i64).bind(r.position_ms.map(|p| p as i64))
-            .bind(r.last_activity_ms as i64).bind(id.as_str())
+            .bind(s.bytes_sent as i64).bind(s.peak_bps as i64).bind(s.watched_ms as i64)
+            .bind(s.stalls as i64).bind(s.position_ms.map(|p| p as i64))
+            .bind(s.last_activity_ms as i64).bind(id.as_str())
             .execute(&mut *tx).await?;
-        if *status_changed {
+        if due.status_changed {
             announce(&mut tx, id, "changed").await?;
         }
     }
-    tx.commit().await
+    tx.commit().await?;
+    for (_, telemetry, due) in due {
+        telemetry
+            .persisted
+            .lock()
+            .unwrap()
+            .acknowledge(due.snapshot);
+    }
+    Ok(())
 }
 
-/// Finish a session's history row with its final counters and end reason.
+/// Durably note why a delivery ended, in the transaction that records the
+/// decision, so recovery after a crash keeps it. The first reason stays.
+pub async fn record_end(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    reason: EndReason,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE playback_monitor_sessions SET end_reason=? WHERE delivery_id=? AND ended_at IS NULL AND end_reason IS NULL")
+        .bind(reason.as_str())
+        .bind(id)
+        .execute(conn)
+        .await
+        .map(|_| ())
+}
+
+/// Finish a session's history row with its final counters. The reason
+/// already recorded with the ending decision wins over `fallback`.
 pub async fn finish(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
     telemetry: &Telemetry,
-    fallback: &'static str,
+    fallback: EndReason,
 ) -> Result<(), sqlx::Error> {
     let r = telemetry.read();
     let reason = telemetry.ended().unwrap_or(fallback);
     let now = wall_ms() as i64;
-    let done = sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=?,ended_at=?,end_reason=? WHERE delivery_id=? AND ended_at IS NULL")
+    let done = sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=?,ended_at=?,end_reason=coalesce(end_reason,?) WHERE delivery_id=? AND ended_at IS NULL")
         .bind(r.bytes_sent as i64).bind(r.peak_bps as i64).bind(r.watched_ms as i64)
         .bind(r.stalls as i64).bind(r.position_ms.map(|p| p as i64))
-        .bind(r.last_activity_ms as i64).bind(now).bind(reason).bind(id)
+        .bind(r.last_activity_ms as i64).bind(now).bind(reason.as_str()).bind(id)
         .execute(&mut *conn).await?;
     if done.rows_affected() > 0 {
         announce(conn, id, "deleted").await?;
@@ -497,10 +506,11 @@ pub async fn finish(
     Ok(())
 }
 
-/// Sessions of a previous process can no longer be live: finish them as
-/// interrupted, at their last recorded activity, with their last counters.
+/// Sessions of a previous process can no longer be live: finish them at
+/// their last recorded activity with their last counters, keeping a reason
+/// recorded with an ending decision and otherwise as interrupted.
 pub async fn recover(conn: &mut sqlx::SqliteConnection) -> Result<u64, sqlx::Error> {
-    sqlx::query("UPDATE playback_monitor_sessions SET ended_at=last_activity_at,end_reason='interrupted' WHERE ended_at IS NULL")
+    sqlx::query("UPDATE playback_monitor_sessions SET ended_at=last_activity_at,end_reason=coalesce(end_reason,'interrupted') WHERE ended_at IS NULL")
         .execute(conn)
         .await
         .map(|r| r.rows_affected())
@@ -549,42 +559,28 @@ mod tests {
     }
 
     #[test]
-    fn watched_time_counts_forward_play_not_seeks() {
+    fn telemetry_follows_core_ordering() {
         let t = Telemetry::new("local", None, Arc::default());
-        t.playhead(0);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        t.playhead(20); // plausible play
-        t.playhead(600_000); // a seek forward: not watched
+        t.playhead(1, 2, 10_000);
+        t.playhead(1, 1, 5_000); // stale: ignored
         let r = t.read();
-        assert_eq!(r.watched_ms, 20);
-        assert_eq!(r.start_position_ms, Some(0));
-        assert_eq!(r.position_ms, Some(600_000));
-    }
-
-    #[test]
-    fn counts_stalls_once_per_episode() {
-        let t = Telemetry::new("local", None, Arc::default());
-        t.viewing(Some("playing".into()), Some(5));
-        {
-            let mut w = t.watch.lock().unwrap();
-            w.advanced_at = Some(wall_ms() - STALL_MS - 1);
-        }
-        t.tick();
-        t.tick();
+        assert_eq!(r.position_ms, Some(10_000));
+        assert_eq!(r.start_position_ms, Some(10_000));
+        t.viewing((1, "v".into(), 1), Viewing::Playing, 2_000);
         let r = t.read();
-        assert!(r.stalled);
-        assert_eq!(r.stalls, 1);
-        assert_eq!(status(None, &r), "stalled");
-        t.viewing(Some("paused".into()), None);
-        t.tick();
-        assert_eq!(status(None, &t.read()), "paused");
+        assert_eq!(
+            r.position_ms,
+            Some(10_000),
+            "a viewing row never rewinds a reducer playhead"
+        );
+        assert_eq!(status(None, &r), "playing");
     }
 
     #[test]
     fn first_end_reason_wins() {
         let t = Telemetry::new("unknown", None, Arc::default());
-        t.end("closed");
-        t.end("lease_expired");
-        assert_eq!(t.ended(), Some("closed"));
+        t.end(EndReason::Error);
+        t.end(EndReason::Closed);
+        assert_eq!(t.ended(), Some(EndReason::Error));
     }
 }

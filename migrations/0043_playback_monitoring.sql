@@ -26,7 +26,8 @@ CREATE TABLE playback_monitor_sessions (
     start_position_ms INTEGER,
     end_position_ms INTEGER,
     stalls INTEGER NOT NULL DEFAULT 0 CHECK (stalls >= 0),
-    CHECK ((ended_at IS NULL) = (end_reason IS NULL))
+    -- A live row may already know why it is ending; a finished row always does.
+    CHECK (ended_at IS NULL OR end_reason IS NOT NULL)
 );
 CREATE INDEX playback_monitor_history ON playback_monitor_sessions(ended_at, delivery_id) WHERE ended_at IS NOT NULL;
 CREATE INDEX playback_monitor_device ON playback_monitor_sessions(principal_id, ended_at, delivery_id);

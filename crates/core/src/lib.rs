@@ -19,6 +19,7 @@ pub mod nfo;
 pub mod offline;
 pub mod organization;
 pub mod playback;
+pub mod playback_monitor;
 pub mod playback_session;
 pub mod processing;
 pub mod ranges;

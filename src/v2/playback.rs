@@ -1204,10 +1204,11 @@ fn generation_json(delivery: &str, owner: &Owner, g: &delivery::GenerationView) 
     let hls = g.transport == "hls";
     let media_url = (!hls).then(|| {
         format!(
-            "/api/v2/media/files/{}/content?revision={}",
+            "/api/v2/media/files/{}/content?revision={}&delivery={}",
             segment(&owner.file),
             url::form_urlencoded::byte_serialize(owner.file_revision.as_bytes())
-                .collect::<String>()
+                .collect::<String>(),
+            url::form_urlencoded::byte_serialize(delivery.as_bytes()).collect::<String>()
         )
     });
     // The v1 view names a manifest only while the generation is served.

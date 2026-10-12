@@ -337,6 +337,9 @@ pub async fn revoke(
 pub struct MediaParams {
     revision: Option<String>,
     ticket: Option<String>,
+    /// The delivery a direct-play URL belongs to: attribution for
+    /// administrator monitoring only, never authorization.
+    delivery: Option<String>,
 }
 
 type TicketRow = (String, String, String, String, Option<String>, i64, bool);
@@ -421,6 +424,7 @@ pub async fn file_content(
         revision: params.revision,
     };
     let attributed = file_id.clone();
+    let named = params.delivery;
     media::serve(
         State(app.clone()),
         Path(file_id),
@@ -430,7 +434,9 @@ pub async fn file_content(
     )
     .await
     .map(|response| match &reader {
-        Some(principal) => crate::delivery::counted_file(&app, principal, &attributed, response),
+        Some(principal) => {
+            crate::delivery::counted_file(&app, principal, &attributed, named.as_deref(), response)
+        }
         None => response,
     })
     .map_err(|e| {
