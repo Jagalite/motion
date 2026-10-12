@@ -1,13 +1,15 @@
 package tui
 
 import (
+	tea "charm.land/bubbletea/v2"
 	"errors"
 	"fmt"
+	"image/color"
 	"strings"
 
+	"charm.land/bubbles/v2/key"
+	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -87,7 +89,7 @@ func (m Model) frame() frame {
 // rendering agree on what is visible and focused.
 func (m *Model) sync() {
 	f := m.frame()
-	m.search.Width = max(m.searchWidth(f)-5, 1)
+	m.search.SetWidth(max(m.searchWidth(f)-5, 1))
 	switch m.kind() {
 	case kindBrowse:
 		lines, elems := m.browse(f.inner)
@@ -106,7 +108,8 @@ func (m *Model) sync() {
 			}
 		}
 		m.offset = min(max(m.offset, 0), max(len(lines)-f.body, 0))
-		m.vp.Width, m.vp.Height = f.inner, f.body
+		m.vp.SetWidth(f.inner)
+		m.vp.SetHeight(f.body)
 		m.vp.SetContent(strings.Join(lines, "\n"))
 		m.vp.SetYOffset(m.offset)
 	case kindTable:
@@ -126,7 +129,8 @@ func (m *Model) sync() {
 		m.table.SetCursor(m.tsel - m.toff)
 	case kindText:
 		follow := m.vp.AtBottom()
-		m.vp.Width, m.vp.Height = f.inner, f.body
+		m.vp.SetWidth(f.inner)
+		m.vp.SetHeight(f.body)
 		m.vp.SetContent(strings.Join(m.text(f.inner), "\n"))
 		if m.route.page == pageActivity && follow {
 			m.vp.GotoBottom()
@@ -247,7 +251,16 @@ func (m Model) sessionProblem() error {
 	return nil
 }
 
-func (m Model) View() string {
+// View declares the frame and the terminal state the console wants: the
+// alternate screen and a window title that summarises the server.
+func (m Model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = true
+	return v
+}
+
+// render draws the whole console at the terminal size.
+func (m Model) render() string {
 	w, h := m.dims()
 	if w < minWidth || h < minHeight {
 		return strings.Join(block([]string{"Motion needs a larger", "terminal."}, w, h, colorBG), "\n")
@@ -331,7 +344,7 @@ func (m Model) body(f frame) []string {
 
 func (m Model) helpPage(width int) []string {
 	h := m.help
-	h.Width = width
+	h.SetWidth(width)
 	lines := strings.Split(h.FullHelpView(fullHelp()), "\n")
 	return append(lines, "",
 		mutedStyle.Render("Tab moves between the sidebar and the page. Esc goes back."),
@@ -437,7 +450,7 @@ func (m Model) sidebar(width, height int, rail bool) []string {
 func (m Model) navLine(e navEntry, width int, rail, current, cursor bool) string {
 	marker, label := " ", mutedStyle.Bold(true)
 	icon := faintStyle
-	bg := lipgloss.Color("")
+	var bg color.Color
 	switch {
 	case current:
 		marker, label, icon, bg = accentStyle.Render("▎"), focusStyle, accentStyle, colorCurrent
@@ -456,7 +469,7 @@ func (m Model) navLine(e navEntry, width int, rail, current, cursor bool) string
 		text += "  " + label.Render(e.label)
 	}
 	text = truncate(text, width-1)
-	if bg == "" {
+	if bg == nil {
 		return text
 	}
 	return paint(text, width, bg)
@@ -504,9 +517,9 @@ func (m Model) statusbar(width int) string {
 		left = " " + m.connection() // the host is on the Server page
 	}
 	h := m.help
-	h.Width = max(width-ansi.StringWidth(left)-3, 0)
+	h.SetWidth(max(width-ansi.StringWidth(left)-3, 0))
 	right := h.ShortHelpView(m.shortHelp())
-	if h.Width < 24 {
+	if h.Width() < 24 {
 		// Too narrow for the context's shortcuts: point at the help page.
 		right = h.ShortHelpView([]key.Binding{keys.Help})
 	}

@@ -2,15 +2,16 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/progress"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/charmbracelet/bubbles/progress"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // The console polls what has no change events: diagnostics, storage and the
@@ -123,9 +124,9 @@ func (m *Model) observe(msg loaded) tea.Cmd {
 			live[j.ID] = true
 			bar, ok := m.bars[j.ID]
 			if !ok {
-				b := progress.New(progress.WithScaledGradient("#9c6b07", "#f0b429"), progress.WithoutPercentage(),
-					progress.WithFillCharacters('━', '━'), progress.WithSpringOptions(14, 1))
-				b.EmptyColor = string(colorLine)
+				b := progress.New(progress.WithColors(lipgloss.Color("#9c6b07"), lipgloss.Color("#f0b429")), progress.WithScaled(true),
+					progress.WithoutPercentage(), progress.WithFillCharacters('━', '━'), progress.WithSpringOptions(14, 1))
+				b.EmptyColor = colorLine
 				bar = &b
 				m.bars[j.ID] = bar
 			}
@@ -146,7 +147,7 @@ func (m *Model) animate(msg progress.FrameMsg) tea.Cmd {
 	var cmds []tea.Cmd
 	for _, bar := range m.bars {
 		next, cmd := bar.Update(msg)
-		*bar = next.(progress.Model)
+		*bar = next
 		cmds = append(cmds, cmd)
 	}
 	return tea.Batch(cmds...)
@@ -166,7 +167,7 @@ type tile struct {
 	note    string
 	id      string
 	series  []point
-	color   lipgloss.Color
+	color   color.Color
 	missing string
 	// relative charts span their own range (sizes); others start at zero.
 	relative bool
@@ -396,7 +397,7 @@ func (m Model) workLines(now time.Time) []string {
 		}
 		bar := faintStyle.Render(strings.Repeat("━", 20))
 		if b, ok := m.bars[j.ID]; ok {
-			b.Width = 20
+			b.SetWidth(20)
 			bar = b.View() + " " + fgStyle.Render(fmt.Sprintf("%3.0f%%", *jobProgress(jobs, j.ID)*100))
 		} else if j.Phase != "queued" {
 			bar = m.spinner.View() + " " + faintStyle.Render(strings.Repeat("·", 18))

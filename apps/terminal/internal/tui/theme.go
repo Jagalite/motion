@@ -1,10 +1,11 @@
 package tui
 
 import (
+	"image/color"
 	"strings"
 	"unicode"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	colorful "github.com/lucasb-eyer/go-colorful"
 )
@@ -64,7 +65,7 @@ func tone(id string) int {
 }
 
 // toneAt blends a tone from top (0) to bottom (1).
-func toneAt(t int, f float64) lipgloss.Color {
+func toneAt(t int, f float64) color.Color {
 	a, _ := colorful.Hex(tones[t][0])
 	b, _ := colorful.Hex(tones[t][1])
 	return lipgloss.Color(a.BlendRgb(b, f).Hex())
@@ -170,9 +171,9 @@ func pad(s string, width int) string {
 
 // backgrounds caches the escape sequence that selects each background in the
 // active color profile ("" when the terminal has no color).
-var backgrounds = map[lipgloss.Color]string{}
+var backgrounds = map[color.Color]string{}
 
-func bgSequence(c lipgloss.Color) string {
+func bgSequence(c color.Color) string {
 	if seq, ok := backgrounds[c]; ok {
 		return seq
 	}
@@ -184,7 +185,7 @@ func bgSequence(c lipgloss.Color) string {
 // paint renders one line at exactly width cells on bg. Inner styles end with
 // a full reset; the background is restored after each one, so nested styles
 // never punch holes in it.
-func paint(line string, width int, bg lipgloss.Color) string {
+func paint(line string, width int, bg color.Color) string {
 	line = pad(line, width)
 	seq := bgSequence(bg)
 	if seq == "" {
@@ -196,7 +197,7 @@ func paint(line string, width int, bg lipgloss.Color) string {
 }
 
 // block pads lines to height, each painted at width on bg.
-func block(lines []string, width, height int, bg lipgloss.Color) []string {
+func block(lines []string, width, height int, bg color.Color) []string {
 	out := make([]string, height)
 	for i := range out {
 		line := ""

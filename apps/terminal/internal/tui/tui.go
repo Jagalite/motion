@@ -19,17 +19,16 @@ import (
 	"sync"
 	"time"
 
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/table"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 	"github.com/Jagalite/motion/apps/terminal/internal/cli"
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/table"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 const (
@@ -125,11 +124,11 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 	search.Prompt = ""
 	search.Placeholder = "Search titles"
 	search.CharLimit = searchLimit
-	search.Cursor.SetMode(cursor.CursorStatic)
-	search.TextStyle = fgStyle
-	search.PlaceholderStyle = faintStyle
-	search.Cursor.Style = accentStyle
-	search.Cursor.TextStyle = fgStyle
+	styles := textinput.DefaultStyles(true)
+	styles.Focused.Text, styles.Blurred.Text = fgStyle, fgStyle
+	styles.Focused.Placeholder, styles.Blurred.Placeholder = faintStyle, faintStyle
+	styles.Cursor.Color, styles.Cursor.Blink = colorAccent, false
+	search.SetStyles(styles)
 	h := help.New()
 	h.Styles.ShortKey, h.Styles.FullKey = keyStyle, keyStyle
 	h.Styles.ShortDesc, h.Styles.FullDesc = faintStyle, mutedStyle
@@ -144,7 +143,7 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 	return Model{
 		ctx: ctx, backend: backend, server: server, incoming: incoming, openBrowser: cli.OpenBrowser,
 		cache:  &cache{slots: map[string]*slot{}},
-		search: search, help: h, table: tbl, vp: viewport.New(0, 0),
+		search: search, help: h, table: tbl, vp: viewport.New(),
 		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
 		cancelling: map[string]bool{}, stream: "connecting",
 		metrics: newHistory(), bars: map[string]*progress.Model{},
@@ -308,7 +307,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return cmd
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.key(msg)
 	case pollMsg:
 		return tea.Batch(m.poll(), pollTick())
@@ -513,7 +512,7 @@ func (m Model) navIndex() int {
 	return 0
 }
 
-func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.String() == "ctrl+c" {
 		return tea.Quit
 	}
@@ -575,7 +574,7 @@ func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
 // navKey moves through the sidebar. The page follows the highlight, so
 // moving is switching; Enter or → then hands focus to the page. Loads for a
 // page passed over quickly are superseded and cancelled like any other.
-func (m *Model) navKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) navKey(msg tea.KeyPressMsg) tea.Cmd {
 	entries := m.navEntries()
 	moved := true
 	switch {
@@ -618,20 +617,20 @@ func (m *Model) focusSearch() tea.Cmd {
 	return cmd
 }
 
-func (m *Model) searchKey(msg tea.KeyMsg) tea.Cmd {
-	switch msg.Type {
-	case tea.KeyEsc:
+func (m *Model) searchKey(msg tea.KeyPressMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
 		m.search.Blur()
 		m.focus = focusContent
 		return nil
-	case tea.KeyEnter, tea.KeyDown:
+	case "enter", "down":
 		m.search.Blur()
 		m.focus = focusContent
-		if msg.Type == tea.KeyEnter {
+		if msg.String() == "enter" {
 			return m.runSearch()
 		}
 		return nil
-	case tea.KeyTab, tea.KeyShiftTab:
+	case "tab", "shift+tab":
 		m.search.Blur()
 		m.focus, m.navSel = focusNav, m.navIndex()
 		return nil
@@ -847,7 +846,7 @@ func Run(ctx context.Context, conn *cli.Conn) error {
 	}, ch)
 	model := New(ctx, conn, conn.URL, ch)
 	model.profile = conn.Profile
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(ctx))
+	program := tea.NewProgram(model, tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return ctx.Err()

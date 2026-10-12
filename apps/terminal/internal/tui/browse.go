@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"strings"
 
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -522,7 +522,7 @@ func abs(n int) int {
 	return n
 }
 
-func (m *Model) browseKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) browseKey(msg tea.KeyPressMsg) tea.Cmd {
 	_, elems := m.browse(m.frame().inner)
 	body := m.frame().body
 	// vertical moves focus by rows; with nothing further it scrolls instead,

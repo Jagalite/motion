@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/table"
+	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/table"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -259,7 +259,7 @@ func (m Model) detail() string {
 	return ""
 }
 
-func (m *Model) tableKeyMsg(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 	page := max(m.frame().body-4, 1)
 	switch {
 	case key.Matches(msg, keys.Up):
@@ -292,7 +292,7 @@ func (m *Model) tableKeyMsg(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *Model) textKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) textKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch {
 	case key.Matches(msg, keys.Up):
 		m.vp.ScrollUp(1)
@@ -314,7 +314,7 @@ func (m *Model) textKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-func (m *Model) contentKey(msg tea.KeyMsg) tea.Cmd {
+func (m *Model) contentKey(msg tea.KeyPressMsg) tea.Cmd {
 	switch m.kind() {
 	case kindTable:
 		return m.tableKeyMsg(msg)

@@ -2,13 +2,14 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // Metric series the console charts. IDs follow the server's admin.metrics
@@ -225,7 +226,7 @@ var sparkLevels = []rune(" ▁▂▃▄▅▆▇█")
 // bucketed by time across the window so gaps read as gaps. Counts are drawn
 // from zero; relative charts (sizes) span their own range, and a flat one
 // sits mid-height rather than looking full.
-func sparkline(pts []point, now time.Time, window time.Duration, width, height int, color lipgloss.Color, relative bool) []string {
+func sparkline(pts []point, now time.Time, window time.Duration, width, height int, tint color.Color, relative bool) []string {
 	rows := make([]string, height)
 	if width <= 0 || height <= 0 {
 		return rows
@@ -256,7 +257,7 @@ func sparkline(pts []point, now time.Time, window time.Duration, width, height i
 		}
 		return 0
 	}
-	line := lipgloss.NewStyle().Foreground(color)
+	line := lipgloss.NewStyle().Foreground(tint)
 	base := lipgloss.NewStyle().Foreground(colorLine)
 	for r := 0; r < height; r++ {
 		var b strings.Builder

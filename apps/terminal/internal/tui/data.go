@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Backend is the subset of the API the interface uses; tests substitute it.

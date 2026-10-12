@@ -3,15 +3,16 @@ package tui
 import (
 	"context"
 	"fmt"
+	"github.com/charmbracelet/x/ansi"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // fake is a contract-shaped backend. Server-supplied text carries control
@@ -207,30 +208,37 @@ func update(t *testing.T, m Model, msg tea.Msg) (Model, tea.Cmd) {
 	return next.(Model), cmd
 }
 
+// keyPress is the key event a terminal sends for a named key or typed text.
+func keyPress(k string) tea.KeyPressMsg {
+	switch k {
+	case "enter":
+		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case "esc":
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
+	case "tab":
+		return tea.KeyPressMsg{Code: tea.KeyTab}
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
+	case "down":
+		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "left":
+		return tea.KeyPressMsg{Code: tea.KeyLeft}
+	case "right":
+		return tea.KeyPressMsg{Code: tea.KeyRight}
+	case "backspace":
+		return tea.KeyPressMsg{Code: tea.KeyBackspace}
+	}
+	r := []rune(k)
+	return tea.KeyPressMsg{Code: r[0], Text: k}
+}
+
+// screen is what the user reads: the frame without escape sequences.
+func screen(m Model) string { return ansi.Strip(m.View().Content) }
+
 func press(t *testing.T, m Model, keys ...string) Model {
 	t.Helper()
 	for _, k := range keys {
-		var msg tea.KeyMsg
-		switch k {
-		case "enter":
-			msg = tea.KeyMsg{Type: tea.KeyEnter}
-		case "esc":
-			msg = tea.KeyMsg{Type: tea.KeyEsc}
-		case "tab":
-			msg = tea.KeyMsg{Type: tea.KeyTab}
-		case "up":
-			msg = tea.KeyMsg{Type: tea.KeyUp}
-		case "down":
-			msg = tea.KeyMsg{Type: tea.KeyDown}
-		case "left":
-			msg = tea.KeyMsg{Type: tea.KeyLeft}
-		case "right":
-			msg = tea.KeyMsg{Type: tea.KeyRight}
-		case "backspace":
-			msg = tea.KeyMsg{Type: tea.KeyBackspace}
-		default:
-			msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
-		}
+		msg := keyPress(k)
 		var cmd tea.Cmd
 		m, cmd = update(t, m, msg)
 		m = drain(t, m, cmd)
@@ -431,7 +439,7 @@ func TestEveryPageFitsTheTerminalAtEverySize(t *testing.T) {
 					m = press(t, m, "tab")
 				}
 				m, _ = update(t, m, tea.WindowSizeMsg{Width: size[0], Height: size[1]})
-				view := m.View()
+				view := m.View().Content
 				lines := strings.Split(view, "\n")
 				if len(lines) != size[1] {
 					t.Fatalf("%v %v: %d lines", size, r, len(lines))
@@ -476,11 +484,11 @@ func TestGridFocusMovesSpatiallyAndStaysVisible(t *testing.T) {
 	for range 20 {
 		m = press(t, m, "down")
 	}
-	if !strings.Contains(m.View(), "Film 039") && !strings.Contains(m.View(), fmt.Sprintf("Film %03d", m.sel)) {
-		t.Fatalf("focused title %d scrolled out of view:\n%s", m.sel, m.View())
+	if !strings.Contains(screen(m), "Film 039") && !strings.Contains(screen(m), fmt.Sprintf("Film %03d", m.sel)) {
+		t.Fatalf("focused title %d scrolled out of view:\n%s", m.sel, screen(m))
 	}
 	m = press(t, m, "v")
-	if !m.list || !strings.Contains(m.View(), "▌") {
+	if !m.list || !strings.Contains(screen(m), "▌") {
 		t.Fatal("list layout did not mark focus")
 	}
 	m = press(t, m, "g", "left")
@@ -497,7 +505,7 @@ func TestOpeningATitleAndGoingBackRestoresFocus(t *testing.T) {
 	if m.route != (route{page: pageItem, id: "film002"}) {
 		t.Fatalf("opened %+v", m.route)
 	}
-	view := m.View()
+	view := screen(m)
 	for _, want := range []string{"Arrival", "Identification needs review", "Theatrical", "2:00:00", "Stopped at 1:00:00.", "Director's cut", "Viewing history is unavailable.", "4K", "Entries", "Episode One", "Offline", "Playback is unavailable"} {
 		if want == "Playback is unavailable" {
 			if strings.Contains(view, "Playback is unavailable.") {
@@ -520,7 +528,7 @@ func TestIncompleteItemIsNotShownAsComplete(t *testing.T) {
 	cmd := m.open(route{page: pageItem, id: "film001"})
 	m.sync()
 	m = drain(t, m, cmd)
-	if v := m.View(); !strings.Contains(v, "Too much to show") || strings.Contains(v, "Theatrical") {
+	if v := screen(m); !strings.Contains(v, "Too much to show") || strings.Contains(v, "Theatrical") {
 		t.Fatalf("partial aggregate shown:\n%s", v)
 	}
 }
@@ -531,7 +539,7 @@ func TestSearchFocusUnicodeDebounceAndStaleReply(t *testing.T) {
 	if m.focus != focusSearch || m.route.page != pageSearch {
 		t.Fatal("search did not take focus")
 	}
-	m, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q猫")})
+	m, cmd := update(t, m, keyPress("q猫"))
 	if cmd == nil || m.search.Value() != "q猫" {
 		t.Fatal("typing did not schedule a search")
 	}
@@ -541,9 +549,9 @@ func TestSearchFocusUnicodeDebounceAndStaleReply(t *testing.T) {
 		t.Fatalf("backspace split Unicode: %q", m.search.Value())
 	}
 	old := m.load(keySearch)
-	m, _ = update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" new")})
+	m, _ = update(t, m, keyPress(" new"))
 	due := searchDue{seq: m.searchSeq}
-	m, cmd = update(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd = update(t, m, keyPress("enter"))
 	m = drain(t, m, cmd)
 	m, cmd = update(t, m, due) // the debounce firing after Enter repeats nothing
 	if cmd != nil {
@@ -554,7 +562,7 @@ func TestSearchFocusUnicodeDebounceAndStaleReply(t *testing.T) {
 	if m.focus != focusContent || len(p.items) != 1 || p.items[0].ID != "q new" {
 		t.Fatalf("stale query replaced results: %+v", p)
 	}
-	if !strings.Contains(m.View(), "Results for “q new”") {
+	if !strings.Contains(screen(m), "Results for “q new”") {
 		t.Fatal("results heading missing")
 	}
 	m, _ = update(t, m, resyncMsg{})
@@ -604,7 +612,7 @@ func TestContinueWatchingFollowsTheChosenProfile(t *testing.T) {
 	f := &fake{profiles: 2, permissions: []string{api.PermPlaybackRequest}, features: []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}}
 	m := start(t, f, 120, 40)
 	m = goTo(t, m, route{page: pageHome})
-	if v := m.View(); !strings.Contains(v, "Resume at 2:30 · 7:30 left") {
+	if v := screen(m); !strings.Contains(v, "Resume at 2:30 · 7:30 left") {
 		t.Fatalf("continue watching missing:\n%s", v)
 	}
 	m = goTo(t, m, route{page: pageProfiles})
@@ -628,7 +636,7 @@ func TestJobCancellationAsksFirstAndSendsOneKeyedRequest(t *testing.T) {
 	if m.confirm != "job2" || len(f.cancelled) != 0 {
 		t.Fatalf("cancel did not ask first: %q %v", m.confirm, f.cancelled)
 	}
-	if !strings.Contains(m.View(), "Cancel this job?") {
+	if !strings.Contains(screen(m), "Cancel this job?") {
 		t.Fatal("confirmation not shown")
 	}
 	m = press(t, m, "n", "c", "y")
@@ -641,19 +649,19 @@ func TestJobCancellationAsksFirstAndSendsOneKeyedRequest(t *testing.T) {
 
 func TestPermissionGatedScreensAppearOnlyWhenAllowed(t *testing.T) {
 	m := start(t, &fake{}, 120, 40)
-	v := m.View()
+	v := screen(m)
 	if strings.Contains(v, "Devices") || strings.Contains(v, "Sources") || !strings.Contains(v, "Activity") || !strings.Contains(v, "need the system:admin permission") {
 		t.Fatalf("navigation ignores permissions:\n%s", v)
 	}
 	m = start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 120, 40)
-	if v := m.View(); !strings.Contains(v, "Devices") || !strings.Contains(v, "Sources") || !strings.Contains(v, "JOBS") {
+	if v := screen(m); !strings.Contains(v, "Devices") || !strings.Contains(v, "Sources") || !strings.Contains(v, "JOBS") {
 		t.Fatalf("administrator screens missing:\n%s", v)
 	}
 }
 
 func TestUnreachableServerShowsOfflineState(t *testing.T) {
 	m := start(t, &fake{meErr: &api.UnavailableError{Err: fmt.Errorf("connection refused")}}, 100, 30)
-	v := m.View()
+	v := screen(m)
 	if !strings.Contains(v, "Server unavailable") || !strings.Contains(v, "○ Offline") || !strings.Contains(v, "to try again") {
 		t.Fatalf("offline state missing:\n%s", v)
 	}
@@ -662,14 +670,14 @@ func TestUnreachableServerShowsOfflineState(t *testing.T) {
 func TestNarrowTerminalKeepsLocationAndNavigation(t *testing.T) {
 	m := start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 24, 10)
 	m = goTo(t, m, route{page: pageServer})
-	if !strings.Contains(m.View(), "Server") {
+	if !strings.Contains(screen(m), "Server") {
 		t.Fatal("active screen clipped out of navigation")
 	}
-	if !strings.Contains(m.View(), "? help") {
+	if !strings.Contains(screen(m), "? help") {
 		t.Fatal("narrow status bar lost the help shortcut")
 	}
 	m = press(t, m, "tab")
-	if v := m.View(); !strings.Contains(v, "▎ ◈  Server") || !strings.Contains(v, "Overview") || strings.Contains(v, "Uptime") {
+	if v := screen(m); !strings.Contains(v, "▎ ◈  Server") || !strings.Contains(v, "Overview") || strings.Contains(v, "Uptime") {
 		t.Fatalf("narrow sidebar not shown:\n%s", v)
 	}
 }
@@ -762,7 +770,7 @@ func TestDropAfterPublishedResyncSchedulesAnother(t *testing.T) {
 func TestHelpPageListsShortcutsAndQuitStillQuits(t *testing.T) {
 	m := start(t, &fake{}, 100, 30)
 	m = press(t, m, "?")
-	if v := m.View(); !strings.Contains(v, "Keyboard shortcuts") || !strings.Contains(v, "grid/list") {
+	if v := screen(m); !strings.Contains(v, "Keyboard shortcuts") || !strings.Contains(v, "grid/list") {
 		t.Fatalf("help page missing:\n%s", v)
 	}
 	m = press(t, m, "esc")
@@ -770,7 +778,7 @@ func TestHelpPageListsShortcutsAndQuitStillQuits(t *testing.T) {
 		t.Fatal("esc did not close help")
 	}
 	m = press(t, m, "?")
-	if _, cmd := update(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}}); cmd == nil {
+	if _, cmd := update(t, m, keyPress("q")); cmd == nil {
 		t.Fatal("q did not quit from the help page")
 	} else if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Fatal("q did not quit from the help page")
@@ -780,12 +788,12 @@ func TestHelpPageListsShortcutsAndQuitStillQuits(t *testing.T) {
 func TestRevokedAccessRemovesWhatWasShown(t *testing.T) {
 	f := &fake{}
 	m := goTo(t, start(t, f, 120, 40), route{page: pageHome})
-	if !strings.Contains(m.View(), "Movies") {
+	if !strings.Contains(screen(m), "Movies") {
 		t.Fatal("libraries not shown")
 	}
 	f.libErr = &api.Problem{Status: 403, Code: "forbidden", Detail: "revoked"}
 	m = press(t, m, "r")
-	if v := m.View(); strings.Contains(v, "Movies") || !strings.Contains(v, "You don't have access") {
+	if v := screen(m); strings.Contains(v, "Movies") || !strings.Contains(v, "You don't have access") {
 		t.Fatalf("revoked libraries still shown:\n%s", v)
 	}
 }
@@ -794,17 +802,17 @@ func TestTableSelectionStaysVisibleAndNarrowRowsKeepEveryField(t *testing.T) {
 	m := start(t, &fake{jobs: 60}, 100, 24)
 	m = goTo(t, m, route{page: pageProcessing})
 	m = press(t, m, "G")
-	if v := m.View(); m.selectedID() != "job-059" || !strings.Contains(v, "job-059") || !strings.Contains(v, "of 60") {
+	if v := screen(m); m.selectedID() != "job-059" || !strings.Contains(v, "job-059") || !strings.Contains(v, "of 60") {
 		t.Fatalf("last job not visible (%s):\n%s", m.selectedID(), v)
 	}
 	for range 30 {
 		m = press(t, m, "up")
 	}
-	if v := m.View(); !strings.Contains(v, "job-029") {
+	if v := screen(m); !strings.Contains(v, "job-029") {
 		t.Fatalf("selection scrolled away:\n%s", v)
 	}
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: 44, Height: 20})
-	if v := m.View(); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by d1") {
+	if v := screen(m); !strings.Contains(v, "job-029") || !strings.Contains(v, "requested by d1") {
 		t.Fatalf("narrow table lost the selected job's fields:\n%s", v)
 	}
 }
@@ -821,7 +829,7 @@ func TestTypingAbandonsTheSearchInFlight(t *testing.T) {
 	}
 	m, cmd := update(t, m, searchDue{seq: m.searchSeq})
 	m = drain(t, m, cmd)
-	if p, _ := data[searchPage](m, keySearch); p.query != "ab" || !strings.Contains(m.View(), "Results for “ab”") {
+	if p, _ := data[searchPage](m, keySearch); p.query != "ab" || !strings.Contains(screen(m), "Results for “ab”") {
 		t.Fatalf("current text not searched: %+v", p)
 	}
 }
@@ -834,7 +842,7 @@ func TestSwitchingProfileHidesThePreviousProfilesHistory(t *testing.T) {
 	m.profile = "p0001"
 	cmd := m.viewerChanged() // the reply has not arrived yet
 	m.sync()
-	if _, ok := data[continuePage](m, keyContinue); ok || strings.Contains(m.View(), "Resume at") {
+	if _, ok := data[continuePage](m, keyContinue); ok || strings.Contains(screen(m), "Resume at") {
 		t.Fatal("previous profile's history shown under the new profile")
 	}
 	m = drain(t, m, cmd)
@@ -872,7 +880,7 @@ func TestRejectedCredentialClearsEverythingShown(t *testing.T) {
 	for _, via := range []string{"stream", "load"} {
 		f := &fake{}
 		m := start(t, f, 120, 40)
-		if !strings.Contains(m.View(), "Movies") {
+		if !strings.Contains(screen(m), "Movies") {
 			t.Fatal("libraries not shown")
 		}
 		rejected := &api.Problem{Status: 401, Code: "authentication_required"}
@@ -882,7 +890,7 @@ func TestRejectedCredentialClearsEverythingShown(t *testing.T) {
 			f.libErr = rejected
 			m = drain(t, m, m.load(keyLibraries))
 		}
-		v := m.View()
+		v := screen(m)
 		if strings.Contains(v, "Movies") || strings.Contains(v, "Continue watching") || !strings.Contains(v, "Sign in to Motion") {
 			t.Fatalf("%s: cached data survived a rejected credential:\n%s", via, v)
 		}
@@ -892,11 +900,11 @@ func TestRejectedCredentialClearsEverythingShown(t *testing.T) {
 func TestEditedSearchNeverShowsOlderResults(t *testing.T) {
 	m := start(t, &fake{}, 100, 30)
 	m = press(t, m, "/", "o", "l", "d", "enter")
-	if !strings.Contains(m.View(), "Results for “old”") {
+	if !strings.Contains(screen(m), "Results for “old”") {
 		t.Fatal("first search")
 	}
 	m = press(t, m, "/", "x") // debounce pending
-	if v := m.View(); strings.Contains(v, "1 title") || !strings.Contains(v, "Searching") {
+	if v := screen(m); strings.Contains(v, "1 title") || !strings.Contains(v, "Searching") {
 		t.Fatalf("old results shown under new text:\n%s", v)
 	}
 }
@@ -904,7 +912,7 @@ func TestEditedSearchNeverShowsOlderResults(t *testing.T) {
 func TestNarrowScanDetailRepeatsDroppedColumns(t *testing.T) {
 	m := start(t, &fake{permissions: []string{api.PermSourcesManage}}, 44, 20)
 	m = goTo(t, m, route{page: pageScans})
-	if v := m.View(); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0 files") {
+	if v := screen(m); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0 files") {
 		t.Fatalf("scan detail lost dropped fields:\n%s", v)
 	}
 }
@@ -924,7 +932,7 @@ func TestResetRequeriesTheDefaultProfilesHistory(t *testing.T) {
 	m := goTo(t, start(t, &fake{}, 120, 40), route{page: pageHome})
 	m, cmd := update(t, m, eventMsg(api.Event{Kind: "reset", ResourceType: "stream"}))
 	m = drain(t, m, cmd)
-	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" || strings.Contains(m.View(), "Choose a profile") {
+	if p, _ := data[continuePage](m, keyContinue); p.profile != "p0000" || strings.Contains(screen(m), "Choose a profile") {
 		t.Fatalf("continue watching lost its profile after a reset: %+v", p)
 	}
 }
@@ -932,7 +940,7 @@ func TestResetRequeriesTheDefaultProfilesHistory(t *testing.T) {
 func TestRejectedActionSignsOut(t *testing.T) {
 	m := start(t, &fake{}, 120, 40)
 	m, _ = update(t, m, launchDone{err: &api.Problem{Status: 401}})
-	if v := m.View(); strings.Contains(v, "Movies") || !strings.Contains(v, "Sign in to Motion") {
+	if v := screen(m); strings.Contains(v, "Movies") || !strings.Contains(v, "Sign in to Motion") {
 		t.Fatalf("rejected action left views:\n%s", v)
 	}
 }
@@ -940,7 +948,7 @@ func TestRejectedActionSignsOut(t *testing.T) {
 func TestCappedTablesSayTheyArePartial(t *testing.T) {
 	m := start(t, &fake{jobs: listCap + 50}, 100, 24)
 	m = goTo(t, m, route{page: pageProcessing})
-	if v := m.View(); !strings.Contains(v, "first 2000 jobs") || !strings.Contains(v, "only the first 2000 are shown") {
+	if v := screen(m); !strings.Contains(v, "first 2000 jobs") || !strings.Contains(v, "only the first 2000 are shown") {
 		t.Fatalf("truncation not shown:\n%s", v)
 	}
 }
@@ -975,13 +983,13 @@ func TestOverviewPollsOnlyForAdministrators(t *testing.T) {
 	if f.diagCalls != 2 {
 		t.Fatalf("diagnostics polls: %d", f.diagCalls)
 	}
-	v := m.View()
+	v := screen(m)
 	for _, want := range []string{"JOBS", "1 running", "2 queued", "DELIVERIES", "FREE SPACE", "210 GB", "aren't reported by this server", "Sampled while this window is open", "Recent failures", "Work in progress"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("overview lacks %q:\n%s", want, v)
 		}
 	}
-	if strings.Contains(v, "\x1b[2J") {
+	if strings.Contains(m.View().Content, "\x1b[2J") {
 		t.Fatal("unsafe text")
 	}
 	m = goTo(t, m, route{page: pageCatalog})
@@ -1005,7 +1013,7 @@ func TestProcessMetricsBecomeRates(t *testing.T) {
 	if got := cpu[len(cpu)-1].v * 100; got < 80 || got > 101 {
 		t.Fatalf("cpu %.1f%%", got)
 	}
-	if v := m.View(); !strings.Contains(v, "CPU") || !strings.Contains(v, "peak") || !strings.Contains(v, "184 MB") || strings.Contains(v, "Not reported") {
+	if v := screen(m); !strings.Contains(v, "CPU") || !strings.Contains(v, "peak") || !strings.Contains(v, "184 MB") || strings.Contains(v, "Not reported") {
 		t.Fatalf("process tiles:\n%s", v)
 	}
 }
@@ -1019,7 +1027,7 @@ func TestServerHistoryIsUsedWhenOffered(t *testing.T) {
 	if r := m.metrics.values(mRequests, time.Now(), time.Hour); len(r) != 30 || r[0].v != 1 {
 		t.Fatalf("requests rate from server history: %v", r)
 	}
-	if !strings.Contains(m.View(), "History from the server") {
+	if !strings.Contains(screen(m), "History from the server") {
 		t.Fatal("source not labelled")
 	}
 	m = press(t, m, "]")
@@ -1072,7 +1080,7 @@ func TestSignOutForgetsMetrics(t *testing.T) {
 	f := &fake{permissions: []string{api.PermSystemAdmin}}
 	m := pollAgain(t, start(t, f, 120, 40))
 	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
-	if len(m.metrics.series) != 0 || strings.Contains(m.View(), "JOBS") {
+	if len(m.metrics.series) != 0 || strings.Contains(screen(m), "JOBS") {
 		t.Fatal("metrics survived sign-out")
 	}
 }
@@ -1080,19 +1088,19 @@ func TestSignOutForgetsMetrics(t *testing.T) {
 func TestLosingAdminAndNullFieldsHideMetrics(t *testing.T) {
 	f := &fake{permissions: []string{api.PermSystemAdmin}}
 	m := pollAgain(t, start(t, f, 140, 60))
-	if !strings.Contains(m.View(), "210 GB") || !strings.Contains(m.View(), "Recent failures") {
+	if !strings.Contains(screen(m), "210 GB") || !strings.Contains(screen(m), "Recent failures") {
 		t.Fatal("admin overview")
 	}
 	// The server stops reporting free space: it is shown as unknown.
 	m.metrics.observeStorage(time.Now().Add(time.Second), api.StorageReport{DatabaseBytes: "1", AssetBytes: "1", TemporaryBytes: "0", ReservedBytes: "0"})
 	m.sync()
-	if v := m.View(); strings.Contains(v, "210 GB") || !strings.Contains(v, "Free space unknown") {
+	if v := screen(m); strings.Contains(v, "210 GB") || !strings.Contains(v, "Free space unknown") {
 		t.Fatalf("stale free space shown:\n%s", v)
 	}
 	// Permission withdrawn on the next session refresh.
 	f.permissions = []string{api.PermCatalogRead}
 	m = drain(t, m, m.load(keySession))
-	if v := m.View(); strings.Contains(v, "JOBS") || strings.Contains(v, "Recent failures") || len(m.metrics.series) != 0 {
+	if v := screen(m); strings.Contains(v, "JOBS") || strings.Contains(v, "Recent failures") || len(m.metrics.series) != 0 {
 		t.Fatalf("admin metrics survived losing system:admin:\n%s", v)
 	}
 }
@@ -1102,7 +1110,7 @@ func TestFailedPollIsNotShownAsFresh(t *testing.T) {
 	m := pollAgain(t, start(t, f, 140, 60))
 	s := m.cache.slots[keyDiagnostics]
 	m, _ = update(t, m, loaded{key: keyDiagnostics, request: s.request, err: &api.UnavailableError{Err: fmt.Errorf("refused")}})
-	if v := m.View(); !strings.Contains(v, "couldn't refresh") {
+	if v := screen(m); !strings.Contains(v, "couldn't refresh") {
 		t.Fatalf("failed refresh not reported:\n%s", v)
 	}
 }
@@ -1110,17 +1118,17 @@ func TestFailedPollIsNotShownAsFresh(t *testing.T) {
 func TestNullProcessFieldsAndFailedStoragePollsAreShown(t *testing.T) {
 	f := &fake{permissions: []string{api.PermSystemAdmin}, process: true}
 	m := pollAgain(t, pollAgain(t, start(t, f, 140, 60)))
-	if !strings.Contains(m.View(), "peak") {
+	if !strings.Contains(screen(m), "peak") {
 		t.Fatal("cpu rate missing")
 	}
 	f.process = false // the server stops reporting process metrics
 	m = pollAgain(t, m)
-	if v := m.View(); strings.Contains(v, "peak") || !strings.Contains(v, "aren't reported") {
+	if v := screen(m); strings.Contains(v, "peak") || !strings.Contains(v, "aren't reported") {
 		t.Fatalf("stale rates shown:\n%s", v)
 	}
 	s := m.cache.slots[keyStorage]
 	m, _ = update(t, m, loaded{key: keyStorage, request: s.request, err: &api.UnavailableError{Err: fmt.Errorf("refused")}})
-	if v := m.View(); !strings.Contains(v, "storage couldn't refresh") {
+	if v := screen(m); !strings.Contains(v, "storage couldn't refresh") {
 		t.Fatalf("storage failure hidden:\n%s", v)
 	}
 }
@@ -1131,7 +1139,7 @@ func TestSidebarSwitchesPagesAsTheHighlightMoves(t *testing.T) {
 	if m.route.page != pageProcessing || m.focus != focusNav {
 		t.Fatalf("moving did not switch: %+v focus %v", m.route, m.focus)
 	}
-	if !strings.Contains(m.View(), "Processing  2 jobs") {
+	if !strings.Contains(screen(m), "Processing  2 jobs") {
 		t.Fatal("processing page not shown")
 	}
 	m = press(t, m, "down", "up")
