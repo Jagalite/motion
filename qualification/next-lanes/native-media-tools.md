@@ -72,7 +72,7 @@ filter loads font attachments of the file it reads). No Fontconfig, no bundled f
 | FFmpeg | 8.0, `b2751fcc…` (unchanged) | GPL build | yes |
 | x264 | `c24e06c`, `090d730e…` (unchanged) | GPL-2.0+ | static |
 | zimg | 3.0.6 tag → commit `f819b14`, `4dc9faba…` | WTFPL | static |
-| FreeType | 2.14.3, `36bc4f1c…` (GPG: Werner Lemberg) | FTL or GPL-2.0+ | static |
+| FreeType | 2.14.3, `36bc4f1c…` (GPG: Werner Lemberg) | FTL or GPL-2.0+; BDF/PCF drivers and `fthash` carry MIT-style notices (shipped) | static |
 | FriBidi | 1.0.17, `6949dcde…` (= GitHub release digest) | LGPL-2.1+ | static |
 | HarfBuzz | 14.6.0, `d07a0073…` (= GitHub release digest) | Old MIT (+ `src/ms-use/COPYING`) | static |
 | libass | 0.17.5, `2dca25c0…` (= GitHub release digest) | ISC | static |
@@ -128,11 +128,13 @@ apply to the new FFmpeg bytes.
   output is probed as `yuv420p` bt709/bt709/bt709/tv.
 - Negative control: retagging the same PQ fixture as BT.709 leaves the
   highlight >40 codes too dark and dim detail >20 codes too bright.
-- HLG bands (BT.2100 OETF code values): black stays 16, peak scene light
-  reaches SDR white (235 ±2.5), output is monotonic and neutral, and stays
-  within 6 codes of the HLG signal, which matches HLG's designed SDR
-  compatibility. Unlike PQ, retagged HLG is therefore close to correct, so
-  this test does not distinguish retagging from a tone map.
+- HLG bands at scene light 0.01/0.1/0.5/1 (BT.2100 OETF code values) match an
+  independent oracle (inverse OETF, reference OOTF for a 1000-nit display with
+  system gamma 1.2, Hable, BT.1886) within ±1.5 codes: measured 55/132/211/235
+  against 54.8/131.6/211.4/235.0. HLG is close to SDR by design, so the test also
+  asserts that an unconverted pass-through would fail that tolerance (verified:
+  an identity graph fails at 135.25 against 131.6). Decoding the same codes as
+  PQ must differ by more than 20 codes.
 - libass drawing (`{\p1}` rectangle, font-independent) appears only during its
   event, at its position; a +1 s offset moves it by exactly 1 s; `si=1`
   renders the second of two same-language embedded tracks, not the first.
@@ -189,4 +191,17 @@ font-attachment fixtures, physical HDR/SDR display checks.
 
 ## 7. Review
 
-_pending: GPT-6.1 Sol review of the implementation commit._
+GPT-6.1 Sol (high effort) reviewed `eb534df`. It confirmed the artifact hashes
+match the receipt and all five required filters are present. Three findings,
+all accepted and fixed in the follow-up commit:
+
+1. P1: FreeType's compiled BDF/PCF drivers and `src/base/fthash.c` carry
+   separate copyright/permission notices that must ship. These are now in the
+   lock's FreeType `notices`, so packaging copies them (and fails if missing).
+2. P2: a relative `MOTION_MEDIA_TOOLS` broke the suite because subprocesses run
+   in temporary directories. The path is now resolved at import, and the suite
+   passes with the relative path.
+3. P2: the HLG assertions passed when tone mapping was removed (an identity
+   graph gave 16/54/135.25/235). They were replaced by the BT.2100 oracle
+   above, a pass-through discrimination assertion and a PQ-decoding negative
+   control. Removing the conversion now fails the test.

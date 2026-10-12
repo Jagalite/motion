@@ -13,7 +13,8 @@ import subprocess
 import tempfile
 import unittest
 
-TOOLS = os.environ.get('MOTION_MEDIA_TOOLS')
+# Resolved now: subprocesses run inside temporary fixture directories.
+TOOLS = os.environ.get('MOTION_MEDIA_TOOLS') and str(Path(os.environ['MOTION_MEDIA_TOOLS']).resolve())
 WIDTH, HEIGHT, BAND = 256, 64, 64
 # Patch luminances in cd/m2: black, dim, diffuse white and a 1000-nit highlight.
 NITS = (0, 10, 100, 1000)
@@ -60,6 +61,26 @@ def expected_sdr_luma(nits):
     signal = nits / REFERENCE_WHITE
     linear = 0 if signal == 0 else hable(signal) / hable(peak)
     return 16 + 219 * linear ** (1 / 2.4)
+
+
+def hlg_code(scene):
+    """BT.2100 HLG OETF of a scene-light fraction as a 10-bit limited code value."""
+    a = 0.17883277
+    b, c = 1 - 4 * a, 0.5 - a * math.log(4 * a)
+    signal = math.sqrt(3 * scene) if scene <= 1 / 12 else a * math.log(12 * scene - b) + c
+    return round(64 + 876 * signal)
+
+
+def expected_hlg_sdr_luma(scene):
+    """Independent oracle: BT.2100 HLG reference OOTF for a 1000-nit display
+    (system gamma 1.2; neutral input, so luminance equals each channel), then
+    the same Hable map and BT.1886 encoding as PQ. Uses the quantized code."""
+    a = 0.17883277
+    b, c = 1 - 4 * a, 0.5 - a * math.log(4 * a)
+    signal = (hlg_code(scene) - 64) / 876
+    linear = signal * signal / 3 if signal <= 0.5 else (math.exp((signal - c) / a) + b) / 12
+    nits = PEAK_NITS * linear ** 1.2
+    return 16 + 219 * (hable(nits / REFERENCE_WHITE) / hable(PEAK_NITS / REFERENCE_WHITE)) ** (1 / 2.4)
 
 
 def probe(path):
@@ -149,34 +170,36 @@ class MediaTransformTests(unittest.TestCase):
         self.assertLess(lumas[3], expected_sdr_luma(1000) - 40)
         self.assertLess(lumas[2], expected_sdr_luma(100) - 15)
 
-    def test_hlg_route_reaches_sdr_white_and_stays_sdr_compatible(self):
-        raw = self.work / 'hlg.yuv'
-        # HLG code values from the BT.2100 OETF at fixed scene-light fractions.
-        def hlg(e):
-            a, b = 0.17883277, 1 - 4 * 0.17883277
-            c = 0.5 - a * math.log(4 * a)
-            signal = math.sqrt(3 * e) if e <= 1 / 12 else a * math.log(12 * e - b) + c
-            return round(64 + 876 * signal)
-        codes = [hlg(e) for e in (0, 0.01, 0.1, 1)]
+    def tone_map_codes(self, codes, transfer):
+        """Tone-map neutral 10-bit bands with the given code values."""
+        raw = self.work / f'{transfer}.yuv'
         row = b''.join(code.to_bytes(2, 'little') * BAND for code in codes)
         chroma = (512).to_bytes(2, 'little') * (WIDTH // 2 * HEIGHT // 2)
         raw.write_bytes(row * HEIGHT + chroma * 2)
-        output = self.work / 'hlg-sdr.mp4'
+        output = self.work / f'{transfer}-sdr.mp4'
         self.ffmpeg('-f', 'rawvideo', '-pixel_format', 'yuv420p10le', '-video_size', f'{WIDTH}x{HEIGHT}',
                     '-framerate', '24', '-i', raw.name, '-frames:v', '2',
-                    '-vf', tone_map_filter('arib-std-b67'), '-c:v', 'libx264', '-qp', '0', output.name)
-        lumas, chromas = self.band_means(output)
-        self.assertAlmostEqual(lumas[0], 16, delta=1.5)
-        self.assertEqual(lumas, sorted(lumas))
-        self.assertAlmostEqual(lumas[3], 235, delta=2.5)
+                    '-vf', tone_map_filter(transfer), '-c:v', 'libx264', '-qp', '0', output.name)
+        return self.band_means(output)
+
+    def test_hlg_tone_map_matches_bt2100_display_oracle(self):
+        scene = (0.01, 0.1, 0.5, 1)
+        codes = [hlg_code(e) for e in scene]
+        lumas, chromas = self.tone_map_codes(codes, 'arib-std-b67')
+        expected = [expected_hlg_sdr_luma(e) for e in scene]
+        for luma, value in zip(lumas, expected):
+            self.assertAlmostEqual(luma, value, delta=1.5)
         for u, v in chromas:
             self.assertAlmostEqual(u, 128, delta=1.5)
             self.assertAlmostEqual(v, 128, delta=1.5)
-        # HLG is designed to be SDR-compatible: with a 1000-nit nominal peak the
-        # mapped SDR luma stays close to the HLG signal itself (unlike PQ).
-        signal = [16 + 219 * (code - 64) / 876 for code in codes]
-        for luma, expected in zip(lumas, signal):
-            self.assertAlmostEqual(luma, expected, delta=6)
+        # HLG is close to SDR by design, so the oracle tolerance must still
+        # reject passing the HLG signal through unconverted.
+        passthrough = [16 + 219 * (code - 64) / 876 for code in codes]
+        self.assertTrue(any(abs(a - b) > 3 for a, b in zip(passthrough, expected)))
+        # The declared input transfer drives linearization: the same codes
+        # decoded as PQ are far from the HLG result.
+        as_pq, _ = self.tone_map_codes(codes, 'smpte2084')
+        self.assertGreater(max(abs(a - b) for a, b in zip(as_pq, lumas)), 20)
 
     # libass drawings ({\p1}) render exact rectangles without depending on fonts.
     ASS_HEADER = ('[Script Info]\nScriptType: v4.00+\nPlayResX: 256\nPlayResY: 64\n\n'

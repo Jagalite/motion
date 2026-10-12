@@ -50,7 +50,10 @@
     "notices": [
       "LICENSE.TXT",
       "docs/FTL.TXT",
-      "docs/GPLv2.TXT"
+      "docs/GPLv2.TXT",
+      "src/bdf/README",
+      "src/pcf/README",
+      "src/base/fthash.c"
     ]
   },
   "fribidi": {
