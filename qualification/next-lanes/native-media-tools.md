@@ -1,7 +1,7 @@
 # Lane N2 — native-tool support and remaining playback transforms
 
 Plan: `MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md` section 11.3.
-Worktree `/Volumes/seed1/Projects/motion-native-media-tools`, branch
+Worktree `motion-native-media-tools` (section 11.1 worktree root), branch
 `native-media-tools`, started from `origin/main` `c6d6e26` (2026-10-11).
 
 **Status: tool-enablement slice.** The packaged FFmpeg can now perform the
@@ -15,7 +15,7 @@ as described under "Handoff" below. Nothing here implies HDR or subtitle parity.
 | Area | Fact | Where |
 |---|---|---|
 | Bundled FFmpeg | 8.0 + static x264, `--disable-autodetect`; has `tonemap`, `overlay`, `scale_vt`, `colorspace`; **no `zscale` (zimg), no `subtitles`/`ass` (libass)** | `scripts/build_media_tools.py`; measured with `ffmpeg -filters` on the integration-release build |
-| Homebrew FFmpeg on the build host | also lacks `zscale` and libass | `/opt/homebrew/bin/ffmpeg -filters` |
+| Homebrew FFmpeg on the build host | also lacks `zscale` and libass | `ffmpeg -filters` (Homebrew 8.x) |
 | Tool location | `processing.ffmpeg` / `ffprobe` config; packaged app uses `Resources/tools/` | `src/config.rs:88-124` |
 | Capability probing | none for filters; only a cached VideoToolbox trial encode; v2 `/processing/capabilities` hardcodes `filters:["scale"]` | `src/processing.rs:998-1031`, `src/v2/processing.rs:102-190` |
 | HDR facts probed | only `color_transfer` and `pix_fmt`; no primaries, matrix, range, mastering/CLL or Dolby Vision side data | `src/scan.rs:306,370-371` |
@@ -74,8 +74,8 @@ filter loads font attachments of the file it reads). No Fontconfig, no bundled f
 | zimg | 3.0.6 tag → commit `f819b14`, `4dc9faba…` | WTFPL | static |
 | FreeType | 2.14.3, `36bc4f1c…` (GPG: Werner Lemberg) | FTL or GPL-2.0+; BDF/PCF drivers and `fthash` carry MIT-style notices (shipped) | static |
 | FriBidi | 1.0.17, `6949dcde…` (= GitHub release digest) | LGPL-2.1+ | static |
-| HarfBuzz | 14.6.0, `d07a0073…` (= GitHub release digest) | Old MIT (+ `src/ms-use/COPYING`) | static |
-| libass | 0.17.5, `2dca25c0…` (= GitHub release digest) | ISC | static |
+| HarfBuzz | 14.6.0, `d07a0073…` (= GitHub release digest) | Old MIT (+ `src/ms-use/COPYING`, ISC-style `src/hb-ucd.cc` notice) | static |
+| libass | 0.17.5, `2dca25c0…` (= GitHub release digest) | ISC (+ UC/Sun/Oshmyan notice in `libass/ass_strtod.c`) | static |
 | GNU m4 / autoconf / automake / libtool | 1.4.21 / 2.73 / 1.19 / 2.6.2 (GPG-verified) | GPL | build-only (zimg `autogen.sh`); sources in companion |
 | CMake (HarfBuzz) | host tool, version recorded in the receipt | — | build-only, not pinned |
 
@@ -127,7 +127,9 @@ apply to the new FFmpeg bytes.
   16/73/151/235 against 16.0/72.6/150.9/235.0. Chroma stays neutral and the
   output is probed as `yuv420p` bt709/bt709/bt709/tv.
 - Negative control: retagging the same PQ fixture as BT.709 leaves the
-  highlight >40 codes too dark and dim detail >20 codes too bright.
+  1000-nit highlight >40 codes too dark (measured 181 vs 235) and the 100-nit
+  diffuse white >15 codes too dark (127.25 vs 150.9); the 10-nit patch is only
+  about 9 codes too bright and is not asserted.
 - HLG bands at scene light 0.01/0.1/0.5/1 (BT.2100 OETF code values) match an
   independent oracle (inverse OETF, reference OOTF for a 1000-nit display with
   system gamma 1.2, Hable, BT.1886) within ±1.5 codes: measured 55/132/211/235
@@ -205,3 +207,22 @@ all accepted and fixed in the follow-up commit:
    graph gave 16/54/135.25/235). They were replaced by the BT.2100 oracle
    above, a pass-through discrimination assertion and a PQ-decoding negative
    control. Removing the conversion now fails the test.
+
+GPT-6.1 Sol re-reviewed `ce9accf` and verified all three fixes. It raised three
+new findings, all accepted and fixed:
+
+1. P1: the ledger contained absolute local paths, which `check_publication`
+   rejects, blocking package source capture. They are replaced with portable
+   references.
+2. P1: libass's compiled `ass_strtod.c` carries separate UC/Sun/Oshmyan
+   notices; it is now a pinned notice. A scan of every compiled library source
+   for non-standard headers also found HarfBuzz's ISC-style `hb-ucd.cc`, which
+   is now pinned as well. FriBidi's `fribidi-config.h` is public domain and
+   zimg has no component notices.
+3. P3: the PQ negative-control description overstated the dim-detail error;
+   it now matches the asserted and measured values.
+
+Notice-list changes alter the lock entries recorded in the build receipt, so
+`artifacts/media-tools-n2` no longer matches the lock and `package_app.py`
+refuses to reuse it. That is expected: the integration package build rebuilds
+the tools. The binaries themselves are unaffected (notices are not compiled in).
