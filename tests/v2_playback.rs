@@ -5417,6 +5417,26 @@ async fn adaptive_conversions_publish_aligned_capped_variants() {
             std::fs::write(path, get(format!("{base}/{name}")).await).unwrap();
         }
     }
+    // The low rung is served under the same ownership as the main one: another
+    // device of the same profile cannot read it, and it retires with its
+    // delivery.
+    let low_segment = low
+        .lines()
+        .find_map(|l| l.strip_prefix("../../"))
+        .unwrap()
+        .to_owned();
+    let low_paths = [
+        format!("{base}/variants/low/index.m3u8"),
+        format!("{base}/variants/low/init.mp4"),
+        format!("{base}/{low_segment}"),
+    ];
+    let (_, stranger) = f.device(&["default"], PLAYER).await;
+    for path in &low_paths {
+        let reply = f
+            .call("GET", path, None, &[("authorization", &stranger)])
+            .await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+    }
     let closed = f
         .call(
             "DELETE",
@@ -5433,6 +5453,10 @@ async fn adaptive_conversions_publish_aligned_capped_variants() {
     })
     .await
     .expect("adaptive capacity was not released");
+    for path in &low_paths {
+        let reply = f.call("GET", path, None, &[("authorization", &auth)]).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+    }
     // A client cap keeps one capped variant.
     let mut capped = plan_input("default", &timeline, "convert", None, &["hls"]);
     capped["quality"]["max_bitrate_bps"] = json!("2000000");
@@ -5455,4 +5479,30 @@ async fn adaptive_conversions_publish_aligned_capped_variants() {
         String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
     assert_eq!(master.matches("#EXT-X-STREAM-INF").count(), 1, "{master}");
     assert!(master.contains("BANDWIDTH=2000000,"), "{master}");
+}
+
+#[tokio::test]
+async fn recovery_keeps_an_adaptive_encoders_two_execution_units() {
+    let mut f = Fixture::new().await;
+    let root = f.server.app.processing.deliveries.root.clone();
+    // Encoders that outlive the server: a single-variant generation and an
+    // adaptive one (its low variant directory precedes its witness).
+    let single = root.join("single").join("1");
+    let ladder = root.join("ladder").join("1");
+    std::fs::create_dir_all(&single).unwrap();
+    std::fs::create_dir_all(ladder.join("low")).unwrap();
+    let (_, single_held) = playscale::execution::Witness::create(&single.join(".owner")).unwrap();
+    let (_, ladder_held) = playscale::execution::Witness::create(&ladder.join(".owner")).unwrap();
+    f.restart().await;
+    assert_eq!(f.server.app.processing.execution.snapshot().used, 3);
+    drop(ladder_held);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 1 || ladder.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the adaptive encoder's units were not released");
+    assert!(single.exists());
+    drop(single_held);
 }

@@ -1362,7 +1362,9 @@ async fn verify_low(
         else {
             return true;
         };
-        if metadata.len() > MAX_SEGMENT_BYTES || segment.duration_ms > target_ms {
+        if metadata.len() > MAX_SEGMENT_BYTES
+            || !core::fits_target(segment.duration_ms, target_seconds(operation))
+        {
             return fail("size or duration");
         }
         if !segment_independent(&dir, segment.index, &mut low.video).await {
@@ -1987,10 +1989,17 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
             continue;
         };
         keep.push(delivery.clone());
+        // An adaptive generation's encoder holds both units; its low variant
+        // directory is created (only for it) before the witness.
+        let units = if generation.join(LOW_VARIANT).is_dir() {
+            2
+        } else {
+            1
+        };
         app.processing.execution.recovered(
             format!("recovered:{}", path.display()),
             Class::Interactive,
-            1,
+            units,
             witness,
             move || {
                 let _ = std::fs::remove_dir_all(generation);
