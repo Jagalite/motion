@@ -175,6 +175,7 @@ impl Model for Playback {
                     clip: None,
                     parts: vec![],
                     max_bitrate_bps: None,
+                    adaptive: false,
                     expires_at: s.now + TTL,
                 });
                 out.push(Effect::Planned);

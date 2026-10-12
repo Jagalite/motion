@@ -85,6 +85,28 @@ pub fn video_track(init: &[u8]) -> Option<VideoTrack> {
     found
 }
 
+/// The presentation size (width, height) of an init segment's video track,
+/// from its `tkhd` (16.16 fixed point). None when absent or not understood.
+pub fn video_size(init: &[u8]) -> Option<(u32, u32)> {
+    let moov = boxes(init).find(|(k, _)| k == b"moov")?.1;
+    for (_, trak) in boxes(moov).filter(|(k, _)| k == b"trak") {
+        let mdia = child(trak, b"mdia")?;
+        if child(mdia, b"hdlr")?.get(8..12)? != b"vide" {
+            continue;
+        }
+        let tkhd = child(trak, b"tkhd")?;
+        // Width and height are the last 8 bytes of either tkhd version.
+        let at = match tkhd.first()? {
+            0 => 76,
+            1 => 88,
+            _ => return None,
+        };
+        let (w, h) = (u32_at(tkhd, at)? >> 16, u32_at(tkhd, at + 4)? >> 16);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    None
+}
+
 /// The RFC 6381 codec identifiers of an init segment's tracks, in track order,
 /// for an HLS `CODECS` attribute: `avc1.PPCCLL` from each H.264 `avcC`, and
 /// `mp4a.40.N` from each AAC `esds` audio object type. None when any track is
@@ -327,7 +349,7 @@ mod tests {
     fn trak(track_id: u32, handler: &[u8; 4], entry: &[u8; 4], length_size: u8) -> Vec<u8> {
         let mut tkhd = vec![0u8; 12];
         tkhd.extend(track_id.to_be_bytes());
-        tkhd.extend([0u8; 64]);
+        tkhd.extend([0u8; 68]);
         let mut hdlr = vec![0u8; 8];
         hdlr.extend_from_slice(handler);
         hdlr.extend([0u8; 12]);
@@ -391,7 +413,7 @@ mod tests {
     fn audio_trak(track_id: u32, specific: &[u8]) -> Vec<u8> {
         let mut tkhd = vec![0u8; 12];
         tkhd.extend(track_id.to_be_bytes());
-        tkhd.extend([0u8; 64]);
+        tkhd.extend([0u8; 68]);
         let mut hdlr = vec![0u8; 8];
         hdlr.extend_from_slice(b"soun");
         hdlr.extend([0u8; 12]);
@@ -413,6 +435,18 @@ mod tests {
         let mut trak = mp4_box(b"tkhd", &tkhd);
         trak.extend(mp4_box(b"mdia", &mdia));
         mp4_box(b"trak", &trak)
+    }
+
+    #[test]
+    fn video_size_reads_the_track_header() {
+        let mut init = init(&[trak(1, b"vide", b"avc1", 4)]);
+        // The test track header is zero-sized: no size.
+        assert_eq!(video_size(&init), None);
+        // Set 640x360 (16.16) in the tkhd width/height fields.
+        let tkhd = init.windows(4).position(|w| w == b"tkhd").unwrap() + 4;
+        init[tkhd + 76..tkhd + 80].copy_from_slice(&(640u32 << 16).to_be_bytes());
+        init[tkhd + 80..tkhd + 84].copy_from_slice(&(360u32 << 16).to_be_bytes());
+        assert_eq!(video_size(&init), Some((640, 360)));
     }
 
     #[test]

@@ -5225,3 +5225,234 @@ async fn multipart_audio_follows_the_component_in_every_part() {
     assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
     let _ = first_revision;
 }
+
+/// An uncapped software conversion on a server with adaptive bitrate enabled
+/// is a two-rung ladder: a capped main (at most 720p) and a capped low (at
+/// most 360p) variant from one encode, segments aligned and published only
+/// when both have them, each rung described and capped from its own output,
+/// holding both execution units. A client cap keeps a single variant.
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_conversions_publish_aligned_capped_variants() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        experimental_adaptive_bitrate: true,
+        ..Default::default()
+    })
+    .await;
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+            "-t",
+            "20",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let caps = advertised_routes(&f, &auth).await;
+    assert_eq!(caps, "original,prepared,software_hls");
+    let plan = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "convert", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0001"),
+            json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 19_900
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base = format!("/api/v2/streams/{id}/1");
+    let master = String::from_utf8(get(format!("{base}/master.m3u8")).await).unwrap();
+    let rungs: Vec<&str> = master
+        .lines()
+        .filter(|l| l.starts_with("#EXT-X-STREAM-INF"))
+        .collect();
+    assert_eq!(rungs.len(), 2, "{master}");
+    assert!(
+        rungs[0].starts_with("#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1."),
+        "{master}"
+    );
+    assert!(
+        rungs[1].starts_with("#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS=\"avc1."),
+        "{master}"
+    );
+    // Each rung names its size, read from its own output.
+    assert!(rungs[0].contains(",RESOLUTION=1280x720"), "{master}");
+    assert!(rungs[1].contains(",RESOLUTION=640x360"), "{master}");
+    assert!(
+        master.contains("variants/main/index.m3u8") && master.contains("variants/low/index.m3u8")
+    );
+    let main = String::from_utf8(get(format!("{base}/variants/main/index.m3u8")).await).unwrap();
+    let low = String::from_utf8(get(format!("{base}/variants/low/index.m3u8")).await).unwrap();
+    let entries = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| {
+                l.starts_with("#EXTINF")
+                    || l.starts_with("#EXT-X-MEDIA-SEQUENCE")
+                    || l.starts_with("#EXT-X-ENDLIST")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(entries(&low), entries(&main), "{low}");
+    // Each rung's picture, and the low rung's measured rate.
+    let probe = |name: &str, init: Vec<u8>, segment: Vec<u8>| {
+        let path = f.dir.path().join(name);
+        std::fs::write(&path, [init, segment].concat()).unwrap();
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let main_init = get(format!("{base}/variants/main/init.mp4")).await;
+    let low_init = get(format!("{base}/variants/low/init.mp4")).await;
+    assert_eq!(
+        probe(
+            "main.mp4",
+            main_init,
+            get(format!("{base}/segments/0.m4s")).await
+        ),
+        "720"
+    );
+    assert_eq!(
+        probe(
+            "low.mp4",
+            low_init,
+            get(format!("{base}/segments/low-0.m4s")).await
+        ),
+        "360"
+    );
+    let mut duration_ms = None;
+    for line in low.lines() {
+        if let Some(seconds) = line.strip_prefix("#EXTINF:") {
+            duration_ms =
+                Some((seconds.trim_end_matches(',').parse::<f64>().unwrap() * 1000.0) as u64);
+        } else if let (Some(ms), Some(name)) =
+            (duration_ms.take(), line.strip_prefix("../../segments/"))
+        {
+            let bytes = get(format!("{base}/segments/{name}")).await.len() as u64;
+            if ms >= 3_000 {
+                assert!(
+                    bytes * 8_000 <= 800_000 * ms,
+                    "{name}: {bytes} bytes in {ms} ms"
+                );
+            }
+        }
+    }
+    // Opt-in: the exact output, for scripts/check_hls_subtitles.mjs --abr.
+    if let Some(dir) = std::env::var_os("MOTION_DUMP_HLS") {
+        let dir = std::path::Path::new(&dir).join("adaptive-ladder");
+        let mut files = vec![
+            "master.m3u8".to_owned(),
+            "variants/main/index.m3u8".into(),
+            "variants/main/init.mp4".into(),
+            "variants/low/index.m3u8".into(),
+            "variants/low/init.mp4".into(),
+        ];
+        for line in main.lines().chain(low.lines()) {
+            if let Some(name) = line.strip_prefix("../../") {
+                files.push(name.to_owned());
+            }
+        }
+        for name in files {
+            let path = dir.join(&name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, get(format!("{base}/{name}")).await).unwrap();
+        }
+    }
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while f.server.app.processing.execution.snapshot().used != 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("adaptive capacity was not released");
+    // A client cap keeps one capped variant.
+    let mut capped = plan_input("default", &timeline, "convert", None, &["hls"]);
+    capped["quality"]["max_bitrate_bps"] = json!("2000000");
+    let capped = f.post("/api/v2/playback/plans", &auth, None, capped).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0002"),
+            json!({"plan_token": capped.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    f.until(&id, &auth, |d| {
+        d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    let master =
+        String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
+    assert_eq!(master.matches("#EXT-X-STREAM-INF").count(), 1, "{master}");
+    assert!(master.contains("BANDWIDTH=2000000,"), "{master}");
+}

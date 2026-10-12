@@ -109,6 +109,8 @@ pub fn routes() -> Router<App> {
 
 /// The only HLS variant a live generation publishes.
 const VARIANT: &str = "main";
+/// The low variant of an adaptive generation.
+const LOW_VARIANT: &str = delivery::LOW_VARIANT;
 /// The subtitle rendition of a live generation with a text subtitle.
 const SUBTITLE_VARIANT: &str = "subtitles";
 
@@ -1594,6 +1596,13 @@ pub async fn plan(
         // limit without one.
         max_bitrate_bps: max_bitrate
             .filter(|_| matches!(route, Route::Transcode | Route::HardwareTranscode)),
+        adaptive: core::adaptive(
+            app.processing.settings.experimental_adaptive_bitrate,
+            route,
+            max_bitrate,
+            burn.is_some(),
+            !chosen.parts.is_empty(),
+        ),
         expires_at,
     };
     let mut warnings = vec![];
@@ -2028,6 +2037,7 @@ pub async fn create_delivery(
         clip: claims.clip,
         parts: claims.parts.clone(),
         max_bitrate_bps: claims.max_bitrate_bps,
+        adaptive: claims.adaptive,
     };
     let authority = Arc::new(PlanAuthority {
         caller: caller.clone(),
@@ -2358,6 +2368,7 @@ pub async fn change_delivery(
                     clip: claims.clip,
                     parts: claims.parts.clone(),
                     max_bitrate_bps: claims.max_bitrate_bps,
+                    adaptive: claims.adaptive,
                     copy_details: copy_probe.transpose().map_err(problem)?,
                 }),
             )
@@ -2549,15 +2560,22 @@ pub async fn master_playlist(
     // A stream copy keeps the source's H.264 profile/level and AAC object
     // type: describe its own output. A transcode keeps its recipe's existing
     // description (H.264 High, AAC-LC stereo).
-    let codecs = if matches!(serving.operation.as_str(), "remux" | "audio_convert") {
-        delivery::init_codecs(&app, &id, &generation)
-            .await
-            .map_err(stream_problem)?
-            .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
-    } else if serving.audio_track.is_some() {
-        "avc1.64001f,mp4a.40.2".into()
-    } else {
-        "avc1.64001f".into()
+    // An adaptive ladder describes each variant from its own init segment.
+    let (codecs, size) =
+        if matches!(serving.operation.as_str(), "remux" | "audio_convert") || serving.adaptive {
+            delivery::init_codecs(&app, &id, &generation, None)
+                .await
+                .map_err(stream_problem)?
+                .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
+        } else if serving.audio_track.is_some() {
+            ("avc1.64001f,mp4a.40.2".into(), None)
+        } else {
+            ("avc1.64001f".into(), None)
+        };
+    // Ladder rungs carry their sizes so a client can tell them apart.
+    let resolution = |size: Option<(u32, u32)>| {
+        size.filter(|_| serving.adaptive)
+            .map_or(String::new(), |(w, h)| format!(",RESOLUTION={w}x{h}"))
     };
     // A selected text subtitle is an in-manifest SUBTITLES rendition that
     // mirrors the media segments (the client selects it as a live track).
@@ -2572,8 +2590,24 @@ pub async fn master_playlist(
     } else {
         (String::new(), "")
     };
+    // The low rung of an adaptive ladder, capped and described from its own
+    // output.
+    let low = if serving.adaptive {
+        let (codecs, size) = delivery::init_codecs(&app, &id, &generation, Some(LOW_VARIANT))
+            .await
+            .map_err(stream_problem)?
+            .ok_or_else(|| Problem::internal("low variant codecs could not be described"))?;
+        format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{}{group}\n{}\n",
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            resolution(size),
+            stream_link(&format!("variants/{LOW_VARIANT}/index.m3u8"), &params)
+        )
+    } else {
+        String::new()
+    };
     let text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n{rendition}#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{group}\n{}\n",
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n{rendition}#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{}{group}\n{}\n{low}",
         // A capped conversion's peak is its cap (measured per window). A copy
         // keeps the source's rate: declare the higher of its probed average
         // and the peak measured so far over published windows (an estimate,
@@ -2586,6 +2620,7 @@ pub async fn master_playlist(
                 5_000_000
             },
         ),
+        resolution(size),
         stream_link(&format!("variants/{VARIANT}/index.m3u8"), &params)
     );
     Ok((
@@ -2606,6 +2641,17 @@ pub async fn variant_playlist(
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    if variant == LOW_VARIANT {
+        return delivery::low_playlist(
+            &app,
+            &id,
+            &generation,
+            |i| stream_link(&format!("../../segments/{LOW_VARIANT}-{i}.m4s"), &params),
+            &stream_link("init.mp4", &params),
+        )
+        .await
+        .map_err(stream_problem);
+    }
     if variant == SUBTITLE_VARIANT {
         return delivery::subtitle_playlist(&app, &id, &generation, |i| {
             stream_link(
@@ -2637,6 +2683,11 @@ pub async fn init_segment(
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    if variant == LOW_VARIANT {
+        return delivery::low_init(&app, &id, &generation)
+            .await
+            .map_err(stream_problem);
+    }
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -2658,6 +2709,15 @@ pub async fn media_segment(
     {
         let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
         return delivery::subtitle_segment(&app, &id, &generation, index)
+            .await
+            .map_err(stream_problem);
+    }
+    if let Some(index) = segment
+        .strip_prefix(&format!("{LOW_VARIANT}-"))
+        .and_then(|s| s.strip_suffix(".m4s"))
+    {
+        let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
+        return delivery::low_segment(&app, &id, &generation, index)
             .await
             .map_err(stream_problem);
     }

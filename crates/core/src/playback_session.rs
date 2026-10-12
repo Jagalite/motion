@@ -184,6 +184,29 @@ pub fn rate_cap(max_bitrate_bps: u64, min_window_ms: u64) -> Option<RateCap> {
     })
 }
 
+/// The adaptive ladder of a conversion: the main variant (at most
+/// `delivery::LIVE_MAX_HEIGHT` lines) and a low variant (at most
+/// `ADAPTIVE_LOW_HEIGHT`), each capped (`rate_cap`) so its declared HLS
+/// BANDWIDTH is a measured bound.
+pub const ADAPTIVE_MAIN_BPS: u64 = 3_000_000;
+pub const ADAPTIVE_LOW_BPS: u64 = 800_000;
+pub const ADAPTIVE_LOW_HEIGHT: u32 = 360;
+
+/// Whether a planned route is delivered as an adaptive (multi-variant)
+/// conversion: the server enables it, the route is a software conversion of
+/// one file without a burned subtitle, and the client set no bitrate cap
+/// (a capped plan keeps its single capped variant). Everything else is one
+/// variant, as before.
+pub fn adaptive(
+    enabled: bool,
+    route: Route,
+    max_bitrate_bps: Option<u64>,
+    burn_in: bool,
+    multipart: bool,
+) -> bool {
+    enabled && route == Route::Transcode && max_bitrate_bps.is_none() && !burn_in && !multipart
+}
+
 /// Whether a published segment honors a peak bitrate cap.
 pub fn within_cap(bytes: u64, duration_ms: u64, max_bitrate_bps: u64) -> bool {
     bytes.saturating_mul(8_000) <= max_bitrate_bps.saturating_mul(duration_ms)
@@ -429,6 +452,9 @@ pub struct Claims {
     /// The peak bitrate a conversion is capped at (`rate_cap`); None uncapped.
     #[serde(default)]
     pub max_bitrate_bps: Option<u64>,
+    /// Delivered as an adaptive ladder (`adaptive`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adaptive: bool,
     pub expires_at: i64,
 }
 
@@ -749,6 +775,7 @@ mod tests {
             clip: None,
             parts: vec![],
             max_bitrate_bps: None,
+            adaptive: false,
             expires_at: 100,
         }
     }
@@ -1390,5 +1417,32 @@ mod tests {
             peak_bitrate(&[(450_000, 4_000), (400_000, 2_000)], 3_000, 9_000),
             850_000 * 8_000 / 6_000
         );
+    }
+
+    #[test]
+    fn adaptive_ladders_only_for_uncapped_single_file_software_conversions() {
+        assert!(adaptive(true, Route::Transcode, None, false, false));
+        assert!(!adaptive(false, Route::Transcode, None, false, false));
+        for route in [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::HardwareTranscode,
+        ] {
+            assert!(!adaptive(true, route, None, false, false), "{route:?}");
+        }
+        assert!(!adaptive(
+            true,
+            Route::Transcode,
+            Some(5_000_000),
+            false,
+            false
+        ));
+        assert!(!adaptive(true, Route::Transcode, None, true, false));
+        assert!(!adaptive(true, Route::Transcode, None, false, true));
+        // Both rungs leave room for video under their caps.
+        assert!(rate_cap(ADAPTIVE_MAIN_BPS, 3_000).is_some());
+        assert!(rate_cap(ADAPTIVE_LOW_BPS, 3_000).is_some());
     }
 }

@@ -210,6 +210,10 @@ pub struct Pin {
     /// (`playback_session::rate_cap`); None uncapped.
     #[serde(default)]
     pub max_bitrate_bps: Option<u64>,
+    /// An adaptive conversion: a capped low variant beside the main one
+    /// (`playback_session::adaptive`). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adaptive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1158,6 +1162,7 @@ mod tests {
             clip: None,
             parts: vec![],
             max_bitrate_bps: None,
+            adaptive: false,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {

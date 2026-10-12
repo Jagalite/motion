@@ -134,12 +134,21 @@ pub async fn capabilities(
         ("timeline_binding", "whole,interval,multipart".into()),
         (
             "subtitles",
-            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,text_hls_rendition_on_live_routes_for_hls_text_clients,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
         ),
         ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
         ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
         ("tickets", "file_or_delivery_generation_playback".into()),
-        ("unsupported", "styled_subtitles,text_subtitles_on_live_routes,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,adaptive_bitrate,cast".into()),
+        (
+            "adaptive_bitrate",
+            if app.processing.settings.experimental_adaptive_bitrate {
+                "software_conversion:720p_3000000,360p_800000"
+            } else {
+                "disabled"
+            }
+            .into(),
+        ),
+        ("unsupported", "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast".into()),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

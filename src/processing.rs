@@ -44,6 +44,10 @@ pub struct Settings {
     /// and admissible, falling back to software only by a new plan. Off until
     /// the hardware output is qualified in the supported players.
     pub experimental_live_hardware: bool,
+    /// Plan uncapped v2 software conversions as an adaptive ladder (a capped
+    /// main and a capped low variant). Off until it is qualified in the
+    /// supported players.
+    pub experimental_adaptive_bitrate: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -58,6 +62,7 @@ impl Default for Settings {
             expected_duration: None,
             experimental_copy_routes: false,
             experimental_live_hardware: false,
+            experimental_adaptive_bitrate: false,
         }
     }
 }

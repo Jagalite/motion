@@ -370,7 +370,11 @@ fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<E
                 below_index,
             } => {
                 let directory = session.directory(app, generation);
-                tokio::task::spawn_blocking(move || discard(&directory, below_index));
+                tokio::task::spawn_blocking(move || {
+                    discard(&directory, below_index);
+                    // An adaptive generation's low variant (absent otherwise).
+                    discard(&directory.join(LOW_VARIANT), below_index);
+                });
             }
             Effect::Cleanup { generation } => {
                 inner.workers.remove(&generation);
@@ -461,9 +465,13 @@ fn arguments(
     burn: Option<u32>,
     parts: Option<PartInputs<'_>>,
     cap: Option<playscale_core::playback_session::RateCap>,
+    adaptive: bool,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
+    // An adaptive conversion of one file without a burned subtitle: a second,
+    // capped low variant from the same decoded and scaled picture.
+    let adaptive = adaptive && !copy && burn.is_none() && parts.is_none();
     let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -585,6 +593,15 @@ fn arguments(
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
         }
+        (None, None) if adaptive => {
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:v:0]{SCALE},split=2[v][split];\
+                 [split]scale=w=-2:h='min({},ih)':force_divisible_by=2[low]",
+                playscale_core::playback_session::ADAPTIVE_LOW_HEIGHT
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
         (None, None) => args.extend(["-map", "0:v:0"].map(str::to_owned)),
     }
     if let (Some(audio), None) = (audio, parts) {
@@ -595,7 +612,7 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        if burn.is_none() && parts.is_none() {
+        if burn.is_none() && parts.is_none() && !adaptive {
             args.extend(["-vf", SCALE].map(str::to_owned));
         }
         args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
@@ -677,8 +694,81 @@ fn arguments(
     args.push("-hls_segment_filename".into());
     args.push(directory.join("seg%d.m4s").to_string_lossy().into_owned());
     args.push(directory.join("ffmpeg.m3u8").to_string_lossy().into_owned());
+    if adaptive {
+        // The low variant: the same audio and keyframe cadence (so its
+        // segments align with the main ones), capped at its own rate.
+        let low = playscale_core::playback_session::rate_cap(
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            PEAK_WINDOW_MS,
+        )
+        .expect("the low rung leaves room for video");
+        args.extend(["-map", "[low]"].map(str::to_owned));
+        if let Some(audio) = audio {
+            args.push("-map".into());
+            args.push(format!("0:a:{audio}"));
+        }
+        if let Some(end_ms) = end_ms {
+            let length = end_ms.saturating_sub(start_ms);
+            args.push("-t".into());
+            args.push(format!("{}.{:03}", length / 1000, length % 1000));
+        }
+        args.extend(
+            [
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-threads",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+        args.extend([
+            "-maxrate".into(),
+            low.video_max_bps.to_string(),
+            "-bufsize".into(),
+            low.video_buffer_bits.to_string(),
+            "-force_key_frames".into(),
+            format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"),
+        ]);
+        args.extend(["-c:a", "aac", "-b:a", "160k", "-ac", "2"].map(str::to_owned));
+        args.extend(
+            [
+                "-f",
+                "hls",
+                "-hls_list_size",
+                FFMPEG_LIST_SIZE,
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_flags",
+                "temp_file+independent_segments",
+                "-start_number",
+                "0",
+                "-hls_time",
+            ]
+            .map(str::to_owned),
+        );
+        args.push(SEGMENT_SECONDS.to_string());
+        let low_dir = directory.join(LOW_VARIANT);
+        args.push("-hls_segment_filename".into());
+        args.push(low_dir.join("seg%d.m4s").to_string_lossy().into_owned());
+        args.push(low_dir.join("ffmpeg.m3u8").to_string_lossy().into_owned());
+    }
     args
 }
+
+/// The low variant of an adaptive generation, in its own subdirectory.
+pub(crate) const LOW_VARIANT: &str = "low";
 
 /// H.264 bitstream details of a source, observed through its validated descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1076,6 +1166,7 @@ async fn observe(
     copy_start: Option<u64>,
     max_bitrate_bps: Option<u64>,
     recent: &mut Vec<(u64, u64)>,
+    mut low: Option<&mut LowVariant>,
 ) -> bool {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -1088,6 +1179,14 @@ async fn observe(
         let _ = apply(app, session, Input::Failed { generation });
         return false;
     }
+    // An adaptive generation publishes a segment only when its low variant
+    // has the same segment, verified like the main one.
+    if let Some(low) = low.as_deref_mut()
+        && !verify_low(app, session, generation, directory, low, operation).await
+    {
+        return false;
+    }
+    let limit = low.as_deref().map(|l| l.verified);
     let Ok(text) = tokio::fs::read_to_string(directory.join("ffmpeg.m3u8")).await else {
         return false;
     };
@@ -1101,7 +1200,7 @@ async fn observe(
     }
     let from = *reported;
     for segment in published.iter().filter(|s| s.index >= from) {
-        if segment.index != *reported {
+        if segment.index != *reported || limit.is_some_and(|limit| segment.index >= limit) {
             return false;
         }
         let Ok(metadata) =
@@ -1198,7 +1297,13 @@ async fn observe(
         let _ = apply(app, session, input);
         *reported += 1;
     }
-    if ended && *reported > 0 && published.last().is_some_and(|s| s.index + 1 == *reported) {
+    if ended
+        && *reported > 0
+        && published.last().is_some_and(|s| s.index + 1 == *reported)
+        && low
+            .as_deref()
+            .is_none_or(|l| l.ended && l.verified == *reported)
+    {
         let _ = apply(
             app,
             session,
@@ -1210,6 +1315,80 @@ async fn observe(
         return true;
     }
     false
+}
+
+/// The verification state of an adaptive generation's low variant.
+#[derive(Default)]
+pub(crate) struct LowVariant {
+    /// Low segments verified so far (every index below is verified).
+    verified: u32,
+    recent: Vec<(u64, u64)>,
+    video: Option<crate::fmp4::VideoTrack>,
+    /// Its playlist ended with all of them verified.
+    ended: bool,
+}
+
+/// Verify newly published low-variant segments in order: present, within the
+/// size cap, beginning with an IDR, and within the low rung's peak bitrate
+/// over every HLS window. A failure fails the generation (false).
+async fn verify_low(
+    app: &App,
+    session: &Arc<Session>,
+    generation: u64,
+    directory: &FsPath,
+    low: &mut LowVariant,
+    operation: Operation,
+) -> bool {
+    let dir = directory.join(LOW_VARIANT);
+    let Ok(text) = tokio::fs::read_to_string(dir.join("ffmpeg.m3u8")).await else {
+        return true;
+    };
+    let (published, ended) = parse_playlist(&text);
+    let fail = |reason: &str| {
+        tracing::warn!(delivery=%session.id, generation, reason, "low variant segment refused");
+        let _ = apply(app, session, Input::Failed { generation });
+        false
+    };
+    if published.first().is_some_and(|s| s.index > low.verified) {
+        return fail("publication gap");
+    }
+    let target_ms = target_seconds(operation) * 1000;
+    let from = low.verified;
+    for segment in published.iter().filter(|s| s.index >= from) {
+        if segment.index != low.verified {
+            return true;
+        }
+        let Ok(metadata) = tokio::fs::metadata(dir.join(format!("seg{}.m4s", segment.index))).await
+        else {
+            return true;
+        };
+        if metadata.len() > MAX_SEGMENT_BYTES || segment.duration_ms > target_ms {
+            return fail("size or duration");
+        }
+        if !segment_independent(&dir, segment.index, &mut low.video).await {
+            return fail("not independent");
+        }
+        low.recent.push((metadata.len(), segment.duration_ms));
+        while low.recent.len() > 1
+            && low.recent[1..].iter().map(|(_, d)| d).sum::<u64>() >= target_ms * 3 / 2
+        {
+            low.recent.remove(0);
+        }
+        if !playscale_core::playback_session::peak_within_cap(
+            &low.recent,
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            target_ms / 2,
+            target_ms * 3 / 2,
+        ) {
+            return fail("bitrate cap");
+        }
+        low.verified += 1;
+    }
+    low.ended = ended
+        && published
+            .last()
+            .is_some_and(|s| s.index + 1 == low.verified);
+    true
 }
 
 /// Open the source beneath its validated root and check its identity. The
@@ -1246,12 +1425,21 @@ async fn run_generation(
         let _ = apply(app, session, Input::Failed { generation });
         stopped(app, session);
     };
+    // An adaptive generation runs two encodes: both execution units.
+    let units = {
+        let inner = session.inner.lock().unwrap();
+        match inner.delivery.generations.get(&generation) {
+            Some(g) if g.pin.adaptive => 2,
+            Some(_) => 1,
+            None => return,
+        }
+    };
     let lease = tokio::select! {
         _ = stop.cancelled() => return stopped(&app, &session),
         lease = app.processing.execution.reserve(
             format!("delivery:{}:{generation}", session.id),
             Class::Interactive,
-            1,
+            units,
         ) => lease,
     };
     let Ok(lease) = lease else {
@@ -1337,6 +1525,9 @@ async fn run_generation(
             OBSERVE_DEADLINE,
             move || {
                 std::fs::create_dir_all(&directory)?;
+                if units == 2 {
+                    std::fs::create_dir_all(directory.join(LOW_VARIANT))?;
+                }
                 crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
                 let input = source_valid(&source)?;
                 anyhow::ensure!(
@@ -1405,6 +1596,7 @@ async fn run_generation(
             part_inputs.as_deref().zip(session.canvas),
             pin.max_bitrate_bps
                 .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
+            pin.adaptive,
             &directory,
         ))
         .stdin(Stdio::piped())
@@ -1464,6 +1656,8 @@ async fn run_generation(
     let mut reported = 0u32;
     // (bytes, duration) of recently published segments, for peak windows.
     let mut recent: Vec<(u64, u64)> = Vec::new();
+    // An adaptive generation's low variant, verified before each publication.
+    let mut low = pin.adaptive.then(LowVariant::default);
     let mut video = None;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     // Liveness, decided by the core deadline policy. Its clock advances only
@@ -1532,6 +1726,7 @@ async fn run_generation(
                             copy_start,
                             pin.max_bitrate_bps,
                             &mut recent,
+                            low.as_mut(),
                         ),
                     ) => observed,
                 };
@@ -1579,6 +1774,7 @@ async fn run_generation(
                     copy_start,
                     pin.max_bitrate_bps,
                     &mut recent,
+                    low.as_mut(),
                 ),
             )
             .await;
@@ -1910,6 +2106,10 @@ pub struct GenerationView {
     #[serde(skip)]
     #[schema(ignore)]
     pub max_bitrate_bps: Option<u64>,
+    /// An adaptive conversion with a low variant (v2 manifests only).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub adaptive: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1978,6 +2178,7 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                     .iter()
                     .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok())),
                 max_bitrate_bps: g.pin.max_bitrate_bps,
+                adaptive: g.pin.adaptive,
             })
     };
     DeliveryView {
@@ -2225,6 +2426,7 @@ fn pin(
         clip: None,
         parts: vec![],
         max_bitrate_bps: None,
+        adaptive: false,
     }
 }
 
@@ -2342,6 +2544,7 @@ fn byte_pin(
         clip: None,
         parts: vec![],
         max_bitrate_bps: None,
+        adaptive: false,
     }
 }
 
@@ -2525,6 +2728,8 @@ pub(crate) struct Planned {
     pub parts: Vec<playscale_core::parts::PartPin>,
     /// The peak bitrate a conversion is capped at.
     pub max_bitrate_bps: Option<u64>,
+    /// An adaptive ladder (`playback_session::adaptive`).
+    pub adaptive: bool,
 }
 
 /// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
@@ -2684,6 +2889,7 @@ pub(crate) struct Selection {
     pub clip: Option<playscale_core::parts::Clip>,
     pub parts: Vec<playscale_core::parts::PartPin>,
     pub max_bitrate_bps: Option<u64>,
+    pub adaptive: bool,
     /// Bitstream details observed for a stream-copy route before the command's
     /// write transaction; None for other routes.
     pub copy_details: Option<CopyDetails>,
@@ -2811,10 +3017,26 @@ pub(crate) async fn change_live(
                     "A bitrate cap is kept only by a conversion with room for its video",
                 ));
             }
+            if selection.adaptive
+                && (pin.operation != Operation::VideoTranscode
+                    || pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE)
+                    || selection.burn.is_some()
+                    || !selection.parts.is_empty()
+                    || selection.max_bitrate_bps.is_some())
+            {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "An adaptive ladder is a software conversion of one file",
+                ));
+            }
             let pin = Pin {
                 clip: selection.clip,
                 parts: selection.parts,
-                max_bitrate_bps: selection.max_bitrate_bps,
+                max_bitrate_bps: selection.max_bitrate_bps.or(selection
+                    .adaptive
+                    .then_some(playscale_core::playback_session::ADAPTIVE_MAIN_BPS)),
+                adaptive: selection.adaptive,
                 ..with_burn(
                     with_sidecar(pin, selection.sidecar.as_ref()),
                     selection.burn,
@@ -2825,15 +3047,23 @@ pub(crate) async fn change_live(
     };
     // The staged generation runs this pin: the replan's, or for a seek the
     // newest generation's, copied unchanged.
-    let staged_hardware = match &replan {
-        Some((_, pin)) => pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+    let (staged_hardware, staged_units) = match &replan {
+        Some((_, pin)) => (
+            pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+            if pin.adaptive { 2 } else { 1 },
+        ),
         None => {
             let inner = session.inner.lock().unwrap();
             let d = &inner.delivery;
             d.pending
                 .or(d.active)
                 .and_then(|n| d.generations.get(&n))
-                .is_some_and(|g| g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE))
+                .map_or((false, 1), |g| {
+                    (
+                        g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+                        if g.pin.adaptive { 2 } else { 1 },
+                    )
+                })
         }
     };
     let input = Input::Change {
@@ -2843,7 +3073,10 @@ pub(crate) async fn change_live(
         // A byte route has no worker; a live route overlaps when another
         // interactive worker (and, for a hardware encode, another hardware
         // session) is admissible now.
-        overlap: app.processing.execution.fits_now(Class::Interactive, 1)
+        overlap: app
+            .processing
+            .execution
+            .fits_now(Class::Interactive, staged_units)
             && (!staged_hardware || app.processing.hardware.fits_now(Class::Interactive, 1)),
         now_ms: app.processing.deliveries.now_ms(),
     };
@@ -3076,7 +3309,8 @@ async fn admit_owned(
                             && p.burn.is_none()
                             && p.clip.is_none()
                             && p.parts.is_empty()
-                            && p.max_bitrate_bps.is_none() =>
+                            && p.max_bitrate_bps.is_none()
+                            && !p.adaptive =>
                     {
                         serde_json::to_vec(&(&r, &p.owner, &p.version, p.route))
                     }
@@ -3090,6 +3324,7 @@ async fn admit_owned(
                         p.clip,
                         &p.parts,
                         p.max_bitrate_bps,
+                        p.adaptive,
                     )),
                 }
                 .expect("serializable request")
@@ -3193,8 +3428,28 @@ async fn admit_owned(
         .as_ref()
         .map(|p| p.parts.clone())
         .unwrap_or_default();
+    // An adaptive ladder is a software conversion of one file without a
+    // burned subtitle; its main rung is capped like a client cap.
+    let adaptive = planned.as_ref().is_some_and(|p| p.adaptive);
+    if adaptive
+        && (operation != Operation::VideoTranscode
+            || hardware
+            || !parts.is_empty()
+            || planned
+                .as_ref()
+                .is_some_and(|p| p.burn.is_some() || p.max_bitrate_bps.is_some()))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "An adaptive ladder is a software conversion of one file",
+        ));
+    }
     // A cap is a conversion's encoder setting; it must be one that can hold.
-    let max_bitrate_bps = planned.as_ref().and_then(|p| p.max_bitrate_bps);
+    let max_bitrate_bps = planned
+        .as_ref()
+        .and_then(|p| p.max_bitrate_bps)
+        .or(adaptive.then_some(playscale_core::playback_session::ADAPTIVE_MAIN_BPS));
     if max_bitrate_bps.is_some_and(|b| {
         operation != Operation::VideoTranscode
             || playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS).is_none()
@@ -3263,6 +3518,7 @@ async fn admit_owned(
             clip,
             parts: parts.clone(),
             max_bitrate_bps,
+            adaptive,
             ..with_burn(
                 with_sidecar(
                     if original {
@@ -3766,19 +4022,24 @@ pub(crate) fn copied_rate(app: &App, id: &str, generation: &str) -> Option<u64> 
 }
 
 /// The codecs of a served generation's output, from its own init segment
-/// (`fmp4::codecs`). None when the init segment is unreadable or describes a
-/// codec configuration that is not understood.
+/// (`fmp4::codecs`), with its video size when the track header gives one.
+/// None when the init segment is unreadable or describes a codec
+/// configuration that is not understood.
 pub(crate) async fn init_codecs(
     app: &App,
     id: &str,
     generation: &str,
-) -> Result<Option<String>, ApiError> {
+    variant: Option<&str>,
+) -> Result<Option<(String, Option<(u32, u32)>)>, ApiError> {
     let generation = generation_number(generation)?;
     let (session, permit) = admit_stream(app, id, |d, now| {
         d.serves(generation, now) && d.generations[&generation].next_segment > 0
     })
     .await?;
-    let path = session.directory(app, generation).join("init.mp4");
+    let directory = session.directory(app, generation);
+    let path = variant
+        .map_or(directory.clone(), |v| directory.join(v))
+        .join("init.mp4");
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let _permit = permit;
@@ -3791,9 +4052,76 @@ pub(crate) async fn init_codecs(
         (init.len() as u64 <= MAX_INIT_BYTES)
             .then(|| crate::fmp4::codecs(&init))
             .flatten()
+            .map(|codecs| (codecs, crate::fmp4::video_size(&init)))
     })
     .await
     .map_err(ApiError::internal)
+}
+
+/// Whether a generation serves an adaptive low variant now.
+fn serves_low(d: &Delivery, generation: u64, now: u64) -> bool {
+    d.serves(generation, now) && d.generations[&generation].pin.adaptive
+}
+
+/// The low variant's media playlist: the same window as the main one (a
+/// segment is reported only once both variants have it).
+pub(crate) async fn low_playlist(
+    app: &App,
+    id: &str,
+    generation: &str,
+    segment_uri: impl Fn(u32) -> String,
+    init_uri: &str,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, _permit) = admit_stream(app, id, |d, now| serves_low(d, generation, now)).await?;
+    let text = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        if !serves_low(d, generation, app.processing.deliveries.now_ms()) {
+            return Err(ApiError::not_found());
+        }
+        core::media_playlist(&d.generations[&generation], segment_uri, init_uri)
+    };
+    Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
+}
+
+/// The low variant's init segment.
+pub(crate) async fn low_init(app: &App, id: &str, generation: &str) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        serves_low(d, generation, now) && d.generations[&generation].next_segment > 0
+    })
+    .await?;
+    file(
+        permit,
+        session
+            .directory(app, generation)
+            .join(LOW_VARIANT)
+            .join("init.mp4"),
+    )
+    .await
+}
+
+/// One low-variant media segment (fetchable exactly when the main one is).
+pub(crate) async fn low_segment(
+    app: &App,
+    id: &str,
+    generation: &str,
+    index: u32,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        serves_low(d, generation, now) && d.fetchable(generation, index, now)
+    })
+    .await?;
+    file(
+        permit,
+        session
+            .directory(app, generation)
+            .join(LOW_VARIANT)
+            .join(format!("seg{index}.m4s")),
+    )
+    .await
 }
 
 pub async fn init(
@@ -4268,6 +4596,7 @@ mod tests {
                 clip: None,
                 parts: vec![],
                 max_bitrate_bps: None,
+                adaptive: false,
             },
             0,
             Some(60_000),
