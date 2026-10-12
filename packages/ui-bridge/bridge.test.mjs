@@ -11,7 +11,7 @@ function harness(storage = new Map(), fetch = async () => ({ok: true, status: 20
     sessionStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)},
     crypto: webcrypto, fetch, location: {reload() {}}, setTimeout: fn => fn(), Blob, ...extra,
   };
-  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair, showPlan})`, context);
+  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair, showPlan, edited})`, context);
 }
 function form(inputs = []) {
   const status = {};
@@ -234,4 +234,23 @@ test('a new preview withdraws the previous plan before it is sent, even if it fa
   command.querySelector = selector => selector === '.plan-result' ? {remove() { removed++; }} : base(selector);
   await bridge.submitCommand(command);
   assert.equal(removed, 1);
+});
+
+test('a preview answered after the form was edited is discarded, not offered', async () => {
+  let release;
+  const bridge = harness(new Map(), () => new Promise(resolve => { release = resolve; }));
+  const status = {setAttribute() {}};
+  let shown = 0;
+  const command = form([input('new_root_path', 'text', '/srv/a')]);
+  command.dataset = {command: 'POST /api/v2/sources/s1/relocation-plans', idempotent: 'true', ifMatch: '"r-2"'};
+  command.classList = {contains: name => name === 'plan'};
+  command.append = () => { shown++; };
+  const base = command.querySelector;
+  command.querySelector = selector => selector === '.command-status' ? status : selector === '.plan-result' ? null : base(selector);
+  const pending = bridge.submitCommand(command);
+  bridge.edited(command);
+  release({ok: true, status: 200, json: async () => ({plan_token: 'token-0123456789abcdef', expires_at: new Date().toISOString(), affected_ids: [], warnings: []})});
+  await pending;
+  assert.equal(shown, 0, 'the stale plan is never rendered');
+  assert.equal(status.textContent, 'The form changed while checking. Check again.');
 });

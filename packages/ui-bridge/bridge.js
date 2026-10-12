@@ -140,6 +140,8 @@ async function submitCommand(form) {
   const status = form.querySelector('.command-status');
   // A new preview always replaces the previous plan, even if it then fails.
   if (form.classList.contains('plan')) form.querySelector('.plan-result')?.remove();
+  // The fields this request was built from; a later edit makes its answer stale.
+  const generation = edits.get(form) ?? 0;
   const button = form.querySelector('button[type="submit"]');
   let identity;
   try {
@@ -160,7 +162,14 @@ async function submitCommand(form) {
     settleKey(identity);
     // Pairing keeps the button disabled for the whole flow (one flow at a time).
     if (form.classList.contains('pairing')) return await pair(form, result);
-    if (form.classList.contains('plan')) return showPlan(form, result, body);
+    if (form.classList.contains('plan')) {
+      // An edit while the preview was pending: the plan describes old fields.
+      if ((edits.get(form) ?? 0) !== generation) {
+        if (status) status.textContent = 'The form changed while checking. Check again.';
+        return;
+      }
+      return showPlan(form, result, body);
+    }
     location.reload();
   } catch (error) {
     // Only a definite rejection ends this request's identity; 5xx, 408/429
@@ -257,9 +266,16 @@ async function pair(form, pairing) {
   status.setAttribute('role', 'alert');
 }
 
-// Editing a previewed form withdraws its plan: it no longer describes the fields.
+// Editing a plan form withdraws any shown plan and invalidates a pending
+// preview: neither describes the fields any more.
+const edits = new WeakMap();
+function edited(form) {
+  edits.set(form, (edits.get(form) ?? 0) + 1);
+  form.querySelector('.plan-result')?.remove();
+}
 document.addEventListener('input', event => {
-  event.target?.closest?.('form.plan')?.querySelector('.plan-result')?.remove();
+  const form = event.target?.closest?.('form.plan');
+  if (form) edited(form);
 });
 
 document.addEventListener('submit', event => {

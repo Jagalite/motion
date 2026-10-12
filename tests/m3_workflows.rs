@@ -1025,4 +1025,63 @@ async fn library_workflow_runs_end_to_end_through_the_pages() {
         item_page.contains("The Night Train"),
         "identity survives relocation"
     );
+
+    // 14. A merge-retired ID still opens a working management page: every
+    // section reads the live work (metadata and artwork reject aliases).
+    let revision = |id: String| {
+        let f = &f;
+        let op = op.clone();
+        async move {
+            f.call(
+                &op,
+                "GET",
+                &format!("/api/v2/catalog/items/{id}"),
+                None,
+                &[],
+            )
+            .await
+            .body["revision"]
+                .clone()
+        }
+    };
+    let plan = f
+        .call(
+            &op,
+            "POST",
+            &format!("/api/v2/catalog/items/{item_id}/merge-plans"),
+            Some(
+                json!({"source_item_ids":[other_id],"target_item_id":item_id,"expected_revisions":{
+                    item_id.clone(): revision(item_id.clone()).await,
+                    other_id.clone(): revision(other_id.clone()).await,
+                }}),
+            ),
+            &[("idempotency-key", "n1-merge-preview-key-padding")],
+        )
+        .await;
+    assert_eq!(plan.status, StatusCode::OK, "{:?}", plan.body);
+    let merged = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":plan.body["plan_token"]})),
+            &[("idempotency-key", "n1-merge-commit-key-padding")],
+        )
+        .await;
+    assert!(merged.status.is_success(), "{:?}", merged.body);
+    let html = f.ok_page(&op, &format!("/item/{other_id}/manage")).await;
+    assert!(
+        html.contains(&format!(
+            "PUT /api/v2/catalog/items/{item_id}/metadata/contributions/local"
+        )),
+        "{html}"
+    );
+    assert!(
+        !html.contains("Details are unavailable") && !html.contains("Artwork is unavailable"),
+        "{html}"
+    );
+    assert!(
+        !html.contains(&format!("/api/v2/catalog/items/{other_id}/")),
+        "{html}"
+    );
 }

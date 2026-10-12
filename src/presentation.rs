@@ -825,10 +825,13 @@ impl UiQueryFacade for Queries {
             if !(write || prepare || organize) {
                 return Err(UiError::Denied);
             }
-            let path = format!("/catalog/items/{}", segment(id));
-            let (value, item_etag) = self.read_tagged(&path).await?;
-            // A retired (merged) ID resolves to its live work; act on the live ID.
+            let (value, item_etag) = self
+                .read_tagged(&format!("/catalog/items/{}", segment(id)))
+                .await?;
+            // A retired (merged) ID resolves to its live work. Section reads
+            // (metadata, artwork) reject aliases, so they use the live ID.
             let item_id = text(&value, "id");
+            let path = format!("/catalog/items/{}", segment(&item_id));
             let card = item(&value);
             let library_ids = strings(&value["library_ids"]);
             // Timelines with their editions and the exact files bound to their
@@ -867,8 +870,11 @@ impl UiQueryFacade for Queries {
                                 ));
                             }
                             // Only an available original bound as one whole file is preparable.
+                            // Interval bindings (e.g. double episodes) are not whole files.
                             if let [only] = bindings.as_slice()
                                 && v["availability"] == "available"
+                                && only["start_ms"].is_null()
+                                && only["end_ms"].is_null()
                             {
                                 whole.push((
                                     text(&only["file"], "file_id"),
@@ -1144,7 +1150,13 @@ impl UiQueryFacade for Queries {
                 Default::default();
             let mut collections = Vec::new();
             for c in self.list_all("/collections", 5).await?.iter().filter(mine) {
-                let ids = strings(&c["item_ids"]);
+                // A smart collection's members follow its filter and are not
+                // listed or edited here, so they spend none of the read budget.
+                let ids = if c["kind"] == "smart" {
+                    Vec::new()
+                } else {
+                    strings(&c["item_ids"])
+                };
                 let mut items = Vec::new();
                 let mut remove_bodies = Vec::new();
                 for item_id in &ids {
