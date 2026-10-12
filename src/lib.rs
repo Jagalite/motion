@@ -18,6 +18,7 @@ pub mod markers;
 pub mod matching;
 pub mod media;
 pub mod metadata;
+pub mod metrics;
 pub mod nfo;
 pub mod operations;
 pub mod organization;

@@ -7018,6 +7018,74 @@ paths:
         '503':
           $ref: '#/components/responses/E503'
       x-required-permission: system:admin
+  /api/v2/admin/metrics:
+    get:
+      operationId: getMetrics
+      summary: Read bounded operational metrics history
+      tags:
+      - administration
+      x-owner: A14
+      x-milestone: M1
+      x-status: implementation_target
+      x-required-permission: system:admin
+      description: >-
+        Redacted process, HTTP, workload, and storage observations retained in SQLite across
+        server restarts. Samples are attempted every 10 seconds for 24 hours; unavailable
+        observations and failed samples produce gaps. Storage observations may be sampled
+        every 60 seconds, without interpolation. No per-sample events are emitted.
+        The server may increase the requested bucket width to bound each series to 2000
+        points. Buckets are anchored to the Unix epoch in UTC. Gauge buckets select the last
+        sample. Counter buckets select the last sample independently within each server
+        epoch, and counter series also retain the first actual sample of each server epoch,
+        to make resets visible; no synthetic zero is inserted.
+        At most the newest 12000 raw observations per series are considered; if excessive
+        restarts still exceed the response cap, only the newest 2000 selected points
+        are returned. Such restart churn can truncate the oldest retained history.
+        interval_seconds reports the native 10-second sampling interval,
+        not the effective bucket width. Points retain their original observation timestamps.
+      parameters:
+      - name: since
+        in: query
+        required: false
+        description: >-
+          Inclusive RFC 3339 timestamp with an explicit UTC offset. Defaults to the
+          retention start (request time minus 86400 seconds); older values are clamped
+          to that floor. A future value returns empty point arrays. Invalid input is 400.
+        schema:
+          $ref: '#/components/schemas/Timestamp'
+      - name: step_seconds
+        in: query
+        required: false
+        description: >-
+          Requested bucket width in whole seconds, at least the native sample interval.
+          Defaults to 10; the server may increase it to enforce the point cap.
+          Malformed, fractional, negative, too-small, or values outside the unsigned
+          64-bit range are 400.
+        schema:
+          type: integer
+          minimum: 10
+          default: 10
+      responses:
+        '200':
+          description: Bounded operational metrics history, ordered oldest to newest per series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsHistory'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
   /api/v2/admin/storage:
     get:
       operationId: getStorage
@@ -9263,6 +9331,11 @@ components:
           $ref: '#/components/schemas/Digest'
         features:
           type: array
+          description: >-
+            Caller-visible feature status. admin.metrics is implemented and enabled,
+            advertising operational history with limits interval_seconds = "10" and
+            retention_seconds = "86400". Its absence means history is unavailable
+            to this caller.
           items:
             $ref: '#/components/schemas/Feature'
           maxItems: 200
@@ -12528,6 +12601,13 @@ components:
           $ref: '#/components/schemas/UInt64'
         db_busy_count:
           $ref: '#/components/schemas/UInt64'
+        process:
+          description: >-
+            Null when process measurements could not be taken for this response;
+            the other diagnostics are still reported.
+          anyOf:
+          - $ref: '#/components/schemas/ProcessMetrics'
+          - type: 'null'
         worker_errors:
           type: array
           items:
@@ -12542,6 +12622,163 @@ components:
       - running_jobs
       - db_busy_count
       - worker_errors
+      - process
+    ProcessMetrics:
+      type: object
+      additionalProperties: false
+      description: >-
+        Current server-process observations and HTTP counters since process start.
+        All potentially large or fractional values are decimal strings. Unsupported
+        optional process observations are null. Failure to obtain a required process
+        observation returns 503 with code process_metrics_unavailable. No executable paths,
+        command lines, environment values, or raw operating-system output are exposed.
+      properties:
+        pid:
+          $ref: '#/components/schemas/UInt64'
+        cpu_seconds_total:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'
+          description: Cumulative user plus system CPU time consumed by this process, in seconds.
+        resident_bytes:
+          $ref: '#/components/schemas/UInt64'
+        virtual_bytes:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        open_files:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        threads:
+          anyOf:
+          - $ref: '#/components/schemas/UInt64'
+          - type: 'null'
+        cpu_count:
+          $ref: '#/components/schemas/UInt64'
+          description: Logical CPUs visible to the process.
+        requests_total:
+          $ref: '#/components/schemas/UInt64'
+          description: >-
+            Completed external HTTP requests across all v2 routes and presentation routes.
+            Completion occurs when the response body ends or is dropped; cancellation before
+            a response exists only releases in-flight. Internal presentation reads are not counted twice.
+        request_errors_total:
+          $ref: '#/components/schemas/UInt64'
+          description: Completed HTTP requests whose response status is at least 500.
+        requests_in_flight:
+          $ref: '#/components/schemas/UInt64'
+          description: HTTP requests currently being handled, including response bodies still streaming.
+      required:
+      - pid
+      - cpu_seconds_total
+      - resident_bytes
+      - virtual_bytes
+      - open_files
+      - threads
+      - cpu_count
+      - requests_total
+      - request_errors_total
+      - requests_in_flight
+    MetricsHistory:
+      type: object
+      additionalProperties: false
+      properties:
+        sampled_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: >-
+            Newest persisted observation within retention at or before request time,
+            in UTC, independent of since. Falls back to request time when no retained
+            observation exists.
+        interval_seconds:
+          type: integer
+          const: 10
+          description: Native sample interval; actual point spacing can be larger or irregular.
+        retention_seconds:
+          type: integer
+          const: 86400
+        series:
+          type: array
+          minItems: 15
+          maxItems: 15
+          description: >-
+            Exactly one entry for every MetricSeries ID, including entries with no points.
+            Missing observations are omitted rather than represented as zero or interpolated.
+          items:
+            $ref: '#/components/schemas/MetricSeries'
+      required:
+      - sampled_at
+      - interval_seconds
+      - retention_seconds
+      - series
+    MetricSeries:
+      type: object
+      additionalProperties: false
+      description: >-
+        process.cpu_seconds_total is a counter in seconds; http.requests_total,
+        http.request_errors_total, jobs.failed_total, and db.busy_total are counters in count.
+        process.resident_bytes and all storage series are gauges in bytes; the remaining
+        series are gauges in count. Counters are process-local and reset on server restart;
+        retained history includes observations from earlier server epochs. jobs.failed_total
+        counts distinct failed jobs observed from the same bounded sources as diagnostics
+        worker_errors. Its first sample is zero before observing failed jobs; later samples
+        count each observed source/job identity once per process lifetime.
+      properties:
+        id:
+          type: string
+          enum:
+          - process.cpu_seconds_total
+          - process.resident_bytes
+          - process.open_files
+          - http.requests_total
+          - http.request_errors_total
+          - http.requests_in_flight
+          - deliveries.active
+          - jobs.queued
+          - jobs.running
+          - jobs.failed_total
+          - db.busy_total
+          - storage.database_bytes
+          - storage.asset_bytes
+          - storage.temporary_bytes
+          - storage.free_bytes
+        kind:
+          type: string
+          enum:
+          - gauge
+          - counter
+        unit:
+          type: string
+          enum:
+          - seconds
+          - bytes
+          - count
+        points:
+          type: array
+          maxItems: 2000
+          description: >-
+            Observations ordered by timestamp from oldest to newest, retaining their original
+            timestamps after downsampling. Unavailable values have no point; an entirely
+            unavailable series has an empty points array.
+          items:
+            $ref: '#/components/schemas/MetricPoint'
+      required:
+      - id
+      - kind
+      - unit
+      - points
+    MetricPoint:
+      type: object
+      additionalProperties: false
+      properties:
+        t:
+          $ref: '#/components/schemas/Timestamp'
+        v:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)(\.[0-9]+)?$'
+          description: Nonnegative decimal string; fractional values occur for CPU seconds.
+      required:
+      - t
+      - v
     StorageReport:
       type: object
       additionalProperties: false

@@ -64,6 +64,7 @@ getLibrary
 getMatch
 getMediaFileBytes
 getMetadata
+getMetrics
 getNextTimeline
 getOpenApi
 getPlaylist

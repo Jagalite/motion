@@ -122,6 +122,11 @@ pub async fn capabilities(
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);
+    let mut metrics = feature("admin.metrics", true, true);
+    metrics.limits = BTreeMap::from([
+        ("interval_seconds", "10".into()),
+        ("retention_seconds", "86400".into()),
+    ]);
     let features = vec![
         api,
         feature("identity.pairing", true, true),
@@ -137,6 +142,7 @@ pub async fn capabilities(
         feature("events.scoped_stream", true, true),
         feature("catalog.v2", true, true),
         playback,
+        metrics,
     ];
     let mut runtime_hashes = BTreeMap::new();
     if let Some(hash) = app
@@ -174,6 +180,16 @@ pub(crate) static DB_BUSY_COUNT: std::sync::atomic::AtomicU64 =
 
 pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
     caller.require(playscale_core::access::Permission::SystemAdmin)?;
+    // Process measurements are optional: when they cannot be taken (the
+    // reader is busy or the platform call failed) the rest of diagnostics
+    // still answers, with `process: null`, rather than failing as a whole.
+    let process = match app.health.metrics.snapshot().await {
+        Ok(process) => Some(process),
+        Err(code) => {
+            tracing::warn!(code, "Process measurements are temporarily unavailable");
+            None
+        }
+    };
     let mut tx = app.db.begin().await?;
     caller
         .reauthorize(
@@ -194,7 +210,52 @@ pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Respo
         "active_deliveries":app.processing.deliveries.active_sessions().to_string(),
         "queued_jobs":queued.to_string(),"running_jobs":running.to_string(),
         "db_busy_count":DB_BUSY_COUNT.load(Ordering::Relaxed).to_string(),
-        "worker_errors":errors
+        "worker_errors":errors,
+        "process":process
     }))
     .into_response())
+}
+
+pub async fn metrics(
+    State(app): State<App>,
+    caller: Caller,
+    query: Result<
+        axum::extract::Query<crate::metrics::history::HistoryQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> Result<Response, Problem> {
+    use playscale_core::access::Permission::SystemAdmin;
+    caller.require(SystemAdmin)?;
+    let query = query
+        .map_err(|_| Problem::bad("invalid_metrics_query", "Invalid metrics query"))?
+        .0;
+    let now = crate::now();
+    let window = query.validate(now).map_err(|_| {
+        Problem::bad(
+            "invalid_metrics_query",
+            "since must be RFC 3339 and step_seconds an integer of at least 10",
+        )
+    })?;
+    let mut tx = app.db.begin().await?;
+    caller.reauthorize(&mut tx, Some(SystemAdmin)).await?;
+    tx.commit().await?;
+    let history = crate::metrics::history::read(&app, window, now)
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                code = "metrics_read_failed",
+                "Metrics history is temporarily unavailable"
+            );
+            Problem::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "metrics_read_failed",
+                "Metrics history is temporarily unavailable",
+            )
+        })?;
+    // Read the credential again after the potentially longer history read,
+    // without keeping an application DB transaction open across that work.
+    let mut tx = app.db.begin().await?;
+    caller.reauthorize(&mut tx, Some(SystemAdmin)).await?;
+    tx.commit().await?;
+    Ok(Json(history).into_response())
 }

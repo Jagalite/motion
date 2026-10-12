@@ -432,6 +432,122 @@ fn contract_operations_are_well_formed() {
     }
 }
 
+#[test]
+fn operational_metrics_contract_preserves_consumer_fields_and_bounds() {
+    let contract = contract();
+    let schemas = &contract["components"]["schemas"];
+    let operation = &contract["paths"]["/api/v2/admin/metrics"]["get"];
+    assert_eq!(operation["operationId"], "getMetrics");
+    assert_eq!(operation["x-required-permission"], "system:admin");
+    assert_eq!(
+        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/MetricsHistory"
+    );
+    let parameters = operation["parameters"].as_array().unwrap();
+    assert_eq!(parameters.len(), 2);
+    let since = parameters.iter().find(|p| p["name"] == "since").unwrap();
+    assert_eq!(since["schema"]["$ref"], "#/components/schemas/Timestamp");
+    assert_eq!(since["required"], false);
+    let step = parameters
+        .iter()
+        .find(|p| p["name"] == "step_seconds")
+        .unwrap();
+    assert_eq!(step["schema"]["type"], "integer");
+    assert_eq!(step["schema"]["minimum"], 10);
+
+    for (name, fields) in [
+        (
+            "ProcessMetrics",
+            &[
+                "pid",
+                "cpu_seconds_total",
+                "resident_bytes",
+                "virtual_bytes",
+                "open_files",
+                "threads",
+                "cpu_count",
+                "requests_total",
+                "request_errors_total",
+                "requests_in_flight",
+            ][..],
+        ),
+        (
+            "MetricsHistory",
+            &[
+                "sampled_at",
+                "interval_seconds",
+                "retention_seconds",
+                "series",
+            ][..],
+        ),
+        ("MetricSeries", &["id", "kind", "unit", "points"][..]),
+        ("MetricPoint", &["t", "v"][..]),
+    ] {
+        let schema = &schemas[name];
+        assert_eq!(schema["additionalProperties"], false, "{name}");
+        let required: BTreeSet<_> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        let properties: BTreeSet<_> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(required, fields.iter().copied().collect(), "{name}");
+        assert_eq!(properties, required, "{name}");
+    }
+    // Always present, null when this response's measurements failed.
+    assert_eq!(
+        schemas["Diagnostics"]["properties"]["process"]["anyOf"],
+        serde_json::json!([
+            {"$ref": "#/components/schemas/ProcessMetrics"},
+            {"type": "null"}
+        ])
+    );
+    assert!(
+        schemas["Diagnostics"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "process")
+    );
+    let process = &schemas["ProcessMetrics"]["properties"];
+    for field in [
+        "pid",
+        "resident_bytes",
+        "cpu_count",
+        "requests_total",
+        "request_errors_total",
+        "requests_in_flight",
+    ] {
+        assert_eq!(process[field]["$ref"], "#/components/schemas/UInt64");
+    }
+    for field in ["virtual_bytes", "open_files", "threads"] {
+        assert_eq!(
+            process[field]["anyOf"],
+            serde_json::json!([
+                {"$ref": "#/components/schemas/UInt64"},
+                {"type": "null"}
+            ])
+        );
+    }
+    assert_eq!(process["cpu_seconds_total"]["type"], "string");
+    assert_eq!(schemas["MetricPoint"]["properties"]["v"]["type"], "string");
+    let history = &schemas["MetricsHistory"]["properties"];
+    assert_eq!(history["interval_seconds"]["const"], 10);
+    assert_eq!(history["retention_seconds"]["const"], 86400);
+    assert_eq!(history["series"]["minItems"], 15);
+    assert_eq!(history["series"]["maxItems"], 15);
+    assert_eq!(
+        schemas["MetricSeries"]["properties"]["points"]["maxItems"],
+        2000
+    );
+}
+
 #[tokio::test]
 async fn served_operations_match_the_ledger() {
     let dir = tempfile::tempdir().unwrap();
