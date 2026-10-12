@@ -337,10 +337,11 @@ mod tests {
         assert_eq!(first.pid, std::process::id().to_string());
         assert!(first.resident_bytes.parse::<u64>().unwrap() > 0);
         assert!(first.cpu_count.parse::<u64>().unwrap() > 0);
-        for optional in [&first.virtual_bytes, &first.open_files, &first.threads] {
-            if let Some(value) = optional {
-                value.parse::<u64>().unwrap();
-            }
+        for value in [&first.virtual_bytes, &first.open_files, &first.threads]
+            .into_iter()
+            .flatten()
+        {
+            value.parse::<u64>().unwrap();
         }
         let mut result = 1u64;
         for number in 0..100_000u64 {
