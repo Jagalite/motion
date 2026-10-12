@@ -531,7 +531,7 @@ func (m Model) shortHelp() []key.Binding {
 	case m.helping:
 		return []key.Binding{key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "close")), keys.Quit}
 	case m.focus == focusNav:
-		return []key.Binding{keys.Up, keys.Down, keys.Open, key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "page")), keys.Search, keys.Help, keys.Quit}
+		return []key.Binding{key.NewBinding(key.WithKeys("up", "down"), key.WithHelp("↑↓", "switch page")), key.NewBinding(key.WithKeys("enter", "right"), key.WithHelp("enter/→", "focus page")), keys.Search, keys.Help, keys.Quit}
 	}
 	back := keys.Back
 	if len(m.history) == 0 {

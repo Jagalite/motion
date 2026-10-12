@@ -1124,3 +1124,22 @@ func TestNullProcessFieldsAndFailedStoragePollsAreShown(t *testing.T) {
 		t.Fatalf("storage failure hidden:\n%s", v)
 	}
 }
+
+func TestSidebarSwitchesPagesAsTheHighlightMoves(t *testing.T) {
+	m := start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 120, 40)
+	m = press(t, m, "tab", "down")
+	if m.route.page != pageProcessing || m.focus != focusNav {
+		t.Fatalf("moving did not switch: %+v focus %v", m.route, m.focus)
+	}
+	if !strings.Contains(m.View(), "Processing  2 jobs") {
+		t.Fatal("processing page not shown")
+	}
+	m = press(t, m, "down", "up")
+	if m.route.page != pageProcessing {
+		t.Fatalf("up did not switch back: %+v", m.route)
+	}
+	m = press(t, m, "enter")
+	if m.focus != focusContent || m.route.page != pageProcessing {
+		t.Fatal("enter did not focus the page")
+	}
+}

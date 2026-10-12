@@ -572,8 +572,12 @@ func (m *Model) key(msg tea.KeyMsg) tea.Cmd {
 	return m.contentKey(msg)
 }
 
+// navKey moves through the sidebar. The page follows the highlight, so
+// moving is switching; Enter or → then hands focus to the page. Loads for a
+// page passed over quickly are superseded and cancelled like any other.
 func (m *Model) navKey(msg tea.KeyMsg) tea.Cmd {
 	entries := m.navEntries()
+	moved := true
 	switch {
 	case key.Matches(msg, keys.Up):
 		m.navSel = max(m.navSel-1, 0)
@@ -583,6 +587,16 @@ func (m *Model) navKey(msg tea.KeyMsg) tea.Cmd {
 		m.navSel = 0
 	case key.Matches(msg, keys.Bottom):
 		m.navSel = len(entries) - 1
+	default:
+		moved = false
+	}
+	if moved {
+		if r := entries[min(m.navSel, len(entries)-1)].route; r != m.section() {
+			return m.navigate(r)
+		}
+		return nil
+	}
+	switch {
 	case key.Matches(msg, keys.Open, keys.Right):
 		m.focus = focusContent
 		if r := entries[min(m.navSel, len(entries)-1)].route; r != m.route || len(m.history) > 0 {
