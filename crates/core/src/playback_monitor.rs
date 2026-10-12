@@ -15,6 +15,13 @@ pub const STALL_MS: u64 = 15_000;
 /// How long a finished delivery's history waits for responses still being
 /// sent before it is written without them.
 pub const DRAIN_MS: u64 = 30_000;
+/// At shutdown the process allows the delivery worker five seconds: wait
+/// this long for responses, then keep retrying failed writes for
+/// `SHUTDOWN_RETRY_MS` before leaving the rest to startup recovery.
+pub const SHUTDOWN_DRAIN_MS: u64 = 3_000;
+pub const SHUTDOWN_RETRY_MS: u64 = 1_000;
+/// The largest position the API carries (a safe JSON integer).
+pub const MAX_POSITION_MS: u64 = 9_007_199_254_740_991;
 
 /// Why a delivery's playback ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -92,9 +99,27 @@ impl Viewing {
     }
 }
 
-/// The identity of a viewing row as read: (updated at, id, revision). A
-/// later read of the same row is not a new observation.
-pub type RowIdentity = (u64, String, u64);
+/// A viewing row as read: which session, its revision, and when it was
+/// last written (to the second the database records).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ViewingRow {
+    pub id: String,
+    pub revision: u64,
+    pub updated_ms: u64,
+}
+
+impl ViewingRow {
+    /// Whether this read is newer than `seen`: a later revision of the same
+    /// session, or another session written no earlier (the delivery's
+    /// authoritative session changed). Rereading a row is not new.
+    pub fn newer_than(&self, seen: &ViewingRow) -> bool {
+        if self.id == seen.id {
+            self.revision > seen.revision
+        } else {
+            self.updated_ms >= seen.updated_ms
+        }
+    }
+}
 
 /// Something observed about a live delivery's playback.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -106,9 +131,9 @@ pub enum Observation {
         position_ms: u64,
         now_ms: u64,
     },
-    /// The delivery's newest viewing row.
+    /// The delivery's authoritative viewing row.
     Viewing {
-        row: RowIdentity,
+        row: ViewingRow,
         status: Viewing,
         position_ms: u64,
         now_ms: u64,
@@ -123,7 +148,7 @@ pub struct Watch {
     /// The newest applied reducer playhead (generation, sequence).
     pub playhead: Option<(u64, u64)>,
     /// The newest applied viewing row and its status.
-    pub row: Option<RowIdentity>,
+    pub row: Option<ViewingRow>,
     pub viewing: Option<Viewing>,
     pub position_ms: Option<u64>,
     pub start_position_ms: Option<u64>,
@@ -132,6 +157,8 @@ pub struct Watch {
     pub advanced_at: Option<u64>,
     /// When the current playing episode began.
     pub playing_since: Option<u64>,
+    /// When the current stall began (its threshold was crossed).
+    pub stalled_since: Option<u64>,
     /// Forward play no faster than real time (with slack); seeks do not count.
     pub watched_ms: u64,
     pub stalled: bool,
@@ -141,7 +168,7 @@ pub struct Watch {
 impl Watch {
     pub fn new(start_position_ms: Option<u64>) -> Self {
         Self {
-            start_position_ms,
+            start_position_ms: start_position_ms.filter(|p| *p <= MAX_POSITION_MS),
             ..Default::default()
         }
     }
@@ -155,9 +182,10 @@ impl Watch {
                 position_ms,
                 now_ms,
             } => {
-                if self
-                    .playhead
-                    .is_some_and(|seen| (generation, sequence) <= seen)
+                if position_ms > MAX_POSITION_MS
+                    || self
+                        .playhead
+                        .is_some_and(|seen| (generation, sequence) <= seen)
                 {
                     return false;
                 }
@@ -170,17 +198,29 @@ impl Watch {
                 position_ms,
                 now_ms,
             } => {
-                if self.row.as_ref().is_some_and(|seen| row <= *seen) {
+                if position_ms > MAX_POSITION_MS
+                    || self.row.as_ref().is_some_and(|seen| !row.newer_than(seen))
+                {
                     return false;
                 }
-                self.row = Some(row);
                 if status != Viewing::Playing {
+                    // Rows are read some seconds after they are written. A
+                    // pause the player recorded before the stall began means
+                    // it was paused, not stalled: that stall never happened.
+                    if self
+                        .stalled_since
+                        .is_some_and(|since| row.updated_ms < since)
+                    {
+                        self.stalls -= 1;
+                    }
                     self.playing_since = None;
                     self.stalled = false;
+                    self.stalled_since = None;
                 } else if self.viewing != Some(Viewing::Playing) {
                     // A new playing episode: time paused is not a stall.
                     self.playing_since = Some(now_ms);
                 }
+                self.row = Some(row);
                 self.viewing = Some(status);
                 // Reducer playheads are ordered and current; a viewing row may
                 // lag them, so its position counts only without them.
@@ -189,11 +229,18 @@ impl Watch {
                 }
             }
             Observation::Tick { now_ms } => {
-                let since = self.advanced_at.max(self.playing_since);
+                let threshold = self
+                    .advanced_at
+                    .max(self.playing_since)
+                    .map(|at| at.saturating_add(STALL_MS));
                 let stalled = self.viewing == Some(Viewing::Playing)
-                    && since.is_some_and(|at| now_ms.saturating_sub(at) >= STALL_MS);
+                    && threshold.is_some_and(|at| now_ms >= at);
                 if stalled && !self.stalled {
                     self.stalls += 1;
+                    self.stalled_since = threshold;
+                }
+                if !stalled {
+                    self.stalled_since = None;
                 }
                 self.stalled = stalled;
             }
@@ -234,6 +281,8 @@ pub struct Snapshot {
     pub position_ms: Option<u64>,
     pub last_activity_ms: u64,
     pub status: String,
+    /// How the bytes are produced now; a replan can change it.
+    pub mode: String,
 }
 
 /// What the history row is known to hold: only committed writes count.
@@ -269,20 +318,41 @@ impl Persisted {
 }
 
 /// Whether a finished delivery's history can be written: once no response
-/// is still being sent, or the drain allowance has passed.
-pub fn settled(open_responses: usize, ended_ms: u64, now_ms: u64) -> bool {
-    open_responses == 0 || now_ms >= ended_ms.saturating_add(DRAIN_MS)
+/// is still being sent, or the drain allowance (shorter while the server
+/// stops) has passed.
+pub fn settled(open_responses: usize, ended_ms: u64, now_ms: u64, stopping: bool) -> bool {
+    let allowance = if stopping {
+        SHUTDOWN_DRAIN_MS
+    } else {
+        DRAIN_MS
+    };
+    open_responses == 0 || now_ms >= ended_ms.saturating_add(allowance)
+}
+
+/// Whether the stopping worker keeps writing (and retrying) the history rows
+/// still queued since it began to stop at `stopped_ms`.
+pub fn keep_finishing(queued: usize, stopped_ms: u64, now_ms: u64) -> bool {
+    queued > 0 && now_ms < stopped_ms.saturating_add(SHUTDOWN_DRAIN_MS + SHUTDOWN_RETRY_MS)
 }
 
 /// The delivery a direct file read is counted toward, among the reader's
-/// live deliveries of that file. The delivery the URL names is used only if
-/// it is one of them; without a name only an unambiguous delivery is chosen,
-/// never a guess between several.
-pub fn attribute<'a>(named: Option<&str>, live: &[&'a str]) -> Option<&'a str> {
+/// live deliveries of that file as (id, source revision). Only deliveries of
+/// the revision actually served qualify. The delivery the URL names is used
+/// only if it is one of them; without a name only an unambiguous delivery is
+/// chosen, never a guess between several.
+pub fn attribute<'a>(
+    named: Option<&str>,
+    served_revision: &str,
+    live: &[(&'a str, &str)],
+) -> Option<&'a str> {
+    let mut serving = live
+        .iter()
+        .filter(|(_, revision)| *revision == served_revision)
+        .map(|(id, _)| *id);
     match named {
-        Some(name) => live.iter().copied().find(|id| *id == name),
-        None => match live {
-            [only] => Some(only),
+        Some(name) => serving.find(|id| *id == name),
+        None => match (serving.next(), serving.next()) {
+            (Some(only), None) => Some(only),
             _ => None,
         },
     }
@@ -292,8 +362,21 @@ pub fn attribute<'a>(named: Option<&str>, live: &[&'a str]) -> Option<&'a str> {
 mod tests {
     use super::*;
 
-    fn row(at: u64, revision: u64) -> RowIdentity {
-        (at, "v".into(), revision)
+    fn row(id: &str, revision: u64, updated_ms: u64) -> ViewingRow {
+        ViewingRow {
+            id: id.into(),
+            revision,
+            updated_ms,
+        }
+    }
+
+    fn viewing(w: &mut Watch, row: ViewingRow, status: Viewing, now_ms: u64) -> bool {
+        w.observe(Observation::Viewing {
+            row,
+            status,
+            position_ms: 0,
+            now_ms,
+        })
     }
 
     #[test]
@@ -311,37 +394,40 @@ mod tests {
             position_ms: 5_000,
             now_ms: 11_000
         }));
-        w.observe(Observation::Viewing {
-            row: row(9_000, 3),
+        assert!(w.observe(Observation::Viewing {
+            row: row("v", 3, 9_000),
             status: Viewing::Playing,
             position_ms: 5_000,
             now_ms: 12_000,
-        });
-        assert_eq!(w.position_ms, Some(10_000));
-        // Reading the same row again is not a new observation.
-        assert!(!w.observe(Observation::Viewing {
-            row: row(9_000, 3),
-            status: Viewing::Playing,
-            position_ms: 5_000,
-            now_ms: 13_000,
         }));
+        assert_eq!(w.position_ms, Some(10_000));
+        // Rereading the same row is not a new observation.
+        assert!(!viewing(
+            &mut w,
+            row("v", 3, 9_000),
+            Viewing::Playing,
+            13_000
+        ));
+        // A superseding session written in the same second is.
+        assert!(viewing(
+            &mut w,
+            row("a", 1, 9_000),
+            Viewing::Playing,
+            13_000
+        ));
+        assert!(!viewing(
+            &mut w,
+            row("v", 2, 8_000),
+            Viewing::Paused,
+            13_000
+        ));
     }
 
     #[test]
     fn resuming_after_a_long_pause_is_not_a_stall() {
         let mut w = Watch::new(None);
-        w.observe(Observation::Viewing {
-            row: row(0, 1),
-            status: Viewing::Paused,
-            position_ms: 0,
-            now_ms: 0,
-        });
-        w.observe(Observation::Viewing {
-            row: row(60_000, 2),
-            status: Viewing::Playing,
-            position_ms: 0,
-            now_ms: 60_000,
-        });
+        viewing(&mut w, row("v", 1, 0), Viewing::Paused, 0);
+        viewing(&mut w, row("v", 2, 60_000), Viewing::Playing, 60_000);
         w.observe(Observation::Tick { now_ms: 60_001 });
         assert!(!w.stalled);
         w.observe(Observation::Tick {
@@ -355,8 +441,40 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_read_late_retracts_the_stall_it_preceded() {
+        let mut w = Watch::new(None);
+        viewing(&mut w, row("v", 1, 0), Viewing::Playing, 0);
+        // The player paused at 14 s; the row is read at 17 s, after a tick at
+        // 15 s still saw it playing.
+        w.observe(Observation::Tick { now_ms: STALL_MS });
+        assert_eq!(w.stalls, 1);
+        viewing(&mut w, row("v", 2, 14_000), Viewing::Paused, 17_000);
+        assert_eq!((w.stalls, w.stalled), (0, false));
+        // A pause recorded after the stall began leaves it counted.
+        viewing(&mut w, row("v", 3, 20_000), Viewing::Playing, 20_000);
+        w.observe(Observation::Tick {
+            now_ms: 20_000 + STALL_MS,
+        });
+        viewing(&mut w, row("v", 4, 36_000), Viewing::Paused, 37_000);
+        assert_eq!((w.stalls, w.stalled), (1, false));
+    }
+
+    #[test]
+    fn positions_beyond_the_api_range_are_not_observed() {
+        let mut w = Watch::new(Some(u64::MAX));
+        assert_eq!(w.start_position_ms, None);
+        assert!(!w.observe(Observation::Playhead {
+            generation: 1,
+            sequence: 1,
+            position_ms: MAX_POSITION_MS + 1,
+            now_ms: 0
+        }));
+        assert_eq!(w.position_ms, None);
+    }
+
+    #[test]
     fn only_committed_writes_are_acknowledged() {
-        let snapshot = |position| Snapshot {
+        let snapshot = |position, mode: &str| Snapshot {
             bytes_sent: 1,
             peak_bps: 1,
             watched_ms: 0,
@@ -364,32 +482,43 @@ mod tests {
             position_ms: Some(position),
             last_activity_ms: 1,
             status: "paused".into(),
+            mode: mode.into(),
         };
         let mut p = Persisted::default();
-        let first = p.due(&snapshot(5)).unwrap();
+        let first = p.due(&snapshot(5, "direct")).unwrap();
         assert!(first.status_changed);
         // The write failed: still due.
-        assert!(p.due(&snapshot(5)).is_some());
+        assert!(p.due(&snapshot(5, "direct")).is_some());
         p.acknowledge(first.snapshot);
-        assert!(p.due(&snapshot(5)).is_none());
-        // A paused seek changes only the position: still written.
-        assert_eq!(p.due(&snapshot(1)).map(|d| d.status_changed), Some(false));
+        assert!(p.due(&snapshot(5, "direct")).is_none());
+        // A paused seek or a replan changes only the position or mode: still written.
+        assert_eq!(
+            p.due(&snapshot(1, "direct")).map(|d| d.status_changed),
+            Some(false)
+        );
+        assert!(p.due(&snapshot(5, "transcode")).is_some());
     }
 
     #[test]
-    fn attribution_never_guesses() {
-        assert_eq!(attribute(Some("b"), &["a", "b"]), Some("b"));
-        assert_eq!(attribute(Some("c"), &["a", "b"]), None);
-        assert_eq!(attribute(Some("c"), &["c2"]), None);
-        assert_eq!(attribute(None, &["a"]), Some("a"));
-        assert_eq!(attribute(None, &["a", "b"]), None);
-        assert_eq!(attribute(None, &[]), None);
+    fn attribution_never_guesses_and_matches_the_served_revision() {
+        let live = [("a", "r1"), ("b", "r1"), ("c", "r0")];
+        assert_eq!(attribute(Some("b"), "r1", &live), Some("b"));
+        assert_eq!(attribute(Some("c"), "r1", &live), None, "another revision");
+        assert_eq!(attribute(Some("z"), "r1", &live), None);
+        assert_eq!(attribute(None, "r0", &live), Some("c"));
+        assert_eq!(attribute(None, "r1", &live), None, "ambiguous");
+        assert_eq!(attribute(None, "r1", &[]), None);
     }
 
     #[test]
     fn drains_until_responses_finish_or_the_allowance_passes() {
-        assert!(settled(0, 10, 10));
-        assert!(!settled(1, 10, 10 + DRAIN_MS - 1));
-        assert!(settled(1, 10, 10 + DRAIN_MS));
+        assert!(settled(0, 10, 10, false));
+        assert!(!settled(1, 10, 10 + DRAIN_MS - 1, false));
+        assert!(settled(1, 10, 10 + DRAIN_MS, false));
+        assert!(!settled(1, 10, 10 + SHUTDOWN_DRAIN_MS - 1, true));
+        assert!(settled(1, 10, 10 + SHUTDOWN_DRAIN_MS, true));
+        assert!(keep_finishing(1, 0, SHUTDOWN_DRAIN_MS));
+        assert!(!keep_finishing(1, 0, SHUTDOWN_DRAIN_MS + SHUTDOWN_RETRY_MS));
+        assert!(!keep_finishing(0, 0, 0));
     }
 }

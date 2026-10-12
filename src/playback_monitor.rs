@@ -19,7 +19,7 @@ use std::{
 use axum::body::{Body, Bytes};
 use http_body::Body as HttpBody;
 use playscale_core::playback_monitor::{
-    EndReason, Observation, Persisted, RowIdentity, Snapshot, Viewing, Watch,
+    EndReason, Observation, Persisted, Snapshot, Viewing, ViewingRow, Watch,
 };
 
 /// Seconds of transfer averaged into the current throughput.
@@ -219,14 +219,17 @@ impl Telemetry {
         }
     }
 
-    /// The delivery's newest viewing row, read with the periodic flush.
-    pub fn viewing(&self, row: RowIdentity, status: Viewing, position_ms: u64) {
-        self.watch.lock().unwrap().observe(Observation::Viewing {
+    /// The delivery's authoritative viewing row, read with the periodic flush.
+    pub fn viewing(&self, row: ViewingRow, status: Viewing, position_ms: u64) {
+        let now = wall_ms();
+        if self.watch.lock().unwrap().observe(Observation::Viewing {
             row,
             status,
             position_ms,
-            now_ms: wall_ms(),
-        });
+            now_ms: now,
+        }) {
+            self.last_activity_ms.store(now, Ordering::Relaxed);
+        }
     }
 
     /// Advance once a second: roll the throughput window, track the peak and
@@ -259,12 +262,12 @@ impl Telemetry {
         let now = wall_ms();
         let bytes = self.bytes.load(Ordering::Relaxed);
         let throughput = self.window.lock().unwrap().rate(now / 1000);
-        let elapsed = now.saturating_sub(self.started_ms).max(1000) / 1000;
+        let elapsed_ms = now.saturating_sub(self.started_ms);
         let w = self.watch.lock().unwrap();
         Reading {
             bytes_sent: bytes,
             throughput_bps: throughput,
-            average_bps: bytes / elapsed,
+            average_bps: average_bps(bytes, elapsed_ms),
             peak_bps: self.peak_bps.load(Ordering::Relaxed).max(throughput),
             position_ms: w.position_ms,
             start_position_ms: w.start_position_ms,
@@ -277,7 +280,14 @@ impl Telemetry {
         }
     }
 
-    fn snapshot(r: &Reading) -> Snapshot {
+    /// What the history row should hold now, with the delivery's own state
+    /// (so reducer-driven status changes are written and announced) and how
+    /// its bytes are produced now.
+    fn snapshot(
+        r: &Reading,
+        delivery: Option<playscale_core::delivery::Status>,
+        mode: &str,
+    ) -> Snapshot {
         Snapshot {
             bytes_sent: r.bytes_sent,
             peak_bps: r.peak_bps,
@@ -285,9 +295,22 @@ impl Telemetry {
             stalls: r.stalls,
             position_ms: r.position_ms,
             last_activity_ms: r.last_activity_ms,
-            status: status(None, r).to_string(),
+            status: status(delivery, r).to_string(),
+            mode: mode.to_string(),
         }
     }
+}
+
+/// Bytes per second over a duration in milliseconds, without truncating it to
+/// whole seconds; durations under a second count as one.
+pub fn average_bps(bytes: u64, elapsed_ms: u64) -> u64 {
+    (u128::from(bytes) * 1000 / u128::from(elapsed_ms.max(1000))) as u64
+}
+
+/// A position as stored: positions beyond the API's range are never
+/// observed (see `MAX_POSITION_MS`), so this only guards the conversion.
+fn stored(position: Option<u64>) -> Option<i64> {
+    position.and_then(|p| i64::try_from(p).ok())
 }
 
 /// The monitor's status for a session: the delivery's own state first, then
@@ -382,7 +405,7 @@ pub async fn start(
         .bind(s.delivery_id).bind(s.principal_id).bind(s.profile_id).bind(s.timeline_id)
         .bind(s.version_id).bind(s.file_id).bind(s.mode).bind(telemetry.network)
         .bind(telemetry.started_ms as i64).bind(telemetry.started_ms as i64)
-        .bind(w.start_position_ms.map(|p| p as i64))
+        .bind(stored(w.start_position_ms))
         .execute(&mut *conn).await?;
     announce(conn, s.delivery_id, "changed").await
 }
@@ -404,63 +427,79 @@ async fn announce(
     .map(|_| ())
 }
 
+/// The viewing row a delivery's monitoring follows: the session its timeline
+/// viewing state names, if that session is on this delivery, otherwise the
+/// newest. Timestamps have one-second precision, so a tie between a
+/// superseded and a replacing session is broken by that recorded fact.
+pub const AUTHORITATIVE_VIEWING: &str = "SELECT vs.id,vs.revision,vs.status,vs.position_ms,vs.updated_at FROM viewing_sessions vs \
+    LEFT JOIN timeline_viewing tv ON tv.profile_id=vs.profile_id AND tv.timeline_id=vs.timeline_id AND tv.session_id=vs.id \
+    WHERE vs.delivery_id=? ORDER BY tv.session_id IS NULL, vs.updated_at DESC, vs.revision DESC, vs.id DESC LIMIT 1";
+
+/// A live delivery as a flush sees it.
+pub struct Live {
+    pub id: String,
+    pub telemetry: Arc<Telemetry>,
+    /// The reducer's status and how the bytes are produced now.
+    pub status: playscale_core::delivery::Status,
+    pub mode: &'static str,
+}
+
 /// Fold the players' viewing rows into live telemetry, then write every
 /// session whose history row is behind. A snapshot counts as written only
 /// once its transaction commits; after a failure the rows stay due and the
 /// next flush retries them. Hints go out only when a session's status changed.
-pub async fn flush(
-    db: &sqlx::SqlitePool,
-    live: &[(String, Arc<Telemetry>)],
-) -> Result<(), sqlx::Error> {
+pub async fn flush(db: &sqlx::SqlitePool, live: &[Live]) -> Result<(), sqlx::Error> {
     if live.is_empty() {
         return Ok(());
     }
     let mut conn = db.acquire().await?;
-    for (id, telemetry) in live {
-        let row: Option<(String, i64, String, i64, i64)> = sqlx::query_as(
-            "SELECT id,revision,status,position_ms,updated_at FROM viewing_sessions WHERE delivery_id=? ORDER BY updated_at DESC, id DESC, revision DESC LIMIT 1",
-        )
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        if let Some((row, revision, status, position, updated)) = row
+    for session in live {
+        let row: Option<(String, i64, String, i64, i64)> = sqlx::query_as(AUTHORITATIVE_VIEWING)
+            .bind(&session.id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if let Some((id, revision, status, position, updated)) = row
             && let Some(status) = Viewing::parse(&status)
         {
-            let identity = (
-                u64::try_from(updated).unwrap_or(0),
-                row,
-                u64::try_from(revision).unwrap_or(0),
-            );
-            telemetry.viewing(identity, status, u64::try_from(position).unwrap_or(0));
+            let row = ViewingRow {
+                id,
+                revision: u64::try_from(revision).unwrap_or(0),
+                updated_ms: u64::try_from(updated).unwrap_or(0).saturating_mul(1000),
+            };
+            session
+                .telemetry
+                .viewing(row, status, u64::try_from(position).unwrap_or(0));
         }
     }
     drop(conn);
     let due: Vec<_> = live
         .iter()
-        .filter_map(|(id, telemetry)| {
-            let snapshot = Telemetry::snapshot(&telemetry.read());
-            let due = telemetry.persisted.lock().unwrap().due(&snapshot)?;
-            Some((id, telemetry, due))
+        .filter_map(|session| {
+            let reading = session.telemetry.read();
+            let snapshot = Telemetry::snapshot(&reading, Some(session.status), session.mode);
+            let due = session.telemetry.persisted.lock().unwrap().due(&snapshot)?;
+            Some((session, due))
         })
         .collect();
     if due.is_empty() {
         return Ok(());
     }
     let mut tx = crate::db::begin_write(db).await?;
-    for (id, _, due) in &due {
+    for (session, due) in &due {
         let s = &due.snapshot;
-        sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=? WHERE delivery_id=? AND ended_at IS NULL")
+        sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=?,mode=? WHERE delivery_id=? AND ended_at IS NULL")
             .bind(s.bytes_sent as i64).bind(s.peak_bps as i64).bind(s.watched_ms as i64)
-            .bind(s.stalls as i64).bind(s.position_ms.map(|p| p as i64))
-            .bind(s.last_activity_ms as i64).bind(id.as_str())
+            .bind(s.stalls as i64).bind(stored(s.position_ms))
+            .bind(s.last_activity_ms as i64).bind(&s.mode).bind(&session.id)
             .execute(&mut *tx).await?;
         if due.status_changed {
-            announce(&mut tx, id, "changed").await?;
+            announce(&mut tx, &session.id, "changed").await?;
         }
     }
     tx.commit().await?;
-    for (_, telemetry, due) in due {
-        telemetry
+    for (session, due) in due {
+        session
+            .telemetry
             .persisted
             .lock()
             .unwrap()
@@ -490,15 +529,16 @@ pub async fn finish(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
     telemetry: &Telemetry,
+    mode: &str,
     fallback: EndReason,
 ) -> Result<(), sqlx::Error> {
     let r = telemetry.read();
     let reason = telemetry.ended().unwrap_or(fallback);
     let now = wall_ms() as i64;
-    let done = sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=?,ended_at=?,end_reason=coalesce(end_reason,?) WHERE delivery_id=? AND ended_at IS NULL")
+    let done = sqlx::query("UPDATE playback_monitor_sessions SET bytes_sent=?,peak_bps=?,watched_ms=?,stalls=?,end_position_ms=?,last_activity_at=?,mode=?,ended_at=?,end_reason=coalesce(end_reason,?) WHERE delivery_id=? AND ended_at IS NULL")
         .bind(r.bytes_sent as i64).bind(r.peak_bps as i64).bind(r.watched_ms as i64)
-        .bind(r.stalls as i64).bind(r.position_ms.map(|p| p as i64))
-        .bind(r.last_activity_ms as i64).bind(now).bind(reason.as_str()).bind(id)
+        .bind(r.stalls as i64).bind(stored(r.position_ms))
+        .bind(r.last_activity_ms as i64).bind(mode).bind(now).bind(reason.as_str()).bind(id)
         .execute(&mut *conn).await?;
     if done.rows_affected() > 0 {
         announce(conn, id, "deleted").await?;
@@ -566,7 +606,15 @@ mod tests {
         let r = t.read();
         assert_eq!(r.position_ms, Some(10_000));
         assert_eq!(r.start_position_ms, Some(10_000));
-        t.viewing((1, "v".into(), 1), Viewing::Playing, 2_000);
+        t.viewing(
+            ViewingRow {
+                id: "v".into(),
+                revision: 1,
+                updated_ms: 1_000,
+            },
+            Viewing::Playing,
+            2_000,
+        );
         let r = t.read();
         assert_eq!(
             r.position_ms,

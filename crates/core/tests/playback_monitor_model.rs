@@ -1,9 +1,11 @@
 //! Playback monitoring follows the production delivery reducer: which
 //! playheads it accepted, which step ended playback and why, viewing rows in
-//! order, stall episodes, and history writes acknowledged only on commit.
+//! order (read some time after the player writes them), stall episodes, and
+//! history writes acknowledged only on commit.
 use playscale_core::delivery::{self as core, Delivery, Input, Operation, Pin};
 use playscale_core::playback_monitor::{
-    self as monitor, EndReason, Observation, Persisted, STALL_MS, Snapshot, Viewing, Watch,
+    self as monitor, EndReason, Observation, Persisted, STALL_MS, Snapshot, Viewing, ViewingRow,
+    Watch,
 };
 use serde::{Deserialize, Serialize};
 use stateless::{
@@ -20,11 +22,21 @@ struct State {
     persisted: Persisted,
     /// What the history row holds (the database, as committed).
     row: Option<Snapshot>,
-    /// Ghost, kept by the model alone: the newest row revision applied and
-    /// when viewing last entered playing.
-    ghost_revision: u64,
-    resumed_at: Option<u64>,
+    /// Viewing rows as the player wrote them, oldest first (the last two).
+    written: Vec<(ViewingRow, Viewing)>,
+    truth: Truth,
     steps: u8,
+}
+
+/// What really happened, kept by the model alone from the player's writes
+/// (at the time they happened) and the reducer's accepted playheads.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct Truth {
+    playing_since: Option<u64>,
+    position: Option<u64>,
+    advanced_at: Option<u64>,
+    stalled: bool,
+    stalls: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -37,8 +49,14 @@ enum Step {
     },
     /// Time passes; the worker ticks the reducer and the monitor.
     Wait(u64),
-    /// The newest viewing row as read (revision, status, position).
-    Row(u64, Viewing, u64),
+    /// The player records a status in its viewing session.
+    Play(Viewing),
+    /// The player starts a new viewing session, playing.
+    Supersede,
+    /// The monitor reads the newest written row, or the one before it.
+    Read {
+        stale: bool,
+    },
     /// A history flush whose transaction commits or fails.
     Flush {
         commits: bool,
@@ -56,6 +74,7 @@ fn snapshot(w: &Watch) -> Snapshot {
         position_ms: w.position_ms,
         last_activity_ms: w.observed_at.unwrap_or(0),
         status: format!("{:?}/{}", w.viewing, w.stalled),
+        mode: "direct".into(),
     }
 }
 
@@ -73,11 +92,44 @@ impl Monitoring {
                     position_ms,
                     now_ms: n.now,
                 });
+                if n.truth.position.is_some_and(|p| position_ms > p) {
+                    n.truth.advanced_at = Some(n.now);
+                }
+                n.truth.position = Some(position_ms);
             }
             if let Some(reason) = monitor::end_reason(&n.delivery, &input, &next, stopping) {
                 n.ended.push(reason);
             }
             n.delivery = next;
+        }
+    }
+
+    fn write(&self, n: &mut State, id: &str, status: Viewing) {
+        let revision = n
+            .written
+            .iter()
+            .rev()
+            .find(|(r, _)| r.id == id)
+            .map_or(1, |(r, _)| r.revision + 1);
+        n.written.push((
+            ViewingRow {
+                id: id.into(),
+                revision,
+                updated_ms: n.now,
+            },
+            status,
+        ));
+        if n.written.len() > 2 {
+            n.written.remove(0);
+        }
+        let was_playing = n.truth.playing_since.is_some();
+        match status {
+            Viewing::Playing if !was_playing => n.truth.playing_since = Some(n.now),
+            Viewing::Playing => {}
+            _ => {
+                n.truth.playing_since = None;
+                n.truth.stalled = false;
+            }
         }
     }
 }
@@ -89,9 +141,9 @@ impl Model for Monitoring {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.playback-monitor".into(),
-            model_version: 1,
-            properties_version: 1,
-            codec_version: 1,
+            model_version: 2,
+            properties_version: 2,
+            codec_version: 2,
             build: [
                 include_str!("../src/playback_monitor.rs"),
                 include_str!("../src/delivery.rs"),
@@ -116,8 +168,8 @@ impl Model for Monitoring {
             ended: vec![],
             persisted: Persisted::default(),
             row: None,
-            ghost_revision: 0,
-            resumed_at: None,
+            written: vec![],
+            truth: Truth::default(),
             steps: 0,
         })
     }
@@ -142,21 +194,36 @@ impl Model for Monitoring {
                 let now_ms = n.now;
                 self.reduce(&mut n, Input::Tick { now_ms }, false);
                 n.watch.observe(Observation::Tick { now_ms });
-            }
-            Step::Row(revision, status, position_ms) => {
-                if *revision > s.ghost_revision {
-                    n.ghost_revision = *revision;
-                    n.resumed_at = match status {
-                        Viewing::Playing => s.resumed_at.or(Some(s.now)),
-                        _ => None,
-                    };
+                let threshold = n
+                    .truth
+                    .advanced_at
+                    .max(n.truth.playing_since)
+                    .map(|at| at + STALL_MS);
+                let stalled =
+                    n.truth.playing_since.is_some() && threshold.is_some_and(|at| now_ms >= at);
+                if stalled && !n.truth.stalled {
+                    n.truth.stalls += 1;
                 }
-                n.watch.observe(Observation::Viewing {
-                    row: (*revision, "v".into(), *revision),
-                    status: *status,
-                    position_ms: *position_ms,
-                    now_ms: s.now,
-                });
+                n.truth.stalled = stalled;
+            }
+            Step::Play(status) => {
+                let id = s
+                    .written
+                    .last()
+                    .map_or("a".to_owned(), |(r, _)| r.id.clone());
+                self.write(&mut n, &id, *status);
+            }
+            Step::Supersede => self.write(&mut n, "b", Viewing::Playing),
+            Step::Read { stale } => {
+                let index = n.written.len().checked_sub(if *stale { 2 } else { 1 });
+                if let Some((row, status)) = index.and_then(|i| n.written.get(i)).cloned() {
+                    n.watch.observe(Observation::Viewing {
+                        row,
+                        status,
+                        position_ms: 0,
+                        now_ms: s.now,
+                    });
+                }
             }
             Step::Flush { commits } => {
                 if let Some(due) = n.persisted.due(&snapshot(&n.watch))
@@ -171,6 +238,8 @@ impl Model for Monitoring {
     }
     fn check_state(&self, s: &State) -> Result<Vec<Check>, ModelError> {
         let current = snapshot(&s.watch);
+        // The monitor has read the player's newest row.
+        let synced = s.written.last().map(|(r, _)| r) == s.watch.row.as_ref();
         let checks = [
             (
                 "one_end_reason_per_delivery",
@@ -189,8 +258,9 @@ impl Model for Monitoring {
                 !s.watch.stalled || s.watch.viewing == Some(Viewing::Playing),
             ),
             (
-                "stall_needs_a_full_window_of_playing",
-                !s.watch.stalled || s.resumed_at.is_some_and(|at| s.now - at >= STALL_MS),
+                "no_false_stalls_once_rows_are_read",
+                !synced
+                    || (s.watch.stalls <= s.truth.stalls && (!s.watch.stalled || s.truth.stalled)),
             ),
         ];
         Ok(checks
@@ -212,6 +282,12 @@ impl Model for Monitoring {
     ) -> Result<Vec<Check>, ModelError> {
         let n = t.state;
         let accepted = n.delivery.observation != s.delivery.observation;
+        let read_row = |stale: bool| {
+            s.written
+                .len()
+                .checked_sub(if stale { 2 } else { 1 })
+                .and_then(|i| s.written.get(i))
+        };
         let checks = [
             (
                 "playheads_follow_the_reducer",
@@ -226,32 +302,46 @@ impl Model for Monitoring {
             ),
             (
                 "viewing_rows_never_rewind_reducer_playheads",
-                !matches!(step, Step::Row(..))
+                !matches!(step, Step::Read { .. })
                     || s.watch.playhead.is_none()
                     || n.watch.position_ms == s.watch.position_ms,
             ),
             (
                 "stale_or_repeated_rows_change_nothing",
                 match step {
-                    Step::Row(revision, ..) => {
-                        s.watch.row.as_ref().is_none_or(|(r, ..)| revision > r)
+                    Step::Read { stale } => read_row(*stale).is_none_or(|(row, _)| {
+                        s.watch.row.as_ref().is_none_or(|seen| row.newer_than(seen))
                             || n.watch == s.watch
-                    }
+                    }),
                     _ => true,
                 },
             ),
             (
-                "stalls_counted_once_per_episode",
+                "stalls_counted_once_per_episode_and_retracted_only_by_an_earlier_pause",
                 n.watch.stalls == s.watch.stalls
                     || (n.watch.stalls == s.watch.stalls + 1
+                        && matches!(step, Step::Wait(_))
                         && !s.watch.stalled
-                        && n.watch.stalled),
+                        && n.watch.stalled)
+                    || (n.watch.stalls + 1 == s.watch.stalls
+                        && s.watch.stalled
+                        && match step {
+                            Step::Read { stale } => {
+                                read_row(*stale).is_some_and(|(row, status)| {
+                                    *status != Viewing::Playing
+                                        && s.watch
+                                            .stalled_since
+                                            .is_some_and(|at| row.updated_ms < at)
+                                })
+                            }
+                            _ => false,
+                        }),
             ),
             (
                 "watched_time_only_grows_with_observed_play",
                 n.watch.watched_ms >= s.watch.watched_ms
                     && (n.watch.watched_ms == s.watch.watched_ms
-                        || matches!(step, Step::Observe(..) | Step::Row(..))),
+                        || matches!(step, Step::Observe(..) | Step::Read { .. })),
             ),
             (
                 "reason_names_the_fencing_step",
@@ -285,9 +375,11 @@ impl Model for Monitoring {
     }
 }
 
+const STEPS: u8 = 6;
+
 impl Enumerate for Monitoring {
     fn inputs(&self, s: &State) -> Result<Vec<Step>, ModelError> {
-        if s.steps >= 5 {
+        if s.steps >= STEPS {
             return Ok(vec![]);
         }
         let mut steps = vec![
@@ -295,20 +387,18 @@ impl Enumerate for Monitoring {
             Step::Close { stopping: false },
             Step::Close { stopping: true },
             Step::Wait(1_000),
-            Step::Wait(STALL_MS),
+            Step::Wait(STALL_MS - 1_000),
+            Step::Play(Viewing::Playing),
+            Step::Play(Viewing::Paused),
+            Step::Supersede,
+            Step::Read { stale: false },
+            Step::Read { stale: true },
             Step::Flush { commits: true },
             Step::Flush { commits: false },
         ];
         for sequence in 1..=2 {
-            for position in [0, 400, 900] {
+            for position in [0, 900] {
                 steps.push(Step::Observe(sequence, position));
-            }
-        }
-        for revision in 1..=2 {
-            for status in [Viewing::Playing, Viewing::Paused] {
-                for position in [0, 900] {
-                    steps.push(Step::Row(revision, status, position));
-                }
             }
         }
         Ok(steps)
@@ -341,7 +431,15 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, ModelError> {
 
 #[test]
 fn monitoring_graph_follows_reducer_decisions_and_commits() {
-    let report = stateless::explore::enumerate(&Monitoring, Default::default()).unwrap();
+    let report = stateless::explore::enumerate(
+        &Monitoring,
+        stateless::explore::SearchConfig {
+            max_states: 5_000_000,
+            max_transitions: 100_000_000,
+            max_depth: STEPS as usize + 1,
+        },
+    )
+    .unwrap();
     assert!(report.failure.is_none(), "{:?}", report.failure);
     assert_eq!(report.skipped_checks, 0);
     assert_eq!(
@@ -349,7 +447,7 @@ fn monitoring_graph_follows_reducer_decisions_and_commits() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Playback monitor: {} states, {} transitions; 5 steps over playheads (sequences 1-2, positions 0/400/900), failure, close (stopping or not), waits of 1 s and the stall window, viewing rows (revisions 1-2, playing/paused), committed and failed flushes",
+        "Playback monitor: {} states, {} transitions; {STEPS} steps over playheads (sequences 1-2, positions 0/900), failure, close (stopping or not), waits of 1 s and 14 s, player rows (playing, paused, a superseding session) read late or stale, committed and failed flushes",
         report.states, report.transitions
     );
 }

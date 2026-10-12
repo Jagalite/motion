@@ -420,6 +420,12 @@ pub async fn file_content(
         core::admit_file_bytes(&caller.principal, facts.as_ref())?;
         reader = Some(caller.principal.id.clone());
     }
+    // The revision served: the one requested (serving refuses any other), or
+    // the current one.
+    let served = params
+        .revision
+        .clone()
+        .or_else(|| facts.as_ref().map(|f| f.revision.clone()));
     let query = media::MediaQuery {
         revision: params.revision,
     };
@@ -433,11 +439,16 @@ pub async fn file_content(
         headers,
     )
     .await
-    .map(|response| match &reader {
-        Some(principal) => {
-            crate::delivery::counted_file(&app, principal, &attributed, named.as_deref(), response)
-        }
-        None => response,
+    .map(|response| match (&reader, &served) {
+        (Some(principal), Some(revision)) => crate::delivery::counted_file(
+            &app,
+            principal,
+            &attributed,
+            revision,
+            named.as_deref(),
+            response,
+        ),
+        _ => response,
     })
     .map_err(|e| {
         let (status, code, _) = e.parts();

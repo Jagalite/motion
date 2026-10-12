@@ -120,12 +120,12 @@ async fn sessions(State(app): State<App>, caller: Caller) -> Result<Response, Pr
             .await?;
         // A delivery admitted this instant may not be readable yet.
         let Some(row) = row else { continue };
-        let viewing: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM viewing_sessions WHERE delivery_id=? ORDER BY updated_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&session.id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let viewing: Option<(String, i64, String, i64, i64)> =
+            sqlx::query_as(crate::playback_monitor::AUTHORITATIVE_VIEWING)
+                .bind(&session.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let viewing = viewing.map(|(id, ..)| id);
         let r = session.telemetry.read();
         let mut m = identity(&row);
         m.insert("viewing_session_id".into(), json!(viewing));
@@ -247,7 +247,7 @@ async fn history(
         .into_iter()
         .map(|r| {
             let ended = r.ended_at.unwrap_or(r.last_activity_at);
-            let active_seconds = (ended - r.started_at).max(1000) / 1000;
+
             let mut m = identity(&r);
             m.insert("ended_at".into(), json!(millis(ended)));
             m.insert("end_reason".into(), json!(r.end_reason));
@@ -257,7 +257,13 @@ async fn history(
             m.insert("bytes_sent".into(), json!(r.bytes_sent.to_string()));
             m.insert(
                 "average_bps".into(),
-                json!((r.bytes_sent / active_seconds).to_string()),
+                json!(
+                    crate::playback_monitor::average_bps(
+                        u64::try_from(r.bytes_sent).unwrap_or(0),
+                        u64::try_from(ended - r.started_at).unwrap_or(0),
+                    )
+                    .to_string()
+                ),
             );
             m.insert("peak_bps".into(), json!(r.peak_bps.to_string()));
             m.insert("stalls".into(), json!(r.stalls));

@@ -1506,8 +1506,19 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                     }
                     finishing(&app, &session);
                 }
-                // Responses are being cut: write every history row now.
-                settle(&app, true).await;
+                // Graceful HTTP shutdown is still sending responses: wait for
+                // them briefly, and keep retrying failed writes, within the
+                // time the process gives this worker. Rows left after that
+                // are finished by startup recovery with the reason recorded.
+                let stopped = crate::playback_monitor::wall_ms();
+                loop {
+                    settle(&app, true).await;
+                    let queued = app.processing.deliveries.finishing.lock().unwrap().len();
+                    if !monitor::keep_finishing(queued, stopped, crate::playback_monitor::wall_ms()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
                 return Ok(());
             }
             _ = tick.tick() => {}
@@ -1531,7 +1542,12 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             };
             session.telemetry.tick();
             if session.owner.is_some() && !state.status.fenced() {
-                monitored.push((session.id.clone(), session.telemetry.clone()));
+                monitored.push(crate::playback_monitor::Live {
+                    id: session.id.clone(),
+                    telemetry: session.telemetry.clone(),
+                    status: state.status,
+                    mode: crate::playback_monitor::mode(current_operation(&state)),
+                });
             }
             if state.status.fenced() && state.generations.is_empty() {
                 if let Err(error) = record(
@@ -1619,9 +1635,9 @@ fn finishing(app: &App, session: &Session) {
 }
 
 /// Write the history rows of ended deliveries once their responses are done
-/// (or the drain allowance passed, or `now` at shutdown). A row whose write
-/// fails stays queued with its telemetry and is retried on the next tick.
-async fn settle(app: &App, now: bool) {
+/// or the drain allowance passed (shorter while `stopping`). A row whose
+/// write fails stays queued with its telemetry and is retried next time.
+async fn settle(app: &App, stopping: bool) {
     let wall = crate::playback_monitor::wall_ms();
     let ready: Vec<_> = app
         .processing
@@ -1630,14 +1646,20 @@ async fn settle(app: &App, now: bool) {
         .lock()
         .unwrap()
         .iter()
-        .filter(|f| now || monitor::settled(f.telemetry.open_responses(), f.ended_ms, wall))
-        .map(|f| (f.id.clone(), f.telemetry.clone()))
+        .filter(|f| monitor::settled(f.telemetry.open_responses(), f.ended_ms, wall, stopping))
+        .map(|f| (f.id.clone(), f.telemetry.clone(), f.mode))
         .collect();
-    for (id, telemetry) in ready {
+    for (id, telemetry, mode) in ready {
         let result = async {
             let mut tx = crate::db::begin_write(&app.db).await?;
-            crate::playback_monitor::finish(&mut tx, &id, &telemetry, monitor::EndReason::Closed)
-                .await?;
+            crate::playback_monitor::finish(
+                &mut tx,
+                &id,
+                &telemetry,
+                mode,
+                monitor::EndReason::Closed,
+            )
+            .await?;
             tx.commit().await
         }
         .await;
@@ -1736,14 +1758,16 @@ pub(crate) fn counted(app: &App, id: &str, response: Response) -> Response {
     }
 }
 
-/// Count a direct file read into the reader's live delivery of that file:
-/// direct play fetches the file's own URL, which names its delivery. Without
-/// a name only an unambiguous delivery is used; otherwise nothing is counted
-/// (a download, or a client reading without a delivery).
+/// Count a direct file read into the reader's live delivery of that file
+/// and of the revision served: direct play fetches the file's own URL, which
+/// names its delivery. Without a name only an unambiguous delivery is used;
+/// otherwise nothing is counted (a download, or a client reading without a
+/// delivery).
 pub(crate) fn counted_file(
     app: &App,
     principal: &str,
     file_id: &str,
+    served_revision: &str,
     named: Option<&str>,
     response: Response,
 ) -> Response {
@@ -1762,8 +1786,14 @@ pub(crate) fn counted_file(
         })
         .cloned()
         .collect();
-    let ids: Vec<&str> = live.iter().map(|s| s.id.as_str()).collect();
-    let telemetry = monitor::attribute(named, &ids)
+    let candidates: Vec<(&str, &str)> = live
+        .iter()
+        .filter_map(|s| {
+            let owner = s.owner.as_ref()?;
+            Some((s.id.as_str(), owner.file_revision.as_str()))
+        })
+        .collect();
+    let telemetry = monitor::attribute(named, served_revision, &candidates)
         .and_then(|id| live.iter().find(|s| s.id == id))
         .map(|s| s.telemetry.clone());
     match telemetry {

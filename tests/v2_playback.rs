@@ -2929,8 +2929,32 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // A response still being sent when the server stops (graceful HTTP
+    // shutdown keeps sending it) is waited for: its bytes reach history.
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v2/streams/{second}/{generation}/content"))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
     // A clean stop finishes live sessions as server_stopped.
     f.server.stop.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let draining: Option<i64> =
+        sqlx::query_scalar("SELECT ended_at FROM playback_monitor_sessions WHERE delivery_id=?")
+            .bind(&second)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(draining, None, "history waits for the open response");
+    let rest = held.into_body().collect().await.unwrap().to_bytes().len() as i64;
+    assert!(rest > 0);
     let mut reason: Option<String> = None;
     for _ in 0..100 {
         reason = sqlx::query_scalar(
@@ -2947,6 +2971,13 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(reason.as_deref(), Some("server_stopped"));
+    let sent: i64 =
+        sqlx::query_scalar("SELECT bytes_sent FROM playback_monitor_sessions WHERE delivery_id=?")
+            .bind(&second)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(sent, 10_000 + rest, "the drained response is counted");
     // An abrupt stop never finishes the row: startup recovery does, keeping a
     // reason recorded with an ending decision (the twin was closed before the
     // crash) and otherwise as interrupted.
@@ -2967,6 +2998,6 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     f.restart().await;
     let entry = finished(&f, &second).await;
     assert_eq!(entry["end_reason"], "interrupted");
-    assert_eq!(entry["bytes_sent"], "10000");
+    assert_eq!(entry["bytes_sent"], (10_000 + rest).to_string());
     assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
 }
