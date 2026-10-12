@@ -3,7 +3,10 @@
 //! SQLite, timers, and filesystem observation consequently stay in this adapter.
 use crate::App;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    QueryBuilder, Sqlite, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use std::{path::PathBuf, sync::atomic::Ordering, time::Duration};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
@@ -150,22 +153,21 @@ pub async fn pool(app: &App) -> Result<SqlitePool, sqlx::Error> {
     app.health
         .metrics
         .history
-        .get_or_try_init(|| async {
-            SqlitePoolOptions::new()
-                .max_connections(3)
-                .min_connections(0)
-                .acquire_timeout(Duration::from_millis(100))
-                .connect_with(
-                    app.db
-                        .connect_options()
-                        .as_ref()
-                        .clone()
-                        .busy_timeout(Duration::ZERO),
-                )
-                .await
-        })
+        .get_or_try_init(|| writer_pool(app.db.connect_options().as_ref().clone()))
         .await
         .cloned()
+}
+
+/// The sampler's pool over `database`: a busy writer or a full pool fails
+/// the sample at once (it is logged and the next interval retries) rather
+/// than waiting behind application writes.
+async fn writer_pool(database: SqliteConnectOptions) -> Result<SqlitePool, sqlx::Error> {
+    SqlitePoolOptions::new()
+        .max_connections(3)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_with(database.busy_timeout(Duration::ZERO))
+        .await
 }
 
 pub async fn read(app: &App, window: ReadWindow, now: i64) -> Result<MetricsHistory, sqlx::Error> {
@@ -567,8 +569,13 @@ pub async fn worker(app: App, stop: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+    use sqlx::sqlite::SqliteJournalMode;
 
+    /// A patient pool for arranging and inspecting test state. Closing a pool
+    /// can return before its last connection's close (and WAL checkpoint)
+    /// finishes, so a pool opened right after may briefly see the file
+    /// locked: that is test lifecycle, not the contention production fails
+    /// fast on. Contention is asserted only through `writer_pool`.
     async fn database(path: &std::path::Path) -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(2)
@@ -577,7 +584,7 @@ mod tests {
                     .filename(path)
                     .create_if_missing(true)
                     .journal_mode(SqliteJournalMode::Wal)
-                    .busy_timeout(Duration::ZERO),
+                    .busy_timeout(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -588,6 +595,19 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    /// Reopen an existing test database patiently (see `database`).
+    async fn reopen(path: &std::path::Path) -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .busy_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -745,15 +765,7 @@ mod tests {
             1
         );
         pool.close().await;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(&path)
-                    .busy_timeout(Duration::ZERO),
-            )
-            .await
-            .unwrap();
+        let pool = reopen(&path).await;
         record(
             &pool,
             "new",
@@ -775,11 +787,16 @@ mod tests {
             points.iter().map(|p| p.v.as_str()).collect::<Vec<_>>(),
             ["100", "0"]
         );
+        // The production sampler pool, while another connection holds the
+        // writer: its sample fails at once instead of queueing.
+        let sampler = writer_pool(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
         let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let blocked = tokio::time::timeout(
             Duration::from_millis(500),
             record(
-                &pool,
+                &sampler,
                 "new",
                 now * 1_000 + 1,
                 &[("http.requests_total", "1".into())],
@@ -792,7 +809,11 @@ mod tests {
         );
         let read = tokio::time::timeout(
             Duration::from_millis(500),
-            read_pool(&pool, HistoryQuery::default().validate(now).unwrap(), now),
+            read_pool(
+                &sampler,
+                HistoryQuery::default().validate(now).unwrap(),
+                now,
+            ),
         )
         .await;
         assert!(
@@ -816,6 +837,15 @@ mod tests {
             .points;
         assert_eq!(points.len(), MAX_POINTS);
         assert_eq!(points.last().unwrap().v, "0");
+        // Uncontended, the sampler pool writes.
+        record(
+            &sampler,
+            "new",
+            now * 1_000 + 2,
+            &[("http.requests_total", "2".into())],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -834,17 +864,7 @@ mod tests {
         // Forget every caller-local result as if the timeout won after SQLite
         // durably committed. Reopening must not lose the count behind dedup.
         pool.close().await;
-        let pool = SqlitePoolOptions::new()
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(&path)
-                    // Allow transient WAL lifecycle locks after reopening. This
-                    // test checks persisted counts and deduplication; the separate
-                    // fail_fast_writer test covers the production zero timeout.
-                    .busy_timeout(Duration::from_secs(3)),
-            )
-            .await
-            .unwrap();
+        let pool = reopen(&path).await;
         record_observations(&pool, "old", now * 1_000 + 10_000, vec![], &observed)
             .await
             .unwrap();
