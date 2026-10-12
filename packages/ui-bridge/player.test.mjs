@@ -340,19 +340,22 @@ test('history requests keep the rendered epoch even if the server changes', asyn
 });
 
 // The loaded provider catalog is an observation, not a server admission decision.
-test('rolling HLS requires a deployed adaptive provider and compatible MSE', () => {
+test('rolling HLS and burned subtitles require a deployed adaptive provider and compatible MSE', () => {
   const probe = (providers, mse) => {
     const observed = runInNewContext(source.replace('export {close, maintainLease};', 'observedCapability;'), {
       document: {getElementById: () => null, querySelector: () => null, addEventListener() {},
         createElement: () => ({canPlayType: () => 'probably'})}, addEventListener() {},
       MediaSource: {isTypeSupported: () => mse},
     });
-    return [...observed(providers && {providers: {snapshot: {providers}}}).transports];
+    const capability = observed(providers && {providers: {snapshot: {providers}}});
+    return [[...capability.transports], [...capability.subtitle_modes]];
   };
-  assert.deepEqual(probe(null, true), ['http_range']);
-  assert.deepEqual(probe([{id: 'browser-original'}], true), ['http_range']);
-  assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), ['http_range']);
-  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), ['http_range', 'hls']);
+  // Burned subtitles arrive inside a conversion, so they are offered exactly
+  // when the client can play HLS conversions.
+  assert.deepEqual(probe(null, true), [['http_range'], ['text']]);
+  assert.deepEqual(probe([{id: 'browser-original'}], true), [['http_range'], ['text']]);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), [['http_range'], ['text']]);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), [['http_range', 'hls'], ['text', 'burned']]);
 });
 
 test('selected subtitles attach after open and unsupported players dispose the candidate', async () => {

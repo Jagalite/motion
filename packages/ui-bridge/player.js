@@ -51,22 +51,26 @@ const key = () => crypto.randomUUID().replaceAll('-', '');
 function observedCapability(shared) {
   const video = document.createElement('video');
   const probe = type => (globalThis.MediaSource?.isTypeSupported?.(type) ?? false) || video.canPlayType(type) !== '';
+  // Motion HLS is rolling: native MIME support does not establish live support.
+  const hls = shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
+    && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
+    && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"');
   return {
     client_id: 'motion-ui-bridge', client_build: 'wave0', demuxe_asset_digest: null,
-    // Motion HLS is rolling: native MIME support does not establish live support.
-    transports: shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
-      && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
-      && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"')
-      ? ['http_range', 'hls'] : ['http_range'],
+    transports: hls ? ['http_range', 'hls'] : ['http_range'],
     video_codecs: probe('video/mp4; codecs="avc1.640028"') ? ['avc1'] : [],
     audio_codecs: probe('audio/mp4; codecs="mp4a.40.2"') ? ['mp4a'] : [],
-    subtitle_modes: ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
+    // Text subtitles attach as WebVTT. A burned subtitle is part of a
+    // conversion's video, which arrives only over HLS, so it needs no player
+    // support beyond playing that conversion.
+    subtitle_modes: hls ? ['text', 'burned'] : ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
     cross_origin_isolated: globalThis.crossOriginIsolated === true,
   };
 }
 
-// Preference vocabulary differs from the planning contract. Automatic selection
-// may be explicitly refused; always requires the first or explicitly selected caption.
+// Preference vocabulary differs from the planning contract. The server chooses
+// automatically by the profile's languages and roles; "always" requires a
+// subtitle in a preferred language and is refused rather than substituted.
 function subtitlePolicy(preference) {
   if (preference === 'off') return 'off';
   if (preference === 'always') return 'require';

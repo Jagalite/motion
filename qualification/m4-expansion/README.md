@@ -7,8 +7,8 @@ Owner: M4 implementation lane (A06/A07 with A08). Branch
 dependency changes. The only dependency change this lane uses is Statelessness
 0.2.0, and the models were rerun under it. Independent reviewer: GPT-6.1 Sol.
 
-This ledger records implementation slices and their evidence. It is not
-release qualification and not M4 closure.
+This ledger records the **completed declared backend slice** of M4 and its
+evidence. It is not release qualification and not M4 closure.
 
 **Declared slices:**
 - **M4-00:** the inventory.
@@ -45,11 +45,14 @@ qualified; the release checks are listed below.
 | Live remux / audio-only conversion | v1 only, behind `processing.experimental_copy_routes` | Implemented in v2 Auto when enabled (off by default): core-decided, details observed lazily; exact-keyframe seeks fixed; the manifest declares the source's rate (probed average or measured peak, an estimate) |
 | Live hardware transcode | v1 only | Implemented in v2 when `processing.experimental_live_hardware` (off by default): available/busy/unavailable observed; a failed or busy session converts in software |
 | Interval (multi-episode) bindings | Refused | Implemented: conversion of the interval only; logical time from the interval start |
-| Multipart versions | Refused | Implemented: conversion only; parts decoded and joined (concat filter), each held to its pinned duration; ≤7 parts, one library, same picture size and audio roles; no subtitles |
+| Multipart versions | Refused | Implemented: conversion only; parts decoded and joined (concat filter), each held to its pinned duration; ≤7 parts, one library, same picture size; the selected audio is each part's own occurrence of the audio component (refused when a part has none); no subtitles |
 | Embedded plain-text subtitles | Original byte route only; `require` took the first track | Original byte route only (WebVTT); `require` and `auto` choose by profile languages and roles |
 | SRT/WebVTT sidecar subtitles | Refused | Implemented on original byte delivery, component-pinned and fingerprint-checked |
-| Bitmap subtitles (PGS, DVD, DVB) | Refused | Implemented as burn-in on conversions for clients listing `burned`; canvas scaled to the video; 20 s lookback for cues active at a start |
-| Styled subtitles (ASS/SSA), text on live routes, text burn-in | Refused | Still refused. Live text: Shaka 5.2.11 refuses external text on a live presentation. Text burn-in: needs libass, absent from the bundled and host FFmpeg |
+| Bitmap subtitles (PGS, DVD, DVB) | Refused | Implemented as burn-in on conversions for clients listing `burned` (the production bridge now lists it whenever it plays HLS); canvas scaled to the video; a 20 s lookback restores cues active at a start, and **cues displayed more than 20 s before a start or seek are not restored** |
+| Client bitrate caps | Refused | **API-only:** the server keeps `max_bitrate_bps` (see M4-04), but no product client sends one. The bridge sends `null`, and no profile preference, contract preference field or player control supplies a value. Follow-up owners in the deferral table |
+| Text subtitles on live (HLS) routes | Refused | Still refused. The specific limit is the external-track path: Motion's bridge attaches a WebVTT URL through Demuxe `addTextTrack`, which calls Shaka 5.2.11 `addTextTrackAsync`, and Shaka throws 4033 (`CANNOT_ADD_EXTERNAL_TEXT_TO_LIVE_STREAM`) when the presentation duration is infinite, as it is for Motion's rolling HLS. Demuxe 1.1.1 does expose in-manifest HLS `SUBTITLES` renditions (Shaka parses them; Demuxe lists them through `getTextTracks()` and selects them with `selectSubtitleTrack`). Motion does not publish a subtitle rendition yet, so no live text path exists today |
+| Styled subtitles (ASS/SSA) and text burn-in | Refused | Still refused: burning text in, including styled subtitles with their fonts and attachments, needs libass, absent from the bundled and host FFmpeg |
+| Subtitles on multipart versions | Refused | Still refused (`subtitle_multipart_unavailable`): subtitle streams and sidecars belong to one part's file |
 | HDR preserve | Byte delivery to clients reporting HDR support | Unchanged (attempt, not a display-fidelity receipt) |
 | HDR tone-map to SDR | Refused | Still refused (deferral below) |
 | Adaptive bitrate | Missing | Release deferral (below) |
@@ -147,11 +150,12 @@ host FFmpeg 8.1.2 and VideoToolbox available. The final receipts are at
 | Copied-stream, hardware-output and burned-subtitle playback | Clients + integration/release | Chromium and Electron on the qualified player: startup, far seek, audio switch and A/V sync. Required before `experimental_copy_routes` or `experimental_live_hardware` default on |
 | Copied-stream audio start | Integration/release | After a seek within 132 ms of a keyframe, audio may start up to 132 ms after video |
 | Capped and multipart/interval playback in players | Clients + integration/release | Seek across part boundaries; correct logical duration; `BANDWIDTH`-based startup |
-| HDR tone mapping | Integration/release (native tools), then this lane | Add zimg (`zscale`) or libplacebo to the bundled FFmpeg. Then implement a tone-mapped conversion gated on the observed filter, and qualify on suitable HDR/SDR displays. Until then HDR conversion stays refused |
-| Text subtitles on live routes / text burn-in | Clients (live text tracks), integration/release (libass) | Either an HLS subtitle rendition the provider plays live, or libass in the bundled FFmpeg |
-| Styled (ASS/SSA) subtitles | This lane after libass | Burn-in with fonts from attachments |
-| Subtitles on multipart versions | This lane | A per-part subtitle source joined on the timeline |
-| Bitmap cues older than the lookback | This lane | A cue displayed more than 20 s before a start is not restored |
+| HDR tone mapping | Integration/release (native tools), then this lane | Add zimg (`zscale`) or libplacebo to the bundled FFmpeg. Then **this lane still has to implement** a tone-mapped conversion gated on the observed filter, and qualify it on suitable HDR/SDR displays. Until then HDR conversion stays refused |
+| Text subtitles on live routes | This lane (server: segmented WebVTT `SUBTITLES` rendition in the master playlist, aligned to the rolling window and in generation media time) + clients (bridge selects it through Demuxe `selectSubtitleTrack` instead of `addTextTrack`) | Demuxe 1.1.1 already lists in-manifest HLS subtitle renditions; Motion must publish one, and the pair must be qualified in Chromium/Electron |
+| Text and styled (ASS/SSA) burn-in, fonts and attachments | Integration/release (libass in the bundled FFmpeg), then this lane | Burn text and styled subtitles with the file's attached fonts; until then refused |
+| Subtitles on multipart versions | This lane | A per-part subtitle source (each part's occurrence of the subtitle component) joined on the timeline; until then refused |
+| Bitmap cues older than the lookback | This lane | A cue displayed more than 20 s before a start or seek is not restored; restoring it needs reading the subtitle stream from the part's start (a second validated descriptor) |
+| Client bitrate-cap source | API/integration owner (a preferences or quality-limit field in the contract) + UI lane (a player or profile control) + clients (the bridge sends it) | Today API-only: the server honors `max_bitrate_bps`, the bridge sends `null` |
 | Preparation by audio component | Data/catalog + this lane | Preparation still refuses component pins; clients pin `a{n}` with the exact source |
 | **M4-05 adaptive bitrate** | This lane, after the single-route matrix is qualified | Release deferral (plan 10.3). Design: one FFmpeg process per generation encoding aligned variants. It would use `-var_stream_map`: split the picture, force shared keyframes, cap every variant. Each variant would be verified (independent segments, peak windows) and segment *n* reported only when every variant has it. Each variant's `BANDWIDTH` would be its cap, and a generation would reserve both execution units. The contract's `variants/{variant_id}` routes already allow it. Manual prepared-file switching is not ABR |
 | Physical A/V and performance budgets | Integration/release | Section 21.3 budgets with a frozen workload; WebKit remains deferred |

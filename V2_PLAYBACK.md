@@ -120,9 +120,18 @@ The M4 expansion changes are in [the M4 ledger](qualification/m4-expansion/READM
 What remains:
 
 - Text subtitles are delivered only as a WebVTT sidecar with byte delivery of
-  the original. Live routes refuse them: the provider rejects external text
-  on a live presentation, and text burn-in needs libass. Styled (ASS/SSA)
-  subtitles and subtitles on multipart versions are refused.
+  the original. Live routes refuse them for a specific reason: the bridge
+  attaches subtitles as an external track (Demuxe `addTextTrack`, which calls
+  Shaka 5.2.11 `addTextTrackAsync`), and Shaka throws 4033 for an external
+  track on a presentation of infinite duration, as Motion's rolling HLS is.
+  Demuxe 1.1.1 does list in-manifest HLS `SUBTITLES` renditions, but Motion
+  does not publish one yet. Text burn-in, including styled (ASS/SSA)
+  subtitles and their fonts, needs libass. Subtitles on multipart versions
+  are refused. Burned bitmap cues displayed more than 20 s before a start
+  or seek are not restored.
+- Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
+  the production bridge sends `null` and nothing in the product supplies a
+  value yet.
 - Content access issues a file-revision ticket or a delivery-generation
   playback ticket. Generation tickets authorize only that generation's bytes,
   its HLS manifests and children, and its selected subtitle. Every read
