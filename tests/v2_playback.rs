@@ -4378,12 +4378,17 @@ async fn multipart_versions_play_their_parts_in_order() {
     );
     // A part of another picture size, or whose audio is another language at
     // the same position, cannot join the timeline.
-    for name in ["c-other.mp4", "d-language.mp4"] {
+    // A part of another picture size cannot join the timeline; a part without
+    // the selected audio component (only Japanese audio) cannot play it.
+    for (name, reason) in [
+        ("c-other.mp4", "source_unavailable"),
+        ("d-language.mp4", "multipart_audio_unavailable"),
+    ] {
         let (other, other_revision) = file(name).await;
         bind_second(other, other_revision).await;
         assert_eq!(
             plan("auto", "auto").await.body["reason_codes"][0],
-            "source_unavailable",
+            reason,
             "{name}"
         );
     }
@@ -4873,4 +4878,190 @@ async fn copied_manifests_declare_the_source_rate() {
         .parse()
         .unwrap();
     assert!(bandwidth > 10_000_000, "{master}");
+}
+
+/// The dominant tone (Hz) of a mono 48 kHz PCM window, by zero crossings.
+fn tone(pcm: &[i16]) -> u64 {
+    let crossings = pcm.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count() as u64;
+    crossings * 48_000 / 2 / pcm.len() as u64
+}
+
+/// A multipart version whose parts order two same-language, same-role audio
+/// alternatives differently still plays the selected one in every part: each
+/// part's own occurrence of the component, never the first part's position.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_audio_follows_the_component_in_every_part() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // "Stereo" is 440 Hz and "Director" 880 Hz in both parts, in opposite
+    // stream orders; both English with no roles.
+    for (name, first, second) in [
+        ("a-part.mp4", ("Stereo", "440"), ("Director", "880")),
+        ("b-part.mp4", ("Director", "880"), ("Stereo", "440")),
+    ] {
+        let (a, b) = (
+            format!("sine=frequency={}:sample_rate=48000", first.1),
+            format!("sine=frequency={}:sample_rate=48000", second.1),
+        );
+        let (ta, tb) = (format!("title={}", first.0), format!("title={}", second.0));
+        f.media(
+            name,
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                &a,
+                "-f",
+                "lavfi",
+                "-i",
+                &b,
+                "-t",
+                "4",
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:a:0",
+                &ta,
+                "-metadata:s:a:1",
+                "language=eng",
+                "-metadata:s:a:1",
+                &tb,
+            ],
+        );
+    }
+    f.scan().await;
+    let ids: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,revision FROM media_files ORDER BY relative_path")
+            .fetch_all(&f.server.app.db)
+            .await
+            .unwrap();
+    let ((first, first_revision), (second, second_revision)) = (ids[0].clone(), ids[1].clone());
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+        .bind(&first)
+        .bind(&second)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(&second)
+    .bind(&second_revision)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let director = components
+        .iter()
+        .find(|c| c.title.as_deref() == Some("Director"))
+        .unwrap()
+        .id
+        .clone();
+    // Delivered tones in the first part (logical 1-2 s) and the second (5-6 s).
+    let deliver = |input: Value, key: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let plan = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+            let admitted = f
+                .post(
+                    "/api/v2/playback/delivery-sessions",
+                    &auth,
+                    Some(key),
+                    json!({"plan_token": plan.body["plan_token"], "start_ms": 0}),
+                )
+                .await;
+            assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+            let id = admitted.body["id"].as_str().unwrap().to_owned();
+            let done = f
+                .until(&id, &auth, |d| {
+                    d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 7_900
+                        || d["active"]["status"] == "failed"
+                })
+                .await;
+            assert_ne!(done["active"]["status"], "failed", "{done}");
+            let mut bytes = Vec::new();
+            for path in ["variants/main/init.mp4", "segments/0.m4s", "segments/1.m4s"] {
+                let reply = f
+                    .call(
+                        "GET",
+                        &format!("/api/v2/streams/{id}/1/{path}"),
+                        None,
+                        &[("authorization", &auth)],
+                    )
+                    .await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                bytes.extend(reply.bytes);
+            }
+            let joined = f.dir.path().join(format!("{key}.mp4"));
+            std::fs::write(&joined, bytes).unwrap();
+            let pcm = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&joined)
+                .args([
+                    "-map", "0:a", "-f", "s16le", "-ac", "1", "-ar", "48000", "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            let pcm: Vec<i16> = pcm
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
+                .collect();
+            (tone(&pcm[48_000..96_000]), tone(&pcm[240_000..288_000]))
+        }
+    };
+    // The default (first) audio of part one is "Stereo": 440 Hz throughout.
+    let (one, two) = deliver(
+        plan_input("default", &timeline, "auto", None, &["hls"]),
+        "mp-audio-default-1",
+    )
+    .await;
+    assert!(
+        (420..=460).contains(&one) && (420..=460).contains(&two),
+        "{one} {two}"
+    );
+    // The "Director" component: 880 Hz throughout.
+    let mut pinned = plan_input("default", &timeline, "auto", None, &["hls"]);
+    pinned["tracks"]["audio_component_id"] = json!(director);
+    let (one, two) = deliver(pinned, "mp-audio-director-1").await;
+    assert!(
+        (860..=900).contains(&one) && (860..=900).contains(&two),
+        "{one} {two}"
+    );
+    let _ = first_revision;
 }

@@ -442,9 +442,10 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
-/// A multipart generation's inputs, each (descriptor, seek, remaining
-/// duration) in milliseconds, and its picture canvas.
-type PartInputs<'a> = (&'a [(u32, u64, u64)], (u32, u32));
+/// A multipart generation's inputs, each (descriptor, seek and remaining
+/// duration in milliseconds, the part's own ordinal of the selected audio),
+/// and its picture canvas.
+type PartInputs<'a> = (&'a [(u32, u64, u64, Option<u32>)], (u32, u32));
 
 /// FFmpeg arguments for a live generation reading the source from `start_ms`
 /// (file time) and, for an interval, stopping at `end_ms` (file time).
@@ -486,7 +487,7 @@ fn arguments(
         // seeks to its offset, the later parts play from their beginning.
         // Each is an inherited validated descriptor.
         Some((parts, _)) => {
-            for (fd, seek, _) in parts {
+            for (fd, seek, _, _) in parts {
                 if *seek > 0 {
                     args.extend(["-ss".to_owned(), at(*seek)]);
                 }
@@ -533,7 +534,7 @@ fn arguments(
     let joined = parts.map(|(parts, (width, height))| {
         let mut graph = String::new();
         let mut inputs = String::new();
-        for (i, (_, _, length)) in parts.iter().enumerate() {
+        for (i, (_, _, length, part_audio)) in parts.iter().enumerate() {
             let end = format!("{}.{:03}", length / 1000, length % 1000);
             graph.push_str(&format!(
                 "[{i}:v:0]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
@@ -542,7 +543,7 @@ fn arguments(
                  tpad=stop_mode=clone:stop=-1,trim=end={end}[v{i}];"
             ));
             inputs.push_str(&format!("[v{i}]"));
-            if let Some(audio) = audio {
+            if let Some(audio) = audio.and(*part_audio) {
                 graph.push_str(&format!(
                     "[{i}:a:{audio}]aresample=48000:async=1:first_pts=0,\
                      aformat=channel_layouts=stereo,apad,atrim=end={end}[a{i}];"
@@ -1295,11 +1296,14 @@ async fn run_generation(
     // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
     // (core `parts::locate`) seeks to its offset; later parts follow whole.
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-    let part_inputs: Option<Vec<(u32, u64, u64)>> = if durations.is_empty() {
+    let part_inputs: Option<Vec<(u32, u64, u64, Option<u32>)>> = if durations.is_empty() {
         None
-    } else if session.canvas.is_none() {
-        // Never fall back to reading only the first part.
-        tracing::warn!(delivery=%session.id, generation, "multipart timeline without a picture canvas");
+    } else if session.canvas.is_none()
+        || (audio.is_some() && pin.parts.iter().any(|p| p.audio.is_none()))
+    {
+        // Never fall back to reading only the first part, or to the first
+        // part's audio position in another part.
+        tracing::warn!(delivery=%session.id, generation, "multipart timeline without a canvas or per-part audio");
         return fail(&app, &session);
     } else {
         let Some((first, offset)) = playscale_core::parts::locate(&durations, start_ms) else {
@@ -1311,7 +1315,7 @@ async fn run_generation(
                 .map(|i| {
                     let fd = if i == 0 { 3 } else { 4 + i as u32 };
                     let seek = if i == first { offset } else { 0 };
-                    (fd, seek, durations[i] - seek)
+                    (fd, seek, durations[i] - seek, pin.parts[i].audio)
                 })
                 .collect(),
         )

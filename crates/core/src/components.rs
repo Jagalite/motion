@@ -86,6 +86,55 @@ pub fn embedded_track(
         .track_index
 }
 
+/// The component of `kind` that the embedded track `track_index` of one
+/// revision-bound file of `version` is an occurrence of.
+pub fn component_of<'a>(
+    components: &'a [Component],
+    kind: Kind,
+    version: &str,
+    file: &str,
+    revision: &str,
+    track_index: i64,
+) -> Option<&'a Component> {
+    components.iter().find(|c| {
+        c.kind == kind
+            && c.occurrences.iter().any(|o| {
+                o.version_id == version
+                    && o.file_id == file
+                    && o.file_revision == revision
+                    && o.sidecar.is_none()
+                    && o.track_index == Some(track_index)
+            })
+    })
+}
+
+/// The embedded track of `component` on each of `files` (file, revision) of
+/// `version`, in order: one exact occurrence per file, so a multipart version
+/// plays the same audio in every part even when the parts order their tracks
+/// differently. None when any file has no occurrence or more than one.
+pub fn per_file_tracks(
+    component: &Component,
+    version: &str,
+    files: &[(&str, &str)],
+) -> Option<Vec<i64>> {
+    files
+        .iter()
+        .map(|(file, revision)| {
+            let mut found = component.occurrences.iter().filter(|o| {
+                o.version_id == version
+                    && o.file_id == *file
+                    && o.file_revision == *revision
+                    && o.sidecar.is_none()
+            });
+            let o = found.next()?;
+            if found.next().is_some() {
+                return None;
+            }
+            o.track_index
+        })
+        .collect()
+}
+
 /// Where an explicit subtitle component occurs on one revision-bound file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubtitleOccurrence {
@@ -712,6 +761,53 @@ mod tests {
                 &options
             ),
             Selected(2)
+        );
+    }
+
+    #[test]
+    fn a_component_maps_to_its_own_track_in_every_part() {
+        // Two English stereo tracks distinguished only by title, in opposite
+        // orders in the two parts of one version.
+        let track = |file: &str, index, title: &str| Observed {
+            file_id: file.into(),
+            file_revision: format!("r-{file}"),
+            kind: Kind::Audio,
+            language: Some("eng".into()),
+            title: Some(title.into()),
+            roles: Roles::default(),
+            default: false,
+            track_index: Some(index),
+            sidecar: None,
+        };
+        let components = derive(
+            "t",
+            &[(
+                "v".into(),
+                vec![
+                    track("p1", 1, "Stereo"),
+                    track("p1", 2, "Director"),
+                    track("p2", 1, "Director"),
+                    track("p2", 2, "Stereo"),
+                ],
+            )],
+        );
+        let files = [("p1", "r-p1"), ("p2", "r-p2")];
+        let stereo = component_of(&components, Kind::Audio, "v", "p1", "r-p1", 1).unwrap();
+        assert_eq!(per_file_tracks(stereo, "v", &files), Some(vec![1, 2]));
+        let director = component_of(&components, Kind::Audio, "v", "p1", "r-p1", 2).unwrap();
+        assert_eq!(per_file_tracks(director, "v", &files), Some(vec![2, 1]));
+        // A part without an occurrence (or at another revision) has no mapping.
+        assert_eq!(
+            per_file_tracks(stereo, "v", &[("p1", "r-p1"), ("p3", "r-p3")]),
+            None
+        );
+        assert_eq!(
+            per_file_tracks(stereo, "v", &[("p1", "r-p1"), ("p2", "stale")]),
+            None
+        );
+        assert_eq!(
+            component_of(&components, Kind::Audio, "v", "p1", "r-p1", 9),
+            None
         );
     }
 }

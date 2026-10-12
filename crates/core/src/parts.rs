@@ -40,6 +40,10 @@ pub struct PartPin {
     pub file: String,
     pub revision: String,
     pub duration_ms: u64,
+    /// The zero-based audio stream of this part that carries the selected
+    /// audio component (`components::per_file_tracks`); None plays no audio.
+    #[serde(default)]
+    pub audio: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

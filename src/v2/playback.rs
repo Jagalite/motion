@@ -457,36 +457,17 @@ type BoundPartRow = (String, String, String, String, Option<f64>);
 const MAX_PARTS: usize = 7;
 
 /// Whether two parts can be played as one timeline: the delivery decodes each
-/// part and joins its first video stream and the selected audio ordinal, so
-/// the pictures must be the same size and the n-th audio stream of every part
-/// must be the same language and roles (a component pinned on the first part
-/// then means the same audio throughout). Codecs and containers may differ.
+/// part's first video stream and joins them on one canvas, so the pictures
+/// must have the same (known) coded size. Audio is matched by component
+/// identity per part when the plan is made (`components::per_file_tracks`),
+/// not by position. Codecs and containers may differ.
 fn compatible_parts(a: &db::ItemRow, b: &db::ItemRow) -> bool {
-    type Audio = (Option<String>, Option<bool>, Option<bool>, Option<bool>);
-    type Shape = (Option<(u32, u32)>, Vec<Audio>);
-    let shape = |file: &db::ItemRow| -> Option<Shape> {
+    let size = |file: &db::ItemRow| -> Option<(u32, u32)> {
         let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
         let video = tracks.iter().find(|t| t.kind == "video")?;
-        Some((
-            video.width.zip(video.height),
-            tracks
-                .iter()
-                .filter(|t| t.kind == "audio")
-                .map(|t| {
-                    // Absent disposition flags mean false, as in components.
-                    (
-                        playscale_core::components::normalize_language(t.language.as_deref()),
-                        Some(t.forced.unwrap_or(false)),
-                        Some(t.hearing_impaired.unwrap_or(false)),
-                        Some(t.commentary.unwrap_or(false)),
-                    )
-                })
-                .collect(),
-        ))
+        video.width.zip(video.height)
     };
-    shape(a).is_some_and(|(size, audio)| {
-        size.is_some() && shape(b).is_some_and(|other| other == (size, audio))
-    })
+    size(a).is_some_and(|first| size(b) == Some(first))
 }
 
 /// The first multipart original version bound to the timeline (or the pinned
@@ -568,6 +549,8 @@ async fn multipart_of(
                 file: row.id.clone(),
                 revision: row.revision.clone(),
                 duration_ms,
+                // Set from the plan's audio component (`multipart_audio`).
+                audio: None,
             })
             .collect();
         return Ok(Some(Bound {
@@ -1113,7 +1096,7 @@ pub async fn plan(
         }
         None => None,
     };
-    let (bound, original_available, found) = match original {
+    let (mut bound, original_available, found) = match original {
         Some(bound) => (bound, true, None),
         // A client pin to an original that is not available in scope is never
         // compared or disclosed: it is simply unavailable.
@@ -1225,6 +1208,20 @@ pub async fn plan(
         ));
     }
     let audio = ca.or(a).or(default_audio);
+    // A multipart timeline plays the selected audio component in every part:
+    // each part's own occurrence of it, never the first part's position.
+    if let Some(audio) = audio.filter(|_| !bound.parts.is_empty()) {
+        match multipart_audio(&mut conn, &components, &bound, &streams, audio).await? {
+            Some(per_part) => {
+                for (part, ordinal) in bound.parts.iter_mut().zip(per_part) {
+                    part.audio = Some(ordinal);
+                }
+            }
+            None => {
+                return Ok(Json(blocked(&input, "multipart_audio_unavailable")).into_response());
+            }
+        }
+    }
     let explicit = cs.or(sub);
     // Subtitle streams and sidecars belong to one file: a multipart timeline
     // has no subtitle to deliver across its parts yet.
@@ -1696,6 +1693,63 @@ async fn may_probe(
         },
     )
     .map_err(plan_problem)
+}
+
+/// The audio stream ordinal, in each part of a multipart binding, of the
+/// component that the first part's audio stream `audio` belongs to. None when
+/// that component has no single occurrence in some part.
+async fn multipart_audio(
+    conn: &mut sqlx::SqliteConnection,
+    components: &[playscale_core::components::Component],
+    bound: &Bound,
+    streams: &[db::Track],
+    audio: u32,
+) -> Result<Option<Vec<u32>>, Problem> {
+    use playscale_core::components::{Kind, component_of, per_file_tracks};
+    let Some(index) = streams
+        .iter()
+        .filter(|t| t.kind == "audio")
+        .nth(audio as usize)
+        .map(|t| t.index)
+    else {
+        return Ok(None);
+    };
+    let Some(component) = component_of(
+        components,
+        Kind::Audio,
+        &bound.version,
+        &bound.file.id,
+        &bound.file.revision,
+        index,
+    ) else {
+        return Ok(None);
+    };
+    let files: Vec<(&str, &str)> = bound
+        .parts
+        .iter()
+        .map(|p| (p.file.as_str(), p.revision.as_str()))
+        .collect();
+    let Some(tracks) = per_file_tracks(component, &bound.version, &files) else {
+        return Ok(None);
+    };
+    let mut ordinals = Vec::with_capacity(tracks.len());
+    for (part, track) in bound.parts.iter().zip(tracks) {
+        let json: String = sqlx::query_scalar("SELECT tracks_json FROM catalog_files WHERE id=?")
+            .bind(&part.file)
+            .fetch_one(&mut *conn)
+            .await?;
+        let part_streams: Vec<db::Track> =
+            serde_json::from_str(&json).map_err(Problem::internal)?;
+        let Some(ordinal) = part_streams
+            .iter()
+            .filter(|t| t.kind == "audio")
+            .position(|t| t.index == track)
+        else {
+            return Ok(None);
+        };
+        ordinals.push(ordinal as u32);
+    }
+    Ok(Some(ordinals))
 }
 
 /// A subtitle on the planned file that automatic selection may choose.
