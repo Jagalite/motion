@@ -259,6 +259,11 @@ pub struct Segment {
 pub struct Retained {
     pub index: u32,
     pub until_ms: u64,
+    /// Logical interval the segment covered (for its subtitle segment).
+    #[serde(default)]
+    pub start_ms: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -703,11 +708,13 @@ impl Delivery {
             }
             let evicted = g.segments.remove(0);
             total -= head;
-            g.available_start_ms += head;
             g.retained.push(Retained {
                 index: evicted.index,
                 until_ms: now_ms.saturating_add(head).saturating_add(longest),
+                start_ms: g.available_start_ms,
+                duration_ms: head,
             });
+            g.available_start_ms += head;
         }
     }
 
@@ -1068,6 +1075,49 @@ pub fn transition(before: &Delivery, input: &Input) -> Result<(Delivery, Vec<Eff
 
 /// Media playlist for a serving segmented generation. A rolling window is never
 /// labelled as a complete VOD playlist; ENDLIST follows only the final segment.
+/// The logical interval (start, duration) of a generation's segment that is
+/// advertised or still retained; None for any other index.
+pub fn segment_interval(generation: &Generation, index: u32) -> Option<(u64, u64)> {
+    let mut start = generation.available_start_ms;
+    for s in &generation.segments {
+        if s.index == index {
+            return Some((start, s.duration_ms));
+        }
+        start += s.duration_ms;
+    }
+    generation
+        .retained
+        .iter()
+        .find(|r| r.index == index)
+        .map(|r| (r.start_ms, r.duration_ms))
+}
+
+/// The subtitle rendition's playlist of a live generation: the same window,
+/// sequence numbers, durations and end as its media playlist, one WebVTT
+/// segment per media segment.
+pub fn subtitle_playlist(generation: &Generation, segment_uri: impl Fn(u32) -> String) -> String {
+    let mut out = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+        generation.target_duration_s,
+        generation
+            .segments
+            .first()
+            .map_or(generation.next_segment, |s| s.index)
+    );
+    for s in &generation.segments {
+        out.push_str(&format!(
+            "#EXTINF:{}.{:03},\n{}\n",
+            s.duration_ms / 1000,
+            s.duration_ms % 1000,
+            segment_uri(s.index)
+        ));
+    }
+    if generation.complete {
+        out.push_str("#EXT-X-ENDLIST\n");
+    }
+    out
+}
+
 pub fn media_playlist(
     generation: &Generation,
     segment_uri: impl Fn(u32) -> String,
@@ -1369,6 +1419,15 @@ mod tests {
         assert!(!d.fetchable(1, 7, 84_000) && d.fetchable(1, 14, 84_000));
         let text = media_playlist(g, |i| format!("s/{i}"), "init.mp4");
         assert!(text.contains("#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:14\n"));
+        // Subtitle segments mirror the media window, and every advertised or
+        // retained segment keeps its logical interval.
+        let subtitles = subtitle_playlist(g, |i| format!("t/{i}.vtt"));
+        assert!(subtitles.contains("#EXT-X-MEDIA-SEQUENCE:14\n#EXTINF:4.000,\nt/14.vtt\n"));
+        assert!(!subtitles.contains("EXT-X-MAP") && !subtitles.contains("ENDLIST"));
+        assert_eq!(segment_interval(g, 14), Some((56_000, 4_000)));
+        assert_eq!(segment_interval(g, 15), Some((60_000, 4_000)));
+        assert_eq!(segment_interval(g, 7), Some((28_000, 4_000)));
+        assert_eq!(segment_interval(g, 20), None);
         assert!(!text.contains("ENDLIST") && !text.contains("PLAYLIST-TYPE"));
         // A completion that skips a report fails rather than ending early.
         let skipped = Input::Completed {

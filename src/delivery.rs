@@ -445,7 +445,10 @@ const FFMPEG_LIST_SIZE: &str = "30";
 /// A multipart generation's inputs, each (descriptor, seek and remaining
 /// duration in milliseconds, the part's own ordinal of the selected audio),
 /// and its picture canvas.
-type PartInputs<'a> = (&'a [(u32, u64, u64, Option<u32>)], (u32, u32));
+type PartInputs<'a> = (&'a [PartInput], (u32, u32));
+/// One multipart input: descriptor, seek and remaining duration (ms), and the
+/// part's own ordinal of the selected audio.
+type PartInput = (u32, u64, u64, Option<u32>);
 
 /// FFmpeg arguments for a live generation reading the source from `start_ms`
 /// (file time) and, for an interval, stopping at `end_ms` (file time).
@@ -1296,7 +1299,7 @@ async fn run_generation(
     // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
     // (core `parts::locate`) seeks to its offset; later parts follow whole.
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-    let part_inputs: Option<Vec<(u32, u64, u64, Option<u32>)>> = if durations.is_empty() {
+    let part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
         None
     } else if session.canvas.is_none()
         || (audio.is_some() && pin.parts.iter().any(|p| p.audio.is_none()))
@@ -3816,11 +3819,21 @@ pub async fn subtitles(
     let pinned = |d: &Delivery, now| {
         d.serves(generation, now) && pins_subtitle(&d.generations[&generation].pin)
     };
-    let session = app.processing.deliveries.session(&id)?;
+    let path = converted_subtitles(&app, &id, generation).await?;
+    let (_, permit) = admit_stream(&app, &id, pinned).await?;
+    streamed(permit, path, "text/vtt; charset=utf-8").await
+}
+
+/// The generation's selected text subtitle converted (once per delivery) to
+/// WebVTT in source-file time, from the validated source or sidecar.
+async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<PathBuf, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
     let selected = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
-        if !pinned(d, app.processing.deliveries.now_ms()) {
+        if !(d.serves(generation, app.processing.deliveries.now_ms())
+            && pins_subtitle(&d.generations[&generation].pin))
+        {
             return Err(ApiError::not_found());
         }
         let pin = &d.generations[&generation].pin;
@@ -3857,8 +3870,86 @@ pub async fn subtitles(
     ))
     .await
     .map_err(ApiError::internal)??;
-    let (_, permit) = admit_stream(&app, &id, pinned).await?;
-    streamed(permit, path, "text/vtt; charset=utf-8").await
+    Ok(path)
+}
+
+/// Whether a live generation publishes a text subtitle rendition.
+fn live_subtitles(d: &Delivery, generation: u64, now: u64) -> bool {
+    d.serves(generation, now) && {
+        let pin = &d.generations[&generation].pin;
+        pin.operation.segmented() && pins_subtitle(pin)
+    }
+}
+
+/// The subtitle rendition playlist of a live generation with a text subtitle
+/// (core `subtitle_playlist`): it mirrors the media playlist's window.
+pub(crate) async fn subtitle_playlist(
+    app: &App,
+    id: &str,
+    generation: &str,
+    segment_uri: impl Fn(u32) -> String,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, _permit) =
+        admit_stream(app, id, |d, now| live_subtitles(d, generation, now)).await?;
+    let text = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        if !live_subtitles(d, generation, app.processing.deliveries.now_ms()) {
+            return Err(ApiError::not_found());
+        }
+        core::subtitle_playlist(&d.generations[&generation], segment_uri)
+    };
+    Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
+}
+
+/// One subtitle segment of a live generation: the cues overlapping its media
+/// segment (`core::segment_interval`), in the generation's media time (core
+/// `subtitles::webvtt_segment`). The converted WebVTT is in source-file
+/// time; media time is file time minus the interval start and the media time
+/// origin.
+pub(crate) async fn subtitle_segment(
+    app: &App,
+    id: &str,
+    generation: &str,
+    index: u32,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let fetchable = |d: &Delivery, now| {
+        live_subtitles(d, generation, now) && d.fetchable(generation, index, now)
+    };
+    let path = converted_subtitles(app, id, generation).await?;
+    let (session, permit) = admit_stream(app, id, fetchable).await?;
+    let window = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        d.generations.get(&generation).and_then(|g| {
+            let (start, duration) = core::segment_interval(g, index)?;
+            let origin = g.media_time_origin_ms;
+            let clip = g.pin.clip.map_or(0, |c| c.start_ms);
+            Some((start.saturating_sub(origin), duration, origin + clip))
+        })
+    };
+    let (from, duration, offset) = window.ok_or_else(ApiError::not_found)?;
+    let text = tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(path).ok()?;
+        let cues = playscale_core::subtitles::parse_webvtt(&text)?;
+        Some(playscale_core::subtitles::webvtt_segment(
+            &cues,
+            from,
+            from + duration,
+            offset,
+        ))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(subtitles_unavailable)?;
+    // The transfer permit is held until the body has been sent.
+    let body = axum::body::Body::from_stream(async_stream::stream! {
+        let _permit = permit;
+        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
+    });
+    Ok((stream_headers("text/vtt; charset=utf-8"), body).into_response())
 }
 
 /// Largest sidecar accepted from the converter.

@@ -2663,8 +2663,9 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
         .status,
         StatusCode::UNAUTHORIZED
     );
-    // Text subtitles are a byte-route sidecar: the supported players cannot
-    // attach external text to a live presentation.
+    // A live route carries a text subtitle only for a client that selects an
+    // in-manifest subtitle rendition (an external track on a live
+    // presentation is refused by the player).
     input["quality"]["mode"] = json!("convert");
     input["client"]["transports"] = json!(["hls"]);
     assert_eq!(
@@ -2673,6 +2674,131 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
             .body["reason_codes"][0],
         "subtitle_conversion_unavailable"
     );
+    let mut live_text = input.clone();
+    live_text["client"]["subtitle_modes"] = json!(["text", "hls_text"]);
+    // The rendition's segment 0 of a conversion admitted at `start_ms`, with
+    // the generation's media time origin.
+    let rendition = |input: Value, start_ms: u64, key: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let plan = f.post("/api/v2/playback/plans", &auth, None, input).await;
+            assert_eq!(plan.body["operation"], "video_transcode", "{}", plan.body);
+            let admitted = f
+                .post(
+                    "/api/v2/playback/delivery-sessions",
+                    &auth,
+                    Some(key),
+                    json!({"plan_token": plan.body["plan_token"], "start_ms": start_ms}),
+                )
+                .await;
+            assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+            let id = admitted.body["id"].as_str().unwrap().to_owned();
+            let ready = f
+                .until(&id, &auth, |d| {
+                    d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start_ms
+                })
+                .await;
+            let url = ready["active"]["subtitles_url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                url,
+                format!("/api/v2/streams/{id}/1/variants/subtitles/index.m3u8")
+            );
+            let auth = &auth;
+            let get = |path: String| async move {
+                let reply = f.call("GET", &path, None, &[("authorization", auth)]).await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                String::from_utf8(reply.bytes).unwrap()
+            };
+            let master = get(format!("/api/v2/streams/{id}/1/master.m3u8")).await;
+            assert!(
+                master.contains("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\"")
+                    && master.contains("URI=\"variants/subtitles/index.m3u8\"")
+                    && master.contains(",SUBTITLES=\"subs\"\n"),
+                "{master}"
+            );
+            let media = get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await;
+            let subtitles = get(url).await;
+            // The rendition mirrors the media playlist's window and durations.
+            let entries = |text: &str| -> Vec<String> {
+                text.lines()
+                    .filter(|l| l.starts_with("#EXTINF") || l.starts_with("#EXT-X-MEDIA-SEQUENCE"))
+                    .map(str::to_owned)
+                    .collect()
+            };
+            assert_eq!(entries(&subtitles), entries(&media), "{subtitles}");
+            assert!(
+                subtitles.contains("../../segments/subtitles-0.vtt"),
+                "{subtitles}"
+            );
+            let segment = get(format!("/api/v2/streams/{id}/1/segments/subtitles-0.vtt")).await;
+            let origin = ready["active"]["media_time_origin_ms"].as_u64().unwrap();
+            // Opt-in: write the server's exact HLS output (same layout) for a
+            // player check outside this test (scripts/check_hls_subtitles.mjs).
+            if let Some(dir) = std::env::var_os("MOTION_DUMP_HLS") {
+                let dir = std::path::Path::new(&dir).join(key);
+                let base = format!("/api/v2/streams/{id}/1");
+                let mut files = vec![
+                    "master.m3u8".to_owned(),
+                    "variants/main/index.m3u8".into(),
+                    "variants/main/init.mp4".into(),
+                    "variants/subtitles/index.m3u8".into(),
+                ];
+                for line in media.lines().chain(subtitles.lines()) {
+                    if let Some(name) = line.strip_prefix("../../") {
+                        files.push(name.to_owned());
+                    }
+                }
+                for name in files {
+                    let reply = f
+                        .call(
+                            "GET",
+                            &format!("{base}/{name}"),
+                            None,
+                            &[("authorization", auth)],
+                        )
+                        .await;
+                    assert_eq!(reply.status, StatusCode::OK, "{name}");
+                    let path = dir.join(&name);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, reply.bytes).unwrap();
+                }
+            }
+            (segment, origin)
+        }
+    };
+    // From 2 s: the 1-3 s caption is at 0 to (3 s - origin) in media time.
+    let (segment, origin) = rendition(live_text.clone(), 2000, "live-text-rendition-1").await;
+    let expected = format!(
+        "00:00:00.000 --> 00:00:0{}.{:03}\nSelected caption",
+        (3000 - origin) / 1000,
+        (3000 - origin) % 1000
+    );
+    assert!(
+        segment.starts_with("WEBVTT") && segment.contains(&expected),
+        "{expected}\n{segment}"
+    );
+    // An interval binding starting at 0.5 s: media time is file time minus
+    // the interval start, so the caption is at 0.5 to 2.5 s.
+    sqlx::query("UPDATE version_files SET start_ms=500,end_ms=9000")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let mut interval = live_text.clone();
+    interval["quality"]["mode"] = json!("auto");
+    let (segment, origin) = rendition(interval, 0, "live-text-rendition-2").await;
+    assert_eq!(origin, 0);
+    assert!(
+        segment.contains("00:00:00.500 --> 00:00:02.500\nSelected caption"),
+        "{segment}"
+    );
+    sqlx::query("UPDATE version_files SET start_ms=NULL,end_ms=NULL")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
     input["quality"]["mode"] = json!("original");
     input["client"]["transports"] = json!(["http_range"]);
     input["tracks"]["subtitle_policy"] = json!("off");

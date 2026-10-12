@@ -355,7 +355,7 @@ test('rolling HLS and burned subtitles require a deployed adaptive provider and 
   assert.deepEqual(probe(null, true), [['http_range'], ['text']]);
   assert.deepEqual(probe([{id: 'browser-original'}], true), [['http_range'], ['text']]);
   assert.deepEqual(probe([{id: 'shaka-adaptive'}], false), [['http_range'], ['text']]);
-  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), [['http_range', 'hls'], ['text', 'burned']]);
+  assert.deepEqual(probe([{id: 'shaka-adaptive'}], true), [['http_range', 'hls'], ['text', 'burned', 'hls_text']]);
 });
 
 test('selected subtitles attach after open and unsupported players dispose the candidate', async () => {
@@ -432,4 +432,38 @@ test('live generation opens without VOD startTime and verifies the public seek',
   calls.length = 0;
   await openGeneration(element, {transport: 'http_range', media_url: '/file.mp4', media_time_origin_ms: 0}, 42500, 'http://localhost');
   assert.equal(calls[0][1].startTime, 42.5);
+});
+
+test('a live generation selects its in-manifest subtitle rendition, never an external track', async () => {
+  const calls = [];
+  let tracks = [{id: 'text:7', external: false}];
+  const element = {setAttribute() {}, open: async () => calls.push(['open']),
+    seek: async () => calls.push(['seek']),
+    destroy: async () => calls.push(['destroy']), remove: () => calls.push(['remove'])};
+  const host = {dataset: {demuxeBase: '/demuxe'}, append() {}};
+  const prepare = runInNewContext(source.replace('if (host) void start();', '').replace('export {close, maintainLease};',
+    'loadDemuxe = async () => null; preparePlayer;'), {
+    document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null, addEventListener() {},
+      createElement: () => {
+        element.player = {
+          get state() { return {seekable: [{start: 0, end: 20}], currentTime: 0, subtitleTracks: tracks}; },
+          addTextTrack: async () => calls.push(['external']),
+          selectSubtitleTrack: async id => calls.push(['select', id]),
+          subtitleVisible: async visible => calls.push(['visible', visible]),
+        };
+        return element;
+      }},
+    addEventListener() {}, URL, location: {origin: 'https://motion.test'}, setTimeout: () => 0,
+  });
+  const generation = {transport: 'hls', manifest_url: '/api/v2/streams/d/2/master.m3u8', media_url: null,
+    media_time_origin_ms: 12000, subtitles_url: '/api/v2/streams/d/2/variants/subtitles/index.m3u8'};
+  await prepare(generation, 12000, () => true);
+  assert.deepEqual(calls.map(c => c[0]), ['open', 'seek', 'select', 'visible']);
+  assert.deepEqual(calls[2], ['select', 'text:7']);
+  // Without an in-manifest subtitle track the player cannot present it: the
+  // candidate is disposed instead of playing silently without subtitles.
+  tracks = [{id: 'ext', external: true}];
+  calls.length = 0;
+  await assert.rejects(prepare(generation, 12000, () => true), /cannot present the selected subtitle/);
+  assert.deepEqual(calls.map(c => c[0]), ['open', 'seek', 'destroy', 'remove']);
 });

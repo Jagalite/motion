@@ -384,14 +384,23 @@ pub enum Subtitle {
     Bitmap(u32),
 }
 
-/// Whether a route presents a subtitle delivered this way: a text subtitle is
-/// a WebVTT sidecar, which the supported players attach only to byte delivery
-/// of the original; a burned one is a video transform, so only a conversion.
-pub fn presents_subtitle(route: Route, burned: bool) -> bool {
-    if burned {
-        matches!(route, Route::Transcode | Route::HardwareTranscode)
-    } else {
-        route == Route::Original
+/// Whether a route presents a subtitle delivered this way. A burned subtitle
+/// is a video transform, so only a conversion. A text subtitle comes from the
+/// original's file: byte delivery of the original carries it as a WebVTT
+/// sidecar, and a live route (copy or conversion of the original) as an HLS
+/// subtitle rendition when the client selects in-manifest live text
+/// (`live_text`; an external track on a live presentation is refused by the
+/// supported player). A prepared rendition is another file.
+pub fn presents_subtitle(route: Route, burned: bool, live_text: bool) -> bool {
+    match (burned, route) {
+        (true, Route::Transcode | Route::HardwareTranscode) => true,
+        (true, _) => false,
+        (false, Route::Original) => true,
+        (
+            false,
+            Route::Remux | Route::AudioConvert | Route::Transcode | Route::HardwareTranscode,
+        ) => live_text,
+        (false, Route::Prepared) => false,
     }
 }
 
@@ -1254,11 +1263,21 @@ mod tests {
             Route::Transcode,
             Route::HardwareTranscode,
         ] {
-            assert_eq!(presents_subtitle(route, false), route == Route::Original);
             assert_eq!(
-                presents_subtitle(route, true),
-                matches!(route, Route::Transcode | Route::HardwareTranscode)
+                presents_subtitle(route, false, false),
+                route == Route::Original
             );
+            assert_eq!(
+                presents_subtitle(route, false, true),
+                route != Route::Prepared,
+                "{route:?}"
+            );
+            for live_text in [false, true] {
+                assert_eq!(
+                    presents_subtitle(route, true, live_text),
+                    matches!(route, Route::Transcode | Route::HardwareTranscode)
+                );
+            }
         }
     }
 

@@ -109,6 +109,8 @@ pub fn routes() -> Router<App> {
 
 /// The only HLS variant a live generation publishes.
 const VARIANT: &str = "main";
+/// The subtitle rendition of a live generation with a text subtitle.
+const SUBTITLE_VARIANT: &str = "subtitles";
 
 /// Map a shared-service error onto the v2 problem vocabulary.
 fn problem(e: ApiError) -> Problem {
@@ -1242,6 +1244,9 @@ pub async fn plan(
     }
     let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
     let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
+    // The client selects an in-manifest HLS subtitle rendition on a live
+    // presentation (an external track there is refused by the player).
+    let live_text = accepts_text && accepts("hls_text");
     // Without an explicit choice, "auto" and "require" select by the profile's
     // languages and subtitle mode (core `automatic_subtitle`); never the first
     // track and never another language. "require" is strict and decided
@@ -1295,7 +1300,7 @@ pub async fn plan(
                 language: c.language.clone(),
                 roles: c.roles.clone(),
                 deliverable: c.deliverable
-                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned)),
+                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text)),
             })
             .collect();
         let mode = match preferences.subtitle_mode.as_str() {
@@ -1532,11 +1537,14 @@ pub async fn plan(
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
         core::Plan::Observe => return Err(Problem::internal("undecided plan")),
     };
-    // Selected text subtitles are a WebVTT sidecar in timeline time, which the
-    // supported players attach only to byte delivery: Shaka refuses external
-    // text on a live (rolling HLS) presentation, and burning text in needs
-    // libass, which the bundled FFmpeg does not include.
-    if (subtitle.is_some() || sidecar.is_some()) && !core::presents_subtitle(route, false) {
+    // Selected text subtitles are a WebVTT sidecar with byte delivery of the
+    // original, or an HLS subtitle rendition on a live route for a client that
+    // selects in-manifest live text. Shaka refuses an external text track on a
+    // live presentation, and burning text in needs libass, which the bundled
+    // FFmpeg does not include.
+    if (subtitle.is_some() || sidecar.is_some())
+        && !core::presents_subtitle(route, false, live_text)
+    {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
     // "auto" adds a subtitle only if the planned route presents it; otherwise
@@ -1939,7 +1947,13 @@ fn generation_json(delivery: &str, owner: &Owner, g: &delivery::GenerationView) 
         "status": g.status,
         "media_url": media_url,
         "manifest_url": manifest_url,
-        "subtitles_url": g.subtitles_url.as_ref().map(|_| format!("/api/v2/streams/{}/{}/subtitles.vtt", segment(delivery), g.generation)),
+        // Byte delivery: a WebVTT sidecar. A live generation: its in-manifest
+        // HLS subtitle rendition's playlist (the client selects that track).
+        "subtitles_url": g.subtitles_url.as_ref().map(|_| if hls {
+            format!("/api/v2/streams/{}/{}/variants/{SUBTITLE_VARIANT}/index.m3u8", segment(delivery), g.generation)
+        } else {
+            format!("/api/v2/streams/{}/{}/subtitles.vtt", segment(delivery), g.generation)
+        }),
         "media_time_origin_ms": g.media_time_origin_ms,
         "requested_start_ms": g.requested_start_ms,
         "available_start_ms": g.available_start_ms,
@@ -2545,8 +2559,21 @@ pub async fn master_playlist(
     } else {
         "avc1.64001f".into()
     };
+    // A selected text subtitle is an in-manifest SUBTITLES rendition that
+    // mirrors the media segments (the client selects it as a live track).
+    let (rendition, group) = if serving.subtitles_url.is_some() {
+        (
+            format!(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Selected subtitles\",DEFAULT=YES,AUTOSELECT=YES,URI=\"{}\"\n",
+                stream_link(&format!("variants/{SUBTITLE_VARIANT}/index.m3u8"), &params)
+            ),
+            ",SUBTITLES=\"subs\"",
+        )
+    } else {
+        (String::new(), "")
+    };
     let text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"\n{}\n",
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n{rendition}#EXT-X-STREAM-INF:BANDWIDTH={},CODECS=\"{codecs}\"{group}\n{}\n",
         // A capped conversion's peak is its cap (measured per window). A copy
         // keeps the source's rate: declare the higher of its probed average
         // and the peak measured so far over published windows (an estimate,
@@ -2579,6 +2606,16 @@ pub async fn variant_playlist(
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    if variant == SUBTITLE_VARIANT {
+        return delivery::subtitle_playlist(&app, &id, &generation, |i| {
+            stream_link(
+                &format!("../../segments/{SUBTITLE_VARIANT}-{i}.vtt"),
+                &params,
+            )
+        })
+        .await
+        .map_err(stream_problem);
+    }
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -2615,6 +2652,15 @@ pub async fn media_segment(
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    if let Some(index) = segment
+        .strip_prefix(&format!("{SUBTITLE_VARIANT}-"))
+        .and_then(|s| s.strip_suffix(".vtt"))
+    {
+        let index: u32 = index.parse().map_err(|_| Problem::not_found())?;
+        return delivery::subtitle_segment(&app, &id, &generation, index)
+            .await
+            .map_err(stream_problem);
+    }
     delivery::segment(State(app), Path((id, generation, segment)))
         .await
         .map_err(stream_problem)
