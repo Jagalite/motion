@@ -236,6 +236,18 @@ three P2 findings and no P1. All three are fixed in the round-10 commit:
 | S28 (P2) | Recoverable crash-leftover blobs were not counted against the quota | Fixed. `Store::usage` counts every blob on disk once, plus staged bytes. A store test covers a leftover blocking admission. |
 | S29 (P2) | A media response that stopped producing bytes blocked the agent indefinitely | Fixed. An inactivity deadline (60 s, reset per chunk; not a total timeout) covers headers and body. A stalled transfer fails alone and resumes from its staged bytes next pass. Agent test covers it. |
 
+**Round 11** (at `b58b228`) raised two P2 findings and no P1. Both concern a
+device that loses `downloads:manage`. They are recorded as open follow-ups,
+not fixed in this PR:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S30 (P2) | After `downloads:manage` is lost, retained offline events are no longer sent, although `viewing:write` would still allow it | Open follow-up. Events are kept, not lost; they reconcile once the permission returns. Fix: reconcile independently of the download-list 403. |
+| S31 (P2) | After withdrawal, a blob orphaned by an earlier crash is not collected and still counts against the quota | Open follow-up. Fix: run `cache collect` after `withdraw()` removes owned copies. |
+
+Across rounds 1–11, Sol raised 31 findings (2 P1, 29 P2). Both P1s and 27 of
+the P2s are fixed; S30 and S31 remain open.
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |
