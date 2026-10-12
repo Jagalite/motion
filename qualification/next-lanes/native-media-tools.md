@@ -226,3 +226,6 @@ Notice-list changes alter the lock entries recorded in the build receipt, so
 `artifacts/media-tools-n2` no longer matches the lock and `package_app.py`
 refuses to reuse it. That is expected: the integration package build rebuilds
 the tools. The binaries themselves are unaffected (notices are not compiled in).
+
+GPT-6.1 Sol re-reviewed `2607345` and verified the three fixes. It reported no
+actionable findings in the cumulative diff from `c6d6e26`.
