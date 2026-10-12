@@ -74,3 +74,26 @@ func TestStorageAndMetricsUseContractPaths(t *testing.T) {
 		t.Fatalf("%+v %v", d, err)
 	}
 }
+
+func TestPlaybackMonitoringUsesContractPathsAndFilters(t *testing.T) {
+	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/admin/playback/sessions":
+			io.WriteString(w, `{"sampled_at":"2026-10-12T10:00:00Z","truncated":false,"sessions":[{"delivery_id":"d","viewing_session_id":null,"status":"playing","device":{"id":"dev","name":"TV"},"profile":{"id":"p","name":null},"item":{"id":"i","title":"Heat","kind":"movie","parent_title":null},"timeline_id":"t","version":{"id":"v","label":"4K"},"mode":"transcode","client_network":"private","started_at":"2026-10-12T09:00:00Z","last_activity_at":"2026-10-12T10:00:00Z","position_ms":1000,"duration_ms":null,"bytes_sent":"18446744073709551615","throughput_bps":"10","average_bps":"5","peak_bps":"20","watched_ms":900,"stalls":1}]}`)
+		case "/api/v2/admin/playback/history":
+			if r.URL.Query().Get("device_id") != "dev/1" || r.URL.Query().Has("profile_id") || r.URL.Query().Get("limit") != "50" {
+				t.Errorf("query %v", r.URL.Query())
+			}
+			io.WriteString(w, `{"items":[],"next_cursor":null,"read_revision":"1","event_cursor":"e"}`)
+		default:
+			t.Errorf("unexpected %s", r.URL)
+		}
+	}))
+	s, err := c.PlaybackSessions(context.Background())
+	if err != nil || len(s.Sessions) != 1 || s.Sessions[0].BytesSent != "18446744073709551615" || s.Sessions[0].Profile.Name != nil || s.Sessions[0].Item.Title != "Heat" {
+		t.Fatalf("%+v %v", s, err)
+	}
+	if _, err := c.PlaybackHistory(context.Background(), "", 50, HistoryFilter{DeviceID: "dev/1"}); err != nil {
+		t.Fatal(err)
+	}
+}

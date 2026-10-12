@@ -18,6 +18,8 @@ const (
 	pageActivity
 	pageProfiles
 	pageServer
+	pageNowPlaying
+	pageHistory
 )
 
 // route names a page; library and item pages carry the resource ID.
@@ -49,6 +51,10 @@ func (r route) keys() []string {
 		return []string{keyDevices}
 	case pageSources:
 		return []string{keySources}
+	case pageNowPlaying:
+		return []string{keyPlayback}
+	case pageHistory:
+		return []string{keyHistory}
 	case pageProfiles:
 		return []string{keyProfiles}
 	case pageServer:
@@ -80,10 +86,14 @@ func (m Model) navEntries() []navEntry {
 		me = m.cache.shape // reloading: keep the sidebar steady
 	}
 	allows := func(p string) bool { return me != nil && me.Allows(p) }
-	entries := []navEntry{
-		{group: "Monitor", label: "Overview", icon: "◉", route: route{page: pageOverview}},
-		{group: "Monitor", label: "Processing", icon: "◷", route: route{page: pageProcessing}},
+	entries := []navEntry{{group: "Monitor", label: "Overview", icon: "◉", route: route{page: pageOverview}}}
+	if allows(api.PermSystemAdmin) && m.playbackFeature() {
+		entries = append(entries,
+			navEntry{group: "Monitor", label: "Now playing", icon: "▶", route: route{page: pageNowPlaying}},
+			navEntry{group: "Monitor", label: "History", icon: "◔", route: route{page: pageHistory}},
+		)
 	}
+	entries = append(entries, navEntry{group: "Monitor", label: "Processing", icon: "◷", route: route{page: pageProcessing}})
 	if allows(api.PermSourcesManage) {
 		entries = append(entries, navEntry{group: "Monitor", label: "Scans", icon: "↻", route: route{page: pageScans}})
 	}
@@ -159,6 +169,10 @@ func (m Model) title(r route) string {
 		return "Profiles"
 	case pageServer:
 		return "Server"
+	case pageNowPlaying:
+		return "Now playing"
+	case pageHistory:
+		return "Playback history"
 	}
 	return ""
 }

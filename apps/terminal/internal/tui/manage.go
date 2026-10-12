@@ -22,7 +22,7 @@ const (
 
 func (m Model) kind() pageKind {
 	switch m.route.page {
-	case pageProcessing, pageScans, pageDevices, pageSources, pageProfiles:
+	case pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
 		return kindTable
 	case pageOverview, pageActivity, pageServer:
 		return kindText
@@ -71,6 +71,8 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 	var rows []table.Row
 	var ids []string
 	switch m.route.page {
+	case pageNowPlaying, pageHistory:
+		return m.playbackRows(width)
 	case pageProcessing:
 		jobs, _ := data[[]api.Job](m, keyJobs)
 		for _, j := range sortedJobs(jobs) {
@@ -176,6 +178,10 @@ func (m Model) tableKey() string {
 		return keyDevices
 	case pageSources:
 		return keySources
+	case pageNowPlaying:
+		return keyPlayback
+	case pageHistory:
+		return keyHistory
 	}
 	return keyProfiles
 }
@@ -190,6 +196,10 @@ func (m Model) tableEmpty() string {
 		return "No paired devices."
 	case pageSources:
 		return "No storage sources registered."
+	case pageNowPlaying:
+		return "Nobody is watching right now."
+	case pageHistory:
+		return "No finished playback sessions yet."
 	}
 	return "No profiles."
 }
@@ -287,6 +297,16 @@ func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 		if id := m.selectedID(); id != "" {
 			m.confirm = id
 		}
+	case (m.route.page == pageNowPlaying || m.route.page == pageHistory) && key.Matches(msg, keys.History):
+		if m.filterHistory() {
+			m.drop(keyHistory) // a different query: never show the old rows under it
+			return m.navigate(route{page: pageHistory})
+		}
+	case m.route.page == pageHistory && key.Matches(msg, keys.ClearFilter) && m.historyFilter.DeviceID != "":
+		m.historyFilter = historyFilter{}
+		m.drop(keyHistory)
+		m.tsel, m.toff, m.tselID = 0, 0, ""
+		return tea.Batch(m.load(keyHistory), m.spin())
 	case m.route.page == pageProfiles && key.Matches(msg, keys.Choose):
 		if id := m.selectedID(); id != "" && id != m.viewer() {
 			m.profile = id

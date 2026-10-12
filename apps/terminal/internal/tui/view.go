@@ -199,6 +199,10 @@ func (m Model) header(width int) []string {
 			return plural(len(v), one, many)
 		case []api.Source:
 			return plural(len(v), one, many)
+		case api.PlaybackSessionList:
+			return plural(len(v.Sessions), one, many)
+		case []api.PlaybackHistoryEntry:
+			return plural(len(v), one, many)
 		}
 		return ""
 	}
@@ -238,6 +242,10 @@ func (m Model) header(width int) []string {
 		lines = m.titled("Overview", m.overviewMeta())
 	case pageSources:
 		lines = m.titled("Sources", count(keySources, "source", "sources"))
+	case pageNowPlaying:
+		lines = m.titled("Now playing", count(keyPlayback, "stream", "streams"))
+	case pageHistory:
+		lines = m.titled("Playback history", count(keyHistory, "session", "sessions"))
 	case pageActivity:
 		lines = m.titled("Activity", plural(len(m.log), "change", "changes"))
 	case pageServer:
@@ -592,6 +600,12 @@ func (m Model) shortHelp() []key.Binding {
 			b = append(b, keys.Cancel)
 		case m.route.page == pageProfiles:
 			b = append(b, keys.Choose)
+		case m.route.page == pageNowPlaying:
+			b = append(b, keys.History)
+		case m.route.page == pageHistory && m.historyFilter.DeviceID != "":
+			b = append(b, keys.ClearFilter)
+		case m.route.page == pageHistory:
+			b = append(b, keys.History)
 		}
 		return append(b, back, keys.Refresh, keys.Help)
 	case kindText:

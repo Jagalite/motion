@@ -18,26 +18,27 @@ import (
 // fake is a contract-shaped backend. Server-supplied text carries control
 // sequences, which must never reach the terminal.
 type fake struct {
-	mu           sync.Mutex
-	profileCalls atomic.Int32
-	itemCalls    atomic.Int32
-	profiles     int
-	titles       int
-	permissions  []string
-	features     []api.Feature
-	viewing      map[string]api.ViewingState
-	editionsMore bool
-	meErr        error
-	block        chan struct{} // when set, GetCatalogItem waits for it or cancellation
-	itemCtx      context.Context
-	continueFor  []string
-	cancelled    []string
-	jobs         int
-	diagCalls    int
-	metricsCalls int
-	process      bool
-	libErr       error
-	cancelErr    error
+	mu             sync.Mutex
+	profileCalls   atomic.Int32
+	itemCalls      atomic.Int32
+	profiles       int
+	titles         int
+	permissions    []string
+	features       []api.Feature
+	viewing        map[string]api.ViewingState
+	editionsMore   bool
+	meErr          error
+	block          chan struct{} // when set, GetCatalogItem waits for it or cancellation
+	itemCtx        context.Context
+	continueFor    []string
+	cancelled      []string
+	jobs           int
+	historyFilters []api.HistoryFilter
+	diagCalls      int
+	metricsCalls   int
+	process        bool
+	libErr         error
+	cancelErr      error
 }
 
 func (f *fake) Me(context.Context) (api.Principal, error) {
@@ -197,6 +198,42 @@ func (f *fake) Metrics(_ context.Context, since time.Time, step int) (api.Metric
 		pts = append(pts, api.MetricPoint{T: now.Add(-time.Duration(i) * 10 * time.Second).Format(time.RFC3339), V: fmt.Sprint(1000 + (30-i)*10)})
 	}
 	return api.MetricsHistory{IntervalSeconds: 10, Series: []api.MetricSeries{{ID: "http.requests_total", Kind: "counter", Points: pts}}}, nil
+}
+func (f *fake) PlaybackSessions(context.Context) (api.PlaybackSessionList, error) {
+	tv, kids := "Living room TV", "Kids"
+	parent := "Northern Line"
+	pos, dur := int64(600_000), int64(2_400_000)
+	return api.PlaybackSessionList{Sessions: []api.PlaybackSession{
+		{DeliveryID: "d1", Status: "playing", Device: api.PlaybackParty{ID: "tv", Name: &tv}, Profile: api.PlaybackParty{ID: "kids", Name: &kids},
+			Item: &api.PlaybackItem{ID: "e1", Title: "Episode One \x1b[2J", Kind: "episode", ParentTitle: &parent}, Mode: "transcode", ClientNetwork: "private",
+			StartedAt: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339), PositionMS: &pos, DurationMS: &dur,
+			BytesSent: "1500000000", ThroughputBPS: "2500000", AverageBPS: "2000000", PeakBPS: "4000000", WatchedMS: 590_000, Stalls: 1},
+		{DeliveryID: "d2", Status: "stalled", Device: api.PlaybackParty{ID: "phone"}, Profile: api.PlaybackParty{ID: "default"},
+			Mode: "direct", ClientNetwork: "remote", BytesSent: "10", ThroughputBPS: "0", AverageBPS: "0", PeakBPS: "0"},
+	}}, nil
+}
+func (f *fake) PlaybackHistory(_ context.Context, cursor string, limit int, filter api.HistoryFilter) (api.Page[api.PlaybackHistoryEntry], error) {
+	f.mu.Lock()
+	f.historyFilters = append(f.historyFilters, filter)
+	f.mu.Unlock()
+	tv := "Living room TV"
+	entries := []api.PlaybackHistoryEntry{
+		{DeliveryID: "h1", Device: api.PlaybackParty{ID: "tv", Name: &tv}, Profile: api.PlaybackParty{ID: "kids"}, Item: &api.PlaybackItem{ID: "m", Title: "Heat"},
+			EndedAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), StartedAt: time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339),
+			EndReason: "closed", WatchedMS: 7_000_000, BytesSent: "6000000000", AverageBPS: "800000", PeakBPS: "2000000", Mode: "direct"},
+		{DeliveryID: "h2", Device: api.PlaybackParty{ID: "phone"}, Profile: api.PlaybackParty{ID: "default"},
+			EndedAt: time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339), EndReason: "interrupted", BytesSent: "5", AverageBPS: "0", PeakBPS: "0"},
+	}
+	if filter.DeviceID != "" {
+		var kept []api.PlaybackHistoryEntry
+		for _, e := range entries {
+			if e.Device.ID == filter.DeviceID {
+				kept = append(kept, e)
+			}
+		}
+		entries = kept
+	}
+	return api.Page[api.PlaybackHistoryEntry]{Items: entries}, nil
 }
 func (f *fake) ListSources(context.Context, string, int) (api.Page[api.Source], error) {
 	return api.Page[api.Source]{Items: []api.Source{{ID: "src", Name: "Media \x1b[2J", RootPath: "/srv/media", Availability: "unavailable"}}}, nil
@@ -1129,8 +1166,14 @@ func TestNullProcessFieldsAndFailedStoragePollsAreShown(t *testing.T) {
 	if !strings.Contains(screen(m), "peak") {
 		t.Fatal("cpu rate missing")
 	}
-	f.process = false // the server stops reporting process metrics
+	f.process = false // one sample without process measurements: still shown
 	m = pollAgain(t, m)
+	if v := screen(m); !strings.Contains(v, "peak") {
+		t.Fatalf("a missing sample hid the process tiles:\n%s", v)
+	}
+	// A reported block whose fields are null: those are unavailable now.
+	m.metrics.observeDiagnostics(time.Now().Add(time.Second), api.Diagnostics{Process: &api.ProcessMetrics{}})
+	m.sync()
 	if v := screen(m); strings.Contains(v, "peak") || !strings.Contains(v, "aren't reported") {
 		t.Fatalf("stale rates shown:\n%s", v)
 	}
@@ -1381,5 +1424,69 @@ func TestActivityGraphCountsTheFirstMinute(t *testing.T) {
 	rows := m.activityGraph(40, 2)
 	if !strings.ContainsAny(ansi.Strip(strings.Join(rows, "")), "⣿⣶⣤⣀⡀⢀⠀⡇⣇⣧⣷⢸⢹⢻") {
 		t.Fatal("first bucket dropped")
+	}
+}
+
+func playbackServer() *fake {
+	return &fake{permissions: []string{api.PermSystemAdmin}, features: []api.Feature{{ID: "admin.playback_sessions", Implemented: true, Enabled: true}}}
+}
+
+func TestNowPlayingShowsWhoWatchesWhatAndHowFast(t *testing.T) {
+	m := start(t, playbackServer(), 150, 46)
+	entries := m.navEntries()
+	if entries[1].route.page != pageNowPlaying || entries[2].route.page != pageHistory {
+		t.Fatalf("playback screens not in the sidebar: %+v", entries[:3])
+	}
+	m = goTo(t, m, route{page: pageNowPlaying})
+	v := screen(m)
+	for _, want := range []string{"Now playing  2 streams", "Living room TV", "Kids", "Northern Line · Episode One", "▶ playing", "⚠ stalled", "transcode", "2.5 MB/s", "1.5 GB", "Throughput", "Transcodes", "1 stalled", "avg 2.0 MB/s", "peak 4.0 MB/s", "private", "phone", "1 stall"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("now playing lacks %q:\n%s", want, v)
+		}
+	}
+	if strings.Contains(m.View().Content, "\x1b[2J") {
+		t.Fatal("unsafe text")
+	}
+	if len(m.metrics.series["session:d1"]) != 1 {
+		t.Fatal("throughput not sampled for the session graph")
+	}
+	// Without the capability or system:admin the screens are absent.
+	plain := start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 150, 46)
+	for _, e := range plain.navEntries() {
+		if e.route.page == pageNowPlaying {
+			t.Fatal("now playing offered without the server feature")
+		}
+	}
+}
+
+func TestHistoryFiltersToTheSelectedDevice(t *testing.T) {
+	f := playbackServer()
+	m := goTo(t, start(t, f, 150, 46), route{page: pageNowPlaying})
+	m = press(t, m, "d")
+	if m.route.page != pageHistory || m.historyFilter.DeviceID != "tv" {
+		t.Fatalf("d did not open the device's history: %+v %+v", m.route, m.historyFilter)
+	}
+	v := screen(m)
+	if !strings.Contains(v, "Finished sessions · Living room TV") || !strings.Contains(v, "Heat") || strings.Contains(v, "interrupted") {
+		t.Fatalf("filtered history:\n%s", v)
+	}
+	m = press(t, m, "x")
+	if v := screen(m); !strings.Contains(v, "interrupted") || m.historyFilter.DeviceID != "" {
+		t.Fatalf("x did not clear the filter:\n%s", v)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.historyFilters) < 2 || f.historyFilters[len(f.historyFilters)-2].DeviceID != "tv" {
+		t.Fatalf("filter not sent to the server: %+v", f.historyFilters)
+	}
+}
+
+func TestPlaybackHintsRefreshBothScreens(t *testing.T) {
+	m := goTo(t, start(t, playbackServer(), 150, 46), route{page: pageHistory})
+	before := m.cache.slots[keyHistory].request
+	m, cmd := update(t, m, eventMsg(api.Event{Kind: "changed", ResourceType: "playback_session"}))
+	m = drain(t, m, cmd)
+	if m.cache.slots[keyHistory].request == before {
+		t.Fatal("history not re-queried on a playback hint")
 	}
 }

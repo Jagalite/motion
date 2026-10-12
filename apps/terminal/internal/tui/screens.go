@@ -125,6 +125,11 @@ func (m Model) tableChrome(f frame) (strip, detail []string) {
 func (m Model) tableStrip(width int) []string {
 	cw := (width - 6) / 4
 	switch m.route.page {
+	case pageNowPlaying, pageHistory:
+		if width < 60 {
+			return nil
+		}
+		return m.playbackStrip(width)
 	case pageProcessing:
 		running, queued, failed, done := m.jobCounts()
 		return strip(width,
@@ -221,6 +226,8 @@ func (m Model) tableDetail(width int) []string {
 	inner := max(width-4, 1)
 	id := m.selectedID()
 	switch m.route.page {
+	case pageNowPlaying, pageHistory:
+		return m.playbackDetail(width)
 	case pageProcessing:
 		jobs, _ := data[[]api.Job](m, keyJobs)
 		for _, j := range jobs {
@@ -384,6 +391,13 @@ func (m Model) listTitle() string {
 		return "Storage sources"
 	case pageDevices:
 		return "Paired devices"
+	case pageNowPlaying:
+		return "Sessions"
+	case pageHistory:
+		if m.historyFilter.label != "" {
+			return "Finished sessions · " + m.historyFilter.label
+		}
+		return "Finished sessions"
 	}
 	return "Viewing profiles"
 }

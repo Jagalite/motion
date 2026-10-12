@@ -30,9 +30,12 @@ const (
 	mAssets     = "storage.asset_bytes"
 	mTemporary  = "storage.temporary_bytes"
 	mFree       = "storage.free_bytes"
+	mSessions   = "playback.sessions_active"
+	mSent       = "playback.bytes_sent_total"
+	mTranscodes = "playback.transcodes_active"
 )
 
-var counters = map[string]bool{mCPU: true, mRequests: true, mErrors: true, mFailed: true, mBusy: true}
+var counters = map[string]bool{mCPU: true, mRequests: true, mErrors: true, mFailed: true, mBusy: true, mSent: true}
 
 // windows are the chart spans the console offers.
 var windows = []time.Duration{5 * time.Minute, 30 * time.Minute, time.Hour, 6 * time.Hour, 24 * time.Hour}
@@ -113,8 +116,10 @@ func (h *history) observe(t time.Time, fields map[string]*string) {
 }
 
 func (h *history) observeDiagnostics(t time.Time, d api.Diagnostics) {
-	fields := map[string]*string{mDeliveries: &d.ActiveDeliveries, mQueued: &d.QueuedJobs, mRunning: &d.RunningJobs, mBusy: &d.DBBusyCount,
-		mCPU: nil, mMemory: nil, mOpenFiles: nil, mRequests: nil, mErrors: nil, mInFlight: nil}
+	fields := map[string]*string{mDeliveries: &d.ActiveDeliveries, mQueued: &d.QueuedJobs, mRunning: &d.RunningJobs, mBusy: &d.DBBusyCount}
+	// A null process block means this sample's measurements could not be
+	// taken, not that the server stopped reporting them: leave them as they
+	// were. A null field inside a reported block is unavailable.
 	if p := d.Process; p != nil {
 		fields[mCPU], fields[mMemory], fields[mOpenFiles] = p.CPUSecondsTotal, p.ResidentBytes, p.OpenFiles
 		fields[mRequests], fields[mErrors], fields[mInFlight] = p.RequestsTotal, p.RequestErrorsTotal, p.RequestsInFlight

@@ -95,9 +95,11 @@ type Model struct {
 	// tselID is the selected row\'s identity; tvisible how many rows fit.
 	tselID   string
 	tvisible int
-	navSel   int
-	list     bool
-	helping  bool
+	// historyFilter narrows playback history to one device.
+	historyFilter historyFilter
+	navSel        int
+	list          bool
+	helping       bool
 
 	search    textinput.Model
 	searchSeq int
@@ -476,6 +478,8 @@ func (m *Model) invalidate(resource string) tea.Cmd {
 		return m.reload(prefix(keyProfiles))
 	case "device":
 		return m.reload(prefix(keyDevices, keySession))
+	case "playback_session":
+		return m.reload(prefix(keyPlayback, keyHistory))
 	}
 	return nil
 }

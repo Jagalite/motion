@@ -37,6 +37,8 @@ type Backend interface {
 	Storage(context.Context) (api.StorageReport, error)
 	Metrics(context.Context, time.Time, int) (api.MetricsHistory, error)
 	ListSources(context.Context, string, int) (api.Page[api.Source], error)
+	PlaybackSessions(context.Context) (api.PlaybackSessionList, error)
+	PlaybackHistory(context.Context, string, int, api.HistoryFilter) (api.Page[api.PlaybackHistoryEntry], error)
 }
 
 const (
@@ -65,6 +67,8 @@ const (
 	keyStorage     = "storage"
 	keyMetrics     = "metrics"
 	keySources     = "sources"
+	keyPlayback    = "playback"
+	keyHistory     = "history"
 )
 
 // baseKeys are loaded at start and after every resync: the shell needs them.
@@ -326,6 +330,16 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 		}
 	case keySources:
 		return list(b.ListSources)
+	case keyPlayback:
+		return func(ctx context.Context) (any, bool, error) {
+			s, err := b.PlaybackSessions(ctx)
+			return s, s.Truncated, err
+		}
+	case keyHistory:
+		filter := m.historyFilter
+		return list(func(ctx context.Context, cursor string, limit int) (api.Page[api.PlaybackHistoryEntry], error) {
+			return b.PlaybackHistory(ctx, cursor, limit, filter.HistoryFilter)
+		})
 	case keyMetrics:
 		window := m.windowSpan()
 		return func(ctx context.Context) (any, bool, error) {

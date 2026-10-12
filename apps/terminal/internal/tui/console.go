@@ -96,6 +96,9 @@ func (m *Model) poll() tea.Cmd {
 			cmds = append(cmds, m.load(keyMetrics))
 		}
 	}
+	if m.route.page == pageNowPlaying && m.admin() && due(keyPlayback, pollEvery) {
+		cmds = append(cmds, m.load(keyPlayback))
+	}
 	if (m.route.page == pageOverview || m.route.page == pageProcessing) && due(keyJobs, jobsEvery) {
 		cmds = append(cmds, m.load(keyJobs))
 	}
@@ -124,6 +127,8 @@ func (m *Model) observe(msg loaded) tea.Cmd {
 	case api.MetricsHistory:
 		m.metrics.replace(v)
 		return m.glide(now)
+	case api.PlaybackSessionList:
+		m.observeSessions(v)
 	case []api.Job:
 		var cmds []tea.Cmd
 		live := map[string]bool{}
@@ -271,7 +276,18 @@ func (m Model) tiles(now time.Time) [][]tile {
 		}
 	}
 	del := tile{label: "Deliveries", id: mDeliveries, unit: "active", accent: colorInfo, colors: rampInfo, missing: waiting}
-	if v, ok := latest(mDeliveries); ok {
+	if v, ok := latest(mSessions); ok {
+		// Servers that monitor playback: streams and their total speed.
+		del.label, del.id, del.unit = "Streams", mSessions, "playing"
+		del.series, del.num, del.format = h.values(mSessions, now, window), v, countText
+		del.note = "now playing"
+		if r := h.values(mSent, now, window); len(r) > 0 {
+			del.note = rateText(lastValue(r)) + " total"
+		}
+		if t, ok := latest(mTranscodes); ok && t > 0 {
+			del.note += " · " + countText(t) + " transcoding"
+		}
+	} else if v, ok := latest(mDeliveries); ok {
 		del.series, del.num, del.format, del.note = h.values(mDeliveries, now, window), v, countText, "streams being served"
 	}
 	busy := tile{label: "Database busy", id: mBusy, accent: colorDanger, colors: rampDanger, missing: waiting}

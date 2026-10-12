@@ -162,3 +162,99 @@ func (c *Client) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/diagnostics", auth: true}, &v)
 	return v, err
 }
+
+// PlaybackParty is a device or profile; Name is nil once it no longer exists.
+type PlaybackParty struct {
+	ID   string  `json:"id"`
+	Name *string `json:"name"`
+}
+
+type PlaybackItem struct {
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Kind        string  `json:"kind"`
+	ParentTitle *string `json:"parent_title"`
+}
+
+type PlaybackVersion struct {
+	ID    string  `json:"id"`
+	Label *string `json:"label"`
+}
+
+// PlaybackSession is a live delivery as administrators see it. Byte counts
+// and rates are decimal strings.
+type PlaybackSession struct {
+	DeliveryID       string          `json:"delivery_id"`
+	ViewingSessionID *string         `json:"viewing_session_id"`
+	Status           string          `json:"status"`
+	Device           PlaybackParty   `json:"device"`
+	Profile          PlaybackParty   `json:"profile"`
+	Item             *PlaybackItem   `json:"item"`
+	TimelineID       string          `json:"timeline_id"`
+	Version          PlaybackVersion `json:"version"`
+	Mode             string          `json:"mode"`
+	ClientNetwork    string          `json:"client_network"`
+	StartedAt        string          `json:"started_at"`
+	LastActivityAt   string          `json:"last_activity_at"`
+	PositionMS       *int64          `json:"position_ms"`
+	DurationMS       *int64          `json:"duration_ms"`
+	BytesSent        string          `json:"bytes_sent"`
+	ThroughputBPS    string          `json:"throughput_bps"`
+	AverageBPS       string          `json:"average_bps"`
+	PeakBPS          string          `json:"peak_bps"`
+	WatchedMS        int64           `json:"watched_ms"`
+	Stalls           int64           `json:"stalls"`
+}
+
+type PlaybackSessionList struct {
+	SampledAt string            `json:"sampled_at"`
+	Truncated bool              `json:"truncated"`
+	Sessions  []PlaybackSession `json:"sessions"`
+}
+
+// PlaybackHistoryEntry is a finished playback session.
+type PlaybackHistoryEntry struct {
+	DeliveryID      string          `json:"delivery_id"`
+	Device          PlaybackParty   `json:"device"`
+	Profile         PlaybackParty   `json:"profile"`
+	Item            *PlaybackItem   `json:"item"`
+	TimelineID      string          `json:"timeline_id"`
+	Version         PlaybackVersion `json:"version"`
+	Mode            string          `json:"mode"`
+	ClientNetwork   string          `json:"client_network"`
+	StartedAt       string          `json:"started_at"`
+	EndedAt         string          `json:"ended_at"`
+	EndReason       string          `json:"end_reason"`
+	WatchedMS       int64           `json:"watched_ms"`
+	StartPositionMS *int64          `json:"start_position_ms"`
+	EndPositionMS   *int64          `json:"end_position_ms"`
+	BytesSent       string          `json:"bytes_sent"`
+	AverageBPS      string          `json:"average_bps"`
+	PeakBPS         string          `json:"peak_bps"`
+	Stalls          int64           `json:"stalls"`
+}
+
+// HistoryFilter narrows playback history; empty fields do not filter.
+type HistoryFilter struct {
+	DeviceID  string
+	ProfileID string
+	ItemID    string
+}
+
+func (c *Client) PlaybackSessions(ctx context.Context) (PlaybackSessionList, error) {
+	var v PlaybackSessionList
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/playback/sessions", auth: true}, &v)
+	return v, err
+}
+
+func (c *Client) PlaybackHistory(ctx context.Context, cursor string, limit int, f HistoryFilter) (Page[PlaybackHistoryEntry], error) {
+	var v Page[PlaybackHistoryEntry]
+	q := pageQuery(cursor, limit)
+	for k, val := range map[string]string{"device_id": f.DeviceID, "profile_id": f.ProfileID, "item_id": f.ItemID} {
+		if val != "" {
+			q.Set(k, val)
+		}
+	}
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/playback/history", query: q, auth: true}, &v)
+	return v, err
+}
