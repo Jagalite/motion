@@ -48,6 +48,8 @@ pub fn router(facade: Facade) -> Router {
         .page(crate::screens::matches)
         .page(crate::screens::processing)
         .page(crate::screens::diagnostics)
+        .page(crate::screens::manage_item)
+        .page(crate::screens::organize)
         .build()
 }
 
@@ -166,6 +168,7 @@ fn icon_path(name: &str) -> &'static str {
         "profiles" => "M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0",
         "diagnostics" => "M3 12h4l3-8 4 16 3-8h4",
         "manage" => "M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4",
+        "collections" => "M4 7h16v13H4zM6 4h12M8 1.5h8",
         "pause" => "M8 5v14M16 5v14",
         "volume" => "M4 9.5h3.5L12 5.5v13l-4.5-4H4zM15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11",
         "next" => "M5 5.5v13l9-6.5zM18 5.5v13",
@@ -236,6 +239,12 @@ fn manage_links(who: &UiPrincipal) -> Vec<ManageLink> {
             "processing",
         ),
         ("sources:manage", "/sources", "Sources", "sources"),
+        (
+            "collections:write",
+            "/organize",
+            "Collections",
+            "collections",
+        ),
         ("system:admin", "/diagnostics", "Diagnostics", "diagnostics"),
     ]
     .into_iter()
@@ -415,7 +424,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             tab_link(href: href!(search).resolve(cx), label: "Search", icon_name: "search", current: path.starts_with("/search"))
                             if can_manage {
                                 tab_link(href: href!(manage).resolve(cx), label: "Manage", icon_name: "manage",
-                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/diagnostics"].iter().any(|p| path.starts_with(p)))
+                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/organize", "/diagnostics"].iter().any(|p| path.starts_with(p)))
                             }
                             tab_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profile", icon_name: "profiles", current: path.starts_with("/profiles"))
                         </nav>
@@ -429,11 +438,19 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
 // --- Components -------------------------------------------------------------
 
 #[component]
-async fn poster(id: String, title: String) -> Result<impl View> {
+async fn poster(
+    id: String,
+    title: String,
+    #[default] artwork: Option<String>,
+) -> Result<impl View> {
     let letters = initials(&title);
     Ok(view! {
         <span class=(art_tone(&id)) aria-hidden="true">
-            <span class="art-initials">(letters.as_str())</span>
+            if let Some(url) = &artwork {
+                <img class="art-image" src=(url.as_str()) alt="" loading="lazy" decoding="async">
+            } else {
+                <span class="art-initials">(letters.as_str())</span>
+            }
         </span>
     })
 }
@@ -446,7 +463,7 @@ async fn item_grid(items: Vec<ItemCard>, label: &str) -> Result<impl View> {
                 <li class="poster-card">
                     <a href=(href!(item, ItemId(entry.id.as_str())))>
                         <span class="poster-frame">
-                            poster(id: entry.id.clone(), title: entry.title.clone())
+                            poster(id: entry.id.clone(), title: entry.title.clone(), artwork: entry.artwork_url.clone())
                             if entry.needs_review {
                                 <span class="badge badge-review">"Needs review"</span>
                             }
@@ -492,7 +509,7 @@ async fn home(cx: &Cx) -> Result<impl View> {
                         <li class="wide-card">
                             <a href=(href!(play, TimelineId(entry.timeline_id.as_str())))>
                                 <span class="wide-frame">
-                                    poster(id: entry.item.id.clone(), title: entry.item.title.clone())
+                                    poster(id: entry.item.id.clone(), title: entry.item.title.clone(), artwork: entry.item.artwork_url.clone())
                                     <span class="play-badge" aria-hidden="true">icon(name: "play")</span>
                                     if let Some(duration) = entry.duration_ms {
                                         <progress max=(duration) value=(entry.position_ms)
@@ -568,6 +585,9 @@ async fn item(cx: &Cx) -> Result<impl View> {
     let id = path_param::<ItemId>(cx);
     let view_model = facade(cx).0.item(who, id).await.map_err(ui_error)?;
     let can_play = who.can("playback:request") && view_model.playback_available;
+    let can_manage = ["catalog:write", "processing:request", "collections:write"]
+        .iter()
+        .any(|p| who.can(p));
     let title = view_model.item.title.clone();
     let entries_heading = match view_model.item.kind.as_str() {
         "series" => "Seasons",
@@ -580,7 +600,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
             <div class=(format!("detail-backdrop {}", art_tone(&view_model.item.id))) aria-hidden="true"></div>
             <div class="detail-hero">
                 <div class="detail-poster">
-                    poster(id: view_model.item.id.clone(), title: title.clone())
+                    poster(id: view_model.item.id.clone(), title: title.clone(), artwork: view_model.item.artwork_url.clone())
                 </div>
                 <div class="detail-info">
                     <h1 class="detail-title">(title.as_str())</h1>
@@ -592,6 +612,9 @@ async fn item(cx: &Cx) -> Result<impl View> {
                             <span class="badge badge-review">"Identification needs review"</span>
                         }
                     </p>
+                    if can_manage {
+                        <p><a class="button" href=(format!("/item/{}/manage", view_model.item.id))>icon(name: "manage") "Manage"</a></p>
+                    }
                     if !view_model.playback_available {
                         <p class="muted">"Playback is unavailable."</p>
                     }

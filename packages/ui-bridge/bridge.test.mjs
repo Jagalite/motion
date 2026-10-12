@@ -5,13 +5,13 @@ import {runInNewContext} from 'node:vm';
 import {webcrypto} from 'node:crypto';
 
 const source = readFileSync(new URL('./bridge.js', import.meta.url), 'utf8');
-function harness(storage = new Map(), fetch = async () => ({ok: true, status: 204})) {
+function harness(storage = new Map(), fetch = async () => ({ok: true, status: 204}), extra = {}) {
   const context = {
     document: {querySelector: () => null, addEventListener() {}},
     sessionStorage: {getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value)},
-    crypto: webcrypto, fetch, location: {reload() {}}, setTimeout: fn => fn(),
+    crypto: webcrypto, fetch, location: {reload() {}}, setTimeout: fn => fn(), Blob, ...extra,
   };
-  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair})`, context);
+  return runInNewContext(`${source}\n({submitCommand, keyFor, settleKey, bodyOf, pair, showPlan})`, context);
 }
 function form(inputs = []) {
   const status = {};
@@ -134,4 +134,104 @@ test('pairing retries session exchange without reclaiming the credential', async
   });
   await bridge.pair(form(), {id: 'pair1', user_code: 'CODE', device_code: 'secret', poll_interval_seconds: 0, expires_at: new Date(Date.now() + 10000).toISOString()});
   assert.deepEqual(paths, ['/api/v2/auth/pairings/pair1/claim', '/api/v2/auth/session', '/api/v2/auth/session']);
+});
+
+test('dotted names nest, blank optional fields are omitted and minutes become seconds', () => {
+  const bridge = harness();
+  const fields = [
+    input('values', 'json', '{}'),
+    input('values.title', 'optional', 'Heat'),
+    input('values.description', 'optional', '  '),
+    input('values.release_year', 'optional-int', '1995'),
+    input('tracks.audio_track_id', 'nullable', ''),
+    input('tracks.subtitle_policy', 'text', 'off'),
+    Object.assign(input('interval_minutes', 'minutes', '90'), {dataset: {type: 'minutes', target: 'interval_seconds'}}),
+  ];
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields))),
+    '{"values":{"title":"Heat","release_year":1995},"tracks":{"audio_track_id":null,"subtitle_policy":"off"},"interval_seconds":5400}');
+  // An emptied correction removes that field from the local contribution.
+  fields[1].value = '';
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields)).values), '{"release_year":1995}');
+});
+
+test('precomputed bodies are sent exactly and identify the request with the precondition', async () => {
+  const sent = [];
+  const bridge = harness(new Map(), async (path, options) => { sent.push([path, options]); return {ok: true, status: 200, json: async () => ({})}; });
+  const command = form();
+  command.dataset = {command: 'PUT /api/v2/collections/c1', idempotent: 'false', ifMatch: '"r-3"', body: 'json'};
+  const fixed = {value: '{"name":"Weekend","profile_id":"p","kind":"manual","item_ids":["i1"],"filter_id":null}'};
+  const base = command.querySelector;
+  command.querySelector = selector => selector === '[data-json-body]' ? fixed : base(selector);
+  await bridge.submitCommand(command);
+  assert.equal(sent[0][0], '/api/v2/collections/c1');
+  assert.equal(sent[0][1].body, fixed.value);
+  assert.equal(sent[0][1].headers['If-Match'], '"r-3"');
+  assert.equal(sent[0][1].headers['Content-Type'], 'application/json');
+});
+
+test('file uploads send the raw bytes as octet-stream with a retry-stable key', async () => {
+  const sent = [];
+  const bridge = harness(new Map(), async (_, options) => { sent.push(options); return {ok: false, status: 503, json: async () => ({})}; });
+  const file = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])]);
+  Object.assign(file, {name: 'poster.png', lastModified: 1});
+  const command = form();
+  command.dataset = {command: 'POST /api/v2/catalog/items/i1/artwork', idempotent: 'true', body: 'file'};
+  const base = command.querySelector;
+  const picker = {files: [file]};
+  command.querySelector = selector => selector === 'input[type="file"]' ? picker : base(selector);
+  await bridge.submitCommand(command);
+  await bridge.submitCommand(command);
+  assert.equal(sent[0].body, file);
+  assert.equal(sent[0].headers['Content-Type'], 'application/octet-stream');
+  assert.equal(sent[0].headers['Idempotency-Key'], sent[1].headers['Idempotency-Key']);
+  // No file chosen: nothing is sent.
+  picker.files = [];
+  await bridge.submitCommand(command);
+  assert.equal(sent.length, 2);
+});
+
+test('a previewed plan is committed only on confirmation, with its own token and key', async () => {
+  const sent = [];
+  let reloaded = 0;
+  const elements = [];
+  const element = () => {
+    const node = {children: [], attributes: {}, listeners: {}, textContent: '',
+      append(...nodes) { this.children.push(...nodes); }, remove() {},
+      setAttribute(name, value) { this.attributes[name] = value; }, removeAttribute(name) { delete this.attributes[name]; },
+      addEventListener(type, fn) { this.listeners[type] = fn; }};
+    elements.push(node);
+    return node;
+  };
+  const bridge = harness(new Map(), async (path, options) => {
+    sent.push([path, options]);
+    return {ok: true, status: 200, json: async () => ({})};
+  }, {document: {querySelector: () => null, addEventListener() {}, createElement: element}, location: {reload() { reloaded++; }}});
+  const status = {setAttribute() {}};
+  const host = {querySelector: selector => selector === '.command-status' ? status
+      : selector === '[data-plan-commit]' ? {dataset: {planCommit: 'POST /api/v2/sources/s1/relocation'}} : null,
+    append() {}};
+  bridge.showPlan(host, {plan_token: 'token-0123456789abcdef', expires_at: new Date().toISOString(), affected_ids: ['a', 'b'], warnings: ['2 files were not found']}, {new_root_path: '/srv/new'});
+  assert.equal(sent.length, 0, 'previewing never commits');
+  const confirm = elements.find(e => e.textContent === 'Apply this change');
+  assert.ok(elements.some(e => e.textContent === '2 files were not found'));
+  assert.ok(elements.some(e => e.textContent.startsWith('Move to /srv/new: 2 items affected.')));
+  await confirm.listeners.click();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], '/api/v2/sources/s1/relocation');
+  assert.equal(sent[0][1].method, 'POST');
+  assert.equal(sent[0][1].body, '{"plan_token":"token-0123456789abcdef"}');
+  assert.match(sent[0][1].headers['Idempotency-Key'], /^[0-9a-f]{32}$/);
+  assert.equal(reloaded, 1);
+});
+
+test('a new preview withdraws the previous plan before it is sent, even if it fails', async () => {
+  let removed = 0;
+  const bridge = harness(new Map(), async () => ({ok: false, status: 422, json: async () => ({detail: 'invalid root'})}));
+  const command = form([input('new_root_path', 'text', '/srv/other')]);
+  command.dataset = {command: 'POST /api/v2/sources/s1/relocation-plans', idempotent: 'true', ifMatch: '"r-2"'};
+  command.classList = {contains: name => name === 'plan'};
+  const base = command.querySelector;
+  command.querySelector = selector => selector === '.plan-result' ? {remove() { removed++; }} : base(selector);
+  await bridge.submitCommand(command);
+  assert.equal(removed, 1);
 });
