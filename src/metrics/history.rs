@@ -830,6 +830,10 @@ mod tests {
         // durably committed. Reopening must not lose the count behind dedup.
         pool.close().await;
         let pool = SqlitePoolOptions::new()
+            // This test exercises durable counter state, not connection startup
+            // contention. Keep one connection so a second WAL connection cannot
+            // race the first write with our intentional zero busy timeout.
+            .max_connections(1)
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(&path)
