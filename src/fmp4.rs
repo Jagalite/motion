@@ -85,6 +85,120 @@ pub fn video_track(init: &[u8]) -> Option<VideoTrack> {
     found
 }
 
+/// The presentation size (width, height) of an init segment's video track,
+/// from its `tkhd` (16.16 fixed point). None when absent or not understood.
+pub fn video_size(init: &[u8]) -> Option<(u32, u32)> {
+    let moov = boxes(init).find(|(k, _)| k == b"moov")?.1;
+    for (_, trak) in boxes(moov).filter(|(k, _)| k == b"trak") {
+        let mdia = child(trak, b"mdia")?;
+        if child(mdia, b"hdlr")?.get(8..12)? != b"vide" {
+            continue;
+        }
+        let tkhd = child(trak, b"tkhd")?;
+        // Width and height are the last 8 bytes of either tkhd version.
+        let at = match tkhd.first()? {
+            0 => 76,
+            1 => 88,
+            _ => return None,
+        };
+        let (w, h) = (u32_at(tkhd, at)? >> 16, u32_at(tkhd, at + 4)? >> 16);
+        return (w > 0 && h > 0).then_some((w, h));
+    }
+    None
+}
+
+/// The RFC 6381 codec identifiers of an init segment's tracks, in track order,
+/// for an HLS `CODECS` attribute: `avc1.PPCCLL` from each H.264 `avcC`, and
+/// `mp4a.40.N` from each AAC `esds` audio object type. None when any track is
+/// another codec or its configuration is not understood.
+pub fn codecs(init: &[u8]) -> Option<String> {
+    let moov = boxes(init).find(|(k, _)| k == b"moov")?.1;
+    let mut found = Vec::new();
+    for (_, trak) in boxes(moov).filter(|(k, _)| k == b"trak") {
+        let mdia = child(trak, b"mdia")?;
+        let stsd = child(child(child(mdia, b"minf")?, b"stbl")?, b"stsd")?;
+        let mut entries = boxes(stsd.get(8..)?);
+        let (kind, entry) = entries.next()?;
+        if entries.next().is_some() {
+            return None;
+        }
+        found.push(match &kind {
+            b"avc1" | b"avc3" => {
+                // Visual sample entry fields precede its child boxes.
+                let avcc = child(entry.get(78..)?, b"avcC")?;
+                format!(
+                    "{}.{:02x}{:02x}{:02x}",
+                    std::str::from_utf8(&kind).ok()?,
+                    avcc.get(1)?,
+                    avcc.get(2)?,
+                    avcc.get(3)?
+                )
+            }
+            // Audio sample entry fields (28 bytes) precede its child boxes.
+            b"mp4a" => format!(
+                "mp4a.40.{}",
+                aac_object_type(child(entry.get(28..)?, b"esds")?)?
+            ),
+            _ => return None,
+        });
+    }
+    (!found.is_empty()).then(|| found.join(","))
+}
+
+/// An MPEG-4 descriptor at the start of `data`: (tag, body, rest).
+fn descriptor(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let tag = *data.first()?;
+    let mut size = 0usize;
+    let mut at = 1;
+    // Up to four 7-bit length bytes, high bit set on all but the last.
+    loop {
+        let byte = *data.get(at)?;
+        size = (size << 7) | usize::from(byte & 0x7f);
+        at += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        if at > 4 {
+            return None;
+        }
+    }
+    let body = data.get(at..at.checked_add(size)?)?;
+    Some((tag, body, &data[at + size..]))
+}
+
+/// The AAC audio object type in an `esds` box (ISO/IEC 14496-1 and -3).
+fn aac_object_type(esds: &[u8]) -> Option<u8> {
+    let (tag, es, _) = descriptor(esds.get(4..)?)?;
+    if tag != 0x03 {
+        return None;
+    }
+    let flags = *es.get(2)?;
+    let mut at = 3;
+    if flags & 0x80 != 0 {
+        at += 2;
+    }
+    if flags & 0x40 != 0 {
+        at += 1 + usize::from(*es.get(at)?);
+    }
+    if flags & 0x20 != 0 {
+        at += 2;
+    }
+    let (tag, config, _) = descriptor(es.get(at..)?)?;
+    // MPEG-4 Audio object type indication.
+    if tag != 0x04 || *config.first()? != 0x40 {
+        return None;
+    }
+    let (tag, specific, _) = descriptor(config.get(13..)?)?;
+    if tag != 0x05 {
+        return None;
+    }
+    match specific.first()? >> 3 {
+        0 => None,
+        31 => Some(32 + ((specific.first()? & 7) << 3 | specific.get(1)? >> 5)),
+        object => Some(object),
+    }
+}
+
 /// Offset (from the start of the segment) and size of the first sample of
 /// `track_id` in a `moof` that starts at `moof_start`. Only explicit data
 /// addressing (a base data offset, or the moof as base) is accepted.
@@ -235,7 +349,7 @@ mod tests {
     fn trak(track_id: u32, handler: &[u8; 4], entry: &[u8; 4], length_size: u8) -> Vec<u8> {
         let mut tkhd = vec![0u8; 12];
         tkhd.extend(track_id.to_be_bytes());
-        tkhd.extend([0u8; 64]);
+        tkhd.extend([0u8; 68]);
         let mut hdlr = vec![0u8; 8];
         hdlr.extend_from_slice(handler);
         hdlr.extend([0u8; 12]);
@@ -294,6 +408,73 @@ mod tests {
             &[&audio_sample[..], &video_sample[..]].concat(),
         ));
         out
+    }
+
+    fn audio_trak(track_id: u32, specific: &[u8]) -> Vec<u8> {
+        let mut tkhd = vec![0u8; 12];
+        tkhd.extend(track_id.to_be_bytes());
+        tkhd.extend([0u8; 68]);
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"soun");
+        hdlr.extend([0u8; 12]);
+        let decoder_specific = [&[0x05, specific.len() as u8][..], specific].concat();
+        let mut config = vec![0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        config.extend(decoder_specific);
+        // ES descriptor with a multi-byte length, as FFmpeg writes it.
+        let mut es = vec![0, 1, 0, 0x04, 0x80, 0x80, 0x80, config.len() as u8];
+        es.extend(config);
+        let mut esds = vec![0, 0, 0, 0, 0x03, 0x80, 0x80, 0x80, es.len() as u8];
+        esds.extend(es);
+        let mut sample_entry = vec![0u8; 28];
+        sample_entry.extend(mp4_box(b"esds", &esds));
+        let mut stsd = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        stsd.extend(mp4_box(b"mp4a", &sample_entry));
+        let stbl = mp4_box(b"stbl", &mp4_box(b"stsd", &stsd));
+        let mut mdia = mp4_box(b"hdlr", &hdlr);
+        mdia.extend(mp4_box(b"minf", &stbl));
+        let mut trak = mp4_box(b"tkhd", &tkhd);
+        trak.extend(mp4_box(b"mdia", &mdia));
+        mp4_box(b"trak", &trak)
+    }
+
+    #[test]
+    fn video_size_reads_the_track_header() {
+        let mut init = init(&[trak(1, b"vide", b"avc1", 4)]);
+        // The test track header is zero-sized: no size.
+        assert_eq!(video_size(&init), None);
+        // Set 640x360 (16.16) in the tkhd width/height fields.
+        let tkhd = init.windows(4).position(|w| w == b"tkhd").unwrap() + 4;
+        init[tkhd + 76..tkhd + 80].copy_from_slice(&(640u32 << 16).to_be_bytes());
+        init[tkhd + 80..tkhd + 84].copy_from_slice(&(360u32 << 16).to_be_bytes());
+        assert_eq!(video_size(&init), Some((640, 360)));
+    }
+
+    #[test]
+    fn codecs_name_each_track_from_its_configuration() {
+        // avcC: High (100), no constraints, level 4.0; AAC-LC, then HE-AAC.
+        let lc = audio_trak(2, &[0x12, 0x10]);
+        let he = audio_trak(2, &[0x2b, 0x92]);
+        assert_eq!(
+            codecs(&init(&[trak(1, b"vide", b"avc1", 4), lc])).as_deref(),
+            Some("avc1.640028,mp4a.40.2")
+        );
+        assert_eq!(
+            codecs(&init(&[trak(1, b"vide", b"avc1", 4), he])).as_deref(),
+            Some("avc1.640028,mp4a.40.5")
+        );
+        assert_eq!(
+            codecs(&init(&[trak(1, b"vide", b"avc1", 4)])).as_deref(),
+            Some("avc1.640028")
+        );
+        // Escaped object types (31 + 6 bits).
+        assert_eq!(
+            codecs(&init(&[audio_trak(1, &[0xf8, 0x20])])).as_deref(),
+            Some("mp4a.40.33")
+        );
+        // Anything not understood is not described.
+        assert_eq!(codecs(&init_with_hevc()), None);
+        assert_eq!(codecs(&init(&[audio_trak(1, &[])])), None);
+        assert_eq!(codecs(&init(&[])), None);
     }
 
     fn check(nals: &[u8]) -> Option<bool> {

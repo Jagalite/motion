@@ -51,22 +51,28 @@ const key = () => crypto.randomUUID().replaceAll('-', '');
 function observedCapability(shared) {
   const video = document.createElement('video');
   const probe = type => (globalThis.MediaSource?.isTypeSupported?.(type) ?? false) || video.canPlayType(type) !== '';
+  // Motion HLS is rolling: native MIME support does not establish live support.
+  const hls = shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
+    && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
+    && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"');
   return {
     client_id: 'motion-ui-bridge', client_build: 'wave0', demuxe_asset_digest: null,
-    // Motion HLS is rolling: native MIME support does not establish live support.
-    transports: shared?.providers.snapshot.providers.some(p => p.id === 'shaka-adaptive')
-      && globalThis.MediaSource?.isTypeSupported?.('video/mp4; codecs="avc1.640028"')
-      && globalThis.MediaSource?.isTypeSupported?.('audio/mp4; codecs="mp4a.40.2"')
-      ? ['http_range', 'hls'] : ['http_range'],
+    transports: hls ? ['http_range', 'hls'] : ['http_range'],
     video_codecs: probe('video/mp4; codecs="avc1.640028"') ? ['avc1'] : [],
     audio_codecs: probe('audio/mp4; codecs="mp4a.40.2"') ? ['mp4a'] : [],
-    subtitle_modes: ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
+    // Text subtitles attach as WebVTT on byte delivery. Over HLS the player
+    // selects the manifest's subtitle rendition (hls_text): Shaka refuses an
+    // external text track on a live presentation but plays in-manifest
+    // WebVTT. A burned subtitle is part of a conversion's video, which
+    // arrives only over HLS, so it needs no player support beyond that.
+    subtitle_modes: hls ? ['text', 'burned', 'hls_text'] : ['text'], hdr: 'unknown', max_height: null, software_decode: 'unknown',
     cross_origin_isolated: globalThis.crossOriginIsolated === true,
   };
 }
 
-// Preference vocabulary differs from the planning contract. Automatic selection
-// may be explicitly refused; always requires the first or explicitly selected caption.
+// Preference vocabulary differs from the planning contract. The server chooses
+// automatically by the profile's languages and roles; "always" requires a
+// subtitle in a preferred language and is refused rather than substituted.
 function subtitlePolicy(preference) {
   if (preference === 'off') return 'off';
   if (preference === 'always') return 'require';
@@ -461,7 +467,14 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await openGeneration(element, generation, position, location.origin);
-    if (generation.subtitles_url) {
+    if (generation.subtitles_url && generation.transport === 'hls') {
+      // A live generation's selected subtitle is its manifest's subtitle
+      // rendition: select that (the only in-manifest subtitle) and show it.
+      const track = element.player.state?.subtitleTracks?.find(t => !t.external);
+      if (!track || typeof element.player.selectSubtitleTrack !== 'function' || typeof element.player.subtitleVisible !== 'function') throw new Error('This player cannot present the selected subtitle.');
+      await element.player.selectSubtitleTrack(track.id);
+      await element.player.subtitleVisible(true);
+    } else if (generation.subtitles_url) {
       if (generation.media_time_origin_ms !== 0 || typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the selected subtitle.');
       await element.player.addTextTrack({src: new URL(generation.subtitles_url, location.origin).href, label: 'Selected subtitles', default: true});
     }

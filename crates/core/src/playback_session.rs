@@ -23,21 +23,42 @@ pub enum Route {
     /// A stored, revision-valid generated rendition of the original, byte
     /// ranges, its default streams.
     Prepared,
+    /// A live HLS stream copy of the original's video and AAC (or no) audio,
+    /// with exactly the selected streams and source timestamps.
+    Remux,
+    /// A live HLS stream copy of the original's video with the selected audio
+    /// converted to AAC.
+    AudioConvert,
     /// A live HLS conversion of the original with exactly the selected streams.
     Transcode,
+    /// The same conversion on a hardware encoder session. Never falls back to
+    /// software within a delivery; a failure is reported and replanned.
+    HardwareTranscode,
 }
 impl Route {
     pub fn operation(self) -> Operation {
         match self {
             Route::Original => Operation::Original,
             Route::Prepared => Operation::Prepared,
-            Route::Transcode => Operation::VideoTranscode,
+            Route::Remux => Operation::Remux,
+            Route::AudioConvert => Operation::AudioConvert,
+            Route::Transcode | Route::HardwareTranscode => Operation::VideoTranscode,
+        }
+    }
+    /// The stream-copy route for a copy operation.
+    pub fn copy(operation: Operation) -> Option<Route> {
+        match operation {
+            Operation::Remux => Some(Route::Remux),
+            Operation::AudioConvert => Some(Route::AudioConvert),
+            _ => None,
         }
     }
     pub fn transport(self) -> &'static str {
         match self {
             Route::Original | Route::Prepared => "http_range",
-            Route::Transcode => "hls",
+            Route::Remux | Route::AudioConvert | Route::Transcode | Route::HardwareTranscode => {
+                "hls"
+            }
         }
     }
     /// Candidate identities are stable for one file and route, so a client
@@ -48,7 +69,10 @@ impl Route {
         let prefix = match self {
             Route::Original => "o",
             Route::Prepared => "p",
+            Route::Remux => "r",
+            Route::AudioConvert => "c",
             Route::Transcode => "t",
+            Route::HardwareTranscode => "h",
         };
         if file_id.len() <= 126 {
             format!("{prefix}-{file_id}")
@@ -75,10 +99,46 @@ pub struct SourceFacts {
     /// The conversion's output honors the client's height and bitrate limits
     /// (`conversion_fits`). A conversion never silently exceeds them.
     pub conversion_within_budget: bool,
+    /// Live stream copy of the selected streams. A copy keeps the source video,
+    /// so `within_budget` is also its budget.
+    pub copy: StreamCopy,
+    /// A hardware encoder for the conversion. Its recipe has the same output
+    /// bounds as the software one, so `conversion_within_budget` covers both.
+    pub hardware: Hardware,
+    /// The timeline is an interval of the original (`parts::Clip`). Byte
+    /// delivery, a stream copy and prepared renditions all present the whole
+    /// file, so only a conversion of the interval can serve it.
+    pub clipped: bool,
+    /// The timeline plays several files in order. Byte delivery, a copy and
+    /// a rendition each present one file, so only a conversion can serve it.
+    pub multipart: bool,
     /// Stored renditions of this original whose output and source revisions
     /// are both still the registered ones (`renditions::available`), in the
     /// adapter's preference order (newest first).
     pub prepared: Vec<PreparedFacts>,
+}
+
+/// What is known about a live stream copy of the selected streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCopy {
+    /// Not enabled on this server, or ruled out by the stream facts
+    /// (`delivery::copy_operation`), or by observed bitstream details.
+    Ineligible,
+    /// The stream facts name this copy route, but the source's bitstream
+    /// details have not been observed yet.
+    Unobserved(Route),
+    /// The core live-route rule admits this copy route with observed details.
+    Eligible(Route),
+}
+
+/// What the server observes about hardware encoding for a live conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hardware {
+    /// Not enabled here, or no hardware encoder session could be opened.
+    Unavailable,
+    /// Available, but no interactive hardware session is admissible now.
+    Busy,
+    Available,
 }
 
 /// Facts about one revision-valid prepared rendition.
@@ -87,6 +147,112 @@ pub struct PreparedFacts {
     pub file: String,
     pub client_support: Support,
     pub within_budget: bool,
+    /// Byte delivery of this rendition presents exactly the selected streams:
+    /// no subtitle is selected, and its one audio stream was prepared from the
+    /// selected audio of the same source revision (or, for a rendition whose
+    /// source audio is not recorded, no audio was chosen explicitly).
+    pub carries_selection: bool,
+}
+
+/// Audio bitrate of every live conversion recipe (AAC stereo).
+pub const LIVE_AUDIO_BPS: u64 = 160_000;
+/// The lowest video rate a capped conversion is offered at.
+pub const MIN_CAPPED_VIDEO_BPS: u64 = 300_000;
+
+/// Encoder rate limits for a conversion capped at a client's peak bitrate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateCap {
+    /// VBV maximum video rate, bits/s.
+    pub video_max_bps: u64,
+    /// VBV buffer, bits (one second at the maximum rate).
+    pub video_buffer_bits: u64,
+}
+
+/// Rate limits that keep a live conversion's peak bitrate within
+/// `max_bitrate_bps` over every window of at least `min_window_ms` (HLS
+/// measures peak bitrate over sets of segments lasting at least half the
+/// target duration). Over a window `w`, a VBV-constrained video stream carries
+/// at most `M*w + B` bits, so with `B` one second at `M` its rate is at most
+/// `M*(1 + 1000/w)`. The audio rate and a 5% container allowance come first.
+/// None when too little remains for video.
+pub fn rate_cap(max_bitrate_bps: u64, min_window_ms: u64) -> Option<RateCap> {
+    let video = (max_bitrate_bps.checked_mul(100)? / 105).checked_sub(LIVE_AUDIO_BPS)?;
+    let max = video.checked_mul(min_window_ms)? / (min_window_ms + 1000);
+    (max >= MIN_CAPPED_VIDEO_BPS).then_some(RateCap {
+        video_max_bps: max,
+        video_buffer_bits: max,
+    })
+}
+
+/// The adaptive ladder of a conversion: the main variant (at most
+/// `delivery::LIVE_MAX_HEIGHT` lines) and a low variant (at most
+/// `ADAPTIVE_LOW_HEIGHT`), each capped (`rate_cap`) so its declared HLS
+/// BANDWIDTH is a measured bound.
+pub const ADAPTIVE_MAIN_BPS: u64 = 3_000_000;
+pub const ADAPTIVE_LOW_BPS: u64 = 800_000;
+pub const ADAPTIVE_LOW_HEIGHT: u32 = 360;
+
+/// Whether a planned route is delivered as an adaptive (multi-variant)
+/// conversion: the server enables it, the route is a software conversion of
+/// one file without a burned subtitle, and the client set no bitrate cap
+/// (a capped plan keeps its single capped variant). Everything else is one
+/// variant, as before.
+pub fn adaptive(
+    enabled: bool,
+    route: Route,
+    max_bitrate_bps: Option<u64>,
+    burn_in: bool,
+    multipart: bool,
+) -> bool {
+    enabled && route == Route::Transcode && max_bitrate_bps.is_none() && !burn_in && !multipart
+}
+
+/// Whether a published segment honors a peak bitrate cap.
+pub fn within_cap(bytes: u64, duration_ms: u64, max_bitrate_bps: u64) -> bool {
+    bytes.saturating_mul(8_000) <= max_bitrate_bps.saturating_mul(duration_ms)
+}
+
+/// The highest bitrate over the runs of contiguous segments ending with the
+/// newest one whose total duration is between `min_window_ms` and
+/// `max_window_ms` (HLS peak windows); zero when no run qualifies yet.
+pub fn peak_bitrate(recent: &[(u64, u64)], min_window_ms: u64, max_window_ms: u64) -> u64 {
+    let (mut bytes, mut duration, mut peak) = (0u64, 0u64, 0u64);
+    for &(b, d) in recent.iter().rev() {
+        bytes = bytes.saturating_add(b);
+        duration = duration.saturating_add(d);
+        if duration > max_window_ms {
+            break;
+        }
+        if duration >= min_window_ms && duration > 0 {
+            peak = peak.max(bytes.saturating_mul(8_000) / duration);
+        }
+    }
+    peak
+}
+
+/// Whether every run of contiguous segments ending with the newest one, whose
+/// total duration is between `min_window_ms` and `max_window_ms` (HLS: 0.5
+/// and 1.5 target durations), stays within the cap. `recent` holds (bytes,
+/// duration) of the generation's segments in order, newest last; runs ending
+/// earlier were checked when their own last segment was published.
+pub fn peak_within_cap(
+    recent: &[(u64, u64)],
+    max_bitrate_bps: u64,
+    min_window_ms: u64,
+    max_window_ms: u64,
+) -> bool {
+    let (mut bytes, mut duration) = (0u64, 0u64);
+    for &(b, d) in recent.iter().rev() {
+        bytes = bytes.saturating_add(b);
+        duration = duration.saturating_add(d);
+        if duration > max_window_ms {
+            break;
+        }
+        if duration >= min_window_ms && !within_cap(bytes, duration, max_bitrate_bps) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether a conversion whose output is at most `output_height` lines and, when
@@ -114,9 +280,10 @@ pub struct Request {
     /// The client pinned the prepared rendition's version: nothing else may
     /// serve the plan.
     pub pinned_prepared: bool,
-    /// The client pinned revision-local source tracks. A rendition has its own
-    /// streams, so it cannot honor them.
-    pub tracks_pinned: bool,
+    /// The selected subtitle can only be presented burned into the video (a
+    /// bitmap subtitle for a client that accepts burned subtitles). Burn-in
+    /// is a video transform: only a conversion can deliver it.
+    pub burn_in: bool,
     pub failed: Vec<String>,
 }
 
@@ -126,24 +293,33 @@ pub enum Plan {
     Ready(Route),
     /// The prepared rendition at this index of `SourceFacts::prepared`.
     Prepared(usize),
+    /// A stream copy would be chosen if the source's bitstream details admit
+    /// it: observe them, then plan again with `StreamCopy` decided. Planning
+    /// with decided copy facts never returns this.
+    Observe,
     Blocked(&'static str),
 }
 
 /// Select a route. Original byte delivery is preferred in Auto, then a
-/// prepared rendition, then a live conversion; Convert prefers a prepared
-/// rendition over a live conversion and never plays the original. A live
-/// conversion is also needed to honor an explicit stream choice. Strict
-/// Original never converts, and a pinned prepared version is never widened.
-/// Nothing here starts processing.
+/// prepared rendition, then a live stream copy, then a live conversion;
+/// Convert prefers a prepared rendition over a live conversion and never plays
+/// the original or a copy of its video. A live route is also needed to honor
+/// an explicit stream choice. Strict Original never converts, and a pinned
+/// prepared version is never widened. A failed copy falls back to conversion.
+/// A conversion uses an available hardware encoder first; a failed or busy
+/// one falls back to software, and a failed software conversion ends the
+/// plan. Nothing here starts processing.
 pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     let failed = |route: Route, file: &str| request.failed.contains(&route.candidate_id(file));
-    let byte = request.range && !request.explicit_streams;
+    let byte = request.range && !request.explicit_streams && !request.burn_in;
     // An unavailable original rules out its own byte route and any live
     // conversion of it, not a stored rendition that is still revision-valid.
     let mut candidates = vec![Candidate {
         original: true,
         available: source.available
             && byte
+            && !source.clipped
+            && !source.multipart
             && !request.pinned_prepared
             && !failed(Route::Original, file_id),
         support: source.client_support,
@@ -153,7 +329,13 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     }];
     candidates.extend(source.prepared.iter().map(|p| Candidate {
         original: false,
-        available: byte && !request.tracks_pinned && !failed(Route::Prepared, &p.file),
+        // A rendition carrying the selected streams honors an explicit choice.
+        available: request.range
+            && !request.burn_in
+            && !source.clipped
+            && !source.multipart
+            && p.carries_selection
+            && !failed(Route::Prepared, &p.file),
         support: p.client_support,
         matches_recipe: true,
         within_budget: p.within_budget,
@@ -167,16 +349,96 @@ pub fn plan(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
     match () {
         _ if request.pinned_prepared => Plan::Blocked("selected_version_unavailable"),
         _ if !source.available => Plan::Blocked("source_unavailable"),
-        _ if request.mode == Mode::Original => Plan::Blocked(if request.explicit_streams {
+        _ if request.mode == Mode::Original => Plan::Blocked(if source.clipped {
+            "interval_requires_conversion"
+        } else if source.multipart {
+            "multipart_requires_conversion"
+        } else if request.burn_in {
+            "subtitle_requires_conversion"
+        } else if request.explicit_streams {
             "stream_selection_requires_conversion"
         } else {
             "original_unavailable_or_unsupported"
         }),
         _ if !request.hls => Plan::Blocked("client_cannot_play_conversion"),
+        // A copy keeps the source's video at its own size and bitrate. Convert
+        // asks for converted video, so only Auto may choose a copy.
+        _ if request.mode == Mode::Auto
+            && source.within_budget
+            && !request.burn_in
+            && !source.clipped
+            && !source.multipart =>
+        {
+            match source.copy {
+                StreamCopy::Eligible(route) if !failed(route, file_id) => Plan::Ready(route),
+                StreamCopy::Unobserved(route) if !failed(route, file_id) => Plan::Observe,
+                _ => transcode(file_id, source, request),
+            }
+        }
+        _ => transcode(file_id, source, request),
+    }
+}
+
+fn transcode(file_id: &str, source: &SourceFacts, request: &Request) -> Plan {
+    let failed = |route: Route| request.failed.contains(&route.candidate_id(file_id));
+    match () {
         _ if !source.transcodable => Plan::Blocked("no_live_route"),
         _ if !source.conversion_within_budget => Plan::Blocked("conversion_exceeds_quality_limit"),
-        _ if failed(Route::Transcode, file_id) => Plan::Blocked("all_candidates_failed"),
+        _ if source.hardware == Hardware::Available && !failed(Route::HardwareTranscode) => {
+            Plan::Ready(Route::HardwareTranscode)
+        }
+        _ if failed(Route::Transcode) => Plan::Blocked("all_candidates_failed"),
         _ => Plan::Ready(Route::Transcode),
+    }
+}
+
+/// A selected subtitle as a plan pins it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subtitle {
+    /// The zero-based embedded text subtitle stream of the pinned file,
+    /// delivered as WebVTT.
+    Text(u32),
+    /// A recognized plain-text sidecar of the pinned file, by name and the
+    /// fingerprint observed when it was scanned. A changed sidecar is refused.
+    Sidecar { name: String, fingerprint: String },
+    /// The zero-based embedded bitmap subtitle stream (PGS, DVD, DVB) of the
+    /// pinned file, burned into converted video.
+    Bitmap(u32),
+}
+
+/// A plan's subtitle claim: the current form, or a bare stream number from
+/// a plan signed before subtitle kinds (an embedded text stream).
+fn subtitle_claim<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Subtitle>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Claim {
+        Legacy(u32),
+        Current(Subtitle),
+    }
+    Ok(Option::<Claim>::deserialize(d)?.map(|claim| match claim {
+        Claim::Legacy(stream) => Subtitle::Text(stream),
+        Claim::Current(subtitle) => subtitle,
+    }))
+}
+
+/// Whether a route presents a subtitle delivered this way. A burned subtitle
+/// is a video transform, so only a conversion. A text subtitle comes from the
+/// original's file: byte delivery of the original carries it as a WebVTT
+/// sidecar, and a live route (copy or conversion of the original) as an HLS
+/// subtitle rendition when the client selects in-manifest live text
+/// (`live_text`; an external track on a live presentation is refused by the
+/// supported player). A prepared rendition is another file.
+pub fn presents_subtitle(route: Route, burned: bool, live_text: bool) -> bool {
+    match (burned, route) {
+        (true, Route::Transcode | Route::HardwareTranscode) => true,
+        (true, _) => false,
+        (false, Route::Original) => true,
+        (
+            false,
+            Route::Remux | Route::AudioConvert | Route::Transcode | Route::HardwareTranscode,
+        ) => live_text,
+        (false, Route::Prepared) => false,
     }
 }
 
@@ -192,8 +454,24 @@ pub struct Claims {
     pub route: Route,
     /// Zero-based audio stream among the source's audio streams; None omits audio.
     pub audio: Option<u32>,
-    /// Zero-based text subtitle stream; None means no subtitle.
-    pub subtitle: Option<u32>,
+    /// The selected subtitle; None means no subtitle. Plans signed before
+    /// subtitle kinds carry an embedded text stream as a bare number.
+    #[serde(deserialize_with = "subtitle_claim")]
+    pub subtitle: Option<Subtitle>,
+    /// The interval of the file the version binds, when it binds one. A
+    /// changed interval is a changed binding.
+    #[serde(default)]
+    pub clip: Option<crate::parts::Clip>,
+    /// Every part of a multipart version, in order (empty for one file). A
+    /// changed part or revision is a changed binding.
+    #[serde(default)]
+    pub parts: Vec<crate::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at (`rate_cap`); None uncapped.
+    #[serde(default)]
+    pub max_bitrate_bps: Option<u64>,
+    /// Delivered as an adaptive ladder (`adaptive`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adaptive: bool,
     pub expires_at: i64,
 }
 
@@ -381,6 +659,10 @@ mod tests {
             within_budget: true,
             transcodable: true,
             conversion_within_budget: true,
+            copy: StreamCopy::Ineligible,
+            hardware: Hardware::Unavailable,
+            clipped: false,
+            multipart: false,
             prepared: vec![],
         }
     }
@@ -399,7 +681,7 @@ mod tests {
             hls: true,
             explicit_streams: false,
             pinned_prepared: false,
-            tracks_pinned: false,
+            burn_in: false,
             failed: vec![],
         }
     }
@@ -507,6 +789,10 @@ mod tests {
             route: Route::Original,
             audio: Some(0),
             subtitle: None,
+            clip: None,
+            parts: vec![],
+            max_bitrate_bps: None,
+            adaptive: false,
             expires_at: 100,
         }
     }
@@ -637,14 +923,24 @@ mod tests {
     #[test]
     fn candidate_ids_are_stable_distinct_and_bounded() {
         let long = "x".repeat(128);
-        for route in [Route::Original, Route::Prepared, Route::Transcode] {
+        let routes = [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::Transcode,
+            Route::HardwareTranscode,
+        ];
+        for route in routes {
             assert_eq!(route.candidate_id(&long), route.candidate_id(&long));
             assert!(route.candidate_id(&long).len() <= 128);
         }
-        assert_ne!(
-            Route::Original.candidate_id("f"),
-            Route::Transcode.candidate_id("f")
-        );
+        for (i, a) in routes.iter().enumerate() {
+            for b in &routes[i + 1..] {
+                assert_ne!(a.candidate_id("f"), b.candidate_id("f"));
+                assert_ne!(a.candidate_id(&long), b.candidate_id(&long));
+            }
+        }
         assert_ne!(
             Route::Original.candidate_id(&long),
             Route::Original.candidate_id(&"y".repeat(128))
@@ -657,6 +953,7 @@ mod tests {
             file: "g".into(),
             client_support: support,
             within_budget: true,
+            carries_selection: true,
         };
         let with = |original, p: Option<PreparedFacts>| SourceFacts {
             prepared: p.into_iter().collect(),
@@ -694,12 +991,18 @@ mod tests {
             ..request(Mode::Convert)
         };
         assert_eq!(plan("f", &ready, &failed), Plan::Ready(Route::Transcode));
-        // A byte route cannot honor an explicit stream choice.
+        // The original's byte route cannot honor an explicit stream choice,
+        // nor can a rendition that does not carry it.
         let explicit = Request {
             explicit_streams: true,
             ..request(Mode::Convert)
         };
-        assert_eq!(plan("f", &ready, &explicit), Plan::Ready(Route::Transcode));
+        let mut without = ready.clone();
+        without.prepared[0].carries_selection = false;
+        assert_eq!(
+            plan("f", &without, &explicit),
+            Plan::Ready(Route::Transcode)
+        );
         // A pinned prepared version is never widened to another route.
         let pinned = Request {
             pinned_prepared: true,
@@ -745,13 +1048,21 @@ mod tests {
             ..source(Support::Unsupported)
         };
         assert_eq!(plan("f", &two, &request(Mode::Convert)), Plan::Prepared(1));
-        // Pinned source tracks are never served by a rendition's own streams.
-        let pinned_tracks = Request {
-            tracks_pinned: true,
-            ..request(Mode::Convert)
-        };
+        // A rendition that does not carry the selected streams never serves
+        // them; one that does serves an explicit choice by byte delivery.
+        let mut other_audio = ready.clone();
+        other_audio.prepared[0].carries_selection = false;
         assert_eq!(
-            plan("f", &ready, &pinned_tracks),
+            plan("f", &other_audio, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        let explicit = Request {
+            explicit_streams: true,
+            ..request(Mode::Auto)
+        };
+        assert_eq!(plan("f", &ready, &explicit), Plan::Prepared(0));
+        assert_eq!(
+            plan("f", &other_audio, &explicit),
             Plan::Ready(Route::Transcode)
         );
     }
@@ -787,5 +1098,383 @@ mod tests {
             ),
             Plan::Ready(Route::Original)
         );
+    }
+
+    #[test]
+    fn auto_prefers_an_eligible_stream_copy_over_conversion_and_falls_back_on_failure() {
+        let mut auto = request(Mode::Auto);
+        auto.explicit_streams = true;
+        let mut s = source(Support::Supported);
+        for route in [Route::Remux, Route::AudioConvert] {
+            s.copy = StreamCopy::Eligible(route);
+            assert_eq!(plan("f", &s, &auto), Plan::Ready(route));
+            // Unobserved details are observed first, never assumed.
+            s.copy = StreamCopy::Unobserved(route);
+            assert_eq!(plan("f", &s, &auto), Plan::Observe);
+            // A failed copy is never offered again or observed again.
+            let mut failed = auto.clone();
+            failed.failed = vec![route.candidate_id("f")];
+            for copy in [StreamCopy::Eligible(route), StreamCopy::Unobserved(route)] {
+                s.copy = copy;
+                assert_eq!(plan("f", &s, &failed), Plan::Ready(Route::Transcode));
+            }
+            failed.failed.push(Route::Transcode.candidate_id("f"));
+            assert_eq!(
+                plan("f", &s, &failed),
+                Plan::Blocked("all_candidates_failed")
+            );
+        }
+        // Byte delivery of the original still wins when it can honor the request.
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Original)
+        );
+        // A copy needs no conversion capability, but still needs HLS.
+        s.transcodable = false;
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Remux));
+        let mut range_only = auto.clone();
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
+        s.copy = StreamCopy::Ineligible;
+        assert_eq!(plan("f", &s, &auto), Plan::Blocked("no_live_route"));
+    }
+
+    #[test]
+    fn stream_copy_keeps_source_limits_and_is_never_chosen_by_strict_modes() {
+        let mut s = source(Support::Supported);
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        // The copied video keeps the source size and unknown peak bitrate: a
+        // source outside the client limits converts instead.
+        s.within_budget = false;
+        let auto = request(Mode::Auto);
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Transcode));
+        s.copy = StreamCopy::Unobserved(Route::Remux);
+        assert_eq!(plan("f", &s, &auto), Plan::Ready(Route::Transcode));
+        s.conversion_within_budget = false;
+        assert_eq!(
+            plan("f", &s, &auto),
+            Plan::Blocked("conversion_exceeds_quality_limit")
+        );
+        // Convert asks for converted video; Original never converts.
+        let mut s = source(Support::Unsupported);
+        s.copy = StreamCopy::Eligible(Route::AudioConvert);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("original_unavailable_or_unsupported")
+        );
+        s.copy = StreamCopy::Unobserved(Route::AudioConvert);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        // An unavailable original has no copy either.
+        let mut offline = s.clone_offline();
+        offline.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &offline, &request(Mode::Auto)),
+            Plan::Blocked("source_unavailable")
+        );
+        // A pinned prepared version is never widened to a copy.
+        let mut pinned = request(Mode::Auto);
+        pinned.pinned_prepared = true;
+        assert_eq!(
+            plan("f", &s, &pinned),
+            Plan::Blocked("selected_version_unavailable")
+        );
+    }
+
+    #[test]
+    fn copy_routes_map_to_their_operations_and_hls() {
+        for (route, operation) in [
+            (Route::Remux, Operation::Remux),
+            (Route::AudioConvert, Operation::AudioConvert),
+        ] {
+            assert_eq!(route.operation(), operation);
+            assert_eq!(Route::copy(operation), Some(route));
+            assert_eq!(route.transport(), "hls");
+        }
+        for operation in [
+            Operation::Original,
+            Operation::Prepared,
+            Operation::VideoTranscode,
+        ] {
+            assert_eq!(Route::copy(operation), None);
+        }
+    }
+
+    #[test]
+    fn conversion_prefers_an_available_hardware_session_and_falls_back_to_software() {
+        let mut s = source(Support::Unsupported);
+        s.hardware = Hardware::Available;
+        for mode in [Mode::Auto, Mode::Convert] {
+            assert_eq!(
+                plan("f", &s, &request(mode)),
+                Plan::Ready(Route::HardwareTranscode)
+            );
+        }
+        // A failed hardware attempt is never offered again; software follows.
+        let mut failed = request(Mode::Auto);
+        failed.failed = vec![Route::HardwareTranscode.candidate_id("f")];
+        assert_eq!(plan("f", &s, &failed), Plan::Ready(Route::Transcode));
+        failed.failed.push(Route::Transcode.candidate_id("f"));
+        assert_eq!(
+            plan("f", &s, &failed),
+            Plan::Blocked("all_candidates_failed")
+        );
+        // Busy or unavailable hardware converts in software.
+        for hardware in [Hardware::Busy, Hardware::Unavailable] {
+            s.hardware = hardware;
+            assert_eq!(
+                plan("f", &s, &request(Mode::Auto)),
+                Plan::Ready(Route::Transcode)
+            );
+        }
+        // Hardware is still a conversion: limits and capability apply alike.
+        s.hardware = Hardware::Available;
+        s.conversion_within_budget = false;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Blocked("conversion_exceeds_quality_limit")
+        );
+        s.conversion_within_budget = true;
+        s.transcodable = false;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Blocked("no_live_route")
+        );
+        // An eligible copy still comes before any conversion.
+        s.transcodable = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Remux)
+        );
+        assert_eq!(
+            Route::HardwareTranscode.operation(),
+            Operation::VideoTranscode
+        );
+        assert_eq!(Route::HardwareTranscode.transport(), "hls");
+    }
+
+    #[test]
+    fn burned_subtitles_need_a_conversion_never_bytes_or_a_copy() {
+        let mut s = source(Support::Supported);
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        let mut burn = request(Mode::Auto);
+        burn.burn_in = true;
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::Transcode));
+        s.hardware = Hardware::Available;
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
+        let mut original = burn.clone();
+        original.mode = Mode::Original;
+        assert_eq!(
+            plan("f", &s, &original),
+            Plan::Blocked("subtitle_requires_conversion")
+        );
+        let mut range_only = burn.clone();
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
+        // A prepared rendition never carries it either.
+        s.prepared = vec![PreparedFacts {
+            file: "p".into(),
+            client_support: Support::Supported,
+            within_budget: true,
+            carries_selection: true,
+        }];
+        assert_eq!(plan("f", &s, &burn), Plan::Ready(Route::HardwareTranscode));
+        s.transcodable = false;
+        assert_eq!(plan("f", &s, &burn), Plan::Blocked("no_live_route"));
+    }
+
+    #[test]
+    fn subtitles_are_presented_only_by_routes_that_can_deliver_them() {
+        for route in [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::Transcode,
+            Route::HardwareTranscode,
+        ] {
+            assert_eq!(
+                presents_subtitle(route, false, false),
+                route == Route::Original
+            );
+            assert_eq!(
+                presents_subtitle(route, false, true),
+                route != Route::Prepared,
+                "{route:?}"
+            );
+            for live_text in [false, true] {
+                assert_eq!(
+                    presents_subtitle(route, true, live_text),
+                    matches!(route, Route::Transcode | Route::HardwareTranscode)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_interval_is_served_only_by_a_conversion_of_it() {
+        let mut s = source(Support::Supported);
+        s.clipped = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        s.prepared = vec![PreparedFacts {
+            file: "p".into(),
+            client_support: Support::Supported,
+            within_budget: true,
+            carries_selection: true,
+        }];
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Convert)),
+            Plan::Ready(Route::Transcode)
+        );
+        s.hardware = Hardware::Available;
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::HardwareTranscode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("interval_requires_conversion")
+        );
+        let mut range_only = request(Mode::Auto);
+        range_only.hls = false;
+        assert_eq!(
+            plan("f", &s, &range_only),
+            Plan::Blocked("client_cannot_play_conversion")
+        );
+    }
+
+    #[test]
+    fn several_parts_are_served_only_by_a_conversion() {
+        let mut s = source(Support::Supported);
+        s.multipart = true;
+        s.copy = StreamCopy::Eligible(Route::Remux);
+        assert_eq!(
+            plan("f", &s, &request(Mode::Auto)),
+            Plan::Ready(Route::Transcode)
+        );
+        assert_eq!(
+            plan("f", &s, &request(Mode::Original)),
+            Plan::Blocked("multipart_requires_conversion")
+        );
+    }
+
+    #[test]
+    fn capped_conversions_keep_every_peak_window_within_the_limit() {
+        let window = 3_000;
+        let cap = rate_cap(2_000_000, window).unwrap();
+        // 2 Mb/s less 5% and the audio, then 3/4 for the one-second buffer.
+        assert_eq!(
+            cap.video_max_bps,
+            (2_000_000 * 100 / 105 - LIVE_AUDIO_BPS) * 3 / 4
+        );
+        assert_eq!(cap.video_buffer_bits, cap.video_max_bps);
+        // The worst window: the maximum rate plus the whole buffer, the audio
+        // and the container allowance stay within the cap.
+        let worst = (cap.video_max_bps * window / 1000 + cap.video_buffer_bits) * 1000 / window
+            + LIVE_AUDIO_BPS;
+        assert!(worst * 105 / 100 <= 2_000_000, "{worst}");
+        // Too little for video is refused, never squeezed.
+        assert_eq!(rate_cap(500_000, window), None);
+        assert!(rate_cap(700_000, window).is_some());
+        assert_eq!(rate_cap(0, window), None);
+        assert_eq!(rate_cap(u64::MAX, window), None);
+        assert!(within_cap(1_000_000, 4_000, 2_000_000));
+        assert!(!within_cap(1_000_001, 4_000, 2_000_000));
+    }
+
+    #[test]
+    fn peak_bitrate_is_checked_over_every_qualifying_window() {
+        let cap = 1_000_000;
+        // A compliant 4 s segment then a 2 s tail that alone is too short to
+        // count, but whose 6 s window with its predecessor is over the cap.
+        assert!(peak_within_cap(&[(450_000, 4_000)], cap, 3_000, 9_000));
+        assert!(!peak_within_cap(
+            &[(450_000, 4_000), (400_000, 2_000)],
+            cap,
+            3_000,
+            9_000
+        ));
+        // A short segment alone is not a window.
+        assert!(peak_within_cap(&[(400_000, 2_000)], cap, 3_000, 9_000));
+        // Windows longer than 1.5 targets are not counted: the oldest segment
+        // here only joins a 12 s run.
+        assert!(peak_within_cap(
+            &[(9_000_000, 4_000), (400_000, 4_000), (400_000, 4_000)],
+            cap,
+            3_000,
+            9_000
+        ));
+        assert!(!peak_within_cap(&[(500_001, 4_000)], cap, 3_000, 9_000));
+    }
+
+    #[test]
+    fn peak_bitrate_is_the_highest_qualifying_window() {
+        assert_eq!(peak_bitrate(&[(400_000, 2_000)], 3_000, 9_000), 0);
+        // 4 s at 0.9 Mb/s, then with a 2 s tail: 6 s at (450k+400k)*8/6 s.
+        assert_eq!(peak_bitrate(&[(450_000, 4_000)], 3_000, 9_000), 900_000);
+        assert_eq!(
+            peak_bitrate(&[(450_000, 4_000), (400_000, 2_000)], 3_000, 9_000),
+            850_000 * 8_000 / 6_000
+        );
+    }
+
+    #[test]
+    fn claims_signed_before_subtitle_kinds_still_open() {
+        let current = Claims {
+            subtitle: Some(Subtitle::Text(3)),
+            ..claims()
+        };
+        let json = serde_json::to_string(&current).unwrap();
+        assert!(json.contains("\"subtitle\":{\"text\":3}"), "{json}");
+        let legacy = json.replace("\"subtitle\":{\"text\":3}", "\"subtitle\":3");
+        assert_eq!(serde_json::from_str::<Claims>(&legacy).unwrap(), current);
+        assert_eq!(serde_json::from_str::<Claims>(&json).unwrap(), current);
+        let none = serde_json::to_string(&claims()).unwrap();
+        assert_eq!(serde_json::from_str::<Claims>(&none).unwrap(), claims());
+    }
+
+    #[test]
+    fn adaptive_ladders_only_for_uncapped_single_file_software_conversions() {
+        assert!(adaptive(true, Route::Transcode, None, false, false));
+        assert!(!adaptive(false, Route::Transcode, None, false, false));
+        for route in [
+            Route::Original,
+            Route::Prepared,
+            Route::Remux,
+            Route::AudioConvert,
+            Route::HardwareTranscode,
+        ] {
+            assert!(!adaptive(true, route, None, false, false), "{route:?}");
+        }
+        assert!(!adaptive(
+            true,
+            Route::Transcode,
+            Some(5_000_000),
+            false,
+            false
+        ));
+        assert!(!adaptive(true, Route::Transcode, None, true, false));
+        assert!(!adaptive(true, Route::Transcode, None, false, true));
+        // Both rungs leave room for video under their caps.
+        assert!(rate_cap(ADAPTIVE_MAIN_BPS, 3_000).is_some());
+        assert!(rate_cap(ADAPTIVE_LOW_BPS, 3_000).is_some());
     }
 }

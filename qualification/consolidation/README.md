@@ -2,6 +2,8 @@
 
 Current combined acceptance and PR dispositions are recorded in
 [the final gate ledger](FINAL.md). The lane-only statuses below are historical.
+M4 playback expansion slices are recorded in
+[the M4 expansion ledger](../m4-expansion/README.md).
 The current distribution includes Electron and Go/TUI. Final player scope is
 Chromium and Electron; WebKit is explicitly deferred.
 

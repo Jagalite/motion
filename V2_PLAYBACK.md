@@ -61,9 +61,10 @@ Adapters supply the facts and commit the decided records:
 - An exact retry of an acknowledged admission is reauthorized without plan
   expiry (`playback_session::reauthorize`); only a new admission needs a
   fresh token (`fresh`).
-- Planning uses only whole, single-part version bindings whose reviewed file
-  revision is still current; timeline reads check the work and the edition,
-  like catalog timeline reads.
+- Planning uses version bindings whose reviewed file revisions are still
+  current: a whole file, an interval of one file, or a multipart version
+  (core `parts::layout`; intervals and parts play by conversion only).
+  Timeline reads check the work and the edition, like catalog timeline reads.
 - Playback-authorized heartbeats carry optional ordered playhead observations,
   independent of viewing events and permission. Core fences generation, sequence,
   duration and lease expiry; duplicate/stale reports do not renew leases.
@@ -109,40 +110,51 @@ routes is qualified separately (A11/A12).
 
 ## Remaining gaps
 
-- Selected embedded plain-text subtitles (`subrip`, `srt`, `webvtt`, `mov_text`,
-  `text`) are extracted from the revision-bound original as WebVTT. Original
-  generations expose `subtitles_url`; the bridge attaches it after opening the
-  player, or fails explicitly if its text-track API is unavailable. Styled
-  ASS/SSA, bitmap subtitles, sidecars and conversion subtitle delivery are
-  explicitly refused. `require` chooses the first embedded subtitle when no
-  exact selection is supplied; `auto` without an explicit selection is refused when embedded captions exist;
-  automatic forced/foreign-audio language policy is not qualified.
-- Content access can issue a file-revision ticket or a delivery-generation
+The M4 expansion changes are in [the M4 ledger](qualification/m4-expansion/README.md):
+- stream copy and hardware conversions (both off by default);
+- sidecar and burned subtitles, and automatic subtitle selection;
+- rendition audio continuity;
+- interval and multipart timelines;
+- bitrate caps;
+- text subtitles on live routes as an in-manifest HLS subtitle rendition;
+- a two-rung adaptive ladder for software conversions (off by default).
+
+What remains:
+
+- Text subtitles reach live (HLS) routes only as an in-manifest `SUBTITLES`
+  rendition, for clients listing `hls_text` (the bridge does with HLS and
+  selects it through Demuxe `selectSubtitleTrack`). An external track on a
+  live presentation is never used: Shaka 5.2.11 throws 4033 for it. The
+  pair is verified in headless Chromium with the pinned Shaka, not yet
+  qualified in Chromium/Electron product builds. Text burn-in, including
+  styled (ASS/SSA) subtitles and their fonts, needs libass. Subtitles on
+  multipart versions are refused. Burned bitmap cues displayed more than
+  20 s before a start or seek are not restored.
+- Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
+  the production bridge sends `null` and nothing in the product supplies a
+  value yet.
+- Content access issues a file-revision ticket or a delivery-generation
   playback ticket. Generation tickets authorize only that generation's bytes,
-  HLS manifests/children and selected subtitle. They do not authorize commands,
-  heartbeat renewal, another generation, or the file endpoint. Every read
+  its HLS manifests and children, and its selected subtitle. Every read
   rechecks issuer credentials, grants, source revision, ownership and the
-  reducer's lease/generation serving state. Restart invalidates delivery tickets.
-  Cast receiver grants and download-resource tickets remain unavailable.
-- Embedded component IDs resolve only against the selected version, file and
-  revision. Missing/sidecar/other-file occurrences never substitute. Track IDs
-  (`a{n}`, `s{n}`) remain revision-local. Explicit prepared-rendition track and
-  component pins are refused until rendition component mapping is available.
-- Live conversion uses the software recipe only; hardware encoding and copy
-  routes are not offered by the v2 planner. Any route is refused when the
-  client sets a bitrate limit: the CRF recipe has no cap and stored-file average
-  bitrate does not establish a VBR peak bound.
-- Multipart versions and interval (multi-episode) bindings are not planned:
-  they are reported as unavailable until a part-aware delivery exists.
-- HDR sources are refused for byte delivery under `require_sdr` or to a
-  client reporting `hdr: unsupported` or `unknown`; no tone-mapped route exists.
-  Reported support permits an attempt, not a display-fidelity qualification.
-- Revision-local track pins (`a{n}`) require an exact `source` pin.
-- Next-in-order uses `timelines.order_group_id`/`order_position`. Composed public
-  placement-writer/client Next qualification belongs to data/catalog and clients.
+  reducer's lease/generation serving state. A restart invalidates delivery
+  tickets. Cast receiver grants and download-resource tickets remain
+  unavailable.
+- Track IDs (`a{n}`, `s{n}`) are revision-local and require an exact
+  `source` pin. A pinned prepared version still refuses track and component
+  pins.
+- HDR sources are refused for byte delivery under `require_sdr`, and to a
+  client reporting `hdr: unsupported` or `unknown`. No tone-mapped route
+  exists.
+- Adaptive bitrate (`processing.experimental_adaptive_bitrate`, off by
+  default) is two fixed rungs (720p at 3 Mb/s, 360p at 800 kb/s) for an
+  uncapped single-file software conversion without burn-in. Copies,
+  hardware conversions, capped, burned and multipart plans stay single
+  variant. Switching is verified with headless Shaka under throttling, not
+  yet qualified in product players.
+- Next-in-order uses `timelines.order_group_id` / `order_position`.
 - v1 item-keyed progress and v2 timeline progress are separate authorities
-  after migration 0032's one-time backfill (exact attributions and
-  single-timeline works only). The v1 web UI does not see v2 progress.
-- Viewing sessions deliberately survive ordinary restarts and may rebind to a
-  new delivery. Delivery interruption is separate from history authority.
+  after migration 0032's backfill.
+- Viewing sessions survive ordinary restarts and may rebind to a new
+  delivery.
 - Native qualification is macOS arm64 only.

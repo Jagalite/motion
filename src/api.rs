@@ -317,5 +317,9 @@ pub fn router_with(
         })
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
+        .layer(middleware::from_fn_with_state(
+            app.health.metrics.clone(),
+            crate::metrics::track,
+        ))
         .with_state(app)
 }

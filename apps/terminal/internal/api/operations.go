@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strconv"
+	"time"
 )
 
 type ScanInput struct {
@@ -50,6 +53,52 @@ type Diagnostics struct {
 	RunningJobs      string   `json:"running_jobs"`
 	DBBusyCount      string   `json:"db_busy_count"`
 	WorkerErrors     []string `json:"worker_errors"`
+	// Process is reported by servers with the admin.metrics feature.
+	Process *ProcessMetrics `json:"process,omitempty"`
+}
+
+// ProcessMetrics describes the server process. Fields a platform cannot
+// provide are null.
+type ProcessMetrics struct {
+	PID                *string `json:"pid"`
+	CPUSecondsTotal    *string `json:"cpu_seconds_total"`
+	ResidentBytes      *string `json:"resident_bytes"`
+	VirtualBytes       *string `json:"virtual_bytes"`
+	OpenFiles          *string `json:"open_files"`
+	Threads            *string `json:"threads"`
+	CPUCount           *string `json:"cpu_count"`
+	RequestsTotal      *string `json:"requests_total"`
+	RequestErrorsTotal *string `json:"request_errors_total"`
+	RequestsInFlight   *string `json:"requests_in_flight"`
+}
+
+// StorageReport is the server's storage use; FreeBytes is null when unknown.
+type StorageReport struct {
+	DatabaseBytes  string  `json:"database_bytes"`
+	AssetBytes     string  `json:"asset_bytes"`
+	TemporaryBytes string  `json:"temporary_bytes"`
+	ReservedBytes  string  `json:"reserved_bytes"`
+	FreeBytes      *string `json:"free_bytes"`
+}
+
+// MetricsHistory is sampled server history (admin.metrics).
+type MetricsHistory struct {
+	SampledAt        string         `json:"sampled_at"`
+	IntervalSeconds  int64          `json:"interval_seconds"`
+	RetentionSeconds int64          `json:"retention_seconds"`
+	Series           []MetricSeries `json:"series"`
+}
+
+type MetricSeries struct {
+	ID     string        `json:"id"`
+	Kind   string        `json:"kind"`
+	Unit   string        `json:"unit"`
+	Points []MetricPoint `json:"points"`
+}
+
+type MetricPoint struct {
+	T string `json:"t"`
+	V string `json:"v"`
 }
 
 func (c *Client) CreateScan(ctx context.Context, library string, input ScanInput, key string) (Tagged[Scan], error) {
@@ -87,8 +136,125 @@ func (c *Client) RetryJob(ctx context.Context, id, key string) (Tagged[Job], err
 	h, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/jobs/" + esc(id) + "/retry", auth: true, idempotencyKey: key}, &v)
 	return Tagged[Job]{Value: v, ETag: h.Get("ETag")}, err
 }
+func (c *Client) Storage(ctx context.Context) (StorageReport, error) {
+	var v StorageReport
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/storage", auth: true}, &v)
+	return v, err
+}
+
+// Metrics reads sampled history since a time, downsampled to step seconds
+// (0 leaves both to the server).
+func (c *Client) Metrics(ctx context.Context, since time.Time, step int) (MetricsHistory, error) {
+	var v MetricsHistory
+	q := url.Values{}
+	if !since.IsZero() {
+		q.Set("since", since.UTC().Format(time.RFC3339))
+	}
+	if step > 0 {
+		q.Set("step_seconds", strconv.Itoa(step))
+	}
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/metrics", query: q, auth: true}, &v)
+	return v, err
+}
+
 func (c *Client) Diagnostics(ctx context.Context) (Diagnostics, error) {
 	var v Diagnostics
 	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/diagnostics", auth: true}, &v)
+	return v, err
+}
+
+// PlaybackParty is a device or profile; Name is nil once it no longer exists.
+type PlaybackParty struct {
+	ID   string  `json:"id"`
+	Name *string `json:"name"`
+}
+
+type PlaybackItem struct {
+	ID          string  `json:"id"`
+	Title       string  `json:"title"`
+	Kind        string  `json:"kind"`
+	ParentTitle *string `json:"parent_title"`
+}
+
+type PlaybackVersion struct {
+	ID    string  `json:"id"`
+	Label *string `json:"label"`
+}
+
+// PlaybackSession is a live delivery as administrators see it. Byte counts
+// and rates are decimal strings.
+type PlaybackSession struct {
+	DeliveryID       string          `json:"delivery_id"`
+	ViewingSessionID *string         `json:"viewing_session_id"`
+	Status           string          `json:"status"`
+	Device           PlaybackParty   `json:"device"`
+	Profile          PlaybackParty   `json:"profile"`
+	Item             *PlaybackItem   `json:"item"`
+	TimelineID       string          `json:"timeline_id"`
+	Version          PlaybackVersion `json:"version"`
+	Mode             string          `json:"mode"`
+	ClientNetwork    string          `json:"client_network"`
+	StartedAt        string          `json:"started_at"`
+	LastActivityAt   string          `json:"last_activity_at"`
+	PositionMS       *int64          `json:"position_ms"`
+	DurationMS       *int64          `json:"duration_ms"`
+	BytesSent        string          `json:"bytes_sent"`
+	ThroughputBPS    string          `json:"throughput_bps"`
+	AverageBPS       string          `json:"average_bps"`
+	PeakBPS          string          `json:"peak_bps"`
+	WatchedMS        int64           `json:"watched_ms"`
+	Stalls           int64           `json:"stalls"`
+}
+
+type PlaybackSessionList struct {
+	SampledAt string            `json:"sampled_at"`
+	Truncated bool              `json:"truncated"`
+	Sessions  []PlaybackSession `json:"sessions"`
+}
+
+// PlaybackHistoryEntry is a finished playback session.
+type PlaybackHistoryEntry struct {
+	DeliveryID      string          `json:"delivery_id"`
+	Device          PlaybackParty   `json:"device"`
+	Profile         PlaybackParty   `json:"profile"`
+	Item            *PlaybackItem   `json:"item"`
+	TimelineID      string          `json:"timeline_id"`
+	Version         PlaybackVersion `json:"version"`
+	Mode            string          `json:"mode"`
+	ClientNetwork   string          `json:"client_network"`
+	StartedAt       string          `json:"started_at"`
+	EndedAt         string          `json:"ended_at"`
+	EndReason       string          `json:"end_reason"`
+	WatchedMS       int64           `json:"watched_ms"`
+	StartPositionMS *int64          `json:"start_position_ms"`
+	EndPositionMS   *int64          `json:"end_position_ms"`
+	BytesSent       string          `json:"bytes_sent"`
+	AverageBPS      string          `json:"average_bps"`
+	PeakBPS         string          `json:"peak_bps"`
+	Stalls          int64           `json:"stalls"`
+}
+
+// HistoryFilter narrows playback history; empty fields do not filter.
+type HistoryFilter struct {
+	DeviceID  string
+	ProfileID string
+	ItemID    string
+}
+
+func (c *Client) PlaybackSessions(ctx context.Context) (PlaybackSessionList, error) {
+	var v PlaybackSessionList
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/playback/sessions", auth: true}, &v)
+	return v, err
+}
+
+func (c *Client) PlaybackHistory(ctx context.Context, cursor string, limit int, f HistoryFilter) (Page[PlaybackHistoryEntry], error) {
+	var v Page[PlaybackHistoryEntry]
+	q := pageQuery(cursor, limit)
+	for k, val := range map[string]string{"device_id": f.DeviceID, "profile_id": f.ProfileID, "item_id": f.ItemID} {
+		if val != "" {
+			q.Set(k, val)
+		}
+	}
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/playback/history", query: q, auth: true}, &v)
 	return v, err
 }

@@ -15,6 +15,7 @@ use std::{
 use utoipa::ToSchema;
 
 pub struct Health {
+    pub metrics: std::sync::Arc<crate::metrics::Runtime>,
     pub started: Instant,
     pub worker_running: AtomicBool,
     pub shutting_down: AtomicBool,
@@ -23,6 +24,7 @@ pub struct Health {
 impl Health {
     pub fn new(demuxe_available: bool) -> Self {
         Self {
+            metrics: std::sync::Arc::new(crate::metrics::Runtime::new()),
             started: Instant::now(),
             worker_running: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
