@@ -1490,3 +1490,24 @@ func TestPlaybackHintsRefreshBothScreens(t *testing.T) {
 		t.Fatal("history not re-queried on a playback hint")
 	}
 }
+
+func TestFitShrinksRequiredColumnsInsteadOfClipping(t *testing.T) {
+	specs := []column{{"Who", 22, false}, {"Watching", 24, false}, {"State", 11, false}, {"Speed", 11, true}}
+	cols, index := fit(50, specs)
+	if len(cols) != 3 || index[2] != 2 {
+		t.Fatalf("optional column kept or required column dropped: %v %v", cols, index)
+	}
+	total := 0
+	for _, c := range cols {
+		total += c.Width + 2
+	}
+	if total != 50 {
+		t.Fatalf("columns use %d of 50 cells", total)
+	}
+	if cols[2].Width < 6 || cols[1].Width >= 24 {
+		t.Fatalf("widest required column should give up width first: %v", cols)
+	}
+	if cols, _ := fit(200, specs); cols[0].Width != 22 || cols[3].Width < 11 {
+		t.Fatalf("wide tables keep their natural widths: %v", cols)
+	}
+}

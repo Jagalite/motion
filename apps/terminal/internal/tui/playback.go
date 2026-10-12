@@ -127,8 +127,12 @@ func (m Model) playbackRows(width int) ([]table.Column, []table.Row, []string) {
 			ended = t.Local().Format("Jan 2 15:04")
 		}
 		who := fgStyle.Render(name(e.Device)) + faintStyle.Render(" · "+name(e.Profile))
+		average := faintStyle.Render("—")
+		if bps := decimal(e.AverageBPS); bps > 0 {
+			average = mutedStyle.Render(rateText(bps))
+		}
 		rows = append(rows, table.Row{faintStyle.Render(ended), who, fgStyle.Render(watching(e.Item)), fgStyle.Render(clock(e.WatchedMS)),
-			mutedStyle.Render(bytesText(decimal(e.BytesSent))), mutedStyle.Render(rateText(decimal(e.AverageBPS))), endCell(e.EndReason)})
+			mutedStyle.Render(bytesText(decimal(e.BytesSent))), average, endCell(e.EndReason)})
 		ids = append(ids, e.DeliveryID)
 	}
 	return project(width, []column{{"Ended", 12, false}, {"Who", 20, false}, {"Watched", 22, false}, {"Time", 8, true}, {"Sent", 9, true}, {"Avg speed", 11, true}, {"End", 13, true}}, rows, ids)
@@ -192,7 +196,13 @@ func (m Model) playbackDetail(width int) []string {
 			if s.DeliveryID != id {
 				continue
 			}
-			graph := areaGraph(m.metrics.values("session:"+id, time.Now(), 5*time.Minute), time.Now(), 5*time.Minute, inner, 2, graphScale{nice: true}, rampRequests)
+			// The window grows with the session, up to five minutes, so a new
+			// stream fills the graph instead of hugging its right edge.
+			window := 5 * time.Minute
+			if t, err := time.Parse(time.RFC3339, s.StartedAt); err == nil {
+				window = min(max(time.Since(t).Round(time.Second), time.Minute), window)
+			}
+			graph := areaGraph(m.metrics.values("session:"+id, time.Now(), window), time.Now(), window, inner, 2, graphScale{nice: true}, rampRequests)
 			version := "original"
 			if s.Version.Label != nil && *s.Version.Label != "" {
 				version = clean(*s.Version.Label)
