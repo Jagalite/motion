@@ -49,6 +49,9 @@ enum CacheCommand {
     /// Verify `staging/<download_id>.part` against the entry read from stdin
     /// and publish it.
     Publish,
+    /// Publish the entry read from stdin from a verified blob left by a
+    /// crashed publication, if one exists and nothing is staged.
+    Recover,
     Remove {
         #[arg(long)]
         download_id: String,
@@ -93,6 +96,13 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
                 .take(64 * 1024)
                 .read_to_string(&mut input)?;
             json!({"publication": store.publish(serde_json::from_str(&input)?)?})
+        }
+        CacheCommand::Recover => {
+            let mut input = String::new();
+            std::io::stdin()
+                .take(64 * 1024)
+                .read_to_string(&mut input)?;
+            json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
         CacheCommand::Events => serde_json::to_value(store.events()?)?,

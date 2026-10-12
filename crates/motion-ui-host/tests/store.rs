@@ -311,3 +311,71 @@ fn a_conflicting_event_is_never_compacted_by_the_watermark() {
     let log = store.acknowledge_results(&partly, 3).unwrap();
     assert_eq!((log.base_sequence, log.events.len()), (1, 1));
 }
+
+#[test]
+fn a_crashed_publication_is_recovered_without_another_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let media = b"verified before the crash";
+    let mut store = Store::open(&root, &scope()).unwrap();
+    // Nothing to recover: no blob.
+    assert!(!store.recover(entry("d1", media)).unwrap());
+    // The blob was renamed into place, then the process died.
+    std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
+    assert!(store.recover(entry("d1", media)).unwrap());
+    assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
+    // A corrupted leftover is refused, not published.
+    let other = b"another title";
+    std::fs::write(
+        root.join("blobs").join(entry("d2", other).sha256),
+        b"corrupt",
+    )
+    .unwrap();
+    assert!(store.recover(entry("d2", other)).is_err());
+    assert_eq!(store.manifest().downloads.len(), 1);
+}
+
+#[test]
+fn compaction_keeps_the_resume_checkpoint_without_moving_the_base() {
+    use playscale_core::offline::Acknowledgement;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let media = b"offline title";
+    let mut store = Store::open(&root, &scope()).unwrap();
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    let identity = entry("d1", media).identity;
+    std::fs::write(
+        root.join("events.json"),
+        serde_json::to_vec(&EventLog {
+            base_sequence: 0,
+            events: vec![event(&identity, 1), event(&identity, 2)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let both = [
+        Acknowledgement {
+            event_id: "e1".into(),
+            consumed: true,
+        },
+        Acknowledgement {
+            event_id: "e2".into(),
+            consumed: true,
+        },
+    ];
+    let log = store.acknowledge_results(&both, 3).unwrap();
+    assert!(log.events.is_empty());
+    let saved = &store.manifest().downloads[0];
+    assert_eq!(saved.resume_position_ms, Some(2_000));
+    assert_eq!(
+        saved.identity, identity,
+        "the causal base moves only by rebase"
+    );
+    drop(store);
+    let reopened = Store::open(&root, &scope()).unwrap();
+    assert_eq!(
+        reopened.manifest().downloads[0].resume_position_ms,
+        Some(2_000)
+    );
+}

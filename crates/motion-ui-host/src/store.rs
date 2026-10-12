@@ -345,7 +345,7 @@ impl Store {
     /// Compact after a sync from the server's results for the leading
     /// `results.len()` retained events (`offline::acknowledged_through`).
     pub fn acknowledge_results(
-        &self,
+        &mut self,
         results: &[offline::Acknowledgement],
         next_device_sequence: u64,
     ) -> anyhow::Result<EventLog> {
@@ -356,7 +356,54 @@ impl Store {
             results,
             next_device_sequence,
         );
+        // The offline host resumes from the newest retained event; keep that
+        // checkpoint in the manifest before compaction removes the events.
+        // The causal base is unchanged: only a rebase after reading the
+        // server may move it.
+        let mut next = self.manifest.clone();
+        let mut changed = false;
+        for entry in &mut next.downloads {
+            let latest = log.events.iter().rev().find(|e| {
+                e.media.download_id == entry.identity.download_id
+                    && offline::sequence(&e.device_sequence).is_some_and(|s| s <= through)
+            });
+            if let Some(e) = latest {
+                let resume = (e.status != "ended" && e.position_ms < entry.duration_ms)
+                    .then_some(e.position_ms)
+                    .filter(|p| *p > 0);
+                if entry.resume_position_ms != resume {
+                    entry.resume_position_ms = resume;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.write_manifest(next)?;
+        }
         self.acknowledge(through)
+    }
+
+    /// Publish `entry` from a blob already verified into place by a
+    /// publication that crashed before its manifest write, without staging
+    /// or transferring again. Returns whether the download is now published.
+    pub fn recover(&mut self, entry: CachedDownload) -> anyhow::Result<bool> {
+        validate_download(&entry)?;
+        let staged = staging_name(&entry.identity.download_id)?;
+        let staged_exists = match self.staging.metadata(&staged) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        let blob_exists = match self.blobs.metadata(&entry.sha256) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if staged_exists || !blob_exists {
+            return Ok(false);
+        }
+        self.publish(entry)?;
+        Ok(true)
     }
 
     /// Pin later offline events of a download to the server's current

@@ -96,8 +96,19 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
     }
+    const entry = JSON.stringify({
+      identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
+        source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
+        viewing_epoch: manifest.viewing_epoch},
+      title: manifest.title, duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType});
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
+    // A publication that crashed after verifying its blob needs no new
+    // transfer or space: the cache tool re-verifies and publishes it.
+    if (have === 0 && (await cache(target.path, target.scope, ['recover'], entry)).recovered) {
+      writeAtomically(join(base, 'current.json'), {root: target.name});
+      return true;
+    }
     if (have > size) { truncateSync(staged, 0); have = 0; }
     const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(quota), '--headroom', String(headroom)]);
     if (!admitted.admitted) {
@@ -128,11 +139,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     }
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.
-    await cache(target.path, target.scope, ['publish'], JSON.stringify({
-      identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
-        source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
-        viewing_epoch: manifest.viewing_epoch},
-      title: manifest.title, duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType}));
+    await cache(target.path, target.scope, ['publish'], entry);
     // Openable offline as soon as one verified copy exists, even if a later
     // transfer in this pass fails.
     writeAtomically(join(base, 'current.json'), {root: target.name});
@@ -204,7 +211,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       if (signal?.aborted) return;
       const target = root(profile);
       // Progress first: it was recorded against the copies about to change.
-      const reconciled = await reconcile(target);
+      // A refused or failed sync keeps the events but never blocks cleanup.
+      let reconciled = false;
+      try { reconciled = await reconcile(target); }
+      catch (error) {
+        if (signal?.aborted) throw error;
+        status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
+      }
       const before = await cache(target.path, target.scope, ['status']);
       let local = before.manifest;
       const wanted = downloads.filter(d => d.profile_id === profile);

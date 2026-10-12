@@ -58,6 +58,12 @@ function fakeCache() {
         return {base_sequence: String(s.base), events: s.events};
       }
       case 'rebase': return {rebased: true};
+      case 'recover': {
+        const entry = JSON.parse(input);
+        if (!s.recoverable?.includes(entry.identity.download_id)) return {recovered: false};
+        s.downloads.push(entry);
+        return {recovered: true};
+      }
       default: throw new Error(`unexpected ${args[0]}`);
     }
   }
@@ -236,4 +242,36 @@ test('a pass removes copies the server no longer offers and records the root to 
     assert.notEqual(rootName({...identity, profile_id: 'default', [field]: 'other'}), rootName({...identity, profile_id: 'default'}));
   }
   assert.ok(existsSync(join(base, 'roots.json')));
+});
+
+test('a verified blob left by a crash is recovered without transferring again', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1,
+    api: async () => manifest('d1'), fetchMedia: async () => assert.fail('no transfer')});
+  const target = agent.root('default');
+  fake.state(target.path).recoverable = ['d1'];
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  assert.ok(!fake.calls.some(c => c[1] === 'admit'), 'no space is reserved for a second copy');
+  assert.deepEqual(fake.state(target.path).downloads.map(d => d.identity.download_id), ['d1']);
+});
+
+test('a refused sync keeps its events but never blocks removal', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async path => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: [], next_cursor: null};
+      if (path === '/api/v2/offline/sync') throw Object.assign(new Error('not found'), {status: 404, code: 'not_found'});
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).events = [event(1)];
+  fake.state(target.path).downloads.push({identity: {download_id: 'revoked', timeline_id: 't1'}});
+  await agent.pass();
+  assert.equal(fake.state(target.path).events.length, 1, 'events are retained');
+  assert.equal(fake.state(target.path).downloads.length, 0, 'the no-longer-visible copy is removed');
+  assert.match(statuses[0], /not_found/);
 });

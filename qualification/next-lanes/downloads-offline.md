@@ -159,6 +159,16 @@ fixed in the round-1 commit:
 | S5 (P2) | The agent killed cache-tool output above 4 MiB while the event log allows 8 MiB | Fixed. The bound is now 16 MiB. |
 | S6 (P2) | Originals above the cache's 64 GiB bound were transferred and could never publish | Fixed. `downloads::MAX_MEDIA_BYTES` is shared by core and host. The server refuses larger originals (422 `download_too_large`), and the agent checks before transferring. |
 
+**Round 2** (at `586d2a0`) raised four P2 findings and no P1. All four are
+fixed in the round-2 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S7 (P2) | A refused sync (for example, 404 after a profile left the grant) aborted the pass before cleanup, so no-longer-visible copies stayed playable | Fixed. Reconciliation failures keep the events and are reported, but removal and other profiles proceed. Agent test covers it. |
+| S8 (P2) | Compaction removed the events the offline host resumes from before a rebase recorded the server position | Fixed. `Store::acknowledge_results` writes the newest compacted position per download into `resume_position_ms` before compacting, without moving the causal base. Covered by `store.rs::compaction_keeps_the_resume_checkpoint_without_moving_the_base`. |
+| S9 (P2) | `EPIPE` on the cache tool's stdin could crash the desktop process | Fixed. A stdin error rejects the operation; the next pass retries. |
+| S10 (P2) | A blob verified before a crash was not recovered until space for a second copy was admitted | Fixed. `cache recover` (`Store::recover`) re-verifies and publishes such a blob before any admission or transfer. Store and agent tests cover it. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

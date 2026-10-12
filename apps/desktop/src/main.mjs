@@ -72,6 +72,9 @@ function runCache(root, scope, args, input) {
     // Bounded above the cache's 8 MiB event-log limit.
     child.stdout.on('data', chunk => { output += chunk; if (output.length > 16 * 1024 * 1024) child.kill('SIGKILL'); });
     child.once('error', reject);
+    // An early exit (lock held, cache unreadable) must not surface as an
+    // uncaught EPIPE on stdin; the operation fails and the next pass retries.
+    child.stdin.on('error', reject);
     child.once('exit', code => {
       let value;
       try { value = JSON.parse(output); } catch { return reject(new Error('The offline cache tool failed')); }
