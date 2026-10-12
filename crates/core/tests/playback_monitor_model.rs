@@ -393,6 +393,7 @@ impl Enumerate for Monitoring {
                 Step::Play(Viewing::Playing),
                 Step::Play(Viewing::Paused),
                 Step::Read { stale: false },
+                Step::Read { stale: true },
                 Step::Observe(2, 900),
                 Step::Observe(3, 950),
                 Step::Wait(1_000),
@@ -484,7 +485,7 @@ fn late_pauses_retract_stalls_despite_intervening_progress() {
         focused: true,
     });
     println!(
-        "Playback monitor (stalls): {} states, {} transitions; 7 steps from a playing session at 0 over player rows (playing, paused) read late, playheads 900 and 950, waits of 1 s and 14 s",
+        "Playback monitor (stalls): {} states, {} transitions; 7 steps from a playing session at 0 over player rows (playing, paused) read late or stale, playheads 900 and 950, waits of 1 s and 14 s",
         report.states, report.transitions
     );
 }

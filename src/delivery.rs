@@ -290,11 +290,14 @@ fn transition_locked(
         session.telemetry.end(reason);
     }
     // Generations are cleaned up before a delivery leaves memory; the mode
-    // its history keeps is the last one a generation produced.
-    if let Some(operation) = serving_operation(&next) {
+    // its history keeps is the last one its active generation had while it
+    // was live (a retiring generation never replaces it).
+    if !next.status.fenced()
+        && let Some(generation) = next.active.and_then(|g| next.generations.get(&g))
+    {
         session
             .telemetry
-            .set_mode(crate::playback_monitor::mode(operation));
+            .set_mode(crate::playback_monitor::mode(generation.pin.operation));
     }
     let outline = |d: &Delivery| (d.status, d.active, d.pending, d.last_generation);
     if outline(&next) != outline(&inner.delivery) {
@@ -1509,13 +1512,25 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(
                     monitor::SHUTDOWN_DRAIN_MS + monitor::SHUTDOWN_RETRY_MS,
                 );
-                let _admission = app.processing.deliveries.admission.lock().await;
+                // Admission refuses new deliveries once stopping; waiting for an
+                // admission in progress is bounded like everything else here.
+                let _admission = tokio::time::timeout_at(deadline, app.processing.deliveries.admission.lock()).await;
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
-                    if let Ok(state) = apply(&app, &session, Input::Close)
-                        && let Err(error) = record(&app.db, &session.id, &session.file_id, &session.revision, &state).await
-                    {
-                        tracing::warn!(?error, "could not record delivery shutdown");
+                    // Closing is in memory; recording it waits for the
+                    // database only until the deadline (recovery fences a
+                    // delivery whose close was not recorded).
+                    if let Ok(state) = apply(&app, &session, Input::Close) {
+                        match tokio::time::timeout_at(
+                            deadline,
+                            record(&app.db, &session.id, &session.file_id, &session.revision, &state),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(?error, "could not record delivery shutdown"),
+                            Err(_) => tracing::warn!("delivery shutdown not recorded before the deadline"),
+                        }
                     }
                     finishing(&app, &session, stopped);
                 }
@@ -1731,14 +1746,12 @@ fn draining(app: &App) -> Vec<crate::playback_monitor::Live> {
 /// The operation producing a delivery's bytes: its active generation's, else
 /// its newest.
 fn current_operation(d: &Delivery) -> playscale_core::delivery::Operation {
-    serving_operation(d).unwrap_or(playscale_core::delivery::Operation::Original)
-}
-
-fn serving_operation(d: &Delivery) -> Option<playscale_core::delivery::Operation> {
     d.active
         .and_then(|g| d.generations.get(&g))
         .or_else(|| d.generations.values().next_back())
-        .map(|g| g.pin.operation)
+        .map_or(playscale_core::delivery::Operation::Original, |g| {
+            g.pin.operation
+        })
 }
 
 /// A live v2 delivery, as the administrator monitor shows it.
@@ -1804,10 +1817,12 @@ pub(crate) fn monitored(app: &App) -> Vec<Monitored> {
 /// admitted, before any preparation is awaited: a close meanwhile then waits
 /// for it, and its bytes are counted (`count`).
 pub(crate) fn transfer(app: &App, id: &str) -> Option<crate::playback_monitor::Transfer> {
-    app.processing
-        .deliveries
-        .session(id)
-        .ok()
+    // Under the map lock: eviction removes a delivery under it before its
+    // history can be written, so a reservation either precedes eviction (and
+    // the write waits for it) or finds no delivery.
+    let sessions = app.processing.deliveries.sessions.lock().unwrap();
+    sessions
+        .get(id)
         .map(|session| crate::playback_monitor::Transfer::begin(session.telemetry.clone()))
 }
 
@@ -1834,12 +1849,9 @@ pub(crate) fn file_transfer(
     served_revision: &str,
     named: Option<&str>,
 ) -> Option<crate::playback_monitor::Transfer> {
-    let live: Vec<Arc<Session>> = app
-        .processing
-        .deliveries
-        .sessions
-        .lock()
-        .unwrap()
+    // Selected and reserved under the map lock, like `transfer`.
+    let sessions = app.processing.deliveries.sessions.lock().unwrap();
+    let live: Vec<&Arc<Session>> = sessions
         .values()
         .filter(|s| {
             s.owner
@@ -1847,7 +1859,6 @@ pub(crate) fn file_transfer(
                 .is_some_and(|o| o.principal == principal && o.file == file_id)
                 && !s.inner.lock().unwrap().delivery.status.fenced()
         })
-        .cloned()
         .collect();
     let candidates: Vec<(&str, &str)> = live
         .iter()
@@ -3016,11 +3027,15 @@ async fn admit_owned(
             changes: Default::default(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
-        telemetry: Arc::new(crate::playback_monitor::Telemetry::new(
-            planned.as_ref().map_or("unknown", |p| p.network),
-            Some(r.start_ms),
-            runtime.bytes_sent.clone(),
-        )),
+        telemetry: Arc::new({
+            let telemetry = crate::playback_monitor::Telemetry::new(
+                planned.as_ref().map_or("unknown", |p| p.network),
+                Some(r.start_ms),
+                runtime.bytes_sent.clone(),
+            );
+            telemetry.set_mode(crate::playback_monitor::mode(current_operation(&delivery)));
+            telemetry
+        }),
     });
     // Byte routes run no encoder and do not consume encoding delivery slots.
     let (encoding, bytes) = runtime.counts();

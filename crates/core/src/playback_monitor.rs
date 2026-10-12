@@ -247,8 +247,14 @@ impl Watch {
                     // pause: restarting it here would count it twice.
                     self.playing_since = self.playing_since.max(Some(row.updated_ms));
                 }
-                // This row settles every stall counted before it was read.
-                self.unresolved.clear();
+                // A playing row confirms the stalls that began before it was
+                // written; a later pause may still undo the rest. Any other
+                // row settles them all (those it undid are gone).
+                if status == Viewing::Playing && !missed {
+                    self.unresolved.retain(|since| *since > row.updated_ms);
+                } else {
+                    self.unresolved.clear();
+                }
                 self.row = Some(row);
                 self.viewing = Some(status);
                 // Reducer playheads are ordered and current; a viewing row may
@@ -530,6 +536,19 @@ mod tests {
         // A stall counted before a gap is read is not certain either.
         viewing(&mut w, row("v", 5, 20_000), Viewing::Playing, 21_000);
         assert_eq!((w.stalls, w.stalled), (0, false));
+    }
+
+    #[test]
+    fn an_older_playing_row_confirms_only_earlier_stalls() {
+        let mut w = Watch::new(None);
+        viewing(&mut w, row("v", 1, 0), Viewing::Playing, 0);
+        w.observe(Observation::Tick { now_ms: STALL_MS });
+        assert_eq!(w.stalls, 1);
+        // Read late: playing at 10 s, then paused at 14 s, before the stall.
+        viewing(&mut w, row("v", 2, 10_000), Viewing::Playing, 16_000);
+        assert_eq!(w.stalls, 1);
+        viewing(&mut w, row("v", 3, 14_000), Viewing::Paused, 17_000);
+        assert_eq!(w.stalls, 0);
     }
 
     #[test]
