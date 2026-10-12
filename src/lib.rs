@@ -23,6 +23,7 @@ pub mod nfo;
 pub mod operations;
 pub mod organization;
 pub mod playback;
+pub mod playback_monitor;
 pub mod processing;
 pub mod renditions;
 pub mod scan;

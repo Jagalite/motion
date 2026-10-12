@@ -108,6 +108,8 @@ listItemTimelines
 listJobs
 listLibrarys
 listMatches
+listPlaybackHistory
+listPlaybackSessions
 listPlaylists
 listProfiles
 listQueues
@@ -118,6 +120,7 @@ listScans
 listSchedules
 listSources
 listVersions
+placeTimelineInOrder
 planPlayback
 previewMerge
 previewSourceRelocation
@@ -144,4 +147,3 @@ selectArtwork
 setWatchedState
 subscribeEvents
 uploadArtwork
-placeTimelineInOrder

@@ -228,9 +228,14 @@ async fn run() -> anyhow::Result<()> {
     }
     let stop_http = shutdown.clone();
     let mut http = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(stop_http.cancelled_owned())
-            .await
+        // Peer addresses classify a playback client's network for monitoring
+        // (local, private or remote); they are not stored or exposed.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(stop_http.cancelled_owned())
+        .await
     });
     if let Some(fd) = cli.ready_fd {
         let (server_id, _) = playscale::v2::system::server_identity(&app)

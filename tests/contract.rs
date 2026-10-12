@@ -540,8 +540,8 @@ fn operational_metrics_contract_preserves_consumer_fields_and_bounds() {
     let history = &schemas["MetricsHistory"]["properties"];
     assert_eq!(history["interval_seconds"]["const"], 10);
     assert_eq!(history["retention_seconds"]["const"], 86400);
-    assert_eq!(history["series"]["minItems"], 15);
-    assert_eq!(history["series"]["maxItems"], 15);
+    assert_eq!(history["series"]["minItems"], 18);
+    assert_eq!(history["series"]["maxItems"], 18);
     assert_eq!(
         schemas["MetricSeries"]["properties"]["points"]["maxItems"],
         2000

@@ -122,6 +122,11 @@ pub async fn capabilities(
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);
+    let mut sessions = feature("admin.playback_sessions", true, true);
+    sessions.limits = BTreeMap::from([(
+        "history_retention_days",
+        crate::playback_monitor::RETENTION_DAYS.to_string(),
+    )]);
     let mut metrics = feature("admin.metrics", true, true);
     metrics.limits = BTreeMap::from([
         ("interval_seconds", "10".into()),
@@ -143,6 +148,7 @@ pub async fn capabilities(
         feature("catalog.v2", true, true),
         playback,
         metrics,
+        sessions,
     ];
     let mut runtime_hashes = BTreeMap::new();
     if let Some(hash) = app

@@ -102,6 +102,8 @@ pub struct Runtime {
     /// Concurrent subtitle conversions (each reads the whole source once).
     subtitle_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
+    /// Bytes sent to clients for all deliveries since this process started.
+    pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,8 @@ struct Session {
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
+    /// Observed transfer and playback, for administrator monitoring only.
+    telemetry: Arc<crate::playback_monitor::Telemetry>,
 }
 
 impl Runtime {
@@ -157,6 +161,7 @@ impl Runtime {
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: Arc::default(),
         }
     }
     /// Monotonic milliseconds for lease and drain deadlines.
@@ -177,6 +182,23 @@ impl Runtime {
     }
     pub fn active_sessions(&self) -> usize {
         self.sessions.lock().unwrap().len()
+    }
+    /// Live v2 (owned) deliveries and how many of them transcode.
+    pub fn playback_counts(&self) -> (usize, usize) {
+        let sessions = self.sessions.lock().unwrap();
+        let owned = sessions.values().filter(|s| s.owner.is_some());
+        let mut total = 0;
+        let mut transcodes = 0;
+        for session in owned {
+            total += 1;
+            if crate::playback_monitor::mode(current_operation(
+                &session.inner.lock().unwrap().delivery,
+            )) == "transcode"
+            {
+                transcodes += 1;
+            }
+        }
+        (total, transcodes)
     }
     /// Live (encoding, byte-route) deliveries. A delivery whose generations
     /// include a segmented one counts as encoding.
@@ -1423,6 +1445,7 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
 /// Tick every session; forget sessions whose workers and files are gone.
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut ticks: u64 = 0;
     loop {
         tokio::select! {
             _ = stop.cancelled() => {
@@ -1430,11 +1453,13 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 let _admission = app.processing.deliveries.admission.lock().await;
                 let sessions: Vec<_> = app.processing.deliveries.sessions.lock().unwrap().values().cloned().collect();
                 for session in sessions {
+                    session.telemetry.end("server_stopped");
                     if let Ok(state) = apply(&app, &session, Input::Close)
                         && let Err(error) = record(&app.db, &session.id, &session.file_id, &session.revision, &state).await
                     {
                         tracing::warn!(?error, "could not record delivery shutdown");
                     }
+                    finish_monitoring(&app, &session).await;
                 }
                 return Ok(());
             }
@@ -1449,12 +1474,31 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             .values()
             .cloned()
             .collect();
+        ticks += 1;
+        let mut monitored = Vec::new();
         for session in sessions {
             revalidate(&app, &session).await;
             let now = app.processing.deliveries.now_ms();
+            // The reducer decides expiry; this only notes which decision
+            // ended the delivery, for its history.
+            let expiring = {
+                let d = &session.inner.lock().unwrap().delivery;
+                !d.status.fenced() && now >= d.lease_expires_ms
+            };
             let Ok(state) = apply(&app, &session, Input::Tick { now_ms: now }) else {
                 continue;
             };
+            session.telemetry.tick();
+            if state.status.fenced() {
+                if state.status == playscale_core::delivery::Status::Failed {
+                    session.telemetry.end("error");
+                } else if expiring {
+                    session.telemetry.end("lease_expired");
+                }
+            }
+            if session.owner.is_some() && !state.status.fenced() {
+                monitored.push((session.id.clone(), session.telemetry.clone()));
+            }
             if state.status.fenced() && state.generations.is_empty() {
                 if let Err(error) = record(
                     &app.db,
@@ -1471,6 +1515,7 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                     );
                     continue;
                 }
+                finish_monitoring(&app, &session).await;
                 app.processing
                     .deliveries
                     .sessions
@@ -1489,6 +1534,139 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
                 }
             }
         }
+        // Monitoring writes are observations: a failure is logged and retried
+        // on the next flush, never allowed to affect delivery.
+        if ticks.is_multiple_of(5)
+            && let Err(error) = crate::playback_monitor::flush(&app.db, &monitored).await
+        {
+            tracing::warn!(
+                code = "playback_monitor_flush_failed",
+                ?error,
+                "playback monitoring not recorded"
+            );
+        }
+        if ticks.is_multiple_of(60)
+            && let Err(error) = crate::playback_monitor::prune(&app.db).await
+        {
+            tracing::warn!(
+                code = "playback_monitor_prune_failed",
+                ?error,
+                "playback history not pruned"
+            );
+        }
+    }
+}
+
+/// Finish a v2 delivery's monitoring row before it leaves memory.
+async fn finish_monitoring(app: &App, session: &Session) {
+    if session.owner.is_none() {
+        return;
+    }
+    let result = async {
+        let mut tx = crate::db::begin_write(&app.db).await?;
+        crate::playback_monitor::finish(&mut tx, &session.id, &session.telemetry, "closed").await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            code = "playback_monitor_finish_failed",
+            ?error,
+            "playback history not finished"
+        );
+    }
+}
+
+/// The operation producing a delivery's bytes: its active generation's, else
+/// its newest.
+fn current_operation(d: &Delivery) -> playscale_core::delivery::Operation {
+    d.active
+        .and_then(|g| d.generations.get(&g))
+        .or_else(|| d.generations.values().next_back())
+        .map_or(playscale_core::delivery::Operation::Original, |g| {
+            g.pin.operation
+        })
+}
+
+/// A live v2 delivery, as the administrator monitor shows it.
+pub(crate) struct Monitored {
+    pub id: String,
+    pub status: playscale_core::delivery::Status,
+    pub mode: &'static str,
+    pub duration_ms: Option<u64>,
+    pub telemetry: Arc<crate::playback_monitor::Telemetry>,
+}
+
+/// Every live v2 delivery, newest first.
+pub(crate) fn monitored(app: &App) -> Vec<Monitored> {
+    let sessions: Vec<_> = app
+        .processing
+        .deliveries
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    let mut out: Vec<Monitored> = sessions
+        .iter()
+        .filter_map(|s| {
+            s.owner.as_ref()?;
+            let inner = s.inner.lock().unwrap();
+            Some(Monitored {
+                id: s.id.clone(),
+                status: inner.delivery.status,
+                mode: crate::playback_monitor::mode(current_operation(&inner.delivery)),
+                duration_ms: inner.delivery.duration_ms,
+                telemetry: s.telemetry.clone(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.telemetry
+            .started_ms
+            .cmp(&a.telemetry.started_ms)
+            .then(a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Count a stream response's bytes into its delivery's telemetry.
+pub(crate) fn counted(app: &App, id: &str, response: Response) -> Response {
+    match app.processing.deliveries.session(id) {
+        Ok(session) => crate::playback_monitor::Counted::wrap(response, session.telemetry.clone()),
+        Err(_) => response,
+    }
+}
+
+/// Count a direct file read into the live delivery this principal holds for
+/// that file: direct play fetches the file's own URL, not a stream route, so
+/// this is how its bytes are attributed. With no such delivery nothing is
+/// counted (a download, or a client reading without a delivery).
+pub(crate) fn counted_file(
+    app: &App,
+    principal: &str,
+    file_id: &str,
+    response: Response,
+) -> Response {
+    let telemetry = app
+        .processing
+        .deliveries
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| {
+            s.owner
+                .as_ref()
+                .is_some_and(|o| o.principal == principal && o.file == file_id)
+                && !s.inner.lock().unwrap().delivery.status.fenced()
+        })
+        .max_by_key(|s| s.telemetry.started_ms)
+        .map(|s| s.telemetry.clone());
+    match telemetry {
+        Some(telemetry) => crate::playback_monitor::Counted::wrap(response, telemetry),
+        None => response,
     }
 }
 
@@ -1509,6 +1687,8 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
     )
     .fetch_all(&mut *transaction)
     .await?;
+    // Monitoring rows of the previous process end as interrupted.
+    crate::playback_monitor::recover(&mut transaction).await?;
     for (id, state) in live {
         let delivery: Delivery = serde_json::from_str(&state)?;
         // Workers died with the old process; their files are handled below.
@@ -2038,6 +2218,8 @@ pub(crate) struct Planned {
     pub owner: Owner,
     pub version: String,
     pub route: Route,
+    /// Where the requesting client connected from, for monitoring only.
+    pub network: &'static str,
 }
 
 /// Admit a planned (v2) delivery. Original routes need no encoder; transcodes
@@ -2111,6 +2293,9 @@ pub(crate) fn heartbeat_live(
     observation: Option<(u64, u64)>,
 ) -> Result<DeliveryView, ApiError> {
     let session = app.processing.deliveries.session(id)?;
+    if let Some((_, position_ms)) = observation {
+        session.telemetry.playhead(position_ms);
+    }
     let d = apply(
         app,
         &session,
@@ -2175,6 +2360,7 @@ pub(crate) async fn close_live(
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<(), ApiError> {
     let session = app.processing.deliveries.session(id)?;
+    session.telemetry.end("closed");
     let state = apply(app, &session, Input::Close).map_err(error)?;
     record(
         conn,
@@ -2633,6 +2819,11 @@ async fn admit_owned(
             changes: Default::default(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
+        telemetry: Arc::new(crate::playback_monitor::Telemetry::new(
+            planned.as_ref().map_or("unknown", |p| p.network),
+            Some(r.start_ms),
+            runtime.bytes_sent.clone(),
+        )),
     });
     // Byte routes run no encoder and do not consume encoding delivery slots.
     let (encoding, bytes) = runtime.counts();
@@ -2665,6 +2856,21 @@ async fn admit_owned(
             .bind(crate::now())
             .execute(&mut *transaction)
             .await?;
+        // The monitoring row commits with the admission it describes.
+        crate::playback_monitor::start(
+            &mut transaction,
+            crate::playback_monitor::Started {
+                delivery_id: &session.id,
+                principal_id: &owner.principal,
+                profile_id: &owner.profile,
+                timeline_id: &owner.timeline,
+                version_id: version,
+                file_id: &owner.file,
+                mode: crate::playback_monitor::mode(current_operation(&delivery)),
+            },
+            &session.telemetry,
+        )
+        .await?;
     }
     if let Some(identity) = identity {
         sqlx::query("INSERT INTO delivery_admissions(principal,request_key,request_digest,delivery_id,acknowledgement_json,created_at) VALUES (?,?,?,?,?,?)")
