@@ -152,6 +152,9 @@ pub struct Telemetry {
     persisted: Mutex<Persisted>,
     /// Counted responses still being sent.
     open: AtomicUsize,
+    /// How the bytes are produced, as of the last reducer state with a
+    /// generation (kept after generations are cleaned up).
+    mode: Mutex<&'static str>,
     /// Bytes counted into the process-wide total.
     total: Arc<AtomicU64>,
 }
@@ -190,6 +193,7 @@ impl Telemetry {
             end: OnceLock::new(),
             persisted: Mutex::new(Persisted::default()),
             open: AtomicUsize::new(0),
+            mode: Mutex::new("direct"),
             total,
         }
     }
@@ -251,6 +255,13 @@ impl Telemetry {
     }
     pub fn ended(&self) -> Option<EndReason> {
         self.end.get().copied()
+    }
+
+    pub fn set_mode(&self, mode: &'static str) {
+        *self.mode.lock().unwrap() = mode;
+    }
+    pub fn mode(&self) -> &'static str {
+        *self.mode.lock().unwrap()
     }
 
     /// Counted responses still being sent.
@@ -334,29 +345,42 @@ pub fn status(delivery: Option<playscale_core::delivery::Status>, r: &Reading) -
     }
 }
 
+/// A response reserved against a delivery's telemetry from the moment its
+/// request is admitted: until it is dropped (sent, abandoned, or never built
+/// because preparation failed) the delivery's history waits for it.
+pub struct Transfer {
+    telemetry: Arc<Telemetry>,
+}
+
+impl Transfer {
+    pub fn begin(telemetry: Arc<Telemetry>) -> Self {
+        telemetry.open.fetch_add(1, Ordering::AcqRel);
+        Self { telemetry }
+    }
+    /// Count the response's bytes as they are sent; the transfer ends with
+    /// the body.
+    pub fn wrap(self, response: axum::response::Response) -> axum::response::Response {
+        response.map(|body| {
+            Body::new(Counted {
+                body,
+                transfer: self,
+            })
+        })
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        self.telemetry.open.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A response body that counts the bytes it yields into a delivery's
 /// telemetry. Bytes are counted as frames are handed to the connection, so a
 /// cancelled download counts only what was sent.
 pub struct Counted {
     body: Body,
-    telemetry: Arc<Telemetry>,
-}
-
-impl Counted {
-    pub fn wrap(
-        response: axum::response::Response,
-        telemetry: Arc<Telemetry>,
-    ) -> axum::response::Response {
-        telemetry.open.fetch_add(1, Ordering::AcqRel);
-        response.map(|body| Body::new(Counted { body, telemetry }))
-    }
-}
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        // Sent in full, or abandoned by the client: either way, done.
-        self.telemetry.open.fetch_sub(1, Ordering::AcqRel);
-    }
+    transfer: Transfer,
 }
 
 impl HttpBody for Counted {
@@ -371,7 +395,7 @@ impl HttpBody for Counted {
         if let Poll::Ready(Some(Ok(frame))) = &result
             && let Some(data) = frame.data_ref()
         {
-            self.telemetry.sent(data.len() as u64);
+            self.transfer.telemetry.sent(data.len() as u64);
         }
         result
     }

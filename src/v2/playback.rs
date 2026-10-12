@@ -1722,6 +1722,7 @@ pub async fn generation_content(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     let owner = stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
     if !delivery::serves_generation(&app, &id, &generation)
         || ![view.active.as_ref(), view.pending.as_ref()]
@@ -1741,7 +1742,7 @@ pub async fn generation_content(
         headers,
     )
     .await
-    .map(|response| delivery::counted(&app, &id, response))
+    .map(|response| delivery::count(transfer, response))
     .map_err(problem)
 }
 
@@ -1752,9 +1753,10 @@ pub async fn generation_subtitles(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     delivery::subtitles(State(app.clone()), Path((id.clone(), generation)))
         .await
-        .map(|response| delivery::counted(&app, &id, response))
+        .map(|response| delivery::count(transfer, response))
         .map_err(stream_problem)
 }
 
@@ -1765,6 +1767,7 @@ pub async fn master_playlist(
     Path((id, generation)): Path<(String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     let view = delivery::live_view(&app, &id).ok_or_else(Problem::not_found)?;
     let serving = [view.active.as_ref(), view.pending.as_ref()]
         .into_iter()
@@ -1790,7 +1793,7 @@ pub async fn master_playlist(
         text,
     )
         .into_response();
-    Ok(delivery::counted(&app, &id, response))
+    Ok(delivery::count(transfer, response))
 }
 
 pub async fn variant_playlist(
@@ -1800,6 +1803,7 @@ pub async fn variant_playlist(
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
@@ -1811,7 +1815,7 @@ pub async fn variant_playlist(
         &stream_link("init.mp4", &params),
     )
     .await
-    .map(|response| delivery::counted(&app, &id, response))
+    .map(|response| delivery::count(transfer, response))
     .map_err(stream_problem)
 }
 
@@ -1822,12 +1826,13 @@ pub async fn init_segment(
     Path((id, generation, variant)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     if variant != VARIANT {
         return Err(Problem::not_found());
     }
     delivery::init(State(app.clone()), Path((id.clone(), generation)))
         .await
-        .map(|response| delivery::counted(&app, &id, response))
+        .map(|response| delivery::count(transfer, response))
         .map_err(stream_problem)
 }
 
@@ -1838,8 +1843,9 @@ pub async fn media_segment(
     Path((id, generation, segment)): Path<(String, String, String)>,
 ) -> Result<Response, Problem> {
     stream_owner(&app, &headers, &params, &id, &generation).await?;
+    let transfer = delivery::transfer(&app, &id);
     delivery::segment(State(app.clone()), Path((id.clone(), generation, segment)))
         .await
-        .map(|response| delivery::counted(&app, &id, response))
+        .map(|response| delivery::count(transfer, response))
         .map_err(stream_problem)
 }

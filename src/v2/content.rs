@@ -420,17 +420,22 @@ pub async fn file_content(
         core::admit_file_bytes(&caller.principal, facts.as_ref())?;
         reader = Some(caller.principal.id.clone());
     }
-    // The revision served: the one requested (serving refuses any other), or
-    // the current one.
-    let served = params
-        .revision
-        .clone()
-        .or_else(|| facts.as_ref().map(|f| f.revision.clone()));
+    // Only reads pinned to a revision are attributed: a delivery's media URL
+    // always pins its own, and serving refuses any other. Reserved before
+    // serving, so a close meanwhile waits for this response.
+    let transfer = match (&reader, &params.revision) {
+        (Some(principal), Some(revision)) => crate::delivery::file_transfer(
+            &app,
+            principal,
+            &file_id,
+            revision,
+            params.delivery.as_deref(),
+        ),
+        _ => None,
+    };
     let query = media::MediaQuery {
         revision: params.revision,
     };
-    let attributed = file_id.clone();
-    let named = params.delivery;
     media::serve(
         State(app.clone()),
         Path(file_id),
@@ -439,17 +444,7 @@ pub async fn file_content(
         headers,
     )
     .await
-    .map(|response| match (&reader, &served) {
-        (Some(principal), Some(revision)) => crate::delivery::counted_file(
-            &app,
-            principal,
-            &attributed,
-            revision,
-            named.as_deref(),
-            response,
-        ),
-        _ => response,
-    })
+    .map(|response| crate::delivery::count(transfer, response))
     .map_err(|e| {
         let (status, code, _) = e.parts();
         let code = match code {

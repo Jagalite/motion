@@ -63,7 +63,12 @@ enum Step {
     },
 }
 
-struct Monitoring;
+/// `focused` starts from a playing session at a known position and explores
+/// only the stall-relevant actions, deeper.
+struct Monitoring {
+    steps: u8,
+    focused: bool,
+}
 
 fn snapshot(w: &Watch) -> Snapshot {
     Snapshot {
@@ -140,7 +145,7 @@ impl Model for Monitoring {
     type Output = ();
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
-            name: "motion.playback-monitor".into(),
+            name: format!("motion.playback-monitor.{}", self.focused),
             model_version: 2,
             properties_version: 2,
             codec_version: 2,
@@ -161,7 +166,7 @@ impl Model for Monitoring {
         };
         let (delivery, _) = Delivery::admit("t".into(), pin, 0, Some(1000), 0)
             .map_err(|e| ModelError::new(format!("{e:?}")))?;
-        Ok(State {
+        let mut state = State {
             delivery,
             watch: Watch::new(Some(0)),
             now: 0,
@@ -171,7 +176,18 @@ impl Model for Monitoring {
             written: vec![],
             truth: Truth::default(),
             steps: 0,
-        })
+        };
+        if self.focused {
+            for step in [
+                Step::Play(Viewing::Playing),
+                Step::Read { stale: false },
+                Step::Observe(1, 0),
+            ] {
+                state = self.step(&state, &step)?.state;
+            }
+            state.steps = 0;
+        }
+        Ok(state)
     }
     fn step(&self, s: &State, step: &Step) -> Result<Transition<State, ()>, ModelError> {
         let mut n = s.clone();
@@ -259,8 +275,9 @@ impl Model for Monitoring {
             ),
             (
                 "no_false_stalls_once_rows_are_read",
-                !synced
-                    || (s.watch.stalls <= s.truth.stalls && (!s.watch.stalled || s.truth.stalled)),
+                // Counts, which history keeps. Whether a stall is ongoing can lag
+                // an unseen pause and resume until progress or a pause is read.
+                !synced || s.watch.stalls <= s.truth.stalls,
             ),
         ];
         Ok(checks
@@ -317,25 +334,16 @@ impl Model for Monitoring {
                 },
             ),
             (
-                "stalls_counted_once_per_episode_and_retracted_only_by_an_earlier_pause",
+                "stalls_counted_once_per_episode_and_retracted_only_while_unconfirmed",
                 n.watch.stalls == s.watch.stalls
                     || (n.watch.stalls == s.watch.stalls + 1
                         && matches!(step, Step::Wait(_))
                         && !s.watch.stalled
                         && n.watch.stalled)
-                    || (n.watch.stalls + 1 == s.watch.stalls
-                        && s.watch.stalled
-                        && match step {
-                            Step::Read { stale } => {
-                                read_row(*stale).is_some_and(|(row, status)| {
-                                    *status != Viewing::Playing
-                                        && s.watch
-                                            .stalled_since
-                                            .is_some_and(|at| row.updated_ms < at)
-                                })
-                            }
-                            _ => false,
-                        }),
+                    // Reading a row only ever retracts stalls not yet confirmed.
+                    || (matches!(step, Step::Read { .. })
+                        && n.watch.stalls < s.watch.stalls
+                        && s.watch.stalls - n.watch.stalls <= s.watch.unresolved.len() as u64),
             ),
             (
                 "watched_time_only_grows_with_observed_play",
@@ -375,12 +383,21 @@ impl Model for Monitoring {
     }
 }
 
-const STEPS: u8 = 6;
-
 impl Enumerate for Monitoring {
     fn inputs(&self, s: &State) -> Result<Vec<Step>, ModelError> {
-        if s.steps >= STEPS {
+        if s.steps >= self.steps {
             return Ok(vec![]);
+        }
+        if self.focused {
+            return Ok(vec![
+                Step::Play(Viewing::Playing),
+                Step::Play(Viewing::Paused),
+                Step::Read { stale: false },
+                Step::Observe(2, 900),
+                Step::Observe(3, 950),
+                Step::Wait(1_000),
+                Step::Wait(STALL_MS - 1_000),
+            ]);
         }
         let mut steps = vec![
             Step::Fail,
@@ -429,14 +446,13 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, ModelError> {
     serde_json::from_slice(b).map_err(|e| ModelError::new(e.to_string()))
 }
 
-#[test]
-fn monitoring_graph_follows_reducer_decisions_and_commits() {
+fn explore(model: &Monitoring) -> stateless::explore::SearchReport<Step> {
     let report = stateless::explore::enumerate(
-        &Monitoring,
+        model,
         stateless::explore::SearchConfig {
             max_states: 5_000_000,
             max_transitions: 100_000_000,
-            max_depth: STEPS as usize + 1,
+            max_depth: model.steps as usize + 1,
         },
     )
     .unwrap();
@@ -446,8 +462,29 @@ fn monitoring_graph_follows_reducer_decisions_and_commits() {
         report.termination,
         stateless::explore::SearchTermination::GraphExhausted
     );
+    report
+}
+
+#[test]
+fn monitoring_graph_follows_reducer_decisions_and_commits() {
+    let report = explore(&Monitoring {
+        steps: 6,
+        focused: false,
+    });
     println!(
-        "Playback monitor: {} states, {} transitions; {STEPS} steps over playheads (sequences 1-2, positions 0/900), failure, close (stopping or not), waits of 1 s and 14 s, player rows (playing, paused, a superseding session) read late or stale, committed and failed flushes",
+        "Playback monitor: {} states, {} transitions; 6 steps over playheads (sequences 1-2, positions 0/900), failure, close (stopping or not), waits of 1 s and 14 s, player rows (playing, paused, a superseding session) read late or stale, committed and failed flushes",
+        report.states, report.transitions
+    );
+}
+
+#[test]
+fn late_pauses_retract_stalls_despite_intervening_progress() {
+    let report = explore(&Monitoring {
+        steps: 7,
+        focused: true,
+    });
+    println!(
+        "Playback monitor (stalls): {} states, {} transitions; 7 steps from a playing session at 0 over player rows (playing, paused) read late, playheads 900 and 950, waits of 1 s and 14 s",
         report.states, report.transitions
     );
 }

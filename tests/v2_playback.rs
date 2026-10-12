@@ -1072,6 +1072,8 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
     assert_eq!(ready["pending"]["status"], "ready", "{ready}");
     let start = ready["pending"]["available_start_ms"].as_u64().unwrap();
     assert!(start <= 60000 && ready["pending"]["available_end_ms"].as_u64().unwrap() > 60000);
+    let live_mode = monitored(&f, &id).await["mode"].clone();
+    assert_ne!(live_mode, "direct");
     let closed = f
         .call("DELETE", &path, None, &[("authorization", &auth)])
         .await;
@@ -1082,6 +1084,9 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         StatusCode::NOT_FOUND,
         "not_found",
     );
+    // History keeps how the bytes were produced after the generations that
+    // produced them are cleaned up.
+    assert_eq!(finished(&f, &id).await["mode"], live_mode);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2816,6 +2821,63 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
         .await;
     assert_eq!(ambiguous.status, StatusCode::OK);
     assert_eq!(monitored(&f, &twin_id).await["bytes_sent"], "1000");
+    // A response still being sent when its delivery closes: the session shows
+    // as closing (and administrators are told) until the response is done,
+    // and its bytes reach history.
+    let twin_generation = twin["active"]["generation"].as_str().unwrap().to_owned();
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v2/streams/{twin_id}/{twin_generation}/content"
+                ))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let hints = |f: &Fixture, id: String| {
+        let db = f.server.app.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM change_events WHERE topic='playback_sessions' AND resource_id=? AND kind='changed'",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let before = hints(&f, twin_id.clone()).await;
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{twin_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    let mut announced = false;
+    for _ in 0..100 {
+        if monitored(&f, &twin_id).await["status"] == "closing"
+            && hints(&f, twin_id.clone()).await > before
+        {
+            announced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        announced,
+        "a draining session is shown and announced as closing"
+    );
+    let twin_rest = held.into_body().collect().await.unwrap().to_bytes().len();
+    let entry = finished(&f, &twin_id).await;
+    assert_eq!(entry["bytes_sent"], (1000 + twin_rest).to_string());
 
     // A playhead from the player.
     let beat = f
@@ -2879,7 +2941,8 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
             &bearer(OPERATOR),
         )
         .await;
-    assert_eq!(mine.body["items"].as_array().unwrap().len(), 1);
+    // This delivery and its twin, both closed.
+    assert_eq!(mine.body["items"].as_array().unwrap().len(), 2);
     let none = f
         .get(
             "/api/v2/admin/playback/history?profile_id=kids",

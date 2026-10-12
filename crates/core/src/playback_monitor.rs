@@ -20,6 +20,9 @@ pub const DRAIN_MS: u64 = 30_000;
 /// `SHUTDOWN_RETRY_MS` before leaving the rest to startup recovery.
 pub const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 pub const SHUTDOWN_RETRY_MS: u64 = 1_000;
+/// Stalls remembered while no viewing row has been read; each takes at least
+/// `STALL_MS`, and rows are read every few seconds.
+const MAX_UNRESOLVED: usize = 16;
 /// The largest position the API carries (a safe JSON integer).
 pub const MAX_POSITION_MS: u64 = 9_007_199_254_740_991;
 
@@ -157,8 +160,10 @@ pub struct Watch {
     pub advanced_at: Option<u64>,
     /// When the current playing episode began.
     pub playing_since: Option<u64>,
-    /// When the current stall began (its threshold was crossed).
-    pub stalled_since: Option<u64>,
+    /// When each stall counted since the last viewing row was read began
+    /// (its threshold crossed), oldest first: until a row confirms them, a
+    /// pause written earlier and read late may show they never happened.
+    pub unresolved: Vec<u64>,
     /// Forward play no faster than real time (with slack); seeks do not count.
     pub watched_ms: u64,
     pub stalled: bool,
@@ -203,23 +208,47 @@ impl Watch {
                 {
                     return false;
                 }
-                if status != Viewing::Playing {
-                    // Rows are read some seconds after they are written. A
-                    // pause the player recorded before the stall began means
-                    // it was paused, not stalled: that stall never happened.
-                    if self
-                        .stalled_since
-                        .is_some_and(|since| row.updated_ms < since)
-                    {
-                        self.stalls -= 1;
+                // Rows are read some seconds after they are written. If
+                // writes were missed (a revision skipped, or another session),
+                // any of them may have been a pause: nothing after the last
+                // row read is certain. Otherwise only this row's own pause is
+                // news. A stall that began after the cutoff never happened.
+                let missed = self
+                    .row
+                    .as_ref()
+                    .is_some_and(|seen| seen.id != row.id || row.revision != seen.revision + 1);
+                let cutoff = if missed {
+                    self.row.as_ref().map(|seen| seen.updated_ms)
+                } else if status != Viewing::Playing {
+                    Some(row.updated_ms)
+                } else {
+                    None
+                };
+                if let Some(cutoff) = cutoff {
+                    let never = self
+                        .unresolved
+                        .iter()
+                        .filter(|since| **since > cutoff)
+                        .count() as u64;
+                    if never > 0 {
+                        self.stalls -= never;
+                        self.stalled = false;
                     }
+                }
+                if status != Viewing::Playing {
                     self.playing_since = None;
                     self.stalled = false;
-                    self.stalled_since = None;
                 } else if self.viewing != Some(Viewing::Playing) {
                     // A new playing episode: time paused is not a stall.
                     self.playing_since = Some(now_ms);
+                } else if missed && !self.stalled {
+                    // Playing again, perhaps after a pause we never read. A
+                    // stall already confirmed continues until progress or a
+                    // pause: restarting it here would count it twice.
+                    self.playing_since = self.playing_since.max(Some(row.updated_ms));
                 }
+                // This row settles every stall counted before it was read.
+                self.unresolved.clear();
                 self.row = Some(row);
                 self.viewing = Some(status);
                 // Reducer playheads are ordered and current; a viewing row may
@@ -237,10 +266,13 @@ impl Watch {
                     && threshold.is_some_and(|at| now_ms >= at);
                 if stalled && !self.stalled {
                     self.stalls += 1;
-                    self.stalled_since = threshold;
-                }
-                if !stalled {
-                    self.stalled_since = None;
+                    if let Some(since) = threshold {
+                        // Bounded: the oldest is taken as confirmed.
+                        if self.unresolved.len() == MAX_UNRESOLVED {
+                            self.unresolved.remove(0);
+                        }
+                        self.unresolved.push(since);
+                    }
                 }
                 self.stalled = stalled;
             }
@@ -457,6 +489,47 @@ mod tests {
         });
         viewing(&mut w, row("v", 4, 36_000), Viewing::Paused, 37_000);
         assert_eq!((w.stalls, w.stalled), (1, false));
+    }
+
+    #[test]
+    fn a_pause_read_after_intervening_progress_still_retracts_the_stall() {
+        let mut w = Watch::new(Some(0));
+        let playhead = |w: &mut Watch, sequence, position_ms, now_ms| {
+            w.observe(Observation::Playhead {
+                generation: 1,
+                sequence,
+                position_ms,
+                now_ms,
+            })
+        };
+        viewing(&mut w, row("v", 1, 0), Viewing::Playing, 0);
+        playhead(&mut w, 1, 0, 0);
+        // Paused at 14 s (unread); a stall is counted at 15 s; a seek forward
+        // while paused, a tick, then the pause is read.
+        w.observe(Observation::Tick { now_ms: STALL_MS });
+        assert_eq!(w.stalls, 1);
+        playhead(&mut w, 2, 900, 16_000);
+        w.observe(Observation::Tick { now_ms: 17_000 });
+        assert!(!w.stalled);
+        viewing(&mut w, row("v", 2, 14_000), Viewing::Paused, 18_000);
+        assert_eq!(w.stalls, 0);
+    }
+
+    #[test]
+    fn a_pause_and_resume_never_read_restarts_the_stall_clock() {
+        let mut w = Watch::new(None);
+        viewing(&mut w, row("v", 1, 0), Viewing::Playing, 0);
+        // Paused at 0 and playing again at 1 s; only the second row is read.
+        viewing(&mut w, row("v", 3, 1_000), Viewing::Playing, 2_000);
+        w.observe(Observation::Tick { now_ms: STALL_MS });
+        assert_eq!(w.stalls, 0, "playing only since 1 s");
+        w.observe(Observation::Tick {
+            now_ms: 1_000 + STALL_MS,
+        });
+        assert_eq!(w.stalls, 1);
+        // A stall counted before a gap is read is not certain either.
+        viewing(&mut w, row("v", 5, 20_000), Viewing::Playing, 21_000);
+        assert_eq!((w.stalls, w.stalled), (0, false));
     }
 
     #[test]
