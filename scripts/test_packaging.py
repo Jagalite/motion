@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from check_source_companion import check as check_source_companion
-from build_media_tools import assert_portable, download
+from build_media_tools import (ROOT, assert_build_paths_absent, assert_portable, download, filters,
+                               media_sources, shipped_sources)
 from package_app import npm_archive, source_inventory, write_source_archive
 from package_privacy import assert_private_paths_absent, public_tar_member, private_content
 
@@ -208,6 +209,40 @@ class PackagingTests(unittest.TestCase):
         with patch('build_media_tools.subprocess.check_output', return_value='ffmpeg:\n\t/usr/lib/libSystem.B.dylib (version 1)\n'):
             assert_portable(Path('ffmpeg'))
 
+
+    def test_media_lock_pins_every_source_and_shipped_notices(self):
+        lock = json.loads((ROOT / 'packaging.lock.json').read_text())
+        order = media_sources(lock)
+        self.assertEqual(order[-1], 'ffmpeg')
+        self.assertEqual(len(order), len(set(order)))
+        # libass links the font/shaping libraries, so they must already be installed.
+        self.assertLess(max(order.index(name) for name in ('freetype', 'fribidi', 'harfbuzz')),
+                        order.index('libass'))
+        self.assertTrue(set(lock['media_build_tools']).isdisjoint(shipped_sources(lock)))
+        for name in order:
+            spec = lock[name]
+            self.assertRegex(spec['sha256'], '^[0-9a-f]{64}$', name)
+            self.assertTrue(spec['url'].startswith('https://'), name)
+            self.assertNotIn('/', spec['archive'], name)
+        for name in shipped_sources(lock):
+            self.assertTrue(lock[name]['notices'], name)
+
+    def test_filter_listing_reads_names_not_legend(self):
+        listing = ('Filters:\n  T.. = Timeline support\n  ..C = Command support\n'
+                   ' ... zscale            V->V       Apply resizing, colorspace and bit depth conversion.\n'
+                   ' .S tonemap           V->V       Conversion to/from different dynamic ranges.\n'
+                   ' ... buffer            |->V       Buffer video frames.\n')
+        with patch('build_media_tools.subprocess.check_output', return_value=listing):
+            self.assertEqual(filters(Path('ffmpeg')), {'zscale', 'tonemap', 'buffer'})
+
+    def test_binary_embedding_build_directory_is_rejected(self):
+        build = self.cache / 'build'
+        binary = self.cache / 'ffmpeg'
+        binary.write_bytes(b'prefix\x00' + str(build).encode() + b'/install/share/fonts\x00')
+        with self.assertRaisesRegex(ValueError, 'local build directory'):
+            assert_build_paths_absent(binary, build)
+        binary.write_bytes(b'--prefix=../../install\x00')
+        assert_build_paths_absent(binary, build)
 
 if __name__ == '__main__':
     unittest.main()

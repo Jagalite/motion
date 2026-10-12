@@ -18,13 +18,15 @@ python3 scripts/test_package.py artifacts/release/Motion-macos-arm64.tar.gz \
 ```
 
 The builder gets **Demuxe 1.1.1 from npm**, verifies its pinned integrity/hash,
-builds FFmpeg 8.0 and x264 from checksum-pinned sources, and packages FFmpeg,
+builds FFmpeg 8.0 with x264, zimg and libass (see `THIRD_PARTY.md`) from
+checksum-pinned sources, and packages FFmpeg,
 FFprobe, the Rust server, web UI, player assets, and license materials. Inputs
 are recorded in `packaging.lock.json`; application input hashes and an installed
 file inventory are in `motion-package.json`. Successful native tool builds can
 be reused after their hashes and source pins are checked. Use a fresh output path
 for each build. The separate source companion includes upstream Demuxe sources,
-FFmpeg/x264 sources, Motion sources, and the native tool build recipe.
+FFmpeg and its library/build-tool sources, Motion sources, and the native tool
+build recipe. Rebuilding the native tools needs CMake (for HarfBuzz).
 
 Build artifacts:
 

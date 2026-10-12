@@ -17,7 +17,8 @@ import tempfile
 import tomllib
 
 from check_publication import source_failures
-from build_media_tools import assert_portable, build, digest, download
+from build_media_tools import (REQUIRED_FILTERS, assert_portable, build, digest, download,
+                               media_sources, shipped_sources)
 from package_desktop import assemble_shell, sign_shell, go_notices
 from build_motion_provider import build as build_provider, SHAKA
 from package_privacy import assert_private_paths_absent, public_tar_member
@@ -114,10 +115,12 @@ def assemble(output, cache, tools, jobs, provider=None, source_manifest=None):
     if not (tools / 'build-receipt.json').is_file():
         raise ValueError('Incomplete media-tool build; use a fresh --media-tools directory')
     receipt = json.loads((tools / 'build-receipt.json').read_text())
-    if receipt.get('schema') != 2 or not receipt.get('portable_paths'):
+    if receipt.get('schema') != 3 or not receipt.get('portable_paths'):
         raise ValueError('Rebuild media tools with portable paths in a fresh --media-tools directory')
-    if receipt['target'] != lock['target'] or receipt['sources'] != {key: lock[key] for key in ('ffmpeg', 'x264')}:
+    if receipt['target'] != lock['target'] or receipt['sources'] != {key: lock[key] for key in media_sources(lock)}:
         raise ValueError('Media tools do not match packaging.lock.json')
+    if receipt.get('filters') != list(REQUIRED_FILTERS):
+        raise ValueError('Media tools were not verified with the required filters')
     for name, expected in receipt['binaries'].items():
         binary = tools / 'install/bin' / name
         if digest(binary) != expected:
@@ -167,11 +170,11 @@ def assemble(output, cache, tools, jobs, provider=None, source_manifest=None):
             shutil.copy2(ROOT / name, app / name)
         notices = resources / 'licenses/media-tools'
         notices.mkdir(parents=True)
-        for name in ('ffmpeg', 'x264'):
+        for name in shipped_sources(lock):
             source, = (tools / name).iterdir()
-            for path in source.iterdir():
-                if path.is_file() and path.name.startswith(('COPYING', 'LICENSE')):
-                    shutil.copy2(path, notices / f'{name}-{path.name}')
+            for notice in lock[name]['notices']:
+                # A missing pinned notice fails packaging instead of shipping without it.
+                shutil.copy2(source / notice, notices / f"{name}-{notice.replace('/', '-')}")
         for name in ('LICENSE', 'THIRD_PARTY.md', 'THIRD_PARTY_NOTICES.txt'):
             shutil.copy2(app / name, resources / name)
         go_notices(resources / 'licenses/go')
@@ -195,7 +198,7 @@ Redistribute the source companion alongside the application archive.
         sources.mkdir()
         write_source_archive(sources / 'motion-source.tar.gz', inputs, provenance)
         shutil.copy2(core_archive, sources / lock['demuxe']['archive'])
-        for spec in [lock['ffmpeg'], lock['x264'], SHAKA]:
+        for spec in [*(lock[name] for name in media_sources(lock)), SHAKA]:
             shutil.copy2(download(spec, cache), sources / spec['archive'])
         (sources / 'scripts').mkdir()
         for script in ('build_media_tools.py', 'package_privacy.py'):
@@ -218,9 +221,11 @@ To assemble the complete package outside Git, run scripts/package_app.py with
 --output, --cache and --media-tools options. Every source byte and membership
 is verified against that original manifest; generated target/artifacts caches
 are excluded. Keep the original manifest outside the extracted source tree.
-FFmpeg and x264 are unmodified pinned source archives. media-build-receipt.json
-records exact configure/make commands and compiler/environment. On macOS arm64,
-from this sources folder run:
+FFmpeg, x264, zimg, libass, FreeType, FriBidi and HarfBuzz are unmodified
+pinned source archives, as are the GNU m4/autoconf/automake/libtool build tools
+used to bootstrap zimg. media-build-receipt.json records exact configure/make
+commands and compiler/CMake/environment (${BUILD} is the build directory). On
+macOS arm64 with CMake installed, from this sources folder run:
   python3 scripts/build_media_tools.py --cache . --output build
 The Demuxe input is the integrity-verified npm release; Motion applies its
 provider configuration and paced-HLS adapter changes during assembly.
