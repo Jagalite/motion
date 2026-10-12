@@ -195,6 +195,9 @@ pub struct Cache {
     /// durable. On Linux cap-std opens `directory` with O_PATH, and fsync on an
     /// O_PATH descriptor fails with EBADF.
     durable: std::fs::File,
+    /// Where playback snapshots are created: the cache's own volume, whose
+    /// free space the download admission reserved for them.
+    path: std::path::PathBuf,
     _lock: std::fs::File,
     manifest: CacheManifest,
     history: Mutex<EventLog>,
@@ -254,6 +257,7 @@ impl Cache {
         Ok(Self {
             directory,
             durable,
+            path: path.to_owned(),
             _lock: lock,
             manifest,
             history: Mutex::new(history),
@@ -304,7 +308,7 @@ impl Cache {
             source.metadata()?.is_file() && source.metadata()?.len() == item.size,
             "download size changed"
         );
-        let mut copy = new_snapshot(item.size)?;
+        let mut copy = new_snapshot(&self.path, item.size)?;
         let mut hash = Sha256::new();
         let mut size = 0;
         let mut buffer = [0u8; 64 * 1024];
@@ -641,8 +645,8 @@ async fn media(
         .unwrap()
 }
 
-fn new_snapshot(size: u64) -> anyhow::Result<std::fs::File> {
-    let copy = tempfile::NamedTempFile::new()?;
+fn new_snapshot(directory: &Path, size: u64) -> anyhow::Result<std::fs::File> {
+    let copy = tempfile::NamedTempFile::new_in(directory)?;
     ensure!(
         size <= fs2::available_space(copy.path())?.saturating_sub(512 * 1024 * 1024),
         "insufficient space for verified playback snapshot"
@@ -688,7 +692,13 @@ mod snapshot_tests {
     use futures_util::TryStreamExt;
     #[tokio::test]
     async fn anonymous_snapshot_reclaims_on_exit_and_concurrent_ranges_keep_offsets() {
-        let mut file = new_snapshot(200_000).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = new_snapshot(dir.path(), 200_000).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the snapshot is anonymous inside the cache directory"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

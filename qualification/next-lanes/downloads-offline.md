@@ -1,7 +1,7 @@
 # Lane N3 — Managed downloads and offline reconciliation (M5) ledger
 
 Plan: `MOTION_CONSOLIDATION_AND_COMPLETION_PLAN.md` section 11.4.
-Branch `m5-downloads` (PR #31), stacked on `m3-workflows` (PR #30).
+Branch `m5-downloads` (PR #31). It was stacked on PR #30 until that merged; `main` (with #22, #28, #29, #30, #32 and #33) is now merged in, and the PR targets `main`.
 Starting SHA: `c6d6e266c76f0ea7ec1274bca10e30f9b4bdf658` (origin/main, 2026-10-11).
 
 This ledger separates implementation, missing wiring, unsupported cases,
@@ -219,6 +219,13 @@ in the round-8 commit:
 |---|---|---|
 | S24 (P2) | `Store::publish` and `Store::remove` collected every unreferenced blob, deleting another ready demand's recoverable leftover before its recovery ran | Fixed. They now release only the blob they themselves stopped referencing; global collection happens only through `cache collect` after recovery. `store.rs::crash_leftovers_are_recovered_or_collected` covers remove and publish leaving a pending blob, then recovery, then collection. |
 | S25 (P2) | Without `downloads:manage` at connect, the agent never started, even after a later grant | Fixed. Passes always run; a 403 from the download list withdraws local copies, and a later grant starts transfers on the next pass. |
+
+**Round 9** (at `1472817`) raised one P2 finding and no P1. It is fixed in
+the round-9 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S26 (P2) | The snapshot reserve was admitted on the cache volume, but the host created playback snapshots in the system temporary directory, possibly on another volume | Fixed. The host creates its anonymous playback snapshot inside the cache directory, so admission and snapshot use the same filesystem. The host unit test checks that the snapshot is anonymous in the given directory. |
 
 ## 8. Deferred release checks
 

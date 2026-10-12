@@ -16,8 +16,8 @@ const UNKNOWN_DEVICE_TIME = '1970-01-01T00:00:00Z';
 const SYNC_BATCH = 200;
 // playscale_core::downloads::MAX_MEDIA_BYTES; the server refuses larger originals too.
 const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
-// The offline host copies a title into a private snapshot before playing it
-// and keeps 512 MiB free besides (motion-ui-host new_snapshot).
+// The offline host copies a title into a private snapshot on the cache's own
+// volume before playing it and keeps 512 MiB free besides (new_snapshot).
 const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
 
 export const rootName = scope => createHash('sha256')

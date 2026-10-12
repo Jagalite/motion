@@ -11,12 +11,12 @@
     "restored_server_neither_applies_nor_erases_offline_progress": true,
     "cancellation_removes_the_device_copy": true
   },
-  "server_sha256": "55b2b312de82f2ba3aafc1d325e3d3ffe424e1a34f343be6e4ad2789b93151dd",
-  "host_sha256": "27c90d106461a66f91a9c86289e85be31fefc466ee20fdbc61818b7786be08db",
+  "server_sha256": "c88a566fb8822934f5dd8a4e493110891bb107938b429026d91d8ccd9b727ce5",
+  "host_sha256": "9e144b35e0233c1a3384abd3569a8eb354708dce4ff34fbab3e2965e9f12e521",
   "media_sha256": "f7c5cb6b947171872df862cd2639ecac03b454e09ae3a9d73d7d43e6d0b4e27d",
-  "commit": "8edc6b1d89ec925b30e7eaae774b881476d49c0d",
-  "recorded_at": "2026-10-12T20:27:25.802Z",
-  "artifacts": "$TMPDIR/motion-download-workflow-POkaiy",
+  "commit": "5a48fed70ce5ab7008caebad0c2547e8b8743425",
+  "recorded_at": "2026-10-12T20:39:16.257Z",
+  "artifacts": "$TMPDIR/motion-download-workflow-Y963pW",
   "limitations": [
     "Node runner without Electron: playback is represented by verified range reads and the offline player's event protocol.",
     "One device, one profile, one complete MP4 original; macOS arm64 debug binaries."
