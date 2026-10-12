@@ -371,7 +371,7 @@ pub struct WatchedInput {
 
 /// Required transport precondition, observed under the same reserved writer
 /// transaction as the history mutation and its idempotency receipt.
-async fn require_history_identity(
+pub(crate) async fn require_history_identity(
     conn: &mut SqliteConnection,
     headers: &HeaderMap,
 ) -> Result<(), Problem> {

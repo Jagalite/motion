@@ -48,6 +48,7 @@ fn media() -> DownloadIdentity {
         source_revision: "source".into(),
         base_viewing_revision: "2".into(),
         base_manual_epoch: "3".into(),
+        viewing_epoch: Some("server:restore".into()),
     }
 }
 fn event(log: &Log, i: &Input) -> OfflineEvent {

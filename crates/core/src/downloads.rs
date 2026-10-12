@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 /// Matches the device cache's manifest bound.
 pub const MAX_ACTIVE_PER_DEVICE: usize = 500;
 
+/// The largest single media file the device cache publishes and verifies.
+pub const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Original containers the offline player can present from one complete file.
 pub const SUPPORTED_CONTENT_TYPES: [&str; 5] = [
     "video/mp4",
@@ -102,6 +105,8 @@ pub enum Refusal {
     ContainerUnavailable,
     /// The duration needed to validate offline progress is unknown.
     DurationUnknown,
+    /// Larger than the device cache can verify and publish (`MAX_MEDIA_BYTES`).
+    TooLarge,
     /// The device already holds the maximum number of active downloads.
     Quota,
 }
@@ -158,6 +163,10 @@ pub fn choose(
             refusal = refusal.max_specific(Refusal::ContainerUnavailable);
             continue;
         }
+        if c.size_bytes > MAX_MEDIA_BYTES {
+            refusal = refusal.max_specific(Refusal::TooLarge);
+            continue;
+        }
         if active >= MAX_ACTIVE_PER_DEVICE {
             return Err(Refusal::Quota);
         }
@@ -181,7 +190,8 @@ impl Refusal {
             Refusal::MultipartUnavailable => 1,
             Refusal::ContainerUnavailable => 2,
             Refusal::DurationUnknown => 3,
-            _ => 4,
+            Refusal::TooLarge => 4,
+            _ => 5,
         };
         if rank(other) > rank(self) {
             other
@@ -536,6 +546,9 @@ mod tests {
             choose(&request(), &[unknown], 0),
             Err(Refusal::DurationUnknown)
         );
+        let mut huge = c.clone();
+        huge.size_bytes = MAX_MEDIA_BYTES + 1;
+        assert_eq!(choose(&request(), &[huge], 0), Err(Refusal::TooLarge));
         assert_eq!(
             choose(&request(), &[c], MAX_ACTIVE_PER_DEVICE),
             Err(Refusal::Quota)

@@ -28,6 +28,7 @@ fn entry(id: &str, bytes: &[u8]) -> CachedDownload {
             source_revision: format!("{:x}", Sha256::digest(bytes)),
             base_viewing_revision: "0".into(),
             base_manual_epoch: "0".into(),
+            viewing_epoch: Some("server:restore".into()),
         },
         title: "Saved".into(),
         duration_ms: 100_000,
@@ -155,6 +156,12 @@ fn quota_counts_published_and_staged_bytes() {
     store.publish(entry("a", b"0123456789")).unwrap();
     stage(&root, "b", b"01234");
     assert_eq!(store.usage().unwrap(), 15);
+    assert_eq!(store.staged().unwrap(), vec!["b".to_string()]);
+    // A cancelled demand's partial transfer is released by removal too.
+    assert!(!store.remove("b").unwrap());
+    assert!(store.staged().unwrap().is_empty());
+    assert_eq!(store.usage().unwrap(), 10);
+    stage(&root, "b", b"01234");
     assert!(store.admits_transfer(5, 20, 0).unwrap());
     assert!(!store.admits_transfer(6, 20, 0).unwrap());
     assert!(!store.admits_transfer(1, u64::MAX, u64::MAX).unwrap());
@@ -232,8 +239,16 @@ fn acknowledged_events_compact_without_renumbering_and_rebase_resumes() {
             events: vec![]
         }
     );
-    assert!(store.rebase("d1", "7", "1", Some(42_000)).unwrap());
-    assert!(!store.rebase("d1", "7", "1", Some(42_000)).unwrap());
+    assert!(
+        store
+            .rebase("d1", "7", "1", "server:restore2", Some(42_000))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .rebase("d1", "7", "1", "server:restore2", Some(42_000))
+            .unwrap()
+    );
     drop(store);
 
     // The host continues the device sequence after the compacted base and
@@ -243,6 +258,56 @@ fn acknowledged_events_compact_without_renumbering_and_rebase_resumes() {
     let store = Store::open(&root, &scope()).unwrap();
     let rebased = &store.manifest().downloads[0];
     assert_eq!(rebased.identity.base_viewing_revision, "7");
+    assert_eq!(
+        rebased.identity.viewing_epoch.as_deref(),
+        Some("server:restore2")
+    );
     assert_eq!(rebased.resume_position_ms, Some(42_000));
     assert_eq!(store.events().unwrap().next_sequence(), Some(4));
+}
+
+#[test]
+fn a_conflicting_event_is_never_compacted_by_the_watermark() {
+    use playscale_core::offline::Acknowledgement;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let media = b"offline title";
+    let mut store = Store::open(&root, &scope()).unwrap();
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    let identity = entry("d1", media).identity;
+    std::fs::write(
+        root.join("events.json"),
+        serde_json::to_vec(&EventLog {
+            base_sequence: 0,
+            events: vec![event(&identity, 1), event(&identity, 2)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    // The server holds other content at 1 (event_conflict) and reports 2 as next.
+    let refused = [
+        Acknowledgement {
+            event_id: "e1".into(),
+            consumed: false,
+        },
+        Acknowledgement {
+            event_id: "e2".into(),
+            consumed: false,
+        },
+    ];
+    let log = store.acknowledge_results(&refused, 2).unwrap();
+    assert_eq!((log.base_sequence, log.events.len()), (0, 2));
+    let partly = [
+        Acknowledgement {
+            event_id: "e1".into(),
+            consumed: true,
+        },
+        Acknowledgement {
+            event_id: "e2".into(),
+            consumed: false,
+        },
+    ];
+    let log = store.acknowledge_results(&partly, 3).unwrap();
+    assert_eq!((log.base_sequence, log.events.len()), (1, 1));
 }

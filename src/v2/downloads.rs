@@ -67,6 +67,10 @@ impl From<Refusal> for Problem {
                 "download_duration_unknown",
                 "The timeline duration is unknown, so offline progress could not be validated",
             ),
+            Refusal::TooLarge => unsupported(
+                "download_too_large",
+                "The original is larger than a device download can hold (64 GiB)",
+            ),
             Refusal::Quota => Problem::new(
                 StatusCode::CONFLICT,
                 "download_quota",
@@ -611,6 +615,11 @@ pub async fn manifest(
     .fetch_one(&mut *tx)
     .await?;
     let view = viewing::load_view(&mut tx, &row.profile_id, &row.timeline_id).await?;
+    // Read in the same snapshot as the base, so the pair names one history.
+    let (server_id, restore_epoch): (String, String) =
+        sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
+            .fetch_one(&mut *tx)
+            .await?;
     tx.commit().await?;
     Ok(tagged(
         StatusCode::OK,
@@ -630,6 +639,7 @@ pub async fn manifest(
             }],
             "viewing_revision": view.revision.to_string(),
             "manual_epoch": view.manual_epoch.to_string(),
+            "viewing_epoch": format!("{server_id}:{restore_epoch}"),
         }),
         row.revision,
     ))
@@ -847,6 +857,7 @@ async fn lineage(
 pub async fn sync(
     State(app): State<App>,
     caller: Caller,
+    headers: HeaderMap,
     body: Body<SyncInput>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::ViewingWrite)?;
@@ -875,6 +886,10 @@ pub async fn sync(
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
         .await?;
     let device = device(&principal, Some(&input.device_id))?;
+    // The batch's bases belong to one server history (the manifest's
+    // viewing_epoch). After a restore or server replacement nothing is
+    // consumed or applied; the device keeps its log for explicit recovery.
+    viewing::require_history_identity(&mut tx, &headers).await?;
     // The whole batch waits (and the device keeps its log) while the profile
     // is unusable; events are never consumed for a profile the caller lacks.
     usable_profile(&mut tx, &principal, &profile).await?;

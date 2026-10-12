@@ -24,6 +24,19 @@ pub struct DownloadIdentity {
     pub source_revision: String,
     pub base_viewing_revision: String,
     pub base_manual_epoch: String,
+    /// `server_id:restore_epoch` of the server history the base belongs to.
+    /// Events cannot cross a restored database or a replaced server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewing_epoch: Option<String>,
+}
+
+/// A well-formed `server_id:restore_epoch` history identity.
+pub fn viewing_epoch(value: &str) -> bool {
+    (3..=257).contains(&value.len())
+        && value
+            .split_once(':')
+            .is_some_and(|(server, epoch)| !server.is_empty() && !epoch.is_empty())
+        && value.bytes().all(|b| b.is_ascii_graphic())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,6 +87,46 @@ pub fn next_sequence(base: u64, history: &[OfflineEvent]) -> Option<u64> {
         Some(e) => sequence(&e.device_sequence)?.checked_add(1),
         None => base.checked_add(1),
     }
+}
+
+/// One server result for a sent event: whether it consumed (or had already
+/// consumed, as an exact duplicate) that event's sequence. `sequence_gap` and
+/// `event_conflict` rejections consume nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Acknowledgement {
+    pub event_id: String,
+    pub consumed: bool,
+}
+
+/// Whether a sync result (`outcome`, `code`) consumed its event's sequence.
+/// Every outcome does except the two rejections the server records nothing for.
+pub fn consumed(outcome: &str, code: Option<&str>) -> bool {
+    matches!(outcome, "applied" | "history_only" | "duplicate")
+        || (outcome == "rejected" && !matches!(code, Some("sequence_gap" | "event_conflict")))
+}
+
+/// The highest sequence that may be compacted after a sync: the leading run
+/// of retained events, in order, that the server confirmed by identity. The
+/// server's sequence watermark alone is never enough: an event it refused as
+/// a conflict sits below that watermark but holds different content.
+pub fn acknowledged_through(
+    base: u64,
+    history: &[OfflineEvent],
+    results: &[Acknowledgement],
+    next_device_sequence: u64,
+) -> u64 {
+    let mut through = base;
+    for (event, result) in history.iter().zip(results) {
+        let Some(sequence) = sequence(&event.device_sequence) else {
+            break;
+        };
+        if result.event_id != event.event_id || !result.consumed || sequence >= next_device_sequence
+        {
+            break;
+        }
+        through = sequence;
+    }
+    through
 }
 
 /// Drop the events the server acknowledged through `acknowledged_through`
@@ -176,6 +229,7 @@ mod tests {
                 source_revision: "r".into(),
                 base_viewing_revision: "2".into(),
                 base_manual_epoch: "3".into(),
+                viewing_epoch: Some("server:restore".into()),
             },
             event_id: "e".into(),
             device_sequence: "1".into(),
@@ -245,6 +299,42 @@ mod tests {
         );
         next.device_sequence = u64::MAX.to_string();
         assert_eq!(next_sequence(0, &[next]), None);
+    }
+    #[test]
+    fn only_confirmed_leading_events_are_acknowledged() {
+        let mut history = vec![];
+        for n in 1..=3u64 {
+            let mut e = event();
+            e.event_id = format!("e{n}");
+            e.device_sequence = n.to_string();
+            history.push(e);
+        }
+        let ack = |id: &str, consumed| Acknowledgement {
+            event_id: id.into(),
+            consumed,
+        };
+        // A conflict at 3 stops there even though the watermark passed it.
+        assert_eq!(
+            acknowledged_through(
+                0,
+                &history,
+                &[ack("e1", true), ack("e2", true), ack("e3", false)],
+                4
+            ),
+            2
+        );
+        // A conflict at 1 acknowledges nothing.
+        assert_eq!(
+            acknowledged_through(0, &history, &[ack("e1", false), ack("e2", true)], 3),
+            0
+        );
+        // Results that do not name the sent events acknowledge nothing.
+        assert_eq!(acknowledged_through(0, &history, &[ack("x", true)], 2), 0);
+        // Never beyond the server's watermark.
+        assert_eq!(
+            acknowledged_through(0, &history, &[ack("e1", true), ack("e2", true)], 2),
+            1
+        );
     }
     #[test]
     fn transfers_respect_quota_and_headroom() {

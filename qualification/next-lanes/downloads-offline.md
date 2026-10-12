@@ -42,6 +42,9 @@ qualification.
 Sequences are per device and profile. Exactly one cache root maps to that pair,
 because the root scope is server, principal, profile and device.
 
+0. The batch's `X-Motion-Viewing-Epoch` must name the current server
+   history (`accepts_history_identity`); otherwise nothing is consumed or
+   applied (409 `viewing_epoch_changed`, or 428 when missing).
 1. A recorded event with the same sequence or ID: an identical retry is
    `duplicate`; it reports the original outcome in `code` and changes nothing.
    Different content is `rejected/event_conflict` and consumes nothing.
@@ -81,7 +84,7 @@ Nothing is silently substituted. Each refusal has a stable code.
 | Server transfer states (`preparing`, `transferring`, `verified_local`, `failed`) | Not produced. Reporting device progress needs a new contract operation (A00 review). The Downloads page states that progress is device-owned. |
 | Offline-mode removal | Removal happens on the next online pass, after a server cancel. There is no remove button in the offline host. |
 | Choosing between several cache roots offline | The desktop opens the most recently synchronized root (`current.json`). Other accounts, profiles and servers keep separate roots but have no picker yet. |
-| Restored or replaced server | A restored server's sequence row is behind the device. Sync then answers `sequence_gap` or a foreign acknowledgement, which the cache refuses. Nothing is applied or erased, and the agent reports it. An explicit recovery flow is not implemented (relates to C08). |
+| Restored or replaced server | Fenced. Every download pins the manifest's `viewing_epoch` (`server_id:restore_epoch`, read in the same snapshot as the base), and every sync sends it as `X-Motion-Viewing-Epoch`. A mismatch answers 409 `viewing_epoch_changed` before anything is consumed or applied. The device keeps its events, and the agent reports it. An explicit recovery flow (re-basing or discarding retained events after a restore) is not implemented (relates to C08). |
 | Server-side retention of `offline_events` | Unbounded per device and profile. Compaction or retention policy is deferred. |
 | Windows | The inherited-pipe host transport is Unix-only (unchanged). |
 
@@ -115,7 +118,7 @@ tests. Network sequencing stays in the desktop agent. It makes no correctness
 decision: publication, compaction and authority are decided by the cache tool
 and the server.
 
-## 6. Results
+## 6. Results (before review round 1; see section 9 for the final run)
 
 Run on 2026-10-12, macOS arm64, Rust 1.98.0 (compiled through kyoto, test
 binaries executed outside kyoto per its policy), Node 22.
@@ -139,7 +142,24 @@ Not run in this lane: the Electron `run-offline.mjs` smoke. The host's
 presentation path is unchanged apart from the event-log format, and the smoke
 was updated to read either format.
 
-## 7. Deferred release checks
+## 7. Independent review (GPT-6.1 Sol)
+
+Run with `codex exec review --base origin/m3-workflows` (model `gpt-6.1-sol`,
+high reasoning effort, read-only sandbox) over the N3 commits only.
+
+**Round 1** (at `afb47a1`) raised two P1 and four P2 findings. All six are
+fixed in the round-1 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S1 (P1) | The agent compacted by the server's sequence watermark, so an event refused as `event_conflict` below it was erased | Fixed. A new core policy, `offline::acknowledged_through`, compacts only the leading run of events the server confirmed by identity; `offline::consumed` classifies results. `motion-ui-host cache acknowledge` takes the server response on stdin and applies it, so the decision is no longer in JavaScript. Covered by core unit tests, `store.rs::a_conflicting_event_is_never_compacted_by_the_watermark`, agent tests, and the reconciliation model, which now compacts through this function. |
+| S2 (P1) | Sync accepted events across a restored database when sequences and bases happened to match | Fixed. The manifest returns `viewing_epoch` with the base. The download identity and every event carry it, and `syncOffline` requires `X-Motion-Viewing-Epoch` (428 if missing, 409 `viewing_epoch_changed` on mismatch). This uses the existing `accepts_history_identity` core rule inside the write transaction. The model gained a Restore input; the oracle requires that nothing is consumed or applied from another history and that the device erases nothing. Covered by `tests/v2_downloads.rs` and a real-binary restore in `run-download-workflow.mjs`. |
+| S3 (P2) | `current.json` was written only after a complete pass, so one later failing transfer hid a published copy | Fixed. It is written after each publication, and one failing transfer no longer stops the others. |
+| S4 (P2) | Staged partial transfers of cancelled or expired demands were never removed | Fixed. `cache status` reports staged transfers, and the agent removes those whose demand is not ready. Store and agent tests cover it. |
+| S5 (P2) | The agent killed cache-tool output above 4 MiB while the event log allows 8 MiB | Fixed. The bound is now 16 MiB. |
+| S6 (P2) | Originals above the cache's 64 GiB bound were transferred and could never publish | Fixed. `downloads::MAX_MEDIA_BYTES` is shared by core and host. The server refuses larger originals (422 `download_too_large`), and the agent checks before transferring. |
+
+## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |
 |---|---|---|
@@ -148,7 +168,6 @@ was updated to read either format.
 | Large-file and long-duration transfer, interrupted network, resume across app restart | ≥ 4 GiB MP4 original on a remote server; network cut at ~50 % twice; app quit mid-transfer | A13 |
 | Physical out-of-space during publication | Volume with free space smaller than the media plus 1 GiB headroom | A13 |
 | Multiple accounts, profiles and servers on one device with an offline root picker | Two servers × two profiles, one download each | A11/A12 (picker UI) with A13 |
-| Restored or replaced server recovery | Backup taken before an offline session, restored after it; device reconnects | A02/A07 (C08) with A13 |
+| Restored or replaced server **recovery flow** (the fence itself is implemented and tested) | Backup taken before an offline session, restored after it; device reconnects and the user chooses to discard or re-base | A02/A07 (C08) with A13 |
 | Server retention of `offline_events` | 10,000+ events per device and profile | A13 with A02 |
 | Device transfer-state reporting (`transferring`, `verified_local`, `failed`) | Requires a new contract operation | A00 (contract) with A13 |
-| Independent GPT-6.1 Sol review of the commits and final diff | This PR | Lane owner; not available to the implementing session |

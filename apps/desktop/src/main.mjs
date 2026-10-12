@@ -69,7 +69,8 @@ function runCache(root, scope, args, input) {
     const child = spawn(hostBinary(), ['cache', '--cache-dir', root, '--scope', JSON.stringify(scope), ...args], {stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true});
     let output = '';
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', chunk => { output += chunk; if (output.length > 4 * 1024 * 1024) child.kill('SIGKILL'); });
+    // Bounded above the cache's 8 MiB event-log limit.
+    child.stdout.on('data', chunk => { output += chunk; if (output.length > 16 * 1024 * 1024) child.kill('SIGKILL'); });
     child.once('error', reject);
     child.once('exit', code => {
       let value;
@@ -211,17 +212,19 @@ async function connectOwned(input, owner, locallyOwned = false) {
     const principal = browserSession.principal;
     if (principal.device_id && principal.permissions?.includes('downloads:manage')) {
       const controller = new AbortController();
-      const api = async (path, {method = 'GET', body, idempotent = false} = {}) => {
+      const api = async (path, {method = 'GET', body, idempotent = false, headers = {}} = {}) => {
         if (!current()) throw new Error('Connection changed');
         const response = await ses.fetch(`${selected.origin}${path}`, {method, redirect: 'error', cache: 'no-store',
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
           headers: {Origin: selected.origin, 'X-CSRF-Token': browserSession.csrf_token,
             ...(body === undefined ? {} : {'Content-Type': 'application/json'}),
-            ...(idempotent ? {'Idempotency-Key': randomUUID().replaceAll('-', '')} : {})},
+            ...(idempotent ? {'Idempotency-Key': randomUUID().replaceAll('-', '')} : {}), ...headers},
           body: body === undefined ? undefined : JSON.stringify(body)});
         if (!response.ok) {
-          const error = new Error(`Server request failed (${response.status})`);
+          const problem = await boundedJson(response, 64 * 1024).catch(() => null);
+          const error = new Error(problem?.detail ?? `Server request failed (${response.status})`);
           error.status = response.status;
+          error.code = problem?.code ?? null;
           throw error;
         }
         return response.status === 204 ? null : boundedJson(response, 4 * 1024 * 1024);
