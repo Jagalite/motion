@@ -163,6 +163,10 @@ impl Model for Monitoring {
             tracks: vec![],
             operation: Operation::Original,
             recipe_digest: None,
+            clip: None,
+            parts: vec![],
+            max_bitrate_bps: None,
+            adaptive: false,
         };
         let (delivery, _) = Delivery::admit("t".into(), pin, 0, Some(1000), 0)
             .map_err(|e| ModelError::new(format!("{e:?}")))?;

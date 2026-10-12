@@ -172,6 +172,10 @@ impl Model for Playback {
                     route: *route,
                     audio: Some(0),
                     subtitle: None,
+                    clip: None,
+                    parts: vec![],
+                    max_bitrate_bps: None,
+                    adaptive: false,
                     expires_at: s.now + TTL,
                 });
                 out.push(Effect::Planned);

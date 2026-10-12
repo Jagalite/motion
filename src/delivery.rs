@@ -43,6 +43,8 @@ pub const MAX_ADMISSIONS: usize = 32;
 pub const SEGMENT_SECONDS: u64 = 4;
 /// Pinned HLS target duration. Longer segments fail the generation.
 pub const TARGET_SECONDS: u64 = 6;
+/// The shortest window HLS peak bitrate is measured over: half the target.
+pub const PEAK_WINDOW_MS: u64 = TARGET_SECONDS * 1000 / 2;
 /// Free space a generation needs beyond the configured floor before it starts.
 /// Pacing and retention bound the segments it keeps; this covers them at the
 /// recipe's peak rate with margin.
@@ -55,6 +57,10 @@ pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 /// Stream copy of H.264 with audio converted to stereo AAC.
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
+/// How far before a generation's start a burned-subtitle conversion begins
+/// reading, so a bitmap cue that started earlier and is still showing is
+/// drawn. Cues established longer before the start are not restored.
+pub const BURN_LOOKBACK_MS: u64 = 20_000;
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
 /// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
@@ -141,6 +147,9 @@ struct Inner {
         playscale_core::delivery_admission::Identity,
         serde_json::Value,
     )>,
+    /// The highest bitrate measured over published HLS peak windows, per
+    /// stream-copy generation (a copy keeps the source's rate).
+    copy_peaks: HashMap<u64, u64>,
 }
 
 /// Control of one generation worker: cancellation and pacing (true = paused).
@@ -157,6 +166,18 @@ struct Session {
     /// v1 (operator) deliveries, which v2 callers can never observe.
     owner: Option<Owner>,
     source: Source,
+    /// The validated sources of a multipart timeline's later parts, in order
+    /// (the first is `source`); empty for one file.
+    parts: Vec<Source>,
+    /// Those later parts' file IDs and pinned revisions, revalidated like the
+    /// first part's.
+    part_files: Vec<(String, String)>,
+    /// A multipart timeline's picture canvas: the first part's coded size
+    /// (every part has it), in even dimensions.
+    canvas: Option<(u32, u32)>,
+    /// The source's probed average rates: its first video stream and each
+    /// audio stream in order (a stream copy keeps those it carries).
+    stream_rates: (Option<u64>, Vec<Option<u64>>),
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
     subtitles: tokio::sync::Mutex<()>,
@@ -427,7 +448,11 @@ fn dispatch(app: &App, session: &Arc<Session>, inner: &mut Inner, effects: Vec<E
                 below_index,
             } => {
                 let directory = session.directory(app, generation);
-                tokio::task::spawn_blocking(move || discard(&directory, below_index));
+                tokio::task::spawn_blocking(move || {
+                    discard(&directory, below_index);
+                    // An adaptive generation's low variant (absent otherwise).
+                    discard(&directory.join(LOW_VARIANT), below_index);
+                });
             }
             Effect::Cleanup { generation } => {
                 inner.workers.remove(&generation);
@@ -499,14 +524,32 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
+/// A multipart generation's inputs, each (descriptor, seek and remaining
+/// duration in milliseconds, the part's own ordinal of the selected audio),
+/// and its picture canvas.
+type PartInputs<'a> = (&'a [PartInput], (u32, u32));
+/// One multipart input: descriptor, seek and remaining duration (ms), and the
+/// part's own ordinal of the selected audio.
+type PartInput = (u32, u64, u64, Option<u32>);
+
+/// FFmpeg arguments for a live generation reading the source from `start_ms`
+/// (file time) and, for an interval, stopping at `end_ms` (file time).
 fn arguments(
     operation: Operation,
     hardware: bool,
     start_ms: u64,
+    end_ms: Option<u64>,
     audio: Option<u32>,
+    burn: Option<u32>,
+    parts: Option<PartInputs<'_>>,
+    cap: Option<playscale_core::playback_session::RateCap>,
+    adaptive: bool,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
+    // An adaptive conversion of one file without a burned subtitle: a second,
+    // capped low variant from the same decoded and scaled picture.
+    let adaptive = adaptive && !copy && burn.is_none() && parts.is_none();
     let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -514,26 +557,132 @@ fn arguments(
         "-nostdin",
         "-protocol_whitelist",
         "file",
-        "-ss",
     ]
     .map(str::to_owned)
     .to_vec();
-    args.push(format!("{}.{:03}", start_ms / 1000, start_ms % 1000));
-    if copy {
-        // Keep source timestamps: copied video starts at the preceding keyframe,
-        // and its media time is timeline time (the route requires a zero start).
-        args.push("-copyts".into());
-    }
-    args.extend(
-        [
+    // A burned bitmap cue is established by a display set that may precede
+    // the start: read BURN_LOOKBACK_MS earlier and trim the output to the
+    // start, so cues still showing there are drawn. Output time zero is the
+    // start either way.
+    let burn = burn.filter(|_| !copy);
+    let input_ms = if burn.is_some() {
+        start_ms.saturating_sub(BURN_LOOKBACK_MS)
+    } else {
+        start_ms
+    };
+    let at = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    match parts {
+        // A multipart timeline from the part the start falls in: that part
+        // seeks to its offset, the later parts play from their beginning.
+        // Each is an inherited validated descriptor.
+        Some((parts, _)) => {
+            for (fd, seek, _, _) in parts {
+                if *seek > 0 {
+                    args.extend(["-ss".to_owned(), at(*seek)]);
+                }
+                args.extend(["-i".to_owned(), format!("/dev/fd/{fd}")]);
+            }
+        }
+        None => {
+            args.extend(["-ss".to_owned(), at(input_ms)]);
+            if copy {
+                // Keep source timestamps: copied video starts at the preceding
+                // keyframe, and its media time is timeline time (the route
+                // requires a zero start).
+                args.push("-copyts".into());
+            }
             // The validated source descriptor inherited as fd 3.
-            "-i",
-            "/dev/fd/3",
-        ]
-        .map(str::to_owned),
-    );
-    args.extend(["-map", "0:v:0"].map(str::to_owned));
-    if let Some(audio) = audio {
+            args.extend(["-i", "/dev/fd/3"].map(str::to_owned));
+        }
+    }
+    if start_ms > input_ms {
+        let trim = start_ms - input_ms;
+        args.push("-ss".into());
+        args.push(format!("{}.{:03}", trim / 1000, trim % 1000));
+    }
+    // An interval ends inside the file: the output stops at its end.
+    if let Some(end_ms) = end_ms {
+        let length = end_ms.saturating_sub(start_ms);
+        args.push("-t".into());
+        args.push(format!("{}.{:03}", length / 1000, length % 1000));
+    }
+    const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    // A burned bitmap subtitle's canvas is scaled to the source video's size
+    // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
+    // overlaid before the output is scaled, so nothing is cropped. In
+    // scale2ref, iw/ih name the reference (video) size on FFmpeg 6.1 through 8.
+    // Multipart: each part's decoded frames are normalized and joined by the
+    // concat filter, so the parts' container time bases never meet. Pictures
+    // are resampled to square pixels and fitted (letterboxed) into one canvas,
+    // the first part's size, so parts whose pixel aspect differs still join
+    // with their display geometry. Each part keeps its own timestamps (its
+    // streams' relative offsets), its audio is filled with silence from zero,
+    // and both are extended and cut at exactly the part's pinned (remaining)
+    // duration, so playback crosses a boundary where seeking (core
+    // `parts::locate`) places it.
+    let joined = parts.map(|(parts, (width, height))| {
+        let mut graph = String::new();
+        let mut inputs = String::new();
+        for (i, (_, _, length, part_audio)) in parts.iter().enumerate() {
+            let end = format!("{}.{:03}", length / 1000, length % 1000);
+            graph.push_str(&format!(
+                "[{i}:v:0]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
+                 scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
+                 pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,\
+                 tpad=stop_mode=clone:stop=-1,trim=end={end}[v{i}];"
+            ));
+            inputs.push_str(&format!("[v{i}]"));
+            if let Some(audio) = audio.and(*part_audio) {
+                graph.push_str(&format!(
+                    "[{i}:a:{audio}]aresample=48000:async=1:first_pts=0,\
+                     aformat=channel_layouts=stereo,apad,atrim=end={end}[a{i}];"
+                ));
+                inputs.push_str(&format!("[a{i}]"));
+            }
+        }
+        let a = u8::from(audio.is_some());
+        graph.push_str(&format!(
+            "{inputs}concat=n={}:v=1:a={a}[joined]",
+            parts.len()
+        ));
+        if audio.is_some() {
+            graph.push_str("[ja]");
+        }
+        graph.push_str(&format!(";[joined]{SCALE}[v]"));
+        graph
+    });
+    match (burn, joined) {
+        (_, Some(graph)) => {
+            args.extend([
+                "-filter_complex".to_owned(),
+                graph,
+                "-map".into(),
+                "[v]".into(),
+            ]);
+            if audio.is_some() {
+                args.extend(["-map", "[ja]"].map(str::to_owned));
+            }
+        }
+        (Some(index), None) => {
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:s:{index}][0:v:0]scale2ref=w=iw:h=ih[sub][base];\
+                 [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (None, None) if adaptive => {
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "[0:v:0]{SCALE},split=2[v][split];\
+                 [split]scale=w=-2:h='min({},ih)':force_divisible_by=2[low]",
+                playscale_core::playback_session::ADAPTIVE_LOW_HEIGHT
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (None, None) => args.extend(["-map", "0:v:0"].map(str::to_owned)),
+    }
+    if let (Some(audio), None) = (audio, parts) {
         args.push("-map".into());
         args.push(format!("0:a:{audio}"));
     }
@@ -541,15 +690,10 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        args.extend(
-            [
-                "-vf",
-                "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-                "-pix_fmt",
-                "yuv420p",
-            ]
-            .map(str::to_owned),
-        );
+        if burn.is_none() && parts.is_none() && !adaptive {
+            args.extend(["-vf", SCALE].map(str::to_owned));
+        }
+        args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
         if hardware {
             // -allow_sw 0: fail rather than silently encode in software.
             args.extend(
@@ -560,15 +704,22 @@ fn arguments(
                     "0",
                     "-realtime",
                     "1",
-                    "-b:v",
-                    "2500k",
-                    "-maxrate",
-                    "2500k",
-                    "-bufsize",
-                    "5000k",
                 ]
                 .map(str::to_owned),
             );
+            // A capped conversion targets and limits its rate to the cap's
+            // VBV settings; otherwise the recipe's 2.5 Mb/s.
+            let (rate, buffer) = cap.map_or(("2500k".to_owned(), "5000k".to_owned()), |c| {
+                (c.video_max_bps.to_string(), c.video_buffer_bits.to_string())
+            });
+            args.extend([
+                "-b:v".into(),
+                rate.clone(),
+                "-maxrate".into(),
+                rate,
+                "-bufsize".into(),
+                buffer,
+            ]);
         } else {
             args.extend(
                 [
@@ -576,6 +727,15 @@ fn arguments(
                 ]
                 .map(str::to_owned),
             );
+            // Capped CRF: quality-targeted below the cap's VBV limit.
+            if let Some(c) = cap {
+                args.extend([
+                    "-maxrate".into(),
+                    c.video_max_bps.to_string(),
+                    "-bufsize".into(),
+                    c.video_buffer_bits.to_string(),
+                ]);
+            }
         }
         args.push("-force_key_frames".into());
         args.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
@@ -612,8 +772,81 @@ fn arguments(
     args.push("-hls_segment_filename".into());
     args.push(directory.join("seg%d.m4s").to_string_lossy().into_owned());
     args.push(directory.join("ffmpeg.m3u8").to_string_lossy().into_owned());
+    if adaptive {
+        // The low variant: the same audio and keyframe cadence (so its
+        // segments align with the main ones), capped at its own rate.
+        let low = playscale_core::playback_session::rate_cap(
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            PEAK_WINDOW_MS,
+        )
+        .expect("the low rung leaves room for video");
+        args.extend(["-map", "[low]"].map(str::to_owned));
+        if let Some(audio) = audio {
+            args.push("-map".into());
+            args.push(format!("0:a:{audio}"));
+        }
+        if let Some(end_ms) = end_ms {
+            let length = end_ms.saturating_sub(start_ms);
+            args.push("-t".into());
+            args.push(format!("{}.{:03}", length / 1000, length % 1000));
+        }
+        args.extend(
+            [
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-threads",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+        args.extend([
+            "-maxrate".into(),
+            low.video_max_bps.to_string(),
+            "-bufsize".into(),
+            low.video_buffer_bits.to_string(),
+            "-force_key_frames".into(),
+            format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"),
+        ]);
+        args.extend(["-c:a", "aac", "-b:a", "160k", "-ac", "2"].map(str::to_owned));
+        args.extend(
+            [
+                "-f",
+                "hls",
+                "-hls_list_size",
+                FFMPEG_LIST_SIZE,
+                "-hls_segment_type",
+                "fmp4",
+                "-hls_fmp4_init_filename",
+                "init.mp4",
+                "-hls_flags",
+                "temp_file+independent_segments",
+                "-start_number",
+                "0",
+                "-hls_time",
+            ]
+            .map(str::to_owned),
+        );
+        args.push(SEGMENT_SECONDS.to_string());
+        let low_dir = directory.join(LOW_VARIANT);
+        args.push("-hls_segment_filename".into());
+        args.push(low_dir.join("seg%d.m4s").to_string_lossy().into_owned());
+        args.push(low_dir.join("ffmpeg.m3u8").to_string_lossy().into_owned());
+    }
     args
 }
+
+/// The low variant of an adaptive generation, in its own subdirectory.
+pub(crate) const LOW_VARIANT: &str = "low";
 
 /// H.264 bitstream details of a source, observed through its validated descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -824,7 +1057,8 @@ fn parse_copy_details(stdout: &[u8], revision: String) -> Option<CopyDetails> {
     })
 }
 
-/// The source keyframe a stream copy of `start_ms` begins at, in microseconds.
+/// The source keyframe a stream copy of `start_ms` begins at, in microseconds,
+/// and the input seek target (ms) that reaches it (core `copy_seek`).
 /// Keyframes are the demuxer's sync packets, which is where the HLS muxer cuts;
 /// the core decides from them whether every segment in the observed window fits
 /// the copy target. A stalled probe stays owned by `lease`.
@@ -834,7 +1068,7 @@ async fn copy_keyframe(
     start_ms: u64,
     duration_ms: Option<u64>,
     lease: &execution::Lease,
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let from = start_ms.saturating_sub(COPY_TARGET_SECONDS * 1000);
     let mut until = start_ms + 60_000 + COPY_TARGET_SECONDS * 1000;
     // Reaching the end of the media also bounds the final segment.
@@ -905,7 +1139,11 @@ async fn copy_keyframe(
         COPY_TARGET_SECONDS,
         end_ms,
     )?;
-    keyframes_us.into_iter().find(|us| us / 1000 == start)
+    let seek_ms = core::copy_seek(&keyframes_ms, start, start_ms)?;
+    keyframes_us
+        .into_iter()
+        .find(|us| us / 1000 == start)
+        .map(|us| (us, seek_ms))
 }
 
 /// Largest init segment read for its video track.
@@ -1004,6 +1242,9 @@ async fn observe(
     start_ms: u64,
     operation: Operation,
     copy_start: Option<u64>,
+    max_bitrate_bps: Option<u64>,
+    recent: &mut Vec<(u64, u64)>,
+    mut low: Option<&mut LowVariant>,
 ) -> bool {
     // Stop writing before the volume drops below the configured free-space floor.
     let floor = app.storage.settings.min_free_bytes;
@@ -1016,6 +1257,14 @@ async fn observe(
         let _ = apply(app, session, Input::Failed { generation });
         return false;
     }
+    // An adaptive generation publishes a segment only when its low variant
+    // has the same segment, verified like the main one.
+    if let Some(low) = low.as_deref_mut()
+        && !verify_low(app, session, generation, directory, low, operation).await
+    {
+        return false;
+    }
+    let limit = low.as_deref().map(|l| l.verified);
     let Ok(text) = tokio::fs::read_to_string(directory.join("ffmpeg.m3u8")).await else {
         return false;
     };
@@ -1029,7 +1278,7 @@ async fn observe(
     }
     let from = *reported;
     for segment in published.iter().filter(|s| s.index >= from) {
-        if segment.index != *reported {
+        if segment.index != *reported || limit.is_some_and(|limit| segment.index >= limit) {
             return false;
         }
         let Ok(metadata) =
@@ -1039,6 +1288,39 @@ async fn observe(
         };
         if metadata.len() > MAX_SEGMENT_BYTES {
             tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), "segment exceeds the size cap");
+            let _ = apply(app, session, Input::Failed { generation });
+            return false;
+        }
+        // A capped conversion's peak bitrate is measured, not assumed: every
+        // run of contiguous segments that HLS counts toward peak bitrate (0.5
+        // to 1.5 target durations) and ends with this one must be within the
+        // cap before it is published.
+        let target_ms = target_seconds(operation) * 1000;
+        recent.push((metadata.len(), segment.duration_ms));
+        while recent.len() > 1
+            && recent[1..].iter().map(|(_, d)| d).sum::<u64>() >= target_ms * 3 / 2
+        {
+            recent.remove(0);
+        }
+        if copies_video(operation) {
+            let peak = playscale_core::playback_session::peak_bitrate(
+                recent,
+                target_ms / 2,
+                target_ms * 3 / 2,
+            );
+            let mut inner = session.inner.lock().unwrap();
+            let known = inner.copy_peaks.entry(generation).or_default();
+            *known = (*known).max(peak);
+        }
+        if let Some(cap) = max_bitrate_bps
+            && !playscale_core::playback_session::peak_within_cap(
+                recent,
+                cap,
+                target_ms / 2,
+                target_ms * 3 / 2,
+            )
+        {
+            tracing::warn!(delivery=%session.id, generation, bytes = metadata.len(), duration_ms = segment.duration_ms, cap, "segment exceeds the bitrate cap");
             let _ = apply(app, session, Input::Failed { generation });
             return false;
         }
@@ -1093,7 +1375,13 @@ async fn observe(
         let _ = apply(app, session, input);
         *reported += 1;
     }
-    if ended && *reported > 0 && published.last().is_some_and(|s| s.index + 1 == *reported) {
+    if ended
+        && *reported > 0
+        && published.last().is_some_and(|s| s.index + 1 == *reported)
+        && low
+            .as_deref()
+            .is_none_or(|l| l.ended && l.verified == *reported)
+    {
         let _ = apply(
             app,
             session,
@@ -1105,6 +1393,82 @@ async fn observe(
         return true;
     }
     false
+}
+
+/// The verification state of an adaptive generation's low variant.
+#[derive(Default)]
+pub(crate) struct LowVariant {
+    /// Low segments verified so far (every index below is verified).
+    verified: u32,
+    recent: Vec<(u64, u64)>,
+    video: Option<crate::fmp4::VideoTrack>,
+    /// Its playlist ended with all of them verified.
+    ended: bool,
+}
+
+/// Verify newly published low-variant segments in order: present, within the
+/// size cap, beginning with an IDR, and within the low rung's peak bitrate
+/// over every HLS window. A failure fails the generation (false).
+async fn verify_low(
+    app: &App,
+    session: &Arc<Session>,
+    generation: u64,
+    directory: &FsPath,
+    low: &mut LowVariant,
+    operation: Operation,
+) -> bool {
+    let dir = directory.join(LOW_VARIANT);
+    let Ok(text) = tokio::fs::read_to_string(dir.join("ffmpeg.m3u8")).await else {
+        return true;
+    };
+    let (published, ended) = parse_playlist(&text);
+    let fail = |reason: &str| {
+        tracing::warn!(delivery=%session.id, generation, reason, "low variant segment refused");
+        let _ = apply(app, session, Input::Failed { generation });
+        false
+    };
+    if published.first().is_some_and(|s| s.index > low.verified) {
+        return fail("publication gap");
+    }
+    let target_ms = target_seconds(operation) * 1000;
+    let from = low.verified;
+    for segment in published.iter().filter(|s| s.index >= from) {
+        if segment.index != low.verified {
+            return true;
+        }
+        let Ok(metadata) = tokio::fs::metadata(dir.join(format!("seg{}.m4s", segment.index))).await
+        else {
+            return true;
+        };
+        if metadata.len() > MAX_SEGMENT_BYTES
+            || !core::fits_target(segment.duration_ms, target_seconds(operation))
+        {
+            return fail("size or duration");
+        }
+        if !segment_independent(&dir, segment.index, &mut low.video).await {
+            return fail("not independent");
+        }
+        low.recent.push((metadata.len(), segment.duration_ms));
+        while low.recent.len() > 1
+            && low.recent[1..].iter().map(|(_, d)| d).sum::<u64>() >= target_ms * 3 / 2
+        {
+            low.recent.remove(0);
+        }
+        if !playscale_core::playback_session::peak_within_cap(
+            &low.recent,
+            playscale_core::playback_session::ADAPTIVE_LOW_BPS,
+            target_ms / 2,
+            target_ms * 3 / 2,
+        ) {
+            return fail("bitrate cap");
+        }
+        low.verified += 1;
+    }
+    low.ended = ended
+        && published
+            .last()
+            .is_some_and(|s| s.index + 1 == low.verified);
+    true
 }
 
 /// Open the source beneath its validated root and check its identity. The
@@ -1141,12 +1505,21 @@ async fn run_generation(
         let _ = apply(app, session, Input::Failed { generation });
         stopped(app, session);
     };
+    // An adaptive generation runs two encodes: both execution units.
+    let units = {
+        let inner = session.inner.lock().unwrap();
+        match inner.delivery.generations.get(&generation) {
+            Some(g) if g.pin.adaptive => 2,
+            Some(_) => 1,
+            None => return,
+        }
+    };
     let lease = tokio::select! {
         _ = stop.cancelled() => return stopped(&app, &session),
         lease = app.processing.execution.reserve(
             format!("delivery:{}:{generation}", session.id),
             Class::Interactive,
-            1,
+            units,
         ) => lease,
     };
     let Ok(lease) = lease else {
@@ -1190,9 +1563,39 @@ async fn run_generation(
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()));
     // Cancellation/timeout fences preparation, but a stalled filesystem operation
     // still owns capacity and prevents generation cleanup until it actually exits.
+    // A multipart timeline reads its parts as separate inputs: the first part
+    // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
+    // (core `parts::locate`) seeks to its offset; later parts follow whole.
+    let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
+    let part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
+        None
+    } else if session.canvas.is_none()
+        || (audio.is_some() && pin.parts.iter().any(|p| p.audio.is_none()))
+    {
+        // Never fall back to reading only the first part, or to the first
+        // part's audio position in another part.
+        tracing::warn!(delivery=%session.id, generation, "multipart timeline without a canvas or per-part audio");
+        return fail(&app, &session);
+    } else {
+        let Some((first, offset)) = playscale_core::parts::locate(&durations, start_ms) else {
+            tracing::warn!(delivery=%session.id, generation, "start beyond the last part");
+            return fail(&app, &session);
+        };
+        Some(
+            (first..durations.len())
+                .map(|i| {
+                    let fd = if i == 0 { 3 } else { 4 + i as u32 };
+                    let seek = if i == first { offset } else { 0 };
+                    (fd, seek, durations[i] - seek, pin.parts[i].audio)
+                })
+                .collect(),
+        )
+    };
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
+        let later = session.parts.clone();
+        let parts = durations.len();
         let floor = app.storage.settings.min_free_bytes;
         let late_app = app.clone();
         let late_session = session.clone();
@@ -1202,10 +1605,21 @@ async fn run_generation(
             OBSERVE_DEADLINE,
             move || {
                 std::fs::create_dir_all(&directory)?;
+                if units == 2 {
+                    std::fs::create_dir_all(directory.join(LOW_VARIANT))?;
+                }
                 crate::storage::require_space(&directory, GENERATION_RESERVE_BYTES, floor)?;
                 let input = source_valid(&source)?;
+                anyhow::ensure!(
+                    later.len() + 1 == parts.max(1),
+                    "part sources do not match the pin"
+                );
+                let later = later
+                    .iter()
+                    .map(source_valid)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
-                anyhow::Ok((input, witness, held))
+                anyhow::Ok((input, later, witness, held))
             },
             move || {
                 stopped(&late_app, &late_session);
@@ -1219,7 +1633,7 @@ async fn run_generation(
         };
         prepared
     };
-    let (input, witness, held) = match prepared {
+    let (input, later, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             tracing::warn!(delivery=%session.id, generation, %error, "delivery generation not started");
@@ -1232,20 +1646,20 @@ async fn run_generation(
     };
     // A stream copy begins at the source keyframe at or before the request; know
     // which one before encoding, so the published start can be verified.
-    let copy_start = if copies_video(operation) {
+    let (copy_start, seek_ms) = if copies_video(operation) {
         // Bounded by its own deadline; not abandoned on stop, which would leave
         // the probe unowned.
         let probed = copy_keyframe(&app, &input, start_ms, duration_ms, &lease).await;
         if stop.is_cancelled() {
             return stopped(&app, &session);
         }
-        let Some(keyframe) = probed else {
+        let Some((keyframe, seek_ms)) = probed else {
             tracing::warn!(delivery=%session.id, generation, "no usable keyframe or keyframe spacing exceeds the copy target");
             return fail(&app, &session);
         };
-        Some(keyframe)
+        (Some(keyframe), seek_ms)
     } else {
-        None
+        (None, start_ms)
     };
     let mut supervisor = Command::new(&app.processing.supervisor);
     supervisor
@@ -1254,17 +1668,29 @@ async fn run_generation(
         .args(arguments(
             operation,
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
-            start_ms,
+            // Logical time is file time offset by the interval's start.
+            seek_ms + pin.clip.map_or(0, |clip| clip.start_ms),
+            pin.clip.map(|clip| clip.end_ms),
             audio,
+            pinned_burn(&pin),
+            part_inputs.as_deref().zip(session.canvas),
+            pin.max_bitrate_bps
+                .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
+            pin.adaptive,
             &directory,
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
-    // fd 3: the validated source; fd 4: the execution witness.
+    // fd 3: the validated source; fd 4: the execution witness; fd 5 onward:
+    // the validated later parts of a multipart timeline.
     #[cfg(unix)]
-    execution::inherit(&mut supervisor, &[&input, &held.0]);
+    {
+        let mut inherited = vec![&input, &held.0];
+        inherited.extend(later.iter());
+        execution::inherit(&mut supervisor, &inherited);
+    }
     if stop.is_cancelled() {
         return stopped(&app, &session);
     }
@@ -1308,6 +1734,10 @@ async fn run_generation(
         });
     }
     let mut reported = 0u32;
+    // (bytes, duration) of recently published segments, for peak windows.
+    let mut recent: Vec<(u64, u64)> = Vec::new();
+    // An adaptive generation's low variant, verified before each publication.
+    let mut low = pin.adaptive.then(LowVariant::default);
     let mut video = None;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     // Liveness, decided by the core deadline policy. Its clock advances only
@@ -1374,6 +1804,9 @@ async fn run_generation(
                             start_ms,
                             operation,
                             copy_start,
+                            pin.max_bitrate_bps,
+                            &mut recent,
+                            low.as_mut(),
                         ),
                     ) => observed,
                 };
@@ -1419,6 +1852,9 @@ async fn run_generation(
                     start_ms,
                     operation,
                     copy_start,
+                    pin.max_bitrate_bps,
+                    &mut recent,
+                    low.as_mut(),
                 ),
             )
             .await;
@@ -1478,13 +1914,23 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
             return;
         }
     }
-    let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
-        .bind(&session.file_id)
-        .fetch_optional(&app.db)
-        .await;
-    if let Ok(current) = current
-        && current.as_deref() != Some(session.revision.as_str())
+    // Every part of the delivered timeline must still be its pinned revision.
+    let mut changed = false;
+    for (file, revision) in std::iter::once((&session.file_id, &session.revision))
+        .chain(session.part_files.iter().map(|(f, r)| (f, r)))
     {
+        let current: Result<Option<String>, _> = sqlx::query_scalar("SELECT revision FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+            .bind(file)
+            .fetch_optional(&app.db)
+            .await;
+        if let Ok(current) = current
+            && current.as_deref() != Some(revision.as_str())
+        {
+            changed = true;
+            break;
+        }
+    }
+    if changed {
         let generations: Vec<u64> = {
             let inner = session.inner.lock().unwrap();
             [inner.delivery.pending, inner.delivery.active]
@@ -1926,10 +2372,17 @@ pub async fn recover(app: &App) -> anyhow::Result<()> {
             continue;
         };
         keep.push(delivery.clone());
+        // An adaptive generation's encoder holds both units; its low variant
+        // directory is created (only for it) before the witness.
+        let units = if generation.join(LOW_VARIANT).is_dir() {
+            2
+        } else {
+            1
+        };
         app.processing.execution.recovered(
             format!("recovered:{}", path.display()),
             Class::Interactive,
-            1,
+            units,
             witness,
             move || {
                 let _ = std::fs::remove_dir_all(generation);
@@ -2041,6 +2494,14 @@ pub struct GenerationView {
     pub subtitle_track: Option<u32>,
     /// WebVTT sidecar for the selected text subtitle, in timeline time.
     pub subtitles_url: Option<String>,
+    /// The peak bitrate a capped conversion keeps to (v2 manifests only).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub max_bitrate_bps: Option<u64>,
+    /// An adaptive conversion with a low variant (v2 manifests only).
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub adaptive: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -2100,7 +2561,7 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                     }
                 }),
                 subtitle_track: pinned_subtitle(&g.pin),
-                subtitles_url: (pinned_subtitle(&g.pin).is_some()
+                subtitles_url: (pins_subtitle(&g.pin)
                     && d.serves(n, app.processing.deliveries.now_ms()))
                 .then(|| format!("/api/v1/streams/{id}/{n}/subtitles.vtt")),
                 audio_track: g
@@ -2108,6 +2569,8 @@ fn view_of(app: &App, id: &str, file_id: &str, file_revision: &str, d: &Delivery
                     .tracks
                     .iter()
                     .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok())),
+                max_bitrate_bps: g.pin.max_bitrate_bps,
+                adaptive: g.pin.adaptive,
             })
     };
     DeliveryView {
@@ -2190,6 +2653,125 @@ fn pinned_subtitle(pin: &Pin) -> Option<u32> {
         .find_map(|t| t.strip_prefix("subtitle:").and_then(|i| i.parse().ok()))
 }
 
+const SIDECAR_TRACK: &str = "subtitle-sidecar:";
+const BURN_TRACK: &str = "subtitle-burn:";
+
+/// A bitmap subtitle stream burned into this generation's video.
+fn pinned_burn(pin: &Pin) -> Option<u32> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix(BURN_TRACK).and_then(|i| i.parse().ok()))
+}
+
+/// Pin a burned bitmap subtitle in place of an absent text one.
+fn with_burn(mut pin: Pin, burn: Option<u32>) -> Pin {
+    if let Some(index) = burn {
+        for track in &mut pin.tracks {
+            if track == "subtitle:none" {
+                *track = format!("{BURN_TRACK}{index}");
+            }
+        }
+    }
+    pin
+}
+
+/// A burned subtitle must be an embedded bitmap stream, and burn-in is a
+/// video transform: only a transcode can carry it.
+fn validate_burn(
+    file: &db::ItemRow,
+    burn: Option<u32>,
+    operation: Operation,
+) -> Result<(), ApiError> {
+    let Some(index) = burn else {
+        return Ok(());
+    };
+    let streams: Vec<db::Track> =
+        serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
+    let codec = streams
+        .iter()
+        .filter(|t| t.kind == "subtitle")
+        .nth(index as usize)
+        .map(|t| t.codec.as_str())
+        .ok_or_else(|| ApiError::bad("Unknown subtitle track"))?;
+    if operation == Operation::VideoTranscode && core::burnable_subtitle(codec) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "Only bitmap subtitles are burned, and only into a transcode",
+        ))
+    }
+}
+
+/// A pinned plain-text sidecar: (fingerprint, file name).
+fn pinned_sidecar(pin: &Pin) -> Option<(&str, &str)> {
+    pin.tracks
+        .iter()
+        .find_map(|t| t.strip_prefix(SIDECAR_TRACK)?.split_once('/'))
+}
+
+/// Whether a generation delivers a selected subtitle (embedded or sidecar).
+fn pins_subtitle(pin: &Pin) -> bool {
+    pinned_subtitle(pin).is_some() || pinned_sidecar(pin).is_some()
+}
+
+/// Pin a sidecar subtitle in place of an absent embedded one. The pin names
+/// the sidecar's scanned fingerprint, so a changed file is never served.
+fn with_sidecar(mut pin: Pin, sidecar: Option<&Sidecar>) -> Pin {
+    if let Some(sidecar) = sidecar {
+        for track in &mut pin.tracks {
+            if track == "subtitle:none" {
+                *track = format!("{SIDECAR_TRACK}{}/{}", sidecar.fingerprint, sidecar.name);
+            }
+        }
+    }
+    pin
+}
+
+/// A selected plain-text sidecar subtitle of the delivered file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Sidecar {
+    pub name: String,
+    pub fingerprint: String,
+}
+
+/// The sidecar must still be the scanned, recognized plain-text sidecar of
+/// this file (same name and fingerprint). Checked inside the command's
+/// transaction; the file itself is revalidated when it is converted.
+async fn validate_sidecar(
+    conn: &mut sqlx::SqliteConnection,
+    file: &str,
+    sidecar: Option<&Sidecar>,
+) -> Result<(), ApiError> {
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+    if sidecar.name.contains('/') || sidecar.fingerprint.contains('/') {
+        return Err(ApiError::bad("Invalid sidecar subtitle"));
+    }
+    let format: Option<String> = sqlx::query_scalar(
+        "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=? AND fingerprint=?",
+    )
+    .bind(file)
+    .bind(&sidecar.name)
+    .bind(&sidecar.fingerprint)
+    .fetch_optional(conn)
+    .await?;
+    match format.as_deref() {
+        Some("srt" | "vtt") => Ok(()),
+        Some(_) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "Only plain-text (SRT, WebVTT) sidecars are delivered",
+        )),
+        None => Err(ApiError::conflict(
+            "source_revision_changed",
+            "The selected subtitle file changed; plan again",
+        )),
+    }
+}
+
 /// The selected subtitle stream must exist and be a text format (sidecar).
 fn validate_subtitle(file: &db::ItemRow, subtitle: Option<u32>) -> Result<(), ApiError> {
     let Some(index) = subtitle else {
@@ -2233,6 +2815,10 @@ fn pin(
         tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: Some(recipe.into()),
+        clip: None,
+        parts: vec![],
+        max_bitrate_bps: None,
+        adaptive: false,
     }
 }
 
@@ -2244,6 +2830,92 @@ pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool 
             .duration_seconds
             .is_some_and(|d| d.is_finite() && d > 0.0)
         && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
+}
+
+/// What a plan observes about live hardware encoding here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardwareState {
+    /// Not enabled (`experimental_live_hardware`), or no session can be opened.
+    Unavailable,
+    /// No interactive hardware session is admissible now.
+    Busy,
+    Available,
+}
+
+/// Observe live hardware encoding: the server setting, the cached VideoToolbox
+/// probe and current interactive hardware capacity.
+pub(crate) async fn hardware_live(app: &App) -> HardwareState {
+    if !app.processing.settings.experimental_live_hardware
+        || !crate::processing::videotoolbox_available(app).await
+    {
+        HardwareState::Unavailable
+    } else if app.processing.hardware.fits_now(Class::Interactive, 1) {
+        HardwareState::Available
+    } else {
+        HardwareState::Busy
+    }
+}
+
+/// The stream-copy operation a plan may consider for `file` with this audio
+/// stream, before its bitstream details are observed: copy routes enabled here,
+/// the live-route preconditions of `live_transcodable`, and the core's stream
+/// facts (`copy_operation`).
+pub(crate) fn copy_candidate(
+    app: &App,
+    file: &db::ItemRow,
+    audio: Option<u32>,
+) -> Option<Operation> {
+    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio) {
+        return None;
+    }
+    with_streams(file, audio, None, core::copy_operation)
+        .ok()
+        .flatten()
+}
+
+/// Observe a source's bitstream details for a plan or replan. The probe holds
+/// an admission slot, so it is bounded together with admissions, and runs in an
+/// owned task: a cancelled request never leaves it without its deadline,
+/// kill and reap.
+pub(crate) async fn observe_copy_details(
+    app: &App,
+    file_id: &str,
+) -> Result<CopyDetails, ApiError> {
+    let slot = app
+        .processing
+        .deliveries
+        .admission_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admission_busy",
+                "Too many pending delivery admissions",
+            )
+        })?;
+    let app = app.clone();
+    let file_id = file_id.to_owned();
+    tokio::spawn(async move {
+        let _slot = slot;
+        probe_copy_details(&app, &file_id).await
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+/// Whether the core live-route rule admits this copy with observed details.
+pub(crate) fn copy_supported(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    operation: Operation,
+    details: &CopyDetails,
+) -> bool {
+    copies_video(operation)
+        && with_streams(file, audio, Some(details), |s| {
+            core::live_route_supported(operation, s)
+        })
+        .unwrap_or(false)
 }
 
 /// A stored representation (original or prepared rendition) served by byte
@@ -2261,6 +2933,10 @@ fn byte_pin(
         tracks: tracks(audio, subtitle),
         operation,
         recipe_digest: None,
+        clip: None,
+        parts: vec![],
+        max_bitrate_bps: None,
+        adaptive: false,
     }
 }
 
@@ -2295,21 +2971,14 @@ fn pinned_audio(pin: &Pin) -> Option<u32> {
         .find_map(|t| t.strip_prefix("audio:").and_then(|i| i.parse().ok()))
 }
 
-/// Check the exact selected streams against the core's live route rule.
-fn validate_route(
+/// The selected streams of `file` as the core live-route rule reads them.
+/// Details apply only when they were observed from this file revision.
+fn with_streams<R>(
     file: &db::ItemRow,
     audio: Option<u32>,
-    operation: Operation,
-    copy_enabled: bool,
     details: Option<&CopyDetails>,
-) -> Result<(), ApiError> {
-    if copies_video(operation) && !copy_enabled {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "route_unqualified",
-            "Live stream-copy routes are not enabled on this server",
-        ));
-    }
+    decide: impl FnOnce(&core::SourceStreams<'_>) -> R,
+) -> Result<R, ApiError> {
     let streams: Vec<db::Track> =
         serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
     let Some(video) = streams.iter().find(|t| t.kind == "video") else {
@@ -2328,7 +2997,7 @@ fn validate_route(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
     );
-    let source = core::SourceStreams {
+    Ok(decide(&core::SourceStreams {
         video: Some(video.codec.as_str()),
         audio: selected.map(|t| t.codec.as_str()),
         hdr,
@@ -2341,8 +3010,28 @@ fn validate_route(
         details: details
             .filter(|d| d.revision == file.revision)
             .map(CopyDetails::observed),
-    };
-    if core::live_route_supported(operation, &source) {
+    }))
+}
+
+/// Check the exact selected streams against the core's live route rule.
+fn validate_route(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    operation: Operation,
+    copy_enabled: bool,
+    details: Option<&CopyDetails>,
+) -> Result<(), ApiError> {
+    if copies_video(operation) && !copy_enabled {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unqualified",
+            "Live stream-copy routes are not enabled on this server",
+        ));
+    }
+    let (supported, hdr) = with_streams(file, audio, details, |s| {
+        (core::live_route_supported(operation, s), s.hdr)
+    })?;
+    if supported {
         return Ok(());
     }
     Err(if hdr {
@@ -2423,10 +3112,22 @@ pub(crate) struct Planned {
     pub route: Route,
     /// Where the requesting client connected from, for monitoring only.
     pub network: &'static str,
+    /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
+    pub sidecar: Option<Sidecar>,
+    /// An embedded bitmap subtitle burned into the converted video.
+    pub burn: Option<u32>,
+    /// The interval of the file the planned timeline is.
+    pub clip: Option<playscale_core::parts::Clip>,
+    /// Every part of a multipart timeline, in order; empty for one file.
+    pub parts: Vec<playscale_core::parts::PartPin>,
+    /// The peak bitrate a conversion is capped at.
+    pub max_bitrate_bps: Option<u64>,
+    /// An adaptive ladder (`playback_session::adaptive`).
+    pub adaptive: bool,
 }
 
-/// Admit a planned (v2) delivery. Original routes need no encoder; transcodes
-/// use the same live admission as v1. Receipts are scoped to the principal.
+/// Admit a planned (v2) delivery. Byte routes need no encoder; live routes
+/// (stream copy or transcode) use the same live admission as v1. Receipts are scoped to the principal.
 pub(crate) async fn admit_planned(
     app: App,
     authority: Arc<dyn AdmissionAuthority>,
@@ -2586,6 +3287,15 @@ pub(crate) struct Selection {
     pub route: Route,
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
+    pub sidecar: Option<Sidecar>,
+    pub burn: Option<u32>,
+    pub clip: Option<playscale_core::parts::Clip>,
+    pub parts: Vec<playscale_core::parts::PartPin>,
+    pub max_bitrate_bps: Option<u64>,
+    pub adaptive: bool,
+    /// Bitstream details observed for a stream-copy route before the command's
+    /// write transaction; None for other routes.
+    pub copy_details: Option<CopyDetails>,
 }
 
 /// Stage a seek (`selection` None keeps the newest pin) or a planned replan.
@@ -2639,7 +3349,29 @@ pub(crate) async fn change_live(
                     )
                 }
                 Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
-                Route::Transcode => {
+                Route::Remux | Route::AudioConvert => {
+                    let operation = selection.route.operation();
+                    validate_route(
+                        &file,
+                        selection.audio,
+                        operation,
+                        app.processing.settings.experimental_copy_routes,
+                        selection.copy_details.as_ref(),
+                    )?;
+                    validate_subtitle(&file, selection.subtitle)?;
+                    pin(&file, selection.audio, selection.subtitle, operation, false)
+                }
+                Route::Transcode | Route::HardwareTranscode => {
+                    let hardware = selection.route == Route::HardwareTranscode;
+                    // Inside the command's write transaction: only the cached
+                    // probe result counts (the v2 command warms it first), so
+                    // an encoder probe never runs while holding the writer.
+                    if hardware
+                        && !(app.processing.settings.experimental_live_hardware
+                            && app.processing.videotoolbox.get() == Some(&true))
+                    {
+                        return Err(backend_unavailable());
+                    }
                     validate_route(
                         &file,
                         selection.audio,
@@ -2653,20 +3385,103 @@ pub(crate) async fn change_live(
                         selection.audio,
                         selection.subtitle,
                         Operation::VideoTranscode,
-                        false,
+                        hardware,
                     )
                 }
             };
+            validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
+            validate_burn(&file, selection.burn, pin.operation)?;
+            // The timeline's interval and part layout are fixed for the
+            // delivery; the selected audio in each part may change.
+            if selection.clip != basis.clip
+                || !playscale_core::parts::same_layout(&selection.parts, &basis.parts)
+            {
+                return Err(ApiError::conflict(
+                    "timeline_changed",
+                    "The timeline's interval changed; create a new delivery",
+                ));
+            }
+            if (selection.clip.is_some() || !selection.parts.is_empty())
+                && pin.operation != Operation::VideoTranscode
+            {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "An interval of a file is delivered only by a conversion",
+                ));
+            }
+            if selection.max_bitrate_bps.is_some_and(|b| {
+                pin.operation != Operation::VideoTranscode
+                    || playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS).is_none()
+            }) {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "A bitrate cap is kept only by a conversion with room for its video",
+                ));
+            }
+            if selection.adaptive
+                && (!app.processing.settings.experimental_adaptive_bitrate
+                    || pin.operation != Operation::VideoTranscode
+                    || pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE)
+                    || selection.burn.is_some()
+                    || !selection.parts.is_empty()
+                    || selection.max_bitrate_bps.is_some())
+            {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "route_unsupported",
+                    "An adaptive ladder is a software conversion of one file",
+                ));
+            }
+            let pin = Pin {
+                clip: selection.clip,
+                parts: selection.parts,
+                max_bitrate_bps: selection.max_bitrate_bps.or(selection
+                    .adaptive
+                    .then_some(playscale_core::playback_session::ADAPTIVE_MAIN_BPS)),
+                adaptive: selection.adaptive,
+                ..with_burn(
+                    with_sidecar(pin, selection.sidecar.as_ref()),
+                    selection.burn,
+                )
+            };
             (Some(basis), Some((timeline, pin)))
+        }
+    };
+    // The staged generation runs this pin: the replan's, or for a seek the
+    // newest generation's, copied unchanged.
+    let (staged_hardware, staged_units) = match &replan {
+        Some((_, pin)) => (
+            pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+            if pin.adaptive { 2 } else { 1 },
+        ),
+        None => {
+            let inner = session.inner.lock().unwrap();
+            let d = &inner.delivery;
+            d.pending
+                .or(d.active)
+                .and_then(|n| d.generations.get(&n))
+                .map_or((false, 1), |g| {
+                    (
+                        g.pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
+                        if g.pin.adaptive { 2 } else { 1 },
+                    )
+                })
         }
     };
     let input = Input::Change {
         expected_generation,
         position_ms,
         replan,
-        // A byte route has no worker; a software transcode overlaps when
-        // another interactive worker is admissible now.
-        overlap: app.processing.execution.fits_now(Class::Interactive, 1),
+        // A byte route has no worker; a live route overlaps when another
+        // interactive worker (and, for a hardware encode, another hardware
+        // session) is admissible now.
+        overlap: app
+            .processing
+            .execution
+            .fits_now(Class::Interactive, staged_units)
+            && (!staged_hardware || app.processing.hardware.fits_now(Class::Interactive, 1)),
         now_ms: app.processing.deliveries.now_ms(),
     };
     // The receipt is checked again and recorded under the same lock as the
@@ -2843,7 +3658,12 @@ async fn admit_owned(
     // before taking the admission lock or the database writer.
     // A probe failure is reported only for a new admission: an exact retry of an
     // acknowledged one replays its receipt below.
-    let copy_probe = match r.operation.map(LiveOperation::operation) {
+    // A planned (v2) admission runs exactly its signed route.
+    let requested = match &planned {
+        Some(p) => Some(p.route.operation()),
+        None => r.operation.map(LiveOperation::operation),
+    };
+    let copy_probe = match requested {
         Some(operation)
             if !original
                 && copies_video(operation)
@@ -2853,9 +3673,21 @@ async fn admit_owned(
         }
         _ => None,
     };
-    // Probed once per process; outside the admission lock and the writer.
-    let hardware_ready = r.backend != Some(crate::processing::Backend::Videotoolbox)
-        || crate::processing::videotoolbox_available(app).await;
+    // A planned (v2) admission uses exactly its signed route's backend.
+    let backend = match &planned {
+        Some(p) if p.route == Route::HardwareTranscode => crate::processing::Backend::Videotoolbox,
+        Some(_) => crate::processing::Backend::Software,
+        None => r
+            .backend
+            .clone()
+            .unwrap_or(crate::processing::Backend::Software),
+    };
+    // Probed once per process; outside the admission lock and the writer. A
+    // planned hardware admission also needs live hardware still enabled: a
+    // plan signed before a restart that disabled it cannot start an encoder.
+    let hardware_ready = backend != crate::processing::Backend::Videotoolbox
+        || ((planned.is_none() || app.processing.settings.experimental_live_hardware)
+            && crate::processing::videotoolbox_available(app).await);
     let _admission = runtime.admission.lock().await;
     let mut transaction = db::begin_write(&app.db).await?;
     let principal = authority.reauthorize(&mut transaction, &r).await?;
@@ -2872,7 +3704,32 @@ async fn admit_owned(
             Sha256::digest(
                 match &planned {
                     None => serde_json::to_vec(&r),
-                    Some(p) => serde_json::to_vec(&(&r, &p.owner, &p.version, p.route)),
+                    // A sidecar or burned subtitle, an interval, multipart parts
+                    // and a bitrate cap are part of the request too; digests
+                    // without any keep their earlier form, so recorded receipts
+                    // replay.
+                    Some(p)
+                        if p.sidecar.is_none()
+                            && p.burn.is_none()
+                            && p.clip.is_none()
+                            && p.parts.is_empty()
+                            && p.max_bitrate_bps.is_none()
+                            && !p.adaptive =>
+                    {
+                        serde_json::to_vec(&(&r, &p.owner, &p.version, p.route))
+                    }
+                    Some(p) => serde_json::to_vec(&(
+                        &r,
+                        &p.owner,
+                        &p.version,
+                        p.route,
+                        p.sidecar.as_ref().map(|s| (&s.name, &s.fingerprint)),
+                        p.burn,
+                        p.clip,
+                        &p.parts,
+                        p.max_bitrate_bps,
+                        p.adaptive,
+                    )),
                 }
                 .expect("serializable request")
             )
@@ -2939,23 +3796,12 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
-    let operation = if let Some(p) = planned.as_ref().filter(|_| original) {
-        p.route.operation()
-    } else {
-        r.operation
-            .unwrap_or(LiveOperation::VideoTranscode)
-            .operation()
-    };
+    let operation = requested.unwrap_or(Operation::VideoTranscode);
     let copy_details = copy_probe.transpose()?;
     if !hardware_ready {
         return Err(backend_unavailable());
     }
-    let hardware = validate_backend(
-        operation,
-        r.backend
-            .as_ref()
-            .unwrap_or(&crate::processing::Backend::Software),
-    )?;
+    let hardware = validate_backend(operation, &backend)?;
     if copy_details
         .as_ref()
         .is_some_and(|d| d.revision != file.revision)
@@ -2975,10 +3821,84 @@ async fn admit_owned(
         )?;
     }
     validate_subtitle(&file, r.subtitle_track)?;
-    let duration_ms = file
-        .duration_seconds
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (d * 1000.0) as u64);
+    let sidecar = planned.as_ref().and_then(|p| p.sidecar.as_ref());
+    validate_sidecar(&mut transaction, &file.id, sidecar).await?;
+    let burn = planned.as_ref().and_then(|p| p.burn);
+    validate_burn(&file, burn, operation)?;
+    // An interval is a clip of the file: only a conversion presents it, and
+    // the delivery's logical duration is the interval's.
+    let clip = planned.as_ref().and_then(|p| p.clip);
+    let parts = planned
+        .as_ref()
+        .map(|p| p.parts.clone())
+        .unwrap_or_default();
+    // An adaptive ladder is a software conversion of one file without a
+    // burned subtitle; its main rung is capped like a client cap.
+    let adaptive = planned.as_ref().is_some_and(|p| p.adaptive);
+    // A plan signed before a restart that disabled ladders cannot start one.
+    if adaptive
+        && (!app.processing.settings.experimental_adaptive_bitrate
+            || operation != Operation::VideoTranscode
+            || hardware
+            || !parts.is_empty()
+            || planned
+                .as_ref()
+                .is_some_and(|p| p.burn.is_some() || p.max_bitrate_bps.is_some()))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "An adaptive ladder is a software conversion of one file",
+        ));
+    }
+    // A cap is a conversion's encoder setting; it must be one that can hold.
+    let max_bitrate_bps = planned
+        .as_ref()
+        .and_then(|p| p.max_bitrate_bps)
+        .or(adaptive.then_some(playscale_core::playback_session::ADAPTIVE_MAIN_BPS));
+    if max_bitrate_bps.is_some_and(|b| {
+        operation != Operation::VideoTranscode
+            || playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS).is_none()
+    }) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "A bitrate cap is kept only by a conversion with room for its video",
+        ));
+    }
+    if (clip.is_some() || !parts.is_empty()) && operation != Operation::VideoTranscode {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "route_unsupported",
+            "An interval of a file is delivered only by a conversion",
+        ));
+    }
+    // Every later part must still be the pinned revision, available, in the
+    // first part's library (whose root its source is opened under).
+    let mut part_sources = Vec::new();
+    for part in parts.iter().skip(1) {
+        let row: Option<db::ItemRow> = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
+            .bind(&part.file)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        let Some(row) =
+            row.filter(|r| r.revision == part.revision && r.library_id == file.library_id)
+        else {
+            return Err(ApiError::conflict(
+                "source_revision_changed",
+                "A part of the timeline changed; plan again",
+            ));
+        };
+        part_sources.push((row.id, row.revision, row.relative_path, row.fingerprint));
+    }
+    let duration_ms = match clip {
+        _ if !parts.is_empty() => Some(parts.iter().map(|p| p.duration_ms).sum()),
+        Some(clip) => Some(clip.duration_ms()),
+        None => file
+            .duration_seconds
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map(|d| (d * 1000.0) as u64),
+    };
     if duration_ms.is_none() && !original {
         return Err(ApiError::bad("Live conversion requires a probed duration"));
     }
@@ -3000,10 +3920,22 @@ async fn admit_owned(
         planned
             .as_ref()
             .map_or_else(|| file.edition_id.clone(), |p| p.owner.timeline.clone()),
-        if original {
-            byte_pin(&file, r.audio_track, r.subtitle_track, operation)
-        } else {
-            pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+        Pin {
+            clip,
+            parts: parts.clone(),
+            max_bitrate_bps,
+            adaptive,
+            ..with_burn(
+                with_sidecar(
+                    if original {
+                        byte_pin(&file, r.audio_track, r.subtitle_track, operation)
+                    } else {
+                        pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+                    },
+                    sidecar,
+                ),
+                burn,
+            )
         },
         r.start_ms,
         duration_ms,
@@ -3015,6 +3947,41 @@ async fn admit_owned(
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
+        stream_rates: serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
+            .map(|tracks| {
+                (
+                    tracks
+                        .iter()
+                        .find(|t| t.kind == "video")
+                        .and_then(|t| t.bitrate),
+                    tracks
+                        .iter()
+                        .filter(|t| t.kind == "audio")
+                        .map(|t| t.bitrate)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default(),
+        canvas: (!parts.is_empty())
+            .then(|| {
+                let tracks: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+                let video = tracks.iter().find(|t| t.kind == "video")?;
+                Some((video.width? & !1, video.height? & !1))
+            })
+            .flatten(),
+        part_files: part_sources
+            .iter()
+            .map(|(id, revision, _, _)| (id.clone(), revision.clone()))
+            .collect(),
+        parts: part_sources
+            .into_iter()
+            .map(|(_, _, relative, fingerprint)| Source {
+                root: root.clone().into(),
+                relative: relative.into(),
+                root_identity: root_identity.clone(),
+                fingerprint,
+            })
+            .collect(),
         source: Source {
             root: root.into(),
             relative: file.relative_path.clone().into(),
@@ -3025,6 +3992,7 @@ async fn admit_owned(
             delivery: delivery.clone(),
             workers: HashMap::new(),
             changes: Default::default(),
+            copy_peaks: HashMap::new(),
         }),
         subtitles: tokio::sync::Mutex::new(()),
         telemetry: Arc::new({
@@ -3455,6 +4423,137 @@ async fn streamed(
     Ok((stream_headers(content_type), body).into_response())
 }
 
+/// The rate a stream-copy generation's manifest declares: the higher of the
+/// probed average rate of exactly the streams it outputs (the copied video,
+/// and the copied audio for remux or the converted 160 kb/s AAC for audio
+/// conversion) and the peak measured over its published HLS windows. A copy
+/// keeps the source's rate, which is not bounded in advance, so this is an
+/// estimate, not a guarantee.
+pub(crate) fn copied_rate(app: &App, id: &str, generation: &str) -> Option<u64> {
+    let generation = generation_number(generation).ok()?;
+    let session = app.processing.deliveries.session(id).ok()?;
+    let (measured, pin) = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.copy_peaks.get(&generation).copied().unwrap_or(0),
+            inner.delivery.generations.get(&generation)?.pin.clone(),
+        )
+    };
+    let (video, audios) = &session.stream_rates;
+    let audio = match (pin.operation, pinned_audio(&pin)) {
+        (_, None) => Some(0),
+        (Operation::AudioConvert, Some(_)) => {
+            Some(playscale_core::playback_session::LIVE_AUDIO_BPS)
+        }
+        (_, Some(index)) => audios.get(index as usize).copied().flatten(),
+    };
+    let probed = video.zip(audio).map(|(v, a)| v + a).unwrap_or(0);
+    Some(measured.max(probed))
+}
+
+/// The codecs of a served generation's output, from its own init segment
+/// (`fmp4::codecs`), with its video size when the track header gives one.
+/// None when the init segment is unreadable or describes a codec
+/// configuration that is not understood.
+pub(crate) async fn init_codecs(
+    app: &App,
+    id: &str,
+    generation: &str,
+    variant: Option<&str>,
+) -> Result<Option<(String, Option<(u32, u32)>)>, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        d.serves(generation, now) && d.generations[&generation].next_segment > 0
+    })
+    .await?;
+    let directory = session.directory(app, generation);
+    let path = variant
+        .map_or(directory.clone(), |v| directory.join(v))
+        .join("init.mp4");
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let _permit = permit;
+        let mut init = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(MAX_INIT_BYTES + 1)
+            .read_to_end(&mut init)
+            .ok()?;
+        (init.len() as u64 <= MAX_INIT_BYTES)
+            .then(|| crate::fmp4::codecs(&init))
+            .flatten()
+            .map(|codecs| (codecs, crate::fmp4::video_size(&init)))
+    })
+    .await
+    .map_err(ApiError::internal)
+}
+
+/// Whether a generation serves an adaptive low variant now.
+fn serves_low(d: &Delivery, generation: u64, now: u64) -> bool {
+    d.serves(generation, now) && d.generations[&generation].pin.adaptive
+}
+
+/// The low variant's media playlist: the same window as the main one (a
+/// segment is reported only once both variants have it).
+pub(crate) async fn low_playlist(
+    app: &App,
+    id: &str,
+    generation: &str,
+    segment_uri: impl Fn(u32) -> String,
+    init_uri: &str,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, _permit) = admit_stream(app, id, |d, now| serves_low(d, generation, now)).await?;
+    let text = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        if !serves_low(d, generation, app.processing.deliveries.now_ms()) {
+            return Err(ApiError::not_found());
+        }
+        core::media_playlist(&d.generations[&generation], segment_uri, init_uri)
+    };
+    Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
+}
+
+/// The low variant's init segment.
+pub(crate) async fn low_init(app: &App, id: &str, generation: &str) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        serves_low(d, generation, now) && d.generations[&generation].next_segment > 0
+    })
+    .await?;
+    file(
+        permit,
+        session
+            .directory(app, generation)
+            .join(LOW_VARIANT)
+            .join("init.mp4"),
+    )
+    .await
+}
+
+/// One low-variant media segment (fetchable exactly when the main one is).
+pub(crate) async fn low_segment(
+    app: &App,
+    id: &str,
+    generation: &str,
+    index: u32,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, permit) = admit_stream(app, id, |d, now| {
+        serves_low(d, generation, now) && d.fetchable(generation, index, now)
+    })
+    .await?;
+    file(
+        permit,
+        session
+            .directory(app, generation)
+            .join(LOW_VARIANT)
+            .join(format!("seg{index}.m4s")),
+    )
+    .await
+}
+
 pub async fn init(
     State(app): State<App>,
     Path((id, generation)): Path<(String, String)>,
@@ -3476,35 +4575,139 @@ pub async fn subtitles(
 ) -> Result<Response, ApiError> {
     let generation = generation_number(&generation)?;
     let pinned = |d: &Delivery, now| {
-        d.serves(generation, now) && pinned_subtitle(&d.generations[&generation].pin).is_some()
+        d.serves(generation, now) && pins_subtitle(&d.generations[&generation].pin)
     };
-    let session = app.processing.deliveries.session(&id)?;
-    let index = {
+    let path = converted_subtitles(&app, &id, generation).await?;
+    let (_, permit) = admit_stream(&app, &id, pinned).await?;
+    streamed(permit, path, "text/vtt; charset=utf-8").await
+}
+
+/// The generation's selected text subtitle converted (once per delivery) to
+/// WebVTT in source-file time, from the validated source or sidecar.
+async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<PathBuf, ApiError> {
+    let session = app.processing.deliveries.session(id)?;
+    let selected = {
         let inner = session.inner.lock().unwrap();
         let d = &inner.delivery;
-        if !pinned(d, app.processing.deliveries.now_ms()) {
+        if !(d.serves(generation, app.processing.deliveries.now_ms())
+            && pins_subtitle(&d.generations[&generation].pin))
+        {
             return Err(ApiError::not_found());
         }
-        pinned_subtitle(&d.generations[&generation].pin).ok_or_else(ApiError::not_found)?
+        let pin = &d.generations[&generation].pin;
+        match (pinned_subtitle(pin), pinned_sidecar(pin)) {
+            (Some(index), _) => SubtitleSource::Embedded(index),
+            (None, Some((fingerprint, name))) => SubtitleSource::Sidecar(Sidecar {
+                name: name.to_owned(),
+                fingerprint: fingerprint.to_owned(),
+            }),
+            (None, None) => return Err(ApiError::not_found()),
+        }
+    };
+    let file_name = match &selected {
+        SubtitleSource::Embedded(index) => format!("subtitles-{index}.vtt"),
+        SubtitleSource::Sidecar(sidecar) => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{}/{}", sidecar.fingerprint, sidecar.name));
+            format!("subtitles-sidecar-{:x}.vtt", digest)
+        }
     };
     let path = app
         .processing
         .deliveries
         .root
         .join(&session.id)
-        .join(format!("subtitles-{index}.vtt"));
+        .join(file_name);
     // Convert (once) before taking a transfer permit, in a task that owns the
     // converter even if this request is cancelled.
     tokio::spawn(ensure_subtitles(
         app.clone(),
         session.clone(),
-        index,
+        selected,
         path.clone(),
     ))
     .await
     .map_err(ApiError::internal)??;
-    let (_, permit) = admit_stream(&app, &id, pinned).await?;
-    streamed(permit, path, "text/vtt; charset=utf-8").await
+    Ok(path)
+}
+
+/// Whether a live generation publishes a text subtitle rendition.
+fn live_subtitles(d: &Delivery, generation: u64, now: u64) -> bool {
+    d.serves(generation, now) && {
+        let pin = &d.generations[&generation].pin;
+        pin.operation.segmented() && pins_subtitle(pin)
+    }
+}
+
+/// The subtitle rendition playlist of a live generation with a text subtitle
+/// (core `subtitle_playlist`): it mirrors the media playlist's window.
+pub(crate) async fn subtitle_playlist(
+    app: &App,
+    id: &str,
+    generation: &str,
+    segment_uri: impl Fn(u32) -> String,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let (session, _permit) =
+        admit_stream(app, id, |d, now| live_subtitles(d, generation, now)).await?;
+    let text = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        if !live_subtitles(d, generation, app.processing.deliveries.now_ms()) {
+            return Err(ApiError::not_found());
+        }
+        core::subtitle_playlist(&d.generations[&generation], segment_uri)
+    };
+    Ok((stream_headers("application/vnd.apple.mpegurl"), text).into_response())
+}
+
+/// One subtitle segment of a live generation: the cues overlapping its media
+/// segment (`core::segment_interval`), in the generation's media time (core
+/// `subtitles::webvtt_segment`). The converted WebVTT is in source-file
+/// time; media time is file time minus the interval start and the media time
+/// origin.
+pub(crate) async fn subtitle_segment(
+    app: &App,
+    id: &str,
+    generation: &str,
+    index: u32,
+) -> Result<Response, ApiError> {
+    let generation = generation_number(generation)?;
+    let fetchable = |d: &Delivery, now| {
+        live_subtitles(d, generation, now) && d.fetchable(generation, index, now)
+    };
+    let path = converted_subtitles(app, id, generation).await?;
+    let (session, permit) = admit_stream(app, id, fetchable).await?;
+    let window = {
+        let inner = session.inner.lock().unwrap();
+        let d = &inner.delivery;
+        d.generations.get(&generation).and_then(|g| {
+            let (start, duration) = core::segment_interval(g, index)?;
+            let origin = g.media_time_origin_ms;
+            let clip = g.pin.clip.map_or(0, |c| c.start_ms);
+            Some((start.saturating_sub(origin), duration, origin + clip))
+        })
+    };
+    let (from, duration, offset) = window.ok_or_else(ApiError::not_found)?;
+    let text = tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(path).ok()?;
+        let cues = playscale_core::subtitles::parse_webvtt(&text)?;
+        Some(playscale_core::subtitles::webvtt_segment(
+            &cues,
+            from,
+            from + duration,
+            offset,
+        ))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(subtitles_unavailable)?;
+    // The transfer permit is held until the body has been sent.
+    let body = axum::body::Body::from_stream(async_stream::stream! {
+        let _permit = permit;
+        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
+    });
+    Ok((stream_headers("text/vtt; charset=utf-8"), body).into_response())
 }
 
 /// Largest sidecar accepted from the converter.
@@ -3521,10 +4724,18 @@ fn subtitles_unavailable() -> ApiError {
 /// Produce the cached sidecar unless it exists. Waiters for the same delivery
 /// queue on its lock (no permits held); conversions share a small global slot
 /// pool; a converter that does not exit keeps both until it is reaped.
+/// What a generation's subtitle sidecar is converted from.
+enum SubtitleSource {
+    /// The n-th embedded subtitle stream of the delivered file.
+    Embedded(u32),
+    /// A plain-text sidecar next to the delivered file.
+    Sidecar(Sidecar),
+}
+
 async fn ensure_subtitles(
     app: App,
     session: Arc<Session>,
-    index: u32,
+    selected: SubtitleSource,
     path: PathBuf,
 ) -> Result<(), ApiError> {
     let _extraction = session.subtitles.lock().await;
@@ -3538,7 +4749,34 @@ async fn ensure_subtitles(
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
-    let source = session.source.clone();
+    // A sidecar is opened like the media file: under the same validated root,
+    // and only while its fingerprint is still the pinned one.
+    let (source, format, map) = match &selected {
+        SubtitleSource::Embedded(index) => (session.source.clone(), None, format!("0:s:{index}")),
+        SubtitleSource::Sidecar(sidecar) => {
+            let format = match sidecar
+                .name
+                .rsplit_once('.')
+                .map(|(_, e)| e.to_ascii_lowercase())
+            {
+                Some(e) if e == "srt" => "srt",
+                Some(e) if e == "vtt" => "webvtt",
+                _ => return Err(subtitles_unavailable()),
+            };
+            let source = Source {
+                relative: session
+                    .source
+                    .relative
+                    .parent()
+                    .unwrap_or(FsPath::new(""))
+                    .join(&sidecar.name),
+                fingerprint: sidecar.fingerprint.clone(),
+                ..session.source.clone()
+            };
+            (source, Some(format), "0:s:0".to_owned())
+        }
+    };
+    let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
         tokio::task::spawn_blocking(move || source_valid(&source)),
@@ -3548,24 +4786,25 @@ async fn ensure_subtitles(
     .map_err(ApiError::internal)?;
     let input = opened
         .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
-    let map = format!("0:s:{index}");
+    let mut args = vec!["-v", "error", "-nostdin"];
+    if let Some(format) = format {
+        args.extend(["-f", format]);
+    }
+    args.extend([
+        "-i",
+        "/dev/fd/3",
+        "-map",
+        &map,
+        "-c:s",
+        "webvtt",
+        "-f",
+        "webvtt",
+        "pipe:1",
+    ]);
     let converted = run_descriptor(
         &app.processing.settings.ffmpeg,
         &input,
-        &[
-            "-v",
-            "error",
-            "-nostdin",
-            "-i",
-            "/dev/fd/3",
-            "-map",
-            &map,
-            "-c:s",
-            "webvtt",
-            "-f",
-            "webvtt",
-            "pipe:1",
-        ],
+        &args,
         MAX_SUBTITLE_BYTES,
         Duration::from_secs(120),
     )
@@ -3580,6 +4819,26 @@ async fn ensure_subtitles(
             return Err(subtitles_unavailable());
         }
     };
+    // The converter read the descriptor after it was validated: an in-place
+    // edit in between would be published under the pinned fingerprint.
+    // Observe the descriptor again before publishing.
+    let unchanged = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            input
+                .metadata()
+                .is_ok_and(|m| scan::fingerprint(&m) == expected)
+        }),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?;
+    if !unchanged {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Create a new delivery",
+        ));
+    }
     // Publish into the existing delivery directory only: if cleanup removed it,
     // the delivery is gone and nothing is resurrected.
     let partial = path.with_extension("vtt.partial");
@@ -3764,6 +5023,10 @@ mod tests {
                 tracks: tracks(None, None),
                 operation: Operation::VideoTranscode,
                 recipe_digest: Some(RECIPE.into()),
+                clip: None,
+                parts: vec![],
+                max_bitrate_bps: None,
+                adaptive: false,
             },
             0,
             Some(60_000),
