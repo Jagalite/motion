@@ -5244,7 +5244,7 @@ async fn adaptive_conversions_publish_aligned_capped_variants() {
         eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
         return;
     }
-    let f = Fixture::with_settings(playscale::processing::Settings {
+    let mut f = Fixture::with_settings(playscale::processing::Settings {
         experimental_adaptive_bitrate: true,
         ..Default::default()
     })
@@ -5486,6 +5486,31 @@ async fn adaptive_conversions_publish_aligned_capped_variants() {
         String::from_utf8(get(format!("/api/v2/streams/{id}/1/master.m3u8")).await).unwrap();
     assert_eq!(master.matches("#EXT-X-STREAM-INF").count(), 1, "{master}");
     assert!(master.contains("BANDWIDTH=2000000,"), "{master}");
+    // A ladder plan signed before a restart that disabled ladders cannot
+    // start one.
+    let ladder = f
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            plan_input("default", &timeline, "convert", None, &["hls"]),
+        )
+        .await;
+    assert_eq!(ladder.status, StatusCode::OK, "{}", ladder.body);
+    f.restart_with(Default::default()).await;
+    let refused = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("adaptive-ladder-0003"),
+            json!({"plan_token": ladder.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    problem(
+        &refused,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "route_unsupported",
+    );
 }
 
 #[tokio::test]

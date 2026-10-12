@@ -3027,7 +3027,8 @@ pub(crate) async fn change_live(
                 ));
             }
             if selection.adaptive
-                && (pin.operation != Operation::VideoTranscode
+                && (!app.processing.settings.experimental_adaptive_bitrate
+                    || pin.operation != Operation::VideoTranscode
                     || pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE)
                     || selection.burn.is_some()
                     || !selection.parts.is_empty()
@@ -3440,8 +3441,10 @@ async fn admit_owned(
     // An adaptive ladder is a software conversion of one file without a
     // burned subtitle; its main rung is capped like a client cap.
     let adaptive = planned.as_ref().is_some_and(|p| p.adaptive);
+    // A plan signed before a restart that disabled ladders cannot start one.
     if adaptive
-        && (operation != Operation::VideoTranscode
+        && (!app.processing.settings.experimental_adaptive_bitrate
+            || operation != Operation::VideoTranscode
             || hardware
             || !parts.is_empty()
             || planned

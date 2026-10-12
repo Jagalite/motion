@@ -407,6 +407,21 @@ pub enum Subtitle {
     Bitmap(u32),
 }
 
+/// A plan's subtitle claim: the current form, or a bare stream number from
+/// a plan signed before subtitle kinds (an embedded text stream).
+fn subtitle_claim<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Subtitle>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Claim {
+        Legacy(u32),
+        Current(Subtitle),
+    }
+    Ok(Option::<Claim>::deserialize(d)?.map(|claim| match claim {
+        Claim::Legacy(stream) => Subtitle::Text(stream),
+        Claim::Current(subtitle) => subtitle,
+    }))
+}
+
 /// Whether a route presents a subtitle delivered this way. A burned subtitle
 /// is a video transform, so only a conversion. A text subtitle comes from the
 /// original's file: byte delivery of the original carries it as a WebVTT
@@ -439,7 +454,9 @@ pub struct Claims {
     pub route: Route,
     /// Zero-based audio stream among the source's audio streams; None omits audio.
     pub audio: Option<u32>,
-    /// The selected subtitle; None means no subtitle.
+    /// The selected subtitle; None means no subtitle. Plans signed before
+    /// subtitle kinds carry an embedded text stream as a bare number.
+    #[serde(deserialize_with = "subtitle_claim")]
     pub subtitle: Option<Subtitle>,
     /// The interval of the file the version binds, when it binds one. A
     /// changed interval is a changed binding.
@@ -1417,6 +1434,21 @@ mod tests {
             peak_bitrate(&[(450_000, 4_000), (400_000, 2_000)], 3_000, 9_000),
             850_000 * 8_000 / 6_000
         );
+    }
+
+    #[test]
+    fn claims_signed_before_subtitle_kinds_still_open() {
+        let current = Claims {
+            subtitle: Some(Subtitle::Text(3)),
+            ..claims()
+        };
+        let json = serde_json::to_string(&current).unwrap();
+        assert!(json.contains("\"subtitle\":{\"text\":3}"), "{json}");
+        let legacy = json.replace("\"subtitle\":{\"text\":3}", "\"subtitle\":3");
+        assert_eq!(serde_json::from_str::<Claims>(&legacy).unwrap(), current);
+        assert_eq!(serde_json::from_str::<Claims>(&json).unwrap(), current);
+        let none = serde_json::to_string(&claims()).unwrap();
+        assert_eq!(serde_json::from_str::<Claims>(&none).unwrap(), claims());
     }
 
     #[test]
