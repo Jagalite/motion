@@ -18815,6 +18815,9 @@
           "device_sequence": {
             "$ref": "#/components/schemas/Revision"
           },
+          "download_id": {
+            "$ref": "#/components/schemas/Id"
+          },
           "profile_id": {
             "$ref": "#/components/schemas/Id"
           },
@@ -18849,6 +18852,7 @@
         "required": [
           "event_id",
           "device_sequence",
+          "download_id",
           "profile_id",
           "timeline_id",
           "timeline_revision",

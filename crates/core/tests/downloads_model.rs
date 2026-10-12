@@ -88,6 +88,7 @@ fn wire(e: &offline::OfflineEvent) -> OfflineEvent {
     OfflineEvent {
         id: e.event_id.clone(),
         sequence: e.device_sequence.parse().unwrap(),
+        download_id: e.media.download_id.clone(),
         timeline_id: e.media.timeline_id.clone(),
         timeline_revision: e.media.timeline_revision.parse().unwrap(),
         base_viewing_revision: e.media.base_viewing_revision.parse().unwrap(),

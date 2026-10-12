@@ -12322,6 +12322,8 @@ components:
           $ref: '#/components/schemas/Id'
         device_sequence:
           $ref: '#/components/schemas/Revision'
+        download_id:
+          $ref: '#/components/schemas/Id'
         profile_id:
           $ref: '#/components/schemas/Id'
         timeline_id:
@@ -12346,6 +12348,7 @@ components:
       required:
       - event_id
       - device_sequence
+      - download_id
       - profile_id
       - timeline_id
       - timeline_revision

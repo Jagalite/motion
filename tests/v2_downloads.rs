@@ -567,7 +567,7 @@ fn event(
     status: &str,
 ) -> Value {
     // Curating the duration in `scanned` makes the timeline revision 2.
-    json!({"event_id":format!("offline-{sequence}"),"device_sequence":sequence.to_string(),"profile_id":"default",
+    json!({"event_id":format!("offline-{sequence}"),"device_sequence":sequence.to_string(),"download_id":"offline-download","profile_id":"default",
         "timeline_id":timeline,"timeline_revision":"2","base_viewing_revision":base.0,"base_manual_epoch":base.1,
         "position_ms":position_ms,"status":status,"device_time":format!("2026-10-11T10:00:0{}Z", sequence % 10)})
 }
@@ -874,14 +874,33 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
         )
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    let played = created.body["id"].as_str().unwrap().to_owned();
+    // A newer demand pins a different probed duration; the event's own
+    // download, not the newest one, decides.
+    sqlx::query("UPDATE media_files SET duration_seconds=120 WHERE id=?")
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let newer = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "download-key-0021",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(newer.status, StatusCode::ACCEPTED, "{:?}", newer.body);
     let (server, restore) = playscale::v2::system::server_identity(&f.app)
         .await
         .unwrap();
     let history = format!("{server}:{restore}");
     let mut beyond = event(1, &timeline, ("0", "0"), 500_000, "paused");
-    let mut completed = event(2, &timeline, ("0", "0"), 95_000, "stopped");
+    // Ended at 99.5 s: complete for the 100 s copy, too early for 120 s.
+    let mut completed = event(2, &timeline, ("0", "0"), 99_500, "ended");
     for e in [&mut beyond, &mut completed] {
         e["timeline_revision"] = json!(revision);
+        e["download_id"] = json!(played);
     }
     let reply = f
         .call(
@@ -894,7 +913,7 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
             ],
         )
         .await;
-    // Validated against the 100 s the download was authorized with.
+    // Validated against the 100 s the played download was authorized with.
     assert_eq!(
         outcomes(&reply),
         vec![
@@ -910,6 +929,6 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
         .await;
     assert_eq!(
         viewing.body["watched"], true,
-        "95% of the effective duration completes it"
+        "ending the played copy completes the timeline"
     );
 }

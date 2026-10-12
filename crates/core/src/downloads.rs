@@ -275,6 +275,9 @@ pub fn transferable(state: State) -> bool {
 pub struct OfflineEvent {
     pub id: String,
     pub sequence: u64,
+    /// The download whose copy was played; its pin supplies the effective
+    /// duration when the timeline has no curated one.
+    pub download_id: String,
     pub timeline_id: String,
     pub timeline_revision: u64,
     pub base_viewing_revision: u64,
@@ -587,6 +590,7 @@ mod tests {
         OfflineEvent {
             id: format!("e{sequence}"),
             sequence,
+            download_id: "d".into(),
             timeline_id: "t".into(),
             timeline_revision: 1,
             base_viewing_revision: 4,

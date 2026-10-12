@@ -196,6 +196,13 @@ in the round-5 commit:
 | S18 (P2) | A failed rebase aborted the pass before later profiles' cleanup | Fixed. Rebase failures are reported per profile and never stop removal elsewhere. |
 | S19 (P2) | For timelines without a curated duration, reconciliation dropped the probed duration that authorized the download, so completion and position checks were skipped | Fixed. The adapter supplies the effective duration: the timeline's, or else the one this device's download was pinned with. Covered by `tests/v2_downloads.rs::reconciliation_uses_the_downloads_effective_duration`. |
 
+**Round 6** (at `553d9c7`) raised one P2 finding and no P1. It is fixed in
+the round-6 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S20 (P2) | The duration fallback used the device's newest download for the timeline, not the copy that produced the event | Fixed. Every offline event carries its `download_id` (a contract addition to `OfflineEvent`). The adapter supplies that download's pinned duration, and only for the same device, profile and timeline, to the core decision. The core event and the model carry the field too. The server test now holds two demands with different durations and checks that the played one decides. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

@@ -58,7 +58,8 @@ export function currentRoot(base) {
 
 /** The wire form of one local offline event. */
 export function wireEvent(event) {
-  return {event_id: event.event_id, device_sequence: event.device_sequence, profile_id: event.scope.profile_id,
+  return {event_id: event.event_id, device_sequence: event.device_sequence, download_id: event.media.download_id,
+    profile_id: event.scope.profile_id,
     timeline_id: event.media.timeline_id, timeline_revision: event.media.timeline_revision,
     base_viewing_revision: event.media.base_viewing_revision, base_manual_epoch: event.media.base_manual_epoch,
     position_ms: event.position_ms, status: event.status, device_time: event.device_time ?? UNKNOWN_DEVICE_TIME};

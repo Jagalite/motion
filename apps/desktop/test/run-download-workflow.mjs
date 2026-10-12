@@ -166,7 +166,7 @@ try {
   assert.ok(log.events.every(e => e.media.viewing_epoch === log.events[0].media.viewing_epoch));
   const lost = await back.api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': log.events[0].media.viewing_epoch},
     body: {device_id: identity.device_id, events: log.events.map(e => ({
-    event_id: e.event_id, device_sequence: e.device_sequence, profile_id: 'default', timeline_id: e.media.timeline_id,
+    event_id: e.event_id, device_sequence: e.device_sequence, download_id: e.media.download_id, profile_id: 'default', timeline_id: e.media.timeline_id,
     timeline_revision: e.media.timeline_revision, base_viewing_revision: e.media.base_viewing_revision, base_manual_epoch: e.media.base_manual_epoch,
     position_ms: e.position_ms, status: e.status, device_time: e.device_time}))}});
   assert.deepEqual(lost.results.map(r => r.outcome), ['applied', 'applied']);
