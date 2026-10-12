@@ -14,7 +14,7 @@ use topcoat::{
     view::{View, view},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CachedDownload {
     pub identity: DownloadIdentity,
@@ -23,6 +23,10 @@ pub struct CachedDownload {
     pub sha256: String,
     pub size: u64,
     pub content_type: String,
+    /// The server's position when the download was last rebased, used to
+    /// resume offline once local events were acknowledged and compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_position_ms: Option<u64>,
 }
 
 pub trait OfflinePresentationReader: Send + Sync + 'static {

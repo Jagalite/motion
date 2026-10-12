@@ -6809,6 +6809,8 @@ paths:
           $ref: '#/components/responses/E413'
         '422':
           $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
         '429':
           $ref: '#/components/responses/E429'
         '500':
@@ -6817,6 +6819,7 @@ paths:
           $ref: '#/components/responses/E503'
       x-required-permission: viewing:write
       parameters:
+      - $ref: '#/components/parameters/ViewingEpoch'
       - $ref: '#/components/parameters/Csrf'
       requestBody:
         required: true
@@ -12463,6 +12466,11 @@ components:
           $ref: '#/components/schemas/Id'
         timeline_revision:
           $ref: '#/components/schemas/Revision'
+        title:
+          type: string
+          maxLength: 1024
+        duration_ms:
+          $ref: '#/components/schemas/Milliseconds'
         files:
           type: array
           items:
@@ -12472,13 +12480,26 @@ components:
           $ref: '#/components/schemas/Revision'
         manual_epoch:
           $ref: '#/components/schemas/Revision'
+        viewing_epoch:
+          type: string
+          minLength: 3
+          maxLength: 257
+          description: server_id:restore_epoch of the history viewing_revision and manual_epoch belong
+            to. Send it as X-Motion-Viewing-Epoch when synchronizing events based on this manifest.
       required:
       - download_id
       - timeline_id
       - timeline_revision
+      - title
+      - duration_ms
       - files
       - viewing_revision
       - manual_epoch
+      - viewing_epoch
+      description: Exact pinned files and the device's viewing base. Offline events carry viewing_revision
+        and manual_epoch as their base; read the manifest again after reconciling to rebase later events.
+        The supported slice is one complete original media file whose SHA-256 digest the device verifies
+        before publication.
     OfflineEvent:
       type: object
       additionalProperties: false
@@ -12487,6 +12508,8 @@ components:
           $ref: '#/components/schemas/Id'
         device_sequence:
           $ref: '#/components/schemas/Revision'
+        download_id:
+          $ref: '#/components/schemas/Id'
         profile_id:
           $ref: '#/components/schemas/Id'
         timeline_id:
@@ -12511,6 +12534,7 @@ components:
       required:
       - event_id
       - device_sequence
+      - download_id
       - profile_id
       - timeline_id
       - timeline_revision
@@ -12535,6 +12559,9 @@ components:
       - events
     OfflineEventResult:
       type: object
+      description: applied and history_only (with the reason code) and rejected events other than sequence_gap
+        and event_conflict consume their device sequence; duplicate reports an exact retry and its original
+        outcome in code. sequence_gap and event_conflict consume nothing.
       additionalProperties: false
       properties:
         event_id:

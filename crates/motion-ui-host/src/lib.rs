@@ -32,10 +32,13 @@ use std::{
 };
 use uuid::Uuid;
 
+pub mod store;
+
 const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
 const MAX_LOG: u64 = 8 * 1024 * 1024;
 const MAX_EVENTS: usize = 10_000;
-const MAX_MEDIA: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_MEDIA: u64 = playscale_core::downloads::MAX_MEDIA_BYTES;
+const MAX_DOWNLOADS: usize = 500;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,17 +48,161 @@ pub struct CacheManifest {
     pub downloads: Vec<CachedDownload>,
 }
 
+/// The durable event log: consecutive events after `base_sequence`, the
+/// highest sequence the server acknowledged and the device compacted. Logs
+/// written before compaction existed are a bare event array (base 0).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventLog {
+    #[serde(with = "decimal")]
+    pub base_sequence: u64,
+    pub events: Vec<OfflineEvent>,
+}
+
+mod decimal {
+    pub fn serialize<S: serde::Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(d)?;
+        playscale_core::offline::sequence(&text)
+            .or((text == "0").then_some(0))
+            .ok_or_else(|| serde::de::Error::custom("invalid base sequence"))
+    }
+}
+
+impl EventLog {
+    pub(crate) fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Log(EventLog),
+            Legacy(Vec<OfflineEvent>),
+        }
+        Ok(match serde_json::from_slice(bytes)? {
+            Stored::Log(log) => log,
+            Stored::Legacy(events) => EventLog {
+                base_sequence: 0,
+                events,
+            },
+        })
+    }
+    pub fn next_sequence(&self) -> Option<u64> {
+        offline::next_sequence(self.base_sequence, &self.events)
+    }
+    /// Retained history replays as appends against its own pinned media;
+    /// failures never silently rebase or renumber it.
+    pub(crate) fn validate(&self, scope: &CacheScope) -> anyhow::Result<()> {
+        for (index, event) in self.events.iter().enumerate() {
+            ensure!(
+                offline::admit(
+                    self.base_sequence,
+                    &self.events[..index],
+                    event,
+                    scope,
+                    &event.media,
+                    9_007_199_254_740_991,
+                    MAX_EVENTS
+                ) == Admission::Append,
+                "invalid cached event history"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_manifest(manifest: &CacheManifest) -> anyhow::Result<()> {
+    ensure!(
+        manifest.protocol == 1 && manifest.downloads.len() <= MAX_DOWNLOADS,
+        "unsupported or oversized cache manifest"
+    );
+    let scope = &manifest.scope;
+    ensure!(
+        [
+            &scope.server_id,
+            &scope.principal_id,
+            &scope.profile_id,
+            &scope.device_id
+        ]
+        .into_iter()
+        .all(|s| offline::identifier(s)),
+        "invalid cache scope"
+    );
+    let mut ids = HashSet::new();
+    for item in &manifest.downloads {
+        validate_download(item)?;
+        ensure!(
+            ids.insert(item.identity.download_id.clone()),
+            "duplicate download identity"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
+    let m = &item.identity;
+    ensure!(
+        offline::identifier(&m.download_id) && offline::identifier(&m.timeline_id),
+        "invalid download identity"
+    );
+    ensure!(
+        [
+            &m.timeline_revision,
+            &m.base_viewing_revision,
+            &m.base_manual_epoch
+        ]
+        .into_iter()
+        .all(|s| offline::sequence(s).is_some()),
+        "invalid causal revision"
+    );
+    ensure!(
+        m.viewing_epoch
+            .as_deref()
+            .is_none_or(offline::viewing_epoch),
+        "invalid server history identity"
+    );
+    ensure!(
+        !m.source_revision.is_empty() && m.source_revision.len() <= 256,
+        "invalid source revision"
+    );
+    ensure!(
+        item.title.len() <= 1024
+            && item.duration_ms > 0
+            && item.duration_ms <= 9_007_199_254_740_991,
+        "invalid download metadata"
+    );
+    ensure!(
+        item.sha256.len() == 64
+            && item
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid media digest"
+    );
+    ensure!(
+        item.size > 0
+            && item.size <= MAX_MEDIA
+            && playscale_core::downloads::SUPPORTED_CONTENT_TYPES
+                .contains(&item.content_type.as_str()),
+        "unsupported cache media"
+    );
+    Ok(())
+}
+
 pub struct Cache {
     directory: Dir,
     /// A readable handle to the same directory, used only to make renames
     /// durable. On Linux cap-std opens `directory` with O_PATH, and fsync on an
     /// O_PATH descriptor fails with EBADF.
     durable: std::fs::File,
+    /// Where playback snapshots are created: the cache's own volume, whose
+    /// free space the download admission reserved for them.
+    path: std::path::PathBuf,
     _lock: std::fs::File,
     manifest: CacheManifest,
-    history: Mutex<Vec<OfflineEvent>>,
+    history: Mutex<EventLog>,
 }
-fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
     ensure!(
         file.metadata()?.is_file() && file.metadata()?.len() <= limit,
         "cache document is too large or not a regular file"
@@ -98,92 +245,19 @@ impl Cache {
             .context("the offline cache is already open")?;
         let manifest: CacheManifest =
             serde_json::from_slice(&bounded(directory.open("manifest.json")?, MAX_MANIFEST)?)?;
-        ensure!(
-            manifest.protocol == 1 && manifest.downloads.len() <= 500,
-            "unsupported or oversized cache manifest"
-        );
-        let scope = &manifest.scope;
-        ensure!(
-            [
-                &scope.server_id,
-                &scope.principal_id,
-                &scope.profile_id,
-                &scope.device_id
-            ]
-            .into_iter()
-            .all(|s| offline::identifier(s)),
-            "invalid cache scope"
-        );
-        let mut ids = HashSet::new();
-        for item in &manifest.downloads {
-            let m = &item.identity;
-            ensure!(
-                offline::identifier(&m.download_id)
-                    && ids.insert(m.download_id.clone())
-                    && offline::identifier(&m.timeline_id),
-                "invalid or duplicate download identity"
-            );
-            ensure!(
-                [
-                    &m.timeline_revision,
-                    &m.base_viewing_revision,
-                    &m.base_manual_epoch
-                ]
-                .into_iter()
-                .all(|s| offline::sequence(s).is_some()),
-                "invalid causal revision"
-            );
-            ensure!(
-                !m.source_revision.is_empty() && m.source_revision.len() <= 256,
-                "invalid source revision"
-            );
-            ensure!(
-                item.title.len() <= 1024
-                    && item.duration_ms > 0
-                    && item.duration_ms <= 9_007_199_254_740_991,
-                "invalid download metadata"
-            );
-            ensure!(
-                item.sha256.len() == 64
-                    && item
-                        .sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-                "invalid media digest"
-            );
-            ensure!(
-                item.size > 0
-                    && item.size <= MAX_MEDIA
-                    && matches!(
-                        item.content_type.as_str(),
-                        "video/mp4" | "video/webm" | "audio/mp4" | "audio/mpeg" | "audio/ogg"
-                    ),
-                "unsupported cache media"
-            );
-        }
-        let history: Vec<OfflineEvent> = match directory.open("events.json") {
-            Ok(file) => serde_json::from_slice(&bounded(file, MAX_LOG)?)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        validate_manifest(&manifest)?;
+        let history = match directory.open("events.json") {
+            Ok(file) => EventLog::parse(&bounded(file, MAX_LOG)?)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EventLog::default(),
             Err(e) => return Err(e.into()),
         };
         // Old downloaded manifests may have been removed. Validate retained
         // history against its own pinned media, never rebase it onto new facts.
-        for (index, event) in history.iter().enumerate() {
-            ensure!(
-                offline::admit(
-                    &history[..index],
-                    event,
-                    scope,
-                    &event.media,
-                    9_007_199_254_740_991,
-                    MAX_EVENTS
-                ) == Admission::Append,
-                "invalid cached event history"
-            );
-        }
+        history.validate(&manifest.scope)?;
         Ok(Self {
             directory,
             durable,
+            path: path.to_owned(),
             _lock: lock,
             manifest,
             history: Mutex::new(history),
@@ -204,7 +278,8 @@ impl Cache {
             .lock()
             .map_err(|_| anyhow::anyhow!("event store failed"))?;
         match offline::admit(
-            &history,
+            history.base_sequence,
+            &history.events,
             &event,
             &self.manifest.scope,
             &item.identity,
@@ -213,41 +288,17 @@ impl Cache {
         ) {
             Admission::Append => {
                 let mut next = history.clone();
-                next.push(event.clone());
+                next.events.push(event.clone());
                 let bytes = serde_json::to_vec(&next)?;
                 ensure!(bytes.len() as u64 <= MAX_LOG, "event storage is full");
-                let name = format!("events-{}.tmp", Uuid::new_v4().simple());
-                let mut file = self.directory.open_with(
-                    &name,
-                    cap_std::fs::OpenOptions::new().write(true).create_new(true),
-                )?;
-                let published = (|| -> anyhow::Result<()> {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        file.set_permissions(cap_std::fs::Permissions::from_std(
-                            std::fs::Permissions::from_mode(0o600),
-                        ))?;
-                    }
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                    self.directory
-                        .rename(&name, &self.directory, "events.json")?;
-                    self.durable.sync_all()?;
-                    Ok(())
-                })();
-                if published.is_err() {
-                    // Only our newly created temporary file; never the prior log.
-                    let _ = self.directory.remove_file(&name);
-                }
-                published?;
+                replace_durably(&self.directory, &self.durable, "events.json", &bytes)?;
                 *history = next; // Publish in memory only after the durable rename.
             }
             Admission::Duplicate => {}
             other => anyhow::bail!("offline event rejected: {other:?}"),
         }
         Ok(
-            json!({"event_id":event.event_id,"device_sequence":event.device_sequence,"next_sequence":offline::next_sequence(&history).map(|n|n.to_string())}),
+            json!({"event_id":event.event_id,"device_sequence":event.device_sequence,"next_sequence":history.next_sequence().map(|n|n.to_string())}),
         )
     }
     fn snapshot(&self, id: &str) -> anyhow::Result<(CachedDownload, std::fs::File)> {
@@ -257,7 +308,7 @@ impl Cache {
             source.metadata()?.is_file() && source.metadata()?.len() == item.size,
             "download size changed"
         );
-        let mut copy = new_snapshot(item.size)?;
+        let mut copy = new_snapshot(&self.path, item.size)?;
         let mut hash = Sha256::new();
         let mut size = 0;
         let mut buffer = [0u8; 64 * 1024];
@@ -280,6 +331,40 @@ impl Cache {
         Ok((item, copy)) // Only the verified private snapshot is served, never the source path.
     }
 }
+/// Replace `name` with `bytes`: a private temporary file is written and
+/// fsynced, renamed over the target and the directory fsynced. A failure
+/// leaves the previous file intact and removes only the temporary file.
+pub(crate) fn replace_durably(
+    directory: &Dir,
+    durable: &std::fs::File,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let temporary = format!("{name}-{}.tmp", Uuid::new_v4().simple());
+    let mut file = directory.open_with(
+        &temporary,
+        cap_std::fs::OpenOptions::new().write(true).create_new(true),
+    )?;
+    let published = (|| -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(cap_std::fs::Permissions::from_std(
+                std::fs::Permissions::from_mode(0o600),
+            ))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        directory.rename(&temporary, directory, name)?;
+        durable.sync_all()?;
+        Ok(())
+    })();
+    if published.is_err() {
+        let _ = directory.remove_file(&temporary);
+    }
+    published
+}
+
 impl OfflinePresentationReader for Cache {
     fn scope(&self) -> &CacheScope {
         &self.manifest.scope
@@ -471,11 +556,14 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
     let history = host.cache.history.lock().unwrap();
+    // The newest local observation of this download (also across rebases),
+    // else the server position recorded at the last rebase.
     let position = history
+        .events
         .iter()
         .rev()
-        .find(|e| e.media == item.identity)
-        .map_or(0, |e| {
+        .find(|e| e.media.download_id == item.identity.download_id)
+        .map_or(item.resume_position_ms.unwrap_or(0), |e| {
             if e.status == "ended" {
                 0
             } else {
@@ -484,7 +572,7 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
         });
     let ticket = Uuid::new_v4().simple().to_string();
     let result = json!({"scope":host.cache.manifest.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
-        "next_sequence":offline::next_sequence(&history).map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
+        "next_sequence":history.next_sequence().map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
     *host.media.lock().unwrap() = Some(Media {
         ticket,
         item,
@@ -557,8 +645,8 @@ async fn media(
         .unwrap()
 }
 
-fn new_snapshot(size: u64) -> anyhow::Result<std::fs::File> {
-    let copy = tempfile::NamedTempFile::new()?;
+fn new_snapshot(directory: &Path, size: u64) -> anyhow::Result<std::fs::File> {
+    let copy = tempfile::NamedTempFile::new_in(directory)?;
     ensure!(
         size <= fs2::available_space(copy.path())?.saturating_sub(512 * 1024 * 1024),
         "insufficient space for verified playback snapshot"
@@ -604,7 +692,13 @@ mod snapshot_tests {
     use futures_util::TryStreamExt;
     #[tokio::test]
     async fn anonymous_snapshot_reclaims_on_exit_and_concurrent_ranges_keep_offsets() {
-        let mut file = new_snapshot(200_000).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = new_snapshot(dir.path(), 200_000).unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the snapshot is anonymous inside the cache directory"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;

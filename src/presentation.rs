@@ -788,6 +788,42 @@ impl UiQueryFacade for Queries {
                 .collect()
         })
     }
+    fn downloads<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>> {
+        Box::pin(async move {
+            let mut rows = Vec::new();
+            // Every record, not the first page; past the bound the page
+            // reports unavailable rather than a partial list. Cancelled
+            // records need no action and are not shown.
+            for v in self
+                .list_all("/downloads", 25)
+                .await?
+                .into_iter()
+                .filter(|v| v["state"] != "cancelled")
+            {
+                // Titles come from the same scoped catalog reads; a timeline
+                // no longer readable is shown without one.
+                let timeline = text(&v, "timeline_id");
+                let title = match self
+                    .read(&format!("/catalog/timelines/{}", segment(&timeline)))
+                    .await
+                {
+                    Ok(t) => self
+                        .read(&format!("/catalog/items/{}", segment(&text(&t, "item_id"))))
+                        .await
+                        .map(|i| text(&i, "title"))
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                rows.push(DownloadRow {
+                    id: text(&v, "id"),
+                    title,
+                    state: text(&v, "state"),
+                    size_bytes: text(&v, "size_bytes").parse().unwrap_or(0),
+                });
+            }
+            Ok(rows)
+        })
+    }
     fn diagnostics<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>> {
         Box::pin(async move {
             let d = self.read("/admin/diagnostics").await?;

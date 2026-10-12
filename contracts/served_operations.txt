@@ -15,6 +15,7 @@ createBrowserSession
 createCatalogItem
 createCollection
 createDelivery
+createDownload
 createEdition
 createLibrary
 createMatch
@@ -35,6 +36,7 @@ createViewingSession
 decideMatch
 deleteBrowserSession
 deleteCollection
+deleteDownload
 deleteLibrary
 deletePlaylist
 deleteProfile
@@ -54,6 +56,8 @@ getDeliverySubtitles
 getDevice
 getDevicePolicy
 getDiagnostics
+getDownload
+getDownloadManifest
 getHealth
 getHlsInit
 getHlsMaster
@@ -100,6 +104,7 @@ listCatalogItems
 listCollections
 listContinueWatching
 listDevices
+listDownloads
 listItemEditions
 listItemFiles
 listItemOrderGroups
@@ -146,4 +151,5 @@ searchCatalog
 selectArtwork
 setWatchedState
 subscribeEvents
+syncOffline
 uploadArtwork

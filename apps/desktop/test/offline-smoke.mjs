@@ -37,7 +37,7 @@ try{
  await window.webContents.executeJavaScript('window.motionHost.disconnect()');
  assert.ok(remote.isDestroyed());
  await assert.rejects(fetch(origin,{signal:AbortSignal.timeout(2000)}));checks.owned_helper_stopped=true;
- let events=JSON.parse(readFileSync(join(process.env.MOTION_CACHE_DIR,'events.json'),'utf8'));
+ let log=JSON.parse(readFileSync(join(process.env.MOTION_CACHE_DIR,'events.json'),'utf8'));let events=Array.isArray(log)?log:log.events;assert.equal(Array.isArray(log)?'0':log.base_sequence,'0');
  assert.ok(events.length>0);assert.ok(events.at(-1).position_ms>=7000);assert.equal(events.at(-1).media.base_manual_epoch,'2');assert.ok(events.every((e,i)=>e.device_sequence===String(i+1)));checks.durable_ordered_progress=true;
  await window.webContents.executeJavaScript('window.motionHost.openDownloads()');
  remote=webContents.getAllWebContents().find(w=>w!==window.webContents&&w.getURL().startsWith('http://127.0.0.1:'));

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -19,10 +19,162 @@ struct Args {
     lifetime_fd: i32,
 }
 
+/// One-shot cache writer used by the desktop download agent. Each command
+/// takes the cache's exclusive lock and prints one JSON result.
+#[derive(Parser)]
+#[command(name = "motion-ui-host cache")]
+struct CacheArgs {
+    #[arg(long)]
+    cache_dir: PathBuf,
+    /// The root's CacheScope as JSON; a root never changes scope.
+    #[arg(long)]
+    scope: String,
+    #[command(subcommand)]
+    command: CacheCommand,
+}
+
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Manifest, byte usage and the event log's next sequence.
+    Status,
+    /// Whether a transfer of `incoming` bytes fits the quota and headroom.
+    Admit {
+        #[arg(long)]
+        incoming: u64,
+        #[arg(long)]
+        quota: u64,
+        #[arg(long)]
+        headroom: u64,
+    },
+    /// Verify `staging/<download_id>.part` against the entry read from stdin
+    /// and publish it.
+    Publish,
+    /// Publish the entry read from stdin from a verified blob left by a
+    /// crashed publication, if one exists and nothing is staged.
+    Recover,
+    Remove {
+        #[arg(long)]
+        download_id: String,
+    },
+    /// Delete blobs no manifest entry references (crash leftovers whose
+    /// demand ended).
+    Collect,
+    Events,
+    /// Compact from a `syncOffline` response read from stdin; only the
+    /// leading events the server confirmed by identity are dropped.
+    Acknowledge,
+    Rebase {
+        #[arg(long)]
+        download_id: String,
+        #[arg(long)]
+        viewing_revision: String,
+        #[arg(long)]
+        manual_epoch: String,
+        #[arg(long)]
+        viewing_epoch: String,
+        #[arg(long)]
+        resume_position_ms: Option<u64>,
+    },
+}
+
+fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
+    use motion_ui_host::store::Store;
+    use serde_json::json;
+    let scope = serde_json::from_str(&args.scope)?;
+    let mut store = Store::open(&args.cache_dir, &scope)?;
+    Ok(match args.command {
+        CacheCommand::Status => {
+            let events = store.events()?;
+            json!({"manifest":store.manifest(),"staged":store.staged()?,"usage":store.usage()?.to_string(),
+                "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string())})
+        }
+        CacheCommand::Admit {
+            incoming,
+            quota,
+            headroom,
+        } => json!({"admitted": store.admits_transfer(incoming, quota, headroom)?}),
+        CacheCommand::Publish => {
+            let mut input = String::new();
+            std::io::stdin()
+                .take(64 * 1024)
+                .read_to_string(&mut input)?;
+            json!({"publication": store.publish(serde_json::from_str(&input)?)?})
+        }
+        CacheCommand::Recover => {
+            let mut input = String::new();
+            std::io::stdin()
+                .take(64 * 1024)
+                .read_to_string(&mut input)?;
+            json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
+        }
+        CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
+        CacheCommand::Collect => {
+            store.collect()?;
+            json!({"collected": true})
+        }
+        CacheCommand::Events => serde_json::to_value(store.events()?)?,
+        CacheCommand::Acknowledge => {
+            #[derive(serde::Deserialize)]
+            struct Result {
+                event_id: String,
+                outcome: String,
+                code: Option<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Response {
+                results: Vec<Result>,
+                next_device_sequence: String,
+            }
+            let mut input = String::new();
+            std::io::stdin()
+                .take(1024 * 1024)
+                .read_to_string(&mut input)?;
+            let response: Response = serde_json::from_str(&input)?;
+            let next = playscale_core::offline::sequence(&response.next_device_sequence)
+                .ok_or_else(|| anyhow::anyhow!("invalid next_device_sequence"))?;
+            let results: Vec<_> = response
+                .results
+                .into_iter()
+                .map(|r| playscale_core::offline::Acknowledgement {
+                    consumed: playscale_core::offline::consumed(&r.outcome, r.code.as_deref()),
+                    event_id: r.event_id,
+                })
+                .collect();
+            serde_json::to_value(store.acknowledge_results(&results, next)?)?
+        }
+        CacheCommand::Rebase {
+            download_id,
+            viewing_revision,
+            manual_epoch,
+            viewing_epoch,
+            resume_position_ms,
+        } => json!({"rebased": store.rebase(
+            &download_id,
+            &viewing_revision,
+            &manual_epoch,
+            &viewing_epoch,
+            resume_position_ms,
+        )?}),
+    })
+}
+
 #[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use std::os::fd::FromRawFd;
+    if std::env::args_os().nth(1).is_some_and(|a| a == "cache") {
+        let args = CacheArgs::parse_from(std::env::args_os().skip(1));
+        return match cache_command(args) {
+            Ok(value) => {
+                println!("{value}");
+                Ok(())
+            }
+            Err(error) => {
+                println!("{}", serde_json::json!({"error": error.to_string()}));
+                std::process::exit(1);
+            }
+        };
+    }
     let args = Args::parse();
     anyhow::ensure!(
         [args.bootstrap_fd, args.ready_fd, args.lifetime_fd]

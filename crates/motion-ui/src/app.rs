@@ -21,6 +21,7 @@ use topcoat::{
 use crate::{
     assets,
     facade::{Availability, Facade, ItemCard, UiError, UiPrincipal},
+    screens::download_form,
 };
 
 path_param!(library_id);
@@ -50,6 +51,7 @@ pub fn router(facade: Facade) -> Router {
         .page(crate::screens::diagnostics)
         .page(crate::screens::manage_item)
         .page(crate::screens::organize)
+        .page(crate::screens::downloads)
         .build()
 }
 
@@ -174,6 +176,7 @@ fn icon_path(name: &str) -> &'static str {
         "next" => "M5 5.5v13l9-6.5zM18 5.5v13",
         "back" => "M15 5l-7 7 7 7",
         "chevron" => "M9 5l7 7-7 7",
+        "download" => "M12 4v11M7 10l5 5 5-5M5 20h14",
         _ => "M12 12h.01",
     }
 }
@@ -245,6 +248,7 @@ fn manage_links(who: &UiPrincipal) -> Vec<ManageLink> {
             "Collections",
             "collections",
         ),
+        ("downloads:manage", "/downloads", "Downloads", "download"),
         ("system:admin", "/diagnostics", "Diagnostics", "diagnostics"),
     ]
     .into_iter()
@@ -632,6 +636,9 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                         icon(name: "play")
                                         if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) { "Resume" } else { "Play" }
                                     </a>
+                                }
+                                if who.can("downloads:manage") {
+                                    download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone())
                                 }
                                 if let Some(viewing) = &timeline.viewing {
                                     if viewing.watched {

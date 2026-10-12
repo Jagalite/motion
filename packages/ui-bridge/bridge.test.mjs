@@ -254,3 +254,14 @@ test('a preview answered after the form was edited is discarded, not offered', a
   assert.equal(shown, 0, 'the stale plan is never rendered');
   assert.equal(status.textContent, 'The form changed while checking. Check again.');
 });
+
+test('desktop-only download actions are revealed only inside the desktop host', () => {
+  for (const [agent, revealed] of [['Mozilla/5.0 Chrome/140 MotionDesktop/1', true], ['Mozilla/5.0 Chrome/140', false]]) {
+    const action = {hidden: true};
+    runInNewContext(source, {
+      document: {querySelector: () => null, querySelectorAll: selector => selector === '[data-desktop-only]' ? [action] : [], addEventListener() {}},
+      navigator: {userAgent: agent}, crypto: webcrypto,
+    });
+    assert.equal(action.hidden, !revealed);
+  }
+});

@@ -417,6 +417,17 @@ pub struct JobRow {
     pub etag: String,
 }
 
+/// A server download demand of this device. Transfer progress is device-owned
+/// and shown by the desktop host, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRow {
+    pub id: String,
+    pub title: String,
+    /// ready | cancelled | expired
+    pub state: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagnosticsView {
     pub server_id: String,
@@ -469,6 +480,7 @@ pub trait UiQueryFacade: Send + Sync + 'static {
     ) -> BoxFuture<'a, UiResult<ItemManageView>>;
     /// The current profile's collections and playlists (`catalog:read`).
     fn organize<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<OrganizeView>>;
+    fn downloads<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>>;
     /// Requires `system:admin`.
     fn diagnostics<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>>;
 }

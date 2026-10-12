@@ -7,13 +7,20 @@
 //   2. runs browser pairing from the sign-in page;
 //   3. switches the viewing profile among those the server rendered;
 //   4. lets "Back" links (a[data-back]) return through history, since an
-//      app installed to the home screen has no browser back button.
+//      app installed to the home screen has no browser back button;
+//   5. reveals [data-desktop-only] actions inside the Motion desktop host,
+//      which performs device downloads. This is presentation only; the
+//      server authorizes every download request.
 // Command forms may also preview a change plan and commit it only after the
 // user has seen its effects (form.plan), or upload one file as the raw body
 // (form[data-body="file"]).
 
 const csrf = () => document.querySelector('meta[name="motion-csrf"]')?.content ?? '';
 const newKey = () => crypto.randomUUID().replaceAll('-', '');
+
+if (/\bMotionDesktop\/\d+/.test(globalThis.navigator?.userAgent ?? '')) {
+  for (const element of document.querySelectorAll('[data-desktop-only]')) element.hidden = false;
+}
 
 // Move focus to an error panel so keyboard and screen-reader users notice it.
 const alert = document.querySelector('main > [role="alert"], main [role="alert"]');

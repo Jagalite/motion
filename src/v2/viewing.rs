@@ -125,7 +125,7 @@ pub(crate) async fn load_view(
     })
 }
 
-async fn store_view(
+pub(crate) async fn store_view(
     conn: &mut sqlx::SqliteConnection,
     profile: &str,
     timeline: &str,
@@ -265,7 +265,10 @@ async fn update_session(
 }
 
 /// Supersede the session that held the authority before (`core::supersede`).
-async fn supersede(conn: &mut sqlx::SqliteConnection, id: Option<&str>) -> Result<(), Problem> {
+pub(crate) async fn supersede(
+    conn: &mut sqlx::SqliteConnection,
+    id: Option<&str>,
+) -> Result<(), Problem> {
     let Some(id) = id else { return Ok(()) };
     let Some(old) = load_session(conn, id).await? else {
         return Ok(());
@@ -312,7 +315,7 @@ fn tagged(status: StatusCode, body: Value, revision: u64) -> Response {
 }
 
 /// Completion threshold from the profile's preferences (default 90 %).
-async fn completion_percent(
+pub(crate) async fn completion_percent(
     conn: &mut sqlx::SqliteConnection,
     profile: &str,
 ) -> Result<f64, Problem> {
@@ -368,7 +371,7 @@ pub struct WatchedInput {
 
 /// Required transport precondition, observed under the same reserved writer
 /// transaction as the history mutation and its idempotency receipt.
-async fn require_history_identity(
+pub(crate) async fn require_history_identity(
     conn: &mut SqliteConnection,
     headers: &HeaderMap,
 ) -> Result<(), Problem> {

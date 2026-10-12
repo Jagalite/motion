@@ -4,7 +4,8 @@
 //! file revision and purpose, never outlives the credential that requested
 //! it, and is re-validated against its issuing principal on every request
 //! (`access::admit_file_ticket`). Generation tickets additionally require the
-//! current owner and reducer serving state. Download resources remain unavailable.
+//! current owner and reducer serving state. Download tickets pin the exact file
+//! revision of a ready download of the caller's device and are revoked with it.
 use super::{
     Body, Problem, Scope,
     auth::{self, Caller, Purpose},
@@ -230,6 +231,16 @@ pub async fn create(
             },
             Some(format!("/api/v2/streams/{id}/{generation}/{endpoint}")),
         )
+    } else if let Some(download) = input.download_id.as_deref() {
+        let (file_id, file_revision) =
+            super::downloads::ticket_file(&mut tx, &principal, download).await?;
+        (
+            FileRef {
+                file_id,
+                file_revision,
+            },
+            None,
+        )
     } else {
         (input.file.ok_or_else(Problem::not_found)?, None)
     };
@@ -276,7 +287,7 @@ pub async fn create(
     let id = new_id();
     let nonce = auth::nonce();
     let token = ticket_token(&app, &nonce, delivery);
-    sqlx::query("INSERT INTO content_tickets(id,token_hash,principal_id,credential_hash,file_id,file_revision,purpose,expires_at) VALUES (?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO content_tickets(id,token_hash,principal_id,credential_hash,file_id,file_revision,purpose,expires_at,download_id) VALUES (?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(auth::token_hash(&token))
         .bind(&principal.id)
@@ -288,6 +299,7 @@ pub async fn create(
             _ => "playback",
         })
         .bind(expires_at)
+        .bind(&input.download_id)
         .execute(&mut *tx)
         .await?;
     // The acknowledgement is stored without the secret; replay re-derives it.
