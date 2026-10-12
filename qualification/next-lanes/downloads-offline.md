@@ -212,6 +212,14 @@ fixed in the round-7 commit:
 | S22 (P2) | Blobs orphaned by a crash whose demand then ended were never collected | Fixed. `cache collect` runs after every still-ready demand had its recovery or transfer; it is skipped when a transfer failed, so a recoverable blob is not discarded. Store and agent tests cover it. |
 | S23 (P2) | The Downloads page showed only the first 200 records | Fixed. It reads every page through the bounded `list_all` (unavailable past 5,000 rather than partial) and lists only actionable (non-cancelled) records. `tests/v2_downloads.rs::the_downloads_page_lists_every_actionable_record` renders 205 records through the real presentation. |
 
+**Round 8** (at `8edc6b1`) raised two P2 findings and no P1. Both are fixed
+in the round-8 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S24 (P2) | `Store::publish` and `Store::remove` collected every unreferenced blob, deleting another ready demand's recoverable leftover before its recovery ran | Fixed. They now release only the blob they themselves stopped referencing; global collection happens only through `cache collect` after recovery. `store.rs::crash_leftovers_are_recovered_or_collected` covers remove and publish leaving a pending blob, then recovery, then collection. |
+| S25 (P2) | Without `downloads:manage` at connect, the agent never started, even after a later grant | Fixed. Passes always run; a 403 from the download list withdraws local copies, and a later grant starts transfers on the next pass. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

@@ -107,10 +107,28 @@ fn crash_leftovers_are_recovered_or_collected() {
         store.publish(entry("d1", media)).unwrap(),
         Publication::Published
     );
-    // An orphan blob from an abandoned transfer is collected on the next write.
-    std::fs::write(root.join("blobs").join("0".repeat(64)), b"orphan").unwrap();
+    // An unreferenced blob may still belong to a ready demand that has not
+    // recovered yet: publication and removal leave it; only `collect`,
+    // run after recovery, deletes it.
+    let pending = b"recoverable later";
+    std::fs::write(
+        root.join("blobs").join(entry("d2", pending).sha256),
+        pending,
+    )
+    .unwrap();
     assert!(!store.remove("never-published").unwrap());
-    assert_eq!(blobs(&root), vec![entry("d1", media).sha256]);
+    stage(&root, "d3", b"another publication");
+    store.publish(entry("d3", b"another publication")).unwrap();
+    assert!(store.recover(entry("d2", pending)).unwrap());
+    std::fs::write(root.join("blobs").join("0".repeat(64)), b"orphan").unwrap();
+    store.collect().unwrap();
+    let mut expected = vec![
+        entry("d1", media).sha256,
+        entry("d2", pending).sha256,
+        entry("d3", b"another publication").sha256,
+    ];
+    expected.sort();
+    assert_eq!(blobs(&root), expected);
 }
 
 #[test]

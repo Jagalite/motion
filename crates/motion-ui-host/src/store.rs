@@ -263,6 +263,11 @@ impl Store {
             Err(e) => return Err(e.into()),
         }
         let mut next = self.manifest.clone();
+        let replaced = next
+            .downloads
+            .iter()
+            .find(|d| d.identity.download_id == id)
+            .map(|d| d.sha256.clone());
         next.downloads.retain(|d| d.identity.download_id != id);
         ensure!(
             next.downloads.len() < MAX_DOWNLOADS,
@@ -270,7 +275,11 @@ impl Store {
         );
         next.downloads.push(entry);
         self.write_manifest(next)?;
-        self.collect()?;
+        // Only bytes this publication superseded; other unreferenced blobs
+        // may still be recovered by their own ready demand (see `collect`).
+        if let Some(old) = replaced {
+            self.release(&old)?;
+        }
         Ok(Publication::Published)
     }
 
@@ -284,17 +293,41 @@ impl Store {
             Err(e) => return Err(e.into()),
         }
         let mut next = self.manifest.clone();
+        let blob = next
+            .downloads
+            .iter()
+            .find(|d| d.identity.download_id == download_id)
+            .map(|d| d.sha256.clone());
         next.downloads
             .retain(|d| d.identity.download_id != download_id);
         let removed = next.downloads.len() != self.manifest.downloads.len();
         if removed {
             self.write_manifest(next)?;
         }
-        self.collect()?;
+        if let Some(blob) = blob {
+            self.release(&blob)?;
+        }
         Ok(removed)
     }
 
-    /// Delete blobs no manifest entry references (crash leftovers and removals).
+    /// Delete one blob a write just stopped referencing, unless another
+    /// entry still shares it.
+    fn release(&self, sha256: &str) -> anyhow::Result<()> {
+        if self.manifest.downloads.iter().any(|d| d.sha256 == sha256) {
+            return Ok(());
+        }
+        match self.blobs.remove_file(sha256) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.blobs_sync.sync_all()?;
+        Ok(())
+    }
+
+    /// Delete every blob no manifest entry references. Run only after each
+    /// still-ready demand had its chance to `recover` a verified leftover;
+    /// publication and removal never collect globally.
     pub fn collect(&self) -> anyhow::Result<()> {
         for entry in self.blobs.entries()? {
             let name = entry?.file_name();
