@@ -842,3 +842,74 @@ async fn offline_sync_consumes_sequences_once_and_never_overwrites_newer_authori
         0
     );
 }
+
+#[tokio::test]
+async fn reconciliation_uses_the_downloads_effective_duration() {
+    let f = Fixture::new().await;
+    let (timeline, file, _) = f.scanned("film.mp4", b"probed only").await;
+    // An ordinary scanned timeline: no curated duration, only the file's probe.
+    sqlx::query("UPDATE timelines SET duration_ms=NULL WHERE id=?")
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_files SET duration_seconds=100 WHERE id=?")
+        .bind(&file)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let revision = f
+        .count(&format!(
+            "SELECT revision FROM timelines WHERE id='{timeline}'"
+        ))
+        .await
+        .to_string();
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "download-key-0020",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let history = format!("{server}:{restore}");
+    let mut beyond = event(1, &timeline, ("0", "0"), 500_000, "paused");
+    let mut completed = event(2, &timeline, ("0", "0"), 95_000, "stopped");
+    for e in [&mut beyond, &mut completed] {
+        e["timeline_revision"] = json!(revision);
+    }
+    let reply = f
+        .call(
+            "POST",
+            "/api/v2/offline/sync",
+            Some(json!({"device_id":device,"events":[beyond, completed]})),
+            &[
+                ("authorization", &auth),
+                ("x-motion-viewing-epoch", &history),
+            ],
+        )
+        .await;
+    // Validated against the 100 s the download was authorized with.
+    assert_eq!(
+        outcomes(&reply),
+        vec![
+            ("rejected".into(), json!("invalid_position")),
+            ("applied".into(), Value::Null)
+        ]
+    );
+    let viewing = f
+        .get(
+            &format!("/api/v2/profiles/default/timelines/{timeline}/viewing"),
+            &auth,
+        )
+        .await;
+    assert_eq!(
+        viewing.body["watched"], true,
+        "95% of the effective duration completes it"
+    );
+}

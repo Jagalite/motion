@@ -186,7 +186,15 @@ fixed in the round-4 commit:
 |---|---|---|
 | S15 (P2) | Roots kept from other servers or credentials were outside the quota | Fixed. Usage is summed over every managed root on the device, and removal is still limited to owned roots. Agent test covers it. |
 | S16 (P2) | A corrupt crash-leftover blob made `recover` fail on every pass | Fixed. `Store::recover` verifies first, discards invalid bytes no published entry references, and returns `false`, so the next transfer proceeds. The real-filesystem test now re-transfers and publishes afterwards. |
-| S17 (P2) | A requested version beyond the first 100 candidates, or eligible originals crowded out by unsupported ones, were refused | Fixed. The requested version is filtered in SQL before the bound, and whole single-part available originals sort first within a 500-row window. A server test covers an explicit version. A timeline with more than 500 versions, all ineligible ahead of an eligible one, is not possible under this ordering; a timeline with more than 500 unreadable eligible originals is not separately tested. |
+| S17 (P2) | A requested version beyond the first 100 candidates, or eligible originals crowded out by unsupported ones, were refused | Fixed. The requested version is filtered in SQL before the bound, and whole single-part available originals sort first within a 500-row window. A server test covers an explicit version. The ordering ranks by structure and availability only, so more than 500 structurally eligible originals that are unreadable or in unsupported containers could still hide a later eligible one. That case is untested and is left as a known bound. |
+
+**Round 5** (at `05b18fe`) raised two P2 findings and no P1. Both are fixed
+in the round-5 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S18 (P2) | A failed rebase aborted the pass before later profiles' cleanup | Fixed. Rebase failures are reported per profile and never stop removal elsewhere. |
+| S19 (P2) | For timelines without a curated duration, reconciliation dropped the probed duration that authorized the download, so completion and position checks were skipped | Fixed. The adapter supplies the effective duration: the timeline's, or else the one this device's download was pinned with. Covered by `tests/v2_downloads.rs::reconciliation_uses_the_downloads_effective_duration`. |
 
 ## 8. Deferred release checks
 

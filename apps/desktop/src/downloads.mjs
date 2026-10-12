@@ -294,7 +294,14 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         }
       }
       local = (await cache(target.path, target.scope, ['status'])).manifest;
-      if (reconciled) await rebase(target, local);
+      // Refreshing the base is best-effort; it never blocks other profiles.
+      if (reconciled) {
+        try { await rebase(target, local); }
+        catch (error) {
+          if (signal?.aborted) throw error;
+          status(`Offline resume points could not be refreshed yet (${error.code ?? error.status ?? error.message}).`);
+        }
+      }
       if (local.downloads.length > 0) current = target.name;
     }
     if (current) writeAtomically(join(base, 'current.json'), {root: current});

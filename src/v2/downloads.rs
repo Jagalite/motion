@@ -822,9 +822,15 @@ async fn prior(
         .collect()
 }
 
+/// The timeline as the event's download saw it. Without a curated timeline
+/// duration, the effective duration is the one this device's download of the
+/// timeline was authorized with (the probed duration of its pinned original),
+/// so completion and position checks match what was played.
 async fn target(
     conn: &mut SqliteConnection,
     principal: &Principal,
+    device: &str,
+    profile: &str,
     timeline: &str,
 ) -> Result<Option<Target>, Problem> {
     match readable_timeline(conn, principal, timeline).await {
@@ -835,8 +841,19 @@ async fn target(
     let (revision, duration): (i64, Option<i64>) =
         sqlx::query_as("SELECT revision,duration_ms FROM timelines WHERE id=?")
             .bind(timeline)
-            .fetch_one(conn)
+            .fetch_one(&mut *conn)
             .await?;
+    let duration = match duration.filter(|d| *d > 0) {
+        Some(d) => Some(d),
+        None => sqlx::query_scalar(
+            "SELECT duration_ms FROM downloads WHERE device_id=? AND profile_id=? AND timeline_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+        )
+        .bind(device)
+        .bind(profile)
+        .bind(timeline)
+        .fetch_optional(&mut *conn)
+        .await?,
+    };
     Ok(Some(Target {
         timeline_revision: revision as u64,
         duration_ms: duration.filter(|d| *d > 0).map(|d| d as u64),
@@ -920,7 +937,7 @@ pub async fn sync(
     let mut results = Vec::with_capacity(events.len());
     for event in &events {
         let prior = prior(&mut tx, &device, &profile, event).await?;
-        let target = target(&mut tx, &principal, &event.timeline_id).await?;
+        let target = target(&mut tx, &principal, &device, &profile, &event.timeline_id).await?;
         let view = viewing::load_view(&mut tx, &profile, &event.timeline_id).await?;
         let chain = lineage(&mut tx, &device, &profile, &event.timeline_id).await?;
         let decision = core::reconcile(
