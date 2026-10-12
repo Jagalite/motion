@@ -4070,9 +4070,22 @@ async fn admit_owned(
         return Err(error.into());
     }
     // No await between durable admission and registration/dispatch. The owned
-    // task survives a dropped HTTP waiter; shutdown serializes on admission.
+    // task survives a dropped HTTP waiter; shutdown serializes on admission,
+    // but only until its deadline: publication checks stopping under the map
+    // lock shutdown snapshots under, so a delivery is either published before
+    // that snapshot (and closed by it) or never published. An unpublished
+    // admission is fenced by startup recovery, like one a crash interrupted.
     {
         let mut sessions = runtime.sessions.lock().unwrap();
+        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(sessions);
+            let _ = std::fs::remove_dir(&directory);
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_stopping",
+                "Delivery admission is closed",
+            ));
+        }
         dispatch(app, &session, &mut session.inner.lock().unwrap(), effects);
         sessions.insert(session.id.clone(), session.clone());
     }
