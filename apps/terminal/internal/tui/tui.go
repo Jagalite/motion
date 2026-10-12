@@ -90,11 +90,14 @@ type Model struct {
 	// view; scrolling past the last element leaves it false.
 	reveal bool
 	// tsel and toff are the table selection and its first visible row.
-	tsel    int
-	toff    int
-	navSel  int
-	list    bool
-	helping bool
+	tsel int
+	toff int
+	// tselID is the selected row\'s identity; tvisible how many rows fit.
+	tselID   string
+	tvisible int
+	navSel   int
+	list     bool
+	helping  bool
 
 	search    textinput.Model
 	searchSeq int
@@ -118,6 +121,7 @@ type Model struct {
 	window  int
 	beat    int
 	anim    *springs
+	beatGen int
 	// opened is when the console started listening for change hints.
 	opened time.Time
 	// blurred is set while the terminal reports it does not have focus:
@@ -159,7 +163,7 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.reloadAll(), m.wait(), m.poll(), pollTick(), beatTick())
+	return tea.Batch(m.reloadAll(), m.wait(), m.poll(), pollTick(), beatTick(m.beatGen))
 }
 
 // wait receives the next stream message; it ends with the interface.
@@ -320,16 +324,20 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case pollMsg:
 		return tea.Batch(m.poll(), pollTick())
 	case beatMsg:
-		if m.blurred {
-			return nil // resumes on focus
+		if m.blurred || msg.gen != m.beatGen {
+			return nil // paused, or a superseded chain: it ends here
 		}
 		m.beat++
 		if m.working() {
-			return tea.Batch(beatTick(), m.spin())
+			return tea.Batch(beatTick(m.beatGen), m.spin())
 		}
-		return beatTick()
+		return beatTick(m.beatGen)
 	case animMsg:
-		if m.anim.step() && !m.blurred {
+		if m.blurred {
+			m.anim.running = false // resumes on focus
+			return nil
+		}
+		if m.anim.step() {
 			return animTick()
 		}
 	case tea.BlurMsg:
@@ -337,7 +345,12 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case tea.FocusMsg:
 		if m.blurred {
 			m.blurred = false
-			return tea.Batch(m.poll(), beatTick())
+			m.beatGen++
+			cmds := []tea.Cmd{m.poll(), beatTick(m.beatGen)}
+			if m.anim.resume() {
+				cmds = append(cmds, animTick())
+			}
+			return tea.Batch(cmds...)
 		}
 	case tea.MouseClickMsg:
 		return m.click(msg.Mouse())
@@ -512,7 +525,7 @@ func (m *Model) back() tea.Cmd {
 // screen or in history are cancelled; their replies would be ignored anyway.
 func (m *Model) show(r route, sel, offset int) tea.Cmd {
 	m.route, m.sel, m.offset, m.helping, m.reveal = r, sel, offset, false, true
-	m.tsel, m.toff = 0, 0
+	m.tsel, m.toff, m.tselID = 0, 0, ""
 	if r.page == pageActivity {
 		m.vp.GotoBottom()
 	} else {

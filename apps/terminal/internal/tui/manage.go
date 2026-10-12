@@ -263,7 +263,8 @@ func (m Model) detail() string {
 }
 
 func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
-	page := max(m.frame().body-4, 1)
+	page := max(m.tvisible, 1) // as many rows as are on screen
+	m.tselID = ""              // moving by keys: the index leads
 	switch {
 	case key.Matches(msg, keys.Up):
 		m.tsel--

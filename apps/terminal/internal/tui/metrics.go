@@ -44,6 +44,9 @@ type point struct {
 	// values beyond 2^53 still count every increment.
 	n     uint64
 	exact bool
+	// gap marks a discontinuity (a counter reset): graphs never carry a
+	// value across it.
+	gap bool
 }
 
 // history holds bounded time series. Server history replaces a series
@@ -186,12 +189,26 @@ func rate(s []point) []point {
 	for i := 1; i < len(s); i++ {
 		dt := s[i].t.Sub(s[i-1].t).Seconds()
 		dv, ok := delta(s[i-1], s[i])
-		if dt <= 0 || !ok {
+		if !ok {
+			out = append(out, point{t: s[i].t, gap: true}) // a restart
+			continue
+		}
+		if dt <= 0 {
 			continue
 		}
 		out = append(out, point{t: s[i].t, v: dv / dt})
 	}
 	return out
+}
+
+// lastValue is the newest real value, skipping restart markers.
+func lastValue(pts []point) float64 {
+	for i := len(pts) - 1; i >= 0; i-- {
+		if !pts[i].gap {
+			return pts[i].v
+		}
+	}
+	return 0
 }
 
 // values returns the series (rates for counters) within the window ending now.

@@ -1044,8 +1044,13 @@ func TestCounterRestartIsNotANegativeRate(t *testing.T) {
 	at := func(d time.Duration, n uint64) point { return point{t: now.Add(-d), v: float64(n), n: n, exact: true} }
 	s := []point{at(3*time.Second, 100), at(2*time.Second, 110), at(time.Second, 3), at(0, 5)}
 	r := rate(s)
-	if len(r) != 2 || r[0].v != 10 || r[1].v != 2 {
+	if len(r) != 3 || r[0].v != 10 || !r[1].gap || r[2].v != 2 || lastValue(r) != 2 {
 		t.Fatalf("%v", r)
+	}
+	// The graph does not carry the pre-restart rate across the restart.
+	rows := areaGraph(r, now, 30*time.Second, 30, 1, graphScale{top: 10}, rampCPU)
+	if strings.Count(ansi.Strip(rows[0]), "⣿") > 2 {
+		t.Fatalf("carried across the restart: %q", ansi.Strip(rows[0]))
 	}
 	h := newHistory()
 	h.series[mBusy] = s
@@ -1292,5 +1297,89 @@ func TestSidebarKeepsItsShapeWhileAResetReloads(t *testing.T) {
 	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
 	if m.cache.shape != nil {
 		t.Fatal("sign-out kept the principal's shape")
+	}
+}
+
+func TestSelectionFollowsTheJobWhenItsPhaseChanges(t *testing.T) {
+	m := goTo(t, start(t, &fake{}, 120, 40), route{page: pageProcessing})
+	m.cache.slots[keyJobs].data = []api.Job{{ID: "a", Kind: "scan", Phase: "failed"}, {ID: "b", Kind: "scan", Phase: "running"}}
+	m.sync()
+	if m.selectedID() != "b" {
+		t.Fatalf("running job not first: %s", m.selectedID())
+	}
+	m.cache.slots[keyJobs].data = []api.Job{{ID: "a", Kind: "scan", Phase: "failed"}, {ID: "b", Kind: "scan", Phase: "completed"}}
+	m.sync()
+	if m.selectedID() != "b" {
+		t.Fatalf("selection moved to %s when b finished", m.selectedID())
+	}
+	m = press(t, m, "up")
+	if m.selectedID() != "a" {
+		t.Fatalf("keys no longer move the selection: %s", m.selectedID())
+	}
+}
+
+func TestShortTerminalsKeepTheSelectedRowAndPageByScreen(t *testing.T) {
+	m := start(t, &fake{jobs: 60}, 120, 8)
+	m = goTo(t, m, route{page: pageProcessing})
+	if !strings.Contains(screen(m), "● running") || !strings.Contains(screen(m), "1–1 of 60") {
+		t.Fatalf("selected row clipped:\n%s", screen(m))
+	}
+	m, _ = update(t, m, tea.WindowSizeMsg{Width: 120, Height: 30})
+	visible := m.tvisible
+	m = press(t, m, "pgdown")
+	if m.tsel != visible {
+		t.Fatalf("page moved %d rows, %d are visible", m.tsel, visible)
+	}
+}
+
+func TestPanelsNeverExceedTheirWidth(t *testing.T) {
+	for _, w := range []int{8, 12, 20, 33, 60} {
+		for _, title := range []string{"Database busy", "A very long server-supplied library name that goes on"} {
+			for _, value := range []string{"", "12 MB", "a very long value"} {
+				for _, l := range panel(title, value, colorAccent, []string{"x"}, w) {
+					if got := lipgloss.Width(l); got != w {
+						t.Fatalf("w=%d title=%q value=%q: line %d wide: %q", w, title, value, got, ansi.Strip(l))
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestStorageBarDoesNotCountReservationsTwice(t *testing.T) {
+	free := "8000000000"
+	lines := storageBar(api.StorageReport{DatabaseBytes: "2000000000", AssetBytes: "0", TemporaryBytes: "0", ReservedBytes: "2000000000", FreeBytes: &free}, 50)
+	bar := ansi.Strip(lines[0])
+	if strings.Count(bar, "█") != 50 || !strings.Contains(ansi.Strip(strings.Join(lines, " ")), "reserved 2.0 GB of free") {
+		t.Fatalf("%q", lines)
+	}
+}
+
+func TestFocusResumesAnimationAndHeartbeatOnce(t *testing.T) {
+	m := start(t, &fake{}, 120, 40)
+	m.anim.aim("x", 1)
+	m.anim.aim("x", 100) // gliding
+	m, _ = update(t, m, tea.BlurMsg{})
+	m, _ = update(t, m, animMsg{}) // a frame arrives while unfocused: the loop stops
+	if m.anim.running {
+		t.Fatal("animation kept running while unfocused")
+	}
+	gen := m.beatGen
+	m, cmd := update(t, m, tea.FocusMsg{})
+	if cmd == nil || !m.anim.running || m.beatGen != gen+1 {
+		t.Fatal("focus did not resume animation and a new heartbeat")
+	}
+	if _, cmd := update(t, m, beatMsg{gen: gen}); cmd != nil {
+		t.Fatal("the superseded heartbeat kept beating")
+	}
+}
+
+func TestActivityGraphCountsTheFirstMinute(t *testing.T) {
+	m := start(t, &fake{}, 120, 40)
+	m.opened = time.Now().Add(-5 * time.Second)
+	m.log = []logEntry{{at: time.Now(), kind: "changed", resource: "item"}}
+	rows := m.activityGraph(40, 2)
+	if !strings.ContainsAny(ansi.Strip(strings.Join(rows, "")), "⣿⣶⣤⣀⡀⢀⠀⡇⣇⣧⣷⢸⢹⢻") {
+		t.Fatal("first bucket dropped")
 	}
 }

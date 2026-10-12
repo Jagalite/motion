@@ -53,6 +53,21 @@ func (g *glide) settled() bool {
 	return math.Abs(g.pos-g.target) < 1e-3*math.Max(1, math.Abs(g.target)) && math.Abs(g.vel) < 1e-3
 }
 
+// resume reports whether a frame loop must restart for unsettled springs
+// (after the terminal regains focus).
+func (s *springs) resume() bool {
+	if s.running {
+		return false
+	}
+	for _, g := range s.values {
+		if !g.settled() {
+			s.running = true
+			return true
+		}
+	}
+	return false
+}
+
 // step advances every spring one frame; false when all have settled.
 func (s *springs) step() bool {
 	moving := false

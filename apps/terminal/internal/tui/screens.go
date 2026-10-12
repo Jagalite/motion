@@ -109,6 +109,18 @@ func (m Model) jobCounts() (running, queued, failed, done int) {
 	return
 }
 
+// tableChrome is the strip and detail around a list, dropped on short
+// terminals so the selected row always has room.
+func (m Model) tableChrome(f frame) (strip, detail []string) {
+	if f.body >= 20 {
+		strip = m.tableStrip(f.inner)
+	}
+	if f.body >= 12 {
+		detail = m.tableDetail(f.inner)
+	}
+	return strip, detail
+}
+
 // tableStrip is the stat strip above a list.
 func (m Model) tableStrip(width int) []string {
 	cw := (width - 6) / 4
@@ -256,7 +268,7 @@ func (m Model) tableDetail(width int) []string {
 					name = shortID(src.SourceID)
 				}
 				line := fgStyle.Render(fmt.Sprintf("%-16s", truncate(name, 16))) + " " + phaseCell(src.Status) + "  " + bar(frac, 14, colorOK) +
-					faintStyle.Render(fmt.Sprintf("  %s of %s files · %s incomplete dirs", src.VerifiedFiles, src.ObservedFiles, clean(src.IncompleteDirectories)))
+					faintStyle.Render(fmt.Sprintf("  %d of %d files · %s incomplete dirs", v, o, clean(src.IncompleteDirectories)))
 				if len(src.ErrorCodes) > 0 {
 					line += dangerStyle.Render("  " + clean(strings.Join(src.ErrorCodes, ", ")))
 				}
@@ -400,7 +412,7 @@ func (m Model) activityGraph(width, height int) []string {
 	}
 	var pts []point
 	for t := now.Add(-window).Truncate(bucket); !t.After(now); t = t.Add(bucket) {
-		if t.Before(m.opened) {
+		if t.Add(bucket).Before(m.opened) {
 			continue // the console was not listening yet: a gap, not zero
 		}
 		pts = append(pts, point{t: t.Add(bucket / 2), v: counts[t.Unix()]})
@@ -466,7 +478,7 @@ func storageBar(s api.StorageReport, width int) []string {
 		label string
 		v     *string
 		tint  color.Color
-	}{{"database", &s.DatabaseBytes, colorAccent}, {"assets", &s.AssetBytes, colorInfo}, {"temporary", &s.TemporaryBytes, colorOK}, {"reserved", &s.ReservedBytes, colorMuted}, {"free", s.FreeBytes, colorPanelLine}}
+	}{{"database", &s.DatabaseBytes, colorAccent}, {"assets", &s.AssetBytes, colorInfo}, {"temporary", &s.TemporaryBytes, colorOK}, {"free", s.FreeBytes, colorPanelLine}}
 	total := 0.0
 	values := make([]float64, len(parts))
 	for i, p := range parts {
@@ -493,6 +505,11 @@ func storageBar(s api.StorageReport, width int) []string {
 		used += n
 		b.WriteString(lipgloss.NewStyle().Foreground(p.tint).Render(strings.Repeat("█", n)))
 		legend = append(legend, lipgloss.NewStyle().Foreground(p.tint).Render("■ ")+mutedStyle.Render(p.label+" ")+fgStyle.Render(bytesText(values[i])))
+	}
+	// Reserved space is held back out of free space, so it is listed but not
+	// drawn as a part of its own (that would count it twice).
+	if r, ok := parse(&s.ReservedBytes); ok {
+		legend = append(legend, faintStyle.Render("reserved ")+mutedStyle.Render(bytesText(r.v))+faintStyle.Render(" of free"))
 	}
 	// The legend wraps rather than clipping a part.
 	lines, line := []string{b.String()}, ""

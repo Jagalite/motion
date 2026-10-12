@@ -119,12 +119,26 @@ func (m *Model) sync() {
 	case kindTable:
 		// The table is given only the visible window of rows, so its own
 		// scrolling never applies and the selection is always on screen.
-		cols, rows, _ := m.tabular(f.inner - 4)
+		cols, rows, ids := m.tabular(f.inner - 4)
+		// Keep the selected row's identity across refreshes: a job that
+		// changes phase moves in the sorted list, and the selection with it.
+		if m.tselID != "" && (m.tsel >= len(ids) || ids[m.tsel] != m.tselID) {
+			for i, id := range ids {
+				if id == m.tselID {
+					m.tsel = i
+				}
+			}
+		}
 		m.tsel = min(max(m.tsel, 0), max(len(rows)-1, 0))
+		if m.tsel < len(ids) {
+			m.tselID = ids[m.tsel]
+		}
 		// Room for the stat strip, the panel's border, header and position
 		// line, and the detail panel.
-		chrome := len(m.tableStrip(f.inner)) + len(m.tableDetail(f.inner)) + 4
+		strip, detail := m.tableChrome(f)
+		chrome := len(strip) + len(detail) + 4
 		visible := min(len(rows), max(f.body-chrome, 1))
+		m.tvisible = visible
 		m.toff = min(max(m.toff, m.tsel-visible+1, 0), m.tsel)
 		window := append([]table.Row(nil), rows[m.toff:min(m.toff+visible, len(rows))]...)
 		if i := m.tsel - m.toff; i >= 0 && i < len(window) {
@@ -364,12 +378,12 @@ func (m Model) body(f frame) []string {
 		if s := m.cache.slots[m.tableKey()]; s != nil && s.truncated {
 			position = strings.TrimPrefix(position+" · only the first "+fmt.Sprint(len(rows))+" are shown", " · ")
 		}
-		lines := m.tableStrip(f.inner)
+		lines, detail := m.tableChrome(f)
 		if position != "" {
 			position = faintStyle.Render(position)
 		}
 		lines = append(lines, panel(m.listTitle(), position, m.tableAccent(), table, f.inner)...)
-		return append(lines, m.tableDetail(f.inner)...)
+		return append(lines, detail...)
 	}
 	return strings.Split(m.vp.View(), "\n")
 }

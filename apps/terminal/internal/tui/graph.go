@@ -69,9 +69,14 @@ func areaGraph(pts []point, now time.Time, window time.Duration, width, height i
 	filled := make([]bool, cols)
 	start := now.Add(-window)
 	lo, hi := math.Inf(1), 0.0
+	breaks := make([]bool, cols)
 	for _, p := range pts {
 		i := int(float64(cols) * p.t.Sub(start).Seconds() / window.Seconds())
 		if i < 0 || i >= cols {
+			continue
+		}
+		if p.gap {
+			breaks[i] = true
 			continue
 		}
 		if !filled[i] || p.v > values[i] {
@@ -88,6 +93,9 @@ func areaGraph(pts []point, now time.Time, window time.Duration, width, height i
 	maxGap := int(math.Ceil(math.Max(maxSampleGap.Seconds(), window.Seconds()/60) / perColumn))
 	last, run := -1, 0
 	for i := range values {
+		if breaks[i] {
+			last = -1 // nothing carries across a restart
+		}
 		if filled[i] {
 			last, run = i, 0
 			continue
@@ -213,14 +221,16 @@ func panel(title, value string, accent color.Color, lines []string, width int) [
 func framed(title, value string, accent, edge color.Color, lines []string, width int) []string {
 	inner := max(width-4, 1)
 	border := lipgloss.NewStyle().Foreground(edge)
-	head := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(" " + title + " ")
+	// The top edge is ╭─, the title, a rule, the value and ─╮: four
+	// border columns; the title is clipped to fit, the value dropped first.
+	head := lipgloss.NewStyle().Foreground(accent).Bold(true).Render(" " + truncate(title, max(width-6, 1)) + " ")
 	right := ""
 	if value != "" {
 		right = " " + value + " "
 	}
-	fill := width - 3 - ansi.StringWidth(head) - ansi.StringWidth(right) - 1
+	fill := width - 4 - ansi.StringWidth(head) - ansi.StringWidth(right)
 	if fill < 1 {
-		right, fill = "", width-3-ansi.StringWidth(head)
+		right, fill = "", width-4-ansi.StringWidth(head)
 	}
 	out := []string{border.Render("╭─") + head + border.Render(strings.Repeat("─", max(fill, 0))) + right + border.Render("─╮")}
 	for _, l := range lines {

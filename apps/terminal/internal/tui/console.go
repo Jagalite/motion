@@ -39,14 +39,17 @@ var (
 )
 
 type pollMsg struct{}
-type beatMsg struct{}
+
+// beatMsg carries its chain's generation: refocusing starts a new chain and
+// the old one ends when its next beat arrives.
+type beatMsg struct{ gen int }
 
 func pollTick() tea.Cmd {
 	return tea.Tick(pollEvery, func(time.Time) tea.Msg { return pollMsg{} })
 }
 
-func beatTick() tea.Cmd {
-	return tea.Tick(beatEvery, func(time.Time) tea.Msg { return beatMsg{} })
+func beatTick(gen int) tea.Cmd {
+	return tea.Tick(beatEvery, func(time.Time) tea.Msg { return beatMsg{gen: gen} })
 }
 
 func (m Model) admin() bool {
@@ -159,7 +162,11 @@ func (m *Model) glide(now time.Time) tea.Cmd {
 			}
 		}
 	}
-	if start && !m.blurred {
+	if start && m.blurred {
+		m.anim.running = false // the loop starts when focus returns
+		return nil
+	}
+	if start {
 		return animTick()
 	}
 	return nil
@@ -218,10 +225,10 @@ func (m Model) tiles(now time.Time) [][]tile {
 			series := make([]point, len(r))
 			peak := 0.0
 			for i, p := range r {
-				series[i] = point{t: p.t, v: p.v * 100}
+				series[i] = point{t: p.t, v: p.v * 100, gap: p.gap}
 				peak = math.Max(peak, p.v*100)
 			}
-			cpu.series, cpu.num, cpu.format = series, series[len(series)-1].v, pct
+			cpu.series, cpu.num, cpu.format = series, lastValue(series), pct
 			cpu.note = fmt.Sprintf("peak %.0f%% · 100%% is one core", peak)
 		} else {
 			cpu.format, cpu.note = measuring, "measuring"
@@ -239,7 +246,7 @@ func (m Model) tiles(now time.Time) [][]tile {
 	req := tile{label: "Requests", id: mRequests, unit: "/s", accent: colorOK, colors: rampRequests, missing: unreported}
 	if _, reported := latest(mRequests); reported {
 		if r := h.values(mRequests, now, window); len(r) > 0 {
-			req.series, req.num, req.format = r, r[len(r)-1].v, countText
+			req.series, req.num, req.format = r, lastValue(r), countText
 			if v, ok := latest(mInFlight); ok {
 				req.note = countText(v) + " in flight"
 			}
