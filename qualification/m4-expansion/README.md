@@ -88,6 +88,7 @@ fixtures. There is no HDR fixture with tone-mapping ground truth.
 | Multipart audio swap: same-language, same-role tracks reordered between parts played the wrong track | Fixed. The planner resolves the selected audio's component on part 1 (`components::component_of`), then that component's exact occurrence on every part (`per_file_tracks`), and pins each part's own ordinal (`PartPin::audio`). A part without it is refused (`multipart_audio_unavailable`); the worker fails closed without a per-part ordinal. Replans may switch audio (`parts::same_layout` compares only files, revisions and durations) | `112c51a`, `03f4133`, and the test fixture commit after them | Core mapping and layout tests. HTTP `multipart_audio_follows_the_component_in_every_part`: Matroska "Stereo" 440 Hz and "Director" 880 Hz in opposite orders; the default plays 440 Hz and a Director pin 880 Hz in both parts (measured), and a live delivery switches by replan | 2 P2 on `112c51a` (replan switch, serialization), fixed in `03f4133`; re-review clean |
 | Production client cannot request burn-in; always sends `max_bitrate_bps: null` | Burn-in wired: the bridge lists `burned` whenever it plays HLS (the only transport a burned conversion arrives over). Bitrate caps recorded as **API-only**, with follow-up owners in the deferral table | `8a629e3` | `player.test.mjs` provider/MSE matrix; JS 55/55 | Clean |
 | Live-subtitle statement too broad | Narrowed after inspecting Demuxe 1.1.1 (npm, pinned): Shaka 5.2.11 throws 4033 from `addTextTrackAsync` (the bridge's external-track path) only for infinite-duration presentations, while Demuxe lists in-manifest HLS `SUBTITLES` renditions. Motion then published one (M4-02 live text) | `8a629e3`, `8335b3a` | Package source inspection (`web/generated/internal/shaka-backend.js`, `web/vendor/shaka-player.js`); headless Shaka playback of the rendition | Clean |
+| Final PR diff review (after the adaptive ladder) | 2 P2 fixed in `9fe66b9`: plans signed on main carried a text subtitle as a bare number and were rejected after the upgrade (now read as `Subtitle::Text`); a ladder plan signed before a restart that disabled ladders still admitted (admission and replans recheck the setting) | `9fe66b9` | Core `claims_signed_before_subtitle_kinds_still_open`; the adaptive HTTP test restarts with ladders disabled and is refused | Fix commit re-review clean |
 | Keep subtitle and HDR limits visible | Inventory and deferral rows: styled/font handling, multipart subtitles, bitmap cues older than the 20 s lookback, client caps API-only, HDR implementation still owed after the native-tool change | `8a629e3` | This ledger, `V2_PLAYBACK.md` | Clean |
 
 ## Correctness boundary
@@ -149,11 +150,13 @@ The playback-session and delivery models pass unchanged.
 Builds ran through the shared Kyoto queue with Rust 1.98, in this worktree's own
 target directory. Tests ran from the compiled binaries on macOS arm64, with
 host FFmpeg 8.1.2 and VideoToolbox available. Receipts are at the PR head
-after `857b238` (rebased onto main `c6d6e26`):
+(rebased onto main `c6d6e26`). Core models, `delivery`, `access_api`, JS and
+contract checks ran after `857b238`. Core lib, `v2_playback` and clippy were
+rerun after `9fe66b9`:
 
 | Suite | Result |
 |---|---|
-| `playscale-core` lib | 120 passed |
+| `playscale-core` lib | 121 passed |
 | Core model and policy tests (`route_selection_model`, `playback_session_model`, `delivery_model`, `delivery_observation_model` and the other models) | Passed (Statelessness 0.2.0). `delivery_model`'s metadata now records a digest of `delivery.rs`, which outgrew the 64 KiB trace string limit |
 | `tests/v2_playback.rs` | 25/25 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
 | `tests/delivery.rs` | 12/12 |
@@ -187,3 +190,13 @@ recipe caps height at 720 but keeps the source frame rate, so 720p sources
 above 30 fps encode at level 3.2. Copy routes derive their codecs from output
 instead. Owner: this lane, with the player matrix, since changing
 transcode manifest text affects existing player receipts.
+
+## Coordination with #32
+
+#32 (admin playback monitoring) owns reconciling the playback code with this
+branch. The textual conflicts are additive: `Planned` fields in
+`src/delivery.rs` and `src/v2/playback.rs`, the `media_segment` handler and
+appended tests in `tests/v2_playback.rs`. One semantic point: the subtitle
+rendition (`subtitles-N.vtt`) and adaptive low-rung (`low-N.m4s`) segment
+routes return before `delivery::segment`, so #32's `delivery::counted` byte
+accounting must wrap them as well.
