@@ -1151,3 +1151,18 @@ func TestSidebarSwitchesPagesAsTheHighlightMoves(t *testing.T) {
 		t.Fatal("enter did not focus the page")
 	}
 }
+
+func TestServerHistoryKeepsNewerLiveSamples(t *testing.T) {
+	h := newHistory()
+	now := time.Now()
+	free := "100"
+	h.observeStorage(now, api.StorageReport{DatabaseBytes: "1", AssetBytes: "1", TemporaryBytes: "0", ReservedBytes: "0", FreeBytes: &free})
+	h.replace(api.MetricsHistory{Series: []api.MetricSeries{{ID: mFree, Kind: "gauge"}, {ID: mDatabase, Kind: "gauge",
+		Points: []api.MetricPoint{{T: now.Add(-time.Minute).UTC().Format(time.RFC3339), V: "5"}}}}})
+	if p, ok := h.latest(mFree); !ok || p.v != 100 {
+		t.Fatalf("live free-space sample lost: %v %v", p, ok)
+	}
+	if s := h.series[mDatabase]; len(s) != 2 || s[0].v != 5 || s[1].v != 1 {
+		t.Fatalf("merge: %v", s)
+	}
+}

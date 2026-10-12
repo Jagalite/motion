@@ -180,6 +180,7 @@ func (m Model) tiles(now time.Time) [][]tile {
 		return p.v, ok
 	}
 	unreported := "Not reported by this server"
+	waiting := "Waiting for a sample"
 	cpu := tile{label: "CPU", id: mCPU, unit: "%", color: colorAccent, missing: unreported}
 	// Rates only for fields reported now, never a stale one.
 	if _, reported := latest(mCPU); reported {
@@ -226,18 +227,18 @@ func (m Model) tiles(now time.Time) [][]tile {
 			errs.value, errs.note = "…", "measuring"
 		}
 	}
-	jobs := tile{label: "Jobs", id: mRunning, color: colorAccent, missing: "Needs system:admin"}
+	jobs := tile{label: "Jobs", id: mRunning, color: colorAccent, missing: waiting}
 	if v, ok := latest(mRunning); ok {
 		jobs.series, jobs.value, jobs.unit = h.values(mRunning, now, window), countText(v), "running"
 		if q, ok := latest(mQueued); ok {
 			jobs.note = countText(q) + " queued"
 		}
 	}
-	del := tile{label: "Deliveries", id: mDeliveries, color: colorInfo, missing: "Needs system:admin"}
+	del := tile{label: "Deliveries", id: mDeliveries, color: colorInfo, missing: waiting}
 	if v, ok := latest(mDeliveries); ok {
 		del.series, del.value, del.unit, del.note = h.values(mDeliveries, now, window), countText(v), "active", "streams"
 	}
-	busy := tile{label: "Database busy", id: mBusy, color: colorDanger, missing: "Needs system:admin"}
+	busy := tile{label: "Database busy", id: mBusy, color: colorDanger, missing: waiting}
 	if v, ok := latest(mBusy); ok {
 		if n, covered, ok := h.increase(mBusy, now, window); ok {
 			busy.series, busy.value = h.values(mBusy, now, window), countText(n)
@@ -246,7 +247,7 @@ func (m Model) tiles(now time.Time) [][]tile {
 			busy.value, busy.note = "…", countText(v)+" total · measuring"
 		}
 	}
-	disk := tile{label: "Free space", id: mFree, color: colorInfo, missing: "Needs system:admin", relative: true}
+	disk := tile{label: "Free space", id: mFree, color: colorInfo, missing: waiting, relative: true}
 	if v, ok := latest(mFree); ok {
 		text := bytesText(v)
 		disk.value, disk.unit, _ = strings.Cut(text, " ")
@@ -272,7 +273,10 @@ func (m Model) renderTile(t tile, width int, now time.Time) []string {
 	if m.flashing(t.id) {
 		value = focusStyle.Render(t.value)
 	}
-	if t.unit != "" {
+	switch {
+	case strings.HasPrefix(t.unit, "%"), strings.HasPrefix(t.unit, "/"):
+		value += mutedStyle.Render(t.unit) // 6.2%, 8.5/s
+	case t.unit != "":
 		value += mutedStyle.Render(" " + t.unit)
 	}
 	chart := sparkline(t.series, now, m.windowSpan(), width, 2, t.color, t.relative)

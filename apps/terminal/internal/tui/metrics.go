@@ -136,6 +136,18 @@ func (h *history) replace(m api.MetricsHistory) {
 				pts = append(pts, p)
 			}
 		}
+		// Keep live samples newer than the server's latest point: the server
+		// samples every interval (storage more sparsely), so the newest
+		// figure is often a poll the history has not caught up with.
+		var last time.Time
+		if len(pts) > 0 {
+			last = pts[len(pts)-1].t
+		}
+		for _, p := range h.series[s.ID] {
+			if p.t.After(last) {
+				pts = append(pts, p)
+			}
+		}
 		h.series[s.ID] = pts
 		if _, seen := h.present[s.ID]; !seen {
 			h.present[s.ID] = len(pts) > 0
