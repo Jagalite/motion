@@ -76,6 +76,8 @@ pub struct ItemCard {
     pub kind: String,
     pub availability: Availability,
     pub needs_review: bool,
+    /// Same-origin URL of the selected poster, when one is selected and visible.
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +195,30 @@ pub struct SourceRow {
     /// Host path of an administrative source; only shown to `sources:manage`.
     pub root_path: String,
     pub availability: Availability,
+    /// Strong validator of the source a relocation preview is checked against.
+    pub etag: String,
+}
+
+/// A library as administered on the sources page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryAdminRow {
+    pub library: LibraryCard,
+    pub language: String,
+    pub source_ids: Vec<String>,
+    /// Strong validator the edit form sends as If-Match.
+    pub etag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub library_id: String,
+    pub library_name: String,
+    /// scan | metadata_refresh | preview | optimize
+    pub task: String,
+    pub interval_seconds: u64,
+    pub enabled: bool,
+    pub etag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,8 +247,10 @@ pub struct SourcesView {
     /// A missing scan API must not appear as an empty scan history.
     pub scans_available: bool,
     pub sources: Vec<SourceRow>,
-    pub libraries: Vec<LibraryCard>,
+    pub libraries: Vec<LibraryAdminRow>,
     pub scans: Vec<ScanRow>,
+    /// None when schedules cannot be read; never shown as "no schedules".
+    pub schedules: Option<Vec<ScheduleRow>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +271,141 @@ pub struct MatchRow {
     pub candidates: Vec<MatchCandidateView>,
 }
 
+/// The editable "local" metadata contribution of one item, and where each
+/// effective field currently comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataEditView {
+    /// Values of the local contribution only (what the form edits).
+    pub title: String,
+    pub description: String,
+    pub release_year: String,
+    /// Local values the form does not edit, as a JSON object; sent back
+    /// unchanged because a save replaces the whole contribution.
+    pub preserved_values: String,
+    pub tags: Vec<String>,
+    pub excluded_tags: Vec<String>,
+    /// Effective field → contributing sources, e.g. ("title", ["local"]).
+    pub field_sources: Vec<(String, Vec<String>)>,
+    /// Effective values as displayed: field → JSON text.
+    pub effective: Vec<(String, String)>,
+    /// Validator of the whole metadata resource (If-Match for the edit).
+    pub etag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtworkRow {
+    pub id: String,
+    pub content_url: String,
+    pub mime_type: String,
+    pub selected: bool,
+}
+
+/// One media file of the item, as an exact revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRow {
+    pub file_id: String,
+    pub file_revision: String,
+    pub library_id: String,
+    pub label: String,
+    pub availability: Availability,
+    /// Audio streams as (planning track ID `a{n}`, label).
+    pub audio_tracks: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipeOption {
+    pub id: String,
+    pub name: String,
+    pub backends: Vec<String>,
+    /// unqualified | partial | qualified
+    pub qualification: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenditionRow {
+    pub id: String,
+    /// pending | validating | ready | stale | failed | expired
+    pub status: String,
+    pub job_id: String,
+    pub source_file_id: String,
+}
+
+/// A timeline's preparable originals and its existing renditions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareTimeline {
+    pub id: String,
+    pub edition: String,
+    /// Original files bound to this timeline (part 1 of each original version).
+    pub sources: Vec<FileRow>,
+    /// None when the renditions read is unavailable (not "none prepared").
+    pub renditions: Option<Vec<RenditionRow>>,
+}
+
+/// A collection or playlist of the current profile, and the exact command
+/// bodies that would add or remove this item (precomputed, If-Match guarded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MembershipRow {
+    pub id: String,
+    pub name: String,
+    pub etag: String,
+    pub contains: bool,
+    /// Full replacement JSON for the toggle (adds when !contains, else removes).
+    pub toggle_body: String,
+}
+
+/// Everything the title management page shows. Sections are `None` when the
+/// principal lacks the permission or the read is unavailable; the page says which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemManageView {
+    pub item: ItemCard,
+    pub library_ids: Vec<String>,
+    pub match_state: String,
+    pub item_etag: String,
+    pub metadata: Option<MetadataEditView>,
+    pub artwork: Option<Vec<ArtworkRow>>,
+    pub files: Option<Vec<FileRow>>,
+    pub recipes: Option<Vec<RecipeOption>>,
+    pub timelines: Option<Vec<PrepareTimeline>>,
+    pub collections: Option<Vec<MembershipRow>>,
+    pub playlists: Option<Vec<MembershipRow>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionView {
+    pub id: String,
+    pub name: String,
+    /// manual | smart
+    pub kind: String,
+    pub etag: String,
+    pub items: Vec<ItemCard>,
+    /// Exact replacement bodies removing each listed item, in `items` order.
+    pub remove_bodies: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistEntryView {
+    pub entry_id: String,
+    pub timeline_id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistView {
+    pub id: String,
+    pub name: String,
+    pub etag: String,
+    pub entries: Vec<PlaylistEntryView>,
+    /// Exact replacement bodies per entry: (remove, move up), in `entries` order.
+    pub entry_bodies: Vec<(String, Option<String>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrganizeView {
+    pub profile_id: String,
+    pub collections: Vec<CollectionView>,
+    pub playlists: Vec<PlaylistView>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobRow {
     pub id: String,
@@ -250,6 +413,8 @@ pub struct JobRow {
     pub phase: String,
     pub progress_percent: Option<u8>,
     pub error_code: Option<String>,
+    /// Validator a retry is checked against.
+    pub etag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,6 +459,16 @@ pub trait UiQueryFacade: Send + Sync + 'static {
     fn matches<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<MatchRow>>>;
     /// Requires `processing:request`.
     fn jobs<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<JobRow>>>;
+    /// Title management; requires at least one of `catalog:write`,
+    /// `processing:request` or `collections:write`. Sections the principal
+    /// may not use are `None`.
+    fn manage_item<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        id: &'a str,
+    ) -> BoxFuture<'a, UiResult<ItemManageView>>;
+    /// The current profile's collections and playlists (`catalog:read`).
+    fn organize<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<OrganizeView>>;
     /// Requires `system:admin`.
     fn diagnostics<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<DiagnosticsView>>;
 }

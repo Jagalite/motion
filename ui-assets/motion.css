@@ -98,6 +98,7 @@ progress::-moz-progress-bar { background: var(--accent); }
    initials, never a broken image. */
 .art { position: absolute; inset: 0; display: grid; place-items: center; overflow: hidden; }
 .art::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255, 255, 255, .06), rgba(0, 0, 0, .35)); }
+.art-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .art-initials { position: relative; z-index: 1; font-size: 2.4rem; font-weight: 800; letter-spacing: .02em; color: rgba(255, 255, 255, .82); text-shadow: 0 2px 12px rgba(0, 0, 0, .35); }
 .art .icon { position: relative; z-index: 1; width: 2.2rem; height: 2.2rem; color: rgba(255, 255, 255, .85); }
 .tone-0 { background: linear-gradient(150deg, #34495e, #1b2631); }
@@ -360,3 +361,15 @@ main > form, main section > form { margin-bottom: 1rem; }
 /* Command forms (crate::screens) lay their fields out in one wrapping row. */
 form.command { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
 form.command label { display: inline-flex; align-items: center; gap: .45rem; color: var(--muted); }
+
+/* Title management */
+.disclosure { margin-top: .5rem; }
+.disclosure > summary { cursor: pointer; color: var(--muted); }
+form.command.stacked { flex-direction: column; align-items: stretch; max-width: 40rem; }
+form.command.stacked label { display: flex; flex-direction: column; align-items: stretch; gap: .3rem; }
+form.command.stacked textarea { font: inherit; }
+.plan-result { flex-basis: 100%; }
+.artwork-grid { list-style: none; padding: 0; margin: 0 0 1rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr)); gap: .75rem; }
+.artwork img { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: var(--radius); background: var(--raised); outline: 2px solid transparent; }
+.artwork.is-selected img { outline-color: var(--accent); }
+.collection { margin-bottom: 1.25rem; }

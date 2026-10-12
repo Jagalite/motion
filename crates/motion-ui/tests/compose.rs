@@ -383,6 +383,7 @@ const ADMIN: &[&str] = &[
     "viewing:write",
     "playback:request",
     "processing:request",
+    "collections:write",
     "system:admin",
 ];
 
@@ -586,4 +587,124 @@ async fn web_manifest_names_this_builds_icons() {
         let (status, _, _) = get_page(&app, icon["src"].as_str().unwrap()).await;
         assert_eq!(status, StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn library_administration_offers_edit_relocation_and_schedules() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, sources) = get_page(&admin, "/sources").await;
+    assert_strict_markup(&sources);
+    // Library edits are checked against the library revision that was shown.
+    assert!(sources.contains(r#"data-command="PUT /api/v2/libraries/lib1" data-idempotent="false" data-if-match="&quot;r-4&quot;""#), "{sources}");
+    assert!(sources.contains(
+        r#"<input type="checkbox" name="source_ids" value="src1" data-type="member" checked="">"#
+    ));
+    // Relocation previews against the source revision and names its commit.
+    assert!(sources.contains(r#"data-command="POST /api/v2/sources/src1/relocation-plans" data-idempotent="true" data-if-match="&quot;r-2&quot;""#));
+    assert!(sources.contains(r#"data-plan-commit="POST /api/v2/sources/src1/relocation""#));
+    // Schedules: only tasks the server runs are offered; intervals are minutes.
+    assert!(sources.contains(r#"data-command="PUT /api/v2/schedules/sch1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
+    assert!(sources.contains(r#"data-type="minutes" data-target="interval_seconds""#));
+    assert!(sources.contains(r#"value="1440""#));
+    assert!(sources.contains(r#"<option value="metadata_refresh">"#));
+    assert!(
+        !sources.contains(r#"<option value="preview">"#)
+            && !sources.contains(r#"<option value="optimize">"#)
+    );
+    let (_, _, processing) = get_page(&admin, "/processing").await;
+    // The server retries failed and cancelled jobs; it takes no precondition.
+    assert!(
+        processing
+            .contains(r#"data-command="POST /api/v2/jobs/job3/retry" data-idempotent="true">"#),
+        "{processing}"
+    );
+    assert!(
+        !processing.contains("/api/v2/jobs/job2/retry"),
+        "running jobs offer no retry"
+    );
+}
+
+#[tokio::test]
+async fn title_management_names_exact_operations_and_unsupported_parts() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, item) = get_page(&admin, "/item/item1").await;
+    assert!(item.contains(r#"href="/item/item1/manage""#));
+    let (status, _, html) = get_page(&admin, "/item/item1/manage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_strict_markup(&html);
+    // Corrections go to the "local" contribution against the metadata validator.
+    assert!(html.contains(r#"data-command="PUT /api/v2/catalog/items/item1/metadata/contributions/local" data-idempotent="false" data-if-match="&quot;r-3&quot;""#), "{html}");
+    assert!(html.contains(r#"name="values.title" data-type="optional""#));
+    assert!(html.contains(r#"name="values.release_year" data-type="optional-int""#));
+    assert!(html.contains(r#"name="locked_fields" data-type="json" value="[]""#));
+    // A save replaces the whole local contribution, so unshown local fields ride along.
+    assert!(html.contains(r#"name="values" data-type="json" value="{&quot;release_date&quot;:&quot;1999-05-01&quot;}""#), "{html}");
+    assert!(html.contains("survive rescans"));
+    assert!(html.contains(
+        r#"data-command="POST /api/v2/catalog/items/item1/metadata/refresh" data-idempotent="true""#
+    ));
+    // Artwork upload sends the file itself; selection is checked against the item.
+    assert!(html.contains(
+        r#"data-command="POST /api/v2/catalog/items/item1/artwork" data-idempotent="true""#
+    ));
+    assert!(html.contains(r#"data-body="file""#));
+    // Identification proposes against the exact file revision and library.
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/matches" data-idempotent="true""#));
+    assert!(html.contains(r#"value="{&quot;file_id&quot;:&quot;file-item1&quot;,&quot;file_revision&quot;:&quot;rev1&quot;}""#), "{html}");
+    // Preparation keeps the chosen audio track and says subtitles are not prepared.
+    assert!(
+        html.contains(
+            r#"data-command="POST /api/v2/processing/preparations" data-idempotent="true""#
+        )
+    );
+    assert!(html.contains(r#"name="tracks.audio_track_id" data-type="nullable""#));
+    assert!(html.contains(r#"<option value="a1">"#));
+    assert!(html.contains(r#"name="tracks.subtitle_policy" data-type="text" value="off""#));
+    assert!(html.contains("subtitles cannot be included in prepared versions yet"));
+    // Collection membership is a full replacement guarded by the collection revision.
+    assert!(html.contains(r#"data-command="PUT /api/v2/collections/col1" data-idempotent="false" data-if-match="&quot;r-1&quot;" data-body="json""#), "{html}");
+    assert!(html.contains(r#"&quot;item_ids&quot;:[&quot;item1&quot;]"#));
+
+    // Each section requires its own permission; a viewer cannot open the page.
+    let viewer = app(Some(principal("everyone", VIEWER)), None);
+    let (_, _, item) = get_page(&viewer, "/item/item1").await;
+    assert!(!item.contains("/item/item1/manage"));
+    let (status, _, _) = get_page(&viewer, "/item/item1/manage").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let preparer = app(
+        Some(principal(
+            "everyone",
+            &["catalog:read", "processing:request"],
+        )),
+        None,
+    );
+    let (status, _, html) = get_page(&preparer, "/item/item1/manage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("/api/v2/processing/preparations"));
+    assert!(!html.contains("/metadata/contributions/") && !html.contains("/api/v2/collections/"));
+    // Restricted titles stay indistinguishable from missing ones.
+    let kids = app(Some(principal("kids", ADMIN)), None);
+    let (restricted, _, restricted_html) = get_page(&kids, "/item/item3/manage").await;
+    let (missing, _, missing_html) = get_page(&kids, "/item/nope/manage").await;
+    assert_eq!(restricted, StatusCode::NOT_FOUND);
+    assert_eq!(missing, StatusCode::NOT_FOUND);
+    assert_eq!(restricted_html, missing_html);
+}
+
+#[tokio::test]
+async fn collections_page_creates_and_edits_with_exact_bodies() {
+    let admin = app(Some(principal("everyone", ADMIN)), None);
+    let (_, _, home) = get_page(&admin, "/").await;
+    assert!(home.contains(r#"href="/organize""#));
+    let (status, _, html) = get_page(&admin, "/organize").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_strict_markup(&html);
+    assert!(html.contains(r#"data-command="POST /api/v2/collections" data-idempotent="true""#));
+    assert!(html.contains(r#"name="profile_id" data-type="text" value="everyone""#));
+    assert!(html.contains(r#"data-command="POST /api/v2/playlists" data-idempotent="true""#));
+    assert!(html.contains(r#"data-command="DELETE /api/v2/collections/col1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
+    assert!(html.contains("Arrival of the Night Train"));
+    let viewer = app(Some(principal("everyone", VIEWER)), None);
+    let (status, _, _) = get_page(&viewer, "/organize").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

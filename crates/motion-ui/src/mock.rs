@@ -117,6 +117,7 @@ fn card(title: &Title) -> ItemCard {
         kind: title.kind.into(),
         availability: Availability::Available,
         needs_review: title.needs_review,
+        artwork_url: None,
     }
 }
 
@@ -326,8 +327,30 @@ impl UiQueryFacade for MockUiQueryFacade {
                     name: "Movies disk".into(),
                     root_path: "/media/movies".into(),
                     availability: Availability::Available,
+                    etag: "\"r-2\"".into(),
                 }],
-                libraries: libraries(),
+                libraries: libraries()
+                    .into_iter()
+                    .map(|library| LibraryAdminRow {
+                        etag: format!("\"r-{}\"", library.id.len()),
+                        source_ids: if library.id == "lib1" {
+                            vec!["src1".into()]
+                        } else {
+                            vec![]
+                        },
+                        language: "en".into(),
+                        library,
+                    })
+                    .collect(),
+                schedules: Some(vec![ScheduleRow {
+                    id: "sch1".into(),
+                    library_id: "lib1".into(),
+                    library_name: "Films".into(),
+                    task: "scan".into(),
+                    interval_seconds: 86_400,
+                    enabled: true,
+                    etag: "\"r-1\"".into(),
+                }]),
                 scans: vec![ScanRow {
                     id: "scan1".into(),
                     library_name: "Television".into(),
@@ -395,6 +418,15 @@ impl UiQueryFacade for MockUiQueryFacade {
                     phase: "completed".into(),
                     progress_percent: Some(100),
                     error_code: None,
+                    etag: "\"r-3\"".into(),
+                },
+                JobRow {
+                    id: "job3".into(),
+                    kind: "rendition".into(),
+                    phase: "failed".into(),
+                    progress_percent: None,
+                    error_code: Some("process_failed".into()),
+                    etag: "\"r-5\"".into(),
                 },
                 JobRow {
                     id: "job2".into(),
@@ -402,6 +434,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     phase: "running".into(),
                     progress_percent: Some(40),
                     error_code: None,
+                    etag: "\"r-2\"".into(),
                 },
             ])
         })
@@ -423,6 +456,117 @@ impl UiQueryFacade for MockUiQueryFacade {
                 queued_jobs: 0,
                 running_jobs: 1,
                 worker_errors: vec![],
+            })
+        })
+    }
+
+    fn manage_item<'a>(
+        &'a self,
+        who: &'a UiPrincipal,
+        id: &'a str,
+    ) -> BoxFuture<'a, UiResult<ItemManageView>> {
+        Box::pin(async move {
+            let write = who.can("catalog:write");
+            let prepare = who.can("processing:request");
+            let organize = who.can("collections:write");
+            if !(write || prepare || organize) {
+                return Err(UiError::Denied);
+            }
+            let title = find(who, id)?;
+            let file = FileRow {
+                file_id: format!("file-{}", title.id),
+                file_revision: "rev1".into(),
+                library_id: title.library.into(),
+                label: "Original file · 1.4 GB".into(),
+                availability: Availability::Available,
+                audio_tracks: vec![
+                    ("a0".into(), "English · AAC 2ch".into()),
+                    ("a1".into(), "Français · AC-3 5.1".into()),
+                ],
+            };
+            let membership = |id: &str, name: &str, contains: bool| MembershipRow {
+                id: id.into(),
+                name: name.into(),
+                etag: "\"r-1\"".into(),
+                contains,
+                toggle_body: format!(
+                    r#"{{"name":"{name}","profile_id":"{}","kind":"manual","item_ids":{},"filter_id":null}}"#,
+                    who.profile_id,
+                    if contains {
+                        "[]".to_string()
+                    } else {
+                        format!(r#"["{}"]"#, title.id)
+                    }
+                ),
+            };
+            Ok(ItemManageView {
+                item: card(title),
+                library_ids: vec![title.library.into()],
+                match_state: if title.needs_review {
+                    "ambiguous"
+                } else {
+                    "matched"
+                }
+                .into(),
+                item_etag: "\"r-7\"".into(),
+                metadata: write.then(|| MetadataEditView {
+                    title: String::new(),
+                    description: String::new(),
+                    release_year: String::new(),
+                    preserved_values: r#"{"release_date":"1999-05-01"}"#.into(),
+                    tags: vec![],
+                    excluded_tags: vec![],
+                    field_sources: vec![("title".into(), vec!["scan".into()])],
+                    effective: vec![("title".into(), title.title.into())],
+                    etag: "\"r-3\"".into(),
+                }),
+                artwork: write.then(Vec::new),
+                files: write.then(|| vec![file.clone()]),
+                recipes: prepare.then(|| {
+                    vec![RecipeOption {
+                        id: "h264720p".into(),
+                        name: "H.264 720p".into(),
+                        backends: vec!["software".into()],
+                        qualification: "partial".into(),
+                    }]
+                }),
+                timelines: prepare.then(|| {
+                    title
+                        .timeline
+                        .map(|tl| PrepareTimeline {
+                            id: tl.into(),
+                            edition: "Original".into(),
+                            sources: vec![file.clone()],
+                            renditions: Some(vec![]),
+                        })
+                        .into_iter()
+                        .collect()
+                }),
+                collections: organize.then(|| vec![membership("col1", "Weekend", false)]),
+                playlists: organize.then(Vec::new),
+            })
+        })
+    }
+
+    fn organize<'a>(&'a self, who: &'a UiPrincipal) -> BoxFuture<'a, UiResult<OrganizeView>> {
+        Box::pin(async move {
+            if !who.can("collections:write") {
+                return Err(UiError::Denied);
+            }
+            Ok(OrganizeView {
+                profile_id: who.profile_id.clone(),
+                collections: vec![CollectionView {
+                    id: "col1".into(),
+                    name: "Weekend".into(),
+                    kind: "manual".into(),
+                    etag: "\"r-1\"".into(),
+                    items: vec![card(&TITLES[0])],
+                    remove_bodies: vec![format!(
+                        r#"{{"name":"Weekend","profile_id":"{}","kind":"manual","item_ids":[],"filter_id":null}}"#,
+                        who.profile_id
+                    )],
+                }],
+                playlists: vec![],
             })
         })
     }

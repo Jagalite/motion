@@ -10,11 +10,14 @@
 use topcoat::{
     Result,
     context::Cx,
-    router::page,
+    router::{page, path_param},
     view::{Child, View, component, view},
 };
 
-use crate::app::{availability_text, empty, facade, principal, ui_error};
+use crate::{
+    app::{availability_text, empty, facade, principal, ui_error},
+    facade::{Availability, MembershipRow},
+};
 
 /// How the bridge encodes one form field into the JSON body.
 #[derive(Clone, Copy)]
@@ -31,6 +34,14 @@ enum Field {
     Json,
     /// Checkbox contributing its value to a JSON array named by the input.
     Member,
+    /// Number of minutes, sent as whole seconds under `data-target`.
+    Minutes,
+    /// Text omitted from the body when blank.
+    Optional,
+    /// Integer omitted from the body when blank.
+    OptionalInt,
+    /// Text sent as JSON null when blank.
+    Nullable,
 }
 
 impl Field {
@@ -42,6 +53,10 @@ impl Field {
             Field::Number => "number",
             Field::Json => "json",
             Field::Member => "member",
+            Field::Minutes => "minutes",
+            Field::Optional => "optional",
+            Field::OptionalInt => "optional-int",
+            Field::Nullable => "nullable",
         }
     }
 }
@@ -58,12 +73,25 @@ pub(crate) async fn command_form(
     #[default] idempotent: bool,
     #[default] if_match: Option<String>,
     #[default] class: Option<&'static str>,
+    #[default] file_body: bool,
+    #[default] json_body: Option<String>,
     #[default] child: Child<'_>,
 ) -> Result<impl View> {
+    let body_kind = if file_body {
+        Some("file")
+    } else if json_body.is_some() {
+        Some("json")
+    } else {
+        None
+    };
     Ok(view! {
         <form class=(class.unwrap_or("command")) data-command=(command.as_str())
             data-idempotent=(if idempotent { "true" } else { "false" })
-            data-if-match=(if_match.as_deref())>
+            data-if-match=(if_match.as_deref())
+            data-body=(body_kind)>
+            if let Some(body) = &json_body {
+                <input type="hidden" data-json-body="" value=(body.as_str())>
+            }
             (child)
             <button type="submit">(label)</button>
             <p class="command-status" role="status" aria-live="polite"></p>
@@ -160,6 +188,26 @@ fn scan_text(status: &str) -> &'static str {
     }
 }
 
+fn task_text(task: &str) -> &'static str {
+    match task {
+        "scan" => "Scan for changes",
+        "metadata_refresh" => "Refresh local metadata",
+        "preview" => "Generate previews",
+        "optimize" => "Prepare versions",
+        _ => "Unknown task",
+    }
+}
+
+/// A whole number of hours when exact, else minutes; schedules are at least a minute.
+fn interval_text(seconds: u64) -> String {
+    match seconds {
+        s if s % 86_400 == 0 => format!("every {} day(s)", s / 86_400),
+        s if s % 3_600 == 0 => format!("every {} hour(s)", s / 3_600),
+        s if s % 60 == 0 => format!("every {} minute(s)", s / 60),
+        s => format!("every {s} second(s)"),
+    }
+}
+
 #[page("/sources")]
 pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
@@ -169,6 +217,21 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         .iter()
         .map(|s| (s.id.clone(), s.name.clone()))
         .collect();
+    let library_options: Vec<(String, String)> = model
+        .libraries
+        .iter()
+        .map(|l| (l.library.id.clone(), l.library.name.clone()))
+        .collect();
+    let kinds = [
+        ("movies", "Movies"),
+        ("television", "Television"),
+        ("personal_video", "Personal video"),
+        ("mixed", "Mixed"),
+    ];
+    let tasks = [
+        ("scan", "Scan for changes"),
+        ("metadata_refresh", "Refresh local metadata"),
+    ];
     Ok(view! {
         <h1>"Sources and scans"</h1>
         <section aria-labelledby="sources-heading">
@@ -178,8 +241,17 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
             } else {
                 <ul class="rows">
                     for source in model.sources {
-                        <li><strong>(source.name.as_str())</strong> " · " (availability_text(source.availability))
-                            <div class="muted small"><code>(source.root_path.as_str())</code></div></li>
+                        <li data-source=(source.id.as_str())><strong>(source.name.as_str())</strong> " · " (availability_text(source.availability))
+                            <div class="muted small"><code>(source.root_path.as_str())</code></div>
+                            <details class="disclosure">
+                                <summary>"Moved this folder?"</summary>
+                                <p class="muted small">"Point the source at its new location. Motion first checks the new folder and shows what will change; files keep their identity, history and corrections only if they are found unchanged."</p>
+                                command_form(command: format!("POST /api/v2/sources/{}/relocation-plans", source.id), label: "Check new location", idempotent: true, if_match: Some(source.etag.clone()), class: Some("command inline plan"),
+                                    <input type="hidden" data-plan-commit=(format!("POST /api/v2/sources/{}/relocation", source.id))>
+                                    <label>"New folder on the server " <input name="new_root_path" data-type=(kind(Field::Text)) required=(true) maxlength="4096" value=(source.root_path.as_str())></label>
+                                )
+                            </details>
+                        </li>
                     }
                 </ul>
             }
@@ -194,20 +266,39 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         <section aria-labelledby="libraries-heading">
             <h2 id="libraries-heading">"Libraries"</h2>
             <ul class="rows">
-                for library in model.libraries {
-                    <li>
-                        <strong>(library.name.as_str())</strong> " · " (availability_text(library.availability))
-                        if model.scans_available {
-                            command_form(command: format!("POST /api/v2/libraries/{}/scans", library.id), label: "Scan now", idempotent: true, class: Some("command inline"),
-                                <label>"Mode "
-                                    <select name="mode" data-type=(kind(Field::Text))>
-                                        <option value="incremental">"Changes only"</option>
-                                        <option value="verify">"Verify file contents"</option>
+                for row in model.libraries {
+                    <li data-library=(row.library.id.as_str())>
+                        <strong>(row.library.name.as_str())</strong> " · " (availability_text(row.library.availability))
+                        // Starting a scan does not depend on reading the history.
+                        command_form(command: format!("POST /api/v2/libraries/{}/scans", row.library.id), label: "Scan now", idempotent: true, class: Some("command inline"),
+                            <label>"Mode "
+                                <select name="mode" data-type=(kind(Field::Text))>
+                                    <option value="incremental">"Changes only"</option>
+                                    <option value="verify">"Verify file contents"</option>
+                                </select>
+                            </label>
+                            <input type="hidden" name="require_complete" data-type=(kind(Field::Json)) value="false">
+                        )
+                        <details class="disclosure">
+                            <summary>"Edit library"</summary>
+                            command_form(command: format!("PUT /api/v2/libraries/{}", row.library.id), label: "Save library", if_match: Some(row.etag.clone()), class: Some("command"),
+                                <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200" value=(row.library.name.as_str())></label>
+                                <label>"Kind "
+                                    <select name="kind" data-type=(kind(Field::Text))>
+                                        for (value, text) in kinds {
+                                            <option value=(value) selected=(row.library.kind == value)>(text)</option>
+                                        }
                                     </select>
                                 </label>
-                                <input type="hidden" name="require_complete" data-type=(kind(Field::Json)) value="false">
+                                <label>"Language " <input name="language" data-type=(kind(Field::Text)) maxlength="35" value=(row.language.as_str())></label>
+                                <input type="hidden" name="source_ids" data-type=(kind(Field::Json)) value="[]">
+                                <fieldset><legend>"Sources"</legend>
+                                    for (id, name) in source_options.iter() {
+                                        <label><input type="checkbox" name="source_ids" value=(id.as_str()) data-type=(kind(Field::Member)) checked=(row.source_ids.contains(id))>" " (name.as_str())</label>
+                                    }
+                                </fieldset>
                             )
-                        }
+                        </details>
                     </li>
                 }
             </ul>
@@ -216,17 +307,16 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                 <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200"></label>
                 <label>"Kind "
                     <select name="kind" data-type=(kind(Field::Text))>
-                        <option value="movies">"Movies"</option>
-                        <option value="television">"Television"</option>
-                        <option value="personal_video">"Personal video"</option>
-                        <option value="mixed">"Mixed"</option>
+                        for (value, text) in kinds {
+                            <option value=(value)>(text)</option>
+                        }
                     </select>
                 </label>
                 <input type="hidden" name="language" data-type=(kind(Field::Text)) value="en">
                 // Always present (possibly empty) as LibraryInput requires; checked sources are appended.
                 <input type="hidden" name="source_ids" data-type=(kind(Field::Json)) value="[]">
                 <fieldset><legend>"Sources"</legend>
-                    for (id, name) in source_options {
+                    for (id, name) in source_options.iter() {
                         <label><input type="checkbox" name="source_ids" value=(id.as_str()) data-type=(kind(Field::Member))>" " (name.as_str())</label>
                     }
                 </fieldset>
@@ -235,7 +325,7 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         <section aria-labelledby="scans-heading">
             <h2 id="scans-heading">"Recent scans"</h2>
             if !model.scans_available {
-                empty(message: "Scanning is unavailable on this server.")
+                empty(message: "Scan history cannot be shown right now.")
             } else if model.scans.is_empty() {
                 empty(message: "No scans yet.")
             } else {
@@ -261,6 +351,58 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                         </li>
                     }
                 </ul>
+            }
+        </section>
+        <section aria-labelledby="schedules-heading">
+            <h2 id="schedules-heading">"Schedules"</h2>
+            if let Some(schedules) = model.schedules {
+                if schedules.is_empty() {
+                    empty(message: "Nothing runs on a schedule.")
+                } else {
+                    <ul class="rows">
+                        for schedule in schedules {
+                            <li data-schedule=(schedule.id.as_str())>
+                                <strong>(schedule.library_name.as_str())</strong> " — " (task_text(&schedule.task)) ", " (interval_text(schedule.interval_seconds))
+                                if !schedule.enabled { <span class="muted">" · paused"</span> }
+                                command_form(command: format!("PUT /api/v2/schedules/{}", schedule.id), label: "Save", if_match: Some(schedule.etag.clone()), class: Some("command inline"),
+                                    <input type="hidden" name="library_id" data-type=(kind(Field::Text)) value=(schedule.library_id.as_str())>
+                                    <input type="hidden" name="task" data-type=(kind(Field::Text)) value=(schedule.task.as_str())>
+                                    // Intervals set through the API need not be whole minutes; never round them.
+                                    if schedule.interval_seconds % 60 == 0 {
+                                        <label>"Every (minutes) " <input type="number" name="interval_minutes" data-type=(kind(Field::Minutes)) data-target="interval_seconds" required=(true) min="1" max="525600" step="1" value=(schedule.interval_seconds / 60)></label>
+                                    } else {
+                                        <label>"Every (seconds) " <input type="number" name="interval_seconds" data-type=(kind(Field::Number)) required=(true) min="60" max="31536000" step="1" value=(schedule.interval_seconds)></label>
+                                    }
+                                    <label><input type="checkbox" name="enabled" data-type=(kind(Field::Bool)) checked=(schedule.enabled)>" Enabled"</label>
+                                )
+                                command_form(command: format!("DELETE /api/v2/schedules/{}", schedule.id), label: "Remove schedule", if_match: Some(schedule.etag.clone()), class: Some("command inline"))
+                            </li>
+                        }
+                    </ul>
+                }
+                if !library_options.is_empty() {
+                    <h3>"Add a schedule"</h3>
+                    command_form(command: "POST /api/v2/schedules".to_string(), label: "Add schedule", idempotent: true, class: Some("command inline"),
+                        <label>"Library "
+                            <select name="library_id" data-type=(kind(Field::Text))>
+                                for (id, name) in library_options {
+                                    <option value=(id.as_str())>(name.as_str())</option>
+                                }
+                            </select>
+                        </label>
+                        <label>"Task "
+                            <select name="task" data-type=(kind(Field::Text))>
+                                for (value, text) in tasks {
+                                    <option value=(value)>(text)</option>
+                                }
+                            </select>
+                        </label>
+                        <label>"Every (minutes) " <input type="number" name="interval_minutes" data-type=(kind(Field::Minutes)) data-target="interval_seconds" required=(true) min="1" max="525600" step="1" value="1440"></label>
+                        <input type="hidden" name="enabled" data-type=(kind(Field::Json)) value="true">
+                    )
+                }
+            } else {
+                empty(message: "Schedules are unavailable on this server.")
             }
         </section>
     })
@@ -323,6 +465,7 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
     let jobs = facade(cx).0.jobs(who).await.map_err(ui_error)?;
     Ok(view! {
         <h1>"Processing"</h1>
+        <p class="muted">"Prepare a version of a title from its management page. Failed or cancelled work can be retried here."</p>
         if jobs.is_empty() {
             empty(message: "No background work.")
         } else {
@@ -345,6 +488,10 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
                             <td>
                                 if !matches!(job.phase.as_str(), "completed" | "failed" | "cancelled" | "interrupted" | "cancelling") {
                                     command_form(command: format!("POST /api/v2/jobs/{}/cancel", job.id), label: "Cancel", idempotent: true, class: Some("command inline"))
+                                }
+                                // The server retries failed and cancelled jobs only.
+                                if matches!(job.phase.as_str(), "failed" | "cancelled") {
+                                    command_form(command: format!("POST /api/v2/jobs/{}/retry", job.id), label: "Retry", idempotent: true, class: Some("command inline"))
                                 }
                             </td>
                         </tr>
@@ -377,5 +524,363 @@ pub(crate) async fn diagnostics(cx: &Cx) -> Result<impl View> {
             <dt>"Jobs"</dt><dd>(d.running_jobs) " running, " (d.queued_jobs) " queued"</dd>
             <dt>"Worker errors"</dt><dd>(errors.as_str())</dd>
         </dl>
+    })
+}
+
+// --- Title management -------------------------------------------------------
+
+path_param!(item_id);
+
+fn match_state_text(state: &str) -> &'static str {
+    match state {
+        "matched" => "Identified automatically",
+        "manual" => "Identified by hand",
+        "ambiguous" => "Several possible matches — needs review",
+        "unmatched" => "Not identified",
+        _ => "Unknown",
+    }
+}
+
+fn rendition_text(status: &str) -> &'static str {
+    match status {
+        "pending" => "Preparing",
+        "validating" => "Checking the result",
+        "ready" => "Ready",
+        "stale" => "Out of date — the original changed",
+        "failed" => "Failed",
+        "expired" => "Expired",
+        _ => "Unknown",
+    }
+}
+
+fn field_label(field: &str) -> &str {
+    match field {
+        "title" => "Title",
+        "description" => "Description",
+        "release_year" => "Year",
+        "release_date" => "Release date",
+        "cast" => "Cast",
+        "tags" => "Tags",
+        other => other,
+    }
+}
+
+fn source_label(source: &str) -> &str {
+    match source {
+        "scan" => "file name",
+        "nfo" => ".nfo file",
+        "local" => "your edit",
+        other => other,
+    }
+}
+
+fn sources_text(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|s| source_label(s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[component]
+async fn membership(
+    rows: Vec<MembershipRow>,
+    command_base: &'static str,
+    add: &'static str,
+    remove: &'static str,
+) -> Result<impl View> {
+    Ok(view! {
+        <ul class="rows">
+            for row in rows {
+                <li>
+                    <strong>(row.name.as_str())</strong>
+                    if row.contains { <span class="muted">" · includes this title"</span> }
+                    command_form(command: format!("PUT {command_base}/{}", row.id), label: if row.contains { remove } else { add }, if_match: Some(row.etag.clone()), json_body: Some(row.toggle_body.clone()), class: Some("command inline"))
+                </li>
+            }
+        </ul>
+    })
+}
+
+#[page("/item/{item_id}/manage")]
+pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
+    let who = principal(cx)?;
+    let id = path_param::<ItemId>(cx);
+    let model = facade(cx).0.manage_item(who, id).await.map_err(ui_error)?;
+    let item_id = model.item.id.clone();
+    let back = format!("/item/{item_id}");
+    let can_write = who.can("catalog:write");
+    let can_prepare = who.can("processing:request");
+    let can_organize = who.can("collections:write");
+    let recipes = model.recipes.clone().unwrap_or_default();
+    Ok(view! {
+        <a class="back-link" href=(back.as_str())>"Back to title"</a>
+        <h1>"Manage “" (model.item.title.as_str()) "”"</h1>
+        <p class="muted">(match_state_text(&model.match_state))
+            if model.item.availability != Availability::Available { " · " (availability_text(model.item.availability)) }
+        </p>
+
+        if can_write {
+            <section aria-labelledby="details-heading">
+                <h2 id="details-heading">"Details"</h2>
+                if let Some(metadata) = &model.metadata {
+                    if !metadata.effective.is_empty() {
+                        <dl class="facts">
+                            for (field, value) in metadata.effective.iter() {
+                                <dt>(field_label(field))</dt>
+                                <dd>(value.as_str())
+                                    if let Some((_, origins)) = metadata.field_sources.iter().find(|(f, _)| f == field) {
+                                        <span class="muted small">" · from " (sources_text(origins))</span>
+                                    }
+                                </dd>
+                            }
+                        </dl>
+                    }
+                    <p class="muted small">"Your edits are kept separately and survive rescans. Values read from file names and .nfo files are refreshed by each scan; a blank field here leaves those values in place."</p>
+                    command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/metadata/contributions/local"), label: "Save details", if_match: Some(metadata.etag.clone()), class: Some("command stacked"),
+                        <input type="hidden" name="values" data-type=(kind(Field::Json)) value=(metadata.preserved_values.as_str())>
+                        <label>"Title " <input name="values.title" data-type=(kind(Field::Optional)) maxlength="500" value=(metadata.title.as_str())></label>
+                        <label>"Year " <input type="number" name="values.release_year" data-type=(kind(Field::OptionalInt)) min="1" max="9999" step="1" value=(metadata.release_year.as_str())></label>
+                        <label>"Description " <textarea name="values.description" data-type=(kind(Field::Optional)) maxlength="8000" rows="4">(metadata.description.as_str())</textarea></label>
+                        <label>"Tags " <input name="tags" data-type=(kind(Field::List)) value=(metadata.tags.join(", ")) placeholder="noir, festival"></label>
+                        <label>"Hide tags " <input name="excluded_tags" data-type=(kind(Field::List)) value=(metadata.excluded_tags.join(", "))></label>
+                        <input type="hidden" name="locked_fields" data-type=(kind(Field::Json)) value="[]">
+                    )
+                    command_form(command: format!("POST /api/v2/catalog/items/{item_id}/metadata/refresh"), label: "Re-read .nfo files", idempotent: true, class: Some("command inline"))
+                } else {
+                    empty(message: "Details are unavailable right now.")
+                }
+            </section>
+
+            <section aria-labelledby="artwork-heading">
+                <h2 id="artwork-heading">"Artwork"</h2>
+                if let Some(artwork) = &model.artwork {
+                    if artwork.is_empty() {
+                        empty(message: "No artwork yet.")
+                    } else {
+                        <ul class="artwork-grid">
+                            for art in artwork.iter() {
+                                <li class=(if art.selected { "artwork is-selected" } else { "artwork" })>
+                                    <img src=(art.content_url.as_str()) alt="" loading="lazy" decoding="async">
+                                    if art.selected {
+                                        <p class="small">"Current poster"</p>
+                                    } else {
+                                        command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/artwork/selection"), label: "Use as poster", if_match: Some(model.item_etag.clone()), class: Some("command inline"),
+                                            <input type="hidden" name="role" data-type=(kind(Field::Text)) value="poster">
+                                            <input type="hidden" name="asset_id" data-type=(kind(Field::Text)) value=(art.id.as_str())>
+                                        )
+                                    }
+                                </li>
+                            }
+                        </ul>
+                    }
+                    command_form(command: format!("POST /api/v2/catalog/items/{item_id}/artwork"), label: "Upload", idempotent: true, file_body: true, class: Some("command inline"),
+                        <label>"Image " <input type="file" name="file" accept="image/png,image/jpeg,image/webp" required=(true)></label>
+                    )
+                    <p class="muted small">"PNG, JPEG or WebP, up to 8 MB. Online artwork providers are not available yet."</p>
+                } else {
+                    empty(message: "Artwork is unavailable right now.")
+                }
+            </section>
+
+            <section aria-labelledby="identify-heading">
+                <h2 id="identify-heading">"Identification"</h2>
+                if let Some(files) = &model.files {
+                    if files.is_empty() {
+                        empty(message: "This title has no files you can identify.")
+                    } else {
+                        <p class="muted small">"Look for other titles in this library that this file belongs to. Proposals appear under Matches, where accepting one moves the file to that title. Online providers are not available yet."</p>
+                        <ul class="rows">
+                            for file in files.iter() {
+                                <li>(file.label.as_str()) " · " (availability_text(file.availability))
+                                    if file.library_id.is_empty() {
+                                        <span class="muted small">" · not in a library you can manage"</span>
+                                    } else {
+                                        command_form(command: "POST /api/v2/catalog/matches".to_string(), label: "Find matches", idempotent: true, class: Some("command inline"),
+                                            <input type="hidden" name="file" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": file.file_id, "file_revision": file.file_revision}).to_string())>
+                                            <input type="hidden" name="library_id" data-type=(kind(Field::Text)) value=(file.library_id.as_str())>
+                                            <input type="hidden" name="provider" data-type=(kind(Field::Json)) value="null">
+                                        )
+                                    }
+                                </li>
+                            }
+                        </ul>
+                        <p><a href="/matches">"Review matches"</a></p>
+                    }
+                } else {
+                    empty(message: "Files are unavailable right now.")
+                }
+            </section>
+        }
+
+        if can_prepare {
+            <section aria-labelledby="prepare-heading">
+                <h2 id="prepare-heading">"Prepared versions"</h2>
+                if let Some(timelines) = &model.timelines {
+                    <p class="muted small">"A prepared version is converted once and kept, so it plays without converting live. The chosen audio track is kept exactly; subtitles cannot be included in prepared versions yet."</p>
+                    for timeline in timelines.iter() {
+                        <section class="edition" aria-label=(format!("Edition {}", timeline.edition))>
+                            <h3>(timeline.edition.as_str())</h3>
+                            if let Some(renditions) = &timeline.renditions {
+                                if renditions.is_empty() {
+                                    <p class="muted">"No prepared versions."</p>
+                                } else {
+                                    <ul class="rows">
+                                        for rendition in renditions.iter() {
+                                            <li data-rendition-status=(rendition.status.as_str())>(rendition_text(&rendition.status))
+                                                <span class="muted small">" · job " (rendition.job_id.as_str())</span></li>
+                                        }
+                                    </ul>
+                                }
+                            } else {
+                                <p class="muted">"Existing prepared versions cannot be listed right now."</p>
+                            }
+                            if timeline.sources.is_empty() {
+                                <p class="muted">"No original file of this edition can be prepared."</p>
+                            }
+                            if recipes.is_empty() && !timeline.sources.is_empty() {
+                                <p class="muted">"Preparation recipes are unavailable."</p>
+                            }
+                            if !recipes.is_empty() {
+                                for source in timeline.sources.iter() {
+                                    command_form(command: "POST /api/v2/processing/preparations".to_string(), label: "Prepare", idempotent: true, class: Some("command inline"),
+                                        <input type="hidden" name="source" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": source.file_id, "file_revision": source.file_revision}).to_string())>
+                                        <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline.id.as_str())>
+                                        <span class="small">(source.label.as_str())</span>
+                                        <label>"Recipe "
+                                            <select name="recipe_id" data-type=(kind(Field::Text))>
+                                                for recipe in recipes.iter() {
+                                                    <option value=(recipe.id.as_str())>(recipe.name.as_str()) if recipe.qualification != "qualified" { " (" (recipe.qualification.as_str()) ")" }</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        <label>"Audio "
+                                            <select name="tracks.audio_track_id" data-type=(kind(Field::Nullable))>
+                                                <option value="">"Default track"</option>
+                                                for (track, label) in source.audio_tracks.iter() {
+                                                    <option value=(track.as_str())>(label.as_str())</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        <input type="hidden" name="tracks.audio_component_id" data-type=(kind(Field::Json)) value="null">
+                                        <input type="hidden" name="tracks.subtitle_component_id" data-type=(kind(Field::Json)) value="null">
+                                        <input type="hidden" name="tracks.subtitle_track_id" data-type=(kind(Field::Json)) value="null">
+                                        <input type="hidden" name="tracks.subtitle_policy" data-type=(kind(Field::Text)) value="off">
+                                    )
+                                }
+                            }
+                        </section>
+                    }
+                } else {
+                    empty(message: "Preparation is unavailable right now.")
+                }
+            </section>
+        }
+
+        if can_organize {
+            <section aria-labelledby="organize-heading">
+                <h2 id="organize-heading">"Collections and playlists"</h2>
+                if let Some(collections) = model.collections.clone() {
+                    if collections.is_empty() {
+                        <p class="muted">"No manual collections for this profile. " <a href="/organize">"Create one"</a></p>
+                    } else {
+                        <h3>"Collections"</h3>
+                        membership(rows: collections, command_base: "/api/v2/collections", add: "Add to collection", remove: "Remove from collection")
+                    }
+                } else {
+                    empty(message: "Collections are unavailable right now.")
+                }
+                if let Some(playlists) = model.playlists.clone() {
+                    if !playlists.is_empty() {
+                        <h3>"Playlists"</h3>
+                        membership(rows: playlists, command_base: "/api/v2/playlists", add: "Add to playlist", remove: "Remove from playlist")
+                    }
+                } else {
+                    empty(message: "Playlists are unavailable right now.")
+                }
+            </section>
+        }
+    })
+}
+
+// --- Collections and playlists ----------------------------------------------
+
+#[page("/organize")]
+pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
+    let who = principal(cx)?;
+    let model = facade(cx).0.organize(who).await.map_err(ui_error)?;
+    let profile = model.profile_id.clone();
+    Ok(view! {
+        <h1>"Collections and playlists"</h1>
+        <p class="muted">"These belong to the current profile. Add titles from a title’s Manage page. Titles you cannot see stay in place when you edit."</p>
+        <section aria-labelledby="collections-heading">
+            <h2 id="collections-heading">"Collections"</h2>
+            if model.collections.is_empty() {
+                empty(message: "No collections yet.")
+            } else {
+                for collection in model.collections {
+                    <section class="collection" aria-labelledby=(format!("col-{}", collection.id))>
+                        <h3 id=(format!("col-{}", collection.id))>(collection.name.as_str())
+                            if collection.kind == "smart" { <span class="muted small">" · smart"</span> }
+                        </h3>
+                        if collection.kind == "smart" {
+                            <p class="muted">"Its titles follow a saved filter, which can be changed through the API only."</p>
+                        } else if collection.items.is_empty() {
+                            <p class="muted">"Empty."</p>
+                        } else {
+                            <ul class="rows">
+                                for (item, remove) in collection.items.iter().zip(collection.remove_bodies.iter()) {
+                                    <li><a href=(format!("/item/{}", item.id))>(item.title.as_str())</a>
+                                        command_form(command: format!("PUT /api/v2/collections/{}", collection.id), label: "Remove", if_match: Some(collection.etag.clone()), json_body: Some(remove.clone()), class: Some("command inline"))
+                                    </li>
+                                }
+                            </ul>
+                        }
+                        command_form(command: format!("DELETE /api/v2/collections/{}", collection.id), label: "Delete collection", if_match: Some(collection.etag.clone()), class: Some("command inline"))
+                    </section>
+                }
+            }
+            <h3>"New collection"</h3>
+            command_form(command: "POST /api/v2/collections".to_string(), label: "Create collection", idempotent: true, class: Some("command inline"),
+                <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200"></label>
+                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile.as_str())>
+                <input type="hidden" name="kind" data-type=(kind(Field::Text)) value="manual">
+                <input type="hidden" name="item_ids" data-type=(kind(Field::Json)) value="[]">
+                <input type="hidden" name="filter_id" data-type=(kind(Field::Json)) value="null">
+            )
+        </section>
+        <section aria-labelledby="playlists-heading">
+            <h2 id="playlists-heading">"Playlists"</h2>
+            if model.playlists.is_empty() {
+                empty(message: "No playlists yet.")
+            } else {
+                for playlist in model.playlists {
+                    <section class="collection" aria-labelledby=(format!("pl-{}", playlist.id))>
+                        <h3 id=(format!("pl-{}", playlist.id))>(playlist.name.as_str())</h3>
+                        if playlist.entries.is_empty() {
+                            <p class="muted">"Empty."</p>
+                        } else {
+                            <ol class="rows">
+                                for (entry, (remove, up)) in playlist.entries.iter().zip(playlist.entry_bodies.iter()) {
+                                    <li>(entry.title.as_str())
+                                        if let Some(up) = up {
+                                            command_form(command: format!("PUT /api/v2/playlists/{}", playlist.id), label: "Move up", if_match: Some(playlist.etag.clone()), json_body: Some(up.clone()), class: Some("command inline"))
+                                        }
+                                        command_form(command: format!("PUT /api/v2/playlists/{}", playlist.id), label: "Remove", if_match: Some(playlist.etag.clone()), json_body: Some(remove.clone()), class: Some("command inline"))
+                                    </li>
+                                }
+                            </ol>
+                        }
+                        command_form(command: format!("DELETE /api/v2/playlists/{}", playlist.id), label: "Delete playlist", if_match: Some(playlist.etag.clone()), class: Some("command inline"))
+                    </section>
+                }
+            }
+            <h3>"New playlist"</h3>
+            command_form(command: "POST /api/v2/playlists".to_string(), label: "Create playlist", idempotent: true, class: Some("command inline"),
+                <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200"></label>
+                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile.as_str())>
+                <input type="hidden" name="entries" data-type=(kind(Field::Json)) value="[]">
+            )
+        </section>
     })
 }

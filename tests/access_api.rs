@@ -3270,7 +3270,7 @@ async fn topcoat_item_details_use_scoped_catalog_and_production_viewing_state() 
 }
 
 #[tokio::test]
-async fn topcoat_sources_use_authorized_reads_and_report_missing_scan_service() {
+async fn topcoat_sources_use_authorized_reads_and_offer_scans() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let app = api::router_with(
         f.app.clone(),
@@ -3301,10 +3301,13 @@ async fn topcoat_sources_use_authorized_reads_and_report_missing_scan_service() 
         assert!(!html.contains("Development mock"));
         if expected == StatusCode::OK {
             assert!(html.contains("Movies"), "{html}");
-            assert!(html.contains("Scanning is unavailable on this server."));
+            // The scan service is served, so the page offers it and reports
+            // an empty history as such rather than as unavailable.
+            assert!(!html.contains("Scanning is unavailable on this server."));
+            assert!(html.contains("No scans yet."), "{html}");
             assert!(html.contains("POST /api/v2/sources"));
-            assert!(!html.contains("Scan now"));
-            assert!(!html.contains("No recent scans"));
+            assert!(html.contains("Scan now"));
+            assert!(html.contains("Nothing runs on a schedule."), "{html}");
         } else {
             assert!(!html.contains(f._dir.path().to_str().unwrap()));
             assert!(!html.contains("POST /api/v2/sources"));
