@@ -278,8 +278,11 @@ func start(t *testing.T, f *fake, w, h int) Model {
 	t.Helper()
 	m := New(context.Background(), f, "http://srv", nil)
 	m, _ = update(t, m, tea.WindowSizeMsg{Width: w, Height: h})
-	// Init without the poll and animation ticks, which never finish.
-	return drain(t, m, tea.Batch(m.reloadAll(), m.poll()))
+	// Init without the poll and animation ticks, which never finish. The
+	// console opens with the sidebar focused; these tests start on the page.
+	m = drain(t, m, tea.Batch(m.reloadAll(), m.poll()))
+	m.focus = focusContent
+	return m
 }
 
 // goTo opens a top-level page as the sidebar does, including the layout
@@ -589,7 +592,7 @@ func TestPlaybackLaunchUsesNoCredentialAndRequiresCapability(t *testing.T) {
 	m = drain(t, m, m.load(keySession))
 	id := "timeline/猫"
 	m.cache.slots[keyCatalog] = &slot{data: []api.CatalogItem{{ID: "film", DefaultTimelineID: &id}}}
-	m.route = route{page: pageCatalog}
+	m.route, m.focus = route{page: pageCatalog}, focusContent
 	m.profile = "p/1"
 	target := ""
 	m.openBrowser = func(_ context.Context, url string) error { target = url; return nil }
@@ -654,7 +657,7 @@ func TestPermissionGatedScreensAppearOnlyWhenAllowed(t *testing.T) {
 		t.Fatalf("navigation ignores permissions:\n%s", v)
 	}
 	m = start(t, &fake{permissions: []string{api.PermSystemAdmin}}, 120, 40)
-	if v := screen(m); !strings.Contains(v, "Devices") || !strings.Contains(v, "Sources") || !strings.Contains(v, "JOBS") {
+	if v := screen(m); !strings.Contains(v, "Devices") || !strings.Contains(v, "Sources") || !strings.Contains(v, "Deliveries") {
 		t.Fatalf("administrator screens missing:\n%s", v)
 	}
 }
@@ -912,7 +915,7 @@ func TestEditedSearchNeverShowsOlderResults(t *testing.T) {
 func TestNarrowScanDetailRepeatsDroppedColumns(t *testing.T) {
 	m := start(t, &fake{permissions: []string{api.PermSourcesManage}}, 44, 20)
 	m = goTo(t, m, route{page: pageScans})
-	if v := screen(m); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0 files") {
+	if v := screen(m); !strings.Contains(v, "complete") || !strings.Contains(v, "0 of 0") || !strings.Contains(v, "verified") {
 		t.Fatalf("scan detail lost dropped fields:\n%s", v)
 	}
 }
@@ -984,7 +987,7 @@ func TestOverviewPollsOnlyForAdministrators(t *testing.T) {
 		t.Fatalf("diagnostics polls: %d", f.diagCalls)
 	}
 	v := screen(m)
-	for _, want := range []string{"JOBS", "1 running", "2 queued", "DELIVERIES", "FREE SPACE", "210 GB", "aren't reported by this server", "Sampled while this window is open", "Recent failures", "Work in progress"} {
+	for _, want := range []string{"Jobs", "1 running", "2 queued", "Deliveries", "Free space", "210 GB", "-5m", "now", "aren't reported by this server", "Sampled while this window is open", "Recent failures", "Work in progress"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("overview lacks %q:\n%s", want, v)
 		}
@@ -1080,7 +1083,7 @@ func TestSignOutForgetsMetrics(t *testing.T) {
 	f := &fake{permissions: []string{api.PermSystemAdmin}}
 	m := pollAgain(t, start(t, f, 120, 40))
 	m, _ = update(t, m, streamMsg{state: "stopped", err: &api.Problem{Status: 401}})
-	if len(m.metrics.series) != 0 || strings.Contains(screen(m), "JOBS") {
+	if len(m.metrics.series) != 0 || strings.Contains(screen(m), "Deliveries") {
 		t.Fatal("metrics survived sign-out")
 	}
 }
@@ -1100,7 +1103,7 @@ func TestLosingAdminAndNullFieldsHideMetrics(t *testing.T) {
 	// Permission withdrawn on the next session refresh.
 	f.permissions = []string{api.PermCatalogRead}
 	m = drain(t, m, m.load(keySession))
-	if v := screen(m); strings.Contains(v, "JOBS") || strings.Contains(v, "Recent failures") || len(m.metrics.series) != 0 {
+	if v := screen(m); strings.Contains(v, "Deliveries") || strings.Contains(v, "Recent failures") || len(m.metrics.series) != 0 {
 		t.Fatalf("admin metrics survived losing system:admin:\n%s", v)
 	}
 }
@@ -1164,5 +1167,111 @@ func TestServerHistoryKeepsNewerLiveSamples(t *testing.T) {
 	}
 	if s := h.series[mDatabase]; len(s) != 2 || s[0].v != 5 || s[1].v != 1 {
 		t.Fatalf("merge: %v", s)
+	}
+}
+
+func TestConsoleOpensWithTheSidebarFocused(t *testing.T) {
+	m := New(context.Background(), &fake{}, "http://srv", nil)
+	if m.focus != focusNav || m.route.page != pageOverview {
+		t.Fatalf("focus %v route %+v", m.focus, m.route)
+	}
+	m = press(t, m, "tab")
+	if m.focus != focusContent {
+		t.Fatal("tab did not move to the page")
+	}
+	m = press(t, m, "tab")
+	if m.focus != focusNav {
+		t.Fatal("tab did not move back to the sidebar")
+	}
+}
+
+func TestAreaGraphAndPanelsFillTheirSpace(t *testing.T) {
+	now := time.Now()
+	pts := []point{{t: now.Add(-4 * time.Minute), v: 10}, {t: now.Add(-3 * time.Minute), v: 80}, {t: now.Add(-10 * time.Second), v: 40}}
+	rows := areaGraph(pts, now, 5*time.Minute, 40, 4, graphScale{top: 100}, rampCPU)
+	if len(rows) != 4 {
+		t.Fatalf("rows %d", len(rows))
+	}
+	for _, r := range rows {
+		if w := lipgloss.Width(r); w != 40 {
+			t.Fatalf("width %d: %q", w, ansi.Strip(r))
+		}
+	}
+	// The 80 sample reaches the top row; the minute between samples is a gap.
+	if !strings.ContainsAny(ansi.Strip(rows[0]), "⣿⣶⣤⣀⡀⢀⣠⣴⣾⢸⡇⣷⣯⣟⡿⢿⣻⣽⣾") {
+		t.Fatalf("peak missing: %q", ansi.Strip(rows[0]))
+	}
+	box := panel("CPU", "41%", colorAccent, rows, 44)
+	for _, l := range box {
+		if w := lipgloss.Width(l); w != 44 {
+			t.Fatalf("panel width %d: %q", w, ansi.Strip(l))
+		}
+	}
+	if !strings.Contains(ansi.Strip(box[0]), "CPU") || !strings.Contains(ansi.Strip(box[0]), "41%") {
+		t.Fatalf("title %q", ansi.Strip(box[0]))
+	}
+}
+
+func TestSpringsGlideAndSettleOnTheTarget(t *testing.T) {
+	s := newSprings()
+	if s.aim("x", 10) || s.value("x", 10) != 10 {
+		t.Fatal("first value should not animate")
+	}
+	if !s.aim("x", 20) {
+		t.Fatal("change did not start the frame loop")
+	}
+	s.step()
+	if v := s.value("x", 20); v <= 10 || v >= 20 {
+		t.Fatalf("not gliding: %v", v)
+	}
+	for i := 0; i < 200 && s.step(); i++ {
+	}
+	if s.value("x", 20) != 20 || s.running {
+		t.Fatal("did not settle on the target")
+	}
+}
+
+func TestMouseClicksTheSidebarAndWheelScrolls(t *testing.T) {
+	m := start(t, &fake{titles: 40, permissions: []string{api.PermSystemAdmin}}, 120, 30)
+	_, index := m.sidebarRows(navWidth, 29, false)
+	row := -1
+	for y, i := range index {
+		if i >= 0 && m.navEntries()[i].route.page == pageCatalog {
+			row = y
+		}
+	}
+	m, cmd := update(t, m, tea.MouseClickMsg{X: 4, Y: row, Button: tea.MouseLeft})
+	m = drain(t, m, cmd)
+	if m.route.page != pageCatalog || m.focus != focusNav {
+		t.Fatalf("click opened %+v focus %v", m.route, m.focus)
+	}
+	m, _ = update(t, m, tea.MouseClickMsg{X: 60, Y: 10, Button: tea.MouseLeft})
+	if m.focus != focusContent {
+		t.Fatal("clicking the page did not focus it")
+	}
+	m, _ = update(t, m, tea.MouseWheelMsg{X: 60, Y: 10, Button: tea.MouseWheelDown})
+	if m.sel == 0 {
+		t.Fatal("wheel did not move down the grid")
+	}
+}
+
+func TestUnfocusedTerminalSlowsPollingAndTitleSummarises(t *testing.T) {
+	f := &fake{permissions: []string{api.PermSystemAdmin}}
+	m := start(t, f, 120, 40)
+	m, _ = update(t, m, tea.BlurMsg{})
+	for _, s := range m.cache.slots {
+		s.at = s.at.Add(-5 * time.Second) // due at the normal interval, not the background one
+	}
+	before := f.diagCalls
+	m = drain(t, m, m.poll())
+	if f.diagCalls != before {
+		t.Fatal("polled at full rate while unfocused")
+	}
+	m, cmd := update(t, m, tea.FocusMsg{})
+	if cmd == nil || m.blurred {
+		t.Fatal("focus did not resume")
+	}
+	if title := m.View().WindowTitle; !strings.HasPrefix(title, "Motion · srv") || !strings.Contains(title, "running") {
+		t.Fatalf("title %q", title)
 	}
 }

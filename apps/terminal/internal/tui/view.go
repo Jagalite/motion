@@ -20,6 +20,7 @@ const (
 	railWidth  = 6
 	wideScreen = 100
 	railScreen = 70
+	minRail    = 40
 )
 
 var (
@@ -61,7 +62,9 @@ func (m Model) frame() frame {
 		f.nav = navWidth
 	case w >= railScreen && m.focus == focusNav:
 		f.nav = navWidth
-	case w >= railScreen:
+	case w >= minRail:
+		// The page stays visible beside an icon rail, since moving through
+		// the sidebar switches pages as it goes.
 		f.nav, f.rail = railWidth, true
 	default:
 		f.overlay = m.focus == focusNav
@@ -256,7 +259,27 @@ func (m Model) sessionProblem() error {
 func (m Model) View() tea.View {
 	v := tea.NewView(m.render())
 	v.AltScreen = true
+	v.ReportFocus = true
+	v.MouseMode = tea.MouseModeCellMotion
+	v.WindowTitle = m.windowTitle()
 	return v
+}
+
+// windowTitle summarises the server for the terminal's tab or title bar.
+func (m Model) windowTitle() string {
+	title := "Motion · " + host(m.server)
+	switch {
+	case m.sessionProblem() != nil:
+		return title + " · offline"
+	case m.admin():
+		if p, ok := m.metrics.latest(mRunning); ok {
+			title += " · " + countText(p.v) + " running"
+		}
+		if d, ok := data[api.Diagnostics](m, keyDiagnostics); ok && len(d.WorkerErrors) > 0 {
+			title += " · " + plural(len(d.WorkerErrors), "failure", "failures")
+		}
+	}
+	return title
 }
 
 // render draws the whole console at the terminal size.
@@ -399,52 +422,40 @@ func (m Model) topbar(f frame) string {
 
 // sidebar lists the navigation entries, foot entries pinned to the bottom.
 func (m Model) sidebar(width, height int, rail bool) []string {
+	lines, _ := m.sidebarRows(width, height, rail)
+	return lines
+}
+
+// sidebarRows lists the sidebar's lines and, for each, the entry it shows
+// (-1 for none), scrolled when the terminal is too short to show them all.
+func (m Model) sidebarRows(width, height int, rail bool) ([]string, []int) {
 	entries := m.navEntries()
 	current := m.section()
-	var main, foot []string
-	cursorLine := 0
-	group := ""
-	for i, e := range entries {
-		if e.group != group && e.group != "foot" {
-			main = append(main, "")
-			if !rail && e.group != "" {
-				main = append(main, " "+headingStyle.Render(strings.ToUpper(e.group)))
-			}
-		}
-		group = e.group
-		line := m.navLine(e, width, rail, e.route == current, m.focus == focusNav && i == m.navSel)
-		if e.group == "foot" {
-			if m.focus == focusNav && i == m.navSel {
-				cursorLine = -1 - len(foot)
-			}
-			foot = append(foot, line)
-			continue
-		}
-		if m.focus == focusNav && i == m.navSel {
-			cursorLine = len(main)
-		}
-		main = append(main, line)
-	}
 	brand := " " + accentStyle.Render("▶") + " " + titleStyle.Render("Motion")
 	if rail {
 		brand = "  " + accentStyle.Render("▶")
 	}
-	top := []string{"", brand}
-	if len(top)+len(main)+len(foot)+2 <= height {
-		lines := append(top, main...)
-		for len(lines) < height-len(foot)-1 {
-			lines = append(lines, "")
+	lines, index := []string{"", brand}, []int{-1, -1}
+	group, target := "", 0
+	for i, e := range entries {
+		if e.group != group {
+			lines, index = append(lines, ""), append(index, -1)
+			if !rail && e.group != "" {
+				lines, index = append(lines, " "+headingStyle.Render(strings.ToUpper(e.group))), append(index, -1)
+			}
+			group = e.group
 		}
-		return append(append(lines, " "+ruleStyle.Render(strings.Repeat("─", max(width-2, 1)))), foot...)
+		cursor := m.focus == focusNav && i == m.navSel
+		if cursor || (m.focus != focusNav && e.route == current) {
+			target = len(lines)
+		}
+		lines, index = append(lines, m.navLine(e, width, rail, e.route == current, cursor)), append(index, i)
 	}
-	// Too short for everything: one list, scrolled to keep the cursor visible.
-	all := append(append(top, main...), append([]string{""}, foot...)...)
-	at := cursorLine + len(top)
-	if cursorLine < 0 {
-		at = len(top) + len(main) + 1 + (-1 - cursorLine)
+	if len(lines) <= height {
+		return lines, index
 	}
-	start := min(max(at-height/2, 0), max(len(all)-height, 0))
-	return all[start:min(start+height, len(all))]
+	start := min(max(target-height/2, 0), len(lines)-height)
+	return lines[start : start+height], index[start : start+height]
 }
 
 func (m Model) navLine(e navEntry, width int, rail, current, cursor bool) string {

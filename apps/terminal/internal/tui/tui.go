@@ -117,6 +117,10 @@ type Model struct {
 	bars    map[string]*progress.Model
 	window  int
 	beat    int
+	anim    *springs
+	// blurred is set while the terminal reports it does not have focus:
+	// polling slows and animation pauses until it returns.
+	blurred bool
 }
 
 func New(ctx context.Context, backend Backend, server string, incoming <-chan tea.Msg) Model {
@@ -146,7 +150,9 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 		search: search, help: h, table: tbl, vp: viewport.New(),
 		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
 		cancelling: map[string]bool{}, stream: "connecting",
-		metrics: newHistory(), bars: map[string]*progress.Model{},
+		metrics: newHistory(), bars: map[string]*progress.Model{}, anim: newSprings(),
+		// The console opens with the sidebar focused; tab moves to the page.
+		focus: focusNav,
 	}
 }
 
@@ -312,11 +318,29 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	case pollMsg:
 		return tea.Batch(m.poll(), pollTick())
 	case beatMsg:
+		if m.blurred {
+			return nil // resumes on focus
+		}
 		m.beat++
 		if m.working() {
 			return tea.Batch(beatTick(), m.spin())
 		}
 		return beatTick()
+	case animMsg:
+		if m.anim.step() && !m.blurred {
+			return animTick()
+		}
+	case tea.BlurMsg:
+		m.blurred = true
+	case tea.FocusMsg:
+		if m.blurred {
+			m.blurred = false
+			return tea.Batch(m.poll(), beatTick())
+		}
+	case tea.MouseClickMsg:
+		return m.click(msg.Mouse())
+	case tea.MouseWheelMsg:
+		return m.wheel(msg.Mouse())
 	case progress.FrameMsg:
 		return m.animate(msg)
 	case loaded:
@@ -852,4 +876,49 @@ func Run(ctx context.Context, conn *cli.Conn) error {
 		return ctx.Err()
 	}
 	return err
+}
+
+// click focuses what was clicked: a sidebar entry opens its page.
+func (m *Model) click(mouse tea.Mouse) tea.Cmd {
+	if mouse.Button != tea.MouseLeft {
+		return nil
+	}
+	f := m.frame()
+	_, h := m.dims()
+	if mouse.Y >= h-1 {
+		return nil
+	}
+	inSidebar := f.overlay || (f.nav > 0 && mouse.X < f.nav)
+	if !inSidebar {
+		m.focus = focusContent
+		return nil
+	}
+	width, rail := f.nav, f.rail
+	if f.overlay {
+		width, rail = f.content, false
+	}
+	_, index := m.sidebarRows(width, h-1, rail)
+	if mouse.Y >= len(index) || index[mouse.Y] < 0 {
+		return nil
+	}
+	m.focus, m.navSel = focusNav, index[mouse.Y]
+	if r := m.navEntries()[m.navSel].route; r != m.section() {
+		return m.navigate(r)
+	}
+	return nil
+}
+
+// wheel scrolls the page under the pointer as the arrow keys do.
+func (m *Model) wheel(mouse tea.Mouse) tea.Cmd {
+	f := m.frame()
+	if f.overlay || (f.nav > 0 && mouse.X < f.nav) {
+		return nil
+	}
+	switch mouse.Button {
+	case tea.MouseWheelUp:
+		return m.contentKey(tea.KeyPressMsg{Code: tea.KeyUp})
+	case tea.MouseWheelDown:
+		return m.contentKey(tea.KeyPressMsg{Code: tea.KeyDown})
+	}
+	return nil
 }

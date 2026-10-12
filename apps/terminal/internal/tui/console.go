@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // The console polls what has no change events: diagnostics, storage and the
@@ -73,6 +74,9 @@ func (m *Model) poll() tea.Cmd {
 		return nil
 	}
 	due := func(key string, every time.Duration) bool {
+		if m.blurred {
+			every = max(every, 15*time.Second) // in the background: slower
+		}
 		s := m.cache.slots[key]
 		return s == nil || (!s.loading && time.Since(s.at) >= every-pollEvery/4)
 	}
@@ -101,7 +105,7 @@ func (m *Model) forgetMetrics() {
 	for _, key := range []string{keyDiagnostics, keyStorage, keyMetrics} {
 		m.drop(key)
 	}
-	m.metrics = newHistory()
+	m.metrics, m.anim = newHistory(), newSprings()
 }
 
 // observe folds console data into history and animates job progress.
@@ -110,10 +114,13 @@ func (m *Model) observe(msg loaded) tea.Cmd {
 	switch v := msg.data.(type) {
 	case api.Diagnostics:
 		m.metrics.observeDiagnostics(now, v)
+		return m.glide(now)
 	case api.StorageReport:
 		m.metrics.observeStorage(now, v)
+		return m.glide(now)
 	case api.MetricsHistory:
 		m.metrics.replace(v)
+		return m.glide(now)
 	case []api.Job:
 		var cmds []tea.Cmd
 		live := map[string]bool{}
@@ -142,6 +149,22 @@ func (m *Model) observe(msg loaded) tea.Cmd {
 	return nil
 }
 
+// glide aims each tile's spring at its new value.
+func (m *Model) glide(now time.Time) tea.Cmd {
+	start := false
+	for _, row := range m.tiles(now) {
+		for _, t := range row {
+			if t.has() && m.anim.aim(t.id, t.num) {
+				start = true
+			}
+		}
+	}
+	if start && !m.blurred {
+		return animTick()
+	}
+	return nil
+}
+
 // animate advances the progress bar springs.
 func (m *Model) animate(msg progress.FrameMsg) tea.Cmd {
 	var cmds []tea.Cmd
@@ -159,19 +182,25 @@ func (m Model) flashing(id string) bool {
 	return ok && time.Since(t) < flashFor
 }
 
-// tile is one metric: a label, a value, a chart and a note.
+// tile is one metric: its current value (animated as it changes), its
+// history and how to draw both. A tile without format has no value yet.
 type tile struct {
 	label   string
-	value   string
+	id      string
+	num     float64
+	format  func(float64) string
 	unit    string
 	note    string
-	id      string
-	series  []point
-	color   color.Color
 	missing string
-	// relative charts span their own range (sizes); others start at zero.
-	relative bool
+	series  []point
+	accent  color.Color
+	colors  ramp
+	scale   graphScale
 }
+
+func (t tile) has() bool { return t.format != nil }
+
+func measuring(float64) string { return "…" }
 
 func (m Model) tiles(now time.Time) [][]tile {
 	h, window := m.metrics, m.windowSpan()
@@ -181,77 +210,75 @@ func (m Model) tiles(now time.Time) [][]tile {
 	}
 	unreported := "Not reported by this server"
 	waiting := "Waiting for a sample"
-	cpu := tile{label: "CPU", id: mCPU, unit: "%", color: colorAccent, missing: unreported}
+	pct := func(v float64) string { return fmt.Sprintf("%.1f", v) }
+	cpu := tile{label: "CPU", id: mCPU, unit: "%", accent: colorAccent, colors: rampCPU, scale: graphScale{nice: true}, missing: unreported}
 	// Rates only for fields reported now, never a stale one.
 	if _, reported := latest(mCPU); reported {
 		if r := h.values(mCPU, now, window); len(r) > 0 {
-			pct := make([]point, len(r))
+			series := make([]point, len(r))
 			peak := 0.0
 			for i, p := range r {
-				pct[i] = point{t: p.t, v: p.v * 100}
+				series[i] = point{t: p.t, v: p.v * 100}
 				peak = math.Max(peak, p.v*100)
 			}
-			cpu.series, cpu.value = pct, fmt.Sprintf("%.1f", pct[len(pct)-1].v)
-			cpu.note = fmt.Sprintf("peak %.0f%%", peak)
+			cpu.series, cpu.num, cpu.format = series, series[len(series)-1].v, pct
+			cpu.note = fmt.Sprintf("peak %.0f%% · 100%% is one core", peak)
 		} else {
-			cpu.value, cpu.note = "…", "measuring"
+			cpu.format, cpu.note = measuring, "measuring"
 		}
 	}
-	mem := tile{label: "Memory", id: mMemory, color: colorInfo, missing: unreported, relative: true}
+	mem := tile{label: "Memory", id: mMemory, accent: colorInfo, colors: rampInfo, scale: graphScale{relative: true}, missing: unreported}
 	if v, ok := latest(mMemory); ok {
-		mem.series = h.values(mMemory, now, window)
-		mem.value, mem.unit, _ = strings.Cut(bytesText(v), " ")
+		mem.series, mem.num, mem.format = h.values(mMemory, now, window), v, bytesText
 		peak := 0.0
 		for _, p := range mem.series {
 			peak = math.Max(peak, p.v)
 		}
 		mem.note = "peak " + bytesText(peak)
 	}
-	req := tile{label: "Requests", id: mRequests, unit: "/s", color: colorOK, missing: unreported}
+	req := tile{label: "Requests", id: mRequests, unit: "/s", accent: colorOK, colors: rampRequests, missing: unreported}
 	if _, reported := latest(mRequests); reported {
 		if r := h.values(mRequests, now, window); len(r) > 0 {
-			req.series, req.value = r, countText(r[len(r)-1].v)
+			req.series, req.num, req.format = r, r[len(r)-1].v, countText
 			if v, ok := latest(mInFlight); ok {
 				req.note = countText(v) + " in flight"
 			}
 		} else {
-			req.value, req.note = "…", "measuring"
+			req.format, req.note = measuring, "measuring"
 		}
 	}
-	errs := tile{label: "Server errors", id: mErrors, color: colorDanger, missing: unreported}
+	errs := tile{label: "Server errors", id: mErrors, accent: colorDanger, colors: rampDanger, missing: unreported}
 	if _, reported := latest(mErrors); reported {
 		if n, covered, ok := h.increase(mErrors, now, window); ok {
-			errs.series, errs.value = h.values(mErrors, now, window), countText(n)
+			errs.series, errs.num, errs.format = h.values(mErrors, now, window), n, countText
 			errs.note = "5xx in " + windowText(covered)
 		} else {
-			errs.value, errs.note = "…", "measuring"
+			errs.format, errs.note = measuring, "measuring"
 		}
 	}
-	jobs := tile{label: "Jobs", id: mRunning, color: colorAccent, missing: waiting}
+	jobs := tile{label: "Jobs", id: mRunning, unit: "running", accent: colorAccent, colors: rampAccent, missing: waiting}
 	if v, ok := latest(mRunning); ok {
-		jobs.series, jobs.value, jobs.unit = h.values(mRunning, now, window), countText(v), "running"
+		jobs.series, jobs.num, jobs.format = h.values(mRunning, now, window), v, countText
 		if q, ok := latest(mQueued); ok {
 			jobs.note = countText(q) + " queued"
 		}
 	}
-	del := tile{label: "Deliveries", id: mDeliveries, color: colorInfo, missing: waiting}
+	del := tile{label: "Deliveries", id: mDeliveries, unit: "active", accent: colorInfo, colors: rampInfo, missing: waiting}
 	if v, ok := latest(mDeliveries); ok {
-		del.series, del.value, del.unit, del.note = h.values(mDeliveries, now, window), countText(v), "active", "streams"
+		del.series, del.num, del.format, del.note = h.values(mDeliveries, now, window), v, countText, "streams being served"
 	}
-	busy := tile{label: "Database busy", id: mBusy, color: colorDanger, missing: waiting}
+	busy := tile{label: "Database busy", id: mBusy, accent: colorDanger, colors: rampDanger, missing: waiting}
 	if v, ok := latest(mBusy); ok {
 		if n, covered, ok := h.increase(mBusy, now, window); ok {
-			busy.series, busy.value = h.values(mBusy, now, window), countText(n)
+			busy.series, busy.num, busy.format = h.values(mBusy, now, window), n, countText
 			busy.note = "in " + windowText(covered) + " · " + countText(v) + " total"
 		} else {
-			busy.value, busy.note = "…", countText(v)+" total · measuring"
+			busy.format, busy.note = measuring, countText(v)+" total · measuring"
 		}
 	}
-	disk := tile{label: "Free space", id: mFree, color: colorInfo, missing: waiting, relative: true}
+	disk := tile{label: "Free space", id: mFree, accent: colorInfo, colors: rampInfo, scale: graphScale{relative: true}, missing: waiting}
 	if v, ok := latest(mFree); ok {
-		text := bytesText(v)
-		disk.value, disk.unit, _ = strings.Cut(text, " ")
-		disk.series = h.values(mFree, now, window)
+		disk.num, disk.format, disk.series = v, bytesText, h.values(mFree, now, window)
 		if used, ok := latest(mAssets); ok {
 			db, _ := latest(mDatabase)
 			disk.note = "db " + bytesText(db) + " · assets " + bytesText(used)
@@ -262,16 +289,16 @@ func (m Model) tiles(now time.Time) [][]tile {
 	return [][]tile{{cpu, mem, req, errs}, {jobs, del, busy, disk}}
 }
 
-// renderTile draws a tile width cells wide: label, value, a two-row chart
-// and a note.
-func (m Model) renderTile(t tile, width int, now time.Time) []string {
-	label := lipgloss.NewStyle().Foreground(t.color).Render("▎") + headingStyle.Render(strings.ToUpper(t.label))
-	if t.value == "" {
-		return []string{label, faintStyle.Render("—"), "", truncate(faintStyle.Render(t.missing), width), ""}
+// valueText is a tile's current value as drawn: gliding toward a new value,
+// and briefly highlighted when it changes.
+func (m Model) valueText(t tile) string {
+	if !t.has() {
+		return faintStyle.Render("—")
 	}
-	value := titleStyle.Render(t.value)
+	text := t.format(m.anim.value(t.id, t.num))
+	value := titleStyle.Render(text)
 	if m.flashing(t.id) {
-		value = focusStyle.Render(t.value)
+		value = focusStyle.Render(text)
 	}
 	switch {
 	case strings.HasPrefix(t.unit, "%"), strings.HasPrefix(t.unit, "/"):
@@ -279,84 +306,173 @@ func (m Model) renderTile(t tile, width int, now time.Time) []string {
 	case t.unit != "":
 		value += mutedStyle.Render(" " + t.unit)
 	}
-	chart := sparkline(t.series, now, m.windowSpan(), width, 2, t.color, t.relative)
-	return []string{label, truncate(value, width), chart[0], chart[1], truncate(faintStyle.Render(t.note), width)}
+	return value
 }
 
-// overview is the console's home: live tiles, running work, activity and
-// recent failures.
+// renderTile is a compact metric panel: value in the title bar, a two-row
+// braille graph and a note.
+func (m Model) renderTile(t tile, width int, now time.Time) []string {
+	inner := max(width-4, 1)
+	body := []string{"", truncate(faintStyle.Render(t.missing), inner), ""}
+	if t.has() {
+		graph := areaGraph(t.series, now, m.windowSpan(), inner, 2, t.scale, t.colors)
+		body = []string{graph[0], graph[1], truncate(faintStyle.Render(t.note), inner)}
+	}
+	return panel(t.label, m.valueText(t), t.accent, body, width)
+}
+
+// renderHero is a large graph panel with a time axis.
+func (m Model) renderHero(t tile, width, height int, now time.Time) []string {
+	inner := max(width-4, 1)
+	var body []string
+	if t.has() {
+		body = areaGraph(t.series, now, m.windowSpan(), inner, height, t.scale, t.colors)
+		if !t.scale.relative && len(t.series) > 0 {
+			// The scale's top, set into the graph's first row.
+			label := t.format(scaleTop(t.series, t.scale))
+			if strings.HasPrefix(t.unit, "%") || strings.HasPrefix(t.unit, "/") {
+				label += t.unit
+			}
+			body[0] = faintStyle.Render(label+" ") + ansi.Cut(body[0], ansi.StringWidth(label)+1, inner)
+		}
+		note := faintStyle.Render(t.note)
+		ax := axis(m.windowSpan(), max(inner-ansi.StringWidth(note)-2, 0))
+		body = append(body, note+"  "+ax)
+	} else {
+		body = append(make([]string, height/2), faintStyle.Render(t.missing))
+		for len(body) < height+1 {
+			body = append(body, "")
+		}
+	}
+	return panel(t.label, m.valueText(t), t.accent, body, width)
+}
+
+// side lays blocks out left to right with a gap, padding shorter ones.
+func side(blocks [][]string, widths []int, gap int) []string {
+	height := 0
+	for _, b := range blocks {
+		height = max(height, len(b))
+	}
+	out := make([]string, height)
+	for r := range out {
+		var line strings.Builder
+		for i, b := range blocks {
+			cell := ""
+			if r < len(b) {
+				cell = b[r]
+			}
+			line.WriteString(pad(cell, widths[i]))
+			if i < len(blocks)-1 {
+				line.WriteString(strings.Repeat(" ", gap))
+			}
+		}
+		out[r] = line.String()
+	}
+	return out
+}
+
+// grid lays panels out in rows of cols.
+func grid(panels [][]string, width, cols, gap int) []string {
+	cols = max(min(cols, len(panels)), 1)
+	w := (width - gap*(cols-1)) / cols
+	var out []string
+	for start := 0; start < len(panels); start += cols {
+		end := min(start+cols, len(panels))
+		widths := make([]int, end-start)
+		for i := range widths {
+			widths[i] = w
+		}
+		if end-start == cols {
+			widths[len(widths)-1] = width - gap*(cols-1) - w*(cols-1) // the rest
+		}
+		out = append(out, side(panels[start:end], widths, gap)...)
+	}
+	return out
+}
+
+// overview is the console's home: large graphs for the busiest signals,
+// compact panels for the rest, then work, activity and failures.
 func (m Model) overview(width int) []string {
 	now := time.Now()
+	const gap = 2
 	var lines []string
 	if m.admin() {
-		cols := 4
-		switch {
-		case width < 40:
-			cols = 1
-		case width < 84:
-			cols = 2
-		}
-		const gap = 3
-		tw := (width - gap*(cols-1)) / cols
-		var all []tile
 		rows := m.tiles(now)
 		host := false
 		for _, t := range rows[0] {
-			host = host || t.value != ""
+			host = host || t.has()
 		}
-		if host {
-			all = append(all, rows[0]...)
-		} else {
-			// One quiet line instead of four empty tiles.
+		heroes, rest := []tile{rows[0][0], rows[0][2]}, append([]tile{rows[0][1], rows[0][3]}, rows[1]...)
+		if !host {
+			// Without process metrics the work signals take the large graphs.
+			heroes, rest = []tile{rows[1][0], rows[1][1]}, []tile{rows[1][2], rows[1][3]}
 			for _, l := range words("CPU, memory and request metrics aren't reported by this server.", width) {
 				lines = append(lines, faintStyle.Render(l))
 			}
 			lines = append(lines, "")
 		}
-		all = append(all, rows[1]...)
-		for start := 0; start < len(all); start += cols {
-			var blocks []string
-			for i := start; i < min(start+cols, len(all)); i++ {
-				block := m.renderTile(all[i], tw, now)
-				for n := range block {
-					block[n] = pad(block[n], tw)
-				}
-				blocks = append(blocks, strings.Join(block, "\n"))
-				if i < min(start+cols, len(all))-1 {
-					blocks = append(blocks, strings.Repeat(" ", gap))
-				}
-			}
-			lines = append(lines, strings.Split(lipgloss.JoinHorizontal(lipgloss.Top, blocks...), "\n")...)
-			lines = append(lines, "")
+		_, h := m.dims()
+		gh := 3
+		switch {
+		case h >= 44:
+			gh = 6
+		case h >= 34:
+			gh = 4
 		}
+		if width >= 90 {
+			hw := (width - gap) / 2
+			lines = append(lines, side([][]string{m.renderHero(heroes[0], hw, gh, now), m.renderHero(heroes[1], width-gap-hw, gh, now)}, []int{hw, width - gap - hw}, gap)...)
+		} else {
+			for _, t := range heroes {
+				lines = append(lines, m.renderHero(t, width, gh, now)...)
+			}
+		}
+		var small [][]string
+		cols := 1
+		switch {
+		case width >= 120:
+			cols = len(rest)
+			if cols > 3 {
+				cols = 3
+			}
+		case width >= 60:
+			cols = 2
+		}
+		cw := (width - gap*(cols-1)) / cols
+		for i, t := range rest {
+			w := cw
+			if i%cols == cols-1 {
+				w = width - gap*(cols-1) - cw*(cols-1)
+			}
+			small = append(small, m.renderTile(t, w, now))
+		}
+		lines = append(lines, grid(small, width, cols, gap)...)
 		source := "Sampled while this window is open"
 		if m.metrics.server {
 			source = "History from the server"
 		}
-		lines = append(lines, truncate(m.updatedText()+faintStyle.Render(" · "+source+" · last "+windowText(m.windowSpan())+" · ")+keyStyle.Render("[ ]")+faintStyle.Render(" change"), width), "")
+		lines = append(lines, truncate(" "+m.updatedText()+faintStyle.Render(" · "+source+" · last "+windowText(m.windowSpan())+" · ")+keyStyle.Render("[ ]")+faintStyle.Render(" change"), width), "")
 	} else if m.me() != nil {
 		for _, l := range words("Server metrics need the system:admin permission.", width) {
 			lines = append(lines, mutedStyle.Render(l))
 		}
 		lines = append(lines, "")
 	}
-	left := m.workLines(now)
-	right := m.activityLines(now, 8)
+	work, workCount := m.workLines(now)
+	activity := m.activityLines(now, 8)
 	if width >= 100 {
-		lw := (width - 4) * 11 / 20
-		rw := width - 4 - lw
-		for n := range left {
-			left[n] = pad(left[n], lw)
-		}
-		for n := range right {
-			right[n] = truncate(right[n], rw)
-		}
-		lines = append(lines, strings.Split(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(left, "\n"), "    ", strings.Join(right, "\n")), "\n")...)
+		lw := (width - gap) * 11 / 20
+		rw := width - gap - lw
+		lines = append(lines, side([][]string{
+			panel("Work in progress", workCount, colorAccent, work, lw),
+			panel("Recent activity", "", colorOK, activity, rw),
+		}, []int{lw, rw}, gap)...)
 	} else {
-		lines = append(append(append(lines, left...), ""), right...)
+		lines = append(lines, panel("Work in progress", workCount, colorAccent, work, width)...)
+		lines = append(lines, panel("Recent activity", "", colorOK, activity, width)...)
 	}
-	if fails := m.failureLines(); len(fails) > 0 {
-		lines = append(append(lines, ""), fails...)
+	if fails, count := m.failureLines(); len(fails) > 0 {
+		lines = append(lines, panel("Recent failures", count, colorDanger, fails, width)...)
 	}
 	return lines
 }
@@ -369,13 +485,14 @@ func phaseActive(phase string) bool {
 	return false
 }
 
-// workLines lists running and queued jobs with animated progress.
-func (m Model) workLines(now time.Time) []string {
-	lines := []string{titleStyle.Render("Work in progress"), ""}
+// workLines lists running and queued jobs with animated progress, and a
+// count for the panel title.
+func (m Model) workLines(now time.Time) ([]string, string) {
+	var lines []string
 	jobs, ok := data[[]api.Job](m, keyJobs)
 	if !ok {
 		if pending, isPending := m.pending(keyJobs, "jobs"); isPending {
-			return append(lines, pending...)
+			return pending, ""
 		}
 	}
 	shown := 0
@@ -416,7 +533,11 @@ func (m Model) workLines(now time.Time) []string {
 	case shown == 0 && ok:
 		lines = append(lines, okStyle.Render("✓ ")+mutedStyle.Render("Nothing running or queued."))
 	}
-	return lines
+	count := ""
+	if shown > 0 {
+		count = mutedStyle.Render(plural(shown, "job", "jobs"))
+	}
+	return lines, count
 }
 
 func jobProgress(jobs []api.Job, id string) *float64 {
@@ -431,7 +552,7 @@ func jobProgress(jobs []api.Job, id string) *float64 {
 
 // activityLines shows the newest change hints; new ones fade in.
 func (m Model) activityLines(now time.Time, n int) []string {
-	lines := []string{titleStyle.Render("Recent activity"), ""}
+	var lines []string
 	if len(m.log) == 0 {
 		return append(lines, mutedStyle.Render("Waiting for changes."))
 	}
@@ -454,12 +575,12 @@ func (m Model) activityLines(now time.Time, n int) []string {
 }
 
 // failureLines lists the server's most recent failed jobs.
-func (m Model) failureLines() []string {
+func (m Model) failureLines() ([]string, string) {
 	d, ok := data[api.Diagnostics](m, keyDiagnostics)
 	if !ok || !m.admin() || len(d.WorkerErrors) == 0 {
-		return nil
+		return nil, ""
 	}
-	lines := []string{titleStyle.Render("Recent failures") + "  " + mutedStyle.Render(plural(len(d.WorkerErrors), "job", "jobs")), ""}
+	var lines []string
 	for i, e := range d.WorkerErrors {
 		if i == 5 {
 			lines = append(lines, faintStyle.Render(fmt.Sprintf("and %d more", len(d.WorkerErrors)-5)))
@@ -469,7 +590,7 @@ func (m Model) failureLines() []string {
 		id, phase, _ := strings.Cut(rest, ":")
 		lines = append(lines, dangerStyle.Render("▎")+fgStyle.Render(fmt.Sprintf("%-11s", kindLabel(kind)))+mutedStyle.Render(phase+"  ")+faintStyle.Render(id))
 	}
-	return lines
+	return lines, mutedStyle.Render(plural(len(d.WorkerErrors), "job", "jobs"))
 }
 
 // logEntry is one change hint from the event stream.
