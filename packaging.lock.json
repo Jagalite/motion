@@ -9,15 +9,102 @@
     "integrity": "sha512-N5nTihp2E7yQiwIcBkch0oiFNaJU/wLV/KrZ5pPSoow2Vpz3kME9kFjDo2Qap0coHCYyeqWu4VQq4cpjCbjZIw==",
     "sha256": "40b66848483e338e10bf2928f83bf6d8e854413186c9517f6143f722c8b13f7f"
   },
+  "m4": {
+    "url": "https://ftp.gnu.org/gnu/m4/m4-1.4.21.tar.xz",
+    "sha256": "f25c6ab51548a73a75558742fb031e0625d6485fe5f9155949d6486a2408ab66",
+    "archive": "m4-1.4.21.tar.xz",
+    "license": "GPL-3.0-or-later"
+  },
+  "autoconf": {
+    "url": "https://ftp.gnu.org/gnu/autoconf/autoconf-2.73.tar.xz",
+    "sha256": "9fd672b1c8425fac2fa67fa0477b990987268b90ff36d5f016dae57be0d6b52e",
+    "archive": "autoconf-2.73.tar.xz",
+    "license": "GPL-3.0-or-later"
+  },
+  "automake": {
+    "url": "https://ftp.gnu.org/gnu/automake/automake-1.19.tar.xz",
+    "sha256": "e3e2c2e3abf37898138db5b6c1d1dc35c9160c5978be7947d2c741705251d445",
+    "archive": "automake-1.19.tar.xz",
+    "license": "GPL-2.0-or-later"
+  },
+  "libtool": {
+    "url": "https://ftp.gnu.org/gnu/libtool/libtool-2.6.2.tar.xz",
+    "sha256": "2ef1067c16c97db930fd740cc9bc3d3ba9a583804ae5ac42cc3e8719e49e191e",
+    "archive": "libtool-2.6.2.tar.xz",
+    "license": "GPL-2.0-or-later"
+  },
+  "zimg": {
+    "url": "https://codeload.github.com/sekrit-twc/zimg/tar.gz/f819b14e8f39d1282400b0d9543e8ef73c1b2bbd",
+    "sha256": "4dc9faba466bce429226f0f5454cb7948ec2b70f6b5b6de383898227b38e51da",
+    "archive": "zimg-f819b14.tar.gz",
+    "license": "WTFPL",
+    "notices": [
+      "COPYING"
+    ]
+  },
+  "freetype": {
+    "url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz",
+    "sha256": "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f",
+    "archive": "freetype-2.14.3.tar.xz",
+    "license": "FTL OR GPL-2.0-or-later",
+    "notices": [
+      "LICENSE.TXT",
+      "docs/FTL.TXT",
+      "docs/GPLv2.TXT",
+      "src/bdf/README",
+      "src/pcf/README",
+      "src/base/fthash.c"
+    ]
+  },
+  "fribidi": {
+    "url": "https://github.com/fribidi/fribidi/releases/download/v1.0.17/fribidi-1.0.17.tar.xz",
+    "sha256": "6949dcde27d41cebad1fd741fcafc36d55a1020d2d872d4a6eb3914caabbada2",
+    "archive": "fribidi-1.0.17.tar.xz",
+    "license": "LGPL-2.1-or-later",
+    "notices": [
+      "COPYING"
+    ]
+  },
+  "harfbuzz": {
+    "url": "https://github.com/harfbuzz/harfbuzz/releases/download/14.6.0/harfbuzz-14.6.0.tar.xz",
+    "sha256": "d07a007327277708a2a73ae437887cdbaf282937f6d03ca5467723e9099af586",
+    "archive": "harfbuzz-14.6.0.tar.xz",
+    "license": "MIT-Modern-Variant",
+    "notices": [
+      "COPYING",
+      "src/ms-use/COPYING",
+      "src/hb-ucd.cc"
+    ]
+  },
+  "libass": {
+    "url": "https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.xz",
+    "sha256": "2dca25c0e0c837ddf00b52011b3f82cac1e4ddd3ad018227806b0c2288864acc",
+    "archive": "libass-0.17.5.tar.xz",
+    "license": "ISC",
+    "notices": [
+      "COPYING",
+      "libass/ass_strtod.c"
+    ]
+  },
   "ffmpeg": {
     "url": "https://ffmpeg.org/releases/ffmpeg-8.0.tar.xz",
     "sha256": "b2751fccb6cc4c77708113cd78b561059b6fa904b24162fa0be2d60273d27b8e",
-    "archive": "ffmpeg-8.0.tar.xz"
+    "archive": "ffmpeg-8.0.tar.xz",
+    "notices": [
+      "COPYING.GPLv2",
+      "COPYING.GPLv3",
+      "COPYING.LGPLv2.1",
+      "COPYING.LGPLv3",
+      "LICENSE.md"
+    ]
   },
   "x264": {
     "url": "https://codeload.github.com/mirror/x264/tar.gz/c24e06c2e184345ceb33eb20a15d1024d9fd3497",
     "sha256": "090d730e867fc63631782a1287974635d1237d0fa7c6fd1d09fd543620a56689",
-    "archive": "x264-c24e06c.tar.gz"
+    "archive": "x264-c24e06c.tar.gz",
+    "notices": [
+      "COPYING"
+    ]
   },
   "demuxe_sources": [],
   "electron": {
@@ -25,5 +112,19 @@
     "url": "https://github.com/electron/electron/releases/download/v44.7.0/electron-v44.7.0-darwin-arm64.zip",
     "archive": "electron-v44.7.0-darwin-arm64.zip",
     "sha256": "e04e411b58a0a14375dd21b0ab4a378fd38930a702e4e20e322fee4849404c0b"
-  }
+  },
+  "media_build_tools": [
+    "m4",
+    "autoconf",
+    "automake",
+    "libtool"
+  ],
+  "media_libraries": [
+    "zimg",
+    "freetype",
+    "fribidi",
+    "harfbuzz",
+    "libass",
+    "x264"
+  ]
 }

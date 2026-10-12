@@ -66,8 +66,24 @@ Motion source archive. Local ad-hoc signing is not Developer ID notarization.
 ## FFmpeg and FFprobe
 
 Motion invokes FFmpeg/FFprobe as separate executables. The macOS package includes
-FFmpeg 8.0 built with statically linked x264 and only system dynamic libraries.
+FFmpeg 8.0 built with only system dynamic libraries and these statically linked
+libraries, each pinned in `packaging.lock.json`:
+
+| Library | Version | License | Purpose |
+|---|---|---|---|
+| x264 | c24e06c | GPL-2.0-or-later | H.264 software encoding |
+| zimg | 3.0.6 (f819b14) | WTFPL | `zscale` colorspace/transfer conversion for HDR tone mapping |
+| libass | 0.17.5 | ISC | `subtitles`/`ass` text subtitle rendering |
+| FreeType | 2.14.3 | FTL or GPL-2.0-or-later | Font rasterization for libass |
+| FriBidi | 1.0.17 | LGPL-2.1-or-later | Bidirectional text for libass |
+| HarfBuzz | 14.6.0 | MIT ("Old MIT") | Text shaping for libass |
+
 That build enables GPL components; the binaries retain FFmpeg/x264's GPL terms.
+Portions of this software are copyright © 2026 The FreeType Project
+(https://freetype.org). All rights reserved. libass uses the macOS Core Text
+font provider; no Fontconfig or fonts are bundled. GNU m4, autoconf, automake
+and libtool are pinned build-only tools that bootstrap zimg; they are not
+installed in the package, but their sources are in the source companion.
 Motion's original Rust code remains MIT. Source-mode users may instead supply
 separately installed executables.
 
