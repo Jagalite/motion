@@ -168,6 +168,13 @@ impl stateless::Generate for Deliveries {
     }
 }
 
+/// FNV-1a (64-bit) of a source text.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn error_name(e: Error) -> String {
     format!("{e:?}")
 }
@@ -182,10 +189,12 @@ impl Model for Deliveries {
             model_version: 2,
             properties_version: 2,
             codec_version: 2,
+            // The source's digest: the source itself exceeds a trace's
+            // string limit.
             build: format!(
-                "{}:{}",
+                "{}:{:016x}",
                 env!("CARGO_PKG_VERSION"),
-                include_str!("../src/delivery.rs")
+                fnv1a(include_str!("../src/delivery.rs"))
             ),
         }
     }

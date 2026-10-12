@@ -2720,8 +2720,15 @@ async fn selected_plain_text_subtitles_are_revision_bound_and_other_formats_refu
                     && master.contains(",SUBTITLES=\"subs\"\n"),
                 "{master}"
             );
-            let media = get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await;
-            let subtitles = get(url).await;
+            // The window may advance between two reads of a live generation:
+            // compare the rendition with a media playlist unchanged around it.
+            let (media, subtitles) = loop {
+                let media = get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await;
+                let subtitles = get(url.clone()).await;
+                if get(format!("/api/v2/streams/{id}/1/variants/main/index.m3u8")).await == media {
+                    break (media, subtitles);
+                }
+            };
             // The rendition mirrors the media playlist's window and durations.
             let entries = |text: &str| -> Vec<String> {
                 text.lines()
