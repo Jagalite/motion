@@ -500,9 +500,13 @@ fn operational_metrics_contract_preserves_consumer_fields_and_bounds() {
         assert_eq!(required, fields.iter().copied().collect(), "{name}");
         assert_eq!(properties, required, "{name}");
     }
+    // Always present, null when this response's measurements failed.
     assert_eq!(
-        schemas["Diagnostics"]["properties"]["process"]["$ref"],
-        "#/components/schemas/ProcessMetrics"
+        schemas["Diagnostics"]["properties"]["process"]["anyOf"],
+        serde_json::json!([
+            {"$ref": "#/components/schemas/ProcessMetrics"},
+            {"type": "null"}
+        ])
     );
     assert!(
         schemas["Diagnostics"]["required"]

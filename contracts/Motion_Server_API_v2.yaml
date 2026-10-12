@@ -7034,9 +7034,10 @@ paths:
         observations and failed samples produce gaps. Storage observations may be sampled
         every 60 seconds, without interpolation. No per-sample events are emitted.
         The server may increase the requested bucket width to bound each series to 2000
-        points. Buckets are anchored to the Unix epoch in UTC and select the last sample
-        independently within each server epoch. Counter series also retain the first actual
-        sample of each server epoch to make resets visible; no synthetic zero is inserted.
+        points. Buckets are anchored to the Unix epoch in UTC. Gauge buckets select the last
+        sample. Counter buckets select the last sample independently within each server
+        epoch, and counter series also retain the first actual sample of each server epoch,
+        to make resets visible; no synthetic zero is inserted.
         At most the newest 12000 raw observations per series are considered; if excessive
         restarts still exceed the response cap, only the newest 2000 selected points
         are returned. Such restart churn can truncate the oldest retained history.
@@ -12601,7 +12602,12 @@ components:
         db_busy_count:
           $ref: '#/components/schemas/UInt64'
         process:
-          $ref: '#/components/schemas/ProcessMetrics'
+          description: >-
+            Null when process measurements could not be taken for this response;
+            the other diagnostics are still reported.
+          anyOf:
+          - $ref: '#/components/schemas/ProcessMetrics'
+          - type: 'null'
         worker_errors:
           type: array
           items:

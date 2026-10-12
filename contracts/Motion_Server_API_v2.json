@@ -10945,7 +10945,7 @@
         "x-milestone": "M1",
         "x-status": "implementation_target",
         "x-required-permission": "system:admin",
-        "description": "Redacted process, HTTP, workload, and storage observations retained in SQLite across server restarts. Samples are attempted every 10 seconds for 24 hours; unavailable observations and failed samples produce gaps. Storage observations may be sampled every 60 seconds, without interpolation. No per-sample events are emitted. The server may increase the requested bucket width to bound each series to 2000 points. Buckets are anchored to the Unix epoch in UTC and select the last sample independently within each server epoch. Counter series also retain the first actual sample of each server epoch to make resets visible; no synthetic zero is inserted. At most the newest 12000 raw observations per series are considered; if excessive restarts still exceed the response cap, only the newest 2000 selected points are returned. Such restart churn can truncate the oldest retained history. interval_seconds reports the native 10-second sampling interval, not the effective bucket width. Points retain their original observation timestamps.",
+        "description": "Redacted process, HTTP, workload, and storage observations retained in SQLite across server restarts. Samples are attempted every 10 seconds for 24 hours; unavailable observations and failed samples produce gaps. Storage observations may be sampled every 60 seconds, without interpolation. No per-sample events are emitted. The server may increase the requested bucket width to bound each series to 2000 points. Buckets are anchored to the Unix epoch in UTC. Gauge buckets select the last sample. Counter buckets select the last sample independently within each server epoch, and counter series also retain the first actual sample of each server epoch, to make resets visible; no synthetic zero is inserted. At most the newest 12000 raw observations per series are considered; if excessive restarts still exceed the response cap, only the newest 2000 selected points are returned. Such restart churn can truncate the oldest retained history. interval_seconds reports the native 10-second sampling interval, not the effective bucket width. Points retain their original observation timestamps.",
         "parameters": [
           {
             "name": "since",
@@ -19222,7 +19222,15 @@
             "$ref": "#/components/schemas/UInt64"
           },
           "process": {
-            "$ref": "#/components/schemas/ProcessMetrics"
+            "description": "Null when process measurements could not be taken for this response; the other diagnostics are still reported.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProcessMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "worker_errors": {
             "type": "array",

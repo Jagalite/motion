@@ -200,7 +200,10 @@ pub async fn read_pool(
                 ORDER BY sampled_at DESC,id DESC LIMIT ?
             ), ranked AS (
                 SELECT id,sampled_at,value,
-                    row_number() OVER (PARTITION BY run_id,sampled_at/? ORDER BY sampled_at DESC,id DESC) AS bucket_rank,
+                    -- Counters keep the last sample per bucket within each
+                    -- run, so a restart's reset stays visible; gauges keep
+                    -- only the last sample of each bucket.
+                    row_number() OVER (PARTITION BY CASE WHEN ? THEN run_id END,sampled_at/? ORDER BY sampled_at DESC,id DESC) AS bucket_rank,
                     row_number() OVER (PARTITION BY run_id ORDER BY sampled_at,id) AS run_rank
                 FROM recent
             ), bounded AS (
@@ -213,6 +216,7 @@ pub async fn read_pool(
         .bind(window.since_millis)
         .bind(through)
         .bind(MAX_READ_SAMPLES)
+        .bind(kind == "counter")
         .bind(window.step_millis)
         .bind(kind == "counter")
         .bind(MAX_POINTS as i64)
@@ -684,9 +688,10 @@ mod tests {
             .find(|s| s.id == "jobs.queued")
             .unwrap()
             .points;
+        // Gauges have no reset to preserve: one point per bucket.
         assert_eq!(
             gauges.iter().map(|p| p.v.as_str()).collect::<Vec<_>>(),
-            ["90", "3"]
+            ["3"]
         );
         assert!(
             history

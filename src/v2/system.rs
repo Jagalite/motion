@@ -180,13 +180,16 @@ pub(crate) static DB_BUSY_COUNT: std::sync::atomic::AtomicU64 =
 
 pub async fn diagnostics(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
     caller.require(playscale_core::access::Permission::SystemAdmin)?;
-    let process = app.health.metrics.snapshot().await.map_err(|code| {
-        Problem::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            code,
-            "Process measurements are temporarily unavailable",
-        )
-    })?;
+    // Process measurements are optional: when they cannot be taken (the
+    // reader is busy or the platform call failed) the rest of diagnostics
+    // still answers, with `process: null`, rather than failing as a whole.
+    let process = match app.health.metrics.snapshot().await {
+        Ok(process) => Some(process),
+        Err(code) => {
+            tracing::warn!(code, "Process measurements are temporarily unavailable");
+            None
+        }
+    };
     let mut tx = app.db.begin().await?;
     caller
         .reauthorize(
