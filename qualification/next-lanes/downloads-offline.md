@@ -203,6 +203,15 @@ the round-6 commit:
 |---|---|---|
 | S20 (P2) | The duration fallback used the device's newest download for the timeline, not the copy that produced the event | Fixed. Every offline event carries its `download_id` (a contract addition to `OfflineEvent`). The adapter supplies that download's pinned duration, and only for the same device, profile and timeline, to the core decision. The core event and the model carry the field too. The server test now holds two demands with different durations and checks that the played one decides. |
 
+**Round 7** (at `3f087bf`) raised three P2 findings and no P1. All three are
+fixed in the round-7 commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| S21 (P2) | Admission could store a title the offline host could then not snapshot for playback | Fixed. Admission headroom is the larger of the configured headroom and the largest saved or incoming title plus the host's 512 MiB reserve. The decision is still `offline::admits_transfer`. Agent test covers it. |
+| S22 (P2) | Blobs orphaned by a crash whose demand then ended were never collected | Fixed. `cache collect` runs after every still-ready demand had its recovery or transfer; it is skipped when a transfer failed, so a recoverable blob is not discarded. Store and agent tests cover it. |
+| S23 (P2) | The Downloads page showed only the first 200 records | Fixed. It reads every page through the bounded `list_all` (unavailable past 5,000 rather than partial) and lists only actionable (non-cancelled) records. `tests/v2_downloads.rs::the_downloads_page_lists_every_actionable_record` renders 205 records through the real presentation. |
+
 ## 8. Deferred release checks
 
 | Check | Exact fixture | Owner |

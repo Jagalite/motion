@@ -56,6 +56,9 @@ enum CacheCommand {
         #[arg(long)]
         download_id: String,
     },
+    /// Delete blobs no manifest entry references (crash leftovers whose
+    /// demand ended).
+    Collect,
     Events,
     /// Compact from a `syncOffline` response read from stdin; only the
     /// leading events the server confirmed by identity are dropped.
@@ -105,6 +108,10 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
+        CacheCommand::Collect => {
+            store.collect()?;
+            json!({"collected": true})
+        }
         CacheCommand::Events => serde_json::to_value(store.events()?)?,
         CacheCommand::Acknowledge => {
             #[derive(serde::Deserialize)]

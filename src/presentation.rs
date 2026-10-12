@@ -791,7 +791,15 @@ impl UiQueryFacade for Queries {
     fn downloads<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>> {
         Box::pin(async move {
             let mut rows = Vec::new();
-            for v in self.list("/downloads?limit=200").await? {
+            // Every record, not the first page; past the bound the page
+            // reports unavailable rather than a partial list. Cancelled
+            // records need no action and are not shown.
+            for v in self
+                .list_all("/downloads", 25)
+                .await?
+                .into_iter()
+                .filter(|v| v["state"] != "cancelled")
+            {
                 // Titles come from the same scoped catalog reads; a timeline
                 // no longer readable is shown without one.
                 let timeline = text(&v, "timeline_id");

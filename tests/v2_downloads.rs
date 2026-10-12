@@ -932,3 +932,43 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
         "ending the played copy completes the timeline"
     );
 }
+
+#[tokio::test]
+async fn the_downloads_page_lists_every_actionable_record() {
+    let f = Fixture::new().await;
+    let (timeline, file, revision) = f.scanned("film.mp4", b"paged").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "download-key-0030",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    // More records than one API page: 205 ready and one cancelled.
+    for n in 0..206 {
+        sqlx::query(
+            "INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) \
+             SELECT ?,1,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,?,?,content_type,size_bytes,duration_ms,?,0,0 FROM downloads WHERE id=?",
+        )
+        .bind(format!("zz-{n:03}"))
+        .bind(&file)
+        .bind(&revision)
+        .bind(if n == 205 { "cancelled" } else { "ready" })
+        .bind(created.body["id"].as_str().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    }
+    let (status, html) = f.bytes("/downloads", &[("authorization", &auth)]).await;
+    let html = String::from_utf8(html).unwrap();
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("DELETE /api/v2/downloads/zz-000"));
+    assert!(
+        html.contains("DELETE /api/v2/downloads/zz-204"),
+        "the last page is listed"
+    );
+    assert!(!html.contains("zz-205"), "cancelled records need no action");
+}

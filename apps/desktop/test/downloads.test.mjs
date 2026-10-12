@@ -58,6 +58,7 @@ function fakeCache() {
         return {base_sequence: String(s.base), events: s.events};
       }
       case 'rebase': return {rebased: true};
+      case 'collect': return {collected: true};
       case 'recover': {
         const entry = JSON.parse(input);
         if (!s.recoverable?.includes(entry.identity.download_id)) return {recovered: false};
@@ -326,4 +327,49 @@ test('long titles are shortened to the cache bound on a character boundary', () 
   assert.ok(new TextEncoder().encode(cached).length <= 1024);
   assert.ok(cached.endsWith('…') && !cached.includes('\uFFFD'));
   assert.equal(cacheTitle('Short'), 'Short');
+});
+
+test('admission keeps room to play the largest saved title, and collection follows recovery', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const admits = [];
+  const cache = async (root, scope, args, input) => {
+    if (args[0] === 'admit') { admits.push(args); return {admitted: true}; }
+    return fake.cache(root, scope, args, input);
+  };
+  const listing = [{id: 'd1', profile_id: 'default', state: 'ready'}];
+  const agent = createDownloadAgent({base, identity, cache, quota: 10 * 1024 ** 3, headroom: 0,
+    fetchMedia: async () => response(200, media),
+    api: async path => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: listing, next_cursor: null};
+      if (path.endsWith('/manifest')) return manifest('d1');
+      if (path === '/api/v2/content-access') return {url: '/api/v2/media/files/f1/content?ticket=t'};
+      if (path.endsWith('/viewing')) return {revision: '3', manual_epoch: '0', position_ms: 0, watched: false};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  fake.state(target.path).downloads.push({identity: {download_id: 'big', timeline_id: 't9'}, size: 3 * 1024 ** 3});
+  listing.push({id: 'big', profile_id: 'default', state: 'ready'});
+  await agent.pass();
+  // The 3 GiB title already saved needs its own snapshot plus 512 MiB free.
+  assert.deepEqual(admits[0].slice(5, 7), ['--headroom', String(3 * 1024 ** 3 + 512 * 1024 ** 2)]);
+  const order = fake.calls.filter(c => ['publish', 'collect'].includes(c[1])).map(c => c[1]);
+  assert.deepEqual(order, ['publish', 'collect'], 'unreferenced blobs are collected only after recovery and transfers');
+});
+
+test('a failed transfer defers collection so its verified blob can still be recovered', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: () => {},
+    fetchMedia: async () => { throw new Error('network'); },
+    api: async path => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: [{id: 'd1', profile_id: 'default', state: 'ready'}], next_cursor: null};
+      if (path.endsWith('/manifest')) return manifest('d1');
+      if (path === '/api/v2/content-access') return {url: '/api/v2/media/files/f1/content?ticket=t'};
+      throw new Error(path);
+    }});
+  await agent.pass();
+  assert.ok(!fake.calls.some(c => c[1] === 'collect'));
 });

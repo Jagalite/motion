@@ -383,3 +383,15 @@ fn compaction_keeps_the_resume_checkpoint_without_moving_the_base() {
         Some(2_000)
     );
 }
+
+#[test]
+fn blobs_of_ended_demands_left_by_a_crash_are_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let store = Store::open(&root, &scope()).unwrap();
+    // Verified and renamed into place, then the process died, then the demand ended.
+    let orphan = root.join("blobs").join(entry("gone", b"orphan").sha256);
+    std::fs::write(&orphan, b"orphan").unwrap();
+    store.collect().unwrap();
+    assert!(!orphan.exists());
+}

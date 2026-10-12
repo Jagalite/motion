@@ -16,6 +16,9 @@ const UNKNOWN_DEVICE_TIME = '1970-01-01T00:00:00Z';
 const SYNC_BATCH = 200;
 // playscale_core::downloads::MAX_MEDIA_BYTES; the server refuses larger originals too.
 const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
+// The offline host copies a title into a private snapshot before playing it
+// and keeps 512 MiB free besides (motion-ui-host new_snapshot).
+const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
 
 export const rootName = scope => createHash('sha256')
   .update([scope.server_id, scope.principal_id, scope.profile_id, scope.device_id].join('\n')).digest('hex').slice(0, 32);
@@ -161,7 +164,11 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       if (other.name !== target.name) elsewhere += Number((await cache(other.path, other.scope, ['status'])).usage);
     }
     const remaining = Math.max(0, quota - elsewhere);
-    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(remaining), '--headroom', String(headroom)]);
+    // Leave room to play the largest saved title afterwards, not only to store it.
+    const largest = Math.max(size, ...(await Promise.all(managedRoots().map(async other =>
+      Math.max(0, ...(await cache(other.path, other.scope, ['status'])).manifest.downloads.map(d => d.size ?? 0))))));
+    const reserve = Math.max(headroom, largest + SNAPSHOT_RESERVE);
+    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(remaining), '--headroom', String(reserve)]);
     if (!admitted.admitted) {
       status(`Not enough space to save "${manifest.title}". Free space or remove downloads, then reconnect.`);
       return false;
@@ -284,6 +291,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       for (const id of present) {
         if (wanted.find(d => d.id === id)?.state !== 'ready') await cache(target.path, target.scope, ['remove', '--download-id', id]);
       }
+      let failed = false;
       for (const download of wanted.filter(d => d.state === 'ready')) {
         if (signal?.aborted) return;
         if (local.downloads.some(entry => entry.identity.download_id === download.id)) continue;
@@ -291,9 +299,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         try { await transfer(download, target); }
         catch (error) {
           if (signal?.aborted) throw error;
+          failed = true;
           status(`A download could not be saved yet: ${error.message}`);
         }
       }
+      // Every still-ready demand has now had its chance to recover a verified
+      // blob; anything unreferenced belongs to an ended demand or a crash.
+      if (!failed) await cache(target.path, target.scope, ['collect']);
       local = (await cache(target.path, target.scope, ['status'])).manifest;
       // Refreshing the base is best-effort; it never blocks other profiles.
       if (reconciled) {

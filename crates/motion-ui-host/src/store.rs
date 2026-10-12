@@ -295,7 +295,7 @@ impl Store {
     }
 
     /// Delete blobs no manifest entry references (crash leftovers and removals).
-    fn collect(&self) -> anyhow::Result<()> {
+    pub fn collect(&self) -> anyhow::Result<()> {
         for entry in self.blobs.entries()? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
