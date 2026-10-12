@@ -29,6 +29,25 @@ func (m Model) playbackFeature() bool {
 	return ok && f.Implemented && f.Enabled
 }
 
+// watchesPlayback reports whether this device may see who is watching:
+// it needs system:admin and a server that monitors playback.
+func (m Model) watchesPlayback() bool {
+	return m.admin() && m.playbackFeature()
+}
+
+// forgetPlayback discards sessions, history and their graphs once the
+// server withdraws access to them.
+func (m *Model) forgetPlayback() {
+	m.drop(keyPlayback)
+	m.drop(keyHistory)
+	m.historyFilter = historyFilter{}
+	for id := range m.metrics.series {
+		if strings.HasPrefix(id, "session:") {
+			m.metrics.forget(id)
+		}
+	}
+}
+
 func decimal(s string) float64 {
 	v, _ := strconv.ParseFloat(s, 64)
 	return v
@@ -268,9 +287,12 @@ func (m *Model) observeSessions(list api.PlaybackSessionList) {
 		live[id] = true
 		m.metrics.add(id, now, point{v: decimal(s.ThroughputBPS)})
 	}
+	if list.Truncated {
+		return // an absent session may still be live: only a full list ends one
+	}
 	for id := range m.metrics.series {
 		if strings.HasPrefix(id, "session:") && !live[id] {
-			delete(m.metrics.series, id)
+			m.metrics.forget(id)
 		}
 	}
 }

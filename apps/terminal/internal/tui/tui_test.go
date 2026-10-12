@@ -1511,3 +1511,59 @@ func TestFitShrinksRequiredColumnsInsteadOfClipping(t *testing.T) {
 		t.Fatalf("wide tables keep their natural widths: %v", cols)
 	}
 }
+
+func TestLosingPlaybackAccessForgetsSessionsAndLeavesTheScreen(t *testing.T) {
+	for name, revoke := range map[string]func(*fake){
+		"system:admin": func(f *fake) { f.permissions = []string{api.PermCatalogRead} },
+		"capability":   func(f *fake) { f.features = nil },
+	} {
+		f := playbackServer()
+		m := goTo(t, start(t, f, 150, 46), route{page: pageNowPlaying})
+		stale := m.cache.slots[keyPlayback].request
+		revoke(f)
+		m = drain(t, m, m.load(keySession))
+		if m.route.page == pageNowPlaying || m.cache.slots[keyPlayback] != nil || len(m.metrics.series["session:d1"]) != 0 {
+			t.Fatalf("%s: playback survived losing access: %+v", name, m.route)
+		}
+		if v := screen(m); strings.Contains(v, "Living room TV") {
+			t.Fatalf("%s: sessions still on screen:\n%s", name, v)
+		}
+		// A late answer to a request made before access ended is discarded.
+		m, _ = update(t, m, loaded{key: keyPlayback, request: stale, data: api.PlaybackSessionList{Sessions: []api.PlaybackSession{{DeliveryID: "late"}}}})
+		if m.cache.slots[keyPlayback] != nil && m.cache.slots[keyPlayback].data != nil || len(m.metrics.series["session:late"]) != 0 {
+			t.Fatalf("%s: late sessions accepted after revocation", name)
+		}
+	}
+}
+
+func TestEndedSessionsAreForgottenOnlyFromCompleteLists(t *testing.T) {
+	m := start(t, playbackServer(), 150, 46)
+	now := time.Now()
+	m.metrics.add("session:a", now.Add(-2*time.Second), point{v: 1})
+	m.metrics.add("session:a", now.Add(-time.Second), point{v: 2}) // marks it changed
+	m.observeSessions(api.PlaybackSessionList{Truncated: true, Sessions: []api.PlaybackSession{{DeliveryID: "b", ThroughputBPS: "5"}}})
+	if len(m.metrics.series["session:a"]) == 0 {
+		t.Fatal("a truncated list ended a session it merely omitted")
+	}
+	m.observeSessions(api.PlaybackSessionList{Sessions: []api.PlaybackSession{{DeliveryID: "b", ThroughputBPS: "5"}}})
+	if _, ok := m.metrics.series["session:a"]; ok {
+		t.Fatal("ended session's graph kept")
+	}
+	if _, ok := m.metrics.changed["session:a"]; ok {
+		t.Fatal("ended session's metadata kept")
+	}
+}
+
+func TestFitNeverExceedsTinyTables(t *testing.T) {
+	specs := []column{{"Who", 22, false}, {"Watching", 24, false}, {"State", 11, false}}
+	for width := 9; width <= 30; width++ {
+		cols, _ := fit(width, specs)
+		total := 0
+		for _, c := range cols {
+			total += c.Width + 2
+		}
+		if total != width {
+			t.Fatalf("width %d: columns use %d cells: %v", width, total, cols)
+		}
+	}
+}

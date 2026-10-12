@@ -368,6 +368,11 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.signedOut(msg.err)
 			return nil
 		}
+		if (msg.key == keyPlayback || msg.key == keyHistory) && (!m.watchesPlayback() || revoked(msg.err)) {
+			// A late answer after access ended, or the server withdrawing it.
+			m.forgetPlayback()
+			return nil
+		}
 		if msg.err == nil {
 			if cmd := m.observe(msg); cmd != nil {
 				return cmd
@@ -392,8 +397,15 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			if !m.admin() {
 				m.forgetMetrics()
 			}
+			var leave tea.Cmd
+			if !m.watchesPlayback() {
+				m.forgetPlayback()
+				if m.route.page == pageNowPlaying || m.route.page == pageHistory {
+					leave = m.navigate(route{page: pageOverview})
+				}
+			}
 			// Permissions and features are known now: start polling at once.
-			return tea.Batch(m.viewerChanged(), m.poll())
+			return tea.Batch(leave, m.viewerChanged(), m.poll())
 		case keyProfiles:
 			return m.viewerChanged()
 		}

@@ -72,6 +72,13 @@ func newHistory() *history {
 	return &history{series: map[string][]point{}, present: map[string]bool{}, changed: map[string]time.Time{}}
 }
 
+// forget drops a series and what is known about it.
+func (h *history) forget(id string) {
+	delete(h.series, id)
+	delete(h.present, id)
+	delete(h.changed, id)
+}
+
 func (h *history) add(id string, t time.Time, p point) {
 	s := h.series[id]
 	if n := len(s); n > 0 && !t.After(s[n-1].t) {

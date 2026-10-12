@@ -62,21 +62,24 @@ func fit(width int, specs []column) ([]table.Column, []int) {
 	}
 	// Required columns wider than the table give up width, widest first, so
 	// cells truncate with an ellipsis rather than being cut off at the edge.
-	for used > width {
-		widest := -1
-		for i, c := range cols {
-			if c.Width > 6 && (widest < 0 || c.Width > cols[widest].Width) {
-				widest = i
+	// Columns keep six cells while they can; tiny terminals go below that.
+	for _, floor := range []int{6, 1} {
+		for used > width {
+			widest := -1
+			for i, c := range cols {
+				if c.Width > floor && (widest < 0 || c.Width > cols[widest].Width) {
+					widest = i
+				}
 			}
+			if widest < 0 {
+				break
+			}
+			cols[widest].Width--
+			used--
 		}
-		if widest < 0 {
-			break
-		}
-		cols[widest].Width--
-		used--
 	}
 	if n := len(cols); n > 0 {
-		cols[n-1].Width = max(cols[n-1].Width+width-used, 4)
+		cols[n-1].Width = max(cols[n-1].Width+width-used, 1)
 	}
 	return cols, index
 }

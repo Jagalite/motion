@@ -96,7 +96,7 @@ func (m *Model) poll() tea.Cmd {
 			cmds = append(cmds, m.load(keyMetrics))
 		}
 	}
-	if m.route.page == pageNowPlaying && m.admin() && due(keyPlayback, pollEvery) {
+	if m.route.page == pageNowPlaying && m.watchesPlayback() && due(keyPlayback, pollEvery) {
 		cmds = append(cmds, m.load(keyPlayback))
 	}
 	if (m.route.page == pageOverview || m.route.page == pageProcessing) && due(keyJobs, jobsEvery) {
@@ -106,11 +106,12 @@ func (m *Model) poll() tea.Cmd {
 }
 
 // forgetMetrics discards administrator-only observations: diagnostics,
-// storage and their history.
+// storage, playback sessions and their history.
 func (m *Model) forgetMetrics() {
 	for _, key := range []string{keyDiagnostics, keyStorage, keyMetrics} {
 		m.drop(key)
 	}
+	m.forgetPlayback()
 	m.metrics, m.anim = newHistory(), newSprings()
 }
 
