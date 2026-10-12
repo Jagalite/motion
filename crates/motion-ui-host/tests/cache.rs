@@ -32,6 +32,7 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
                 source_revision: "sha256-source".into(),
                 base_viewing_revision: "4".into(),
                 base_manual_epoch: "2".into(),
+                viewing_epoch: Some("server:restore".into()),
             },
             title: "<Saved title>".into(),
             duration_ms: 10000,

@@ -8,14 +8,15 @@
     "offline_restart_resumes_saved_progress": true,
     "reconnect_reconciles_once_and_compacts": true,
     "newer_manual_state_is_not_overwritten": true,
+    "restored_server_neither_applies_nor_erases_offline_progress": true,
     "cancellation_removes_the_device_copy": true
   },
-  "server_sha256": "1555d73d7261342e41d15ccf8689289b1ba290f5b6d2619bfd23f014ba4acd7a",
-  "host_sha256": "161f614a466ce2f98fbe7bf3db51aa9f1f7705ba4823932410285540ec0a3f9f",
+  "server_sha256": "11bbb3b67571977a41d187d1e725e7490405c23e29ff3c55769e7525bd5d3fb4",
+  "host_sha256": "a16f8ac669ae55efb6e52a123eb701a6b08a78dd6a21e2b65d93198ceb61e4ff",
   "media_sha256": "f7c5cb6b947171872df862cd2639ecac03b454e09ae3a9d73d7d43e6d0b4e27d",
-  "commit": "d5972a756baf3c274b9e9f19fc7fc0b2e4011897",
-  "recorded_at": "2026-10-12T05:08:24.753Z",
-  "artifacts": "/var/folders/p2/hs2582qs5672qbvtm4z5_9840000gn/T/motion-download-workflow-R29FKn",
+  "commit": "b641601b5cf44e8f1643c176dec17a1ce6abcd88",
+  "recorded_at": "2026-10-12T18:44:54.434Z",
+  "artifacts": "$TMPDIR/motion-download-workflow-EffLU0",
   "limitations": [
     "Node runner without Electron: playback is represented by verified range reads and the offline player's event protocol.",
     "One device, one profile, one complete MP4 original; macOS arm64 debug binaries."

@@ -6809,6 +6809,8 @@ paths:
           $ref: '#/components/responses/E413'
         '422':
           $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
         '429':
           $ref: '#/components/responses/E429'
         '500':
@@ -6817,6 +6819,7 @@ paths:
           $ref: '#/components/responses/E503'
       x-required-permission: viewing:write
       parameters:
+      - $ref: '#/components/parameters/ViewingEpoch'
       - $ref: '#/components/parameters/Csrf'
       requestBody:
         required: true
@@ -12477,6 +12480,12 @@ components:
           $ref: '#/components/schemas/Revision'
         manual_epoch:
           $ref: '#/components/schemas/Revision'
+        viewing_epoch:
+          type: string
+          minLength: 3
+          maxLength: 257
+          description: server_id:restore_epoch of the history viewing_revision and manual_epoch belong
+            to. Send it as X-Motion-Viewing-Epoch when synchronizing events based on this manifest.
       required:
       - download_id
       - timeline_id
@@ -12486,6 +12495,7 @@ components:
       - files
       - viewing_revision
       - manual_epoch
+      - viewing_epoch
       description: Exact pinned files and the device's viewing base. Offline events carry viewing_revision
         and manual_epoch as their base; read the manifest again after reconciling to rebase later events.
         The supported slice is one complete original media file whose SHA-256 digest the device verifies

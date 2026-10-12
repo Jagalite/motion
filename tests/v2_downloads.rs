@@ -371,6 +371,13 @@ async fn downloads_pin_exact_originals_and_grant_only_their_bytes() {
     assert_eq!(manifest.body["duration_ms"], 100000);
     assert_eq!(manifest.body["viewing_revision"], "0");
     assert_eq!(manifest.body["manual_epoch"], "0");
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        manifest.body["viewing_epoch"],
+        format!("{server}:{restore}")
+    );
     let timeline_revision = f
         .count(&format!(
             "SELECT revision FROM timelines WHERE id='{timeline}'"
@@ -558,17 +565,28 @@ async fn offline_sync_consumes_sequences_once_and_never_overwrites_newer_authori
         2
     );
     let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
-    let sync = |events: Vec<Value>, device: String, auth: String| {
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let history = format!("{server}:{restore}");
+    let sync_with = |events: Vec<Value>, device: String, auth: String, epoch: Option<String>| {
         let f = &f;
         async move {
+            let mut headers = vec![("authorization", auth.as_str())];
+            if let Some(epoch) = &epoch {
+                headers.push(("x-motion-viewing-epoch", epoch.as_str()));
+            }
             f.call(
                 "POST",
                 "/api/v2/offline/sync",
                 Some(json!({"device_id":device,"events":events})),
-                &[("authorization", &auth)],
+                &headers,
             )
             .await
         }
+    };
+    let sync = |events: Vec<Value>, device: String, auth: String| {
+        sync_with(events, device, auth, Some(history.clone()))
     };
     let viewing = format!("/api/v2/profiles/default/timelines/{timeline}/viewing");
     let base = ("0", "0");
@@ -762,4 +780,36 @@ async fn offline_sync_consumes_sequences_once_and_never_overwrites_newer_authori
         vec![("rejected".into(), json!("not_found"))]
     );
     assert_eq!(gone.body["next_device_sequence"], "7");
+
+    // Events based on another server history (a restored database or a
+    // replaced server) are refused before anything is consumed or applied.
+    let before = f.get(&viewing, &auth).await.body;
+    problem(
+        &sync_with(
+            vec![event(7, &timeline, base, 1, "paused")],
+            device.clone(),
+            auth.clone(),
+            Some(format!("{server}:restored-elsewhere")),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "viewing_epoch_changed",
+    );
+    problem(
+        &sync_with(
+            vec![event(7, &timeline, base, 1, "paused")],
+            device.clone(),
+            auth.clone(),
+            None,
+        )
+        .await,
+        StatusCode::PRECONDITION_REQUIRED,
+        "viewing_epoch_required",
+    );
+    assert_eq!(f.get(&viewing, &auth).await.body, before);
+    assert_eq!(
+        f.count("SELECT count(*) FROM offline_events WHERE sequence=7")
+            .await,
+        0
+    );
 }

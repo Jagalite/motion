@@ -14,7 +14,7 @@ import json, subprocess, sys
 
 FULL_ONLY = {
     # Stateless models that take minutes in a debug build.
-    'access_model', 'delivery_model', 'timeline_viewing_model', 'work_model',
+    'access_model', 'delivery_model', 'downloads_model', 'timeline_viewing_model', 'work_model',
     # Live HLS delivery and v2 playback with real FFmpeg conversions.
     'delivery', 'v2_playback',
 }

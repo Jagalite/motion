@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync} from 'node:fs';
+import {mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -11,7 +11,7 @@ const media = Buffer.from('0123456789abcdefghij');
 const digest = createHash('sha256').update(media).digest('hex');
 const manifest = id => ({download_id: id, timeline_id: 't1', timeline_revision: '1', title: 'Film', duration_ms: 100000,
   files: [{asset_id: 'f1', relative_name: 'media.mp4', digest: `sha256:${digest}`, size_bytes: String(media.length), media_url: '/x', role: 'media'}],
-  viewing_revision: '3', manual_epoch: '0'});
+  viewing_revision: '3', manual_epoch: '0', viewing_epoch: 'server:r1'});
 
 /** An in-memory stand-in for `motion-ui-host cache`, recording its commands. */
 function fakeCache() {
@@ -26,7 +26,8 @@ function fakeCache() {
     mkdirSync(join(root, 'staging'), {recursive: true});
     const s = state(root);
     switch (args[0]) {
-      case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads}};
+      case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads},
+        staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5))};
       case 'admit': return {admitted: Number(args[2]) <= 1000};
       case 'publish': {
         const entry = JSON.parse(input);
@@ -36,10 +37,22 @@ function fakeCache() {
         s.downloads.push(entry);
         return {publication: 'published'};
       }
-      case 'remove': s.downloads = s.downloads.filter(d => d.identity.download_id !== args[2]); return {removed: true};
+      case 'remove':
+        rmSync(join(root, 'staging', `${args[2]}.part`), {force: true});
+        s.downloads = s.downloads.filter(d => d.identity.download_id !== args[2]);
+        return {removed: true};
       case 'events': return {base_sequence: String(s.base), events: s.events};
       case 'acknowledge': {
-        const through = Number(args[2]);
+        // Mirrors offline::acknowledged_through: the leading run confirmed by identity.
+        const {results, next_device_sequence: next} = JSON.parse(input);
+        const consumed = r => ['applied', 'history_only', 'duplicate'].includes(r.outcome)
+          || (r.outcome === 'rejected' && !['sequence_gap', 'event_conflict'].includes(r.code));
+        let through = s.base;
+        for (const [i, e] of s.events.entries()) {
+          const r = results[i];
+          if (!r || r.event_id !== e.event_id || !consumed(r) || Number(e.device_sequence) >= Number(next)) break;
+          through = Number(e.device_sequence);
+        }
         s.events = s.events.filter(e => Number(e.device_sequence) > through);
         s.base = through;
         return {base_sequence: String(s.base), events: s.events};
@@ -69,7 +82,7 @@ test('a resumed transfer appends from the staged length and publishes the exact 
   assert.deepEqual(ranges, ['bytes=8-']);
   const published = JSON.parse(calls.find(c => c[1] === 'publish')[3]);
   assert.deepEqual(published.identity, {download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
-    base_viewing_revision: '3', base_manual_epoch: '0'});
+    base_viewing_revision: '3', base_manual_epoch: '0', viewing_epoch: 'server:r1'});
   assert.equal(published.content_type, 'video/mp4');
   assert.equal(published.size, media.length);
 });
@@ -95,6 +108,15 @@ test('a full response restarts the file, and quota refusal transfers nothing', a
   assert.equal(await refused.transfer({id: 'd2'}, target), false);
   assert.equal(fetched, 1);
   assert.match(statuses.at(-1), /Not enough space/);
+
+  // Larger than the cache can publish: refused before any byte moves.
+  const huge = manifest('d3');
+  huge.files[0].size_bytes = String(64 * 1024 ** 3 + 1);
+  const tooLarge = createDownloadAgent({base, identity, cache, quota: Number.MAX_SAFE_INTEGER, status: m => statuses.push(m),
+    api: async () => huge, fetchMedia: async () => { fetched++; return response(200, media); }});
+  assert.equal(await tooLarge.transfer({id: 'd3'}, target), false);
+  assert.equal(fetched, 1);
+  assert.match(statuses.at(-1), /64 GiB/);
 });
 
 test('unsupported manifests are reported instead of silently dropping files', async () => {
@@ -109,56 +131,105 @@ test('unsupported manifests are reported instead of silently dropping files', as
 });
 
 const event = (sequence, extra = {}) => ({scope: {...identity, profile_id: 'default'},
-  media: {download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest, base_viewing_revision: '3', base_manual_epoch: '0'},
+  media: {download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest, base_viewing_revision: '3', base_manual_epoch: '0',
+    viewing_epoch: 'server:r1'},
   event_id: `e${sequence}`, device_sequence: String(sequence), position_ms: sequence * 1000, status: 'paused', ...extra});
 
-test('reconciliation sends ordered batches and compacts only acknowledged sequences', async () => {
+function syncAgent(fake, statuses, reply) {
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
-  const fake = fakeCache();
-  const statuses = [];
   const sent = [];
   const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
     fetchMedia: async () => assert.fail('no transfer'),
     api: async (path, init) => {
       assert.equal(path, '/api/v2/offline/sync');
-      sent.push(init.body.events.map(e => e.device_sequence));
-      // The server consumes 1 and 2 and reports a gap at 3 (it expects 3 but
-      // holds a conflicting record); only 1 and 2 are acknowledged.
-      return {results: [{event_id: 'e1', outcome: 'applied', code: null}, {event_id: 'e2', outcome: 'history_only', code: 'viewing_newer'},
-        {event_id: 'e3', outcome: 'rejected', code: 'event_conflict'}], next_device_sequence: '3'};
+      sent.push([init.headers['X-Motion-Viewing-Epoch'], init.body.events.map(e => e.device_sequence)]);
+      return reply(init.body.events);
     }});
+  return {agent, sent};
+}
+
+test('reconciliation compacts only events the server confirmed by identity', async () => {
+  const fake = fakeCache();
+  const statuses = [];
+  // Consumed 1 and 2; other content already sits at 3.
+  const {agent, sent} = syncAgent(fake, statuses, () => ({results: [{event_id: 'e1', outcome: 'applied', code: null},
+    {event_id: 'e2', outcome: 'history_only', code: 'viewing_newer'}, {event_id: 'e3', outcome: 'rejected', code: 'event_conflict'}],
+  next_device_sequence: '4'}));
   const target = agent.root('default');
   fake.state(target.path).events = [event(1, {device_time: '2026-10-11T10:00:00Z'}), event(2), event(3)];
   assert.equal(await agent.reconcile(target), false);
-  assert.deepEqual(sent, [['1', '2', '3']]);
-  assert.deepEqual(fake.state(target.path).events.map(e => e.device_sequence), ['3']);
+  assert.deepEqual(sent, [['server:r1', ['1', '2', '3']]]);
+  assert.deepEqual(fake.state(target.path).events.map(e => e.device_sequence), ['3'], 'the conflicting event survives the watermark');
   assert.match(statuses[0], /event_conflict/);
   assert.equal(wireEvent(event(2)).device_time, '1970-01-01T00:00:00Z');
   assert.equal(wireEvent(event(1, {device_time: 'x'})).device_time, 'x');
+});
+
+test('a conflict on the first event erases nothing', async () => {
+  const fake = fakeCache();
+  const statuses = [];
+  const {agent} = syncAgent(fake, statuses, () => ({results: [{event_id: 'e1', outcome: 'rejected', code: 'event_conflict'}],
+    next_device_sequence: '2'}));
+  const target = agent.root('default');
+  fake.state(target.path).events = [event(1)];
+  assert.equal(await agent.reconcile(target), false);
+  assert.deepEqual(fake.state(target.path).events.map(e => e.event_id), ['e1']);
+});
+
+test('a restored server history keeps every offline event', async () => {
+  const fake = fakeCache();
+  const statuses = [];
+  const {agent} = syncAgent(fake, statuses, () => {
+    throw Object.assign(new Error('Server history changed'), {status: 409, code: 'viewing_epoch_changed'});
+  });
+  const target = agent.root('default');
+  fake.state(target.path).events = [event(1), event(2)];
+  assert.equal(await agent.reconcile(target), false);
+  assert.equal(fake.state(target.path).events.length, 2);
+  assert.ok(!fake.calls.some(c => c[1] === 'acknowledge'));
+  assert.match(statuses[0], /restored or replaced/);
+  // Batches never mix histories: only the leading run of one identity is sent.
+  const mixed = fakeCache();
+  const second = syncAgent(mixed, [], events => ({results: events.map(e => ({event_id: e.event_id, outcome: 'applied', code: null})),
+    next_device_sequence: String(Number(events.at(-1).device_sequence) + 1)}));
+  const root2 = second.agent.root('default');
+  const later = event(2);
+  later.media = {...later.media, viewing_epoch: 'server:r2'};
+  mixed.state(root2.path).events = [event(1), later];
+  await second.agent.reconcile(root2);
+  assert.deepEqual(second.sent, [['server:r1', ['1']], ['server:r2', ['2']]]);
 });
 
 test('a pass removes copies the server no longer offers and records the root to open offline', async () => {
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   assert.throws(() => currentRoot(base), /Nothing has been saved/);
   const fake = fakeCache();
-  const listing = [{id: 'd1', profile_id: 'default', state: 'ready'}, {id: 'gone', profile_id: 'default', state: 'cancelled'}];
+  const listing = [{id: 'd1', profile_id: 'default', state: 'ready'}, {id: 'gone', profile_id: 'default', state: 'cancelled'},
+    {id: 'partial', profile_id: 'default', state: 'expired'}, {id: 'broken', profile_id: 'default', state: 'ready'}];
   const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
     fetchMedia: async () => response(200, media),
     api: async path => {
       if (path.startsWith('/api/v2/downloads?')) return {items: listing, next_cursor: null};
-      if (path.endsWith('/manifest')) return manifest('d1');
+      if (path === '/api/v2/downloads/broken/manifest') throw new Error('server unavailable');
+      if (path.endsWith('/manifest')) return {...manifest('d1'), viewing_revision: '5', viewing_epoch: 'server:r1'};
       if (path === '/api/v2/content-access') return {url: '/api/v2/media/files/f1/content?ticket=t'};
       if (path.endsWith('/viewing')) return {revision: '5', manual_epoch: '0', position_ms: 1000, watched: false};
       throw new Error(path);
     }});
   const target = agent.root('default');
   fake.state(target.path).downloads.push({identity: {download_id: 'gone', timeline_id: 't2'}});
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  writeFileSync(join(target.path, 'staging', 'partial.part'), 'interrupted');
+  writeFileSync(join(target.path, 'manifest.json'), '{}'); // Written by the real cache tool.
   await agent.pass();
+  // An expired demand's interrupted transfer is released too.
+  assert.ok(!existsSync(join(target.path, 'staging', 'partial.part')));
   assert.deepEqual(fake.state(target.path).downloads.map(d => d.identity.download_id), ['d1']);
   assert.ok(fake.calls.some(c => c[1] === 'remove' && c[2][1] === 'gone'));
   const rebase = fake.calls.find(c => c[1] === 'rebase');
-  assert.deepEqual(rebase[2], ['--download-id', 'd1', '--viewing-revision', '5', '--manual-epoch', '0', '--resume-position-ms', '1000']);
-  writeFileSync(join(target.path, 'manifest.json'), '{}'); // Written by the real cache tool.
+  assert.deepEqual(rebase[2], ['--download-id', 'd1', '--viewing-revision', '5', '--manual-epoch', '0', '--viewing-epoch', 'server:r1',
+    '--resume-position-ms', '1000']);
+  // A later failing transfer neither blocks the pass nor hides the published copy.
   assert.equal(currentRoot(base), join(base, rootName({...identity, profile_id: 'default'})));
   // Another server, principal, profile or device never shares a root.
   for (const field of ['server_id', 'principal_id', 'profile_id', 'device_id']) {

@@ -69,8 +69,10 @@ async function session(origin, credential) {
         ...(idempotent ? {'Idempotency-Key': randomUUID().replaceAll('-', '')} : {}), ...headers},
       body: payload === undefined ? undefined : JSON.stringify(payload)});
     if (!reply.ok) {
-      const error = new Error(`${method} ${path} -> ${reply.status} ${await reply.text()}`);
+      const text = await reply.text();
+      const error = new Error(`${method} ${path} -> ${reply.status} ${text}`);
       error.status = reply.status;
+      try { error.code = JSON.parse(text).code; } catch { error.code = null; }
       throw error;
     }
     return reply.status === 204 ? {value: null, etag: null} : {value: await reply.json(), etag: reply.headers.get('etag')};
@@ -161,7 +163,9 @@ try {
   ready = await owned.start();
   const back = await session(ready.origin, ready.credential);
   const log = await runCache(rootPath, {...identity, profile_id: 'default'}, ['events']);
-  const lost = await back.api('/api/v2/offline/sync', {method: 'POST', body: {device_id: identity.device_id, events: log.events.map(e => ({
+  assert.ok(log.events.every(e => e.media.viewing_epoch === log.events[0].media.viewing_epoch));
+  const lost = await back.api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': log.events[0].media.viewing_epoch},
+    body: {device_id: identity.device_id, events: log.events.map(e => ({
     event_id: e.event_id, device_sequence: e.device_sequence, profile_id: 'default', timeline_id: e.media.timeline_id,
     timeline_revision: e.media.timeline_revision, base_viewing_revision: e.media.base_viewing_revision, base_manual_epoch: e.media.base_manual_epoch,
     position_ms: e.position_ms, status: e.status, device_time: e.device_time}))}});
@@ -193,9 +197,38 @@ try {
   assert.equal(final.position_ms, 0);
   checks.newer_manual_state_is_not_overwritten = true;
 
+  // A restored server history: pending offline progress is neither applied
+  // nor erased, and the agent reports it.
+  await owned.stop();
+  session1 = await offline();
+  await record(session1, 4000, 'paused');
+  await session1.helper.stop();
+  const backupDir = join(work, 'backup');
+  execFileSync('python3', ['-I', join(root, 'scripts/backup.py'), 'backup', '--data-dir', options.dataDir, '--output', backupDir]);
+  const restoredDir = join(work, 'server-restored');
+  execFileSync('python3', ['-I', join(root, 'scripts/backup.py'), 'restore', '--backup', backupDir, '--data-dir', restoredDir]);
+  const restoredOptions = {...options, dataDir: restoredDir};
+  owned = createOwnedServer(restoredOptions);
+  ready = await owned.start();
+  const restored = await session(ready.origin, ready.credential);
+  const beforeRestored = (await restored.raw(viewingPath)).value;
+  const messages = [];
+  await createDownloadAgent({base: cacheBase, identity: {...identity, server_id: ready.serverId}, api: restored.api, cache: runCache,
+    quota: 10 * 1024 ** 3, headroom: 0, status: m => messages.push(m),
+    fetchMedia: (url, {range, signal}) => fetch(`${ready.origin}${url}`, {signal, headers: range ? {Range: range} : {}})}).reconcile(
+    {path: rootPath, name: '', scope: {...identity, profile_id: 'default'}});
+  assert.ok(messages.some(m => /restored or replaced/.test(m)), messages.join('; '));
+  assert.equal((await runCache(rootPath, {...identity, profile_id: 'default'}, ['events'])).events.length, 1);
+  assert.deepEqual((await restored.raw(viewingPath)).value, beforeRestored);
+  checks.restored_server_neither_applies_nor_erases_offline_progress = true;
+  await owned.stop();
+  owned = createOwnedServer(options);
+  ready = await owned.start();
+  const fourth = await session(ready.origin, ready.credential);
+
   // Cancelling on the server removes this device's copy at the next pass.
-  await third.api(`/api/v2/downloads/${download.id}`, {method: 'DELETE'});
-  await agent(third).pass();
+  await fourth.api(`/api/v2/downloads/${download.id}`, {method: 'DELETE'});
+  await agent(fourth).pass();
   assert.equal(JSON.parse(readFileSync(join(rootPath, 'manifest.json'), 'utf8')).downloads.length, 0);
   checks.cancellation_removes_the_device_copy = true;
 } catch (error) {

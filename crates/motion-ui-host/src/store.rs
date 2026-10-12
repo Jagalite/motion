@@ -145,6 +145,22 @@ impl Store {
         &self.manifest
     }
 
+    /// Downloads with a staged (unpublished) transfer. These are lifecycle
+    /// facts too: a cancelled or expired demand must also release them.
+    pub fn staged(&self) -> anyhow::Result<Vec<String>> {
+        let mut ids = Vec::new();
+        for entry in self.staging.entries()? {
+            let name = entry?.file_name();
+            if let Some(id) = name.to_string_lossy().strip_suffix(".part")
+                && offline::identifier(id)
+            {
+                ids.push(id.to_owned());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Published bytes (each blob once) plus staged partial transfers.
     pub fn usage(&self) -> anyhow::Result<u64> {
         let mut seen = std::collections::HashSet::new();
@@ -326,6 +342,23 @@ impl Store {
         Ok(next)
     }
 
+    /// Compact after a sync from the server's results for the leading
+    /// `results.len()` retained events (`offline::acknowledged_through`).
+    pub fn acknowledge_results(
+        &self,
+        results: &[offline::Acknowledgement],
+        next_device_sequence: u64,
+    ) -> anyhow::Result<EventLog> {
+        let log = self.events()?;
+        let through = offline::acknowledged_through(
+            log.base_sequence,
+            &log.events,
+            results,
+            next_device_sequence,
+        );
+        self.acknowledge(through)
+    }
+
     /// Pin later offline events of a download to the server's current
     /// viewing state, read after reconciliation, and remember its position
     /// for offline resume once local events were compacted.
@@ -334,11 +367,13 @@ impl Store {
         download_id: &str,
         viewing_revision: &str,
         manual_epoch: &str,
+        viewing_epoch: &str,
         resume_position_ms: Option<u64>,
     ) -> anyhow::Result<bool> {
         ensure!(
             offline::sequence(viewing_revision).is_some()
-                && offline::sequence(manual_epoch).is_some(),
+                && offline::sequence(manual_epoch).is_some()
+                && offline::viewing_epoch(viewing_epoch),
             "invalid causal revision"
         );
         let mut next = self.manifest.clone();
@@ -352,12 +387,14 @@ impl Store {
         let resume = resume_position_ms.filter(|p| *p < entry.duration_ms);
         if entry.identity.base_viewing_revision == viewing_revision
             && entry.identity.base_manual_epoch == manual_epoch
+            && entry.identity.viewing_epoch.as_deref() == Some(viewing_epoch)
             && entry.resume_position_ms == resume
         {
             return Ok(false);
         }
         entry.identity.base_viewing_revision = viewing_revision.into();
         entry.identity.base_manual_epoch = manual_epoch.into();
+        entry.identity.viewing_epoch = Some(viewing_epoch.into());
         entry.resume_position_ms = resume;
         self.write_manifest(next)?;
         Ok(true)

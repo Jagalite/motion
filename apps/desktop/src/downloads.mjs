@@ -14,6 +14,8 @@ import {pipeline} from 'node:stream/promises';
 const CONTENT_TYPES = {mp4: 'video/mp4', webm: 'video/webm', m4a: 'audio/mp4', mp3: 'audio/mpeg', ogg: 'audio/ogg'};
 const UNKNOWN_DEVICE_TIME = '1970-01-01T00:00:00Z';
 const SYNC_BATCH = 200;
+// playscale_core::downloads::MAX_MEDIA_BYTES; the server refuses larger originals too.
+const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
 
 export const rootName = scope => createHash('sha256')
   .update([scope.server_id, scope.principal_id, scope.profile_id, scope.device_id].join('\n')).digest('hex').slice(0, 32);
@@ -90,6 +92,10 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return false;
     }
     const size = Number(file.size_bytes);
+    if (!(size > 0) || size > MAX_MEDIA_BYTES) {
+      status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
+      return false;
+    }
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     if (have > size) { truncateSync(staged, 0); have = 0; }
@@ -124,39 +130,71 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     // discards the staged bytes and the next pass transfers again.
     await cache(target.path, target.scope, ['publish'], JSON.stringify({
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
-        source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch},
+        source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
+        viewing_epoch: manifest.viewing_epoch},
       title: manifest.title, duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType}));
+    // Openable offline as soon as one verified copy exists, even if a later
+    // transfer in this pass fails.
+    writeAtomically(join(base, 'current.json'), {root: target.name});
     return true;
   }
 
-  /** Send the root's retained events in order and compact what the server acknowledged. */
+  /**
+   * Send the root's retained events in order, one server history at a time,
+   * and let the cache tool compact only what the results confirm by identity.
+   */
   async function reconcile(target) {
     for (;;) {
       const log = await cache(target.path, target.scope, ['events']);
       if (log.events.length === 0) return true;
-      const result = await api('/api/v2/offline/sync', {method: 'POST',
-        body: {device_id: identity.device_id, events: log.events.slice(0, SYNC_BATCH).map(wireEvent)}});
+      const history = log.events[0].media.viewing_epoch;
+      if (!history) {
+        status('Offline progress has no server history identity and stays on this device.');
+        return false;
+      }
+      const batch = [];
+      for (const event of log.events) {
+        if (batch.length === SYNC_BATCH || event.media.viewing_epoch !== history) break;
+        batch.push(event);
+      }
+      let result;
+      try {
+        result = await api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': history},
+          body: {device_id: identity.device_id, events: batch.map(wireEvent)}});
+      } catch (error) {
+        if (error.code !== 'viewing_epoch_changed') throw error;
+        status('The server was restored or replaced since these were saved. Offline progress stays on this device.');
+        return false;
+      }
+      const after = await cache(target.path, target.scope, ['acknowledge'], JSON.stringify(result));
       const blocked = result.results.find(r => r.outcome === 'rejected' && ['sequence_gap', 'event_conflict'].includes(r.code));
-      const through = BigInt(result.next_device_sequence) - 1n;
-      const progressed = through > BigInt(log.base_sequence);
-      if (progressed) await cache(target.path, target.scope, ['acknowledge', '--through', String(through)]);
-      if (blocked || !progressed) {
+      if (blocked || after.base_sequence === log.base_sequence) {
         status(`Offline progress could not be reconciled (${blocked?.code ?? 'no_progress'}). It stays on this device.`);
         return false;
       }
     }
   }
 
+  /** Pin later events to the server state read after reconciliation. */
   async function rebase(target, manifest) {
     for (const entry of manifest.downloads) {
+      let pinned;
+      try {
+        pinned = await api(`/api/v2/downloads/${encodeURIComponent(entry.identity.download_id)}/manifest`);
+      } catch (error) {
+        if (error.status === 409 || error.status === 404) continue; // Removed on the next pass.
+        throw error;
+      }
       const viewing = await api(`/api/v2/profiles/${encodeURIComponent(target.scope.profile_id)}/timelines/${encodeURIComponent(entry.identity.timeline_id)}/viewing`);
-      const args = ['rebase', '--download-id', entry.identity.download_id, '--viewing-revision', viewing.revision, '--manual-epoch', viewing.manual_epoch];
+      const args = ['rebase', '--download-id', entry.identity.download_id, '--viewing-revision', pinned.viewing_revision,
+        '--manual-epoch', pinned.manual_epoch, '--viewing-epoch', pinned.viewing_epoch];
+      // The resume position is a convenience; the causal base comes from the manifest snapshot.
       if (!viewing.watched && viewing.position_ms > 0) args.push('--resume-position-ms', String(viewing.position_ms));
       await cache(target.path, target.scope, args);
     }
   }
 
-  /** One complete pass. Errors stop the pass; the next pass resumes. */
+  /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */
   async function pass() {
     const downloads = await listDownloads();
     const profiles = new Set(downloads.map(d => d.profile_id));
@@ -167,17 +205,24 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       const target = root(profile);
       // Progress first: it was recorded against the copies about to change.
       const reconciled = await reconcile(target);
-      let local = (await cache(target.path, target.scope, ['status'])).manifest;
+      const before = await cache(target.path, target.scope, ['status']);
+      let local = before.manifest;
       const wanted = downloads.filter(d => d.profile_id === profile);
-      for (const entry of local.downloads) {
-        const server = wanted.find(d => d.id === entry.identity.download_id);
-        // Cancelled, expired and no-longer-visible downloads leave this device.
-        if (server?.state !== 'ready') await cache(target.path, target.scope, ['remove', '--download-id', entry.identity.download_id]);
+      // Cancelled, expired and no-longer-visible downloads leave this device,
+      // published copies and unpublished staged transfers alike.
+      const present = new Set([...local.downloads.map(entry => entry.identity.download_id), ...before.staged]);
+      for (const id of present) {
+        if (wanted.find(d => d.id === id)?.state !== 'ready') await cache(target.path, target.scope, ['remove', '--download-id', id]);
       }
       for (const download of wanted.filter(d => d.state === 'ready')) {
         if (signal?.aborted) return;
         if (local.downloads.some(entry => entry.identity.download_id === download.id)) continue;
-        await transfer(download, target);
+        // One failing transfer never blocks the others; the next pass retries it.
+        try { await transfer(download, target); }
+        catch (error) {
+          if (signal?.aborted) throw error;
+          status(`A download could not be saved yet: ${error.message}`);
+        }
       }
       local = (await cache(target.path, target.scope, ['status'])).manifest;
       if (reconciled) await rebase(target, local);

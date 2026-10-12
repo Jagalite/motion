@@ -10,7 +10,7 @@
 use playscale_core::{
     downloads::{self, Code, Decision, Lineage, OfflineEvent, Outcome, Recorded, Target},
     offline::{self, Admission, CacheScope, DownloadIdentity},
-    timeline_viewing::{Status, View},
+    timeline_viewing::{self, Status, View},
 };
 use serde::{Deserialize, Serialize};
 use stateless::{
@@ -40,6 +40,9 @@ enum Input {
     OnlineProgress,
     ManualOverride,
     TimelineEdit,
+    /// The server database is restored from a backup taken at the start; its
+    /// history identity (restore epoch) changes.
+    Restore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -67,6 +70,9 @@ struct World {
     online: u8,
     manual: u8,
     edits: u8,
+    /// The server's restore epoch and how many restores happened.
+    epoch: u8,
+    restores: u8,
 }
 
 fn scope() -> CacheScope {
@@ -111,12 +117,36 @@ fn identity(w: &World) -> DownloadIdentity {
         source_revision: "source".into(),
         base_viewing_revision: w.view.revision.to_string(),
         base_manual_epoch: w.view.manual_epoch.to_string(),
+        viewing_epoch: Some(history(w)),
     }
+}
+
+fn history(w: &World) -> String {
+    format!("server:{}", w.epoch)
+}
+
+/// The history identity a batch is sent under: that of its events' base.
+fn header(log: &[offline::OfflineEvent]) -> Option<String> {
+    log.first().and_then(|e| e.media.viewing_epoch.clone())
 }
 
 /// Server side of one batch: each event decided in order against the state
 /// left by the previous one, exactly as the adapter's transaction does.
-fn sync(w: &mut World, events: &[OfflineEvent]) -> Vec<Option<(Outcome, Option<Code>)>> {
+fn sync(
+    w: &mut World,
+    events: &[OfflineEvent],
+    header: Option<&str>,
+) -> Vec<Option<(Outcome, Option<Code>)>> {
+    // The adapter checks the history identity first, inside the transaction.
+    let current = history(w);
+    let accepted = header
+        .and_then(|h| h.split_once(':'))
+        .is_some_and(|expected| {
+            timeline_viewing::accepts_history_identity(expected, current.split_once(':').unwrap())
+        });
+    if !accepted {
+        return vec![None; events.len()];
+    }
     let mut results = vec![];
     for event in events {
         let prior: Vec<Recorded> = w
@@ -179,8 +209,8 @@ impl Model for Downloads {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-download-reconciliation".into(),
-            model_version: 1,
-            properties_version: 1,
+            model_version: 2,
+            properties_version: 2,
             codec_version: 1,
             build: concat!(
                 include_str!("../src/downloads.rs"),
@@ -205,6 +235,8 @@ impl Model for Downloads {
             online: 0,
             manual: 0,
             edits: 0,
+            epoch: 0,
+            restores: 0,
         })
     }
 
@@ -220,7 +252,9 @@ impl Model for Downloads {
             ),
             check(
                 "reconcile.device_never_compacts_unrecorded_events",
-                w.base < w.next_sequence,
+                // A restore rewinds the server below what the device already
+                // compacted against the previous history.
+                w.restores > 0 || w.base < w.next_sequence,
             ),
         ])
     }
@@ -261,19 +295,31 @@ impl Model for Downloads {
             }
             Input::Sync | Input::SyncLost => {
                 let events: Vec<_> = w.log.iter().map(wire).collect();
-                out = sync(&mut n, &events);
-                if *input == Input::Sync
-                    && let Some((base, log)) = offline::compact(w.base, &w.log, n.next_sequence - 1)
-                {
-                    n.base = base;
-                    n.log = log;
+                out = sync(&mut n, &events, header(&w.log).as_deref());
+                if *input == Input::Sync {
+                    // The device compacts only what the results confirm.
+                    let acks: Vec<_> = w
+                        .log
+                        .iter()
+                        .zip(&out)
+                        .map(|(e, r)| offline::Acknowledgement {
+                            event_id: e.event_id.clone(),
+                            consumed: r.is_some(),
+                        })
+                        .collect();
+                    let through =
+                        offline::acknowledged_through(w.base, &w.log, &acks, n.next_sequence);
+                    if let Some((base, log)) = offline::compact(w.base, &w.log, through) {
+                        n.base = base;
+                        n.log = log;
+                    }
                 }
             }
             Input::AlteredRetry => {
                 if let Some(first) = w.recorded.first() {
                     let mut altered = first.event.clone();
                     altered.position_ms += 1;
-                    out = sync(&mut n, &[altered]);
+                    out = sync(&mut n, &[altered], Some(&history(w)));
                 }
             }
             Input::Gap => {
@@ -288,7 +334,7 @@ impl Model for Downloads {
                         device_time: None,
                     });
                     e.device_time = "gap".into();
-                    out = sync(&mut n, &[e]);
+                    out = sync(&mut n, &[e], Some(&history(w)));
                 }
             }
             Input::Rebase if w.download.is_some() && w.log.is_empty() => {
@@ -316,6 +362,16 @@ impl Model for Downloads {
                 n.edits += 1;
                 n.timeline_revision += 1;
             }
+            Input::Restore if w.restores < 1 => {
+                // Back to the empty backup; the device keeps everything.
+                n.view = View::default();
+                n.timeline_revision = 1;
+                n.next_sequence = 1;
+                n.recorded = vec![];
+                n.lineage = None;
+                n.epoch += 1;
+                n.restores += 1;
+            }
             _ => {}
         }
         Ok(Transition::accepted(n, out))
@@ -339,7 +395,8 @@ impl Model for Downloads {
             ),
             check(
                 "reconcile.viewing_revision_monotonic",
-                n.view.revision >= w.view.revision,
+                // Within one server history; a restore rewinds it by definition.
+                *input == Input::Restore || n.view.revision >= w.view.revision,
             ),
             check(
                 "device.sequence_never_renumbered",
@@ -354,22 +411,35 @@ impl Model for Downloads {
                     .as_ref()
                     .map(|d| d.timeline_revision.parse::<u64>().unwrap());
                 let mut expected = vec![];
+                let same_history = header(&w.log) == Some(history(w));
+                let mut next = w.next_sequence;
                 for e in &w.log {
                     let sequence: u64 = e.device_sequence.parse().unwrap();
-                    if let Some(r) = w.recorded.iter().find(|r| r.event.sequence == sequence) {
+                    if !same_history {
+                        // Another server history: nothing is consumed or applied.
+                        expected.push(None);
+                    } else if let Some(r) = w.recorded.iter().find(|r| r.event.sequence == sequence)
+                    {
                         expected.push(Some((r.outcome, r.code)));
+                    } else if sequence != next {
+                        expected.push(None);
                     } else if e.position_ms > DURATION + 1_000 {
+                        next += 1;
                         expected.push(Some((Outcome::Rejected, Some(Code::InvalidPosition))));
                     } else if pin != Some(w.timeline_revision) {
+                        next += 1;
                         expected.push(Some((Outcome::HistoryOnly, Some(Code::TimelineChanged))));
                     } else if w.other_manual {
+                        next += 1;
                         expected.push(Some((
                             Outcome::HistoryOnly,
                             Some(Code::ManualOverrideNewer),
                         )));
                     } else if w.other_viewing {
+                        next += 1;
                         expected.push(Some((Outcome::HistoryOnly, Some(Code::ViewingNewer))));
                     } else {
+                        next += 1;
                         expected.push(Some((Outcome::Applied, None)));
                     }
                 }
@@ -397,7 +467,8 @@ impl Model for Downloads {
                 checks.push(check(
                     "device.compacts_exactly_acknowledged_events",
                     if *input == Input::Sync {
-                        n.log.is_empty() && n.base == w.base + w.log.len() as u64
+                        let confirmed = expected.iter().take_while(|x| x.is_some()).count();
+                        n.log == w.log[confirmed..] && n.base == w.base + confirmed as u64
                     } else {
                         n.log == w.log && n.base == w.base
                     },
@@ -428,6 +499,7 @@ impl Enumerate for Downloads {
             Input::OnlineProgress,
             Input::ManualOverride,
             Input::TimelineEdit,
+            Input::Restore,
         ])
     }
 }
@@ -461,7 +533,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
     let report = stateless::explore::enumerate(
         &Downloads,
         stateless::explore::SearchConfig {
-            max_states: 3_000_000,
+            max_states: 12_000_000,
             max_transitions: 200_000_000,
             max_depth: 100,
         },
@@ -474,7 +546,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit; download/rebase, partial/complete/beyond, sync, lost response, altered retry, gap",
+        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore; download/rebase, partial/complete/beyond, sync, lost response, altered retry, gap",
         report.states, report.transitions
     );
 }

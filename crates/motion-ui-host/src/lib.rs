@@ -37,7 +37,7 @@ pub mod store;
 const MAX_MANIFEST: u64 = 2 * 1024 * 1024;
 const MAX_LOG: u64 = 8 * 1024 * 1024;
 const MAX_EVENTS: usize = 10_000;
-const MAX_MEDIA: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_MEDIA: u64 = playscale_core::downloads::MAX_MEDIA_BYTES;
 const MAX_DOWNLOADS: usize = 500;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -154,6 +154,12 @@ pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
         .into_iter()
         .all(|s| offline::sequence(s).is_some()),
         "invalid causal revision"
+    );
+    ensure!(
+        m.viewing_epoch
+            .as_deref()
+            .is_none_or(offline::viewing_epoch),
+        "invalid server history identity"
     );
     ensure!(
         !m.source_revision.is_empty() && m.source_revision.len() <= 256,

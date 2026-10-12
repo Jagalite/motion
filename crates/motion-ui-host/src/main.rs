@@ -54,10 +54,9 @@ enum CacheCommand {
         download_id: String,
     },
     Events,
-    Acknowledge {
-        #[arg(long)]
-        through: u64,
-    },
+    /// Compact from a `syncOffline` response read from stdin; only the
+    /// leading events the server confirmed by identity are dropped.
+    Acknowledge,
     Rebase {
         #[arg(long)]
         download_id: String,
@@ -65,6 +64,8 @@ enum CacheCommand {
         viewing_revision: String,
         #[arg(long)]
         manual_epoch: String,
+        #[arg(long)]
+        viewing_epoch: String,
         #[arg(long)]
         resume_position_ms: Option<u64>,
     },
@@ -78,7 +79,7 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
     Ok(match args.command {
         CacheCommand::Status => {
             let events = store.events()?;
-            json!({"manifest":store.manifest(),"usage":store.usage()?.to_string(),
+            json!({"manifest":store.manifest(),"staged":store.staged()?,"usage":store.usage()?.to_string(),
                 "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string())})
         }
         CacheCommand::Admit {
@@ -95,15 +96,48 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
         CacheCommand::Events => serde_json::to_value(store.events()?)?,
-        CacheCommand::Acknowledge { through } => serde_json::to_value(store.acknowledge(through)?)?,
+        CacheCommand::Acknowledge => {
+            #[derive(serde::Deserialize)]
+            struct Result {
+                event_id: String,
+                outcome: String,
+                code: Option<String>,
+            }
+            #[derive(serde::Deserialize)]
+            struct Response {
+                results: Vec<Result>,
+                next_device_sequence: String,
+            }
+            let mut input = String::new();
+            std::io::stdin()
+                .take(1024 * 1024)
+                .read_to_string(&mut input)?;
+            let response: Response = serde_json::from_str(&input)?;
+            let next = playscale_core::offline::sequence(&response.next_device_sequence)
+                .ok_or_else(|| anyhow::anyhow!("invalid next_device_sequence"))?;
+            let results: Vec<_> = response
+                .results
+                .into_iter()
+                .map(|r| playscale_core::offline::Acknowledgement {
+                    consumed: playscale_core::offline::consumed(&r.outcome, r.code.as_deref()),
+                    event_id: r.event_id,
+                })
+                .collect();
+            serde_json::to_value(store.acknowledge_results(&results, next)?)?
+        }
         CacheCommand::Rebase {
             download_id,
             viewing_revision,
             manual_epoch,
+            viewing_epoch,
             resume_position_ms,
-        } => {
-            json!({"rebased": store.rebase(&download_id, &viewing_revision, &manual_epoch, resume_position_ms)?})
-        }
+        } => json!({"rebased": store.rebase(
+            &download_id,
+            &viewing_revision,
+            &manual_epoch,
+            &viewing_epoch,
+            resume_position_ms,
+        )?}),
     })
 }
 
