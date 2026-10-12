@@ -115,20 +115,21 @@ The M4 expansion changes are in [the M4 ledger](qualification/m4-expansion/READM
 - sidecar and burned subtitles, and automatic subtitle selection;
 - rendition audio continuity;
 - interval and multipart timelines;
-- bitrate caps.
+- bitrate caps;
+- text subtitles on live routes as an in-manifest HLS subtitle rendition;
+- a two-rung adaptive ladder for software conversions (off by default).
 
 What remains:
 
-- Text subtitles are delivered only as a WebVTT sidecar with byte delivery of
-  the original. Live routes refuse them for a specific reason: the bridge
-  attaches subtitles as an external track (Demuxe `addTextTrack`, which calls
-  Shaka 5.2.11 `addTextTrackAsync`), and Shaka throws 4033 for an external
-  track on a presentation of infinite duration, as Motion's rolling HLS is.
-  Demuxe 1.1.1 does list in-manifest HLS `SUBTITLES` renditions, but Motion
-  does not publish one yet. Text burn-in, including styled (ASS/SSA)
-  subtitles and their fonts, needs libass. Subtitles on multipart versions
-  are refused. Burned bitmap cues displayed more than 20 s before a start
-  or seek are not restored.
+- Text subtitles reach live (HLS) routes only as an in-manifest `SUBTITLES`
+  rendition, for clients listing `hls_text` (the bridge does with HLS and
+  selects it through Demuxe `selectSubtitleTrack`). An external track on a
+  live presentation is never used: Shaka 5.2.11 throws 4033 for it. The
+  pair is verified in headless Chromium with the pinned Shaka, not yet
+  qualified in Chromium/Electron product builds. Text burn-in, including
+  styled (ASS/SSA) subtitles and their fonts, needs libass. Subtitles on
+  multipart versions are refused. Burned bitmap cues displayed more than
+  20 s before a start or seek are not restored.
 - Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
   the production bridge sends `null` and nothing in the product supplies a
   value yet.
@@ -145,7 +146,12 @@ What remains:
 - HDR sources are refused for byte delivery under `require_sdr`, and to a
   client reporting `hdr: unsupported` or `unknown`. No tone-mapped route
   exists.
-- Adaptive bitrate is a recorded release deferral.
+- Adaptive bitrate (`processing.experimental_adaptive_bitrate`, off by
+  default) is two fixed rungs (720p at 3 Mb/s, 360p at 800 kb/s) for an
+  uncapped single-file software conversion without burn-in. Copies,
+  hardware conversions, capped, burned and multipart plans stay single
+  variant. Switching is verified with headless Shaka under throttling, not
+  yet qualified in product players.
 - Next-in-order uses `timelines.order_group_id` / `order_position`.
 - v1 item-keyed progress and v2 timeline progress are separate authorities
   after migration 0032's backfill.

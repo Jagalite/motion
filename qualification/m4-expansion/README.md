@@ -17,12 +17,16 @@ evidence. It is not release qualification and not M4 closure.
   rendition audio continuity.
 - **M4-03:** intervals and multipart versions.
 - **M4-04:** bitrate caps.
+- **M4-02 (follow-up):** text subtitles on live routes as an in-manifest HLS
+  subtitle rendition.
+- **M4-05:** a two-rung adaptive ladder for software conversions, off by
+  default.
 
 **Explicit deferrals:**
 - **M4-04:** HDR tone mapping. No available FFmpeg has the filters it needs
   (below).
-- **M4-05:** adaptive bitrate, as a release deferral.
-- **Subtitles:** text subtitles on live routes and text burn-in.
+- **Subtitles:** text and styled burn-in (libass), subtitles on multipart
+  versions, bitmap cues older than the 20 s lookback.
 
 SHAs below are on the current branch, after the rebase onto `b5d9ced`.
 
@@ -50,12 +54,12 @@ qualified; the release checks are listed below.
 | SRT/WebVTT sidecar subtitles | Refused | Implemented on original byte delivery, component-pinned and fingerprint-checked |
 | Bitmap subtitles (PGS, DVD, DVB) | Refused | Implemented as burn-in on conversions for clients listing `burned` (the production bridge now lists it whenever it plays HLS); canvas scaled to the video; a 20 s lookback restores cues active at a start, and **cues displayed more than 20 s before a start or seek are not restored** |
 | Client bitrate caps | Refused | **API-only:** the server keeps `max_bitrate_bps` (see M4-04), but no product client sends one. The bridge sends `null`, and no profile preference, contract preference field or player control supplies a value. Follow-up owners in the deferral table |
-| Text subtitles on live (HLS) routes | Refused | Still refused. The specific limit is the external-track path: Motion's bridge attaches a WebVTT URL through Demuxe `addTextTrack`, which calls Shaka 5.2.11 `addTextTrackAsync`, and Shaka throws 4033 (`CANNOT_ADD_EXTERNAL_TEXT_TO_LIVE_STREAM`) when the presentation duration is infinite, as it is for Motion's rolling HLS. Demuxe 1.1.1 does expose in-manifest HLS `SUBTITLES` renditions (Shaka parses them; Demuxe lists them through `getTextTracks()` and selects them with `selectSubtitleTrack`). Motion does not publish a subtitle rendition yet, so no live text path exists today |
+| Text subtitles on live (HLS) routes | Refused | Implemented for clients listing `hls_text`: the master playlist declares a WebVTT `SUBTITLES` rendition whose playlist mirrors the media window, with cues cut per segment in generation media time (offset by an interval's start). The bridge lists `hls_text` with HLS and selects the in-manifest track (Demuxe `selectSubtitleTrack`), never an external track on live: Shaka 5.2.11 throws 4033 (`CANNOT_ADD_EXTERNAL_TEXT_TO_LIVE_STREAM`) from `addTextTrackAsync` for infinite-duration presentations. Clients without `hls_text` are still refused |
 | Styled subtitles (ASS/SSA) and text burn-in | Refused | Still refused: burning text in, including styled subtitles with their fonts and attachments, needs libass, absent from the bundled and host FFmpeg |
 | Subtitles on multipart versions | Refused | Still refused (`subtitle_multipart_unavailable`): subtitle streams and sidecars belong to one part's file |
 | HDR preserve | Byte delivery to clients reporting HDR support | Unchanged (attempt, not a display-fidelity receipt) |
 | HDR tone-map to SDR | Refused | Still refused (deferral below) |
-| Adaptive bitrate | Missing | Release deferral (below) |
+| Adaptive bitrate | Missing | Implemented behind `processing.experimental_adaptive_bitrate` (off by default): an uncapped single-file software conversion without burn-in is one FFmpeg process encoding a 720p rung (3 Mb/s cap) and a 360p rung (800 kb/s cap) with shared keyframes; segment *n* is published only when both rungs have it; two execution units reserved; `BANDWIDTH`, `CODECS` and `RESOLUTION` per rung. Copies, hardware, capped, burned and multipart plans stay single variant |
 
 Fixtures are generated in the tests: FFmpeg `lavfi` media, a byte-level PGS
 stream, and SRT, ASS and noise sources. The repository stores no media
@@ -74,7 +78,17 @@ fixtures. There is no HDR fixture with tone-mapping ground truth.
 | M4-03 multipart | `e03488f`, `5ca4766`, `5525506`, `6c1d504` | Plans and pins carry `parts`; `multipart_requires_conversion`, `subtitle_multipart_unavailable` | See inventory | Core `parts::locate`; model property; HTTP multipart test (Matroska part, part-2 frame after a seek, incompatible parts, live part change fails the delivery) and boundary test | 4 P2, then 3 P2, then 2 P2 (time bases, positions, audio identity, revalidation, boundaries, SAR, flags, A/V sync, canvas), all fixed |
 | M4-04 caps | `0843d72`, `cfc18d0` | `bitrate_caps` capability; master `BANDWIDTH` is the cap | A conversion with at least 300 kb/s of video after audio and overhead; byte routes, copies and renditions still refuse caps | Core `rate_cap`, `peak_within_cap`; HTTP test on an ~18 Mb/s noise source capped at 1 Mb/s | 1 P2 (windows, fixed); 1 P2 (digest forms) not applicable: the only shipped form is preserved |
 | M4-04 HDR | none | None | Tone mapping refused | `scale_vt` measured: retags PQ without tone mapping (mean luma unchanged) | n/a |
-| M4-05 | none | None | Not advertised | n/a | n/a |
+| M4-02 live text | `8335b3a` | Contract `subtitle_modes` adds `hls_text` (additive); bridge lists it with HLS and selects the in-manifest track; `subtitles_url` names the rendition playlist for HLS | Live text for `hls_text` clients; others refused | Core `subtitles` (WebVTT parsing, per-segment windows, playlist); HTTP plain-text test (rendition, playlist mirrors media window, cues at 2 s starts and on an interval); JS 56/56; headless Shaka 5.2.11 on the server's exact output: cue active at the expected times on VOD and rolling playlists | Clean |
+| M4-05 | `5bc255f`, `857b238` | Capabilities report `adaptive_bitrate`; master lists a `low` variant (existing `variants/{variant_id}` routes) | See inventory | Core `adaptive`; HTTP `adaptive_conversions_publish_aligned_capped_variants` (identical segment lists, rung sizes, per-rung caps over every peak window, another device refused, rung retired with its delivery, capacity released, a client cap keeps one variant); `recovery_keeps_an_adaptive_encoders_two_execution_units`; headless Shaka 5.2.11 under a CDP throttle: 360p at 600 kb/s, 720p when restored | 2 P2 (restart recovery adopted the ladder's encoder at one unit; low-rung duration check stricter than core `fits_target`), fixed in `857b238`; re-review clean |
+
+## PR #22 follow-up review (rebased onto main `c6d6e26`)
+
+| Finding | Disposition | SHAs | Evidence | GPT-6.1 Sol |
+|---|---|---|---|---|
+| Multipart audio swap: same-language, same-role tracks reordered between parts played the wrong track | Fixed. The planner resolves the selected audio's component on part 1 (`components::component_of`), then that component's exact occurrence on every part (`per_file_tracks`), and pins each part's own ordinal (`PartPin::audio`). A part without it is refused (`multipart_audio_unavailable`); the worker fails closed without a per-part ordinal. Replans may switch audio (`parts::same_layout` compares only files, revisions and durations) | `112c51a`, `03f4133`, and the test fixture commit after them | Core mapping and layout tests. HTTP `multipart_audio_follows_the_component_in_every_part`: Matroska "Stereo" 440 Hz and "Director" 880 Hz in opposite orders; the default plays 440 Hz and a Director pin 880 Hz in both parts (measured), and a live delivery switches by replan | 2 P2 on `112c51a` (replan switch, serialization), fixed in `03f4133`; re-review clean |
+| Production client cannot request burn-in; always sends `max_bitrate_bps: null` | Burn-in wired: the bridge lists `burned` whenever it plays HLS (the only transport a burned conversion arrives over). Bitrate caps recorded as **API-only**, with follow-up owners in the deferral table | `8a629e3` | `player.test.mjs` provider/MSE matrix; JS 55/55 | Clean |
+| Live-subtitle statement too broad | Narrowed after inspecting Demuxe 1.1.1 (npm, pinned): Shaka 5.2.11 throws 4033 from `addTextTrackAsync` (the bridge's external-track path) only for infinite-duration presentations, while Demuxe lists in-manifest HLS `SUBTITLES` renditions. Motion then published one (M4-02 live text) | `8a629e3`, `8335b3a` | Package source inspection (`web/generated/internal/shaka-backend.js`, `web/vendor/shaka-player.js`); headless Shaka playback of the rendition | Clean |
+| Keep subtitle and HDR limits visible | Inventory and deferral rows: styled/font handling, multipart subtitles, bitmap cues older than the 20 s lookback, client caps API-only, HDR implementation still owed after the native-tool change | `8a629e3` | This ledger, `V2_PLAYBACK.md` | Clean |
 
 ## Correctness boundary
 
@@ -87,7 +101,11 @@ fixtures. There is no HDR fixture with tone-mapping ground truth.
   - `presents_subtitle`, `rate_cap`, `within_cap`, `peak_within_cap`.
 - `delivery`: `copy_operation`, `live_route_supported`, `copy_start`,
   `copy_seek` and `burnable_subtitle`.
+- `playback_session::adaptive`: which plans are delivered as a ladder,
+  carried in the signed claims and the delivery pin.
 - `components`: `subtitle_occurrence`, `automatic_subtitle`, `same_language`.
+- `subtitles`: WebVTT parsing, the cues of each segment window and the
+  rendition playlist mirroring the media window.
 - `parts`: `layout` and `locate`.
 
 **Adapters:**
@@ -100,7 +118,8 @@ fixtures. There is no HDR fixture with tone-mapping ground truth.
 - copied stream start;
 - independent segments;
 - copied codecs;
-- per-window peak bitrate;
+- per-window peak bitrate, for each adaptive rung;
+- both adaptive rungs holding segment *n* before it is reported;
 - sidecar fingerprint before and after conversion;
 - live revalidation of every part.
 
@@ -117,8 +136,11 @@ and 43,032 transitions. Its expected outcomes are stated independently, across:
 The playback-session and delivery models pass unchanged.
 
 **Gaps:**
-- Prepared renditions, subtitles and caps are not in that model; unit and
-  HTTP tests cover them.
+- Prepared renditions, subtitles, caps and the adaptive ladder are not in
+  that model; unit and HTTP tests cover them. Ladder publication (segment
+  *n* only when both rungs hold it) is an adapter conjunction feeding the
+  core delivery's existing segment input, so the delivery models still
+  cover what is published after it.
 - Adapter probes, filters and segment measurement are covered by HTTP tests,
   not models.
 
@@ -126,22 +148,20 @@ The playback-session and delivery models pass unchanged.
 
 Builds ran through the shared Kyoto queue with Rust 1.98, in this worktree's own
 target directory. Tests ran from the compiled binaries on macOS arm64, with
-host FFmpeg 8.1.2 and VideoToolbox available. The final receipts are at
-`d17556a`, with `0ab47ce` rechecked for v2_playback, delivery and clippy. Compilation was through Kyoto
-(`f84a3f490289462d88f430bb7f35e646`, `a45dea1d43ec4fecad8e7377384a78b7`):
+host FFmpeg 8.1.2 and VideoToolbox available. Receipts are at the PR head
+after `857b238` (rebased onto main `c6d6e26`):
 
 | Suite | Result |
 |---|---|
-| `playscale-core` lib | 114 passed |
-| `route_selection_model` | Graph exhausted, 28,689 states |
-| `playback_session_model`, `delivery_model`, `delivery_observation_model` | Passed (Statelessness 0.2.0) |
-| `tests/v2_playback.rs` | 22/22 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
+| `playscale-core` lib | 120 passed |
+| Core model and policy tests (`route_selection_model`, `playback_session_model`, `delivery_model`, `delivery_observation_model` and the other models) | Passed (Statelessness 0.2.0). `delivery_model`'s metadata now records a digest of `delivery.rs`, which outgrew the 64 KiB trace string limit |
+| `tests/v2_playback.rs` | 25/25 (`MOTION_REQUIRE_VIDEOTOOLBOX=1`) |
 | `tests/delivery.rs` | 12/12 |
 | `tests/access_api.rs` | 32/32 |
-| JavaScript | 54/54 (no client files changed) |
-| Contract checks | Pass (contract unchanged against main) |
-| Pinned clippy, `-p playscale-core -p playscale --all-targets` (CI allow-list) | Clean, Kyoto `069bd0b0c11146fdbabf09586dcfea61` at `0ab47ce` |
-| `cargo fmt --check`, contract checks | Pass |
+| JavaScript (CI set) | 78/78 |
+| Headless Shaka 5.2.11 (`scripts/check_hls_subtitles.mjs`) | Subtitle cues on VOD and rolling playlists; ABR 360p throttled, 720p restored |
+| Pinned clippy, `-p playscale-core -p playscale --all-targets` (CI allow-list) | Clean, Kyoto `e58fb78db05a4992b07fd2d88f676276` |
+| `cargo fmt --check`, contract checks (`check_contract.py`, `contract_json.rb --check`) | Pass |
 
 ## Deferred work and release checks
 
@@ -151,13 +171,13 @@ host FFmpeg 8.1.2 and VideoToolbox available. The final receipts are at
 | Copied-stream audio start | Integration/release | After a seek within 132 ms of a keyframe, audio may start up to 132 ms after video |
 | Capped and multipart/interval playback in players | Clients + integration/release | Seek across part boundaries; correct logical duration; `BANDWIDTH`-based startup |
 | HDR tone mapping | Integration/release (native tools), then this lane | Add zimg (`zscale`) or libplacebo to the bundled FFmpeg. Then **this lane still has to implement** a tone-mapped conversion gated on the observed filter, and qualify it on suitable HDR/SDR displays. Until then HDR conversion stays refused |
-| Text subtitles on live routes | This lane (server: segmented WebVTT `SUBTITLES` rendition in the master playlist, aligned to the rolling window and in generation media time) + clients (bridge selects it through Demuxe `selectSubtitleTrack` instead of `addTextTrack`) | Demuxe 1.1.1 already lists in-manifest HLS subtitle renditions; Motion must publish one, and the pair must be qualified in Chromium/Electron |
+| Live text subtitle and adaptive playback in product players | Clients + integration/release | Chromium and Electron builds: the subtitle rendition shown at startup, after far seeks and generation changes; ladder switching under real network changes. Verified so far with the pinned Shaka in headless Chromium only. Required before `experimental_adaptive_bitrate` defaults on |
 | Text and styled (ASS/SSA) burn-in, fonts and attachments | Integration/release (libass in the bundled FFmpeg), then this lane | Burn text and styled subtitles with the file's attached fonts; until then refused |
 | Subtitles on multipart versions | This lane | A per-part subtitle source (each part's occurrence of the subtitle component) joined on the timeline; until then refused |
 | Bitmap cues older than the lookback | This lane | A cue displayed more than 20 s before a start or seek is not restored; restoring it needs reading the subtitle stream from the part's start (a second validated descriptor) |
 | Client bitrate-cap source | API/integration owner (a preferences or quality-limit field in the contract) + UI lane (a player or profile control) + clients (the bridge sends it) | Today API-only: the server honors `max_bitrate_bps`, the bridge sends `null` |
 | Preparation by audio component | Data/catalog + this lane | Preparation still refuses component pins; clients pin `a{n}` with the exact source |
-| **M4-05 adaptive bitrate** | This lane, after the single-route matrix is qualified | Release deferral (plan 10.3). Design: one FFmpeg process per generation encoding aligned variants. It would use `-var_stream_map`: split the picture, force shared keyframes, cap every variant. Each variant would be verified (independent segments, peak windows) and segment *n* reported only when every variant has it. Each variant's `BANDWIDTH` would be its cap, and a generation would reserve both execution units. The contract's `variants/{variant_id}` routes already allow it. Manual prepared-file switching is not ABR |
+| Wider adaptive ladders | This lane | Ladders for copies, hardware conversions and capped plans, more rungs, and an audio-only rung are not implemented; a ladder retains both rungs over the same window (about 1.3 times the storage of the main rung alone, by cap) |
 | Physical A/V and performance budgets | Integration/release | Section 21.3 budgets with a frozen workload; WebKit remains deferred |
 
 ## Known pre-existing gaps found during this lane
