@@ -17,6 +17,7 @@ pub mod metadata;
 pub mod monitor;
 pub mod organization;
 pub mod playback;
+pub mod previews;
 pub mod processing;
 pub mod scans;
 pub mod schedules;
@@ -815,6 +816,7 @@ pub fn router() -> Router<App> {
         .merge(playback::routes())
         .merge(processing::routes())
         .merge(downloads::routes())
+        .merge(previews::routes())
         .merge(markers::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))

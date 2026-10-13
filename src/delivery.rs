@@ -5486,6 +5486,48 @@ async fn ensure_subtitles(
     Ok(())
 }
 
+/// An available file at exactly `revision`, as a source to open beneath its
+/// library root (`source_valid`); a changed revision is a conflict.
+async fn source_of(app: &App, file_id: &str, revision: &str) -> Result<Source, ApiError> {
+    let file: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT f.relative_path,f.fingerprint,l.root,l.root_identity FROM media_files f JOIN libraries l ON l.id=f.library_id \
+         WHERE f.id=? AND f.revision=? AND f.available=1 AND l.enabled=1",
+    )
+    .bind(file_id)
+    .bind(revision)
+    .fetch_optional(&app.db)
+    .await?;
+    let (relative, fingerprint, root, root_identity) =
+        file.ok_or_else(|| ApiError::conflict("source_revision_changed", "The file changed"))?;
+    Ok(Source {
+        root: root.into(),
+        relative: relative.into(),
+        root_identity,
+        fingerprint,
+    })
+}
+
+/// Open an available file at exactly `revision` beneath its validated root,
+/// only while its fingerprint is the recorded one: the descriptor and that
+/// fingerprint, so a reader can observe it unchanged afterwards.
+pub(crate) async fn open_source(
+    app: &App,
+    file_id: &str,
+    revision: &str,
+) -> Result<(std::fs::File, String), ApiError> {
+    let source = source_of(app, file_id, revision).await?;
+    let fingerprint = source.fingerprint.clone();
+    let opened = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || source_valid(&source)),
+    )
+    .await
+    .map_err(|_| ApiError::conflict("source_unavailable", "The file could not be opened"))?
+    .map_err(ApiError::internal)?
+    .map_err(|_| ApiError::conflict("source_revision_changed", "The file changed"))?;
+    Ok((opened, fingerprint))
+}
+
 /// Convert subtitle stream `index` of an available file at exactly
 /// `revision` to WebVTT in its file time, for a download (`owner`). The file
 /// is opened beneath its library root only while its fingerprint is the
@@ -5498,16 +5540,7 @@ pub(crate) async fn download_subtitles(
     revision: &str,
     index: u32,
 ) -> Result<Vec<u8>, ApiError> {
-    let file: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT f.relative_path,f.fingerprint,l.root,l.root_identity FROM media_files f JOIN libraries l ON l.id=f.library_id \
-         WHERE f.id=? AND f.revision=? AND f.available=1 AND l.enabled=1",
-    )
-    .bind(file_id)
-    .bind(revision)
-    .fetch_optional(&app.db)
-    .await?;
-    let (relative, fingerprint, root, root_identity) = file
-        .ok_or_else(|| ApiError::conflict("source_revision_changed", "Request a new download"))?;
+    let source = source_of(app, file_id, revision).await?;
     let _slot = app
         .processing
         .deliveries
@@ -5515,12 +5548,6 @@ pub(crate) async fn download_subtitles(
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
-    let source = Source {
-        root: root.into(),
-        relative: relative.into(),
-        root_identity,
-        fingerprint,
-    };
     let text = convert_subtitle(app, owner, source, None, index).await?;
     if !std::str::from_utf8(&text)
         .ok()

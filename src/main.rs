@@ -198,6 +198,7 @@ async fn run() -> anyhow::Result<()> {
         let result = tokio::try_join!(
             scan::worker(worker_app.clone(), worker_stop.clone()),
             playscale::processing::worker(worker_app.clone(), worker_stop.clone()),
+            playscale::v2::previews::worker(worker_app.clone(), worker_stop.clone()),
             playscale::delivery::worker(worker_app.clone(), worker_stop.clone()),
             playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
             playscale::storage::worker(worker_app.clone(), worker_stop.clone()),

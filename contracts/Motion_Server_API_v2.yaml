@@ -3923,6 +3923,157 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/ArtworkSelection'
+  /api/v2/catalog/timelines/{timeline_id}/previews:
+    parameters:
+    - name: timeline_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    get:
+      operationId: getTimelinePreviews
+      summary: Read the trick-play previews of a timeline's original
+      description: Thumbnail sheets of the timeline's whole single-file original at its current revision,
+        ready (with their layout and sheet URLs), pending (a job is rendering them) or none. Thumbnail n
+        (from 0) shows the picture at n * interval_ms; it is tile n mod (columns*rows) of sheet n div
+        (columns*rows) + 1, row by row.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The timeline's previews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelinePreviews'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: catalog:read
+    post:
+      operationId: createTimelinePreviews
+      summary: Render trick-play previews of a timeline's original
+      description: Queues a preview job for the original's current revision (202), or answers with the
+        job already rendering or that rendered it (200); never duplicated. preview_unavailable when the
+        timeline has no whole single-file original with a known duration and picture.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The job already rendering or that rendered this revision's previews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '202':
+          description: A preview job was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: processing:request
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/Csrf'
+  /api/v2/media/files/{file_id}/previews/{sheet}:
+    parameters:
+    - name: file_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    - name: sheet
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+    - name: revision
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    get:
+      operationId: getPreviewSheet
+      summary: Read one trick-play preview sheet
+      description: A published sheet (JPEG) of the file's current revision, only to a caller who may read
+        the file.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The sheet.
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: catalog:read
   /api/v2/catalog/timelines/{timeline_id}/markers:
     parameters:
     - name: timeline_id
@@ -12566,6 +12717,48 @@ components:
       - current_entry_id
       - repeat
       - shuffle_seed
+    TimelinePreviews:
+      type: object
+      additionalProperties: false
+      properties:
+        timeline_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          type: string
+          enum:
+          - ready
+          - pending
+          - none
+        file_id:
+          $ref: '#/components/schemas/Id'
+        file_revision:
+          $ref: '#/components/schemas/Id'
+        job_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        interval_ms:
+          type: integer
+          minimum: 1
+        tile_width:
+          type: integer
+        tile_height:
+          type: integer
+        columns:
+          type: integer
+        rows:
+          type: integer
+        tiles:
+          type: integer
+        sheets:
+          type: array
+          maxItems: 1000
+          items:
+            type: string
+            maxLength: 4096
+      required:
+      - timeline_id
+      - status
     DownloadInput:
       type: object
       additionalProperties: false

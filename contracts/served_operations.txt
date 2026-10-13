@@ -157,3 +157,6 @@ setWatchedState
 subscribeEvents
 syncOffline
 uploadArtwork
+createTimelinePreviews
+getTimelinePreviews
+getPreviewSheet

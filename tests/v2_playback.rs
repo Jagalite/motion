@@ -8133,3 +8133,158 @@ async fn bitmap_subtitles_are_burned_across_parts() {
         assert_eq!(closed.status, StatusCode::NO_CONTENT);
     }
 }
+
+/// Trick-play previews (6C): requested once per file revision, rendered by
+/// the bounded worker into thumbnail sheets of the promised layout, served
+/// only for the current revision to a caller who may read the file, never
+/// rendered once cancelled, and retired when the revision changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn previews_are_rendered_once_served_by_revision_and_retired() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "25");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let operator = bearer(OPERATOR);
+    let path = format!("/api/v2/catalog/timelines/{timeline}/previews");
+    let manifest = f.get(&path, &auth).await;
+    assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
+    assert_eq!(manifest.body["status"], "none");
+    // A reader cannot request rendering.
+    let refused = f
+        .post(&path, &auth, Some("preview-request-0001"), json!(null))
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    // A cancelled queued job is never rendered; a new request queues again.
+    let first = f
+        .post(&path, &operator, Some("preview-request-0002"), json!(null))
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let cancelled_id = first.body["id"].as_str().unwrap().to_owned();
+    let again = f
+        .post(&path, &operator, Some("preview-request-0003"), json!(null))
+        .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.body["id"], cancelled_id.as_str(), "never duplicated");
+    let cancel = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/cancel"),
+            &operator,
+            Some("preview-cancel-0001"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK, "{}", cancel.body);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    let queued = f
+        .post(&path, &operator, Some("preview-request-0004"), json!(null))
+        .await;
+    assert_eq!(queued.status, StatusCode::ACCEPTED, "{}", queued.body);
+    assert_ne!(queued.body["id"], cancelled_id.as_str());
+    assert_eq!(f.get(&path, &auth).await.body["status"], "pending");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(playscale::v2::previews::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    let mut ready = Value::Null;
+    for _ in 0..600 {
+        ready = f.get(&path, &auth).await.body;
+        if ready["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["job_id"], queued.body["id"]);
+    // 25 s at one thumbnail per 10 s: 3 tiles of 160x120 on one sheet.
+    assert_eq!(
+        (
+            &ready["interval_ms"],
+            &ready["tiles"],
+            &ready["tile_width"],
+            &ready["tile_height"]
+        ),
+        (&json!(10000), &json!(3), &json!(160), &json!(120))
+    );
+    let sheets = ready["sheets"].as_array().unwrap();
+    assert_eq!(sheets.len(), 1);
+    let url = sheets[0].as_str().unwrap().to_owned();
+    let sheet = f.call("GET", &url, None, &[("authorization", &auth)]).await;
+    assert_eq!(sheet.status, StatusCode::OK);
+    assert_eq!(sheet.headers["content-type"], "image/jpeg");
+    let image = f.dir.path().join("sheet.jpg");
+    std::fs::write(&image, &sheet.bytes).unwrap();
+    let size = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&image)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(String::from_utf8_lossy(&size).trim(), "1600,1200");
+    // The cancelled job rendered nothing, and its record says so.
+    let cancelled = f
+        .get(&format!("/api/v2/jobs/{cancelled_id}"), &operator)
+        .await;
+    assert_eq!(cancelled.body["phase"], "cancelled");
+    // Only the current revision, an existing sheet, and a reader.
+    let other = url.replace("/previews/1?", "/previews/2?");
+    assert_eq!(
+        f.call("GET", &other, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.call("GET", &url, None, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // A device that may not read this library sees neither.
+    let (scoped, scoped_auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&scoped, &[], PLAYER, "\"r-2\"").await;
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &scoped_auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.get(&path, &scoped_auth).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // A new request for the same revision answers with the rendering job.
+    let done = f
+        .post(&path, &operator, Some("preview-request-0005"), json!(null))
+        .await;
+    assert_eq!(
+        (done.status, &done.body["id"]),
+        (StatusCode::OK, &queued.body["id"])
+    );
+    // The file changes: its previews retire with the old revision.
+    sqlx::query("UPDATE media_files SET revision='0000000000000000000000000000000000000000000000000000000000000001'")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    playscale::v2::previews::retain(&f.server.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    stop.cancel();
+    worker.await.unwrap().unwrap();
+}

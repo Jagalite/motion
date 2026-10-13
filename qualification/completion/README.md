@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented (review pending); 6C rest, 6D, 6E not started | markers, embedded-chapters and previews PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1610,11 +1610,64 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 3 at `26f9578` is clean: no actionable findings.
 
+### 6C (part 1). Server-generated trick-play previews
+
+- **Source SHA:** branch `plan-completion/previews`, stacked on
+  `plan-completion/multipart-burn` (migration 0051 follows 0050).
+- **Implemented:**
+  - **Core `previews`:**
+    - `layout`: 160 px thumbnails with the picture's shape, 10×10 per
+      sheet, one every 10 s or wider so there are at most 2,000.
+    - `valid_sheets`: exactly the promised sheets, each a full grid, none
+      over 4 MiB.
+    - `PublicationFacts`: the attempt is current, the source revision is
+      current, the sheets are valid and the source unchanged while
+      rendering, and the requester is still authorized.
+    - `tile_at`: where a position's thumbnail is.
+  - **Jobs:** `preview_jobs` (migration 0051) with the shared job reducer
+    (`jobs::transition`). The job appears in `api_jobs` as kind `preview`,
+    so `getJob`, `listJobs`, `cancelJob` and `retryJob` work. A stopped
+    server's attempts are recovered (requeued or cancelled) at the next
+    start.
+  - **Worker:** reserves maintenance execution capacity and opens the file
+    at exactly its revision through the delivery source validation. FFmpeg
+    decodes key frames only (`-skip_frame nokey`, `fps`, `tile`). It stops
+    on cancellation, server stop, lease termination or a 30-minute
+    deadline; a renderer that will not exit goes to the lease's reaper. It
+    checks the source fingerprint afterwards, observes the sheets'
+    decoded size, then publishes or discards (`PublicationFacts`) under the
+    jobs lock in one write transaction: durable sheets, then an immutable
+    `previews/<file>/<revision>/` directory, then the `previews` row.
+  - **Retention:** rows whose revision is no longer current are removed
+    first, then their directories. Attempt staging and orphan directories
+    are swept under the jobs lock.
+  - **API** (contract additions, served):
+    - `getTimelinePreviews`: ready with layout and sheet URLs, pending, or
+      none, for the timeline's readable whole single-file original.
+    - `createTimelinePreviews`: needs `processing:request` and an
+      Idempotency-Key. It is never duplicated: it answers with the active
+      or publishing job.
+    - `getPreviewSheet`: JPEG, only for the file's current revision and to
+      a caller who may read the file.
+- **Not yet:** `preview` schedules are still refused (part 2), and the
+  player does not show the thumbnails yet (part 3).
+- **Core/adapter boundary:** layout, validity, publication and lookup are
+  core policies (unit-tested); the job lifecycle is the core reducer
+  (`jobs_model`). The adapter renders, observes and executes publication
+  atomically.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core | 167 passed. New: layouts bound tiles and follow the picture shape; only the promised sheets validate and publish; a position finds its thumbnail |
+  | `tests/v2_playback.rs` `previews_are_rendered_once_served_by_revision_and_retired` | passed. A reader cannot request rendering. A repeated request answers with the same job. A cancelled queued job never renders, and a new request queues again. The worker publishes one 1600×1200 sheet of three 160×120 thumbnails (25 s, one every 10 s). Another sheet number, no session, or a device scoped away from the library is refused. After a revision change, retention retires the previews |
+  | `v2_playback` 36, `jobs_model` 3, contract 5, `v2_downloads` 11, `access_api` 39, `m3_workflows` 2, `catalog_workflows` 27, `catalog_persistence` 15, `scans` 8, `v2_catalog` 20 | passed; clippy clean |
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |
 |---|---|---|
-| 6C server-generated previews | Bounded trick-play thumbnail job with publication validation, cancellation, retention and access control; then enable `preview` schedules | None |
+| 6C remaining: preview schedules and player thumbnails | Accept `preview` schedules (fan-out without duplicate work, like `metadata_refresh`); register a Demuxe `AuthoredPreviewProvider` in the player from `getTimelinePreviews` | 6C part 1 |
 | 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
 | 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |
 

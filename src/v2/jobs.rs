@@ -185,6 +185,12 @@ async fn control(
                 .bind(&id)
                 .execute(&mut *tx)
                 .await?;
+        } else if old.kind == "preview" {
+            sqlx::query("UPDATE preview_jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
         } else {
             sqlx::query("UPDATE processing_jobs SET phase=?,error=NULL,cache_cleaned=0,updated_at=? WHERE id=?").bind(crate::db::phase_name(next.phase)).bind(crate::now()).bind(&id).execute(&mut *tx).await?;
         }

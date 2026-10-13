@@ -24,6 +24,7 @@ pub mod parts;
 pub mod playback;
 pub mod playback_monitor;
 pub mod playback_session;
+pub mod previews;
 pub mod processing;
 pub mod ranges;
 pub mod renditions;
