@@ -220,6 +220,47 @@ pub fn admit(
     Admission::Append
 }
 
+/// The history (`viewing_epoch`) of a log's compaction point after
+/// compacting through `base`: that of the event at `base` when compaction
+/// advanced, otherwise unchanged. A restored server never saw that history.
+pub fn compacted_epoch(
+    previous: Option<&str>,
+    history: &[OfflineEvent],
+    old_base: u64,
+    base: u64,
+) -> Option<String> {
+    if base == old_base {
+        return previous.map(str::to_owned);
+    }
+    history
+        .iter()
+        .find(|e| sequence(&e.device_sequence) == Some(base))
+        .and_then(|e| e.media.viewing_epoch.clone())
+}
+
+/// A device's request that a restored server continue its sequence after
+/// the device's compaction point (`downloads::reanchor`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Reanchor {
+    /// The history the compaction point belongs to.
+    pub from_viewing_epoch: String,
+    /// The compaction point: the device never sends a sequence at or below it.
+    pub through: u64,
+}
+
+/// Whether a batch sent under `batch_epoch` must carry a re-anchor: the
+/// device compacted through `base` in another history, which a restored
+/// server never consumed, so its sequence would otherwise stop at a gap.
+/// A compaction point of unknown history (logs from before this was
+/// recorded) is never re-anchored.
+pub fn reanchor(base: u64, base_epoch: Option<&str>, batch_epoch: &str) -> Option<Reanchor> {
+    let from = base_epoch.filter(|e| *e != batch_epoch && base > 0)?;
+    Some(Reanchor {
+        from_viewing_epoch: from.to_owned(),
+        through: base,
+    })
+}
+
 /// What the server answered when a download the person removed on this
 /// device was deleted there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +292,56 @@ pub fn settles(outcome: Deletion, saved_locally: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compaction_point_of_another_history_is_reanchored() {
+        let event = |sequence: u64, epoch: &str| OfflineEvent {
+            scope: CacheScope {
+                server_id: "s".into(),
+                principal_id: "p".into(),
+                profile_id: "f".into(),
+                device_id: "d".into(),
+            },
+            media: DownloadIdentity {
+                download_id: "x".into(),
+                timeline_id: "t".into(),
+                timeline_revision: "1".into(),
+                source_revision: "r".into(),
+                base_viewing_revision: "0".into(),
+                base_manual_epoch: "0".into(),
+                viewing_epoch: Some(epoch.into()),
+            },
+            event_id: format!("e{sequence}"),
+            device_sequence: sequence.to_string(),
+            position_ms: 1,
+            status: "paused".into(),
+            device_time: None,
+        };
+        let log = [event(3, "s:old"), event(4, "s:new")];
+        assert_eq!(
+            compacted_epoch(Some("s:x"), &log, 2, 2).as_deref(),
+            Some("s:x")
+        );
+        assert_eq!(compacted_epoch(None, &log, 2, 3).as_deref(), Some("s:old"));
+        assert_eq!(
+            compacted_epoch(Some("s:old"), &log, 2, 4).as_deref(),
+            Some("s:new")
+        );
+        assert_eq!(
+            reanchor(3, Some("s:old"), "s:new"),
+            Some(Reanchor {
+                from_viewing_epoch: "s:old".into(),
+                through: 3
+            })
+        );
+        assert_eq!(reanchor(3, Some("s:new"), "s:new"), None, "same history");
+        assert_eq!(reanchor(3, None, "s:new"), None, "unknown history");
+        assert_eq!(
+            reanchor(0, Some("s:old"), "s:new"),
+            None,
+            "nothing compacted"
+        );
+    }
 
     #[test]
     fn a_removed_download_is_never_saved_again_until_the_server_confirms() {

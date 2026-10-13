@@ -128,7 +128,13 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             store.collect()?;
             json!({"collected": true})
         }
-        CacheCommand::Events => serde_json::to_value(store.events()?)?,
+        CacheCommand::Events => {
+            let mut value = serde_json::to_value(store.events()?)?;
+            value["reanchor"] = json!(store.pending_reanchor()?.map(|r| {
+                json!({"from_viewing_epoch": r.from_viewing_epoch, "through": r.through.to_string()})
+            }));
+            value
+        }
         CacheCommand::Acknowledge => {
             #[derive(serde::Deserialize)]
             struct Result {

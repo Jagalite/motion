@@ -725,6 +725,17 @@ pub struct SyncInput {
     /// The device's own compaction point; see `core::retain`.
     #[serde(default)]
     acknowledged_through: Option<String>,
+    /// Continue the device's sequence on a restored server; see
+    /// `core::reanchor`.
+    #[serde(default)]
+    reanchor: Option<ReanchorInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReanchorInput {
+    from_viewing_epoch: String,
+    through: String,
 }
 
 const MAX_BATCH: usize = 200;
@@ -927,6 +938,18 @@ pub async fn sync(
         .map(parse)
         .collect::<Option<_>>()
         .ok_or_else(|| Problem::invalid("invalid_event", "An offline event is malformed"))?;
+    let reanchor = match &input.reanchor {
+        None => None,
+        Some(r) => Some((
+            r.from_viewing_epoch.clone(),
+            viewing::decimal(&r.through).ok_or_else(|| {
+                Problem::invalid(
+                    "invalid_reanchor",
+                    "reanchor.through must be a decimal sequence",
+                )
+            })?,
+        )),
+    };
     let acknowledged = match &input.acknowledged_through {
         None => None,
         Some(v) => Some(viewing::decimal(v).ok_or_else(|| {
@@ -949,7 +972,7 @@ pub async fn sync(
     // is unusable; events are never consumed for a profile the caller lacks.
     usable_profile(&mut tx, &principal, &profile).await?;
     let completion = viewing::completion_percent(&mut tx, &profile).await?;
-    let (mut next, pruned): (i64, i64) = sqlx::query_as(
+    let (mut next, mut pruned): (i64, i64) = sqlx::query_as(
         "SELECT next_sequence,pruned_through FROM offline_sequences WHERE device_id=? AND profile_id=?",
     )
     .bind(&device)
@@ -957,6 +980,55 @@ pub async fn sync(
     .fetch_optional(&mut *tx)
     .await?
     .unwrap_or((1, 0));
+    // A device whose compaction point belongs to an earlier history of this
+    // server continues its sequence after it (`core::reanchor`), in this
+    // transaction, before retention and the batch are decided.
+    if let Some((from, through)) = &reanchor {
+        let current: (String, String) =
+            sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
+                .fetch_one(&mut *tx)
+                .await?;
+        let (moved, retention) = core::reanchor(
+            (&current.0, &current.1),
+            from,
+            *through,
+            next as u64,
+            core::Retention::server(pruned as u64),
+        )
+        .map_err(|refusal| {
+            Problem::invalid(
+                "invalid_reanchor",
+                match refusal {
+                    core::ReanchorRefusal::Invalid => "The re-anchor is malformed",
+                    core::ReanchorRefusal::OtherServer => {
+                        "A re-anchor continues only this server's own earlier history"
+                    }
+                    core::ReanchorRefusal::SameHistory => {
+                        "The current history's sequence is never skipped"
+                    }
+                },
+            )
+        })?;
+        if moved as i64 != next {
+            sqlx::query(
+                "DELETE FROM offline_events WHERE device_id=? AND profile_id=? AND sequence<=?",
+            )
+            .bind(&device)
+            .bind(&profile)
+            .bind(retention.pruned_through as i64)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO offline_sequences(device_id,profile_id,next_sequence,pruned_through) VALUES (?,?,?,?) ON CONFLICT(device_id,profile_id) DO UPDATE SET next_sequence=excluded.next_sequence,pruned_through=excluded.pruned_through")
+                .bind(&device)
+                .bind(&profile)
+                .bind(moved as i64)
+                .bind(retention.pruned_through as i64)
+                .execute(&mut *tx)
+                .await?;
+            next = moved as i64;
+            pruned = retention.pruned_through as i64;
+        }
+    }
     // Records the device has compacted are never resent by it: prune them,
     // in this transaction, before deciding the batch against the new floor.
     let retention = core::retain(

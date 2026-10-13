@@ -1111,3 +1111,100 @@ async fn the_downloads_page_lists_every_actionable_record() {
     );
     assert!(!html.contains("zz-205"), "cancelled records need no action");
 }
+
+/// After the server is restored from a backup, a device whose compaction
+/// point belongs to the earlier history continues its sequence with its
+/// first batch under the new one (`downloads::reanchor`); without the
+/// re-anchor it would stop at a gap forever. Only this server's own earlier
+/// history is accepted, and a retry changes nothing.
+#[tokio::test]
+async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"restored film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let before = format!("{server}:{restore}");
+    let base = ("0", "0");
+    let sync = |history: String, events: Vec<Value>, acknowledged: Value, reanchor: Value| {
+        let body = json!({"device_id":device,"events":events,"acknowledged_through":acknowledged,"reanchor":reanchor});
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            f.call(
+                "POST",
+                "/api/v2/offline/sync",
+                Some(body),
+                &[
+                    ("authorization", &auth),
+                    ("x-motion-viewing-epoch", &history),
+                ],
+            )
+            .await
+        }
+    };
+    let first = vec![
+        event(1, &timeline, base, 10_000, "paused"),
+        event(2, &timeline, base, 20_000, "paused"),
+    ];
+    let reply = sync(before.clone(), first, Value::Null, Value::Null).await;
+    assert_eq!(reply.body["next_device_sequence"], "3", "{:?}", reply.body);
+    // The database is restored from a backup taken before the device synced:
+    // a new restore epoch and no record of this device's sequence.
+    sqlx::query("UPDATE server_identity SET restore_epoch='restored-backup'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    for table in ["offline_events", "offline_sequences"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE device_id=?"))
+            .bind(&device)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let after = format!("{server}:restored-backup");
+    let third = vec![event(3, &timeline, base, 30_000, "paused")];
+    // The device compacted 1 and 2 in the earlier history: without a
+    // re-anchor its report is ahead of this server and nothing proceeds.
+    problem(
+        &sync(after.clone(), third.clone(), json!("2"), Value::Null).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "acknowledgement_ahead",
+    );
+    let reanchor = json!({"from_viewing_epoch": before, "through": "2"});
+    let continued = sync(after.clone(), third.clone(), json!("2"), reanchor.clone()).await;
+    assert_eq!(continued.status, StatusCode::OK, "{:?}", continued.body);
+    assert_ne!(
+        outcomes(&continued)[0].0,
+        "rejected",
+        "{:?}",
+        continued.body
+    );
+    assert_eq!(continued.body["next_device_sequence"], "4");
+    assert_eq!(
+        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+        2
+    );
+    // A lost response: the retry is a duplicate and the anchor stays.
+    let retry = sync(after.clone(), third, json!("2"), reanchor).await;
+    assert_eq!(outcomes(&retry)[0].0, "duplicate");
+    assert_eq!(retry.body["next_device_sequence"], "4");
+    // Never the current history, another server, or a malformed sequence.
+    let fourth = vec![event(4, &timeline, base, 40_000, "paused")];
+    for reanchor in [
+        json!({"from_viewing_epoch": after, "through": "3"}),
+        json!({"from_viewing_epoch": "another-server:r1", "through": "3"}),
+        json!({"from_viewing_epoch": before, "through": "x"}),
+    ] {
+        problem(
+            &sync(after.clone(), fourth.clone(), json!("3"), reanchor).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_reanchor",
+        );
+    }
+    assert_eq!(
+        retention_value(&f, &device, "next_sequence", "offline_sequences").await,
+        4
+    );
+}

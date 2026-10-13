@@ -7,7 +7,9 @@
 //! manual overrides and timeline edits on the server. Each sync reports the
 //! device's compaction point and the server prunes its records through it
 //! (`downloads::retain`) under a small retention limit; a stale device copy
-//! replays its first event after pruning. The oracle does not re-run the
+//! replays its first event after pruning. After a server restore the device
+//! re-anchors its sequence (`offline::reanchor`, `downloads::reanchor`) with
+//! its first batch under the new history. The oracle does not re-run the
 //! policy: it tracks whether any other authority touched the timeline since
 //! the download's base and derives the required outcome.
 use playscale_core::{
@@ -76,6 +78,9 @@ struct World {
     download: Option<DownloadIdentity>,
     base: u64,
     log: Vec<offline::OfflineEvent>,
+    /// The server history the device's compaction point belongs to
+    /// (`offline::compacted_epoch`); None before anything was compacted.
+    base_epoch: Option<u8>,
     /// The device's first event, as a stale copy would resend it.
     first: Option<OfflineEvent>,
     // Oracle facts since the download's base.
@@ -137,7 +142,21 @@ fn identity(w: &World) -> DownloadIdentity {
 }
 
 fn history(w: &World) -> String {
-    format!("server:{}", w.epoch)
+    epoch_name(w.epoch)
+}
+
+fn epoch_name(epoch: u8) -> String {
+    format!("server:{epoch}")
+}
+
+/// The device's compaction point belongs to an earlier server history.
+fn foreign_base(w: &World) -> bool {
+    w.base_epoch.is_some_and(|e| e != w.epoch)
+}
+
+/// The re-anchor the device sends with a batch under `header`.
+fn device_reanchor(w: &World, header: Option<&str>) -> Option<offline::Reanchor> {
+    offline::reanchor(w.base, w.base_epoch.map(epoch_name).as_deref(), header?)
 }
 
 /// The history identity a batch is sent under: that of its events' base.
@@ -152,6 +171,7 @@ fn sync(
     events: &[OfflineEvent],
     header: Option<&str>,
     acknowledged: Option<u64>,
+    reanchor: Option<&offline::Reanchor>,
 ) -> Vec<Option<(Outcome, Option<Code>)>> {
     // The adapter checks the history identity first, inside the transaction.
     let current = history(w);
@@ -163,10 +183,26 @@ fn sync(
     if !accepted {
         return vec![None; events.len()];
     }
-    let retention = Retention {
+    let mut retention = Retention {
         pruned_through: w.pruned,
         limit: RETENTION_LIMIT,
     };
+    if let Some(r) = reanchor {
+        let Ok((next, moved)) = downloads::reanchor(
+            current.split_once(':').unwrap(),
+            &r.from_viewing_epoch,
+            r.through,
+            w.next_sequence,
+            retention,
+        ) else {
+            return vec![None; events.len()];
+        };
+        w.next_sequence = next;
+        w.pruned = moved.pruned_through;
+        w.recorded
+            .retain(|x| x.event.sequence > moved.pruned_through);
+        retention = moved;
+    }
     let Ok(retention) = downloads::retain(w.next_sequence, retention, acknowledged) else {
         return vec![None; events.len()];
     };
@@ -239,8 +275,8 @@ impl Model for Downloads {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-download-reconciliation".into(),
-            model_version: 3,
-            properties_version: 3,
+            model_version: 4,
+            properties_version: 4,
             codec_version: 1,
             build: concat!(
                 include_str!("../src/downloads.rs"),
@@ -261,6 +297,7 @@ impl Model for Downloads {
             download: None,
             base: 0,
             log: vec![],
+            base_epoch: None,
             first: None,
             other_viewing: false,
             other_manual: false,
@@ -284,7 +321,9 @@ impl Model for Downloads {
             ),
             check(
                 "retention.never_prunes_beyond_device_compaction",
-                w.restores > 0 || w.pruned <= w.base,
+                // Within the device's compaction history; a restored server
+                // knows nothing of an earlier one until it is re-anchored.
+                foreign_base(w) || w.pruned <= w.base,
             ),
             check(
                 "retention.bounded",
@@ -292,9 +331,10 @@ impl Model for Downloads {
             ),
             check(
                 "reconcile.device_never_compacts_unrecorded_events",
-                // A restore rewinds the server below what the device already
-                // compacted against the previous history.
-                w.restores > 0 || w.base < w.next_sequence,
+                // A restore rewinds the server below what the device compacted
+                // in the previous history; once the device compacts in the
+                // current one (after re-anchoring), the server is past it.
+                foreign_base(w) || w.base < w.next_sequence,
             ),
         ])
     }
@@ -338,7 +378,15 @@ impl Model for Downloads {
             }
             Input::Sync | Input::SyncLost => {
                 let events: Vec<_> = w.log.iter().map(wire).collect();
-                out = sync(&mut n, &events, header(&w.log).as_deref(), Some(w.base));
+                let head = header(&w.log);
+                let reanchor = device_reanchor(w, head.as_deref());
+                out = sync(
+                    &mut n,
+                    &events,
+                    head.as_deref(),
+                    Some(w.base),
+                    reanchor.as_ref(),
+                );
                 if *input == Input::Sync {
                     // The device compacts only what the results confirm.
                     let acks: Vec<_> = w
@@ -353,6 +401,13 @@ impl Model for Downloads {
                     let through =
                         offline::acknowledged_through(w.base, &w.log, &acks, n.next_sequence);
                     if let Some((base, log)) = offline::compact(w.base, &w.log, through) {
+                        n.base_epoch = offline::compacted_epoch(
+                            w.base_epoch.map(epoch_name).as_deref(),
+                            &w.log,
+                            w.base,
+                            base,
+                        )
+                        .map(|e| e.strip_prefix("server:").unwrap().parse().unwrap());
                         n.base = base;
                         n.log = log;
                     }
@@ -362,7 +417,7 @@ impl Model for Downloads {
                 if let Some(first) = w.recorded.first() {
                     let mut altered = first.event.clone();
                     altered.position_ms += 1;
-                    out = sync(&mut n, &[altered], Some(&history(w)), None);
+                    out = sync(&mut n, &[altered], Some(&history(w)), None, None);
                 }
             }
             Input::StaleReplay if w.next_sequence > 1 && w.restores == 0 => {
@@ -372,6 +427,7 @@ impl Model for Downloads {
                         std::slice::from_ref(first),
                         Some(&history(w)),
                         Some(0),
+                        None,
                     );
                 }
             }
@@ -387,7 +443,7 @@ impl Model for Downloads {
                         device_time: None,
                     });
                     e.device_time = "gap".into();
-                    out = sync(&mut n, &[e], Some(&history(w)), None);
+                    out = sync(&mut n, &[e], Some(&history(w)), None, None);
                 }
             }
             Input::Rebase if w.download.is_some() && w.log.is_empty() => {
@@ -470,7 +526,12 @@ impl Model for Downloads {
                     .map(|d| d.timeline_revision.parse::<u64>().unwrap());
                 let mut expected = vec![];
                 let same_history = header(&w.log) == Some(history(w));
-                let mut next = w.next_sequence;
+                // A batch under the current history re-anchors a compaction
+                // point of the previous one: the server continues after it.
+                let reanchored = device_reanchor(w, header(&w.log).as_deref())
+                    .filter(|_| same_history)
+                    .map_or(0, |r| r.through + 1);
+                let mut next = w.next_sequence.max(reanchored);
                 // The device reports its base, so the floor becomes the base.
                 let floor = w.pruned.max(w.base);
                 for e in &w.log {
@@ -622,7 +683,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
+        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
         report.states, report.transitions
     );
 }
@@ -682,5 +743,39 @@ fn checks_detect_pruning_beyond_the_devices_compaction() {
             .outputs
             .iter()
             .all(|o| matches!(o, Some((Outcome::Applied, None))))
+    );
+}
+
+#[test]
+fn a_restored_server_continues_after_the_devices_compaction() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Restore,
+        Input::Rebase,
+        Input::Play(Position::Partial),
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    // The device compacted 1 in history 0; the restored server is at 1 again.
+    assert_eq!(
+        (w.base, w.base_epoch, w.epoch, w.next_sequence),
+        (1, Some(0), 1, 1)
+    );
+    let synced = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(synced.outputs, vec![Some((Outcome::Applied, None))]);
+    let n = synced.state;
+    assert_eq!((n.base, n.base_epoch, n.next_sequence), (2, Some(1), 3));
+    // A server that ignored the re-anchor would stop the device at a gap;
+    // the oracle requires the event to be decided normally.
+    let stuck = Transition::accepted(w.clone(), vec![None]);
+    assert!(
+        Downloads
+            .check_transition(&w, &Input::Sync, &stuck.as_ref())
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
     );
 }

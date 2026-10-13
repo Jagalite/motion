@@ -43,7 +43,7 @@ function fakeCache() {
         rmSync(join(root, 'staging', `${args[2]}.part`), {force: true});
         s.downloads = s.downloads.filter(d => d.identity.download_id !== args[2]);
         return {removed: true};
-      case 'events': return {base_sequence: String(s.base), events: s.events};
+      case 'events': return {base_sequence: String(s.base), events: s.events, reanchor: s.reanchor ?? null};
       case 'acknowledge': {
         // Mirrors offline::acknowledged_through: the leading run confirmed by identity.
         const {results, next_device_sequence: next} = JSON.parse(input);
@@ -562,4 +562,32 @@ test('a removal settled in this pass is not transferred from the list read befor
   assert.deepEqual(fake.state(target.path).removals, []);
   assert.ok(!statuses.some(m => /could not be saved/.test(m)), statuses.join('\n'));
   assert.ok(fake.calls.some(c => c[1] === 'collect'), 'blob collection still runs');
+});
+
+test('the first batch after a server restore carries the cache\'s re-anchor', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const bodies = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path === '/api/v2/offline/sync') {
+        bodies.push(init.body);
+        return {results: init.body.events.map(e => ({event_id: e.event_id, outcome: 'applied', code: null})), next_device_sequence: '9'};
+      }
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  const state = fake.state(target.path);
+  state.base = 7;
+  state.events = [{...event(8), media: {...event(8).media, viewing_epoch: 'server:r2'}}];
+  state.reanchor = {from_viewing_epoch: 'server:r1', through: '7'};
+  assert.equal(await agent.reconcile(target), true);
+  assert.deepEqual(bodies[0].reanchor, {from_viewing_epoch: 'server:r1', through: '7'});
+  assert.equal(bodies[0].acknowledged_through, '7');
+  // Without one, nothing is added.
+  state.reanchor = null;
+  state.events = [{...event(9), media: {...event(9).media, viewing_epoch: 'server:r2'}}];
+  await agent.reconcile(target);
+  assert.equal('reanchor' in bodies[1], false);
 });

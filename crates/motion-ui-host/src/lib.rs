@@ -57,6 +57,13 @@ pub struct EventLog {
     #[serde(with = "decimal")]
     pub base_sequence: u64,
     pub events: Vec<OfflineEvent>,
+    /// The server history (`viewing_epoch`) the compacted events through
+    /// `base_sequence` belonged to (`offline::compacted_epoch`): a restored
+    /// server never consumed them, so a batch sent under another history
+    /// re-anchors the device's sequence (`offline::reanchor`). None before
+    /// anything was compacted, or for logs from before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_viewing_epoch: Option<String>,
 }
 
 mod decimal {
@@ -84,6 +91,7 @@ impl EventLog {
             Stored::Legacy(events) => EventLog {
                 base_sequence: 0,
                 events,
+                base_viewing_epoch: None,
             },
         })
     }

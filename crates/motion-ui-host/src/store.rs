@@ -500,6 +500,20 @@ impl Store {
         Ok(log)
     }
 
+    /// The re-anchor the next batch (sent under its first event's history)
+    /// must carry (`offline::reanchor`): the log's compaction point belongs
+    /// to another history of the server, which a restored server never saw.
+    pub fn pending_reanchor(&self) -> anyhow::Result<Option<offline::Reanchor>> {
+        let log = self.events()?;
+        Ok(log
+            .events
+            .first()
+            .and_then(|e| e.media.viewing_epoch.as_deref())
+            .and_then(|epoch| {
+                offline::reanchor(log.base_sequence, log.base_viewing_epoch.as_deref(), epoch)
+            }))
+    }
+
     /// Compact the events the server acknowledged through `through` (its
     /// `next_device_sequence - 1`). An acknowledgement beyond anything this
     /// log wrote is refused and erases nothing.
@@ -511,6 +525,12 @@ impl Store {
             bail!("the server acknowledged sequences this device never wrote");
         };
         let next = EventLog {
+            base_viewing_epoch: offline::compacted_epoch(
+                log.base_viewing_epoch.as_deref(),
+                &log.events,
+                log.base_sequence,
+                base_sequence,
+            ),
             base_sequence,
             events,
         };

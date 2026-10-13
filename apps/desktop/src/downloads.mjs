@@ -291,8 +291,11 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       try {
         // Report this log's compaction point so the server can prune what it
         // will never be sent again (playscale_core::downloads::retain).
+        // After a server restore, the first batch under the new history
+        // carries the re-anchor the cache computed (offline::reanchor).
         result = await api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': history},
-          body: {device_id: identity.device_id, events: batch.map(wireEvent), acknowledged_through: String(log.base_sequence)}});
+          body: {device_id: identity.device_id, events: batch.map(wireEvent), acknowledged_through: String(log.base_sequence),
+            ...(log.reanchor ? {reanchor: log.reanchor} : {})}});
       } catch (error) {
         if (error.code !== 'viewing_epoch_changed') throw error;
         status('The server was restored or replaced since these were saved. Offline progress stays on this device.');

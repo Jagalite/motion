@@ -426,6 +426,53 @@ pub fn retain(
     })
 }
 
+/// Why a re-anchor was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReanchorRefusal {
+    /// Not a `server_id:restore_epoch` identity, or an unsafe sequence.
+    Invalid,
+    /// Another server's history: a replaced server never continues it.
+    OtherServer,
+    /// The current history itself: its sequence is never skipped.
+    SameHistory,
+}
+
+/// Continue a device's sequence on a restored server. The device compacted
+/// its log through `through` in `from` (an earlier history of this server)
+/// and never sends those sequences again; the restored server, which never
+/// consumed them, moves its next sequence past them and retains nothing at
+/// or below. Only the device's own sequence space moves, and only forward;
+/// when the server already is past `through` nothing changes (a retried
+/// request). Refused for the current history or another server's.
+pub fn reanchor(
+    current: (&str, &str),
+    from: &str,
+    through: u64,
+    next_sequence: u64,
+    retention: Retention,
+) -> Result<(u64, Retention), ReanchorRefusal> {
+    let (server, restore) = from
+        .split_once(':')
+        .filter(|_| crate::offline::viewing_epoch(from) && through < 1 << 53)
+        .ok_or(ReanchorRefusal::Invalid)?;
+    if server != current.0 {
+        return Err(ReanchorRefusal::OtherServer);
+    }
+    if restore == current.1 {
+        return Err(ReanchorRefusal::SameHistory);
+    }
+    if through < next_sequence {
+        return Ok((next_sequence, retention));
+    }
+    Ok((
+        through + 1,
+        Retention {
+            pruned_through: retention.pruned_through.max(through),
+            ..retention
+        },
+    ))
+}
+
 /// Decide one offline event under the server's retention floor. A recorded
 /// event above the floor is still an exact duplicate or a conflict; an
 /// unrecorded sequence at or below it is a stale copy and is refused; a new
@@ -860,6 +907,40 @@ mod tests {
             panic!()
         };
         assert_eq!(recorded.code, Some(Code::TimelineChanged));
+    }
+
+    #[test]
+    fn a_restored_server_continues_the_devices_sequence_only_when_asked_from_another_history() {
+        let retention = Retention::server(0);
+        let current = ("server", "r2");
+        // The device compacted through 7 under r1; the restored server is at 3.
+        assert_eq!(
+            reanchor(current, "server:r1", 7, 3, retention),
+            Ok((8, Retention::server(7)))
+        );
+        // A retried request after the move changes nothing.
+        assert_eq!(
+            reanchor(current, "server:r1", 7, 8, Retention::server(7)),
+            Ok((8, Retention::server(7)))
+        );
+        assert_eq!(
+            reanchor(current, "server:r2", 7, 3, retention),
+            Err(ReanchorRefusal::SameHistory)
+        );
+        assert_eq!(
+            reanchor(current, "other:r1", 7, 3, retention),
+            Err(ReanchorRefusal::OtherServer)
+        );
+        for bad in ["server", ":r1", "server:"] {
+            assert_eq!(
+                reanchor(current, bad, 7, 3, retention),
+                Err(ReanchorRefusal::Invalid)
+            );
+        }
+        assert_eq!(
+            reanchor(current, "server:r1", 1 << 53, 3, retention),
+            Err(ReanchorRefusal::Invalid)
+        );
     }
 
     #[test]

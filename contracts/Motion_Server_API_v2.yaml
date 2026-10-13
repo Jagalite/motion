@@ -12644,6 +12644,28 @@ components:
           anyOf:
           - $ref: '#/components/schemas/Revision'
           - type: 'null'
+        reanchor:
+          description: Sent with the first batch under a server history other than the one the device's
+            compaction point (acknowledged_through) belongs to, after the server was restored from a backup.
+            The device never sends a sequence at or below `through`; the restored server, which never consumed
+            those events, continues the device's sequence after it and retains nothing at or below it. Only this
+            server's own earlier history is accepted (from_viewing_epoch is `server_id:restore_epoch` with this
+            server's ID and another restore epoch); otherwise invalid_reanchor. A retried re-anchor changes
+            nothing.
+          anyOf:
+          - type: object
+            additionalProperties: false
+            properties:
+              from_viewing_epoch:
+                type: string
+                minLength: 3
+                maxLength: 257
+              through:
+                $ref: '#/components/schemas/Revision'
+            required:
+            - from_viewing_epoch
+            - through
+          - type: 'null'
       required:
       - device_id
       - events

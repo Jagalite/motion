@@ -254,7 +254,9 @@ fn acknowledged_events_compact_without_renumbering_and_rebase_resumes() {
         log,
         EventLog {
             base_sequence: 3,
-            events: vec![]
+            events: vec![],
+            // The compaction point remembers the history it belonged to.
+            base_viewing_epoch: Some("server:restore".into()),
         }
     );
     assert!(
@@ -299,6 +301,7 @@ fn a_conflicting_event_is_never_compacted_by_the_watermark() {
         serde_json::to_vec(&EventLog {
             base_sequence: 0,
             events: vec![event(&identity, 1), event(&identity, 2)],
+            base_viewing_epoch: None,
         })
         .unwrap(),
     )
@@ -372,6 +375,7 @@ fn compaction_keeps_the_resume_checkpoint_without_moving_the_base() {
         serde_json::to_vec(&EventLog {
             base_sequence: 0,
             events: vec![event(&identity, 1), event(&identity, 2)],
+            base_viewing_epoch: None,
         })
         .unwrap(),
     )
@@ -559,4 +563,44 @@ fn a_removal_is_settled_only_once_its_copy_is_gone() {
     let mut store = Store::open(&root, &scope()).unwrap();
     assert!(store.settle_removal("d1", Deletion::Deleted).unwrap());
     assert!(store.manifest().downloads.is_empty() && store.removals().is_empty());
+
+/// After a server restore the first batch under the new history carries a
+/// re-anchor from the history the log's compaction point belongs to.
+#[test]
+fn a_compaction_point_of_an_earlier_history_is_reanchored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"restored media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    let identity = entry("d1", media).identity;
+    let write = |log: &EventLog| {
+        std::fs::write(root.join("events.json"), serde_json::to_vec(log).unwrap()).unwrap();
+    };
+    // Compacted through 2 in "server:before"; event 3 is under the new history.
+    write(&EventLog {
+        base_sequence: 2,
+        events: vec![event(&identity, 3)],
+        base_viewing_epoch: Some("server:before".into()),
+    });
+    assert_eq!(
+        store.pending_reanchor().unwrap(),
+        Some(playscale_core::offline::Reanchor {
+            from_viewing_epoch: "server:before".into(),
+            through: 2,
+        })
+    );
+    // Once compacted in the current history, nothing more is needed.
+    store.acknowledge(3).unwrap();
+    assert_eq!(
+        store.events().unwrap().base_viewing_epoch.as_deref(),
+        Some("server:restore")
+    );
+    write(&EventLog {
+        base_sequence: 3,
+        events: vec![event(&identity, 4)],
+        base_viewing_epoch: Some("server:restore".into()),
+    });
+    assert_eq!(store.pending_reanchor().unwrap(), None);
 }

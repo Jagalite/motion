@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C–5F not started | offline-roots and offline-removal PRs | Merge by user; then 5C |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented (review pending); 5C part 2 and 5D–5F not started | offline-roots, offline-removal and restore-recovery PRs | Merge by user; then 5C part 2 |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -739,6 +739,75 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   Core 151, store 15 and cache 9 passed.
 
   Round 4 at `0496fc7`: clean.
+
+### 5C (part 1). Sequence continuity after a server restore
+
+- **Source SHA:** branch `plan-completion/restore-recovery`, stacked on 5B
+  (`plan-completion/offline-removal`).
+- **Defect fixed:** after the server was restored from a backup, a device
+  that had already compacted acknowledged events stopped forever. This
+  happened even with nothing retained.
+  - The device reports its compaction point as `acknowledged_through`, and
+    the restored server, which never consumed those sequences, refused it
+    as `acknowledgement_ahead`.
+  - Without the report, each new event was a `sequence_gap`.
+- **Implemented:**
+  - **Device:** the log records the history its compaction point belongs
+    to (`EventLog.base_viewing_epoch`, from core
+    `offline::compacted_epoch`). The first batch sent under another
+    history carries a re-anchor (core `offline::reanchor`, exposed by the
+    cache tool's `events`), which the agent forwards.
+  - **Server:** core `downloads::reanchor` continues the device's sequence
+    after `through` and retains nothing at or below it.
+    - Accepted only from this server's own earlier history; another
+      server's history or the current one is refused with
+      `invalid_reanchor`.
+    - It only moves forward; a retried request changes nothing.
+    - It is applied in the sync's write transaction before retention and
+      the batch.
+  - **Contract:** `OfflineSyncInput.reanchor` (optional).
+- **Core/adapter boundary:** core decides both whether a batch must
+  re-anchor and whether the server accepts it. Each takes the histories
+  and sequences as explicit inputs. The adapters:
+  - persist the compaction history with the compaction (one durable write
+    of `events.json`);
+  - apply the new floor and pruning in the sync transaction.
+- **Stateless:** `downloads_model` (model and properties version 4) now
+  re-anchors after its restore:
+  - The device tracks its compaction history, and the server applies
+    `downloads::reanchor`.
+  - The oracle requires a batch under the new history to be decided from
+    the re-anchored sequence.
+  - The invariants that were relaxed for the whole run after a restore
+    (`retention.never_prunes_beyond_device_compaction`,
+    `reconcile.device_never_compacts_unrecorded_events`) are now relaxed
+    only while the device's compaction point belongs to the earlier
+    history.
+  - Result: 4,166,162 states and 58,326,268 transitions, exhausted, in
+    134 s release.
+  - New scenario and mutation test: a server ignoring the re-anchor fails
+    `reconcile.required_outcomes`.
+- **Evidence:**
+  - Core lib: 153 passed (`compacted_epoch`, `reanchor` on both sides).
+  - `v2_downloads`: 6 passed. New:
+    `offline_sync_reanchors_the_devices_sequence_after_a_restore` covers a
+    simulated restore (new restore epoch, the device's sequence records
+    gone):
+    - without the re-anchor, `acknowledgement_ahead`;
+    - with it, the event is consumed and the next sequence is 4;
+    - the retry is a duplicate;
+    - the current history, another server, or a malformed sequence is
+      refused.
+  - `motion-ui-host` store: 15 passed (compaction history recorded;
+    pending re-anchor computed, then none once compacted in the current
+    history).
+  - JS: 90 passed (the batch carries the cache's re-anchor).
+  - Contract: 5 passed.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered (5C part 2):** progress retained from the earlier history
+  (events pinned to it) still waits. The person's explicit choice to
+  discard it or re-apply it onto the restored server is next.
+- **Review:** pending (GPT-6.1 Sol).
 
 ### Remaining item 5 work (not started)
 
