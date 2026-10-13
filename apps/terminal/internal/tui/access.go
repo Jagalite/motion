@@ -203,6 +203,17 @@ func textField(label, id, value string) accessField {
 func toggle(label, kind, id string, on bool) accessField {
 	return accessField{label: label, kind: kind, id: id, checked: on}
 }
+func (f *accessField) focusInput() tea.Cmd {
+	if f.kind == "text" {
+		return f.input.Focus()
+	}
+	return nil
+}
+func (f *accessField) blurInput() {
+	if f.kind == "text" {
+		f.input.Blur()
+	}
+}
 func has(values []string, id string) bool {
 	for _, v := range values {
 		if v == id {
@@ -308,10 +319,10 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 		}
 		d.review = true
 	}
-	if len(d.fields) > 0 {
-		d.fields[0].input.Focus()
-	}
 	m.access = d
+	if len(d.fields) > 0 {
+		return d.fields[0].focusInput()
+	}
 	return nil
 }
 func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
@@ -338,7 +349,7 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 				m.access.title = "Create access user"
 				m.access.fields = nil
 				m.grantFields(m.access, api.User{Policy: api.GrantPolicy{AllowUnrated: true}, Permissions: []string{api.PermCatalogRead, api.PermPlaybackRequest, api.PermViewingWrite, api.PermEventsRead}})
-				m.access.fields[0].input.Focus()
+				cmd = m.access.fields[0].focusInput()
 			}
 			return true, cmd
 		}
@@ -394,15 +405,13 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 	f := &d.fields[d.focus]
 	switch msg.String() {
 	case "up", "shift+tab":
-		f.input.Blur()
+		f.blurInput()
 		d.focus = (d.focus + len(d.fields) - 1) % len(d.fields)
-		d.fields[d.focus].input.Focus()
-		return nil
+		return d.fields[d.focus].focusInput()
 	case "down", "tab":
-		f.input.Blur()
+		f.blurInput()
 		d.focus = (d.focus + 1) % len(d.fields)
-		d.fields[d.focus].input.Focus()
-		return nil
+		return d.fields[d.focus].focusInput()
 	case "enter", "space":
 		if f.kind == "user" {
 			d.user = d.focus
@@ -414,13 +423,15 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 				d.title = "Create invitation for “" + clean(u.Name) + "”"
 			}
 			m.grantFields(d, u)
-			d.fields[0].input.Focus()
-			return nil
+			return d.fields[0].focusInput()
 		}
 		if f.kind != "text" {
 			f.checked = !f.checked
 			return nil
 		}
+	}
+	if f.kind != "text" {
+		return nil
 	}
 	var cmd tea.Cmd
 	f.input, cmd = f.input.Update(msg)

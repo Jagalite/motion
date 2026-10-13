@@ -73,6 +73,72 @@ func TestInvitationAdminRequiresExplicitSelection(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessFormsNavigateTextToggleAndUserFields(t *testing.T) {
+	for _, kind := range []string{"user", "approve", "invite"} {
+		t.Run(kind, func(t *testing.T) {
+			f := &fake{permissions: []string{api.PermSystemAdmin}, features: []api.Feature{{ID: "identity.access_management", Enabled: true}}, profiles: 1}
+			m := start(t, f, 100, 40)
+			m.backend = &accessFake{fake: f}
+			m.cache.slots[keyUsers] = &slot{data: []api.User{{ID: "u1", Name: "Alice", Permissions: []string{api.PermCatalogRead}}}}
+			if kind == "approve" {
+				m.route = route{page: pagePairings}
+				m.cache.slots[keyPairings] = &slot{data: []api.PairingSummary{{ID: "p1", Status: "pending", UserCode: "ABCD-EFGH"}}}
+			}
+			m.beginAccess(kind)
+			if m.access == nil {
+				t.Fatal("form did not open")
+			}
+			if kind != "user" {
+				if m.access.fields[0].kind != "user" {
+					t.Fatal("intended-user selector missing")
+				}
+				m.accessKey(keyPress("tab"))
+				m.accessKey(keyPress("enter"))
+				if m.access.user != 0 {
+					t.Fatal("selected user lost")
+				}
+			}
+			d := m.access
+			for i := range d.fields {
+				if d.focus != i {
+					t.Fatalf("focus = %d, want %d", d.focus, i)
+				}
+				field := &d.fields[i]
+				if field.input.Focused() != (field.kind == "text") {
+					t.Fatalf("wrong text focus for %s", field.label)
+				}
+				if field.kind == "text" {
+					before := field.input.Value()
+					m.accessKey(keyPress("x"))
+					if field.input.Value() != before+"x" {
+						t.Fatalf("text input did not edit: %s", field.label)
+					}
+					m.accessKey(keyPress("backspace"))
+				} else {
+					before := field.checked
+					m.accessKey(keyPress("enter"))
+					if field.checked == before {
+						t.Fatalf("toggle did not change: %s", field.label)
+					}
+					m.accessKey(keyPress("enter"))
+				}
+				m.accessKey(keyPress("tab"))
+				if field.input.Focused() {
+					t.Fatalf("previous field retained text focus: %s", field.label)
+				}
+			}
+			m.accessKey(keyPress("up"))
+			if d.focus != len(d.fields)-1 {
+				t.Fatal("reverse navigation did not wrap")
+			}
+			m.accessKey(keyPress("esc"))
+			if m.access != nil {
+				t.Fatal("cancel retained form")
+			}
+		})
+	}
+}
 func TestInvitationCodeVisibleWithoutTruncation(t *testing.T) {
 	secret := "min_" + strings.Repeat("abcdef01", 8)
 	for _, width := range []int{20, 40, 60, 100} {
