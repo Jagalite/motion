@@ -25805,8 +25805,7 @@
             "$ref": "#/components/schemas/Id"
           },
           "code": {
-            "type": "string",
-            "writeOnly": true
+            "type": "string"
           },
           "status": {
             "type": "string"

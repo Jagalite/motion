@@ -93,8 +93,9 @@ the protected server-local operator recovery mechanism.
 ## Storage, backup and restore
 
 Provider/mail secrets, PKCE verifiers and pending mail payloads use authenticated
-encryption with purpose-specific keys derived from Motion's external credential
-key. Keep that protected key file separate from database-only backups; losing it
+encryption with one encryption subkey derived from Motion's external credential
+key and purpose/entity-bound authenticated associated data. Challenge HMACs use
+separate purpose domains. Keep that protected key file separate from database-only backups; losing it
 prevents decrypting saved authentication configuration. Preserve its restricted
 filesystem permissions. Codes are keyed hashes in transaction rows; encrypted
 outbox plaintext is erased after delivery, cancellation or expiry. Delivery uses

@@ -16976,7 +16976,6 @@ components:
           $ref: '#/components/schemas/Id'
         code:
           type: string
-          writeOnly: true
         status:
           type: string
         action:

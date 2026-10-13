@@ -33,9 +33,12 @@ Completed checks on the implementation draft:
   four times under memory/swap/disk pressure, then cancelled before completion.
   Snapshot-03 compile `daed411bbc5443e1ba34b2bcba217e72` targets core models,
   server/UI libraries, access/sign-in/protocol APIs, contracts and playback.
-  TUI/API Go regression job `9ad5620dc3f54d89b235171c7bf435d7` is also queued.
+  TUI/API Go regression job `9ad5620dc3f54d89b235171c7bf435d7` passed both
+  `internal/api` and `internal/tui` packages on snapshot 03. Those Go sources
+  are unchanged in implementation commit `04b1a8f`.
   Compilation and test execution remain distinct gates; no native runtime pass
-  is claimed. Further source edits require a new final snapshot.
+  is claimed. Snapshot 03 was deferred under pressure and superseded after review
+  fixes; a new final snapshot is required.
 - Dependency notices regenerated and verified; six notice-generator tests passed.
   The defmt-parser archive omits licenses, so exact upstream-revision texts and
   their provenance are preserved under `third_party/licenses`.
@@ -52,7 +55,13 @@ email identity was rejected. Linking now intersects initiating-device, user and
 existing-method ceilings; admin elevation requires action-bound freshness;
 transactions capture actor revisions and the original proof deadline; same-owner
 email re-enrollment is an explicit core exception. Adapter regressions cover
-these boundaries. Final implementation-commit and PR-diff review remains pending.
+these boundaries. GPT-6.1 Sol reviewed implementation commit `04b1a8f` and
+`origin/main...HEAD`. Three additional findings were resolved and accepted in
+focused review: the returned approval code's contract annotation, exact encryption
+key/AAD documentation, and session expiry measured from verified authentication
+rather than later local issuance. The latter now uses production core policy and
+one deadline for device, parent, session, family and cookie. Final qualification
+evidence review remains pending.
 
 The local fixtures use a genuine `oidc-provider` service and a loopback SMTP sink.
 No external provider, real mailbox or live database is used. Remaining gates are

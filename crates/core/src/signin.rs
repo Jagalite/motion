@@ -223,6 +223,14 @@ pub fn proof_valid(
         && now < p.expires_at
         && p.approved_by.is_some_and(|other| other != actor)
 }
+/// Local issuance cannot extend the maximum interval since verified proof.
+/// A tolerated provider clock lead must not lengthen the local session.
+pub fn session_expiry(authenticated_at: i64, now: i64) -> Option<i64> {
+    authenticated_at
+        .min(now)
+        .checked_add(SESSION_MAX)
+        .filter(|expiry| *expiry > now)
+}
 pub fn fresh(authenticated_at: i64, now: i64) -> bool {
     now.checked_sub(authenticated_at)
         .is_some_and(|elapsed| (0..=FRESH_SECONDS).contains(&elapsed))

@@ -755,3 +755,17 @@ fn return_target_is_same_server_path_without_encoded_or_header_redirects() {
     assert!(core::safe_return(&format!("/{}", "a".repeat(511))));
     assert!(!core::safe_return(&format!("/{}", "a".repeat(512))));
 }
+
+#[test]
+fn session_expiry_is_bounded_by_proof_time_not_delayed_issuance() {
+    assert_eq!(
+        core::session_expiry(1_000, 1_300),
+        Some(1_000 + core::SESSION_MAX)
+    );
+    assert_eq!(
+        core::session_expiry(1_030, 1_000),
+        Some(1_000 + core::SESSION_MAX)
+    );
+    assert_eq!(core::session_expiry(1_000, 1_000 + core::SESSION_MAX), None);
+    assert_eq!(core::session_expiry(i64::MAX, i64::MAX), None);
+}

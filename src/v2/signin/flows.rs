@@ -610,7 +610,9 @@ async fn issue(
     identity: &str,
     method_revision: u64,
     authenticated_at: i64,
-) -> Result<String, Problem> {
+) -> Result<(String, i64), Problem> {
+    let issued_at = now();
+    let expires_at = core::session_expiry(authenticated_at, issued_at).ok_or_else(unavailable)?;
     let row = sqlx::query("SELECT * FROM signin_identities WHERE id=? AND enabled=1")
         .bind(identity)
         .fetch_one(&mut *c)
@@ -629,7 +631,7 @@ async fn issue(
         policy: serde_json::from_str(row.get("policy")).map_err(Problem::internal)?,
         revoked: false,
         generation: 1,
-        credential_expires_at: Some(now() + core::SESSION_MAX),
+        credential_expires_at: Some(expires_at),
     };
     let mut device = access_admin::constrain(&initial, &user)?;
     device.revision = 1;
@@ -649,7 +651,7 @@ async fn issue(
         device_id: d.device.id.clone(),
         kind: CredentialKind::Device,
         generation: 1,
-        expires_at: now() + core::SESSION_MAX,
+        expires_at,
     };
     auth::insert_credential(c, &parent_hash, &credential, None, None).await?;
     credential.kind = CredentialKind::Session;
@@ -662,14 +664,14 @@ async fn issue(
     )
     .await?;
     let epoch = epoch(c).await?;
-    sqlx::query("INSERT INTO signin_families(id,device_id,user_id,identity_id,identity_revision,method_revision,epoch,issued_at,authenticated_at,expires_at,parent_hash,session_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(new_id()).bind(&d.device.id).bind(&user.id).bind(identity).bind(row.get::<i64,_>("revision")).bind(method_revision as i64).bind(epoch).bind(now()).bind(authenticated_at).bind(credential.expires_at).bind(parent_hash).bind(session_hash).execute(&mut *c).await?;
-    Ok(token)
+    sqlx::query("INSERT INTO signin_families(id,device_id,user_id,identity_id,identity_revision,method_revision,epoch,issued_at,authenticated_at,expires_at,parent_hash,session_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(new_id()).bind(&d.device.id).bind(&user.id).bind(identity).bind(row.get::<i64,_>("revision")).bind(method_revision as i64).bind(epoch).bind(issued_at).bind(authenticated_at).bind(credential.expires_at).bind(parent_hash).bind(session_hash).execute(&mut *c).await?;
+    Ok((token, expires_at))
 }
-fn session_header(app: &App, token: &str) -> HeaderValue {
+fn session_header(app: &App, (token, expires_at): &(String, i64)) -> HeaderValue {
     HeaderValue::from_str(&format!(
         "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
         auth::SESSION_COOKIE,
-        core::SESSION_MAX,
+        expires_at.saturating_sub(now()).max(0),
         if app.origin.starts_with("https://") {
             "; Secure"
         } else {
