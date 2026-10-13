@@ -415,11 +415,13 @@ pub async fn authorization_url(
     let challenge = PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(
         pkce_verifier.to_owned(),
     ));
+    let state = CsrfToken::new(state.to_owned());
+    let nonce = Nonce::new(nonce.to_owned());
     let (url, _, _) = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
-            || CsrfToken::new(state.to_owned()),
-            || Nonce::new(nonce.to_owned()),
+            move || state,
+            move || nonce,
         )
         .add_scope(Scope::new("email".to_owned()))
         .add_scope(Scope::new("profile".to_owned()))
