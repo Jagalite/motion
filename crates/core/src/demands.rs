@@ -204,14 +204,21 @@ pub fn request_status(statuses: &[DemandStatus]) -> DemandStatus {
 pub const RETAINED_SCANS_PER_LIBRARY: usize = 200;
 
 /// Which of a library's scan requests to prune. `newest_first` lists every
-/// request of one library, newest first, with its per-source demand
-/// statuses. A request still pending (by [`request_status`]) is never pruned
-/// and does not count toward `keep`; of the settled ones, the newest `keep`
+/// request of one library in admission order, newest first, with its
+/// per-source demand statuses. The request being admitted (`admitting`) and
+/// every request still pending (by [`request_status`]) are never pruned and
+/// do not count toward `keep`; of the other settled ones, the newest `keep`
 /// stay.
-pub fn prunable_requests<I: Clone>(newest_first: &[(I, Vec<DemandStatus>)], keep: usize) -> Vec<I> {
+pub fn prunable_requests<I: Clone + PartialEq>(
+    newest_first: &[(I, Vec<DemandStatus>)],
+    keep: usize,
+    admitting: &I,
+) -> Vec<I> {
     newest_first
         .iter()
-        .filter(|(_, statuses)| request_status(statuses) != DemandStatus::Pending)
+        .filter(|(id, statuses)| {
+            id != admitting && request_status(statuses) != DemandStatus::Pending
+        })
         .skip(keep)
         .map(|(id, _)| id.clone())
         .collect()
@@ -231,11 +238,24 @@ mod retention_tests {
             ("oldest", vec![Cancelled]),
             ("ancient", vec![Partial]),
         ];
-        assert_eq!(prunable_requests(&requests, 2), vec!["oldest", "ancient"]);
         assert_eq!(
-            prunable_requests(&requests, 0),
+            prunable_requests(&requests, 2, &"none"),
+            vec!["oldest", "ancient"]
+        );
+        assert_eq!(
+            prunable_requests(&requests, 0, &"none"),
             vec!["new", "older", "oldest", "ancient"]
         );
-        assert!(prunable_requests(&requests, 10).is_empty());
+        assert!(prunable_requests(&requests, 10, &"none").is_empty());
+        // The request being admitted survives even when it is already settled
+        // (all its sources disabled) and sorts below the kept history.
+        assert_eq!(
+            prunable_requests(&requests, 1, &"oldest"),
+            vec!["older", "ancient"]
+        );
+        assert_eq!(
+            prunable_requests(&requests, 0, &"ancient"),
+            vec!["new", "older", "oldest"]
+        );
     }
 }

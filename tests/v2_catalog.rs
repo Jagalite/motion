@@ -2367,8 +2367,6 @@ async fn scan_history(f: &Fixture, library: &str, prefix: &str, settled: usize) 
 async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
     let f = Fixture::new().await;
     let auth = bearer(OPERATOR);
-    scan_history(&f, &f.a, "a", 1_100).await;
-    scan_history(&f, &f.b, "b", 3).await;
     // The oldest request is still running: it is never pruned.
     sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-running',?,0,1)")
         .bind(&f.a)
@@ -2380,6 +2378,8 @@ async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
         .execute(&f.app.db)
         .await
         .unwrap();
+    scan_history(&f, &f.a, "a", 1_100).await;
+    scan_history(&f, &f.b, "b", 3).await;
     let get = |path: String, auth: String| {
         let f = &f;
         async move {
@@ -2397,7 +2397,8 @@ async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
     .await;
     assert_eq!(first.status, StatusCode::OK, "{}", first.body);
     assert_eq!(ids(&first)[..2], ["a-1099".to_owned(), "a-1098".to_owned()]);
-    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-late',?,0,99999)")
+    // Admission order, not the clock: this one claims an older capture time.
+    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-late',?,0,0)")
         .bind(&f.a)
         .execute(&f.app.db)
         .await
@@ -2436,6 +2437,38 @@ async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
     let limited = f.device(&["catalog:read", "sources:manage"], &[&f.b]).await;
     let mine = get("/api/v2/scans?order=recent".into(), limited.clone()).await;
     assert_eq!(ids(&mine), ["b-0002", "b-0001", "b-0000"]);
+    // A real admission between two page reads, within the same second as
+    // the history it follows, appears only on a fresh first page.
+    sqlx::query("UPDATE scan_requests SET created_at=? WHERE id LIKE 'b-%'")
+        .bind(playscale::now())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let first = get("/api/v2/scans?order=recent&limit=2".into(), limited.clone()).await;
+    assert_eq!(ids(&first), ["b-0002", "b-0001"]);
+    let admitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-mid-read-00001"),
+            ],
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::ACCEPTED, "{}", admitted.body);
+    let next = get(
+        format!(
+            "/api/v2/scans?order=recent&limit=2&cursor={}",
+            first.body["next_cursor"].as_str().unwrap()
+        ),
+        limited.clone(),
+    )
+    .await;
+    assert_eq!(ids(&next), ["b-0000"]);
+    let fresh = get("/api/v2/scans?order=recent&limit=1".into(), limited.clone()).await;
+    assert_eq!(ids(&fresh), [admitted.body["id"].as_str().unwrap()]);
     let hidden = get(
         format!("/api/v2/scans?order=recent&library_id={}", f.a),
         limited,

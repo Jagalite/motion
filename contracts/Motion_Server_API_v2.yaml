@@ -1847,8 +1847,8 @@ paths:
       - name: order
         in: query
         required: false
-        description: '`id` (default) pages by scan ID. `recent` pages newest first by capture time, then ID;
-          its cursors stay stable while new scans are admitted, which appear only on a fresh first page.'
+        description: '`id` (default) pages by scan ID. `recent` pages newest first in admission order; its
+          cursors stay stable while new scans are admitted, which appear only on a fresh first page.'
         schema:
           type: string
           enum:

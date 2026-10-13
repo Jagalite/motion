@@ -50,7 +50,7 @@ applying any pending migration to an existing database.
 | 0043 | `0043_playback_monitoring.sql` | Playback monitoring | administrator session history with transfer counters, a viewing-by-delivery index, and three playback metric series (rebuilds `operational_metrics`) |
 | 0044 | `0044_offline_downloads.sql` | A13 (N3 downloads, PR #31) | device downloads, download ticket link, offline sequences/events/lineage |
 | 0045 | `0045_offline_event_retention.sql` | Completion item 1 (downloads) | offline event retention floor acknowledged by the device |
-| 0046 | `0046_bounded_library_queries.sql` | Completion item 2 (library queries) | recent-scan and rendition-by-timeline indexes |
+| 0046 | `0046_bounded_library_queries.sql` | Completion item 2 (library queries) | scan-history-by-library and rendition-by-timeline indexes |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 

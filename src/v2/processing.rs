@@ -502,6 +502,12 @@ async fn renditions(
     let limit = q.limit()?;
     let (clause, all, ids) =
         super::scope_clause(&access::catalog_scope(&caller.principal), "f.library_id");
+    // A given timeline is a direct predicate, so its index drives the read.
+    let timeline = if query.timeline_id.is_some() {
+        "p.timeline_id=?"
+    } else {
+        "? IS NULL"
+    };
     type Row = (
         String,
         String,
@@ -517,7 +523,7 @@ async fn renditions(
         bool,
         bool,
     );
-    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND (? IS NULL OR p.timeline_id=?) AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(&query.timeline_id).bind(&query.timeline_id).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {timeline} AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(&query.timeline_id).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
     for (
         id,

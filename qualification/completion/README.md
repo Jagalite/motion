@@ -126,15 +126,17 @@ item below is the single completion agent unless stated otherwise.
 - **Source SHA:** branch `plan-completion/library-queries`, stacked on item 1
   (migration order 0045 → 0046, shared ledger).
 - **Implemented:**
-  - **Scan history.** `listScans` gains `order=recent` (newest first by
-    capture time, then ID, with an opaque keyset cursor) and `library_id`.
+  - **Scan history.** `listScans` gains `order=recent`, which pages newest
+    first in admission order (SQLite rowid, with an opaque keyset cursor;
+    not the whole-second, clock-dependent capture time), and `library_id`.
     Authorization and the filter apply before ordering and the limit. A scan
     admitted mid-read sorts before every cursor, so it never shifts or
     repeats a later page. Retention: admitting a scan prunes the library's
     settled history beyond the newest 200 in the same transaction. The policy
-    is core `demands::prunable_requests`, which never prunes a pending request
-    (by `request_status`) or counts it. Demands cascade; jobs are untouched.
-    Indexes in migration 0046.
+    is core `demands::prunable_requests`, which never prunes the request
+    being admitted or a pending one, and does not count them. Demands
+    cascade; jobs are untouched. Index `scan_requests(library_id)` in
+    migration 0046 (rowid is implicit).
   - **Renditions.** `listRenditions` gains `timeline_id`, applied before the
     page limit; an unknown or unreadable timeline is an empty page. Index
     `preparations(timeline_id, job_id)`.
@@ -148,6 +150,12 @@ item below is the single completion agent unless stated otherwise.
     Past those bounds, entries stay listed and removable as "Title not
     loaded" (collection members are left out) instead of the whole page
     becoming unavailable.
+- **Query plans:** optional filters (`ids`, `timeline_id`, `library_id`,
+  the cursor) are emitted as direct predicates only when present.
+  `EXPLAIN QUERY PLAN` on the migrated schema shows primary-key lookups for
+  `ids`, `preparations_timeline` for renditions, and
+  `scan_requests_library (library_id=? AND rowid<?)` or the rowid key for
+  scan pages.
 - **Unsupported / limits:** a collection with more than 100 merged-alias or
   hidden members leaves the excess unresolved. Playlists with more than 500
   distinct timelines show the rest untitled. An idempotent replay of a pruned
@@ -171,7 +179,20 @@ item below is the single completion agent unless stated otherwise.
   | `tests/m3_workflows.rs` (real scan, ffmpeg, processing worker) | 1 passed |
   | Pinned clippy 1.98, CI flags, `-p playscale-core -p playscale --all-targets` | clean (Kyoto `a3a08b28`) |
   | `fmt`, contract checks | pass |
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol):** round 1 at `e4dd792` raised five P2 findings,
+  all fixed in the follow-up commit:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | L1 | Pruning could delete the request being admitted (all sources disabled, clock stepped back or same-second ordering), failing admission | Fixed: `prunable_requests` takes the admitting request and never prunes it; pruning orders by rowid. Core test covers a settled admitting request below the kept history |
+  | L2 | Same-second admissions could appear on later recent pages (whole-second capture times, random IDs) | Fixed: recent order and cursor use the admission rowid. The test admits a real scan through the API between two page reads, with history in the same second |
+  | L3 | Batched `ids` used an optional `OR`, scanning the catalog | Fixed: direct predicate when given; plan uses primary-key lookups |
+  | L4 | Rendition `timeline_id` used an optional `OR`, so the timeline index was unused | Fixed: direct predicate; plan uses `preparations_timeline` |
+  | L5 | Recent scan pages could not seek by cursor or library | Fixed: direct `library_id=?` and `rowid<?` when given; plan seeks `scan_requests_library` |
+
+  After the fixes: core lib 142, `playscale` lib 64, `v2_catalog` 19 (the
+  scan test ran three times), `v2_metadata_processing` 18, `access_api` 39,
+  `m3_workflows` 1 passed; clippy clean (Kyoto `415cb9b5`, `e59a0b6c`).
 - **Release checks:** frozen 10,000-item / 100,000-file browse and organize
   timings (handoff section 8).
 

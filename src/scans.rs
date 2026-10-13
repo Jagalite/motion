@@ -251,16 +251,21 @@ pub(crate) async fn request_in(
         sqlx::query("INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status) VALUES (?,?,?,?,?,'pending')")
             .bind(&demand_id).bind(&id).bind(&source).bind(barrier).bind(verify).execute(&mut *tx).await?;
     }
-    prune_history(tx, library).await?;
+    prune_history(tx, library, &id).await?;
     get_in(tx, &id).await
 }
 
 /// Bound a library's scan history in the admitting transaction: the policy
-/// (`core::prunable_requests`) keeps every pending request and the newest
-/// settled ones. Demands cascade with their request; jobs are not touched.
-async fn prune_history(tx: &mut SqliteConnection, library: &str) -> Result<(), ScanError> {
+/// (`core::prunable_requests`) keeps the admitted request, every pending one
+/// and the newest settled ones by admission order (rowid, not the clock).
+/// Demands cascade with their request; jobs are not touched.
+async fn prune_history(
+    tx: &mut SqliteConnection,
+    library: &str,
+    admitting: &str,
+) -> Result<(), ScanError> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT r.id,(SELECT json_group_array(d.status) FROM scan_demands d WHERE d.request_id=r.id) FROM scan_requests r WHERE r.library_id=? ORDER BY r.created_at DESC,r.id DESC",
+        "SELECT r.id,(SELECT json_group_array(d.status) FROM scan_demands d WHERE d.request_id=r.id) FROM scan_requests r WHERE r.library_id=? ORDER BY r.rowid DESC",
     )
     .bind(library)
     .fetch_all(&mut *tx)
@@ -275,7 +280,11 @@ async fn prune_history(tx: &mut SqliteConnection, library: &str) -> Result<(), S
             .collect::<anyhow::Result<Vec<_>>>()?;
         requests.push((id, statuses));
     }
-    for id in core::prunable_requests(&requests, core::RETAINED_SCANS_PER_LIBRARY) {
+    for id in core::prunable_requests(
+        &requests,
+        core::RETAINED_SCANS_PER_LIBRARY,
+        &admitting.to_owned(),
+    ) {
         sqlx::query("DELETE FROM scan_requests WHERE id=?")
             .bind(&id)
             .execute(&mut *tx)

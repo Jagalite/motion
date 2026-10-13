@@ -678,6 +678,13 @@ async fn browse(
     };
     let scope = access::catalog_scope(&caller.principal);
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
+    // The batched ID filter is emitted only when given, as a direct predicate
+    // SQLite resolves by primary-key lookups (an optional `OR` would scan).
+    let by_id = if filter.ids.is_some() {
+        "i.id IN (SELECT value FROM json_each(?))"
+    } else {
+        "? IS NULL"
+    };
     let sql = format!(
         "{ITEM_SELECT} WHERE i.id NOT IN (SELECT alias_id FROM item_aliases)
          AND (? OR EXISTS (SELECT 1 FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=i.id AND f.generated=0 AND {clause}))
@@ -685,7 +692,7 @@ async fn browse(
          AND ? AND (? IS NULL OR coalesce(s.media_type,'unclassified')=?) AND (? IS NULL OR i.kind=?)
          AND (? IS NULL OR s.parent_id=?)
          AND (? IS NULL OR instr(lower(i.title),lower(?))>0)
-         AND (? IS NULL OR i.id IN (SELECT value FROM json_each(?)))
+         AND {by_id}
          AND (? OR i.title>? OR (i.title=? AND i.id>?))
          ORDER BY i.title,i.id LIMIT ?"
     );
@@ -708,7 +715,6 @@ async fn browse(
         .bind(&filter.parent_id)
         .bind(&filter.q)
         .bind(&filter.q)
-        .bind(&filter.ids)
         .bind(&filter.ids)
         .bind(after.is_none())
         .bind(&after_title)

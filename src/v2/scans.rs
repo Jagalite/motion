@@ -271,17 +271,16 @@ struct ListQuery {
     order: Order,
     library_id: Option<String>,
 }
-/// Keyset cursor for newest-first pages: `(created_at, id)` of the last row.
-fn recent_cursor(created: i64, id: &str) -> String {
-    super::catalog::b64_encode(
-        serde_json::to_string(&(created, id))
-            .expect("serializes")
-            .as_bytes(),
-    )
+/// Keyset cursor for newest-first pages: the admission sequence (SQLite
+/// rowid) of the last row. Rowids grow with every admission, unlike capture
+/// times (whole seconds, possibly stepping back with the clock).
+fn recent_cursor(sequence: i64) -> String {
+    super::catalog::b64_encode(sequence.to_string().as_bytes())
 }
-fn decode_recent(cursor: &str) -> Result<(i64, String), Problem> {
+fn decode_recent(cursor: &str) -> Result<i64, Problem> {
     super::catalog::b64_decode(cursor)
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
         .ok_or_else(|| Problem::bad("invalid_cursor", "The page cursor is invalid"))
 }
 async fn list(
@@ -315,48 +314,58 @@ async fn list(
         _ => "[]".into(),
     };
     // Authorization and the optional library filter apply before ordering
-    // and the page limit, so hidden scans never shape a page.
-    let filter =
-        "(? OR library_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR library_id=?)";
+    // and the limit, so hidden scans never shape a page. Optional predicates
+    // are emitted only when present, so SQLite can seek its indexes.
+    let scoped = "(? OR library_id IN (SELECT value FROM json_each(?)))";
+    let library = if query.library_id.is_some() {
+        " AND library_id=?"
+    } else {
+        ""
+    };
     let keyed: Vec<(String, String)> = match query.order {
         Order::Id => {
-            let rows: Vec<String> = sqlx::query_scalar(&format!(
-                "SELECT id FROM scan_requests WHERE id>? AND {filter} ORDER BY id LIMIT ?"
-            ))
-            .bind(q.after()?)
-            .bind(all)
-            .bind(&ids)
-            .bind(&query.library_id)
-            .bind(&query.library_id)
-            .bind(i64::from(limit) + 1)
-            .fetch_all(&mut *tx)
-            .await?;
-            rows.into_iter().map(|id| (id.clone(), id)).collect()
+            let sql = format!(
+                "SELECT id FROM scan_requests WHERE id>? AND {scoped}{library} ORDER BY id LIMIT ?"
+            );
+            let mut rows = sqlx::query_scalar::<_, String>(&sql)
+                .bind(q.after()?)
+                .bind(all)
+                .bind(&ids);
+            if let Some(library) = &query.library_id {
+                rows = rows.bind(library);
+            }
+            rows.bind(i64::from(limit) + 1)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|id| (id.clone(), id))
+                .collect()
         }
         Order::Recent => {
-            // Newest first by capture time, then ID. A new scan sorts before
-            // every existing cursor, so it never shifts a later page.
+            // Newest admission first. A scan admitted mid-read has a larger
+            // sequence than every cursor, so it never shifts a later page.
             let after = match q.after()? {
                 "" => None,
                 cursor => Some(decode_recent(cursor)?),
             };
-            let (created, after_id) = after.clone().unwrap_or((i64::MAX, String::new()));
-            let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
-                "SELECT id,created_at FROM scan_requests WHERE (? OR created_at<? OR (created_at=? AND id<?)) AND {filter} ORDER BY created_at DESC,id DESC LIMIT ?"
-            ))
-            .bind(after.is_none())
-            .bind(created)
-            .bind(created)
-            .bind(&after_id)
-            .bind(all)
-            .bind(&ids)
-            .bind(&query.library_id)
-            .bind(&query.library_id)
-            .bind(i64::from(limit) + 1)
-            .fetch_all(&mut *tx)
-            .await?;
-            rows.into_iter()
-                .map(|(id, created)| (recent_cursor(created, &id), id))
+            let before = if after.is_some() { " AND rowid<?" } else { "" };
+            let sql = format!(
+                "SELECT rowid,id FROM scan_requests WHERE {scoped}{library}{before} ORDER BY rowid DESC LIMIT ?"
+            );
+            let mut rows = sqlx::query_as::<_, (i64, String)>(&sql)
+                .bind(all)
+                .bind(&ids);
+            if let Some(library) = &query.library_id {
+                rows = rows.bind(library);
+            }
+            if let Some(after) = after {
+                rows = rows.bind(after);
+            }
+            rows.bind(i64::from(limit) + 1)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|(sequence, id)| (recent_cursor(sequence), id))
                 .collect()
         }
     };
