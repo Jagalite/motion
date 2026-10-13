@@ -56,6 +56,14 @@ enum CacheCommand {
         #[arg(long)]
         download_id: String,
     },
+    /// The person's choice for progress recorded before a server restore:
+    /// discard or reapply, against the server's current history.
+    Restore {
+        #[arg(long)]
+        choice: String,
+        #[arg(long)]
+        viewing_epoch: String,
+    },
     /// Settle a removal the person made on this device with the server's
     /// answer to deleting the download: deleted, absent or failed.
     SettleRemoval {
@@ -117,6 +125,13 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
+        CacheCommand::Restore {
+            choice,
+            viewing_epoch,
+        } => {
+            let choice = serde_json::from_value(serde_json::Value::String(choice))?;
+            serde_json::to_value(store.resolve_restore(choice, &viewing_epoch)?)?
+        }
         CacheCommand::SettleRemoval {
             download_id,
             outcome,

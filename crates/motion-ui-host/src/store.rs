@@ -36,6 +36,21 @@ pub struct Store {
     removals: Vec<String>,
 }
 
+/// The person's choice for progress recorded before a server restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreChoice {
+    Discard,
+    Reapply,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RestoreOutcome {
+    pub discarded: usize,
+    pub reapplied: usize,
+    pub dropped: usize,
+}
+
 /// At most this many unsettled removals are kept.
 const MAX_REMOVALS: usize = 500;
 const MAX_REMOVALS_BYTES: u64 = 128 * 1024;
@@ -498,6 +513,70 @@ impl Store {
         };
         log.validate(&self.manifest.scope)?;
         Ok(log)
+    }
+
+    /// Apply the person's choice for progress recorded against an earlier
+    /// history of a restored server (`current` is the server's history now):
+    /// discard it (`offline::discard`), or re-apply it pinned to each
+    /// download's current pin (`offline::reapply`; the agent re-pins the
+    /// downloads first). One durable replacement of the event log; the next
+    /// batch re-anchors past the old events. Returns how many events were
+    /// discarded, re-applied and dropped.
+    pub fn resolve_restore(
+        &mut self,
+        choice: RestoreChoice,
+        current: &str,
+    ) -> anyhow::Result<RestoreOutcome> {
+        ensure!(offline::viewing_epoch(current), "invalid server history");
+        let log = self.events()?;
+        let foreign = offline::foreign_events(&log.events, current);
+        if foreign == 0 {
+            return Ok(RestoreOutcome::default());
+        }
+        let resolved = match choice {
+            RestoreChoice::Discard => offline::discard(
+                log.base_sequence,
+                log.base_viewing_epoch.as_deref(),
+                &log.events,
+                current,
+            ),
+            RestoreChoice::Reapply => {
+                let pins: Vec<_> = self
+                    .manifest
+                    .downloads
+                    .iter()
+                    .map(|d| d.identity.clone())
+                    .collect();
+                offline::reapply(
+                    log.base_sequence,
+                    log.base_viewing_epoch.as_deref(),
+                    &log.events,
+                    &pins,
+                    current,
+                )
+                .context("the device sequence is exhausted")?
+            }
+        };
+        let next = EventLog {
+            base_sequence: resolved.base,
+            events: resolved.events,
+            base_viewing_epoch: resolved.base_epoch,
+        };
+        next.validate(&self.manifest.scope)?;
+        let bytes = serde_json::to_vec(&next)?;
+        ensure!(bytes.len() as u64 <= MAX_LOG, "event storage is full");
+        replace_durably(&self.root, &self.root_sync, "events.json", &bytes)?;
+        Ok(match choice {
+            RestoreChoice::Discard => RestoreOutcome {
+                discarded: foreign,
+                ..Default::default()
+            },
+            RestoreChoice::Reapply => RestoreOutcome {
+                reapplied: foreign - resolved.dropped,
+                dropped: resolved.dropped,
+                ..Default::default()
+            },
+        })
     }
 
     /// The re-anchor the next batch (sent under its first event's history)

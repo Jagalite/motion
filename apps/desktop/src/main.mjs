@@ -240,7 +240,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
           return ses.fetch(`${selected.origin}${url}`, {redirect: 'error', cache: 'no-store', signal, headers: range ? {Range: range} : {}});
         },
         status: message => { if (current()) window.webContents.send('motion:status', message); }});
-      const state = {abort: () => controller.abort(), running: null};
+      const state = {abort: () => controller.abort(), running: null, agent};
       const run = async () => {
         if (!current() || controller.signal.aborted) return;
         state.running = agent.pass().catch(error => {
@@ -334,6 +334,21 @@ else {
     ipcMain.handle('motion:disconnect', event => { authorize(event); return disconnect(); });
     ipcMain.handle('motion:downloads', (event, choice) => { authorize(event); return openDownloads(choice ?? null); });
     ipcMain.handle('motion:offline-roots', event => { authorize(event); return offlineRoots(cacheBase()).map(({name, label, titles, current}) => ({name, label, titles, current})); });
+    // Offline progress recorded before the connected server was restored:
+    // listed for an explicit choice, never resolved without one.
+    ipcMain.handle('motion:offline-restore', async event => {
+      authorize(event);
+      return downloads?.agent ? downloads.agent.restoreChoices() : [];
+    });
+    ipcMain.handle('motion:offline-restore-choose', async (event, root, choice) => {
+      authorize(event);
+      if (typeof root !== 'string' || !/^[0-9a-f]{32}$/.test(root) || !['discard', 'reapply'].includes(choice)) throw new Error('Invalid choice');
+      const state = downloads;
+      if (!state?.agent) throw new Error('Connect to the server first');
+      // After the pass in progress: the cache admits one writer at a time.
+      await state.running?.catch(() => {});
+      return state.agent.resolveRestore(root, choice);
+    });
     ipcMain.handle('motion:start-local', event => {
       authorize(event);
       return serialize(async owner => {

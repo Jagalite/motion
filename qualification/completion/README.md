@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 and 5D–5F not started | offline-roots, offline-removal and restore-recovery PRs | Merge by user; then 5C part 2 |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented (review pending); 5D–5F not started | offline-roots, offline-removal, restore-recovery and restore-choice PRs | Merge by user; then 5D |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -819,11 +819,72 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `04a7c62`: clean.
 
+### 5C (part 2). The person's choice for progress from before a restore
+
+- **Source SHA:** branch `plan-completion/restore-choice`, stacked on 5C
+  part 1 (`plan-completion/restore-recovery`).
+- **Implemented:** offline progress recorded against the server's earlier
+  history (before a restore) used to wait on the device indefinitely.
+  The desktop window now lists, per profile, how many saved positions for
+  how many titles are waiting, and offers two choices:
+  - **Keep my offline progress (re-apply):** the agent re-pins the
+    profile's downloads to the restored server's current state (the
+    existing rebase). The cache then re-records each earlier observation,
+    in order, against its download's current pin (core
+    `offline::reapply`): same position, status and device time, a new
+    identity, and the next sequences after every retained event. The
+    earlier events are compacted, and the next batch re-anchors past them
+    (part 1). The server decides the new events against its current
+    state, so progress newer on the server still wins (`viewing_newer`).
+    Events whose download has no current pin are dropped and counted.
+  - **Discard it:** the cache compacts the earlier events without
+    sending them (core `offline::discard`), so the restored server keeps
+    its own state. The next batch re-anchors.
+  - Each choice is one durable replacement of the event log, validated
+    as a log against its own pins.
+  - Retained events are never renumbered.
+  - Nothing is resolved without the person's choice.
+  - The agent learns the server's current history from
+    `/system/capabilities`, only for the root's own server.
+- **Core/adapter boundary:**
+  - **Core:** what each choice does to the log (`foreign_events`,
+    `discard`, `reapply`), with the pins and the current history as
+    explicit inputs.
+  - **Cache tool:** applies it under the cache lock
+    (`Store::resolve_restore`, `cache restore`).
+  - **Agent and window:** re-pin first (re-apply only) and present the
+    choice.
+- **Stateless:** `downloads_model` (v5) adds the two choices after its
+  restore.
+  - New transition properties: discarding drops exactly the earlier
+    progress; re-applying keeps every observation in order under the
+    current history and the re-pinned download.
+  - The existing oracle requires re-applied events to be decided against
+    the restored server's state.
+  - Result: 5,083,512 states and 81,336,192 transitions, exhausted, in
+    182 s release.
+  - New scenario test: a stuck completion, once kept, is applied and
+    counts as watched; once discarded, nothing is sent.
+- **Evidence:**
+  - Core lib: 154 passed (discard, reapply with a dropped download, log
+    validity).
+  - `motion-ui-host` store: 17 passed (re-apply onto the manifest pin with
+    a pending re-anchor; a second choice changes nothing; discard; the
+    host still opens the log).
+  - JS: 92 passed. New:
+    - agent: listing counts; unknown choice or root refused; re-apply
+      re-pins before the cache restore, with the current history;
+      discard needs no re-pin;
+    - chrome: the panel appears after the agent's status, the choice is
+      sent, and the outcome is reported.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:** the packaged Electron run of the choice (5F).
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5C restore recovery | When sync answers `viewing_epoch_changed`, offer "re-base on the restored server" or "discard", as an explicit choice applied by the cache tool | Core rule for re-basing retained events onto a new history |
 | 5D transfer state | Contract operation for device-reported progress, owned by the device; never inferred by the server | Contract review |
 | 5E prepared and track-selected downloads | Manifest files for renditions, subtitles and artwork with pins | Item 3D (preparation by component) |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |

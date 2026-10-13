@@ -298,7 +298,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
             ...(log.reanchor ? {reanchor: log.reanchor} : {})}});
       } catch (error) {
         if (error.code !== 'viewing_epoch_changed') throw error;
-        status('The server was restored or replaced since these were saved. Offline progress stays on this device.');
+        status('The server was restored from a backup since this progress was saved. Choose whether to keep it or discard it; it stays on this device until you do.');
         return false;
       }
       const after = await cache(target.path, target.scope, ['acknowledge'], JSON.stringify(result));
@@ -327,6 +327,53 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       if (!viewing.watched && viewing.position_ms > 0) args.push('--resume-position-ms', String(viewing.position_ms));
       await cache(target.path, target.scope, args);
     }
+  }
+
+  /** The server's current history identity (`server_id:restore_epoch`), if it is this root's server. */
+  async function currentHistory() {
+    const capabilities = await api('/api/v2/system/capabilities');
+    if (capabilities.server_id !== identity.server_id || !capabilities.restore_epoch) return null;
+    return `${capabilities.server_id}:${capabilities.restore_epoch}`;
+  }
+
+  /**
+   * Profiles holding offline progress recorded before the server was
+   * restored from a backup: those events can never be sent as they are.
+   * The person chooses for each whether to keep (re-apply) or discard it.
+   */
+  async function restoreChoices() {
+    const current = await currentHistory();
+    if (!current) return [];
+    const choices = [];
+    for (const target of ownedRoots()) {
+      const log = await cache(target.path, target.scope, ['events']);
+      const earlier = [];
+      for (const event of log.events) {
+        if (event.media.viewing_epoch === current) break;
+        earlier.push(event);
+      }
+      if (earlier.length > 0) {
+        choices.push({root: target.name, profile_id: target.scope.profile_id, events: earlier.length,
+          titles: new Set(earlier.map(e => e.media.download_id)).size});
+      }
+    }
+    return choices;
+  }
+
+  /**
+   * Apply the person's choice for one root: `reapply` re-pins its downloads
+   * to the restored server's current state, then the cache re-records the
+   * earlier progress against those pins (offline::reapply); `discard` drops
+   * it (offline::discard). The next pass sends what remains.
+   */
+  async function resolveRestore(rootName, choice) {
+    if (!['discard', 'reapply'].includes(choice)) throw new Error('Unknown choice');
+    const target = ownedRoots().find(root => root.name === rootName);
+    if (!target) throw new Error('That offline library is not on this device');
+    const current = await currentHistory();
+    if (!current) throw new Error('The server identity could not be confirmed');
+    if (choice === 'reapply') await rebase(target, (await cache(target.path, target.scope, ['status'])).manifest);
+    return cache(target.path, target.scope, ['restore', '--choice', choice, '--viewing-epoch', current]);
   }
 
   /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */
@@ -414,5 +461,5 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (current) writeAtomically(join(base, 'current.json'), {root: current});
   }
 
-  return {pass, root, transfer, reconcile, withdraw};
+  return {pass, root, transfer, reconcile, withdraw, restoreChoices, resolveRestore};
 }

@@ -55,6 +55,11 @@ enum Input {
     /// The server database is restored from a backup taken at the start; its
     /// history identity (restore epoch) changes.
     Restore,
+    /// The person discards progress recorded against the earlier history.
+    Discard,
+    /// The person keeps it: the download is re-pinned to the restored
+    /// server's state and the progress re-recorded against it.
+    Reapply,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -147,6 +152,15 @@ fn history(w: &World) -> String {
 
 fn epoch_name(epoch: u8) -> String {
     format!("server:{epoch}")
+}
+
+/// The log starts with progress recorded against an earlier history.
+fn earlier_progress(w: &World) -> bool {
+    header(&w.log).is_some_and(|h| h != history(w))
+}
+
+fn epoch_number(epoch: Option<String>) -> Option<u8> {
+    epoch.map(|e| e.strip_prefix("server:").unwrap().parse().unwrap())
 }
 
 /// The device's compaction point belongs to an earlier server history.
@@ -275,8 +289,8 @@ impl Model for Downloads {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-download-reconciliation".into(),
-            model_version: 4,
-            properties_version: 4,
+            model_version: 5,
+            properties_version: 5,
             codec_version: 1,
             build: concat!(
                 include_str!("../src/downloads.rs"),
@@ -471,6 +485,36 @@ impl Model for Downloads {
                 n.edits += 1;
                 n.timeline_revision += 1;
             }
+            Input::Discard if earlier_progress(w) => {
+                let r = offline::discard(
+                    w.base,
+                    w.base_epoch.map(epoch_name).as_deref(),
+                    &w.log,
+                    &history(w),
+                );
+                n.base = r.base;
+                n.base_epoch = epoch_number(r.base_epoch);
+                n.log = r.events;
+            }
+            Input::Reapply if earlier_progress(w) && w.download.is_some() => {
+                // The agent re-pins the download to the restored server first.
+                let mut pin = identity(w);
+                pin.timeline_revision = w.download.as_ref().unwrap().timeline_revision.clone();
+                n.download = Some(pin.clone());
+                n.other_viewing = false;
+                n.other_manual = false;
+                let r = offline::reapply(
+                    w.base,
+                    w.base_epoch.map(epoch_name).as_deref(),
+                    &w.log,
+                    std::slice::from_ref(&pin),
+                    &history(w),
+                )
+                .unwrap();
+                n.base = r.base;
+                n.base_epoch = epoch_number(r.base_epoch);
+                n.log = r.events;
+            }
             Input::Restore if w.restores < 1 => {
                 // Back to the empty backup; the device keeps everything.
                 n.view = View::default();
@@ -595,6 +639,32 @@ impl Model for Downloads {
                     },
                 ));
             }
+            Input::Discard if earlier_progress(w) => {
+                let earlier = offline::foreign_events(&w.log, &history(w));
+                checks.push(check(
+                    "restore.discard_drops_exactly_the_earlier_progress",
+                    !earlier_progress(n)
+                        && n.log == w.log[earlier..]
+                        && n.base == w.base + earlier as u64,
+                ));
+            }
+            Input::Reapply if earlier_progress(w) && w.download.is_some() => {
+                let observed = |log: &[offline::OfflineEvent]| {
+                    log.iter()
+                        .map(|e| (e.position_ms, e.status.clone()))
+                        .collect::<Vec<_>>()
+                };
+                checks.push(check(
+                    "restore.reapply_keeps_every_observation_in_order_under_the_current_history",
+                    !earlier_progress(n)
+                        && observed(&n.log) == observed(&w.log)
+                        && n.log.iter().all(|e| {
+                            e.media.viewing_epoch == Some(history(w))
+                                && Some(&e.media) == n.download.as_ref()
+                        })
+                        && n.base + n.log.len() as u64 >= w.base + w.log.len() as u64,
+                ));
+            }
             Input::AlteredRetry | Input::Gap => checks.push(check(
                 "reconcile.conflicts_and_gaps_change_nothing",
                 n == w && t.outputs.iter().all(Option::is_none),
@@ -637,6 +707,8 @@ impl Enumerate for Downloads {
             Input::ManualOverride,
             Input::TimelineEdit,
             Input::Restore,
+            Input::Discard,
+            Input::Reapply,
         ])
     }
 }
@@ -683,7 +755,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
+        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring and a discard or re-apply choice, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
         report.states, report.transitions
     );
 }
@@ -778,4 +850,34 @@ fn a_restored_server_continues_after_the_devices_compaction() {
             .iter()
             .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
     );
+}
+
+#[test]
+fn reapplied_progress_is_applied_on_the_restored_server() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Play(Position::Complete),
+        Input::Restore,
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    // The completion was recorded before the restore and is stuck.
+    assert!(earlier_progress(&w));
+    let stuck = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(stuck.outputs, vec![None]);
+    let kept = Downloads.step(&w, &Input::Reapply).unwrap().state;
+    let synced = Downloads.step(&kept, &Input::Sync).unwrap();
+    assert_eq!(synced.outputs, vec![Some((Outcome::Applied, None))]);
+    assert!(
+        synced.state.view.automatic_watched,
+        "the kept completion counts"
+    );
+    // Discarding sends nothing and leaves the restored server's state.
+    let dropped = Downloads.step(&w, &Input::Discard).unwrap().state;
+    assert!(dropped.log.is_empty());
+    let synced = Downloads.step(&dropped, &Input::Sync).unwrap();
+    assert!(synced.outputs.is_empty() && synced.state.view == w.view);
 }

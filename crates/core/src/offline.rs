@@ -261,6 +261,98 @@ pub fn reanchor(base: u64, base_epoch: Option<&str>, batch_epoch: &str) -> Optio
     })
 }
 
+/// A log after the person's choice for progress recorded against an
+/// earlier history of a restored server (`discard`, `reapply`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub base: u64,
+    pub base_epoch: Option<String>,
+    pub events: Vec<OfflineEvent>,
+    /// Re-applied events dropped because their download has no pin in the
+    /// current history (it was deleted, or not re-pinned yet).
+    pub dropped: usize,
+}
+
+/// How many leading retained events were recorded against another history
+/// than `current`: they can never be sent to the restored server as they are.
+pub fn foreign_events(history: &[OfflineEvent], current: &str) -> usize {
+    history
+        .iter()
+        .take_while(|e| e.media.viewing_epoch.as_deref() != Some(current))
+        .count()
+}
+
+/// Discard progress recorded against an earlier history: the leading foreign
+/// events are compacted on the device (nothing is sent), so the restored
+/// server keeps its own state; the next batch re-anchors past them.
+pub fn discard(
+    base: u64,
+    base_epoch: Option<&str>,
+    history: &[OfflineEvent],
+    current: &str,
+) -> Resolved {
+    let foreign = foreign_events(history, current);
+    let Some(last) = foreign.checked_sub(1).map(|i| &history[i]) else {
+        return Resolved {
+            base,
+            base_epoch: base_epoch.map(str::to_owned),
+            events: history.to_vec(),
+            dropped: 0,
+        };
+    };
+    Resolved {
+        base: sequence(&last.device_sequence).unwrap_or(base),
+        base_epoch: last.media.viewing_epoch.clone(),
+        events: history[foreign..].to_vec(),
+        dropped: 0,
+    }
+}
+
+/// Re-apply progress recorded against an earlier history onto the restored
+/// server. Each leading foreign event becomes a new event, in order, with the
+/// same observation (position, status, device time) pinned to its
+/// download's current pin in `pins` (read from the restored server), with a
+/// new identity and the next sequences after every retained event; the
+/// foreign events are compacted and the next batch re-anchors past them.
+/// The server then decides the new events against its current state, so an
+/// observation newer on the server still wins. Events whose download has no
+/// pin in `current` are dropped. Retained events are never renumbered.
+pub fn reapply(
+    base: u64,
+    base_epoch: Option<&str>,
+    history: &[OfflineEvent],
+    pins: &[DownloadIdentity],
+    current: &str,
+) -> Option<Resolved> {
+    let discarded = discard(base, base_epoch, history, current);
+    let foreign = &history[..history.len() - discarded.events.len()];
+    let mut events = discarded.events;
+    let mut next = next_sequence(discarded.base, &events)?;
+    let mut dropped = 0;
+    for event in foreign {
+        let Some(pin) = pins.iter().find(|p| {
+            p.download_id == event.media.download_id
+                && p.timeline_id == event.media.timeline_id
+                && p.viewing_epoch.as_deref() == Some(current)
+        }) else {
+            dropped += 1;
+            continue;
+        };
+        events.push(OfflineEvent {
+            media: pin.clone(),
+            event_id: format!("reapplied-{next}"),
+            device_sequence: next.to_string(),
+            ..event.clone()
+        });
+        next = next.checked_add(1)?;
+    }
+    Some(Resolved {
+        events,
+        dropped,
+        ..discarded
+    })
+}
+
 /// What the server answered when a download the person removed on this
 /// device was deleted there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +384,120 @@ pub fn settles(outcome: Deletion, saved_locally: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restored_event(
+        sequence: u64,
+        download: &str,
+        epoch: &str,
+        position_ms: u64,
+    ) -> OfflineEvent {
+        OfflineEvent {
+            scope: CacheScope {
+                server_id: "s".into(),
+                principal_id: "p".into(),
+                profile_id: "f".into(),
+                device_id: "d".into(),
+            },
+            media: DownloadIdentity {
+                download_id: download.into(),
+                timeline_id: format!("t-{download}"),
+                timeline_revision: "1".into(),
+                source_revision: "r".into(),
+                base_viewing_revision: "4".into(),
+                base_manual_epoch: "0".into(),
+                viewing_epoch: Some(epoch.into()),
+            },
+            event_id: format!("e{sequence}"),
+            device_sequence: sequence.to_string(),
+            position_ms,
+            status: "paused".into(),
+            device_time: Some(format!("t{sequence}")),
+        }
+    }
+
+    #[test]
+    fn progress_of_an_earlier_history_is_discarded_or_reapplied_by_choice() {
+        let log = vec![
+            restored_event(3, "a", "s:old", 10),
+            restored_event(4, "b", "s:old", 20),
+            restored_event(5, "a", "s:old", 30),
+            // A download taken after the restore: already current.
+            restored_event(6, "c", "s:new", 40),
+        ];
+        assert_eq!(foreign_events(&log, "s:new"), 3);
+        let discarded = discard(2, Some("s:old"), &log, "s:new");
+        assert_eq!(
+            (
+                discarded.base,
+                discarded.base_epoch.as_deref(),
+                discarded.events.len()
+            ),
+            (5, Some("s:old"), 1)
+        );
+        assert_eq!(
+            reanchor(5, Some("s:old"), "s:new").map(|r| r.through),
+            Some(5)
+        );
+        // Nothing foreign: unchanged.
+        assert_eq!(
+            discard(5, Some("s:old"), &log[3..], "s:new").events,
+            log[3..]
+        );
+        let pin = |download: &str, epoch: &str| DownloadIdentity {
+            base_viewing_revision: "9".into(),
+            viewing_epoch: Some(epoch.into()),
+            ..restored_event(0, download, epoch, 0).media
+        };
+        // "b" was not re-pinned to the current history: its event is dropped.
+        let resolved = reapply(
+            2,
+            Some("s:old"),
+            &log,
+            &[pin("a", "s:new"), pin("b", "s:old")],
+            "s:new",
+        )
+        .unwrap();
+        assert_eq!((resolved.base, resolved.dropped), (5, 1));
+        assert_eq!(
+            resolved.events[0], log[3],
+            "retained events are never renumbered"
+        );
+        let reapplied: Vec<_> = resolved.events[1..]
+            .iter()
+            .map(|e| {
+                (
+                    e.device_sequence.as_str(),
+                    e.event_id.as_str(),
+                    e.position_ms,
+                    e.media.base_viewing_revision.as_str(),
+                    e.media.viewing_epoch.as_deref(),
+                    e.device_time.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reapplied,
+            [
+                ("7", "reapplied-7", 10, "9", Some("s:new"), Some("t3")),
+                ("8", "reapplied-8", 30, "9", Some("s:new"), Some("t5")),
+            ]
+        );
+        // The result is a valid log for its own pins.
+        for (i, e) in resolved.events.iter().enumerate() {
+            assert_eq!(
+                admit(
+                    resolved.base,
+                    &resolved.events[..i],
+                    e,
+                    &e.scope,
+                    &e.media,
+                    100,
+                    10
+                ),
+                Admission::Append
+            );
+        }
+    }
 
     #[test]
     fn a_compaction_point_of_another_history_is_reanchored() {

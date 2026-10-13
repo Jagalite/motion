@@ -13,6 +13,7 @@ form.addEventListener('submit', async event => {
   try {
     const result = await window.motionHost.connect(request);
     show(`Connected to ${result.serverId}. Closing this window leaves the server running.`);
+    void listRestoreChoices();
   } catch (error) { show(error.message, true); }
   finally { button.disabled = false; }
 });
@@ -24,7 +25,36 @@ document.getElementById('disconnect').addEventListener('click', async event => {
   finally { button.disabled = false; }
 });
 
-window.motionHost.onStatus(message => show(message, true));
+window.motionHost.onStatus(message => { show(message, true); void listRestoreChoices(); });
+
+// Offline progress recorded before a server restore waits for the person's
+// explicit choice per profile (text is set with textContent, never markup).
+const restorePanel = document.getElementById('offline-restore');
+const restoreList = document.getElementById('offline-restore-list');
+async function listRestoreChoices() {
+  if (!restorePanel || !window.motionHost.offlineRestore) return;
+  try {
+    const choices = await window.motionHost.offlineRestore();
+    restoreList.replaceChildren(...choices.map(choice => {
+      const item = document.createElement('li');
+      const text = document.createElement('span');
+      text.textContent = `Profile ${choice.profile_id}: ${choice.events} saved positions for ${choice.titles} titles `;
+      const button = (label, value) => Object.assign(document.createElement('button'), {type: 'button', textContent: label,
+        onclick: async () => {
+          for (const b of item.querySelectorAll('button')) b.disabled = true;
+          try {
+            const outcome = await window.motionHost.chooseOfflineRestore(choice.root, value);
+            show(value === 'discard' ? `Discarded ${outcome.discarded} saved positions.`
+              : `Kept ${outcome.reapplied} saved positions${outcome.dropped ? `; ${outcome.dropped} belonged to titles no longer available` : ''}. They are sent with the next synchronization.`);
+          } catch (error) { show(error.message, true); }
+          await listRestoreChoices();
+        }});
+      item.append(text, button('Keep my offline progress', 'reapply'), ' ', button('Discard it', 'discard'));
+      return item;
+    }));
+    restorePanel.hidden = choices.length === 0;
+  } catch { restorePanel.hidden = true; }
+}
 
 // Several servers or profiles may have saved titles here: offer a choice
 // (labels are built with textContent, never markup). The list is re-read

@@ -605,3 +605,77 @@ fn a_compaction_point_of_an_earlier_history_is_reanchored() {
     });
     assert_eq!(store.pending_reanchor().unwrap(), None);
 }
+
+/// Progress recorded before a server restore is re-applied onto the
+/// downloads' current pins or discarded, by the person's choice, in one
+/// durable write; the next batch then re-anchors past the old events.
+#[test]
+fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
+    use motion_ui_host::store::{RestoreChoice, RestoreOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"choice media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    // The manifest pin is already the restored history ("server:restore").
+    let mut before = entry("d1", media).identity;
+    before.viewing_epoch = Some("server:before".into());
+    before.base_viewing_revision = "4".into();
+    let log = EventLog {
+        base_sequence: 2,
+        events: vec![event(&before, 3), event(&before, 4)],
+        base_viewing_epoch: Some("server:before".into()),
+    };
+    let write = |log: &EventLog| {
+        std::fs::write(root.join("events.json"), serde_json::to_vec(log).unwrap()).unwrap();
+    };
+    write(&log);
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Discard, "bad")
+            .is_err()
+    );
+    let kept = store
+        .resolve_restore(RestoreChoice::Reapply, "server:restore")
+        .unwrap();
+    assert_eq!(
+        kept,
+        RestoreOutcome {
+            reapplied: 2,
+            ..Default::default()
+        }
+    );
+    let after = store.events().unwrap();
+    assert_eq!(after.base_sequence, 4);
+    let pin = entry("d1", media).identity;
+    assert_eq!(
+        after
+            .events
+            .iter()
+            .map(|e| (e.device_sequence.as_str(), e.position_ms, &e.media))
+            .collect::<Vec<_>>(),
+        [("5", 3_000, &pin), ("6", 4_000, &pin)]
+    );
+    assert_eq!(
+        store.pending_reanchor().unwrap().map(|r| r.through),
+        Some(4)
+    );
+    // Nothing earlier is left: a second choice changes nothing.
+    assert_eq!(
+        store
+            .resolve_restore(RestoreChoice::Discard, "server:restore")
+            .unwrap(),
+        RestoreOutcome::default()
+    );
+    // Discarding instead drops them; the host still opens the log.
+    write(&log);
+    let dropped = store
+        .resolve_restore(RestoreChoice::Discard, "server:restore")
+        .unwrap();
+    assert_eq!(dropped.discarded, 2);
+    let after = store.events().unwrap();
+    assert_eq!((after.base_sequence, after.events.len()), (4, 0));
+    drop(store);
+    Cache::open(&root).unwrap();
+}
