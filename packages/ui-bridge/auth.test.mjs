@@ -39,6 +39,12 @@ function harness(fetch = async () => ({ok: true, status: 204}), extra = {}) {
 const response = (status, data) => ({ok: status >= 200 && status < 300, status, json: async () => data});
 const plain = value => JSON.parse(JSON.stringify(value));
 
+test('last administrator protection explains recovery rather than suggesting stale-data retry', () => {
+  const client = harness();
+  assert.match(client.errorMessage({status: 409, code: 'last_administrator'}), /another usable administrator/);
+  assert.match(client.errorMessage({status: 412, code: 'revision_conflict'}), /Refresh this section/);
+});
+
 test('writes use same-origin credentials, CSRF, explicit revision/proof and reject redirects', async () => {
   const calls = [];
   const client = harness(async (path, options) => { calls.push({path, options}); return response(200, {ok: true}); });

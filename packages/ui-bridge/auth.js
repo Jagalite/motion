@@ -133,6 +133,7 @@ function errorMessage(error) {
   if (error.code === 'code_attempts_exhausted') return 'This code has reached its attempt limit. Start a new email request.';
   if (['signin_expired', 'signin_already_used'].includes(error.code)) return 'This sign-in request expired or was already used. Start a new request.';
   if (error.code === 'last_signin_method') return 'Keep another usable sign-in method before removing this one, or arrange recovery with the local operator.';
+  if (error.code === 'last_administrator') return 'Keep another usable administrator before disabling or removing this access. Set up and verify another administrator first.';
   if ([409, 412, 428].includes(error.status)) return 'This information changed or the request expired. Refresh this section, review the current values, and submit a new request.';
   if (error.status === 401) return 'Your session ended. Sign in again to continue.';
   if (error.status === 403) return 'Your current access does not allow this action.';
@@ -418,7 +419,8 @@ async function methodsSection(parent) {
     const enabled = checkbox(input.fields, 'Enable email sign-in', email.enabled);
     const disableConfirmed = checkbox(input.fields, 'If disabling email, I confirm cancellation of pending email sign-ins and revocation of email-authenticated sessions.');
     const testForm = form(area, 'Send test email to this address', async () => {
-      await mutation(area, 'POST', '/admin/auth/email/test', {address: destination.value.trim()}, {action: 'email.test', target: 'email', done: () => { announce(testForm.output, 'The test email was accepted by the configured server. Check the displayed destination mailbox.'); }});
+      const address = destination.value.trim();
+      await mutation(area, 'POST', '/admin/auth/email/test', {address}, {action: 'email.test', target: 'email', done: async () => { await reload(); announce(status(body), `The test email to ${address} was accepted by the configured server. Check that destination mailbox.`); }});
     });
     const destination = field(testForm.fields, 'Explicit test email destination', '', 'email', {required: true, autocomplete: 'off'});
   };
