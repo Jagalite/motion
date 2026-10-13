@@ -90,7 +90,7 @@ Nothing is silently substituted. Each refusal has a stable code.
 | Offline-mode removal | Removal happens on the next online pass, after a server cancel. There is no remove button in the offline host. |
 | Choosing between several cache roots offline | The desktop opens the most recently synchronized root (`current.json`). Other accounts, profiles and servers keep separate roots but have no picker yet. |
 | Restored or replaced server | Fenced. Every download pins the manifest's `viewing_epoch` (`server_id:restore_epoch`, read in the same snapshot as the base), and every sync sends it as `X-Motion-Viewing-Epoch`. A mismatch answers 409 `viewing_epoch_changed` before anything is consumed or applied. The device keeps its events, and the agent reports it. An explicit recovery flow (re-basing or discarding retained events after a restore) is not implemented (relates to C08). |
-| Server-side retention of `offline_events` | Unbounded per device and profile. Compaction or retention policy is deferred. |
+| Server-side retention of `offline_events` | Bounded since completion item 1: each sync reports the device's compaction point (`acknowledged_through`); the server prunes through it and refuses stale copies below the floor (`sequence_acknowledged`). Agents that never report are held to 10,000 unacknowledged events (`acknowledgement_required`). |
 | Windows | The inherited-pipe host transport is Unix-only (unchanged). |
 
 ## 4. Focused checks
@@ -247,11 +247,12 @@ not fixed in this PR:
 
 | # | Finding | Disposition |
 |---|---|---|
-| S30 (P2) | After `downloads:manage` is lost, retained offline events are no longer sent, although `viewing:write` would still allow it | Open follow-up. Events are kept, not lost; they reconcile once the permission returns. Fix: reconcile independently of the download-list 403. |
-| S31 (P2) | After withdrawal, a blob orphaned by an earlier crash is not collected and still counts against the quota | Open follow-up. Fix: run `cache collect` after `withdraw()` removes owned copies. |
+| S30 (P2) | After `downloads:manage` is lost, retained offline events are no longer sent, although `viewing:write` would still allow it | Fixed in completion item 1 ([completion ledger](../completion/README.md)): on a download-list 403 the agent reconciles every owned root first, independently, then withdraws. |
+| S31 (P2) | After withdrawal, a blob orphaned by an earlier crash is not collected and still counts against the quota | Fixed in completion item 1: `withdraw()` runs `cache collect` on each owned root after removing its copies. |
 
 Across rounds 1–11, Sol raised 31 findings (2 P1, 29 P2). Both P1s and 27 of
-the P2s are fixed; S30 and S31 remain open.
+the P2s were fixed in this lane; S30 and S31 were fixed afterwards in
+completion item 1.
 
 ## 8. Deferred release checks
 
@@ -263,5 +264,4 @@ the P2s are fixed; S30 and S31 remain open.
 | Physical out-of-space during publication | Volume with free space smaller than the media plus 1 GiB headroom | A13 |
 | Multiple accounts, profiles and servers on one device with an offline root picker | Two servers × two profiles, one download each | A11/A12 (picker UI) with A13 |
 | Restored or replaced server **recovery flow** (the fence itself is implemented and tested) | Backup taken before an offline session, restored after it; device reconnects and the user chooses to discard or re-base | A02/A07 (C08) with A13 |
-| Server retention of `offline_events` | 10,000+ events per device and profile | A13 with A02 |
 | Device transfer-state reporting (`transferring`, `verified_local`, `failed`) | Requires a new contract operation | A00 (contract) with A13 |

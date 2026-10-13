@@ -99,10 +99,19 @@ pub struct Acknowledgement {
 }
 
 /// Whether a sync result (`outcome`, `code`) consumed its event's sequence.
-/// Every outcome does except the two rejections the server records nothing for.
+/// Every outcome does except the rejections the server records nothing for.
 pub fn consumed(outcome: &str, code: Option<&str>) -> bool {
     matches!(outcome, "applied" | "history_only" | "duplicate")
-        || (outcome == "rejected" && !matches!(code, Some("sequence_gap" | "event_conflict")))
+        || (outcome == "rejected"
+            && !matches!(
+                code,
+                Some(
+                    "sequence_gap"
+                        | "event_conflict"
+                        | "sequence_acknowledged"
+                        | "acknowledgement_required"
+                )
+            ))
 }
 
 /// The highest sequence that may be compacted after a sync: the leading run
@@ -372,5 +381,22 @@ mod tests {
             admit(base, &empty, &fresh, &fresh.scope, &fresh.media, 200, 5),
             Admission::Append
         );
+    }
+
+    #[test]
+    fn only_refusals_the_server_records_nothing_for_are_unconsumed() {
+        for code in [
+            "sequence_gap",
+            "event_conflict",
+            "sequence_acknowledged",
+            "acknowledgement_required",
+        ] {
+            assert!(!consumed("rejected", Some(code)), "{code}");
+        }
+        for code in ["not_found", "invalid_event", "invalid_position"] {
+            assert!(consumed("rejected", Some(code)), "{code}");
+        }
+        assert!(consumed("duplicate", Some("applied")));
+        assert!(consumed("history_only", Some("viewing_newer")));
     }
 }

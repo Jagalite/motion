@@ -358,6 +358,14 @@ pub enum Decision {
     Conflict,
     /// Not the next consecutive sequence. Not consumed.
     SequenceGap,
+    /// The sequence is at or below the retention floor: the device reported
+    /// that it compacted its log through it, so this is a stale copy (for
+    /// example a restored device backup). Not consumed.
+    Acknowledged,
+    /// The server already retains `Retention::limit` consumed events the
+    /// device has not acknowledged. Not consumed; the device must report its
+    /// compaction before more events are accepted.
+    RetentionFull,
     /// The sequence is consumed and `recorded` is stored with it.
     Consumed {
         recorded: Recorded,
@@ -369,12 +377,100 @@ pub enum Decision {
     },
 }
 
+/// At most this many consumed events are retained per device and profile
+/// before the device acknowledges its compaction.
+pub const MAX_RETAINED_EVENTS: u64 = 10_000;
+
+/// Server retention of consumed offline events for one device and profile.
+/// Every event at or below `pruned_through` has been deleted; every consumed
+/// event above it is retained for exact-retry deduplication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Retention {
+    pub pruned_through: u64,
+    pub limit: u64,
+}
+
+impl Retention {
+    pub fn server(pruned_through: u64) -> Self {
+        Self {
+            pruned_through,
+            limit: MAX_RETAINED_EVENTS,
+        }
+    }
+}
+
+/// The device reported a compaction beyond what the server consumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcknowledgementAhead;
+
+/// The retention floor after a sync request. `acknowledged` is the device's
+/// own compaction point: it never resends an event at or below it, so the
+/// server may delete those records without weakening exact-retry
+/// deduplication. The floor never moves backward, and never past what the
+/// server consumed (`next_sequence - 1`); a report beyond that is refused.
+/// Without a report (an older agent) nothing is pruned.
+pub fn retain(
+    next_sequence: u64,
+    retention: Retention,
+    acknowledged: Option<u64>,
+) -> Result<Retention, AcknowledgementAhead> {
+    let Some(acknowledged) = acknowledged else {
+        return Ok(retention);
+    };
+    if acknowledged >= next_sequence.max(1) {
+        return Err(AcknowledgementAhead);
+    }
+    Ok(Retention {
+        pruned_through: retention.pruned_through.max(acknowledged),
+        ..retention
+    })
+}
+
+/// Decide one offline event under the server's retention floor. A recorded
+/// event above the floor is still an exact duplicate or a conflict; an
+/// unrecorded sequence at or below it is a stale copy and is refused; a new
+/// event is refused while the retained, unacknowledged records fill the limit.
+/// Otherwise see [`decide`].
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile(
+    retention: Retention,
+    next_sequence: u64,
+    prior: &[Recorded],
+    event: &OfflineEvent,
+    target: Option<&Target>,
+    view: &View,
+    lineage: Option<&Lineage>,
+    completion_percent: f64,
+) -> Decision {
+    let recorded = prior
+        .iter()
+        .any(|p| p.event.sequence == event.sequence || p.event.id == event.id);
+    if !recorded {
+        if event.sequence <= retention.pruned_through {
+            return Decision::Acknowledged;
+        }
+        let retained = next_sequence.saturating_sub(1 + retention.pruned_through);
+        if event.sequence == next_sequence && retained >= retention.limit {
+            return Decision::RetentionFull;
+        }
+    }
+    decide(
+        next_sequence,
+        prior,
+        event,
+        target,
+        view,
+        lineage,
+        completion_percent,
+    )
+}
+
 /// Decide one offline event. `next_sequence` is the next unconsumed device
 /// sequence for this device and profile, `prior` any recorded event sharing
 /// the incoming sequence or identity, `target` the timeline when the profile
 /// is usable and the timeline readable now, and `lineage` this device's
 /// chain on the profile and timeline.
-pub fn reconcile(
+fn decide(
     next_sequence: u64,
     prior: &[Recorded],
     event: &OfflineEvent,
@@ -618,7 +714,7 @@ mod tests {
             view: Some(next),
             fenced,
             lineage: Some(lineage),
-        } = reconcile(1, &[], &offline(1, 5_000), Some(&TARGET), &view, None, 90.0)
+        } = decide(1, &[], &offline(1, 5_000), Some(&TARGET), &view, None, 90.0)
         else {
             panic!()
         };
@@ -633,7 +729,7 @@ mod tests {
             view: Some(after),
             lineage: Some(l2),
             ..
-        } = reconcile(
+        } = decide(
             2,
             &[],
             &offline(2, 95_000),
@@ -650,7 +746,7 @@ mod tests {
         // A newer online revision breaks the chain: history only.
         let mut newer = after.clone();
         newer.revision = 7;
-        let Decision::Consumed { recorded, view, .. } = reconcile(
+        let Decision::Consumed { recorded, view, .. } = decide(
             3,
             &[],
             &offline(3, 2_000),
@@ -670,7 +766,7 @@ mod tests {
             manual_epoch: 1,
             ..view_at(4)
         };
-        let Decision::Consumed { recorded, .. } = reconcile(
+        let Decision::Consumed { recorded, .. } = decide(
             1,
             &[],
             &offline(1, 2_000),
@@ -695,12 +791,12 @@ mod tests {
     fn sequences_are_consumed_once_and_retries_are_exact() {
         let view = view_at(4);
         let Decision::Consumed { recorded, .. } =
-            reconcile(1, &[], &offline(1, 10), Some(&TARGET), &view, None, 90.0)
+            decide(1, &[], &offline(1, 10), Some(&TARGET), &view, None, 90.0)
         else {
             panic!()
         };
         assert_eq!(
-            reconcile(
+            decide(
                 2,
                 std::slice::from_ref(&recorded),
                 &offline(1, 10),
@@ -712,7 +808,7 @@ mod tests {
             Decision::Duplicate(recorded.clone())
         );
         assert_eq!(
-            reconcile(
+            decide(
                 2,
                 std::slice::from_ref(&recorded),
                 &offline(1, 11),
@@ -724,7 +820,7 @@ mod tests {
             Decision::Conflict
         );
         assert_eq!(
-            reconcile(2, &[], &offline(3, 10), Some(&TARGET), &view, None, 90.0),
+            decide(2, &[], &offline(3, 10), Some(&TARGET), &view, None, 90.0),
             Decision::SequenceGap
         );
         // Unusable targets and invalid positions still consume the sequence.
@@ -732,7 +828,7 @@ mod tests {
             (None, 10, Code::NotFound),
             (Some(&TARGET), 200_000, Code::InvalidPosition),
         ] {
-            let Decision::Consumed { recorded, view, .. } = reconcile(
+            let Decision::Consumed { recorded, view, .. } = decide(
                 2,
                 &[],
                 &offline(2, position),
@@ -752,7 +848,7 @@ mod tests {
             timeline_revision: 2,
             ..TARGET
         };
-        let Decision::Consumed { recorded, .. } = reconcile(
+        let Decision::Consumed { recorded, .. } = decide(
             2,
             &[],
             &offline(2, 10),
@@ -764,5 +860,108 @@ mod tests {
             panic!()
         };
         assert_eq!(recorded.code, Some(Code::TimelineChanged));
+    }
+
+    #[test]
+    fn retention_follows_the_devices_acknowledged_compaction() {
+        let floor = Retention::server(3);
+        // No report: an older agent; nothing is pruned.
+        assert_eq!(retain(10, floor, None), Ok(floor));
+        // Never backward, never past what was consumed.
+        assert_eq!(retain(10, floor, Some(1)), Ok(floor));
+        assert_eq!(retain(10, floor, Some(9)).unwrap().pruned_through, 9);
+        assert_eq!(retain(10, floor, Some(10)), Err(AcknowledgementAhead));
+        assert_eq!(
+            retain(1, Retention::server(0), Some(0)),
+            Ok(Retention::server(0))
+        );
+        assert_eq!(
+            retain(1, Retention::server(0), Some(1)),
+            Err(AcknowledgementAhead)
+        );
+    }
+
+    #[test]
+    fn pruned_sequences_refuse_stale_copies_and_the_limit_bounds_retention() {
+        let view = view_at(4);
+        let tight = Retention {
+            pruned_through: 2,
+            limit: 2,
+        };
+        // A stale copy of a pruned event consumes nothing.
+        assert_eq!(
+            reconcile(
+                tight,
+                5,
+                &[],
+                &offline(2, 10),
+                Some(&TARGET),
+                &view,
+                None,
+                90.0
+            ),
+            Decision::Acknowledged
+        );
+        // 3 and 4 are retained and unacknowledged: the next new event waits.
+        assert_eq!(
+            reconcile(
+                tight,
+                5,
+                &[],
+                &offline(5, 10),
+                Some(&TARGET),
+                &view,
+                None,
+                90.0
+            ),
+            Decision::RetentionFull
+        );
+        // An exact retry of a retained event is still a duplicate.
+        let Decision::Consumed { recorded, .. } =
+            decide(4, &[], &offline(4, 10), Some(&TARGET), &view, None, 90.0)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            reconcile(
+                tight,
+                5,
+                std::slice::from_ref(&recorded),
+                &offline(4, 10),
+                Some(&TARGET),
+                &view,
+                None,
+                90.0
+            ),
+            Decision::Duplicate(recorded)
+        );
+        // Below the limit the next event is decided normally; a gap is a gap.
+        let room = Retention { limit: 3, ..tight };
+        assert!(matches!(
+            reconcile(
+                room,
+                5,
+                &[],
+                &offline(5, 10),
+                Some(&TARGET),
+                &view,
+                None,
+                90.0
+            ),
+            Decision::Consumed { .. }
+        ));
+        assert_eq!(
+            reconcile(
+                room,
+                5,
+                &[],
+                &offline(7, 10),
+                Some(&TARGET),
+                &view,
+                None,
+                90.0
+            ),
+            Decision::SequenceGap
+        );
     }
 }

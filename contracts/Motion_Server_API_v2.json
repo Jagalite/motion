@@ -19099,6 +19099,17 @@
               "$ref": "#/components/schemas/OfflineEvent"
             },
             "maxItems": 200
+          },
+          "acknowledged_through": {
+            "description": "The device sequence through which this device has compacted its own log after earlier results; it never resends those events. The server deletes its records through this sequence and refuses a later unrecorded event at or below it as sequence_acknowledged. It must not exceed the sequences the server consumed (acknowledgement_ahead). Without it nothing is pruned, and at most 10,000 unacknowledged consumed events are retained per device and profile; further new events are refused as acknowledgement_required.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Revision"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -19108,7 +19119,7 @@
       },
       "OfflineEventResult": {
         "type": "object",
-        "description": "applied and history_only (with the reason code) and rejected events other than sequence_gap and event_conflict consume their device sequence; duplicate reports an exact retry and its original outcome in code. sequence_gap and event_conflict consume nothing.",
+        "description": "applied and history_only (with the reason code) and rejected events other than sequence_gap, event_conflict, sequence_acknowledged and acknowledgement_required consume their device sequence; duplicate reports an exact retry and its original outcome in code. Those four rejections consume nothing.",
         "additionalProperties": false,
         "properties": {
           "event_id": {

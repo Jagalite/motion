@@ -46,7 +46,7 @@ function fakeCache() {
         // Mirrors offline::acknowledged_through: the leading run confirmed by identity.
         const {results, next_device_sequence: next} = JSON.parse(input);
         const consumed = r => ['applied', 'history_only', 'duplicate'].includes(r.outcome)
-          || (r.outcome === 'rejected' && !['sequence_gap', 'event_conflict'].includes(r.code));
+          || (r.outcome === 'rejected' && !['sequence_gap', 'event_conflict', 'sequence_acknowledged', 'acknowledgement_required'].includes(r.code));
         let through = s.base;
         for (const [i, e] of s.events.entries()) {
           const r = results[i];
@@ -145,14 +145,16 @@ const event = (sequence, extra = {}) => ({scope: {...identity, profile_id: 'defa
 function syncAgent(fake, statuses, reply) {
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   const sent = [];
+  const acks = [];
   const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
     fetchMedia: async () => assert.fail('no transfer'),
     api: async (path, init) => {
       assert.equal(path, '/api/v2/offline/sync');
       sent.push([init.headers['X-Motion-Viewing-Epoch'], init.body.events.map(e => e.device_sequence)]);
+      acks.push(init.body.acknowledged_through);
       return reply(init.body.events);
     }});
-  return {agent, sent};
+  return {agent, sent, acks};
 }
 
 test('reconciliation compacts only events the server confirmed by identity', async () => {
@@ -170,6 +172,29 @@ test('reconciliation compacts only events the server confirmed by identity', asy
   assert.match(statuses[0], /event_conflict/);
   assert.equal(wireEvent(event(2)).device_time, '1970-01-01T00:00:00Z');
   assert.equal(wireEvent(event(1, {device_time: 'x'})).device_time, 'x');
+});
+
+test('every batch reports the log\'s compaction point, and a stale-copy refusal erases nothing', async () => {
+  const fake = fakeCache();
+  const statuses = [];
+  let round = 0;
+  const {agent, sent, acks} = syncAgent(fake, statuses, events => (++round === 1
+    ? {results: events.slice(0, 1).map(e => ({event_id: e.event_id, outcome: 'applied', code: null})), next_device_sequence: '2'}
+    : {results: events.map(e => ({event_id: e.event_id, outcome: 'rejected', code: 'acknowledgement_required'})), next_device_sequence: '2'}));
+  const target = agent.root('default');
+  fake.state(target.path).events = [event(1), event(2)];
+  assert.equal(await agent.reconcile(target), false);
+  assert.deepEqual(sent.map(s => s[1]), [['1', '2'], ['2']]);
+  assert.deepEqual(acks, ['0', '1'], 'the second batch reports the compaction of the first');
+  assert.deepEqual(fake.state(target.path).events.map(e => e.event_id), ['e2']);
+  assert.match(statuses.at(-1), /acknowledgement_required/);
+  const stale = fakeCache();
+  const second = syncAgent(stale, [], events => ({results: events.map(e => ({event_id: e.event_id, outcome: 'rejected', code: 'sequence_acknowledged'})),
+    next_device_sequence: '9'}));
+  const root2 = second.agent.root('default');
+  stale.state(root2.path).events = [event(1)];
+  assert.equal(await second.agent.reconcile(root2), false);
+  assert.equal(stale.state(root2.path).events.length, 1);
 });
 
 test('a conflict on the first event erases nothing', async () => {
@@ -317,8 +342,62 @@ test('losing downloads:manage withdraws every owned copy but keeps offline progr
   fake.state(target.path).events = [event(1)];
   await agent.pass();
   assert.equal(fake.state(target.path).downloads.length, 0);
-  assert.equal(fake.state(target.path).events.length, 1);
-  assert.match(statuses[0], /removed from this device/);
+  assert.equal(fake.state(target.path).events.length, 1, 'a refused sync (no viewing:write either) keeps the events');
+  assert.ok(!fake.calls.some(c => c[1] === 'acknowledge'));
+  assert.match(statuses.at(-1), /removed from this device/);
+});
+
+test('without downloads:manage, viewing:write still reconciles retained events by exact identity', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const sent = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: () => {},
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init) => {
+      if (path === '/api/v2/offline/sync') {
+        sent.push([init.headers['X-Motion-Viewing-Epoch'], init.body.events.map(e => e.event_id)]);
+        // A lost response: the first answer never arrives; the retry is a duplicate.
+        if (sent.length === 1) throw Object.assign(new Error('connection reset'), {code: 'ECONNRESET'});
+        return {results: init.body.events.map(e => ({event_id: e.event_id, outcome: sent.length === 2 ? 'duplicate' : 'applied', code: 'applied'})),
+          next_device_sequence: String(Number(init.body.events.at(-1).device_sequence) + 1)};
+      }
+      if (path.startsWith('/api/v2/downloads')) throw Object.assign(new Error('forbidden'), {status: 403, code: 'forbidden'});
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  fake.state(target.path).downloads.push({identity: {download_id: 'd1'}});
+  fake.state(target.path).events = [event(1), event(2)];
+  await agent.pass();
+  assert.equal(fake.state(target.path).events.length, 2, 'nothing is compacted without a response');
+  assert.equal(fake.state(target.path).downloads.length, 0, 'a failed sync never blocks withdrawal');
+  await agent.pass();
+  assert.deepEqual(sent, [['server:r1', ['e1', 'e2']], ['server:r1', ['e1', 'e2']]], 'the retry resends the same events and history');
+  assert.equal(fake.state(target.path).events.length, 0);
+  assert.equal(fake.state(target.path).base, 2);
+});
+
+test('withdrawal collects crash leftovers on owned roots only', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: () => {},
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async () => { throw Object.assign(new Error('forbidden'), {status: 403, code: 'forbidden'}); }});
+  const target = agent.root('default');
+  const other = createDownloadAgent({base, identity: {...identity, server_id: 'other'}, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail(), api: async () => assert.fail()}).root('default');
+  for (const root of [target, other]) {
+    mkdirSync(root.path, {recursive: true});
+    writeFileSync(join(root.path, 'manifest.json'), '{}');
+  }
+  fake.state(other.path).downloads.push({identity: {download_id: 'x1'}, size: 5});
+  await agent.pass();
+  const collected = fake.calls.filter(c => c[1] === 'collect').map(c => c[0]);
+  assert.deepEqual(collected, [target.path], 'only the withdrawn root is collected');
+  const removeThenCollect = fake.calls.filter(c => c[0] === target.path).map(c => c[1]);
+  assert.deepEqual(removeThenCollect.slice(-2), ['status', 'collect']);
+  assert.equal(fake.state(other.path).downloads.length, 1, 'another server\'s copy is untouched');
 });
 
 test('long titles are shortened to the cache bound on a character boundary', () => {

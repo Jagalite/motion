@@ -844,6 +844,139 @@ async fn offline_sync_consumes_sequences_once_and_never_overwrites_newer_authori
 }
 
 #[tokio::test]
+async fn offline_event_retention_follows_the_devices_acknowledgement() {
+    let mut f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"retained film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let history = format!("{server}:{restore}");
+    let base = ("0", "0");
+    // Macros, not closures: the fixture is reopened in between.
+    macro_rules! sync {
+        ($events:expr, $acknowledged:expr) => {
+            retention_sync(&f, &device, &auth, &history, $events, $acknowledged).await
+        };
+    }
+    macro_rules! retained {
+        () => {
+            (
+                retention_value(&f, &device, "count(*)", "offline_events").await,
+                retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+            )
+        };
+    }
+
+    // An older agent reports nothing: every consumed event is retained.
+    let first = vec![
+        event(1, &timeline, base, 10_000, "paused"),
+        event(2, &timeline, base, 20_000, "paused"),
+    ];
+    let reply = sync!(first.clone(), Value::Null);
+    assert_eq!(outcomes(&reply).len(), 2);
+    assert_eq!(retained!(), (2, 0));
+
+    // The device compacted 1 and 2 and says so with its next batch.
+    let third = vec![event(3, &timeline, base, 30_000, "paused")];
+    let reply = sync!(third.clone(), json!("2"));
+    assert_eq!(reply.body["next_device_sequence"], "4");
+    assert_eq!(retained!(), (1, 2));
+    // Its response was lost: the retry with the same report is a duplicate.
+    let retry = sync!(third.clone(), json!("2"));
+    assert_eq!(outcomes(&retry)[0].0, "duplicate");
+    assert_eq!(retry.body["next_device_sequence"], "4");
+
+    // The floor and records survive a restart (a reopened database).
+    f.app.db.close().await;
+    f.app.db = db::connect(&f.dir.path().join("db.sqlite")).await.unwrap();
+    assert_eq!(retained!(), (1, 2));
+
+    // A stale copy of the device resends a pruned event: refused, nothing
+    // consumed, and an older report never moves the floor back.
+    let stale = sync!(first[..1].to_vec(), json!("0"));
+    assert_eq!(
+        outcomes(&stale),
+        vec![("rejected".into(), json!("sequence_acknowledged"))]
+    );
+    assert_eq!(stale.body["next_device_sequence"], "4");
+    assert_eq!(retained!(), (1, 2));
+
+    // A report beyond what was consumed, or a malformed one, is refused
+    // before anything is pruned or consumed.
+    let fourth = vec![event(4, &timeline, base, 40_000, "paused")];
+    problem(
+        &sync!(fourth.clone(), json!("4")),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "acknowledgement_ahead",
+    );
+    problem(
+        &sync!(fourth.clone(), json!("x")),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_acknowledgement",
+    );
+    // A batch refused for an unusable profile prunes nothing either.
+    let mut kids = fourth[0].clone();
+    kids["profile_id"] = json!("kids");
+    problem(
+        &sync!(vec![kids], json!("3")),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    assert_eq!(retained!(), (1, 2));
+
+    // The bound: with 10,000 consumed events unacknowledged, a new event
+    // waits (not consumed) until the device reports its compaction.
+    let limit = playscale_core::downloads::MAX_RETAINED_EVENTS as i64;
+    sqlx::query("UPDATE offline_sequences SET next_sequence=? WHERE device_id=?")
+        .bind(2 + limit + 1)
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let next = (2 + limit + 1) as u64;
+    let waiting = vec![event(next, &timeline, base, 50_000, "paused")];
+    let full = sync!(waiting.clone(), json!("2"));
+    assert_eq!(
+        outcomes(&full),
+        vec![("rejected".into(), json!("acknowledgement_required"))]
+    );
+    assert_eq!(full.body["next_device_sequence"], next.to_string());
+    let accepted = sync!(waiting, json!((next - 1).to_string()));
+    assert_ne!(outcomes(&accepted)[0].0, "rejected");
+    assert_eq!(
+        accepted.body["next_device_sequence"],
+        (next + 1).to_string()
+    );
+    assert_eq!(retained!(), (1, next as i64 - 1));
+}
+
+async fn retention_sync(
+    f: &Fixture,
+    device: &str,
+    auth: &str,
+    history: &str,
+    events: Vec<Value>,
+    acknowledged: Value,
+) -> Reply {
+    let body = json!({"device_id":device,"events":events,"acknowledged_through":acknowledged});
+    f.call(
+        "POST",
+        "/api/v2/offline/sync",
+        Some(body),
+        &[("authorization", auth), ("x-motion-viewing-epoch", history)],
+    )
+    .await
+}
+
+async fn retention_value(f: &Fixture, device: &str, column: &str, table: &str) -> i64 {
+    f.count(&format!(
+        "SELECT {column} FROM {table} WHERE device_id='{device}'"
+    ))
+    .await
+}
+
+#[tokio::test]
 async fn reconciliation_uses_the_downloads_effective_duration() {
     let f = Fixture::new().await;
     let (timeline, file, _) = f.scanned("film.mp4", b"probed only").await;

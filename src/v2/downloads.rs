@@ -722,6 +722,9 @@ pub struct WireEvent {
 pub struct SyncInput {
     device_id: String,
     events: Vec<WireEvent>,
+    /// The device's own compaction point; see `core::retain`.
+    #[serde(default)]
+    acknowledged_through: Option<String>,
 }
 
 const MAX_BATCH: usize = 200;
@@ -924,6 +927,15 @@ pub async fn sync(
         .map(parse)
         .collect::<Option<_>>()
         .ok_or_else(|| Problem::invalid("invalid_event", "An offline event is malformed"))?;
+    let acknowledged = match &input.acknowledged_through {
+        None => None,
+        Some(v) => Some(viewing::decimal(v).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_acknowledgement",
+                "acknowledged_through must be a decimal sequence",
+            )
+        })?),
+    };
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
@@ -937,14 +949,45 @@ pub async fn sync(
     // is unusable; events are never consumed for a profile the caller lacks.
     usable_profile(&mut tx, &principal, &profile).await?;
     let completion = viewing::completion_percent(&mut tx, &profile).await?;
-    let mut next: i64 = sqlx::query_scalar(
-        "SELECT next_sequence FROM offline_sequences WHERE device_id=? AND profile_id=?",
+    let (mut next, pruned): (i64, i64) = sqlx::query_as(
+        "SELECT next_sequence,pruned_through FROM offline_sequences WHERE device_id=? AND profile_id=?",
     )
     .bind(&device)
     .bind(&profile)
     .fetch_optional(&mut *tx)
     .await?
-    .unwrap_or(1);
+    .unwrap_or((1, 0));
+    // Records the device has compacted are never resent by it: prune them,
+    // in this transaction, before deciding the batch against the new floor.
+    let retention = core::retain(
+        next as u64,
+        core::Retention::server(pruned as u64),
+        acknowledged,
+    )
+    .map_err(|_| {
+        Problem::invalid(
+            "acknowledgement_ahead",
+            "acknowledged_through is beyond the events this server consumed",
+        )
+    })?;
+    if retention.pruned_through as i64 > pruned {
+        sqlx::query(
+            "DELETE FROM offline_events WHERE device_id=? AND profile_id=? AND sequence<=?",
+        )
+        .bind(&device)
+        .bind(&profile)
+        .bind(retention.pruned_through as i64)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE offline_sequences SET pruned_through=? WHERE device_id=? AND profile_id=?",
+        )
+        .bind(retention.pruned_through as i64)
+        .bind(&device)
+        .bind(&profile)
+        .execute(&mut *tx)
+        .await?;
+    }
     let mut results = Vec::with_capacity(events.len());
     for event in &events {
         let prior = prior(&mut tx, &device, &profile, event).await?;
@@ -952,6 +995,7 @@ pub async fn sync(
         let view = viewing::load_view(&mut tx, &profile, &event.timeline_id).await?;
         let chain = lineage(&mut tx, &device, &profile, &event.timeline_id).await?;
         let decision = core::reconcile(
+            retention,
             next as u64,
             &prior,
             event,
@@ -976,6 +1020,14 @@ pub async fn sync(
             }),
             Decision::SequenceGap => json!({
                 "event_id": event.id, "outcome": "rejected", "code": "sequence_gap",
+                "current_viewing": null,
+            }),
+            Decision::Acknowledged => json!({
+                "event_id": event.id, "outcome": "rejected", "code": "sequence_acknowledged",
+                "current_viewing": null,
+            }),
+            Decision::RetentionFull => json!({
+                "event_id": event.id, "outcome": "rejected", "code": "acknowledgement_required",
                 "current_viewing": null,
             }),
             Decision::Consumed {

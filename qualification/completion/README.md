@@ -23,7 +23,7 @@ item below is the single completion agent unless stated otherwise.
 | Item | State | PR | Next step |
 |---|---|---|---|
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
-| 1 Download correctness and retention | Not started | — | S30 agent change |
+| 1 Download correctness and retention | Implemented, tested | downloads PR | Sol review |
 | 2 Library query scaling | Not started | — | Scan history ordering |
 | 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
 | 4 Library-management UI | Not started | — | After item 2 |
@@ -54,8 +54,55 @@ item below is the single completion agent unless stated otherwise.
 
 ## 1. Download correctness and bounded storage
 
-Not started. Inputs: N3 ledger S30, S31 and the retention deferral
-([downloads-offline.md](../next-lanes/downloads-offline.md)).
+- **Source SHA:** branch `plan-completion/downloads`, stacked on the docs PR
+  (it shares this ledger). Commit recorded in the PR.
+- **Implemented:**
+  - **S30.** On a 403 from the download list the agent reconciles every owned
+    root first and independently (`reconcileOwned`), then withdraws. Sync
+    needs only `viewing:write` on the server; without it the server refuses
+    and the events stay. Restore-epoch fencing and identity-based compaction
+    are unchanged.
+  - **S31.** `withdraw()` runs `cache collect` on each owned root after removing
+    its copies. Nothing on a withdrawn root is wanted, so an unreferenced blob
+    can only be a crash leftover. Collection is per root under the cache lock;
+    another server's or principal's roots are never touched.
+  - **Retention protocol.** Each sync may carry `acknowledged_through`, the
+    device's own compaction point (its log base). Core `downloads::retain`
+    moves a per-device-and-profile floor to it: never backward, never past
+    `next_sequence - 1` (else 422 `acknowledgement_ahead`). The adapter deletes
+    records through the floor in the same `BEGIN IMMEDIATE` transaction,
+    before deciding the batch, and stores the floor (migration 0045,
+    `offline_sequences.pruned_through`). Core `downloads::reconcile` then
+    decides each event under the floor:
+    - a recorded event above it is still an exact duplicate or a conflict;
+    - an unrecorded sequence at or below it is a stale copy, refused as
+      `sequence_acknowledged` (not consumed);
+    - a new event while `MAX_RETAINED_EVENTS` (10,000) consumed events remain
+      unacknowledged is refused as `acknowledgement_required` (not consumed).
+
+    Both new refusals are non-consuming in `offline::consumed`, so the device
+    never compacts them, and the agent stops reconciling that root until the next pass. Sequence
+    identity (`next_sequence`) and causal lineage (`offline_lineage`) are never
+    pruned. A compliant agent keeps at most one batch (200) of records on the
+    server between syncs; older agents keep up to 10,000.
+- **Contract:** `OfflineSyncInput.acknowledged_through` (optional, nullable);
+  `OfflineEventResult` documents the two new non-consuming codes. Additive;
+  older agents keep working without pruning.
+- **Unsupported / limits:** event IDs are deduplicated only while their record
+  is retained. A device that reused a pruned event ID with a new sequence
+  would not be caught as a conflict; the agent generates fresh IDs.
+  Offline `history_only`/`rejected` records are pruned with the rest. No API
+  reads them, and their effect on viewing state is already applied.
+- **Core/adapter boundary:** retention floor, stale-copy refusal and the bound
+  are core decisions (`retain`, `reconcile`, `offline::consumed`). The adapter
+  observes `(next_sequence, pruned_through)`, deletes and records the floor in
+  the request transaction. The agent only forwards the cache tool's base.
+- **Focused evidence (2026-10-12, darwin-arm64, Rust 1.98, Kyoto compile then
+  direct execution):** RESULTS_PLACEHOLDER
+- **Review:** pending (GPT-6.1 Sol).
+- **Release checks:** the N3 deferred rows (installed package, large or
+  interrupted transfers, physical full disk, Electron/Demuxe on an
+  agent-published root) remain in section 8 of the handoff.
 
 ## 2. Library scalability and query support
 

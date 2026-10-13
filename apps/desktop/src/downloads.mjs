@@ -14,6 +14,8 @@ import {pipeline} from 'node:stream/promises';
 const CONTENT_TYPES = {mp4: 'video/mp4', webm: 'video/webm', m4a: 'audio/mp4', mp3: 'audio/mpeg', ogg: 'audio/ogg'};
 const UNKNOWN_DEVICE_TIME = '1970-01-01T00:00:00Z';
 const SYNC_BATCH = 200;
+// Refusals that consume nothing (playscale_core::offline::consumed).
+const NOT_CONSUMED = ['sequence_gap', 'event_conflict', 'sequence_acknowledged', 'acknowledgement_required'];
 // playscale_core::downloads::MAX_MEDIA_BYTES; the server refuses larger originals too.
 const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
 // The offline host copies a title into a private snapshot on the cache's own
@@ -115,8 +117,27 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         await cache(target.path, target.scope, ['remove', '--download-id', id]);
         removed++;
       }
+      // No demand on this root is wanted any more, so an unreferenced blob
+      // (a crash leftover) can never be recovered: release its space.
+      await cache(target.path, target.scope, ['collect']);
     }
     if (removed > 0) status('Downloads were removed from this device because it may no longer keep them. Offline progress was kept.');
+  }
+
+  /**
+   * Send every owned root's retained events. Syncing is authorized by
+   * `viewing:write` alone, so it does not depend on the download list; the
+   * server refuses it when viewing authority is gone and the events stay.
+   */
+  async function reconcileOwned() {
+    for (const target of ownedRoots()) {
+      if (signal?.aborted) return;
+      try { await reconcile(target); }
+      catch (error) {
+        if (signal?.aborted) throw error;
+        status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
+      }
+    }
   }
 
   async function listDownloads() {
@@ -241,15 +262,17 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       }
       let result;
       try {
+        // Report this log's compaction point so the server can prune what it
+        // will never be sent again (playscale_core::downloads::retain).
         result = await api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': history},
-          body: {device_id: identity.device_id, events: batch.map(wireEvent)}});
+          body: {device_id: identity.device_id, events: batch.map(wireEvent), acknowledged_through: String(log.base_sequence)}});
       } catch (error) {
         if (error.code !== 'viewing_epoch_changed') throw error;
         status('The server was restored or replaced since these were saved. Offline progress stays on this device.');
         return false;
       }
       const after = await cache(target.path, target.scope, ['acknowledge'], JSON.stringify(result));
-      const blocked = result.results.find(r => r.outcome === 'rejected' && ['sequence_gap', 'event_conflict'].includes(r.code));
+      const blocked = result.results.find(r => r.outcome === 'rejected' && NOT_CONSUMED.includes(r.code));
       if (blocked || after.base_sequence === log.base_sequence) {
         status(`Offline progress could not be reconciled (${blocked?.code ?? 'no_progress'}). It stays on this device.`);
         return false;
@@ -281,8 +304,12 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     let downloads;
     try { downloads = await listDownloads(); }
     catch (error) {
-      // A definitive authorization refusal withdraws local copies.
-      if (error.status === 403) return withdraw();
+      // A definitive refusal of the download list withdraws local copies.
+      // Offline progress is reconciled first and independently.
+      if (error.status === 403) {
+        await reconcileOwned();
+        return withdraw();
+      }
       throw error;
     }
     const profiles = new Set(downloads.map(d => d.profile_id));
