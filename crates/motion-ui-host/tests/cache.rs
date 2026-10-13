@@ -484,8 +484,9 @@ async fn a_saved_title_is_removed_from_the_offline_host() {
     assert!(!dir.path().join("blobs").read_dir().unwrap().any(|_| true));
 }
 
-/// The manifest write commits but releasing the blob fails: the host still
-/// presents exactly what was committed and the open ticket stops serving.
+/// The manifest write commits but releasing the blob fails: the removal is
+/// reported, the host presents exactly what was committed and the open
+/// ticket stops serving.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_partially_committed_removal_is_what_the_host_presents() {
@@ -514,11 +515,8 @@ async fn a_partially_committed_removal_is_what_the_host_presents() {
     )
     .await;
     std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "cleanup failed after the commit"
-    );
+    // The removal committed; only freeing the blob failed (collected later).
+    assert_eq!(status, StatusCode::OK, "the committed removal is reported");
     assert!(!cache.presents("download"));
     let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
     assert!(
@@ -535,4 +533,93 @@ async fn a_partially_committed_removal_is_what_the_host_presents() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// An earlier removal of A recorded its intent but stopped before its copy
+/// went (a crash or failed write). A is no longer presented; retrying A
+/// reports success, and removing B completes A and invalidates A's ticket.
+#[tokio::test]
+async fn interrupted_removals_are_never_presented_and_complete_later() {
+    let (dir, mut manifest) = fixture();
+    let mut second = manifest.downloads[0].clone();
+    second.identity.download_id = "second".into();
+    manifest.downloads.push(second);
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    // The intent of an interrupted removal of "download" is durable; the
+    // running host learns of it with the next removal it performs.
+    std::fs::write(dir.path().join("removals.json"), br#"["download"]"#).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/second",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!cache.presents("download") && !cache.presents("second"));
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the completed removal's ticket is gone"
+    );
+    drop(app);
+    drop(cache);
+    // A host opened over an intent whose copy is still there, and which
+    // cannot even complete it (the root is read-only, so the manifest write
+    // fails), presents nothing of it.
+    let (dir, _) = fixture();
+    std::fs::write(dir.path().join("removals.json"), br#"["download"]"#).unwrap();
+    std::fs::write(dir.path().join("events.lock"), b"").unwrap();
+    std::fs::create_dir(dir.path().join("staging")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["downloads"].as_array().unwrap().len(),
+        1,
+        "the copy is still listed"
+    );
+    assert!(!cache.presents("download"));
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
 }

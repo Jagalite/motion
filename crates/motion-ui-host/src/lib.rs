@@ -202,8 +202,10 @@ pub struct Cache {
     /// as the writer under it (`Store::open_held`).
     lock: std::fs::File,
     scope: CacheScope,
-    /// Replaced only after a removal's durable manifest write.
-    manifest: std::sync::RwLock<CacheManifest>,
+    /// What the store committed: the manifest and the pending removals,
+    /// whose titles are never presented (`offline::may_publish`). Replaced
+    /// after every removal, whatever it committed.
+    manifest: std::sync::RwLock<(CacheManifest, Vec<String>)>,
     history: Mutex<EventLog>,
 }
 pub(crate) fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -251,13 +253,13 @@ impl Cache {
             serde_json::from_slice(&bounded(directory.open("manifest.json")?, MAX_MANIFEST)?)?;
         validate_manifest(&manifest)?;
         // Complete removals a crash interrupted (`Store::open_held` replays
-        // them under the lock taken above) before presenting any title.
-        let manifest = if directory.exists("removals.json") {
-            crate::store::Store::open_held(path, &manifest.scope, lock.try_clone()?)?
-                .manifest()
-                .clone()
+        // them under the lock taken above); a title whose removal is still
+        // pending is never presented.
+        let (manifest, removals) = if directory.exists("removals.json") {
+            let store = crate::store::Store::open_held(path, &manifest.scope, lock.try_clone()?)?;
+            (store.manifest().clone(), store.removals().to_vec())
         } else {
-            manifest
+            (manifest, vec![])
         };
         let history = match directory.open("events.json") {
             Ok(file) => EventLog::parse(&bounded(file, MAX_LOG)?)?,
@@ -273,34 +275,59 @@ impl Cache {
             path: path.to_owned(),
             lock,
             scope: manifest.scope.clone(),
-            manifest: std::sync::RwLock::new(manifest),
+            manifest: std::sync::RwLock::new((manifest, removals)),
             history: Mutex::new(history),
         })
     }
     fn item(&self, id: &str) -> Option<CachedDownload> {
-        self.manifest
-            .read()
+        self.presented()
             .ok()?
+            .into_iter()
+            .find(|d| d.identity.download_id == id)
+    }
+    /// The saved titles this host presents: none with a pending removal.
+    fn presented(&self) -> anyhow::Result<Vec<CachedDownload>> {
+        let state = self
+            .manifest
+            .read()
+            .map_err(|_| anyhow::anyhow!("cache manifest failed"))?;
+        Ok(state
+            .0
             .downloads
             .iter()
-            .find(|d| d.identity.download_id == id)
+            .filter(|d| offline::may_publish(&d.identity.download_id, &state.1))
             .cloned()
+            .collect())
     }
     /// The person removes a saved title from this device while it is open
     /// for offline viewing (`Store::remove_by_person` under the lock this
     /// host holds). Its offline progress is kept; the download agent asks
     /// the server to delete the download when it next connects.
+    ///
+    /// The outcome is judged by what the host presents afterwards: the title
+    /// was presented and no longer is (its intent or manifest removal
+    /// committed, even if a later cleanup step failed, or an earlier
+    /// interrupted removal of it was completed now). Ok(false): it was not
+    /// presented.
     pub fn remove(&self, download_id: &str) -> anyhow::Result<bool> {
+        if !self.presents(download_id) {
+            return Ok(false);
+        }
         let mut store =
             crate::store::Store::open_held(&self.path, &self.scope, self.lock.try_clone()?)?;
         let removed = store.remove_by_person(download_id);
-        // Whatever the removal committed (its manifest write may succeed
-        // before a later cleanup step fails) is what the host presents.
+        // Whatever the store committed (including removals it replayed) is
+        // what the host presents.
         *self
             .manifest
             .write()
-            .map_err(|_| anyhow::anyhow!("cache manifest failed"))? = store.manifest().clone();
-        removed
+            .map_err(|_| anyhow::anyhow!("cache manifest failed"))? =
+            (store.manifest().clone(), store.removals().to_vec());
+        if self.presents(download_id) {
+            removed?;
+            anyhow::bail!("the title is still saved");
+        }
+        Ok(true)
     }
     /// Whether `download_id` is a saved title the host presents.
     pub fn presents(&self, download_id: &str) -> bool {
@@ -408,9 +435,7 @@ impl OfflinePresentationReader for Cache {
     }
     fn downloads(&self) -> BoxFuture<'_, UiResult<Vec<CachedDownload>>> {
         Box::pin(async {
-            self.manifest
-                .read()
-                .map(|m| m.downloads.clone())
+            self.presented()
                 .map_err(|_| motion_ui::facade::UiError::Unavailable)
         })
     }
@@ -638,14 +663,14 @@ async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Res
     let removed = tokio::task::spawn_blocking(move || {
         let _single = single;
         let removed = worker.cache.remove(&id);
-        if !worker.cache.presents(&id) {
-            let mut media = worker.media.lock().unwrap();
-            if media
-                .as_ref()
-                .is_some_and(|m| m.item.identity.download_id == id)
-            {
-                *media = None;
-            }
+        // Any title no longer presented (this one, or one whose interrupted
+        // removal was completed now) loses its open ticket.
+        let mut media = worker.media.lock().unwrap();
+        if media
+            .as_ref()
+            .is_some_and(|m| !worker.cache.presents(&m.item.identity.download_id))
+        {
+            *media = None;
         }
         removed
     })

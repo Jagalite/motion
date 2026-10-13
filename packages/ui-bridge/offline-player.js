@@ -12,7 +12,7 @@ async function request(path, body) {
   const response = await fetch(path, {method: body ? 'POST' : 'GET', credentials: 'same-origin', redirect: 'error', cache: 'no-store',
     headers: body ? {'Content-Type': 'application/json', 'X-Motion-Cache': '1'} : {},
     body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(path.startsWith('/cache/open/') ? 120000 : 10000)});
-  if (!response.ok) throw new Error(`Local download request failed (${response.status}). Keep this window open and retry.`);
+  if (!response.ok) throw Object.assign(new Error(`Local download request failed (${response.status}). Keep this window open and retry.`), {status: response.status});
   return response.json();
 }
 function flush() {
@@ -91,6 +91,8 @@ document.addEventListener('click', event => {
   const status = document.getElementById('offline-removal');
   button.disabled = true;
   void request(`/cache/remove/${encodeURIComponent(id)}`, {}).then(() => location.reload(), error => {
+    // Already gone (an earlier attempt completed it): show the current list.
+    if (error.status === 404) { location.reload(); return; }
     button.disabled = false;
     if (status) { status.textContent = 'This title could not be removed now. Close any title that is playing and try again.'; status.setAttribute('role', 'alert'); }
     else fail(error);

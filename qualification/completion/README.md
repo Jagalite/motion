@@ -708,6 +708,26 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   clean. R3 and R4 are ordering fixes without a deterministic
   cancellation test.
 
+  Round 2 at `40cd3f7` raised three P2 findings, all about replaying an
+  earlier interrupted removal inside a later removal call:
+  - a replay whose cleanup failed hid its committed manifest change;
+  - only the requested title's ticket was invalidated;
+  - a retry of an already-completed removal reported 404 as a failure.
+
+  All are fixed by one rule: a title with a pending removal is never
+  presented (`offline::may_publish` over the durable intents).
+  - Replay is explicit and best effort (`Store::replay_removals`) and
+    retried at every open.
+  - The host presents the committed manifest minus pending removals, and
+    judges a removal by whether the title is still presented.
+  - Every ticket of a no-longer-presented title is invalidated.
+  - The page reloads on 404 (already gone).
+  - Tests: completing A while removing B invalidates A's ticket; a host
+    whose replay cannot write (read-only root) still presents nothing of
+    the pending title; a committed removal whose blob release fails is
+    reported as removed. Cache 9, store 14 and JS 89 passed; pinned
+    clippy is clean.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

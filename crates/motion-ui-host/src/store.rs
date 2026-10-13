@@ -94,7 +94,8 @@ impl Store {
 
     /// Open the root as the writer that already holds its exclusive lock:
     /// `lock` is a handle on this root's `events.lock` whose lock the caller
-    /// (the running offline host) holds, so no other writer can run.
+    /// (the running offline host) holds, so no other writer can run. Like
+    /// `open`, it replays pending removals best effort.
     pub fn open_held(path: &Path, scope: &CacheScope, lock: std::fs::File) -> anyhow::Result<Self> {
         Self::open_with(path, scope, Some(lock))
     }
@@ -192,11 +193,19 @@ impl Store {
             removals,
         };
         // A removal whose intent is durable but whose copy a crash left in
-        // place is completed before anything reads the manifest.
-        for id in store.removals.clone() {
-            store.remove(&id)?;
-        }
+        // place is completed now, best effort: whatever fails is retried at
+        // the next open, and meanwhile the title is neither published nor
+        // presented (`offline::may_publish` over the durable intents).
+        let _ = store.replay_removals();
         Ok(store)
+    }
+
+    /// Complete every pending removal whose copy is still here.
+    pub fn replay_removals(&mut self) -> anyhow::Result<()> {
+        for id in self.removals.clone() {
+            self.remove(&id)?;
+        }
+        Ok(())
     }
 
     pub fn manifest(&self) -> &CacheManifest {
