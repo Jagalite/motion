@@ -6,7 +6,7 @@
   color-scheme: dark;
   --bg: #1f2326; --raised: #282c30; --raised-2: #2f3439; --sidebar: #191c1f;
   --line: rgba(255, 255, 255, .08); --line-strong: rgba(255, 255, 255, .16);
-  --fg: #eeeeee; --muted: #a0a4a8; --faint: #6f7478;
+  --fg: #eeeeee; --muted: #a0a4a8; --faint: #8f9499;
   --accent: #e5a00d; --accent-hover: #f0b429; --accent-fg: #1f2326;
   --ok: #4caf7d; --danger: #ff7b72; --focus: #e5a00d;
   --radius: 4px; --radius-lg: 8px;

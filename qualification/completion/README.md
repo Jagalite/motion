@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented and reviewed; 6C rest, 6D, 6E not started | markers, embedded-chapters, previews, preview-schedules and player-previews PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented and reviewed; 6D implemented (review pending); 6E not started | markers, embedded-chapters, previews, preview-schedules, player-previews and accessibility PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1792,11 +1792,50 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `69211d1` is clean: no actionable findings.
 
-### Remaining item 6 work (not started)
+### 6D. Keyboard, focus and accessibility
+
+- **Source SHA:** branch `plan-completion/accessibility`, stacked on
+  `plan-completion/player-previews`.
+- **Audit:** `scripts/a11y/audit.cjs` runs axe-core 4.14.0 (WCAG 2.0/2.1
+  A and AA and best practice) in Electron 44.7.0's Chromium.
+  - It covers every presentation page, served with the mock facade as an
+    administrator by `crates/motion-ui/tests/a11y_serve.rs` (a no-op
+    unless `MOTION_A11Y_ADDR` is set).
+  - It also covers the desktop chrome with its script-shown panels
+    revealed, and the offline list and title pages over one saved title.
+  - It records each page's first Tab stop. The receipt is
+    [a11y-audit.json](a11y-audit.json).
+- **Fixed:**
+  - **Contrast (serious, every page):** `--faint` text (the sidebar's
+    "Libraries" and "Manage" headings, version titles) was #6f7478, 3.62:1
+    on the sidebar. It is now #8f9499: 5.59:1 on the sidebar, 5.17:1 on
+    the page and 4.6:1 on raised panels. It stays fainter than `--muted`.
+  - **Focus after a command:** a successful command reloaded the
+    server-rendered page, losing a keyboard or screen-reader user's place
+    and announcing nothing. The bridge now remembers the form (command and
+    position) for that page. After the reload it focuses the same form's
+    button and sets its live status to "Done."; if the form is gone (what
+    it changed was removed) it focuses the main content. Sign-in and
+    profile switching, which change the whole page, are unchanged.
+- **Result:** no violations remain except `region` on the mock facade's
+  own banner, which exists only with the mock. Every page's first Tab stop
+  is "Skip to content"; the chrome's is its address field.
+- **Not covered:** a screen reader pass (VoiceOver or NVDA) needs a person,
+  and stays an item 8 release check. Interactive states beyond the first
+  Tab stop are covered by the focus unit test, not the audit. The offline
+  subtitles attribute lives on the device stack, not this branch.
+- **Evidence:**
+
+  | Check | Result |
+  |---|---|
+  | `a11y-audit.json` | 15 presentation pages, desktop chrome, 2 offline pages; only the mock banner's `region` remains |
+  | `node --test packages/ui-bridge` | 48 passed. New: after a reload the same form's button is focused with "Done." (same command, second form); when the form is gone the main content is focused; another page moves nothing; the remembered place is used once |
+  | compose | 22 passed; clippy clean |
+
+### Remaining item 6 work
 
 | Slice | Next step | Blocker |
 |---|---|---|
-| 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
 | 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |
 
 ## 7. M6 and wider parity backlog

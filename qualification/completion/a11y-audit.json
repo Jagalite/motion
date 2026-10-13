@@ -1,0 +1,275 @@
+{
+  "tool": "axe-core 4.14.0 in Electron 44.7.0 (scripts/a11y/audit.cjs)",
+  "rules": [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "best-practice"
+  ],
+  "commit": "742c73569f073fa95b0f5ff659f0a4e920f9ff48",
+  "note": "Presentation pages served with the self-identifying mock facade as an administrator; the mock banner (mock only) is outside landmarks. Desktop chrome audited with hidden panels revealed. Offline pages over one saved title.",
+  "presentation": {
+    "/": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/library/lib1": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "BODY Skip to contentMotionHomeLibrariesFilmsT"
+    },
+    "/item/item1": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/item/item1/manage": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/search?q=midnight": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/libraries": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/manage": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/play/tl1": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/profiles": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/sources": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/matches": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/processing": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/downloads": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/diagnostics": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/organize": {
+      "violations": [
+        {
+          "id": "region",
+          "impact": "moderate",
+          "help": "All page content should be contained by landmarks",
+          "nodes": [
+            {
+              "target": ".mock-banner",
+              "summary": "Fix any of the following:\n  Some page content is not contained by landmarks"
+            }
+          ]
+        }
+      ],
+      "first_tab_stop": "A.skip-link Skip to content"
+    }
+  },
+  "desktop_chrome": {
+    "chrome.html": {
+      "violations": [],
+      "first_tab_stop": "INPUT "
+    }
+  },
+  "offline": {
+    "/": {
+      "violations": [],
+      "first_tab_stop": "A.skip-link Skip to content"
+    },
+    "/download/saved": {
+      "violations": [],
+      "first_tab_stop": "A.skip-link Skip to content"
+    }
+  },
+  "not_covered": [
+    "A screen reader pass (VoiceOver/NVDA)",
+    "Interactive states beyond the first Tab stop are covered by unit tests (focus after a command), not by this audit",
+    "Offline subtitles attribute (device stack, not in this branch)"
+  ]
+}

@@ -318,3 +318,37 @@ test('a custom video profile sends whole bit rates and a chosen subtitle require
   subtitle.value = '';
   assert.equal(JSON.stringify(bridge.bodyOf(form(fields)).tracks), '{"subtitle_track_id":null,"subtitle_policy":"off"}');
 });
+
+test('after a command reloads the page, focus returns to the same form and its status says it was done', () => {
+  const storage = new Map();
+  const focused = [];
+  const makeForm = (command, n) => {
+    const status = {textContent: ''};
+    const button = {focus: () => focused.push(`${command}#${n}`)};
+    return {dataset: {command}, status, querySelector: s => s === '.command-status' ? status : s.startsWith('button') ? button : null};
+  };
+  let forms = [makeForm('POST /a', 0), makeForm('PUT /b', 0), makeForm('PUT /b', 1)];
+  const main = {focus: () => focused.push('main')};
+  const context = () => ({
+    document: {querySelector: () => null, querySelectorAll: () => forms, getElementById: id => id === 'main' ? main : null, addEventListener() {}},
+    sessionStorage: {getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k)},
+    crypto: webcrypto, location: {pathname: '/sources', search: '', reload() {}}, setTimeout: fn => fn(), Blob,
+  });
+  const before = runInNewContext(`${source}\n({reloadAfter})`, context());
+  before.reloadAfter(forms[2]);
+  // The page is rendered again: the same second "PUT /b" form gets focus.
+  forms = [makeForm('POST /a', 0), makeForm('PUT /b', 0), makeForm('PUT /b', 1)];
+  runInNewContext(source, context());
+  assert.deepEqual(focused, ['PUT /b#1']);
+  assert.equal(forms[2].status.textContent, 'Done.');
+  assert.equal(storage.size, 0, 'used once');
+  // The form is gone (what it changed was removed): the main content.
+  before.reloadAfter(forms[1]);
+  forms = [makeForm('POST /a', 0)];
+  runInNewContext(source, context());
+  assert.deepEqual(focused, ['PUT /b#1', 'main']);
+  // Another page: nothing is moved.
+  before.reloadAfter(forms[0]);
+  runInNewContext(source, {...context(), location: {pathname: '/elsewhere', search: '', reload() {}}});
+  assert.deepEqual(focused, ['PUT /b#1', 'main']);
+});

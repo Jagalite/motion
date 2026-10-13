@@ -159,6 +159,34 @@ function definitelyRejected(error) {
   return Boolean(error.status) && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
 }
 
+// After a command the page is rendered again by the server. A keyboard or
+// screen-reader user keeps their place: the same form's button (by command
+// and position) gets focus again and its status says the command was done;
+// if the form is gone (the thing it changed was removed), the main content.
+const AFTER_COMMAND = 'motion:after-command';
+function reloadAfter(form) {
+  try {
+    const same = [...document.querySelectorAll('form[data-command]')].filter(f => f.dataset.command === form.dataset.command);
+    sessionStorage.setItem(AFTER_COMMAND, JSON.stringify({page: location.pathname + location.search,
+      command: form.dataset.command, index: same.indexOf(form)}));
+  } catch { /* Without storage the page reloads at its top, as before. */ }
+  location.reload();
+}
+function restoreAfterReload() {
+  let saved = null;
+  try {
+    saved = JSON.parse(sessionStorage.getItem(AFTER_COMMAND) ?? 'null');
+    sessionStorage.removeItem(AFTER_COMMAND);
+  } catch { return; }
+  if (!saved || saved.page !== location.pathname + location.search) return;
+  const same = [...document.querySelectorAll('form[data-command]')].filter(f => f.dataset.command === saved.command);
+  const form = same[saved.index];
+  const status = form?.querySelector('.command-status');
+  if (status) status.textContent = 'Done.';
+  (form?.querySelector('button[type="submit"]:not([disabled])') ?? document.getElementById('main'))?.focus();
+}
+restoreAfterReload();
+
 const submitting = new WeakSet();
 async function submitCommand(form) {
   if (submitting.has(form)) return;
@@ -197,7 +225,7 @@ async function submitCommand(form) {
       }
       return showPlan(form, result, body);
     }
-    location.reload();
+    reloadAfter(form);
   } catch (error) {
     // Only a definite rejection ends this request's identity; 5xx, 408/429
     // and network failures may have been applied, so a retry reuses the key.
@@ -252,7 +280,7 @@ function showPlan(form, plan, request = {}) {
     try {
       await call(method, path, {plan_token: plan.plan_token}, {'Idempotency-Key': keyFor(identity)});
       settleKey(identity);
-      location.reload();
+      reloadAfter(form);
     } catch (error) {
       if (definitelyRejected(error)) settleKey(identity);
       if (status) {
