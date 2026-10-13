@@ -1636,10 +1636,17 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
     assert_eq!(created.body["subtitle_track_id"], "s0");
     let id = created.body["id"].as_str().unwrap().to_owned();
-    let manifest = f
-        .get(&format!("/api/v2/downloads/{id}/manifest"), &auth)
-        .await;
+    // Concurrent first reads share one conversion and name the same file.
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let (manifest, second, third) = tokio::join!(
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        f.get(&path, &auth)
+    );
     assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
+    assert_eq!(second.body["files"], manifest.body["files"]);
+    assert_eq!(third.body["files"], manifest.body["files"]);
+    assert_eq!(playscale::v2::downloads::subtitle_conversions(&id), 1);
     let file = manifest.body["files"]
         .as_array()
         .unwrap()
@@ -1694,7 +1701,54 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
         )
         .await;
     assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
-    assert!(!kept.exists());
+    let released = async {
+        while kept.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), released)
+        .await
+        .expect("released");
     let (status, _) = f.bytes(url, &[("authorization", &auth)]).await;
     assert_eq!(status, StatusCode::CONFLICT);
+
+    // A cancellation ordered while a conversion waits for the download's
+    // subtitle lock: nothing is converted or published afterwards.
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0004",
+            with_subtitle("s0", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let cancelling = async {
+        // Let the read reach the lock first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cancelled = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/downloads/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        drop(held);
+        cancelled
+    };
+    let (read, cancelled) = tokio::join!(f.get(&path, &auth), cancelling);
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    problem(&read, StatusCode::CONFLICT, "download_cancelled");
+    assert_eq!(playscale::v2::downloads::subtitle_conversions(&id), 0);
+    let kept = root
+        .parent()
+        .unwrap_or(root)
+        .join("download-subtitles")
+        .join(format!("{id}.vtt"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!kept.exists());
 }

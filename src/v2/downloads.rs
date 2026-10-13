@@ -33,7 +33,7 @@ use playscale_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub fn routes() -> Router<App> {
     Router::new()
@@ -873,8 +873,10 @@ pub async fn cancel(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    // Its subtitle file is no longer served; keep only those of active demands.
-    release_subtitles(&app).await;
+    // Its subtitle file is no longer served. Released in the background:
+    // a conversion still running holds the file's lock until it has seen
+    // the cancellation.
+    tokio::spawn(release_subtitles(app.clone()));
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -888,10 +890,63 @@ fn subtitles_path(app: &App, download_id: &str) -> std::path::PathBuf {
         .join(format!("{download_id}.vtt"))
 }
 
-/// Remove subtitle files whose download is no longer an active demand
-/// (cancelled or gone). Best effort: a leftover is removed by a later call.
-async fn release_subtitles(app: &App) {
-    let directory = subtitles_path(app, "x");
+/// The lock ordering a download's subtitle file: conversion and
+/// publication hold it from their state check to the rename, and removal
+/// holds it too, so a cancelled download's file is never published after
+/// its removal, and one download converts at most once at a time.
+fn subtitles_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    type Locks = HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Conversions run per download, for tests asserting none is duplicated.
+#[doc(hidden)]
+pub fn subtitle_conversions(download_id: &str) -> u64 {
+    conversions()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(download_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn conversions() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::LazyLock::new(Default::default);
+    &COUNTS
+}
+
+/// Hold a download's subtitle lock (tests order a cancellation against a
+/// conversion with it).
+#[doc(hidden)]
+pub async fn hold_subtitles(app: &App, download_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    subtitles_lock(&subtitles_path(app, download_id))
+        .lock_owned()
+        .await
+}
+
+async fn active(app: &App, download_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT 1 FROM downloads WHERE id=? AND state='ready'")
+        .bind(download_id)
+        .fetch_optional(&app.db)
+        .await
+        .map_or(true, |row| row.is_some())
+}
+
+/// Remove subtitle files (and partial ones) whose download is no longer an
+/// active demand (cancelled or gone), each under its lock. Best effort: a
+/// leftover is removed by a later call.
+async fn release_subtitles(app: App) {
+    let directory = subtitles_path(&app, "x");
     let Some(directory) = directory.parent() else {
         return;
     };
@@ -900,26 +955,25 @@ async fn release_subtitles(app: &App) {
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let id = name
-            .strip_suffix(".vtt")
-            .or_else(|| name.split_once(".vtt.").map(|(id, _)| id))
-            .unwrap_or(&name);
-        let active: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM downloads WHERE id=? AND state='ready'")
-                .bind(id)
-                .fetch_optional(&app.db)
-                .await
-                .unwrap_or(Some(1));
-        if active.is_none() {
-            let _ = tokio::fs::remove_file(entry.path()).await;
+        let Some(id) = name.split_once(".vtt").map(|(id, _)| id.to_owned()) else {
+            continue;
+        };
+        if active(&app, &id).await {
+            continue;
         }
+        let _held = subtitles_lock(&subtitles_path(&app, &id))
+            .lock_owned()
+            .await;
+        let _ = tokio::fs::remove_file(entry.path()).await;
     }
 }
 
 /// The download's subtitle file: converted once from the pinned file
 /// revision's track (`delivery::download_subtitles`), then kept, so its
-/// digest is stable for the download. Conversion runs in its own task: a
-/// request that stops waiting never leaves a partial file in place.
+/// digest is stable for the download. Conversion runs in its own task under
+/// the download's subtitle lock: concurrent and retried reads share it, a
+/// request that stops waiting never leaves a partial file in place, and a
+/// cancelled download is never converted or published.
 async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, Problem> {
     let path = subtitles_path(app, &row.id);
     if let Ok(bytes) = tokio::fs::read(&path).await {
@@ -936,21 +990,43 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
         row.file_revision.clone(),
     );
     let converted = tokio::spawn(async move {
-        let text = crate::delivery::download_subtitles(&app, &id, &file, &revision, index).await?;
         let path = subtitles_path(&app, &id);
+        let _held = subtitles_lock(&path).lock_owned().await;
+        // Another read converted it while this one waited.
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return Ok(bytes);
+        }
+        let cancelled =
+            || crate::api::ApiError::conflict("download_cancelled", "The download was cancelled");
+        if !active(&app, &id).await {
+            return Err(cancelled());
+        }
+        *conversions()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.clone())
+            .or_default() += 1;
+        let text = crate::delivery::download_subtitles(&app, &id, &file, &revision, index).await?;
         let partial = path.with_extension(format!("vtt.{}", new_id()));
         let written = async {
             tokio::fs::create_dir_all(path.parent().unwrap_or(&path)).await?;
             tokio::fs::write(&partial, &text).await?;
-            tokio::fs::File::open(&partial).await?.sync_all().await?;
-            tokio::fs::rename(&partial, &path).await
+            tokio::fs::File::open(&partial).await?.sync_all().await
         }
         .await;
-        if written.is_err() {
+        // Published only while the download is still active, under the lock
+        // its removal takes.
+        let published = match written {
+            Ok(()) if active(&app, &id).await => tokio::fs::rename(&partial, &path)
+                .await
+                .map_err(crate::api::ApiError::internal),
+            Ok(()) => Err(cancelled()),
+            Err(error) => Err(crate::api::ApiError::internal(error)),
+        };
+        if published.is_err() {
             let _ = tokio::fs::remove_file(&partial).await;
         }
-        written.map_err(crate::api::ApiError::internal)?;
-        Ok::<_, crate::api::ApiError>(text)
+        published.map(|()| text)
     });
     match tokio::time::timeout(Duration::from_secs(30), converted).await {
         Ok(Ok(Ok(text))) => Ok(text),
@@ -958,6 +1034,11 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
             StatusCode::CONFLICT,
             "download_expired",
             "The source changed or is no longer readable; request a new download",
+        )),
+        Ok(Ok(Err(error))) if error.parts().1 == "download_cancelled" => Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_cancelled",
+            "The download was cancelled",
         )),
         // Still converting, or the conversion failed: try again later.
         _ => Err(Problem::new(

@@ -1265,6 +1265,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | core `downloads` | 10 passed. New: an original's named text subtitle is pinned on the first candidate carrying it; no carrier refuses; malformed selections refuse; a rendition's kept subtitle travels as `s0` only when it is text |
   | `tests/v2_downloads.rs` `an_originals_text_subtitle_travels_as_pinned_webvtt` | passed with a real ffmpeg MP4 (mov_text). Policy and missing-track refusals; the manifest names `subtitles.vtt` with digest and size; the served bytes are that digest and contain the cue; repeated manifests are identical; another digest is refused; cancelling releases the file and serving stops |
   | `v2_downloads` 11, `downloads_model` 6 (unchanged model, exhausted), contract 5, `v2_playback` 32 (delivery converter shared), compose 22, `access_api` 39, `m3_workflows` 2 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `2ce2560` raised two P2 findings,
+  both fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | S1 | Concurrent or retried manifest reads each started a conversion, so one download could hold both shared subtitle slots | Fixed: conversion runs under a per-download lock and rechecks the kept file under it, so reads share one conversion. Integration test: three concurrent first reads give one conversion and identical files |
+  | S2 | A conversion finishing after cancellation published its file anyway, and the read reported success | Fixed: under the same lock the conversion checks that the download is active before converting and again before the rename. Removal (now in the background after cancel) takes the lock too, so nothing is published after a cancellation's removal. Integration test holds the lock, cancels while a read waits, and sees 409 `download_cancelled`, no conversion and no file |
+
+  After the fixes: `v2_downloads` 11 passed (three runs); clippy clean.
 
 ### Remaining item 5 work (not started)
 
