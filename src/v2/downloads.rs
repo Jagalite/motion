@@ -1185,7 +1185,10 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
     if let Ok(bytes) = read_subtitle(&path).await {
         record_subtitle(app, &row.id, Some(&bytes))
             .await
-            .map_err(Problem::internal)?;
+            .map_err(|error| {
+                let (status, code, message) = error.parts();
+                Problem::new(status, code, message)
+            })?;
         return Ok(bytes);
     }
     let index = track

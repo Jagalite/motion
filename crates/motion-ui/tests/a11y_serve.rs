@@ -126,6 +126,7 @@ impl motion_ui::offline::OfflinePresentationReader for SavedTitle {
                 size: 1,
                 content_type: "video/mp4".into(),
                 resume_position_ms: None,
+                subtitles: None,
                 artwork: Some(motion_ui::offline::CachedArtwork {
                     sha256: "1".repeat(64),
                     size: 1,
