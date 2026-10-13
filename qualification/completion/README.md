@@ -18,9 +18,9 @@ proposal remains a design document and is not implemented by these repairs.
 
 ### Current patch batch
 
-Twenty findings have implementation changes. Compilation and Rust regressions
-remain pending; these are not merged or release-qualified. Completed non-Rust evidence is recorded below; the queued Rust checks do not yet
-qualify these implementation commits.
+Twenty findings have implementation changes. The pinned Rust compile passed at
+`526e490`; runtime regressions and CI repair verification remain pending. These
+changes are not merged or release-qualified.
 
 | Findings | Implemented behavior | Verification / remaining qualification |
 |---|---|---|
@@ -79,8 +79,9 @@ Review is static evidence, not compilation or runtime qualification.
   import, both corrected. A compile concurrent with a core edit also observed
   stale core declarations. The pinned consolidated compile subsequently found
   missing `Hash` on `ArtifactUse` and a non-static property-name parameter in
-  the artifact model test. Both are corrected; a replacement compile is queued.
-  No Rust-test success is claimed yet.
+  the artifact model test. Both are corrected; replacement job
+  `751fca1d83dd49c8a71291c885f357d1` compiled all selected targets successfully.
+  That result is compilation evidence, not Rust-test execution.
 
 ### Follow-up review of the repair commits
 
@@ -125,7 +126,8 @@ Dedicated target resource: this worktree's `target` directory.
   to 1.98.0. Failed with the two artifact-model compilation errors recorded above.
 - `751fca1d83dd49c8a71291c885f357d1`: pinned replacement compile after adding
   the state hash derive and making literal property names explicitly static.
-  Submitted October 13; completion and regression execution remain pending.
+  Completed successfully on October 13 at `526e490`; regression execution
+  was not part of this compile-only job.
 - `0768ee27f6f84737ba9397686d311ebf`: Go CLI test compilation succeeded; compiled
   CLI suite executed separately and passed.
 - Earlier Rust attempts found the corrected lock/import errors. Superseded host,
@@ -149,6 +151,29 @@ watch ingress, maintenance and cancelled-I/O tests; and the focused playback
 planning, prepared-GC, conversion-codec and restore tests. Run the access/SSE
 ownership regression. Record actual counts, model bounds and any failures before
 changing pending status. A compile-only success is not runtime-test success.
+
+### PR 60 CI repairs
+
+CI at `526e490` passed API contract, clients/desktop/terminal, real-process
+integration/upgrade/restore, and macOS packaging. Three checks failed:
+
+- Clippy rejected the component map's nested tuple type. A named `ComponentKey`
+  alias preserves the existing grouping policy without suppressing the lint.
+- Prepared-playback coverage stopped before the ownership assertions because
+  its idempotency key was shorter than the API's 16-character minimum. The
+  fixture now supplies a valid key; production validation remains unchanged.
+- Dependency notices retained the old lockfile digest after the earlier direct
+  core dependency addition. Regeneration changes only that digest; the 318
+  dependency packages are unchanged. The notice check and six unit tests pass.
+
+These repairs do not change state-dependent production decisions. Validation:
+Kyoto test rebuild `5b2ca112d654406699be1c0f9c517941` and full-workspace Clippy
+`da7755504eab480eaa9c5c32eab48470` are pending. The first local Clippy attempt
+`b008213b43694b5cbc8101f34a419097` failed from selecting the Homebrew 1.99 driver
+with 1.98 dependencies; the replacement also pins the toolchain binary directory.
+Runtime checks will execute compiled test binaries under Kyoto's compile-only
+policy. The prepared-playback lifecycle assertion must pass before its ownership
+coverage can be claimed.
 
 ### Remaining fourteen findings
 

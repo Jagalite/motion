@@ -363,6 +363,7 @@ fn key(o: &Observed) -> (Kind, Option<String>, Roles, Option<String>) {
 /// does not establish correspondence with another file's track ordinal.
 pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component> {
     type Key = (Kind, Option<String>, Roles, Option<String>);
+    type ComponentKey = (Key, u32, Option<(Id, Id, String)>);
     let mut ambiguous = BTreeSet::new();
     for (_, tracks) in versions {
         let mut counts = BTreeMap::new();
@@ -377,7 +378,7 @@ pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component
             }
         }
     }
-    let mut components: BTreeMap<(Key, u32, Option<(Id, Id, String)>), Component> = BTreeMap::new();
+    let mut components: BTreeMap<ComponentKey, Component> = BTreeMap::new();
     for (version, tracks) in versions {
         // Ordinals count same-key tracks within one file, so each part of a
         // multipart version continues the same components.

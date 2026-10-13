@@ -4167,7 +4167,7 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
         .post(
             "/api/v2/playback/delivery-sessions",
             &auth,
-            Some("prepared-gc-pin"),
+            Some("prepared-gc-pin-0001"),
             json!({"plan_token":pinned.body["plan_token"],"start_ms":0}),
         )
         .await;
