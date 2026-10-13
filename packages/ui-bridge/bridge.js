@@ -160,15 +160,21 @@ function definitelyRejected(error) {
 }
 
 // After a command the page is rendered again by the server. A keyboard or
-// screen-reader user keeps their place: the same form's button (by command
-// and position) gets focus again and its status says the command was done;
-// if the form is gone (the thing it changed was removed), the main content.
+// screen-reader user keeps their place: the form that ran gets focus again
+// and its status says the command was done. A form is recognised by what it
+// acts on (its command, fixed fields and fixed body, not its revision), and
+// only when exactly one form on the new page matches; otherwise (it is gone,
+// or several look alike) focus goes to the main content. Never another
+// entry's action, which a repeated key press would then run.
 const AFTER_COMMAND = 'motion:after-command';
+function formIdentity(form) {
+  const fixed = [...form.querySelectorAll('input[type="hidden"][name]')].map(input => `${input.name}=${input.value}`);
+  const body = form.querySelector('[data-json-body]')?.value ?? '';
+  return JSON.stringify([form.dataset.command, fixed, body]);
+}
 function reloadAfter(form) {
   try {
-    const same = [...document.querySelectorAll('form[data-command]')].filter(f => f.dataset.command === form.dataset.command);
-    sessionStorage.setItem(AFTER_COMMAND, JSON.stringify({page: location.pathname + location.search,
-      command: form.dataset.command, index: same.indexOf(form)}));
+    sessionStorage.setItem(AFTER_COMMAND, JSON.stringify({page: location.pathname + location.search, form: formIdentity(form)}));
   } catch { /* Without storage the page reloads at its top, as before. */ }
   location.reload();
 }
@@ -179,8 +185,12 @@ function restoreAfterReload() {
     sessionStorage.removeItem(AFTER_COMMAND);
   } catch { return; }
   if (!saved || saved.page !== location.pathname + location.search) return;
-  const same = [...document.querySelectorAll('form[data-command]')].filter(f => f.dataset.command === saved.command);
-  const form = same[saved.index];
+  const matches = [...document.querySelectorAll('form[data-command]')].filter(f => formIdentity(f) === saved.form);
+  const form = matches.length === 1 ? matches[0] : null;
+  // A form inside closed disclosures is shown again before it takes focus.
+  for (let parent = form?.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName === 'DETAILS') parent.open = true;
+  }
   const status = form?.querySelector('.command-status');
   if (status) status.textContent = 'Done.';
   (form?.querySelector('button[type="submit"]:not([disabled])') ?? document.getElementById('main'))?.focus();

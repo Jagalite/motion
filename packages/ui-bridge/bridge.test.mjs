@@ -319,36 +319,58 @@ test('a custom video profile sends whole bit rates and a chosen subtitle require
   assert.equal(JSON.stringify(bridge.bodyOf(form(fields)).tracks), '{"subtitle_track_id":null,"subtitle_policy":"off"}');
 });
 
-test('after a command reloads the page, focus returns to the same form and its status says it was done', () => {
+test('after a command reloads the page, focus returns to the same action, never to another entry', () => {
   const storage = new Map();
   const focused = [];
-  const makeForm = (command, n) => {
+  // A form acting on one entry: its command, its fixed entry field, and the
+  // disclosure (if any) it sits in.
+  const makeForm = (command, entry, details = null) => {
     const status = {textContent: ''};
-    const button = {focus: () => focused.push(`${command}#${n}`)};
-    return {dataset: {command}, status, querySelector: s => s === '.command-status' ? status : s.startsWith('button') ? button : null};
+    const button = {focus: () => focused.push(`${command} ${entry}`)};
+    const hidden = [{name: 'entry', value: entry}];
+    return {dataset: {command}, status, parentElement: details,
+      querySelectorAll: s => s.startsWith('input[type="hidden"]') ? hidden : [],
+      querySelector: s => s === '.command-status' ? status : s.startsWith('button') ? button : null};
   };
-  let forms = [makeForm('POST /a', 0), makeForm('PUT /b', 0), makeForm('PUT /b', 1)];
+  let forms = [];
   const main = {focus: () => focused.push('main')};
-  const context = () => ({
+  const context = (pathname = '/organize') => ({
     document: {querySelector: () => null, querySelectorAll: () => forms, getElementById: id => id === 'main' ? main : null, addEventListener() {}},
     sessionStorage: {getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k)},
-    crypto: webcrypto, location: {pathname: '/sources', search: '', reload() {}}, setTimeout: fn => fn(), Blob,
+    crypto: webcrypto, location: {pathname, search: '', reload() {}}, setTimeout: fn => fn(), Blob,
   });
+  const reorder = 'PUT /api/v2/playlists/p1/entries';
+  forms = [makeForm(reorder, 'A'), makeForm(reorder, 'B')];
   const before = runInNewContext(`${source}\n({reloadAfter})`, context());
-  before.reloadAfter(forms[2]);
-  // The page is rendered again: the same second "PUT /b" form gets focus.
-  forms = [makeForm('POST /a', 0), makeForm('PUT /b', 0), makeForm('PUT /b', 1)];
-  runInNewContext(source, context());
-  assert.deepEqual(focused, ['PUT /b#1']);
-  assert.equal(forms[2].status.textContent, 'Done.');
-  assert.equal(storage.size, 0, 'used once');
-  // The form is gone (what it changed was removed): the main content.
+  // "Move up B": after the reload B is first, and its own action gets focus.
   before.reloadAfter(forms[1]);
-  forms = [makeForm('POST /a', 0)];
+  forms = [makeForm(reorder, 'B'), makeForm(reorder, 'A')];
   runInNewContext(source, context());
-  assert.deepEqual(focused, ['PUT /b#1', 'main']);
-  // Another page: nothing is moved.
+  assert.deepEqual(focused, [`${reorder} B`]);
+  assert.equal(forms[0].status.textContent, 'Done.');
+  assert.equal(forms[1].status.textContent, '', 'never another entry');
+  assert.equal(storage.size, 0, 'used once');
+  // "Remove B": B is gone, so the main content, never A's action.
   before.reloadAfter(forms[0]);
-  runInNewContext(source, {...context(), location: {pathname: '/elsewhere', search: '', reload() {}}});
-  assert.deepEqual(focused, ['PUT /b#1', 'main']);
+  forms = [makeForm(reorder, 'A')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'main');
+  // Two look-alike forms: ambiguous, so the main content.
+  before.reloadAfter(forms[0]);
+  forms = [makeForm(reorder, 'A'), makeForm(reorder, 'A')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'main');
+  // A form inside a closed disclosure is shown again before focus.
+  const details = {tagName: 'DETAILS', open: false, parentElement: null};
+  forms = [makeForm('PUT /api/v2/libraries/l1', 'l1', details)];
+  before.reloadAfter(forms[0]);
+  forms = [makeForm('PUT /api/v2/libraries/l1', 'l1', details)];
+  runInNewContext(source, context());
+  assert.equal(details.open, true);
+  assert.deepEqual(focused.at(-1), 'PUT /api/v2/libraries/l1 l1');
+  // Another page: nothing is moved.
+  const count = focused.length;
+  before.reloadAfter(forms[0]);
+  runInNewContext(source, context('/elsewhere'));
+  assert.equal(focused.length, count);
 });

@@ -1831,6 +1831,26 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | `a11y-audit.json` | 15 presentation pages, desktop chrome, 2 offline pages; only the mock banner's `region` remains |
   | `node --test packages/ui-bridge` | 48 passed. New: after a reload the same form's button is focused with "Done." (same command, second form); when the form is gone the main content is focused; another page moves nothing; the remembered place is used once |
   | compose | 22 passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `e0a394d` raised two P2 findings,
+  both fixed:
+  - **Wrong entry:** focus was restored by position among forms with the
+    same command. On `/organize` every entry's Move up and Remove share a
+    command, so after a reorder or removal it could land on another entry's
+    action, which a repeated key press would run. A form is now recognised
+    by what it acts on: its command, fixed fields and fixed body (not its
+    revision). Focus is restored only when exactly one form on the new page
+    matches, otherwise to the main content. Playlist forms carry the whole
+    resulting entry list as their body, so the action that just ran equals
+    the new current state, which no form on the new page produces; focus
+    goes to the main content, never to another entry.
+  - **Closed disclosures:** forms inside an initially closed `<details>`
+    (Edit library, Change conditions) could not take focus after the
+    reload. Their disclosures are now opened before focusing.
+
+  Test: after a reorder the same entry's action is found again; a removed
+  entry falls back to the main content; look-alike forms are ambiguous and
+  fall back too; a closed disclosure is opened; another page moves
+  nothing. ui-bridge 48 passed.
 
 ### Remaining item 6 work
 
