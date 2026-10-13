@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C rest, 6D, 6E not started | markers, embedded-chapters and previews PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented (review pending); 6C rest, 6D, 6E not started | markers, embedded-chapters, previews and preview-schedules PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1699,11 +1699,37 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 3 at `12107f8` is clean: no actionable findings.
 
+### 6C (part 2). Preview schedules
+
+- **Source SHA:** branch `plan-completion/preview-schedules`, stacked on
+  `plan-completion/previews`.
+- **Implemented:**
+  - `preview` schedules are accepted for a caller with
+    `processing:request` (`optimize` stays refused).
+  - Each run takes up to 200 of the library's files that are whole
+    single-file originals. It queues a preview job only for a file the
+    schedule's requester may read, with pictures and a known duration
+    (core `previews::layout`), whose revision has no active job and no
+    published previews. The partial unique index enforces that too.
+  - Runs stop at the preview queue bound (100 active) and resume from a
+    durable cursor (`schedule_dispatch_progress`), like
+    `metadata_refresh`.
+  - The Sources page offers "Generate previews" as a schedule task.
+- **Core/adapter boundary:** eligibility uses core `previews::layout`; the
+  job lifecycle, publication and retention are part 1's. The adapter only
+  selects candidates and enqueues within the bounds.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `tests/v2_metadata_processing.rs` `preview_schedules_queue_each_revision_once_within_the_queue` | passed. Accepted through the API. A run queues exactly the two eligible originals, skipping one with published previews and one without pictures. A second run adds nothing. With 99 other active jobs a run queues one and keeps its cursor; the next run, with room, queues the other and clears the cursor |
+  | `v2_metadata_processing` 19, compose 22 (the form offers `preview` but not `optimize`), `m3_workflows` 2 | passed; clippy clean |
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |
 |---|---|---|
-| 6C remaining: preview schedules and player thumbnails | Accept `preview` schedules (fan-out without duplicate work, like `metadata_refresh`); register a Demuxe `AuthoredPreviewProvider` in the player from `getTimelinePreviews` | 6C part 1 |
+| 6C remaining: player thumbnails | Register a Demuxe `AuthoredPreviewProvider` in the player from `getTimelinePreviews` (sheet URL and crop per position, core `tile_at`) | 6C parts 1–2 |
 | 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
 | 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |
 

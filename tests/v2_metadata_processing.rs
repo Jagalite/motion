@@ -2161,3 +2161,101 @@ async fn parameterized_preparation_persists_profile_and_fences_changed_inputs() 
         .unwrap();
     assert_eq!(count, 1);
 }
+
+/// Preview schedules (6C part 2) queue one job per eligible revision of the
+/// library's originals: never alongside an active job or published
+/// previews, never for a file without pictures, and never beyond the
+/// preview queue, resuming where a full queue stopped them.
+#[tokio::test]
+async fn preview_schedules_queue_each_revision_once_within_the_queue() {
+    let f = Fixture::new().await;
+    for name in ["a", "b", "c", "d"] {
+        f.work(
+            &format!("pv-{name}"),
+            name,
+            &f.library,
+            &format!("pv-{name}.mp4"),
+            &format!("rev-{name}"),
+        )
+        .await;
+    }
+    let video =
+        r#"[{"index":0,"kind":"video","codec":"h264","language":null,"width":1920,"height":1080}]"#;
+    sqlx::query("UPDATE media_files SET duration_seconds=60,tracks_json=? WHERE id IN ('file-pv-a','file-pv-b','file-pv-c')")
+        .bind(video)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_files SET duration_seconds=60 WHERE id='file-pv-d'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    // c's revision already has published previews.
+    sqlx::query("INSERT INTO previews(file_id,file_revision,job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets,created_at) VALUES ('file-pv-c','rev-c','old',10000,160,90,10,10,6,1,1)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let op = format!("Bearer {OPERATOR}");
+    let created = f
+        .call(
+            "POST",
+            "/api/v2/schedules",
+            Some(json!({"library_id": f.library, "task": "preview", "interval_seconds": 3600, "enabled": true})),
+            &[("authorization", &op), ("idempotency-key", "preview-schedule-000000000001")],
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let due = || {
+        sqlx::query("UPDATE api_schedules SET next_run=0 WHERE id=?")
+            .bind(&id)
+            .execute(&f.app.db)
+    };
+    let queued = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT file_id FROM preview_jobs WHERE phase='queued' AND file_id LIKE 'file-pv-%' ORDER BY file_id",
+        )
+        .fetch_all(&f.app.db)
+        .await
+        .unwrap()
+    };
+    due().await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    assert_eq!(queued().await, ["file-pv-a", "file-pv-b"]);
+    // The next run adds nothing: those revisions have active jobs.
+    due().await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    assert_eq!(queued().await, ["file-pv-a", "file-pv-b"]);
+    // A full queue stops the run where it is, and the next one resumes.
+    sqlx::query("UPDATE preview_jobs SET phase='cancelled'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    for n in 0..99 {
+        sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,requester_id,created_at) VALUES (?,?,'r','operator',1)")
+            .bind(format!("busy-{n}"))
+            .bind(format!("other-{n}"))
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    due().await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    assert_eq!(queued().await, ["file-pv-a"]);
+    let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_dispatch_progress")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(progress, 1);
+    sqlx::query("UPDATE preview_jobs SET phase='cancelled' WHERE id LIKE 'busy-%'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    assert_eq!(queued().await, ["file-pv-a", "file-pv-b"]);
+    let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_dispatch_progress")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(progress, 0);
+}

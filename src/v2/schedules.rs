@@ -84,10 +84,15 @@ fn validate(i: &Input, p: &access::Principal) -> Result<(), Problem> {
                 return Err(access::AccessError::Forbidden(Permission::CatalogWrite).into());
             }
         }
-        "preview" | "optimize" => {
+        "preview" => {
+            if !p.allows(Permission::ProcessingRequest) {
+                return Err(access::AccessError::Forbidden(Permission::ProcessingRequest).into());
+            }
+        }
+        "optimize" => {
             return Err(Problem::invalid(
                 "schedule_task_unavailable",
-                "This server has no scheduled preview or optimization service",
+                "This server has no scheduled optimization service",
             ));
         }
         _ => {
@@ -338,6 +343,109 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                         .bind(&row.id)
                         .execute(&mut *tx)
                         .await?;
+                }
+            }
+            // Previews of the library's originals that have none: bounded
+            // per tick and by the preview queue, never duplicated (an active
+            // job or published previews of the revision skip it; the unique
+            // active index enforces it), only of files the requester reads.
+            "preview" if p.allows(Permission::ProcessingRequest) => {
+                let after: Option<String> = sqlx::query_scalar(
+                    "SELECT after_item FROM schedule_dispatch_progress WHERE schedule_id=?",
+                )
+                .bind(&row.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                type Candidate = (String, String, Option<f64>, String);
+                let mut files: Vec<Candidate> = sqlx::query_as(
+                    "SELECT DISTINCT f.id,f.revision,f.duration_seconds,f.tracks_json FROM media_files f \
+                     JOIN library_sources ls ON ls.source_id=f.library_id \
+                     JOIN version_files b ON b.file_id=f.id AND b.part=1 AND b.file_revision=f.revision \
+                     JOIN media_versions v ON v.id=b.version_id AND v.origin='original' \
+                     WHERE ls.library_id=? AND f.available=1 AND f.generated=0 \
+                     AND b.start_ms IS NULL AND b.end_ms IS NULL \
+                     AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+                     AND f.id>? ORDER BY f.id LIMIT 201",
+                )
+                .bind(&row.library_id)
+                .bind(after.unwrap_or_default())
+                .fetch_all(&mut *tx)
+                .await?;
+                more = files.len() > 200;
+                files.truncate(200);
+                let mut last = files.last().map(|f| f.0.clone());
+                for (n, (file, revision, seconds, tracks)) in files.iter().enumerate() {
+                    let active: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM preview_jobs WHERE phase IN ('queued','running','cancelling')",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if active >= super::previews::MAX_ACTIVE_JOBS {
+                        // The queue is full: continue from here next time.
+                        more = true;
+                        last = n.checked_sub(1).map(|p| files[p].0.clone());
+                        break;
+                    }
+                    if !playscale_core::playback_session::readable(
+                        &p,
+                        super::content::file_facts(&mut tx, file)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                            .as_ref(),
+                    ) {
+                        continue;
+                    }
+                    let tracks: Vec<crate::db::Track> =
+                        serde_json::from_str(tracks).unwrap_or_default();
+                    let Some(video) = tracks.iter().find(|t| t.kind == "video") else {
+                        continue;
+                    };
+                    let duration = seconds
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .map(|s| (s * 1000.0).floor() as u64);
+                    if duration
+                        .and_then(|d| {
+                            playscale_core::previews::layout(
+                                d,
+                                video.width.unwrap_or(0),
+                                video.height.unwrap_or(0),
+                            )
+                        })
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    sqlx::query(
+                        "INSERT INTO preview_jobs(id,file_id,file_revision,requester_id,credential_hash,ingress_id,created_at) \
+                         SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM preview_jobs WHERE file_id=? AND file_revision=? \
+                         AND phase IN ('queued','running','cancelling')) \
+                         AND NOT EXISTS(SELECT 1 FROM previews WHERE file_id=? AND file_revision=?)",
+                    )
+                    .bind(crate::new_id())
+                    .bind(file)
+                    .bind(revision)
+                    .bind(&p.id)
+                    .bind(&row.credential_hash)
+                    .bind(&row.ingress_id)
+                    .bind(crate::now())
+                    .bind(file)
+                    .bind(revision)
+                    .bind(file)
+                    .bind(revision)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                match (more, last) {
+                    (true, Some(last)) => {
+                        sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(&row.id).bind(last).execute(&mut *tx).await?;
+                    }
+                    (true, None) => {}
+                    (false, _) => {
+                        sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
+                            .bind(&row.id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
                 }
             }
             _ => {

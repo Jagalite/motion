@@ -638,10 +638,8 @@ async fn library_administration_offers_edit_relocation_and_schedules() {
     assert!(sources.contains(r#"data-type="minutes" data-target="interval_seconds""#));
     assert!(sources.contains(r#"value="1440""#));
     assert!(sources.contains(r#"<option value="metadata_refresh">"#));
-    assert!(
-        !sources.contains(r#"<option value="preview">"#)
-            && !sources.contains(r#"<option value="optimize">"#)
-    );
+    assert!(sources.contains(r#"<option value="preview">"#));
+    assert!(!sources.contains(r#"<option value="optimize">"#));
     let (_, _, processing) = get_page(&admin, "/processing").await;
     // The server retries failed and cancelled jobs; it takes no precondition.
     assert!(

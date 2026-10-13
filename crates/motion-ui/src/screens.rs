@@ -352,6 +352,7 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
     let tasks = [
         ("scan", "Scan for changes"),
         ("metadata_refresh", "Refresh local metadata"),
+        ("preview", "Generate previews"),
     ];
     Ok(view! {
         <h1>"Sources and scans"</h1>
