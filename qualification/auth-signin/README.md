@@ -9,11 +9,12 @@ The user approved isolated local services for final provider/mail qualification.
 ## Source and correctness boundary
 
 Native qualification used `6868a4c0258f56d2ec1526228dfc6bded8c4300c`.
-Final application source review accepted `ad0b481`; its application changes after
+The earlier application source review accepted `ad0b481`; its application changes after
 that native-tested commit are authentication JavaScript and tests: recovery safeguard explanations,
 no stale-revision retry advice for those safeguards, and immediate email-test
 status refresh. Follow-up `c85b07f` adds only the reviewed callback fault fixture
-and two adapter tests. Final presentation build/result is recorded below.
+and two adapter tests. Final source review accepted `1a75385`, including the
+contrast/count wording fixes and accelerated executable hashing described below.
 
 The branch integrates access/TUI head `1a10cd4` through merge `5d0c088`.
 Migration 0045 is unchanged. Forward migrations 0046/0047 reconcile legacy
@@ -191,18 +192,17 @@ closure ownership, Clippy findings, and three fixture assumptions (fresh invitat
 proof, JSON boolean, and anonymous identity state). Earlier Kyoto builds were
 cancelled or deferred under host pressure; their partial logs do not qualify runtime.
 
-## Outstanding A5 presentation gates and release boundaries
+## Presentation qualification and release boundaries
 
-T3 snapshot capture repeatedly failed and both preset/freeform resize operations
-timed out; navigation, DOM reads, clicks, typing and keyboard interaction worked.
-Screenshot-based visual review, actual narrow-viewport presentation review and
-screen-reader walkthrough remain outstanding A5 qualification gates. The
-implementation is delivered, but these walkthroughs are not qualified. No installed
-desktop/native OIDC walkthrough is claimed.
-The scope explicitly preserves native pairing rather than adding native OIDC.
-Production provider interoperability, real mailbox delivery and deployment remain
-outside the user-approved isolated qualification. These limitations do not change
-the default-disabled behavior or authorize a release.
+T3 navigation, DOM reads, clicks, typing and keyboard interaction worked, but
+screenshot capture and viewport resizing repeatedly failed. The user then
+explicitly authorized an isolated headless browser. The final Chromium checks
+below complete the plan's keyboard, accessible-label and narrow-layout checks.
+A manual screen-reader walkthrough was not performed; this is not a claim of
+comprehensive accessibility conformance. No installed desktop/native OIDC
+walkthrough is claimed. The scope preserves native pairing rather than adding
+native OIDC. Production provider interoperability, real mailbox delivery and
+deployment remain outside the approved isolated qualification.
 
 ## Final rebuilt presentation
 
@@ -229,17 +229,94 @@ checks, the committed pending request still granted no access, fresh email login
 worked, and administrator UI denial persisted. The interruption remains a
 stability observation, not a clean uninterrupted walkthrough pass.
 
-Final source/test review accepted `c85b07f`. Current-head contract, clients/Go
-and notices CI pass. Final-head integration run `38435524333` failed its smoke
-and operations checks on ten-second first-call capabilities timeouts; its other
-integration checks passed. The failing receipt/logs are preserved. Kyoto job
-`94c55be85dbb43e09f5fa1e0d0b36b79` reran those exact scripts on the recorded
-`c85b07f` artifact: smoke passed in 6.539 seconds and operations in 12.189 seconds.
-A separate first capabilities call took 6.099 seconds versus 0.228 seconds warm;
-executable hashing is a plausible cold-start cause, not a demonstrated CI root
-cause. No assertions or timeouts were weakened. GitHub disallows rerunning the
-failed job while sibling jobs are running; that CI rerun remains outstanding.
-Final fast Rust CI `38435524612` passed formatting, Clippy and fast tests in
-13m32s. Heavy/package jobs remain pending. The
-application's preceding `ad0b481` fast Rust CI and real-process upgrade/restore
-CI passed. No application Rust changed after that checkpoint.
+## CI timeout investigation and final executable
+
+CI integration runs `38435524333` (`c85b07f`) and `38437953691` (`c50da03`)
+failed smoke and operations on ten-second first-call capabilities timeouts;
+their other integration checks passed. Receipts/logs are preserved. The earlier
+Kyoto rerun `94c55be85dbb43e09f5fa1e0d0b36b79` passed the unchanged scripts on
+`c85b07f` in 6.539 / 12.189 seconds. An unprofiled first capabilities call took
+6.099 seconds versus 0.228 seconds warm. Sampling a later cold request captured
+software SHA-256 on an async worker; only two samples were captured, so no
+statistical dominance claim is made. That profiled request took 10.266 seconds.
+
+`c9885e1` enables the maintained `sha2` accelerated implementation and moves
+both executable reading and hashing into `spawn_blocking`. The cached SHA-256
+identity and failure behavior remain unchanged. This is derived artifact metadata
+and adapter scheduling, not a domain-state transition. Dependency notices include
+`sha2-asm`. No assertion or HTTP timeout was weakened.
+
+The final application source is `1a753851f0b8b38c85dc1887df845f44a08487e8`.
+Kyoto compile `cfc8a610f6bf411a80c59d99925682f9` succeeded after one pressure
+deferral. Separate execution `f3d3a79ba9a24e3490e614151ab35b35` passed all
+**98 affected native tests**: server library 73, sign-in API 17, protocol 1,
+contract 5, UI library 2. These repeat tests in the 348-distinct-test total above;
+they are not 98 additional distinct tests. Bridge tests passed 61/61 after the
+final wording change. Structural/JSON contract validation passed 142 paths,
+201 operations and 213 schemas.
+
+The final preserved server is 131,397,800 bytes, SHA-256
+`5985ac53394947f477cd6210a4fa28e6e4b253d696210b7f8c244ca128bccfc1`.
+Its cold capabilities request completed in 0.9187 seconds, followed by
+0.0049 / 0.0043 seconds warm. All three reported digests matched an independent
+Python SHA-256 calculation. Kyoto execution `b59cd3a5e0044750839b4535089b16b4`
+passed the unchanged smoke and operations scripts in 1.638 / 2.316 seconds.
+The CI rerun remains a separate gate; local latency evidence alone does not
+establish the remote runner's causal diagnosis.
+
+Receipts: `server-1a75385-receipt.json`, `native-1a75385-receipt.json`,
+`capabilities-1a75385-timing.json`, `integration-1a75385/receipt.json`,
+`cold-capabilities-profile.json` and `cold-capabilities-sample.txt`.
+Superseded compiles `756c536fdff344df9be5fc33fe68e23a` (pressure deferred) and
+`717a0104a068438b90fb7bcd33cd34ec` (33-second cancellation to preserve JSON
+formatting) are not counted as passes. The final JSON differs only in the new
+administrator-device count description; API shape is unchanged.
+
+## Final headless browser evidence
+
+The user-approved isolated Chromium 149.0.7827.55, Playwright 1.61.1 and axe-core
+4.11.1 exercised the recorded `1a75385` executable. Fresh genuine OIDC and email
+logins in separate browser contexts each returned authenticated `/me` and loaded
+My sign-in methods for the intended administrator. No browser context received
+the operator token. Codes were read only from the isolated SMTP sink.
+
+All **27 viewport/state audits** passed with zero reported axe violations,
+zero page JavaScript errors and no document horizontal overflow:
+
+- `/signin`, `/settings/access` and `/settings/signin` at widths 1440, 390 and
+  320 CSS pixels, each 1000 pixels high.
+- All eight administration sections at 1440 and 320 pixels, with their available
+  detail/disclosure forms expanded, including provider secrets, user grants,
+  invitations and destructive confirmations.
+- Incorrect email-code recovery at 390 and 320 pixels, including its accessible
+  alert and focus. Chromium exposes the alert as a polite, atomic live region.
+
+Screenshots were inspected at desktop and narrow widths. The initial audit found
+sidebar section-heading contrast of 3.62:1; `859b7f1` switched those headings to
+the existing muted color and the rebuilt audit passed. `93b9e13` / `1a75385`
+clarify that usable administrator counts are devices, not independent people or
+recovery accounts; the final browser displays the explanation.
+
+Keyboard assertions checked visible Skip to content, Enter moving focus to main,
+Enter toggling disclosure state, and Tab reaching the labelled User name input
+with a visible 2px outline. The browser accessibility tree exposes the expected
+headings, controls, labels and live regions. Axe ran WCAG 2 A/AA and 2.1 AA rules.
+Nine audit states retained incomplete contrast evaluations on fixed mobile brand
+or navigation labels because axe could not resolve the overlapping backdrop.
+Follow-up inspection identified those labels, screenshots showed them readable,
+and worst-case white-behind-backdrop calculations give 5.779:1 for muted labels
+and 12.497:1 for the brand. These manual checks are recorded separately from the
+automated result. Physical mobile hardware, touch behavior, other browser engines
+and a manual screen reader were not qualified.
+
+Evidence is under `motion-auth-signin-artifacts/headless/1a75385/`:
+`final-report.json`, screenshots, `final-accessibility-tree.json`,
+`contrast-review.json`, `contrast-manual.json` and `fresh-logins.json`.
+Harness scripts are in the parent `headless/` directory; private browser storage
+and mail stay outside Git. GPT-6.1 Sol accepted the implementation and each final
+fix; review is not substituted for runtime evidence.
+
+This ledger records completed local qualification at the application-source
+checkpoint above. GitHub checks and the PR description track the subsequent
+final-head CI outcome separately; a queued or running job is not a pass.
+No PR merge, deployment or fully qualified production release is claimed.

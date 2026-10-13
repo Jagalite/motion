@@ -1,18 +1,19 @@
 # Motion SSO, email sign-in and administrator access screen
 
-Status (2026-10-13): A1–A4 implemented and qualified with isolated local OIDC/mail
-services in [PR #38](https://github.com/Jagalite/motion/pull/38), stacked on
-[PR #36](https://github.com/Jagalite/motion/pull/36). A5 recovery/model/API work,
-review and documentation are implemented; presentation qualification and a CI
-integration rerun remain open. This is not a shipped or fully qualified release.
+Status (2026-10-13): A1–A5 implemented, reviewed and qualified within the
+isolated local OIDC/mail scope in [PR #38](https://github.com/Jagalite/motion/pull/38),
+stacked on [PR #36](https://github.com/Jagalite/motion/pull/36). This is not a
+shipped or fully qualified production release. Final-head CI is tracked on the PR.
 
 See [the qualification ledger](qualification/auth-signin/README.md) for exact
-source/artifact receipts: 346 native tests plus two added OIDC adapter fault tests,
-61 bridge tests, genuine-provider/mail browser flows and final rebuilt UI checks.
-T3 screenshot/resize failures block visual/narrow-screen sign-off; an alternative
-browser choice is pending. Final-head CI smoke/operations timed out on first
-capabilities reads, while both exact scripts passed locally through Kyoto.
-The ledger also retains an isolated-server SQLite-busy exit and its recovery.
+source/artifact receipts: 348 distinct native tests across checkpoints, 98 affected
+tests rerun on final application source, 61 bridge tests, genuine provider/mail
+browser flows and 27 final headless viewport/state audits. The user-approved
+headless browser resolved the earlier T3 screenshot/resize qualification gap.
+Keyboard, labels, narrow layouts and targeted accessibility checks passed; a
+manual screen-reader walkthrough and physical mobile hardware remain unqualified.
+The ledger retains the CI timeout diagnosis/fix and isolated-server SQLite-busy
+interruption, including recovery evidence and the limits of each claim.
 Original source-review baseline: local main `28f4b32`, 2026-10-12.
 
 ## Outcome and scope
