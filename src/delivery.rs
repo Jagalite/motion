@@ -5504,7 +5504,15 @@ async fn ensure_subtitles(
     // and only while its fingerprint is still the pinned one.
     let text = match &selected {
         SubtitleSource::Embedded(index) => {
-            convert_subtitle(&app, &session.id, session.source.clone(), None, *index).await?
+            convert_subtitle(
+                &app,
+                &session.id,
+                session.source.clone(),
+                None,
+                *index,
+                admission.clone(),
+            )
+            .await?
         }
         SubtitleSource::Sidecar(sidecar) => {
             let format = match sidecar
@@ -5526,7 +5534,15 @@ async fn ensure_subtitles(
                 fingerprint: sidecar.fingerprint.clone(),
                 ..session.source.clone()
             };
-            convert_subtitle(&app, &session.id, source, Some(format), 0).await?
+            convert_subtitle(
+                &app,
+                &session.id,
+                source,
+                Some(format),
+                0,
+                admission.clone(),
+            )
+            .await?
         }
         SubtitleSource::Parts(parts) => {
             if parts.len() != session.parts.len() + 1 {
@@ -5535,8 +5551,15 @@ async fn ensure_subtitles(
             let sources = std::iter::once(&session.source).chain(&session.parts);
             let mut converted = Vec::with_capacity(parts.len());
             for (source, (index, duration)) in sources.zip(parts) {
-                let text =
-                    convert_subtitle(&app, &session.id, source.clone(), None, *index).await?;
+                let text = convert_subtitle(
+                    &app,
+                    &session.id,
+                    source.clone(),
+                    None,
+                    *index,
+                    admission.clone(),
+                )
+                .await?;
                 let cues = std::str::from_utf8(&text)
                     .ok()
                     .and_then(playscale_core::subtitles::parse_webvtt)
@@ -5632,15 +5655,21 @@ pub(crate) async fn download_subtitles(
     revision: &str,
     index: u32,
 ) -> Result<Vec<u8>, ApiError> {
+    let artifacts = app
+        .processing
+        .artifacts
+        .pin([file_id.to_owned()])
+        .ok_or_else(subtitles_unavailable)?;
     let source = source_of(app, file_id, revision).await?;
-    let _slot = app
+    let slot = app
         .processing
         .deliveries
         .subtitle_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
-    let text = convert_subtitle(app, owner, source, None, index).await?;
+    let admission = Arc::new((slot, artifacts));
+    let text = convert_subtitle(app, owner, source, None, index, admission).await?;
     if !std::str::from_utf8(&text)
         .ok()
         .is_some_and(|t| playscale_core::subtitles::parse_webvtt(t).is_some())
@@ -5657,12 +5686,13 @@ pub(crate) async fn download_subtitles(
 /// Convert subtitle stream `index` of `source` (opened beneath its validated
 /// root, only while its fingerprint is the pinned one) to WebVTT in its file
 /// time, observing the descriptor again before the result is used.
-async fn convert_subtitle(
+async fn convert_subtitle<A: Send + Sync + 'static>(
     app: &App,
     owner: &str,
     source: Source,
     format: Option<&'static str>,
     index: u32,
+    admission: Arc<A>,
 ) -> Result<Vec<u8>, ApiError> {
     let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
