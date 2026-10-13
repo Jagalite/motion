@@ -238,6 +238,24 @@ pub fn compacted_epoch(
         .and_then(|e| e.media.viewing_epoch.clone())
 }
 
+/// A legacy compacted log can learn its epoch only while the existing
+/// manifest and the freshly authenticated server still name the same history.
+pub fn may_backfill_epoch(
+    base: u64,
+    base_epoch: Option<&str>,
+    history: &[OfflineEvent],
+    manifest_epoch: Option<&str>,
+    current: &str,
+) -> bool {
+    base > 0
+        && base_epoch.is_none()
+        && viewing_epoch(current)
+        && manifest_epoch == Some(current)
+        && history
+            .iter()
+            .all(|e| e.media.viewing_epoch.as_deref() == Some(current))
+}
+
 /// A device's request that a restored server continue its sequence after
 /// the device's compaction point (`downloads::reanchor`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -575,6 +593,14 @@ mod tests {
         let result = reapply(2, Some("s:old"), &[old, new.clone()], &[pin], "s:new").unwrap();
         assert_eq!(result.events, vec![new]);
         assert_eq!(result.dropped, 1);
+    }
+
+    #[test]
+    fn legacy_epoch_backfill_requires_a_confirmed_matching_history() {
+        assert!(may_backfill_epoch(7, None, &[], Some("s:old"), "s:old"));
+        assert!(!may_backfill_epoch(7, None, &[], Some("s:old"), "s:new"));
+        assert!(!may_backfill_epoch(7, None, &[], None, "s:old"));
+        assert!(!may_backfill_epoch(0, None, &[], Some("s:old"), "s:old"));
     }
 
     #[test]

@@ -335,11 +335,15 @@ pub async fn remove_profile(
     crate::v2::viewing::delete_profile(&mut tx, &id)
         .await
         .map_err(|p| ApiError::new(p.status, p.code, &p.detail))?;
+    crate::v2::downloads::delete_profile(&mut tx, &id)
+        .await
+        .map_err(|p| ApiError::new(p.status, p.code, &p.detail))?;
     sqlx::query("DELETE FROM profiles WHERE id=?")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    tokio::spawn(crate::v2::downloads::release_subtitles(app.clone()));
     Ok(StatusCode::NO_CONTENT)
 }
 

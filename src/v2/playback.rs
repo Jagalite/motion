@@ -1367,7 +1367,31 @@ pub async fn plan(
                 language: c.language.clone(),
                 roles: c.roles.clone(),
                 deliverable: c.deliverable
-                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text, false)),
+                    && route.is_none_or(|r| {
+                        core::presents_subtitle(r, c.burned, live_text, false)
+                            || (!multipart
+                                && accepts_burned
+                                && filters.subtitles
+                                && c.choice.1.is_none()
+                                && c.choice
+                                    .0
+                                    .and_then(|index| {
+                                        streams
+                                            .iter()
+                                            .filter(|t| t.kind == "subtitle")
+                                            .nth(index as usize)
+                                    })
+                                    .is_some_and(|track| {
+                                        playscale_core::delivery::presentation(
+                                            &track.codec,
+                                            false,
+                                            true,
+                                            true,
+                                        )
+                                        .is_some()
+                                    })
+                                && core::presents_subtitle(r, true, live_text, false))
+                    }),
             })
             .collect();
         let mode = match preferences.subtitle_mode.as_str() {
@@ -1409,7 +1433,7 @@ pub async fn plan(
         },
         _ => (None, None),
     };
-    let (subtitle, sidecar, burn) = match resolve_subtitle(
+    let (mut subtitle, sidecar, mut burn) = match resolve_subtitle(
         &mut conn,
         &bound.file,
         &streams,
@@ -1501,11 +1525,23 @@ pub async fn plan(
         || input.tracks.audio_component_id.is_some()
         || audio != default_audio;
     use playscale_core::processing::{Wanted, WantedSubtitle};
+    let prepared_subtitle = if automatic && !require {
+        match choose(Some(Route::Prepared)) {
+            AutomaticSubtitle::Selected(i)
+                if !candidates[i].burned && candidates[i].choice.1.is_none() =>
+            {
+                candidates[i].choice.0
+            }
+            _ => None,
+        }
+    } else {
+        subtitle
+    };
     let wanted = Wanted {
         audio,
         audio_chosen,
         default_audio,
-        subtitle: match (subtitle, &sidecar, &burn) {
+        subtitle: match (prepared_subtitle, &sidecar, &burn) {
             (None, None, None) => WantedSubtitle::None,
             // A text subtitle presented as text; a rendition may carry it.
             (Some(index), None, None) => WantedSubtitle::Text(index),
@@ -1591,7 +1627,7 @@ pub async fn plan(
         clipped: bound.clip.is_some(),
         multipart,
     };
-    let request = core::Request {
+    let mut request = core::Request {
         mode,
         range: input.client.transports.iter().any(|t| t == "http_range"),
         hls: input.client.transports.iter().any(|t| t == "hls"),
@@ -1626,6 +1662,49 @@ pub async fn plan(
             ));
         }
     }
+    // A route that cannot carry external text may still render the selected
+    // embedded text via libass. Decide again with the burn fact so stream-copy
+    // never silently drops it and conversion remains subject to normal policy.
+    let mut automatic_burn_resolved = false;
+    if let core::Plan::Ready(route) = decided
+        && !multipart
+        && sidecar.is_none()
+        && burn.is_none()
+        && !core::presents_subtitle(route, false, live_text, true)
+        && accepts_burned
+        && filters.subtitles
+    {
+        let candidate = if automatic && !require {
+            match choose(Some(route)) {
+                AutomaticSubtitle::Selected(i) if candidates[i].choice.1.is_none() => {
+                    candidates[i].choice.0
+                }
+                _ => None,
+            }
+        } else {
+            subtitle
+        };
+        if let Some(index) = candidate {
+            if let Ok((_, _, Some(selected_burn))) = resolve_subtitle(
+                &mut conn,
+                &bound.file,
+                &streams,
+                false,
+                accepts_burned,
+                filters.subtitles,
+                Some(index),
+                None,
+            )
+            .await?
+            {
+                subtitle = None;
+                burn = Some(selected_burn);
+                request.burn_in = true;
+                decided = core::plan(&bound.file.id, &source, &request);
+                automatic_burn_resolved = automatic && !require;
+            }
+        }
+    }
     // A prepared plan pins the chosen rendition and plays its default streams:
     // its only audio and, when it carries the selected text subtitle
     // (`processing::carries`), its only subtitle.
@@ -1637,7 +1716,7 @@ pub async fn plan(
                 .nth(i)
                 .ok_or_else(|| Problem::internal("prepared plan without rendition"))?;
             let audio = first_audio(&p.file);
-            let subtitle = match subtitle {
+            let subtitle = match prepared_subtitle {
                 None => None,
                 Some(_) => {
                     let streams: Vec<db::Track> =
@@ -1672,34 +1751,35 @@ pub async fn plan(
     }
     // "auto" adds a subtitle only if the planned route presents it; otherwise
     // the plan proceeds without one, as it would with no subtitles at all.
-    let (subtitle, sidecar, burn) = match automatic && !require {
-        true => match choose(Some(route)) {
-            AutomaticSubtitle::Selected(i) => {
-                let (embedded, name) = candidates[i].choice.clone();
-                for (part, ordinal) in chosen.parts.iter_mut().zip(&candidates[i].parts) {
-                    if candidates[i].burned {
-                        part.burn = Some(*ordinal);
-                    } else {
-                        part.subtitle = Some(*ordinal);
+    let (subtitle, sidecar, burn) =
+        match automatic && !require && route != Route::Prepared && !automatic_burn_resolved {
+            true => match choose(Some(route)) {
+                AutomaticSubtitle::Selected(i) => {
+                    let (embedded, name) = candidates[i].choice.clone();
+                    for (part, ordinal) in chosen.parts.iter_mut().zip(&candidates[i].parts) {
+                        if candidates[i].burned {
+                            part.burn = Some(*ordinal);
+                        } else {
+                            part.subtitle = Some(*ordinal);
+                        }
                     }
+                    resolve_subtitle(
+                        &mut conn,
+                        &chosen.file,
+                        &streams,
+                        accepts_text,
+                        accepts_burned,
+                        filters.subtitles,
+                        embedded,
+                        name,
+                    )
+                    .await?
+                    .unwrap_or((None, None, None))
                 }
-                resolve_subtitle(
-                    &mut conn,
-                    &chosen.file,
-                    &streams,
-                    accepts_text,
-                    accepts_burned,
-                    filters.subtitles,
-                    embedded,
-                    name,
-                )
-                .await?
-                .unwrap_or((None, None, None))
-            }
-            _ => (None, None, None),
-        },
-        false => (subtitle, sidecar, burn),
-    };
+                _ => (None, None, None),
+            },
+            false => (subtitle, sidecar, burn),
+        };
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -2222,9 +2302,7 @@ pub async fn create_delivery(
 ) -> Result<Response, Problem> {
     caller.require(Permission::PlaybackRequest)?;
     let key = idempotency_key(&headers)?;
-    // Admission decides tone mapping from the cached filter observation
-    // inside its write transaction: warm it first.
-    crate::processing::filters(&app).await;
+
     let input = body.value;
     let claims = open(&app, &input.plan_token)?;
     if claims.principal != caller.principal.id {
@@ -2235,6 +2313,16 @@ pub async fn create_delivery(
     // rechecks everything, including for an exact retry.
     if matches!(claims.route, Route::Remux | Route::AudioConvert) {
         may_probe(&app, &caller, &claims, None).await?;
+    }
+    let receipt_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM delivery_admissions WHERE principal=? AND request_key=?)",
+    )
+    .bind(&caller.principal.id)
+    .bind(&key)
+    .fetch_one(&app.db)
+    .await?;
+    if !receipt_exists && matches!(claims.route, Route::Transcode | Route::HardwareTranscode) {
+        crate::processing::filters(&app).await;
     }
     let owner = owner_of(&claims);
     let request = delivery::CreateRequest {
@@ -2472,7 +2560,28 @@ pub async fn change_delivery(
     body: Body<DeliveryChange>,
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
-    crate::processing::filters(&app).await;
+    // Exact receipts replay before external tool probes. Recheck below after
+    // observation, because another request may record the same key meanwhile.
+    {
+        let (mut tx, principal, _) = command(&app, &caller, &id).await?;
+        let durable = Scope {
+            principal: &principal.id,
+            operation: "changeDelivery",
+            target: &id,
+            key: &key,
+        };
+        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+            return Ok(replay);
+        }
+        tx.commit().await?;
+    }
+    if let DeliveryChange::Replan { plan_token, .. } = &body.value
+        && let Ok(claims) = open(&app, plan_token)
+        && claims.principal == caller.principal.id
+        && matches!(claims.route, Route::Transcode | Route::HardwareTranscode)
+    {
+        crate::processing::filters(&app).await;
+    }
     // A stream-copy replan needs the source's bitstream details: observe them
     // before the write transaction. A probe failure is reported only for a new
     // change, after an exact retry had the chance to replay.

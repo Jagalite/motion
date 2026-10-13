@@ -1179,6 +1179,16 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
         StatusCode::UNPROCESSABLE_ENTITY,
         "acknowledgement_ahead",
     );
+    let inconsistent = json!({"from_viewing_epoch": before, "through": "100"});
+    problem(
+        &sync(after.clone(), third.clone(), json!("2"), inconsistent).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_reanchor",
+    );
+    assert_eq!(
+        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+        0
+    );
     let reanchor = json!({"from_viewing_epoch": before, "through": "2"});
     let continued = sync(after.clone(), third.clone(), json!("2"), reanchor.clone()).await;
     assert_eq!(continued.status, StatusCode::OK, "{:?}", continued.body);
@@ -1677,6 +1687,41 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
         format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
     );
     assert_eq!(file["size_bytes"], bytes.len().to_string());
+    let current = f.get(&format!("/api/v2/downloads/{id}"), &auth).await;
+    assert_ne!(current.body["revision"], created.body["revision"]);
+    let media_size = created.body["size_bytes"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(
+        current.body["size_bytes"],
+        (media_size + bytes.len() as u64).to_string()
+    );
+    let report = |count| json!({"sequence":"1", "download_revision":current.body["revision"], "state":"verified_local", "bytes_received":count});
+    let partial = f
+        .call(
+            "PUT",
+            &format!("/api/v2/downloads/{id}/transfer"),
+            Some(report(media_size.to_string())),
+            &[("authorization", &auth)],
+        )
+        .await;
+    problem(
+        &partial,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_transfer",
+    );
+    let verified = f
+        .call(
+            "PUT",
+            &format!("/api/v2/downloads/{id}/transfer"),
+            Some(report((media_size + bytes.len() as u64).to_string())),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(verified.status, StatusCode::OK, "{}", verified.body);
+
     // The same bytes on every manifest read; another digest is refused.
     let again = f
         .get(&format!("/api/v2/downloads/{id}/manifest"), &auth)
@@ -1808,18 +1853,24 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     for read in [&first, &second, &third] {
         problem(
             read,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "download_subtitles_unavailable",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_conversion_failed",
         );
     }
     assert_eq!(conversions() - before, 1);
     let again = f.get(&path, &auth).await;
     problem(
         &again,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "download_subtitles_unavailable",
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subtitle_conversion_failed",
     );
-    assert_eq!(conversions() - before, 2);
+    assert_eq!(conversions() - before, 1);
+    // Clear only the test's terminal artifact to exercise transient failure replay.
+    sqlx::query("DELETE FROM download_subtitle_artifacts WHERE download_id=?")
+        .bind(&id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
 
     // A waiting read replays the failure it waited for as it was: an
     // expired source stays expired (not a retry)...

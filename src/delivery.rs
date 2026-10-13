@@ -1022,6 +1022,8 @@ const HLS_TIME_SECONDS: u64 = SEGMENT_SECONDS;
 enum ProbeFailure {
     /// FFprobe could not run, failed, or timed out and was reaped.
     Unavailable,
+    /// The process exited unsuccessfully or exceeded the output bound.
+    InvalidOutput,
     /// It timed out and did not exit when killed: ownership must be retained.
     Stalled(tokio::process::Child),
 }
@@ -1088,7 +1090,7 @@ async fn bitmap_display_sets_inner(
             *stuck = true;
             None
         }
-        Err(ProbeFailure::Unavailable) => None,
+        Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => None,
     };
     let stream = format!("s:{index}");
     let info: serde_json::Value = serde_json::from_slice(&owned(
@@ -1272,7 +1274,11 @@ async fn run_descriptor(
     let overflow = output.len() as u64 > max_output;
     match finished {
         Ok(Ok(status)) if status.success() && !overflow && rewind() => Ok(output),
-        Ok(_) => {
+        Ok(Ok(_)) => {
+            rewind();
+            Err(ProbeFailure::InvalidOutput)
+        }
+        Ok(Err(_)) => {
             rewind();
             Err(ProbeFailure::Unavailable)
         }
@@ -1281,7 +1287,11 @@ async fn run_descriptor(
             match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
                 Ok(_) => {
                     rewind();
-                    Err(ProbeFailure::Unavailable)
+                    Err(if overflow {
+                        ProbeFailure::InvalidOutput
+                    } else {
+                        ProbeFailure::Unavailable
+                    })
                 }
                 Err(_) => Err(ProbeFailure::Stalled(child)),
             }
@@ -1430,7 +1440,7 @@ async fn copy_keyframe(
             });
             return None;
         }
-        Err(ProbeFailure::Unavailable) => return None,
+        Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => return None,
     };
     let mut keyframes_us = Vec::new();
     let mut last_us = 0;
@@ -5553,7 +5563,11 @@ pub(crate) async fn download_subtitles(
         .ok()
         .is_some_and(|t| playscale_core::subtitles::parse_webvtt(t).is_some())
     {
-        return Err(subtitles_unavailable());
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_conversion_failed",
+            "The converted subtitle is invalid",
+        ));
     }
     Ok(text)
 }
@@ -5604,7 +5618,14 @@ async fn convert_subtitle(
     .await;
     let text = match converted {
         Ok(text) if text.starts_with(b"WEBVTT") => text,
-        Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
+        Ok(_) | Err(ProbeFailure::InvalidOutput) => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subtitle_conversion_failed",
+                "The selected subtitle cannot be converted within the supported bounds",
+            ));
+        }
+        Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
         Err(ProbeFailure::Stalled(mut child)) => {
             tracing::error!(%owner, "subtitle conversion did not exit when killed");
             // Keep the lock and slot until the converter is actually gone.
@@ -5728,7 +5749,9 @@ async fn ensure_burn_text(
         {
             text
         }
-        Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
+        Ok(_) | Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => {
+            return Err(subtitles_unavailable());
+        }
         Err(ProbeFailure::Stalled(mut child)) => {
             tracing::error!(delivery=%session.id, "subtitle extraction did not exit when killed");
             let _ = child.wait().await;

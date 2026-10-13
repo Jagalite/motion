@@ -309,6 +309,8 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return false;
     }
     const size = Number(file.size_bytes);
+    const transferSize = size + (subtitles?.size ?? 0);
+    download = {...download, revision: manifest.download_revision ?? download.revision, size_bytes: String(transferSize)};
     if (!(size > 0) || size > MAX_MEDIA_BYTES) {
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
@@ -335,7 +337,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (have === 0 && ((posterIdentity && (await cache(target.path, target.scope, ['recover'], entryFor(posterIdentity))).recovered)
         || (await cache(target.path, target.scope, ['recover'], entryFor(null))).recovered)) {
       writeAtomically(join(base, 'current.json'), {root: target.name});
-      await report(download, 'verified_local', size);
+      await report(download, 'verified_local', transferSize);
       return true;
     }
     if (have > size) { truncateSync(staged, 0); have = 0; }
@@ -436,7 +438,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     // Openable offline as soon as one verified copy exists, even if a later
     // transfer in this pass fails.
     writeAtomically(join(base, 'current.json'), {root: target.name});
-    await report(download, 'verified_local', size);
+    await report(download, 'verified_local', transferSize);
     return true;
   }
 
