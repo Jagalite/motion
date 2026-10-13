@@ -468,3 +468,62 @@ async fn snapshot_retirement_is_exact_and_reopening_invalidates_the_old_ticket()
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn snapshot_retirement_preserves_already_admitted_readers() {
+    let (dir, _) = fixture();
+    let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
+    let (status, _, bytes) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&bytes).unwrap();
+    let url = opened["media_url"].as_str().unwrap();
+    let reader = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(url)
+                .header("Host", "127.0.0.1:1234")
+                .header("Cookie", &cookie)
+                .header("Range", "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &url.replace("/cache/media/", "/cache/close/"),
+            &cookie,
+            Some(json!({})),
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", url, &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Closing prevents new readers, while the body admitted before close owns
+    // its snapshot until its actual read completes.
+    assert_eq!(
+        reader
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        b"2345"
+    );
+}

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Per-artifact ownership. The adapter supplies releases only from unique RAII
 /// guards; clones retain a guard rather than manufacturing independent releases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArtifactUse {
     Readers(u32),
     Cleaning,

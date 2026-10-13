@@ -48,6 +48,16 @@ async function releaseSnapshot() {
   const path = snapshotClosePath();
   if (path) await request(path, {});
 }
+async function disposePlayer() {
+  try {
+    await element?.destroy();
+  } finally {
+    // A decoder/provider teardown failure must not retain the host's disk copy.
+    // Readers already admitted by the host keep their own file handle.
+    element?.remove();
+    await releaseSnapshot();
+  }
+}
 async function close() {
   if (closing) return closing;
   closing = (async () => {
@@ -55,9 +65,7 @@ async function close() {
     unsubscribe?.();
     if (element?.player) observe({...element.player.state, status: element.player.state.status === 'ended' ? 'ended' : 'stopped'}, true);
     await flush(); // Failure keeps native close/navigation retryable.
-    await element?.destroy();
-    element?.remove();
-    await releaseSnapshot();
+    await disposePlayer();
   })().catch(error => { closing = null; fail(error); throw error; });
   return closing;
 }
@@ -73,7 +81,7 @@ async function start() {
   element.controls = true; element.showSourceControls = false; element.allowFileDrop = false;
   host.append(element);
   await element.open(context.media_url, {startTime: context.position_ms / 1000});
-  if (retired) { await element.destroy(); await releaseSnapshot(); return; }
+  if (retired) { await disposePlayer(); return; }
   host.querySelector('.status-panel')?.remove();
   host.dataset.state = 'ready';
   unsubscribe = element.player.subscribe(state => observe(state));
@@ -98,6 +106,5 @@ addEventListener('pagehide', () => {
 addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 if (host) void start().catch(async error => {
   host.dataset.state = 'failed'; fail(error);
-  await element?.destroy(); element?.remove();
-  await releaseSnapshot().catch(() => {});
+  await disposePlayer().catch(() => {});
 });

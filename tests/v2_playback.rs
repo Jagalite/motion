@@ -4185,18 +4185,68 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
             .unwrap(),
         1
     );
+    let id = delivery.body["id"].as_str().unwrap();
+    let generation = delivery.body["active"]["generation"].as_str().unwrap();
+    // Retain an admitted response without polling its body. It must own the
+    // generated file independently of the delivery's runtime lifetime.
+    let expected = std::fs::read(Path::new(&path.0).join(&path.1)).unwrap();
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v2/streams/{id}/{generation}/content"))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
     let removed = f
         .call(
             "DELETE",
-            &format!(
-                "/api/v2/playback/delivery-sessions/{}",
-                delivery.body["id"].as_str().unwrap()
-            ),
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
             None,
             &[("authorization", &auth)],
         )
         .await;
     assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.server.app.processing.deliveries.is_live(id) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("closed prepared delivery did not retire");
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0,
+        "an admitted response must retain its artifact after delivery retirement"
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), expected.as_slice());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let removed = playscale::maintenance::clean(&f.server.app).await.unwrap();
+            if removed == 1 {
+                break;
+            }
+            assert_eq!(removed, 0);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("generated artifact stayed pinned after its last reader completed");
+    assert!(!Path::new(&path.0).join(&path.1).exists());
+    let cleaned: (i64, i64, i64) = sqlx::query_as(
+        "SELECT f.available,p.expired,p.cache_cleaned FROM processing_jobs p JOIN media_files f ON f.id=p.output_file_id WHERE p.id=?",
+    )
+    .bind(&job)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(cleaned, (0, 1, 1));
 }
 
 /// One gray frame of `path` at `at` seconds (320x240 sources).

@@ -65,23 +65,67 @@ Review is static evidence, not compilation or runtime qualification.
 ### Completed verification so far
 
 - `scripts/test_backup.py`: one passing test.
-- Player/offline bridge and desktop downloads Node tests: 41 passed.
+- Player/offline bridge and desktop downloads Node tests: 44 passed, including
+  the follow-up teardown-failure and refused-progress regressions below.
 - OpenAPI validator: 104 paths, 157 operations, 164 schemas, 2,772 references.
 - All 47 migration files applied to isolated SQLite with foreign keys enabled;
   `foreign_key_check` returned no rows.
+- Publication privacy checks passed after replacing the Catabolic proposal's
+  machine-specific paths with source references relative to its repository.
+- Rust 1.98 formatting passed for all 30 Rust files changed by the repair branch;
+  `git diff --check` passed.
 - Kyoto compiled the terminal CLI test binary; executing that binary passed.
 - Rust Kyoto compilation found a lockfile dependency disambiguation and a missing
   import, both corrected. A compile concurrent with a core edit also observed
-  stale core declarations. A consolidated compile of the stable source is queued;
-  no Rust-test success is claimed yet.
+  stale core declarations. The pinned consolidated compile subsequently found
+  missing `Hash` on `ArtifactUse` and a non-static property-name parameter in
+  the artifact model test. Both are corrected; a replacement compile is queued.
+  No Rust-test success is claimed yet.
+
+### Follow-up review of the repair commits
+
+Reviewed the branch through `10087d9`, with independent review of the new fixes.
+Three defects in the submitted changes were corrected:
+
+- **Download pagination:** flattening `PageQuery` through the URL deserializer
+  buffered numeric limits as strings, rejecting clients' ordinary `limit=200`
+  requests. Explicit typed query fields now feed the existing pagination policy.
+  The new router regression covers active/history filtering, continuation with
+  a changed page size, and invalid inputs.
+- **Offline snapshot disposal:** rejected player teardown skipped exact-ticket
+  release during close and failed startup. Disposal now releases in `finally`.
+  A refused final progress write still prevents disposal and retains retry state.
+  All three Node regressions passed as part of the 44-test client suite.
+- **Publication:** the new Catabolic proposal included absolute local paths,
+  failing the repository publication check. All 40 external source references
+  retain their repository-relative paths and the reviewed commit identity.
+
+Two adapter regressions also strengthen ownership coverage: an admitted offline
+range response remains readable after its ticket closes, and an admitted prepared
+media response pins its artifact after delivery retirement until the last reader
+completes, then permits durable cleanup. These Rust regressions await compilation
+and execution. No additional production defect was confirmed in the reviewed
+restore, scan/watch, migration, component, playback or artifact-lease changes.
+
+The follow-up fixes concern transport decoding and adapter resource disposal.
+Core download authority, artifact admission, and offline event decisions are
+unchanged; no additional state transition or model rule is introduced. Real HTTP
+and byte-body tests check adapter conformance separately from the existing
+bounded artifact model. This review does not close the fourteen findings below.
 
 ### Kyoto verification handoff
 
 Shared queue owner: `2d141a38-74f5-48f3-a8c6-6f82288224f1`.
 Dedicated target resource: this worktree's `target` directory.
 
-- `e34ff990bb82449f9681c41be39b9d99`: consolidated Rust compile, queued against
-  implementation source `5d12744`; pressure deferrals may change its start time.
+- `e34ff990bb82449f9681c41be39b9d99`: cancelled before launch. Its inherited
+  environment did not pin `RUSTC`; the prior target cache reported Rust 1.99.
+- `29d27faa34cc43ddb6b6246e6fa91326`: replacement consolidated compile including
+  the follow-up regressions, with Cargo, `RUSTC`, and `RUSTDOC` explicitly pinned
+  to 1.98.0. Failed with the two artifact-model compilation errors recorded above.
+- `751fca1d83dd49c8a71291c885f357d1`: pinned replacement compile after adding
+  the state hash derive and making literal property names explicitly static.
+  Submitted October 13; completion and regression execution remain pending.
 - `0768ee27f6f84737ba9397686d311ebf`: Go CLI test compilation succeeded; compiled
   CLI suite executed separately and passed.
 - Earlier Rust attempts found the corrected lock/import errors. Superseded host,
@@ -91,7 +135,7 @@ Dedicated target resource: this worktree's `target` directory.
 The queued command is:
 
 ```sh
-cargo test --locked --jobs 1 --workspace --lib \
+cargo +1.98.0 test --locked --jobs 1 --workspace --lib \
   --test catalog_persistence --test v2_metadata_processing \
   --test v2_playback --test v2_downloads --test cache --test contract \
   --test access_api --test artifact_leases_model --no-run \

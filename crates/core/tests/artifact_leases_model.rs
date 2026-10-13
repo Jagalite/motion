@@ -70,7 +70,7 @@ impl Model for Leases {
         ])
     }
 }
-fn check(name: &str, value: bool) -> Check {
+fn check(name: &'static str, value: bool) -> Check {
     if value {
         Check::passed(name)
     } else {
