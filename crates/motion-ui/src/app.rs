@@ -830,6 +830,28 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <button type="button" data-player-action="next">icon(name: "next") <span>"Next title"</span></button>
                 <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
             </div>
+            // Skip buttons appear while playback is inside their interval
+            // (the player shows them); chapters are always listed.
+            for marker in view_model.markers.iter().filter(|m| m.kind != "chapter" && m.end_ms.is_some()) {
+                <button type="button" class="player-skip" hidden=(true)
+                    data-player-seek=(marker.end_ms.unwrap_or(0)) data-marker-start=(marker.start_ms) data-marker-end=(marker.end_ms.unwrap_or(0))>
+                    (match marker.kind.as_str() { "intro" => "Skip intro", "recap" => "Skip recap", _ => "Skip credits" })
+                    if marker.detected { <span class="muted small">" (detected)"</span> }
+                </button>
+            }
+            if view_model.markers.iter().any(|m| m.kind == "chapter") {
+                <details class="player-chapters">
+                    <summary>"Chapters"</summary>
+                    <ol class="rows">
+                        for (n, marker) in view_model.markers.iter().filter(|m| m.kind == "chapter").enumerate() {
+                            <li><button type="button" data-player-seek=(marker.start_ms)>
+                                (format!("{} · {}", clock(marker.start_ms), marker.label.clone().unwrap_or_else(|| format!("Chapter {}", n + 1))))
+                                if marker.detected { <span class="muted small">" (detected)"</span> }
+                            </button></li>
+                        }
+                    </ol>
+                </details>
+            }
             <details class="player-options">
                 <summary>"Playback options"</summary>
                 <div class="player-options-body">

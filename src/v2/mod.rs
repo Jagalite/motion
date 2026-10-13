@@ -12,6 +12,7 @@ pub mod events;
 pub mod identity;
 pub mod jobs;
 pub mod libraries;
+pub mod markers;
 pub mod metadata;
 pub mod monitor;
 pub mod organization;
@@ -814,6 +815,7 @@ pub fn router() -> Router<App> {
         .merge(playback::routes())
         .merge(processing::routes())
         .merge(downloads::routes())
+        .merge(markers::routes())
         .fallback(|| async { Problem::not_found() })
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(request_scope))

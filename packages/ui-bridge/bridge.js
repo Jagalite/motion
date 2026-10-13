@@ -57,6 +57,8 @@ function bodyOf(form) {
       case 'list': place(body, name, input.value.split(',').map(v => v.trim()).filter(Boolean)); break;
       case 'json': place(body, name, JSON.parse(input.value)); break;
       case 'minutes': place(body, input.dataset.target, Math.round(Number(input.value) * 60)); break;
+      // Seconds entered, whole milliseconds sent; blank is null.
+      case 'seconds-ms': place(body, name, text === '' ? null : Math.round(Number(text) * 1000)); break;
       // Blank optional fields are omitted: the server reads absence as "no value".
       case 'optional': if (text !== '') place(body, name, input.value); break;
       case 'optional-int': if (text !== '') place(body, name, Number(text)); break;

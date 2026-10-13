@@ -679,6 +679,23 @@ impl UiQueryFacade for Queries {
                 audio_tracks,
                 audio_version: audio_source.as_ref().map(|s| s.0.clone()),
                 audio_file: audio_source.map(|(_, file, revision)| (file, revision)),
+                // Chapters and skip markers in effect; none if unreadable.
+                markers: self
+                    .list(&format!(
+                        "/catalog/timelines/{}/markers?effective=true&limit=200",
+                        segment(timeline_id)
+                    ))
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|m| MarkerView {
+                        kind: text(m, "kind"),
+                        start_ms: m["start_ms"].as_u64().unwrap_or(0),
+                        end_ms: m["end_ms"].as_u64(),
+                        label: m["label"].as_str().map(str::to_owned),
+                        detected: m["provenance"] == "detected",
+                    })
+                    .collect(),
             })
         })
     }
@@ -1352,8 +1369,56 @@ impl UiQueryFacade for Queries {
             } else {
                 None
             };
+            // Chapters and skip markers of each timeline, all of them (stale
+            // and uncertain ones shown as such), for correction.
+            let markers = if write {
+                async {
+                    let editions = self
+                        .complete_list(&format!("{path}/editions?limit=200"))
+                        .await?;
+                    let mut out = Vec::new();
+                    for t in self
+                        .complete_list(&format!("{path}/timelines?limit=20"))
+                        .await?
+                    {
+                        let revision = text(&t, "revision");
+                        let rows = self
+                            .list(&format!(
+                                "/catalog/timelines/{}/markers?limit=200",
+                                segment(&text(&t, "id"))
+                            ))
+                            .await?;
+                        out.push(TimelineMarkersView {
+                            timeline_id: text(&t, "id"),
+                            edition: editions
+                                .iter()
+                                .find(|e| e["id"] == t["edition_id"])
+                                .map(|e| text(e, "label"))
+                                .unwrap_or_default(),
+                            markers: rows
+                                .iter()
+                                .map(|m| StoredMarkerView {
+                                    kind: text(m, "kind"),
+                                    start_ms: m["start_ms"].as_u64().unwrap_or(0),
+                                    end_ms: m["end_ms"].as_u64(),
+                                    label: m["label"].as_str().map(str::to_owned),
+                                    provenance: text(m, "provenance"),
+                                    current: text(m, "timeline_revision") == revision,
+                                })
+                                .collect(),
+                            revision,
+                        });
+                    }
+                    UiResult::Ok(out)
+                }
+                .await
+                .ok()
+            } else {
+                None
+            };
             Ok(ItemManageView {
                 item: card,
+                markers,
                 item_revision,
                 merge_candidates,
                 versions,

@@ -157,6 +157,20 @@ pub struct PlayerView {
     pub audio_version: Option<String>,
     /// The exact file revision `audio_tracks` describe; a chosen track pins it.
     pub audio_file: Option<(String, String)>,
+    /// Markers in effect for the timeline's current revision, by start.
+    pub markers: Vec<MarkerView>,
+}
+
+/// A chapter or a skippable interval (intro, recap, credits) of a timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerView {
+    /// chapter | intro | recap | credits
+    pub kind: String,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub label: Option<String>,
+    /// Found automatically and not confirmed: shown as uncertain.
+    pub detected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -421,6 +435,30 @@ pub struct ItemManageView {
     pub playlists: Option<Vec<MembershipRow>>,
     /// Play orders (catalog:write).
     pub ordering: Option<OrderingView>,
+    /// Chapters and skip markers per timeline (catalog:write).
+    pub markers: Option<Vec<TimelineMarkersView>>,
+}
+
+/// One stored marker as listed for correction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMarkerView {
+    pub kind: String,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub label: Option<String>,
+    /// embedded | manual | detected | imported
+    pub provenance: String,
+    /// Validated against the timeline's current revision (else not in effect).
+    pub current: bool,
+}
+
+/// A timeline's markers and the revision a new one is checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineMarkersView {
+    pub timeline_id: String,
+    pub edition: String,
+    pub revision: String,
+    pub markers: Vec<StoredMarkerView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

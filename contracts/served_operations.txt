@@ -18,6 +18,7 @@ createDelivery
 createDownload
 createEdition
 createLibrary
+createMarker
 createMatch
 createOrderGroup
 createPairing
@@ -112,6 +113,7 @@ listItemRelationships
 listItemTimelines
 listJobs
 listLibrarys
+listMarkers
 listMatches
 listPlaybackHistory
 listPlaybackSessions

@@ -467,3 +467,22 @@ test('a live generation selects its in-manifest subtitle rendition, never an ext
   await assert.rejects(prepare(generation, 12000, () => true), /cannot present the selected subtitle/);
   assert.deepEqual(calls.map(c => c[0]), ['open', 'seek', 'destroy', 'remove']);
 });
+
+test('skip buttons are shown only inside their marker interval', () => {
+  const buttons = [
+    {dataset: {markerStart: '5000', markerEnd: '65000'}, hidden: true},
+    {dataset: {markerStart: '3000000', markerEnd: '3100000'}, hidden: true},
+  ];
+  const {showSkips} = runInNewContext(source.replace('export {close, maintainLease};', '({showSkips});'), {
+    document: {getElementById: () => null, querySelector: () => null, querySelectorAll: () => buttons, addEventListener() {}},
+    addEventListener() {},
+  });
+  showSkips(4999);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, true]);
+  showSkips(5000);
+  assert.deepEqual(buttons.map(b => b.hidden), [false, true]);
+  showSkips(65000);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, true]);
+  showSkips(3050000);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, false]);
+});

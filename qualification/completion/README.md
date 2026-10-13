@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | Not started | — | After item 1 |
-| 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
+| 6 M5 convenience and receiver | 6A implemented; 6B–6E not started | markers PR | Tests, Sol review |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -406,9 +406,64 @@ Not started. Depends on item 1.
 
 ## 6. M5 convenience and receiver work
 
-Not started. Existing primitives to inventory first: `crates/core/src/markers.rs`,
-`src/markers.rs`, migration 0030. Physical receiver qualification needs
-hardware; if unavailable the exact blocked check will be named here.
+### Inventory (before implementation)
+
+| Primitive | State at `3fc8b84` |
+|---|---|
+| Marker storage (migration 0030), core `markers` (validation, provenance precedence, effective view), adapter `src/markers.rs` | Implemented, not served |
+| `listMarkers`, `createMarker` contract operations | Contract only (`implementation_target`) |
+| Embedded chapter extraction, intro/credits detection | Missing (no producer of `embedded`/`detected` markers) |
+| Server-generated previews (trick-play thumbnails) | Missing; `preview` schedules refused (`schedule_task_unavailable`) |
+| Player chapter/skip UI | Missing |
+| TV/cast receiver | Missing; `cast` listed unsupported |
+
+### 6A. Marker API, correction UI and player exposure
+
+- **Source SHA:** branch `plan-completion/markers`, stacked on item 4.
+- **Implemented:**
+  - `listMarkers` and `createMarker` are served (`src/v2/markers.rs`).
+    Reading needs `catalog:read` and a readable timeline. Creating needs
+    `catalog:write`, the whole work in scope, an Idempotency-Key and the
+    timeline revision the caller reviewed (409 `timeline_changed` otherwise).
+    Created markers are `manual`. Core precedence makes a manual marker the
+    effective one over embedded, imported and detected markers, which stay
+    listed. `listMarkers?effective=true` (additive) returns the core
+    effective view for the current revision. Every marker carries its
+    provenance and the revision it was validated against.
+  - Manage page "Chapters and skip markers": every marker per timeline in
+    words ("detected, unconfirmed"; "not in effect (earlier timeline)") and an
+    "Add marker" form (seconds entered, milliseconds sent) checked against the
+    revision shown.
+  - Player: effective chapters as seek buttons, and "Skip intro/recap/credits"
+    buttons the player shows only while playback is inside the interval,
+    labelled "(detected)" when uncertain. Seeks go through the generation API
+    like the position form.
+- **Unsupported / limits:** no marker deletion or editing operation exists
+  in the contract; corrections add a manual marker that takes precedence.
+  Nothing produces `embedded` or `detected` markers yet (chapter extraction
+  and intro/credits detection are not implemented).
+- **Core/adapter boundary:** validation, precedence and the effective view
+  are the existing core decisions; the adapter reads facts and enforces the
+  revision fence and scope in one write transaction.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `tests/v2_catalog.rs` `markers_are_revision_bound_and_manual_corrections_take_effect` | passed. Detected and embedded markers are listed with provenance; a manual intro outranks the detected one in `effective=true`; exact replay is idempotent; refusals cover a stale revision (409), an open-ended intro (422), no write permission (403) and outside scope (404); after the timeline changes the old markers stay listed but none is in effect |
+  | `tests/contract.rs` (served-operation ledger) | 5 passed with `listMarkers` and `createMarker` served |
+  | `crates/motion-ui/tests/compose.rs` | 22 passed. New: manage-page marker list and form; player chapter and skip buttons with the detected label |
+  | `tests/access_api.rs`, `tests/m3_workflows.rs` | 39 and 2 passed (pages that changed) |
+  | `node --test packages/ui-bridge` | 43 passed. New: skip buttons only inside their interval; seconds sent as milliseconds |
+- **Review:** pending (GPT-6.1 Sol).
+
+### Remaining item 6 work (not started)
+
+| Slice | Next step | Blocker |
+|---|---|---|
+| 6B embedded chapter extraction | Probe `-show_chapters` at scan; record `embedded` markers per timeline revision | None |
+| 6C server-generated previews | Bounded trick-play thumbnail job with publication validation, cancellation, retention and access control; then enable `preview` schedules | None |
+| 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
+| 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |
 
 ## 7. M6 and wider parity backlog
 

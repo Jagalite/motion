@@ -275,6 +275,16 @@ async fn player_page_emits_a_stable_host_and_external_module() {
     assert!(html.contains(r#"data-resume-ms="1830000""#));
     assert!(html.contains(r#"data-demuxe-base="/assets/demuxe/""#));
     assert!(html.contains(&format!(r#"src="{}""#, assets::PLAYER.url())));
+    // Markers: a skip button the player reveals inside its interval, marked
+    // uncertain when detected, and chapters that seek.
+    assert!(
+        html.contains(
+            r#"data-player-seek="65000" data-marker-start="5000" data-marker-end="65000""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Skip intro") && html.contains("(detected)"));
+    assert!(html.contains(r#"data-player-seek="0""#) && html.contains("Departure"));
     assert_strict_markup(&html);
 }
 
@@ -686,6 +696,18 @@ async fn title_management_names_exact_operations_and_unsupported_parts() {
         html.contains(r#"name="order_position" data-type="number" value="3""#),
         "{html}"
     );
+    // Markers: listed with provenance and effect; a new one is checked
+    // against the timeline revision the page showed.
+    assert!(
+        html.contains("Intro 0:05–1:05 · detected, unconfirmed"),
+        "{html}"
+    );
+    assert!(html.contains("not in effect (earlier timeline)"));
+    assert!(html.contains(
+        r#"data-command="POST /api/v2/catalog/timelines/tl-mock/markers" data-idempotent="true""#
+    ));
+    assert!(html.contains(r#"name="timeline_revision" data-type="text" value="3""#));
+    assert!(html.contains(r#"name="start_ms" data-type="seconds-ms""#));
     // Artwork upload sends the file itself; selection is checked against the item.
     assert!(html.contains(
         r#"data-command="POST /api/v2/catalog/items/item1/artwork" data-idempotent="true""#

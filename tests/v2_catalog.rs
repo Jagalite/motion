@@ -2640,3 +2640,147 @@ async fn batched_item_reads_apply_the_catalog_scope_and_skip_aliases() {
         .await;
     problem(&reply, StatusCode::BAD_REQUEST, "invalid_query");
 }
+
+#[tokio::test]
+async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    let op = bearer(OPERATOR);
+    let path = "/api/v2/catalog/timelines/film-a-ed/markers";
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-a-ed",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(timeline.status, StatusCode::OK, "{}", timeline.body);
+    let revision = timeline.body["revision"].as_str().unwrap().to_owned();
+    // A detected intro and embedded chapters, recorded against this revision.
+    for (id, kind, start, end, provenance) in [
+        ("det-intro", "intro", 1_000, Some(5_000), "detected"),
+        ("chap-1", "chapter", 0, None, "embedded"),
+        ("chap-2", "chapter", 60_000, None, "embedded"),
+    ] {
+        sqlx::query("INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) VALUES (?,'film-a-ed',?,?,?,?,NULL,?)")
+            .bind(id)
+            .bind(revision.parse::<i64>().unwrap())
+            .bind(kind)
+            .bind(start)
+            .bind(end)
+            .bind(provenance)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let all = f.call("GET", path, None, &[("authorization", &op)]).await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    assert_eq!(ids(&all), ["chap-1", "det-intro", "chap-2"]);
+    assert_eq!(all.body["items"][1]["provenance"], "detected");
+
+    // A manual correction outranks the detected intro in the effective view.
+    let input = json!({"timeline_revision":revision,"kind":"intro","start_ms":2000,"end_ms":6000,"label":"Opening"});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "marker-create-0000001"),
+    ];
+    let created = f.call("POST", path, Some(input.clone()), &headers).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(created.body["provenance"], "manual");
+    let replay = f.call("POST", path, Some(input.clone()), &headers).await;
+    assert_eq!(replay.body, created.body);
+    let effective = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(
+        ids(&effective),
+        ["chap-1", created.body["id"].as_str().unwrap(), "chap-2"]
+    );
+
+    // Refusals: a stale revision, an open-ended intro, no write permission,
+    // a title outside the caller's scope.
+    let mut stale = input.clone();
+    stale["timeline_revision"] = json!("999");
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(stale),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000002"),
+            ],
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "timeline_changed",
+    );
+    let mut open = input.clone();
+    open["end_ms"] = Value::Null;
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(open),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000003"),
+            ],
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_interval",
+    );
+    let reader = f.device(&["catalog:read"], &[&f.a]).await;
+    assert_eq!(
+        f.call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &reader),
+                ("idempotency-key", "marker-create-0000004")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.call("GET", path, None, &[("authorization", &reader)])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let outsider = f.device(&["catalog:read", "catalog:write"], &[&f.b]).await;
+    assert_eq!(
+        f.call("GET", path, None, &[("authorization", &outsider)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // After the timeline changes, the old markers stay listed but none is in effect.
+    sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id='film-a-ed'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let effective = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert!(ids(&effective).is_empty(), "{}", effective.body);
+    assert_eq!(
+        ids(&f.call("GET", path, None, &[("authorization", &op)]).await).len(),
+        4
+    );
+}

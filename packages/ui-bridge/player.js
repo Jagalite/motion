@@ -388,6 +388,7 @@ function observeViewing(element, generation, writer, current) {
     const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
     const output = document.getElementById('motion-position');
     if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
+    if (Number.isSafeInteger(logical)) showSkips(logical);
     if (!writer) {
       if (observation.status === 'ended' && host.dataset.autoplay === 'true') void playNext(current);
       return;
@@ -856,6 +857,13 @@ function close({unloading = false} = {}) {
   return state.closing;
 }
 
+/** Show each skip button only while playback is inside its marker's interval. */
+function showSkips(logical) {
+  for (const button of document.querySelectorAll('[data-marker-end]')) {
+    button.hidden = !(logical >= Number(button.dataset.markerStart) && logical < Number(button.dataset.markerEnd));
+  }
+}
+
 const controls = document.getElementById('motion-playback-controls');
 controls?.addEventListener('submit', event => {
   event.preventDefault();
@@ -863,6 +871,14 @@ controls?.addEventListener('submit', event => {
   if (!Number.isSafeInteger(position) || position < 0 || (Number(host.dataset.durationMs) > 0 && position > Number(host.dataset.durationMs))) { status('Choose a position within this title.', 'alert'); return; }
   // Explicit logical seek uses the generation API, including range routes,
   // so the server preserves source and generation preconditions consistently.
+  void changePlayback({kind: 'seek', position_ms: position});
+});
+// Chapters and skip buttons seek through the generation API, like the form.
+document.addEventListener('click', event => {
+  const target = event.target?.closest?.('[data-player-seek]');
+  if (!target || !state.element || state.changing) return;
+  const position = Number(target.dataset.playerSeek);
+  if (!Number.isSafeInteger(position) || position < 0) return;
   void changePlayback({kind: 'seek', position_ms: position});
 });
 controls?.addEventListener('click', event => {

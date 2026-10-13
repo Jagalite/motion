@@ -6194,6 +6194,15 @@
           },
           {
             "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "effective",
+            "in": "query",
+            "required": false,
+            "description": "Only the markers in effect for the timeline's current revision (a manual correction outranks embedded, imported and detected markers). Otherwise every marker, each with the timeline revision it was validated against and its provenance.",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ]
       },

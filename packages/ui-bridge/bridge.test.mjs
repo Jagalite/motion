@@ -288,3 +288,9 @@ test('filter terms are typed and only chosen criteria are sent', () => {
   // No criteria at all is an empty conjunction, not a missing field.
   assert.deepEqual(JSON.parse(JSON.stringify(bridge.bodyOf(form([term('title', 'contains', 'text', '')])))), {all: []});
 });
+
+test('seconds are sent as whole milliseconds and blank as null', () => {
+  const bridge = harness();
+  const body = bridge.bodyOf(form([input('start_ms', 'seconds-ms', '12.3456'), input('end_ms', 'seconds-ms', ' ')]));
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), {start_ms: 12346, end_ms: null});
+});

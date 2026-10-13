@@ -16,7 +16,7 @@ use topcoat::{
 
 use crate::{
     app::{availability_text, empty, facade, principal, ui_error},
-    facade::{Availability, FilterTermView, MembershipRow},
+    facade::{Availability, FilterTermView, MembershipRow, StoredMarkerView},
 };
 
 /// How the bridge encodes one form field into the JSON body.
@@ -45,6 +45,8 @@ enum Field {
     /// One typed filter term appended to the array named by the input, only
     /// when a value is chosen (`data-field`, `data-operator`, `data-value-type`).
     Term,
+    /// Seconds, sent as whole milliseconds (null when blank).
+    SecondsMs,
 }
 
 impl Field {
@@ -61,6 +63,7 @@ impl Field {
             Field::OptionalInt => "optional-int",
             Field::Nullable => "nullable",
             Field::Term => "term",
+            Field::SecondsMs => "seconds-ms",
         }
     }
 }
@@ -888,6 +891,42 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
             </section>
         }
 
+        if can_write {
+            <section aria-labelledby="markers-heading">
+                <h2 id="markers-heading">"Chapters and skip markers"</h2>
+                <p class="muted">"A marker you add here takes precedence over chapters from the file and over detected intros or credits; those stay listed. Markers recorded for an earlier version of the timeline are no longer in effect."</p>
+                if let Some(timelines) = model.markers.clone() {
+                    for (n, timeline) in timelines.iter().enumerate() {
+                        <h3>(format!("Timeline {} ({})", n + 1, timeline.edition))</h3>
+                        if timeline.markers.is_empty() {
+                            <p class="muted">"No markers."</p>
+                        } else {
+                            <ul class="rows">
+                                for marker in timeline.markers.iter() {
+                                    <li>(marker_text(marker))</li>
+                                }
+                            </ul>
+                        }
+                        command_form(command: format!("POST /api/v2/catalog/timelines/{}/markers", timeline.timeline_id), label: "Add marker", idempotent: true, class: Some("command inline"),
+                            <label>"Kind "
+                                <select name="kind" data-type=(kind(Field::Text))>
+                                    for (value, text) in [("chapter", "Chapter"), ("intro", "Intro"), ("recap", "Recap"), ("credits", "Credits")] {
+                                        <option value=(value)>(text)</option>
+                                    }
+                                </select>
+                            </label>
+                            <label>"Starts at (seconds) " <input type="number" min="0" step="0.1" required=(true) name="start_ms" data-type=(kind(Field::SecondsMs))></label>
+                            <label>"Ends at (seconds; needed except for chapters) " <input type="number" min="0" step="0.1" name="end_ms" data-type=(kind(Field::SecondsMs))></label>
+                            <label>"Label " <input name="label" data-type=(kind(Field::Nullable)) maxlength="200"></label>
+                            <input type="hidden" name="timeline_revision" data-type=(kind(Field::Text)) value=(timeline.revision.as_str())>
+                        )
+                    }
+                } else {
+                    empty(message: "Markers are unavailable right now.")
+                }
+            </section>
+        }
+
         if can_organize {
             <section aria-labelledby="organize-heading">
                 <h2 id="organize-heading">"Collections and playlists"</h2>
@@ -1136,6 +1175,38 @@ async fn filter_fields(
             }
         </fieldset>
     })
+}
+
+/// A stored marker in words, with its provenance and whether it is in effect.
+fn marker_text(marker: &StoredMarkerView) -> String {
+    let at = |ms: u64| format!("{}:{:02}", ms / 60_000, ms / 1000 % 60);
+    let span = match marker.end_ms {
+        Some(end) => format!("{}–{}", at(marker.start_ms), at(end)),
+        None => at(marker.start_ms),
+    };
+    let kind = match marker.kind.as_str() {
+        "intro" => "Intro",
+        "recap" => "Recap",
+        "credits" => "Credits",
+        _ => "Chapter",
+    };
+    let origin = match marker.provenance.as_str() {
+        "manual" => "added here",
+        "embedded" => "from the file",
+        "detected" => "detected, unconfirmed",
+        _ => "imported",
+    };
+    let label = marker
+        .label
+        .as_deref()
+        .map(|l| format!(" “{l}”"))
+        .unwrap_or_default();
+    let stale = if marker.current {
+        ""
+    } else {
+        " · not in effect (earlier timeline)"
+    };
+    format!("{kind}{label} {span} · {origin}{stale}")
 }
 
 #[page("/organize")]

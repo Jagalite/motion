@@ -292,6 +292,22 @@ impl UiQueryFacade for MockUiQueryFacade {
                 audio_tracks: vec![],
                 audio_version: None,
                 audio_file: None,
+                markers: vec![
+                    MarkerView {
+                        kind: "chapter".into(),
+                        start_ms: 0,
+                        end_ms: None,
+                        label: Some("Departure".into()),
+                        detected: false,
+                    },
+                    MarkerView {
+                        kind: "intro".into(),
+                        start_ms: 5_000,
+                        end_ms: Some(65_000),
+                        label: None,
+                        detected: true,
+                    },
+                ],
             })
         })
     }
@@ -598,6 +614,31 @@ impl UiQueryFacade for MockUiQueryFacade {
                         })
                         .into_iter()
                         .collect(),
+                }),
+                markers: write.then(|| {
+                    vec![TimelineMarkersView {
+                        timeline_id: "tl-mock".into(),
+                        edition: "Original".into(),
+                        revision: "3".into(),
+                        markers: vec![
+                            StoredMarkerView {
+                                kind: "intro".into(),
+                                start_ms: 5_000,
+                                end_ms: Some(65_000),
+                                label: None,
+                                provenance: "detected".into(),
+                                current: true,
+                            },
+                            StoredMarkerView {
+                                kind: "chapter".into(),
+                                start_ms: 0,
+                                end_ms: None,
+                                label: Some("Old cut".into()),
+                                provenance: "embedded".into(),
+                                current: false,
+                            },
+                        ],
+                    }]
                 }),
             })
         })
