@@ -292,3 +292,55 @@ func TestInvalidServerURLIsNotEchoed(t *testing.T) {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
 }
+
+func TestInvitationRedemptionRetainsClaimAcrossLostResponseAndKeepsSecretsPrivate(t *testing.T) {
+	var bodies []api.RedemptionInput
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v2/system/health" {
+			fmt.Fprint(w, `{"status":"ok","server_id":"inv-server","server_epoch":"e1"}`)
+			return
+		}
+		if r.URL.Path != "/api/v2/auth/invitations/redeem" {
+			t.Errorf("unexpected route %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		var in api.RedemptionInput
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Error(err)
+		}
+		bodies = append(bodies, in)
+		if len(bodies) == 1 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			conn.Close()
+			return
+		}
+		fmt.Fprint(w, `{"device_id":"inv-device","access_token":"mdv_private-result","expires_at":"2030-01-01T00:00:00Z"}`)
+	}))
+	defer server.Close()
+	var out, errOut bytes.Buffer
+	dir := t.TempDir()
+	root := NewRoot(&Env{Out: &out, Err: &errOut, HTTP: server.Client()})
+	root.SetIn(strings.NewReader("min_private-input\n"))
+	root.SetArgs([]string{"--server", server.URL, "--config-dir", dir, "auth", "redeem", "--credential-store", "file"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 || bodies[0] != bodies[1] || bodies[0].ClaimID == "" {
+		t.Fatalf("claim identity changed: %d requests", len(bodies))
+	}
+	for _, secret := range []string{"min_private-input", "mdv_private-result"} {
+		if strings.Contains(out.String()+errOut.String(), secret) {
+			t.Fatal("secret printed")
+		}
+	}
+	credential, err := (store.Store{Dir: dir}).Credential("inv-server")
+	if err != nil || credential == nil || credential.AccessToken != "mdv_private-result" {
+		t.Fatal("credential not privately stored", err)
+	}
+}

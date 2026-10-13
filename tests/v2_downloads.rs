@@ -993,7 +993,7 @@ async fn administrator_user_changes_fence_download_tickets_and_keep_history() {
             create.clone(),
         )
         .await;
-    assert_eq!(download.status, StatusCode::CREATED, "{}", download.body);
+    assert_eq!(download.status, StatusCode::ACCEPTED, "{}", download.body);
     let id = download.body["id"].as_str().unwrap();
     let ticket = f
         .post(

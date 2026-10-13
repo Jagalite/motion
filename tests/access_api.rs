@@ -3809,7 +3809,14 @@ fn user_edit(mut body: Value) -> Value {
 async fn administrator_pairing_decision_race_and_generated_name_bounds() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let auth = bearer(OPERATOR);
-    for (index, name) in ["a".repeat(100), "界".repeat(100)].iter().enumerate() {
+    for (index, name) in [
+        "a".repeat(100),
+        "界".repeat(100),
+        format!("{}　{}", "a".repeat(83), "a".repeat(16)),
+    ]
+    .iter()
+    .enumerate()
+    {
         let p = f
             .call(
                 "POST",
@@ -4182,4 +4189,68 @@ async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
             .unwrap();
         assert_eq!(n, 0, "{table}");
     }
+}
+
+#[tokio::test]
+async fn administrator_invitation_replay_observes_current_user_and_limiter_survives_runtime_restart()
+ {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Revision target").await;
+    let inv = access_invite(&f, &user, "revision-invite").await;
+    let input = redemption(&inv["code"], "0123456789abcdef0123456789abcdef");
+    let issued = f
+        .call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(input.clone()),
+            &[],
+        )
+        .await;
+    assert_eq!(issued.status, StatusCode::OK);
+    let mut edit = user_edit(user.clone());
+    edit["permissions"] = json!([]);
+    let changed = f
+        .call(
+            "PUT",
+            &format!("/api/v2/users/{}", user["id"].as_str().unwrap()),
+            Some(edit),
+            &[
+                ("authorization", &bearer(OPERATOR)),
+                ("if-match", "\"r-1\""),
+            ],
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.body);
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(input.clone()),
+            &[]
+        )
+        .await
+        .body["code"],
+        "invitation_unavailable"
+    );
+    for _ in 0..28 {
+        assert_eq!(
+            f.call(
+                "POST",
+                "/api/v2/auth/invitations/redeem",
+                Some(input.clone()),
+                &[]
+            )
+            .await
+            .body["code"],
+            "invitation_unavailable"
+        );
+    }
+    let mut restarted = f.app.clone();
+    restarted.access = Arc::new(playscale::v2::Runtime::new(AccessMode::Restricted, [0; 32]));
+    let response = api::router(restarted, None)
+        .oneshot(f.request("POST", "/api/v2/auth/invitations/redeem", Some(&input), &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key("retry-after"));
 }
