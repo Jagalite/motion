@@ -937,6 +937,12 @@ async fn offline_event_retention_follows_the_devices_acknowledgement() {
         .unwrap();
     let next = (2 + limit + 1) as u64;
     let waiting = vec![event(next, &timeline, base, 50_000, "paused")];
+    let legacy = sync!(waiting.clone(), Value::Null);
+    assert_eq!(
+        outcomes(&legacy),
+        vec![("rejected".into(), json!("sequence_gap"))]
+    );
+    assert_eq!(legacy.body["next_device_sequence"], next.to_string());
     let full = sync!(waiting.clone(), json!("2"));
     assert_eq!(
         outcomes(&full),

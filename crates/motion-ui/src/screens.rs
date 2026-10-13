@@ -190,15 +190,15 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
 // --- Profiles and preferences ---------------------------------------------
 
 /// Streaming limits offered to people, in bits per second (None: no limit),
-/// with what each is typically enough for.
+/// independent of resolution: a cap does not select an output height.
 const BITRATE_LIMITS: [(Option<u64>, &str); 8] = [
     (None, "No limit"),
-    (Some(40_000_000), "40 Mbps — 4K"),
-    (Some(20_000_000), "20 Mbps — 1080p, high"),
-    (Some(12_000_000), "12 Mbps — 1080p"),
-    (Some(8_000_000), "8 Mbps — 720p, high"),
-    (Some(4_000_000), "4 Mbps — 720p"),
-    (Some(2_000_000), "2 Mbps — 480p"),
+    (Some(40_000_000), "40 Mbps"),
+    (Some(20_000_000), "20 Mbps"),
+    (Some(12_000_000), "12 Mbps"),
+    (Some(8_000_000), "8 Mbps"),
+    (Some(4_000_000), "4 Mbps"),
+    (Some(2_000_000), "2 Mbps"),
     (Some(1_000_000), "1 Mbps — low bandwidth"),
 ];
 

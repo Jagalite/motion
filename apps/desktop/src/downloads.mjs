@@ -95,7 +95,7 @@ export function offlineRoots(base) {
     .map(([name, scope]) => ({name, scope, titles: readJson(join(base, name, 'manifest.json'), null)?.downloads?.length ?? 0}))
     .filter(root => root.titles > 0)
     .map(({name, scope, titles}) => ({name, titles, current: name === current,
-      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id}`}));
+      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id} · account ${scope.principal_id} · device ${scope.device_id}`}));
 }
 
 /**
@@ -520,7 +520,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       const log = await cache(target.path, target.scope, ['events']);
       const earlier = [];
       for (const event of log.events) {
-        if (event.media.viewing_epoch === current) break;
+        if (!event.media.viewing_epoch || event.media.viewing_epoch === current) break;
         earlier.push(event);
       }
       if (earlier.length > 0) {
@@ -556,7 +556,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       }
       // Restored again meanwhile: nothing changes, and the choice is offered again.
       if (pinned.viewing_epoch !== current) throw new Error('The server changed again. Choose again.');
-      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) continue;
+      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) throw new Error("Cannot keep progress: the restored server baseline is unknown. Your saved progress has been retained.");
       pins.push({...entry.identity, base_viewing_revision: pinned.restored_viewing_revision,
         base_manual_epoch: pinned.restored_manual_epoch, viewing_epoch: current});
     }

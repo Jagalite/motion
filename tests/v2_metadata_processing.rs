@@ -1244,6 +1244,23 @@ async fn match_replay_rechecks_current_file_visibility() {
         )
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED);
+    sqlx::query("UPDATE items SET title='Renamed after request' WHERE id=(SELECT e.item_id FROM editions e JOIN media_files f ON f.edition_id=e.id WHERE f.id='file-a')")
+        .execute(&f.app.db).await.unwrap();
+    sqlx::query("UPDATE media_files SET relative_path=? WHERE id='file-a'")
+        .bind(r"folder\Film.mkv")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let updated = f
+        .call(
+            "POST",
+            "/api/v2/catalog/matches",
+            Some(body.clone()),
+            &headers,
+        )
+        .await;
+    assert_eq!(updated.body["subject"]["title"], "Renamed after request");
+    assert_eq!(updated.body["subject"]["file_name"], "Film.mkv");
     sqlx::query("UPDATE media_files SET library_id=? WHERE id='file-a'")
         .bind(&f.hidden)
         .execute(&f.app.db)

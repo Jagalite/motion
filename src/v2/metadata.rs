@@ -379,7 +379,7 @@ async fn subjects(
         out.insert(
             p.file_id.clone(),
             SubjectBody {
-                file_name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
+                file_name: path.rsplit(['/', '\\']).next().unwrap_or(&path).to_owned(),
                 item_id: item.filter(|_| visible),
                 title: title.filter(|_| visible),
             },
@@ -631,7 +631,15 @@ async fn create_match(
             .ok_or_else(|| Problem::internal("invalid match receipt"))?;
         // A saved acknowledgement is not an authorization snapshot. Keep its
         // revision/outcome, but hide candidates no longer visible to this caller.
-        load_match(&mut tx, &scope, id).await?;
+        let proposal = load_match(&mut tx, &scope, id).await?;
+        let current_subjects = subjects(&mut tx, &scope, std::slice::from_ref(&proposal)).await?;
+        body["subject"] = serde_json::to_value(
+            current_subjects
+                .get(&proposal.file_id)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(Problem::internal)?;
         let candidates = body["candidates"]
             .as_array_mut()
             .ok_or_else(|| Problem::internal("invalid match candidates"))?;

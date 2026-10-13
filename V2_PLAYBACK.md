@@ -136,9 +136,9 @@ What remains:
   start or seek, its display sets in the 5 minutes before are probed; a cue
   still showing at the start is read from its own display set, so it is
   drawn. Cues established earlier than that are not restored.
-- Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
-  the production bridge sends `null` and nothing in the product supplies a
-  value yet.
+- Client bitrate caps are supplied by profile preferences and the player quality
+  control. The bridge passes the selected limit as `max_bitrate_bps`. A bitrate
+  cap does not select resolution; live conversion still uses its qualified recipe.
 - Content access issues a file-revision ticket or a delivery-generation
   playback ticket. Generation tickets authorize only that generation's bytes,
   its HLS manifests and children, and its selected subtitle. Every read

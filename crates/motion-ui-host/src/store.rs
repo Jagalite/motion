@@ -853,6 +853,13 @@ impl Store {
                 drop(file);
                 if from_staging {
                     self.staging.remove_file(name)?;
+                    // A verified content-addressed copy may already be shared
+                    // by another title even when this staging attempt is bad.
+                    if let Ok(mut blob) = self.blobs.open(sha256) {
+                        if Self::verify(&mut blob, *size, sha256).is_ok() {
+                            continue;
+                        }
+                    }
                 } else if !self.referenced(sha256) {
                     self.blobs.remove_file(sha256)?;
                     self.blobs_sync.sync_all()?;

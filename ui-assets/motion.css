@@ -374,3 +374,6 @@ form.command.stacked textarea { font: inherit; }
 .artwork img { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: var(--radius); background: var(--raised); outline: 2px solid transparent; }
 .artwork.is-selected img { outline-color: var(--accent); }
 .collection { margin-bottom: 1.25rem; }
+
+/* Offline posters never size cards from untrusted intrinsic dimensions. */
+.card-art { width: 100%; aspect-ratio: 2 / 3; max-height: 24rem; object-fit: cover; }

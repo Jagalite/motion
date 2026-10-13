@@ -197,6 +197,32 @@ async fn clean_with(
         let mut tx = crate::db::begin_write(&app.db).await?;
         let mut paths = Vec::new();
         for (id, file, attempt) in rows {
+            // Reobserve inside the write transaction used by createDownload:
+            // a demand admitted after candidate enumeration still pins bytes.
+            let pinned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM downloads WHERE file_id=? AND state!='cancelled')",
+            )
+            .bind(&file)
+            .fetch_one(&mut *tx)
+            .await?;
+            let observed: (String, i64, bool, Option<i64>) = sqlx::query_as("SELECT phase,updated_at,cache_cleaned,(SELECT max(updated_at) FROM playback_sessions WHERE file_id=processing_jobs.output_file_id AND status IN ('playing','paused')) FROM processing_jobs WHERE id=? AND attempt=?")
+                .bind(&id).bind(attempt).fetch_one(&mut *tx).await?;
+            let state = playscale_core::maintenance::CacheEntry {
+                job: playscale_core::jobs::Job {
+                    phase: serde_json::from_value(serde_json::json!(observed.0))?,
+                    attempt: attempt.try_into()?,
+                },
+                cleaned: observed.2,
+                updated_at: observed.1,
+                last_active_playback: observed.3,
+            };
+            if !state.removable_with_download(
+                now(),
+                app.processing.settings.retention_seconds,
+                pinned,
+            ) {
+                continue;
+            }
             if let Some(file) = file {
                 sqlx::query(
                     "UPDATE media_files SET available=0 WHERE id=? AND generated=1 AND available=1",

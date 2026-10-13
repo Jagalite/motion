@@ -151,6 +151,7 @@ fn retention_respects_active_work_playback_and_attempt_races() {
             updated_at: 0,
             last_active_playback: None,
         };
+        assert!(!state.removable_with_download(10000, 100, true));
         assert_eq!(
             state.removable(10000, 100),
             matches!(phase, Phase::Cancelled | Phase::Failed | Phase::Completed)
