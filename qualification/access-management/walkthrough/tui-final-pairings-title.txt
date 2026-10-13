@@ -1,0 +1,50 @@
+⌕ Search titles                                                                             Profile: Everyone   E
+ ▶ Motion               ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ MONITOR                   Pairing requests  n new · a approve · e edit · d deny/revoke
+  ◉  Overview
+  ▶  Now playing           ╭─ Pairing requests ──────────────────────────────────────────────────────────────────────────────────────────────╮
+  ◔  History               │ Names are untrusted. Compare the code with the requesting device.                                               │
+  ◷  Processing            │ Created: 2026-10-13T03:42:59Z · Expires: 2026-10-13T03:52:59Z                                                   │
+  ↻  Scans                 │ a approve · d deny · r refresh                                                                                  │
+  ≡  Activity              ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ◈  Server                ╭─ Pairing requests ──────────────────────────────────────────────────────────────────────────────────────────────╮
+                           │  Device                Client              Status        Compare code  Expires                                  │
+ LIBRARY                   │  Web browser           Motion web          denied        EDHV-M2RS     2026-10-13T03:52:59Z                     │
+  ⌂  Browse                │  Access review termi…  motion-terminal     claimed       NAFE-MLL3     2026-10-13T03:41:52Z                     │
+  ▤  All titles            │  Web browser           Motion web          claimed       EL7A-LCNZ     2026-10-13T03:42:32Z                     │
+                           ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ADMIN
+  ▥  Sources
+▎ ⇄  Pairing requests
+  ♙  Users and access
+  ✉  Invitations
+  ▢  Devices
+  ☺  Profiles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ● Live · 127.0.0.1:18795                                                                            ←↑↓→ select  esc sidebar  r refresh  ? help

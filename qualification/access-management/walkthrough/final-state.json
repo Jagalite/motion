@@ -1,0 +1,201 @@
+{
+  "users": [
+    {
+      "id": "d6621121-51c7-459a-973b-d959894de640",
+      "name": "Walkthrough household",
+      "revision": "3",
+      "disabled": true,
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "policy": {
+        "library_ids": [],
+        "allow_unrated": true,
+        "allowed_ratings": [],
+        "blocked_labels": []
+      }
+    },
+    {
+      "id": "user-2e65df81-dfdc-4d8e-bcda-3be5a280a902",
+      "name": "Device identity: Access review terminal",
+      "revision": "1",
+      "disabled": false,
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "system:admin"
+      ],
+      "policy": {
+        "library_ids": [],
+        "allow_unrated": true,
+        "allowed_ratings": [],
+        "blocked_labels": []
+      }
+    }
+  ],
+  "devices": [
+    {
+      "id": "15713969-d10f-44da-adbc-f64e20068e70",
+      "name": "Walkthrough terminal",
+      "revision": "3",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "revoked": true,
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "client_name": "motion-terminal"
+    },
+    {
+      "id": "2e65df81-dfdc-4d8e-bcda-3be5a280a902",
+      "name": "Access review terminal",
+      "revision": "1",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "system:admin"
+      ],
+      "revoked": false,
+      "user_id": "user-2e65df81-dfdc-4d8e-bcda-3be5a280a902",
+      "client_name": "motion-terminal"
+    },
+    {
+      "id": "36fa9d44-f128-4fe4-8392-aea048031bc0",
+      "name": "Web browser",
+      "revision": "4",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "revoked": true,
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "client_name": "Motion web"
+    },
+    {
+      "id": "3da219e1-a4b8-49b3-9f95-f65940a97505",
+      "name": "Web browser",
+      "revision": "2",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "revoked": true,
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "client_name": "Motion web"
+    }
+  ],
+  "invitations": [
+    {
+      "id": "21c79d9f-b7ee-4712-8f2a-8585ffdc92dd",
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "revision": "2",
+      "created_at": "2026-10-13T03:40:48Z",
+      "expires_at": "2026-10-13T03:50:48Z",
+      "status": "claimed",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request",
+        "events:read"
+      ],
+      "policy": {
+        "library_ids": [],
+        "allow_unrated": true,
+        "allowed_ratings": [],
+        "blocked_labels": []
+      }
+    },
+    {
+      "id": "4dcc3941-8d50-4bd2-9aa2-6fe5a64da85e",
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "revision": "2",
+      "created_at": "2026-10-13T03:51:27Z",
+      "expires_at": "2026-10-13T04:01:27Z",
+      "status": "claimed",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "policy": {
+        "library_ids": [],
+        "allow_unrated": true,
+        "allowed_ratings": [],
+        "blocked_labels": []
+      }
+    },
+    {
+      "id": "71eef49c-5448-4928-bbbc-3d8c9665ac25",
+      "user_id": "d6621121-51c7-459a-973b-d959894de640",
+      "revision": "2",
+      "created_at": "2026-10-13T03:43:36Z",
+      "expires_at": "2026-10-13T03:53:36Z",
+      "status": "revoked",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "viewing:write",
+        "playback:request"
+      ],
+      "policy": {
+        "library_ids": [],
+        "allow_unrated": true,
+        "allowed_ratings": [],
+        "blocked_labels": []
+      }
+    }
+  ],
+  "pairings": [
+    {
+      "id": "a464542c-b431-47a1-b414-e7276f794e23",
+      "device_name": "Web browser",
+      "client_name": "Motion web",
+      "created_at": "2026-10-13T03:42:59Z",
+      "expires_at": "2026-10-13T03:52:59Z",
+      "status": "denied"
+    },
+    {
+      "id": "aebe9f76-d2d0-48a2-aee1-55c71310d051",
+      "device_name": "Access review terminal",
+      "client_name": "motion-terminal",
+      "created_at": "2026-10-13T03:31:52Z",
+      "expires_at": "2026-10-13T03:41:52Z",
+      "status": "claimed"
+    },
+    {
+      "id": "f7ff3aa1-c0b8-460d-85cb-3a549332a204",
+      "device_name": "Web browser",
+      "client_name": "Motion web",
+      "created_at": "2026-10-13T03:32:32Z",
+      "expires_at": "2026-10-13T03:42:32Z",
+      "status": "claimed"
+    }
+  ]
+}

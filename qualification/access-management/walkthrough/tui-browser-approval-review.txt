@@ -1,0 +1,10 @@
+Approve access for “Walkthrough household”
+
+  Compare EL7A-LCNZ with the requesting device. Names are untrusted.
+
+  Confirm this access change? y apply · n edit · Esc cancel
+  User: Walkthrough household · enabled
+  Permissions: catalog:read, viewing:write, playback:request, events:read
+  Profiles: Everyone
+  Libraries: none
+  Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.

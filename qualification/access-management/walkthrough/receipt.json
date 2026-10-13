@@ -1,0 +1,33 @@
+{
+  "status": "passed",
+  "server_source": "6980c6007a58f0654e7bbd0518c212500c56ad14",
+  "server_binary_sha256": "c1b25a94076ba0f2aab1eb8b3695142ed8dc7572ddf5c4b6f6a32a1a97791560",
+  "server_archive_sha256": "821562602a0383a308fbdadba453efda1eb5a673dbfab85bd0ffca62c5ca7887",
+  "server_ci_artifact": 11787381501,
+  "terminal_source": "e804b87eb82472cc0ef7dcbe21aa6a63335576b0",
+  "terminal_sha256": "8d30b939057bd8049eeb44136260c91408b72a9ef8d270ba3206b01a838c4248",
+  "terminal_kyoto_job": "ddd6949f8c5c49449778c19d059d2483",
+  "rustc": "1.98.0 (88d9e12ae)",
+  "client_fixture": "T3 collaborative browser and real PTY; isolated restricted localhost server; paired administrator",
+  "steps": [
+    "create_user",
+    "browser_pairing_approval",
+    "invitation_create",
+    "server_restart_before_unused_invitation_redemption",
+    "terminal_redemption_private_credential",
+    "user_grant_narrowing_two_devices",
+    "individual_device_revocation_sibling_retained",
+    "browser_pairing_denial",
+    "invitation_revocation_refused_redemption",
+    "browser_invitation_redemption",
+    "user_disable_all_owned_devices",
+    "last_usable_administrator_preserved"
+  ],
+  "source_trees": {
+    "src": "90fe958cb4be82384a80f1f5371ed6a7851b9ad4",
+    "crates/core": "86471b7c22a471e646e481e161552ec9fe13d667",
+    "migrations": "61bf317d24d159bd244be9591a2641d1cf555e6c",
+    "contracts": "c23a0403ac684e99a38509044969bc8614eed29a"
+  },
+  "final_presentation_receipt": "final-presentation-receipt.json"
+}

@@ -1,0 +1,10 @@
+Create access user
+
+
+
+  Confirm this access change? y apply · n edit · Esc cancel
+  User: Walkthrough household · enabled
+  Permissions: catalog:read, viewing:write, playback:request, events:read
+  Profiles: Everyone
+  Libraries: none
+  Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.

@@ -1,0 +1,5 @@
+Revoke device “Web browser”?
+
+  Only this device is revoked. Already downloaded bytes cannot be erased.
+
+  Confirm this access change? y apply · n edit · Esc cancel

@@ -1,0 +1,8 @@
+Choose the intended user
+
+  Compare EL7A-LCNZ with the requesting device. Names are untrusted.
+
+  ↑/↓ or Tab choose · Space toggle · Ctrl+S review · Esc cancel
+
+  › Walkthrough household · d6621121
+    Device identity: Access review terminal · user-2e6

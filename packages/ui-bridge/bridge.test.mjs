@@ -284,12 +284,29 @@ test('invitation redemption retains claim after lost response without storing th
   assert.equal(storage.size, 0);
 });
 
-test('denied pairing ends polling with an actionable outcome', async () => {
-  let calls = 0;
-  const bridge = harness(new Map(), async () => {
-    calls++;
-    return {ok:false, status:409, json:async()=>({code:'pairing_denied',detail:'Pairing denied'})};
-  });
-  await bridge.pair(form(), {id:'pair',user_code:'CODE',device_code:'secret',poll_interval_seconds:0,expires_at:new Date(Date.now()+1000).toISOString()});
-  assert.equal(calls,1);
+test('denied and expired pairing stop polling and explain the actual outcome', async () => {
+  for (const [code, expected] of [
+    ['pairing_denied', 'An administrator denied this pairing request. Ask them before starting a new request.'],
+    ['pairing_expired', 'The pairing code expired before it was approved. Start a new pairing request.'],
+  ]) {
+    let calls = 0;
+    const bridge = harness(new Map(), async () => {
+      calls++;
+      return {ok:false, status:409, json:async()=>({code,detail:'Server detail'})};
+    });
+    const f = form();
+    await bridge.pair(f, {id:'pair',user_code:'CODE',device_code:'secret',poll_interval_seconds:0,expires_at:new Date(Date.now()+1000).toISOString()});
+    assert.equal(calls,1);
+    assert.equal(f.querySelector('.command-status').textContent, expected);
+  }
+});
+
+test('an unavailable invitation asks for a new code without saving the secret', async () => {
+  const storage = new Map();
+  const bridge = harness(storage, async () => ({ok:false, status:409, json:async()=>({code:'invitation_unavailable'})}));
+  const f = form([input('code', 'text', 'private-invitation')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f);
+  assert.equal(f.querySelector('.command-status').textContent, 'This invitation is no longer available. Ask an administrator for a new code.');
+  assert.equal(storage.size, 0);
 });

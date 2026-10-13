@@ -1,0 +1,50 @@
+⌕ Search titles                                                                             Profile: Everyone   E
+ ▶ Motion               ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ MONITOR                   Access invitations  n new · a approve · e edit · d deny/revoke
+  ◉  Overview
+  ▶  Now playing           ╭─ Access invitations ────────────────────────────────────────────────────────────────────────────────────────────╮
+  ◔  History               │ n create invitation · d revoke unused invitation · r refresh                                                    │
+  ◷  Processing            │ Codes are shown only after issuance. Send them privately.                                                       │
+  ↻  Scans                 │ Claimed invitations: revoke the device on Devices.                                                              │
+  ≡  Activity              ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ◈  Server                ╭─ Viewing profiles ──────────────────────────────────────────────────────────────────────────────────────────────╮
+                           │  User                      Status        Created                 Expires                                        │
+ LIBRARY                   │  Walkthrough household     claimed       2026-10-13T03:40:48Z    2026-10-13T03:50:48Z                           │
+  ⌂  Browse                │  Walkthrough household     revoked       2026-10-13T03:43:36Z    2026-10-13T03:53:36Z                           │
+  ▤  All titles            ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ADMIN
+  ▥  Sources
+  ⇄  Pairing requests
+  ♙  Users and access
+▎ ✉  Invitations
+  ▢  Devices
+  ☺  Profiles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ● Live · 127.0.0.1:18795                                                                            ←↑↓→ select  esc sidebar  r refresh  ? help
