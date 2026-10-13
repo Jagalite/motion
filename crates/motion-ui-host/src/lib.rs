@@ -57,6 +57,13 @@ pub struct EventLog {
     #[serde(with = "decimal")]
     pub base_sequence: u64,
     pub events: Vec<OfflineEvent>,
+    /// The server history (`viewing_epoch`) the compacted events through
+    /// `base_sequence` belonged to (`offline::compacted_epoch`): a restored
+    /// server never consumed them, so a batch sent under another history
+    /// re-anchors the device's sequence (`offline::reanchor`). None before
+    /// anything was compacted, or for logs from before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_viewing_epoch: Option<String>,
 }
 
 mod decimal {
@@ -84,6 +91,7 @@ impl EventLog {
             Stored::Legacy(events) => EventLog {
                 base_sequence: 0,
                 events,
+                base_viewing_epoch: None,
             },
         })
     }
@@ -186,8 +194,41 @@ pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
                 .contains(&item.content_type.as_str()),
         "unsupported cache media"
     );
+    if let Some(art) = &item.artwork {
+        ensure!(
+            art.sha256.len() == 64
+                && art
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && art.size > 0
+                && art.size <= MAX_ARTWORK
+                && matches!(
+                    art.content_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                ),
+            "unsupported cache artwork"
+        );
+    }
+    if let Some(subtitles) = &item.subtitles {
+        ensure!(
+            subtitles.sha256.len() == 64
+                && subtitles
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && subtitles.size > 0
+                && subtitles.size <= MAX_SUBTITLES,
+            "unsupported cache subtitles"
+        );
+    }
     Ok(())
 }
+
+/// Largest poster saved with a download.
+pub const MAX_ARTWORK: u64 = 8 * 1024 * 1024;
+/// Largest saved subtitle file (the server's WebVTT conversion bound).
+pub const MAX_SUBTITLES: u64 = 16 * 1024 * 1024;
 
 pub struct Cache {
     directory: Dir,
@@ -198,8 +239,14 @@ pub struct Cache {
     /// Where playback snapshots are created: the cache's own volume, whose
     /// free space the download admission reserved for them.
     path: std::path::PathBuf,
-    _lock: std::fs::File,
-    manifest: CacheManifest,
+    /// The root's exclusive lock, held for the host's lifetime; removals run
+    /// as the writer under it (`Store::open_held`).
+    lock: std::fs::File,
+    scope: CacheScope,
+    /// What the store committed: the manifest and the pending removals,
+    /// whose titles are never presented (`offline::may_publish`). Replaced
+    /// after every removal, whatever it committed.
+    manifest: std::sync::RwLock<(CacheManifest, Vec<String>)>,
     history: Mutex<EventLog>,
 }
 pub(crate) fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -246,6 +293,15 @@ impl Cache {
         let manifest: CacheManifest =
             serde_json::from_slice(&bounded(directory.open("manifest.json")?, MAX_MANIFEST)?)?;
         validate_manifest(&manifest)?;
+        // Complete removals a crash interrupted (`Store::open_held` replays
+        // them under the lock taken above); a title whose removal is still
+        // pending is never presented.
+        let (manifest, removals) = if directory.exists("removals.json") {
+            let store = crate::store::Store::open_held(path, &manifest.scope, lock.try_clone()?)?;
+            (store.manifest().clone(), store.removals().to_vec())
+        } else {
+            (manifest, vec![])
+        };
         let history = match directory.open("events.json") {
             Ok(file) => EventLog::parse(&bounded(file, MAX_LOG)?)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => EventLog::default(),
@@ -258,16 +314,65 @@ impl Cache {
             directory,
             durable,
             path: path.to_owned(),
-            _lock: lock,
-            manifest,
+            lock,
+            scope: manifest.scope.clone(),
+            manifest: std::sync::RwLock::new((manifest, removals)),
             history: Mutex::new(history),
         })
     }
-    fn item(&self, id: &str) -> Option<&CachedDownload> {
-        self.manifest
+    fn item(&self, id: &str) -> Option<CachedDownload> {
+        self.presented()
+            .ok()?
+            .into_iter()
+            .find(|d| d.identity.download_id == id)
+    }
+    /// The saved titles this host presents: none with a pending removal.
+    fn presented(&self) -> anyhow::Result<Vec<CachedDownload>> {
+        let state = self
+            .manifest
+            .read()
+            .map_err(|_| anyhow::anyhow!("cache manifest failed"))?;
+        Ok(state
+            .0
             .downloads
             .iter()
-            .find(|d| d.identity.download_id == id)
+            .filter(|d| offline::may_publish(&d.identity.download_id, &state.1))
+            .cloned()
+            .collect())
+    }
+    /// The person removes a saved title from this device while it is open
+    /// for offline viewing (`Store::remove_by_person` under the lock this
+    /// host holds). Its offline progress is kept; the download agent asks
+    /// the server to delete the download when it next connects.
+    ///
+    /// The outcome is judged by what the host presents afterwards: the title
+    /// was presented and no longer is (its intent or manifest removal
+    /// committed, even if a later cleanup step failed, or an earlier
+    /// interrupted removal of it was completed now). Ok(false): it was not
+    /// presented.
+    pub fn remove(&self, download_id: &str) -> anyhow::Result<bool> {
+        if !self.presents(download_id) {
+            return Ok(false);
+        }
+        let mut store =
+            crate::store::Store::open_held(&self.path, &self.scope, self.lock.try_clone()?)?;
+        let removed = store.remove_by_person(download_id);
+        // Whatever the store committed (including removals it replayed) is
+        // what the host presents.
+        *self
+            .manifest
+            .write()
+            .map_err(|_| anyhow::anyhow!("cache manifest failed"))? =
+            (store.manifest().clone(), store.removals().to_vec());
+        if self.presents(download_id) {
+            removed?;
+            anyhow::bail!("the title is still saved");
+        }
+        Ok(true)
+    }
+    /// Whether `download_id` is a saved title the host presents.
+    pub fn presents(&self, download_id: &str) -> bool {
+        self.item(download_id).is_some()
     }
     fn record(&self, event: OfflineEvent) -> anyhow::Result<serde_json::Value> {
         let item = self
@@ -281,7 +386,7 @@ impl Cache {
             history.base_sequence,
             &history.events,
             &event,
-            &self.manifest.scope,
+            &self.scope,
             &item.identity,
             item.duration_ms,
             MAX_EVENTS,
@@ -302,7 +407,7 @@ impl Cache {
         )
     }
     fn snapshot(&self, id: &str) -> anyhow::Result<(CachedDownload, std::fs::File)> {
-        let item = self.item(id).context("download is unavailable")?.clone();
+        let item = self.item(id).context("download is unavailable")?;
         let mut source = self.directory.open(format!("blobs/{}", item.sha256))?;
         ensure!(
             source.metadata()?.is_file() && source.metadata()?.len() == item.size,
@@ -367,10 +472,13 @@ pub(crate) fn replace_durably(
 
 impl OfflinePresentationReader for Cache {
     fn scope(&self) -> &CacheScope {
-        &self.manifest.scope
+        &self.scope
     }
     fn downloads(&self) -> BoxFuture<'_, UiResult<Vec<CachedDownload>>> {
-        Box::pin(async { Ok(self.manifest.downloads.clone()) })
+        Box::pin(async {
+            self.presented()
+                .map_err(|_| motion_ui::facade::UiError::Unavailable)
+        })
     }
 }
 
@@ -446,8 +554,12 @@ impl Host {
         Router::new()
             .route("/cache/bootstrap", post(bootstrap))
             .route("/cache/open/{id}", post(open_media))
+            .route("/cache/close/{ticket}", post(close_media))
             .route("/cache/media/{ticket}", get(media))
             .route("/cache/events", post(record))
+            .route("/cache/remove/{id}", post(remove))
+            .route("/cache/artwork/{id}", get(artwork))
+            .route("/cache/subtitles/{id}", get(subtitles))
             .route("/ui/{file}", get(motion_ui::ui_asset))
             .route("/assets/demuxe/{*file}", get(player_asset))
             .fallback_service(
@@ -535,7 +647,7 @@ async fn bootstrap(State(host): State<Host>, Json(input): Json<Bootstrap>) -> Re
                 host.cookie
             ),
         )],
-        Json(json!({"protocol":1,"scope":host.cache.manifest.scope})),
+        Json(json!({"protocol":1,"scope":host.cache.scope})),
     )
         .into_response()
 }
@@ -543,16 +655,22 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     let Ok(_single) = host.opening.clone().try_lock_owned() else {
         return StatusCode::CONFLICT.into_response();
     };
+    // Retire the previous ticket before allocating its replacement. Bodies
+    // already admitted retain Arc<File> until their actual read completes;
+    // the new snapshot must fit alongside only those outstanding readers.
+    host.media.lock().unwrap().take();
     let cache = host.cache.clone();
     let download = id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         // Cancellation of the HTTP handler cannot admit another copy while this
-        // blocking worker still consumes the snapshot disk budget.
-        let _single = _single;
-        cache.snapshot(&download)
+        // blocking worker still consumes the snapshot disk budget. The guard
+        // comes back with the result and is held until the ticket is
+        // installed, so no removal completes between the two.
+        let single = _single;
+        (cache.snapshot(&download), single)
     })
     .await;
-    let Ok(Ok((item, file))) = snapshot else {
+    let Ok((Ok((item, file)), _single)) = snapshot else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
     let history = host.cache.history.lock().unwrap();
@@ -571,7 +689,7 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
             }
         });
     let ticket = Uuid::new_v4().simple().to_string();
-    let result = json!({"scope":host.cache.manifest.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
+    let result = json!({"scope":host.cache.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
         "next_sequence":history.next_sequence().map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
     *host.media.lock().unwrap() = Some(Media {
         ticket,
@@ -580,6 +698,122 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     });
     Json(result).into_response()
 }
+/// A presented title's saved subtitles (WebVTT), verified against their
+/// digest again.
+async fn subtitles(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let cache = host.cache.clone();
+    let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(subtitles) = cache.item(&id).and_then(|item| item.subtitles) else {
+            return Ok(None);
+        };
+        let bytes = bounded(
+            cache
+                .directory
+                .open(format!("blobs/{}", subtitles.sha256))?,
+            MAX_SUBTITLES,
+        )?;
+        ensure!(
+            bytes.len() as u64 == subtitles.size
+                && format!("{:x}", Sha256::digest(&bytes)) == subtitles.sha256,
+            "subtitles checksum mismatch"
+        );
+        Ok(Some(bytes))
+    })
+    .await;
+    match read {
+        Ok(Ok(Some(bytes))) => (
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8".to_owned()),
+                (header::CACHE_CONTROL, "private, no-store".to_owned()),
+                (
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff".to_owned(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    }
+}
+
+/// A presented title's saved poster, verified against its digest again.
+async fn artwork(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let cache = host.cache.clone();
+    let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let Some(art) = cache.item(&id).and_then(|item| item.artwork) else {
+            return Ok(None);
+        };
+        let bytes = bounded(
+            cache.directory.open(format!("blobs/{}", art.sha256))?,
+            MAX_ARTWORK,
+        )?;
+        ensure!(
+            bytes.len() as u64 == art.size && format!("{:x}", Sha256::digest(&bytes)) == art.sha256,
+            "artwork checksum mismatch"
+        );
+        Ok(Some((art.content_type, bytes)))
+    })
+    .await;
+    match read {
+        Ok(Ok(Some((content_type, bytes)))) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "private, no-store".to_owned()),
+                (
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff".to_owned(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    }
+}
+
+/// Remove a saved title from this device. Serialized with opening media,
+/// whose snapshot reads the blob being removed.
+async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let Ok(single) = host.opening.clone().try_lock_owned() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    // The removal, its serialization and the ticket invalidation all live in
+    // the blocking task: cancelling this handler cannot release the guard
+    // while the removal runs, or skip invalidating an open player's ticket.
+    let worker = host.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let _single = single;
+        let removed = worker.cache.remove(&id);
+        // Any title no longer presented (this one, or one whose interrupted
+        // removal was completed now) loses its open ticket.
+        let mut media = worker.media.lock().unwrap();
+        if media
+            .as_ref()
+            .is_some_and(|m| !worker.cache.presents(&m.item.identity.download_id))
+        {
+            *media = None;
+        }
+        removed
+    })
+    .await;
+    match removed {
+        Ok(Ok(true)) => Json(json!({"removed": true})).into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::CONFLICT.into_response(),
+    }
+}
+async fn close_media(State(host): State<Host>, AxumPath(ticket): AxumPath<String>) -> Response {
+    let mut active = host.media.lock().unwrap();
+    if active.as_ref().is_some_and(|media| media.ticket == ticket) {
+        active.take();
+    }
+    // Exact-ticket retirement is idempotent and cannot close a newer open.
+    Json(json!({"closed":true})).into_response()
+}
+
 async fn record(State(host): State<Host>, Json(event): Json<OfflineEvent>) -> Response {
     match tokio::task::spawn_blocking(move || host.cache.record(event)).await {
         Ok(Ok(ack)) => Json(ack).into_response(),

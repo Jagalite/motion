@@ -57,10 +57,6 @@ pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 /// Stream copy of H.264 with audio converted to stereo AAC.
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
-/// How far before a generation's start a burned-subtitle conversion begins
-/// reading, so a bitmap cue that started earlier and is still showing is
-/// drawn. Cues established longer before the start are not restored.
-pub const BURN_LOOKBACK_MS: u64 = 20_000;
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
 /// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
@@ -108,6 +104,7 @@ pub struct Runtime {
     admission_slots: Arc<tokio::sync::Semaphore>,
     /// Concurrent subtitle conversions (each reads the whole source once).
     subtitle_slots: Arc<tokio::sync::Semaphore>,
+    copy_probe_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
     /// Bytes sent to clients for all deliveries since this process started.
     pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
@@ -160,6 +157,8 @@ struct WorkerControl {
 
 struct Session {
     id: String,
+    /// Retained by session workers and responses even after runtime retirement.
+    _artifacts: Arc<crate::artifact_leases::Lease>,
     file_id: String,
     revision: String,
     /// The v2 principal and context this delivery was admitted for; None for
@@ -180,7 +179,7 @@ struct Session {
     stream_rates: (Option<u64>, Vec<Option<u64>>),
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
-    subtitles: tokio::sync::Mutex<()>,
+    subtitles: Arc<tokio::sync::Mutex<()>>,
     /// Observed transfer and playback, for administrator monitoring only.
     telemetry: Arc<crate::playback_monitor::Telemetry>,
 }
@@ -194,6 +193,7 @@ impl Runtime {
             admission: tokio::sync::Mutex::new(()),
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            copy_probe_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: Arc::default(),
             finishing: Mutex::default(),
@@ -521,16 +521,81 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
     (out, text.lines().any(|l| l == "#EXT-X-ENDLIST"))
 }
 
+/// Output colour tags of a tone-mapped conversion: SDR BT.709, limited range.
+const SDR_TAGS: [&str; 8] = [
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+    "-colorspace",
+    "bt709",
+    "-color_range",
+    "tv",
+];
+
+/// The HDR-to-SDR filter chain for a pinned tone map: zimg linearizes the
+/// source with explicit input properties (never trusting possibly incomplete
+/// stream tags), converts primaries, applies FFmpeg's Hable curve for the
+/// pinned peak and encodes display-referred BT.709 limited range. The same
+/// chain is pixel-verified in `scripts/test_media_transforms.py`.
+fn tone_map_graph(t: playscale_core::color::ToneMap) -> String {
+    use playscale_core::color::{Range, Transfer};
+    let transfer = match t.transfer {
+        Transfer::Pq => "smpte2084",
+        Transfer::Hlg => "arib-std-b67",
+    };
+    let range = match t.range {
+        Range::Limited => "limited",
+        Range::Full => "full",
+    };
+    // zscale's npl maps linear 1.0 to 100 nits, so the peak is in those units.
+    let peak = f64::from(t.peak_nits) / 100.0;
+    format!(
+        "zscale=tin={transfer}:pin=bt2020:min=bt2020nc:rin={range}:t=linear:npl=100:p=bt2020:m=bt2020nc:r=full,\
+         format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0:peak={peak},\
+         zscale=t=bt709:m=bt709:r=limited,format=yuv420p"
+    )
+}
+
+/// An executable path that stays valid when the child's working directory
+/// changes: a relative path with directory components is joined to the
+/// server's working directory; a bare name is left for PATH lookup.
+fn resolved_executable(path: &FsPath) -> std::path::PathBuf {
+    if path.is_relative() && path.components().count() > 1 {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_owned())
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Per-delivery files of a burned text subtitle, beside the generations:
+/// `burn-text-<n>.ass` and the font directory `burn-fonts-<n>`.
+const BURN_TEXT: &str = "burn-text-";
+const BURN_FONTS: &str = "burn-fonts-";
+
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
-/// A multipart generation's inputs, each (descriptor, seek and remaining
-/// duration in milliseconds, the part's own ordinal of the selected audio),
-/// and its picture canvas.
+/// A multipart generation's inputs and its picture canvas.
 type PartInputs<'a> = (&'a [PartInput], (u32, u32));
-/// One multipart input: descriptor, seek and remaining duration (ms), and the
-/// part's own ordinal of the selected audio.
-type PartInput = (u32, u64, u64, Option<u32>);
+/// One multipart input.
+#[derive(Clone, Copy, Debug)]
+struct PartInput {
+    /// The inherited validated descriptor.
+    fd: u32,
+    /// Where in the part playback starts, and how much of it remains (ms).
+    seek: u64,
+    length: u64,
+    /// The part's own ordinal of the selected audio.
+    audio: Option<u32>,
+    /// The part's own ordinal of a burned bitmap subtitle.
+    burn: Option<u32>,
+    /// How much earlier than `seek` it is read, so a burned cue still
+    /// showing at the seek is drawn (core `burn_read_from`); trimmed off.
+    lookback: u64,
+}
 
 /// FFmpeg arguments for a live generation reading the source from `start_ms`
 /// (file time) and, for an interval, stopping at `end_ms` (file time).
@@ -540,13 +605,18 @@ fn arguments(
     start_ms: u64,
     end_ms: Option<u64>,
     audio: Option<u32>,
-    burn: Option<u32>,
+    burn: Option<Burn>,
+    burn_from: Option<u64>,
     parts: Option<PartInputs<'_>>,
     cap: Option<playscale_core::playback_session::RateCap>,
     adaptive: bool,
+    tone_map: Option<playscale_core::color::ToneMap>,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
+    // A tone map applies to one file's conversion only (never a copy or a
+    // multipart join, which the pin never carries it for).
+    let tone_map = tone_map.filter(|_| !copy && parts.is_none());
     // An adaptive conversion of one file without a burned subtitle: a second,
     // capped low variant from the same decoded and scaled picture.
     let adaptive = adaptive && !copy && burn.is_none() && parts.is_none();
@@ -561,12 +631,17 @@ fn arguments(
     .map(str::to_owned)
     .to_vec();
     // A burned bitmap cue is established by a display set that may precede
-    // the start: read BURN_LOOKBACK_MS earlier and trim the output to the
-    // start, so cues still showing there are drawn. Output time zero is the
+    // the start: read from where core `burn_read_from` decided (the display
+    // set still showing there, or the bounded fallback) and trim the output
+    // to the start, so cues still showing are drawn. Output time zero is the
     // start either way.
     let burn = burn.filter(|_| !copy);
-    let input_ms = if burn.is_some() {
-        start_ms.saturating_sub(BURN_LOOKBACK_MS)
+    // libass reads every event of an extracted subtitle: no lookback.
+    // (Across parts each part's own lookback is trimmed in the graph.)
+    let input_ms = if matches!(burn, Some(Burn::Bitmap(_))) && parts.is_none() {
+        burn_from
+            .unwrap_or_else(|| playscale_core::delivery::burn_read_from(start_ms, None))
+            .min(start_ms)
     } else {
         start_ms
     };
@@ -576,11 +651,12 @@ fn arguments(
         // seeks to its offset, the later parts play from their beginning.
         // Each is an inherited validated descriptor.
         Some((parts, _)) => {
-            for (fd, seek, _, _) in parts {
-                if *seek > 0 {
-                    args.extend(["-ss".to_owned(), at(*seek)]);
+            for part in parts {
+                let from = part.seek - part.lookback.min(part.seek);
+                if from > 0 {
+                    args.extend(["-ss".to_owned(), at(from)]);
                 }
-                args.extend(["-i".to_owned(), format!("/dev/fd/{fd}")]);
+                args.extend(["-i".to_owned(), format!("/dev/fd/{}", part.fd)]);
             }
         }
         None => {
@@ -607,6 +683,16 @@ fn arguments(
         args.push(format!("{}.{:03}", length / 1000, length % 1000));
     }
     const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    // The source picture: tone-mapped to SDR BT.709 first when the pin says so.
+    let video = match tone_map {
+        Some(t) => format!("[0:v:0]{}[hv];", tone_map_graph(t)),
+        None => String::new(),
+    };
+    let source = if tone_map.is_some() {
+        "[hv]"
+    } else {
+        "[0:v:0]"
+    };
     // A burned bitmap subtitle's canvas is scaled to the source video's size
     // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
     // overlaid before the output is scaled, so nothing is cropped. In
@@ -623,18 +709,39 @@ fn arguments(
     let joined = parts.map(|(parts, (width, height))| {
         let mut graph = String::new();
         let mut inputs = String::new();
-        for (i, (_, _, length, part_audio)) in parts.iter().enumerate() {
-            let end = format!("{}.{:03}", length / 1000, length % 1000);
+        for (i, part) in parts.iter().enumerate() {
+            let end = format!("{}.{:03}", part.length / 1000, part.length % 1000);
+            // A burned bitmap subtitle is overlaid on the part's own
+            // pictures first (its canvas scaled to theirs); what was read
+            // early for it is trimmed off.
+            let mut picture = match part.burn {
+                Some(index) => format!(
+                    "[{i}:s:{index}][{i}:v:0]scale2ref=w=iw:h=ih[s{i}][r{i}];\
+                     [r{i}][s{i}]overlay=eof_action=pass:repeatlast=0[o{i}];[o{i}]"
+                ),
+                None => format!("[{i}:v:0]"),
+            };
+            let lookback = part.lookback.min(part.seek);
+            if lookback > 0 {
+                // Both streams shift by the same lookback, so a stream that
+                // starts later in the part (delayed audio) keeps its offset.
+                picture.push_str(&format!("trim=start={0},setpts=PTS-{0}/TB,", at(lookback)));
+            }
             graph.push_str(&format!(
-                "[{i}:v:0]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
+                "{picture}scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
                  scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
                  pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,\
                  tpad=stop_mode=clone:stop=-1,trim=end={end}[v{i}];"
             ));
             inputs.push_str(&format!("[v{i}]"));
-            if let Some(audio) = audio.and(*part_audio) {
+            if let Some(audio) = audio.and(part.audio) {
+                let trim = if lookback > 0 {
+                    format!("atrim=start={0},asetpts=PTS-{0}/TB,", at(lookback))
+                } else {
+                    String::new()
+                };
                 graph.push_str(&format!(
-                    "[{i}:a:{audio}]aresample=48000:async=1:first_pts=0,\
+                    "[{i}:a:{audio}]{trim}aresample=48000:async=1:first_pts=0,\
                      aformat=channel_layouts=stereo,apad,atrim=end={end}[a{i}];"
                 ));
                 inputs.push_str(&format!("[a{i}]"));
@@ -663,10 +770,32 @@ fn arguments(
                 args.extend(["-map", "[ja]"].map(str::to_owned));
             }
         }
-        (Some(index), None) => {
+        (Some(Burn::Text { index, attachments }), None) => {
+            // libass renders the subtitle extracted for this delivery
+            // (`ensure_burn_text`), referenced relative to the generation
+            // directory (FFmpeg's working directory) so no path needs
+            // filtergraph escaping. Its events are in file time: frames are
+            // shifted to file time for rendering and back. Text is drawn on
+            // the already tone-mapped picture.
+            let fonts = if attachments > 0 {
+                format!(":fontsdir=../{BURN_FONTS}{index}")
+            } else {
+                String::new()
+            };
+            let origin = at(start_ms);
             args.push("-filter_complex".into());
             args.push(format!(
-                "[0:s:{index}][0:v:0]scale2ref=w=iw:h=ih[sub][base];\
+                "{video}{source}setpts=PTS+{origin}/TB,\
+                 subtitles=filename=../{BURN_TEXT}{index}.ass{fonts},\
+                 setpts=PTS-{origin}/TB,{SCALE}[v]"
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (Some(Burn::Bitmap(index)), None) => {
+            args.push("-filter_complex".into());
+            // Subpictures are SDR: they are drawn on the already tone-mapped picture.
+            args.push(format!(
+                "{video}[0:s:{index}]{source}scale2ref=w=iw:h=ih[sub][base];\
                  [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
@@ -674,10 +803,15 @@ fn arguments(
         (None, None) if adaptive => {
             args.push("-filter_complex".into());
             args.push(format!(
-                "[0:v:0]{SCALE},split=2[v][split];\
+                "{video}{source}{SCALE},split=2[v][split];\
                  [split]scale=w=-2:h='min({},ih)':force_divisible_by=2[low]",
                 playscale_core::playback_session::ADAPTIVE_LOW_HEIGHT
             ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (None, None) if tone_map.is_some() => {
+            args.push("-filter_complex".into());
+            args.push(format!("{video}{source}{SCALE}[v]"));
             args.extend(["-map", "[v]"].map(str::to_owned));
         }
         (None, None) => args.extend(["-map", "0:v:0"].map(str::to_owned)),
@@ -690,10 +824,13 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        if burn.is_none() && parts.is_none() && !adaptive {
+        if burn.is_none() && parts.is_none() && !adaptive && tone_map.is_none() {
             args.extend(["-vf", SCALE].map(str::to_owned));
         }
         args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
+        if tone_map.is_some() {
+            args.extend(SDR_TAGS.map(str::to_owned));
+        }
         if hardware {
             // -allow_sw 0: fail rather than silently encode in software.
             args.extend(
@@ -809,6 +946,9 @@ fn arguments(
             ]
             .map(str::to_owned),
         );
+        if tone_map.is_some() {
+            args.extend(SDR_TAGS.map(str::to_owned));
+        }
         args.extend([
             "-maxrate".into(),
             low.video_max_bps.to_string(),
@@ -886,6 +1026,8 @@ const HLS_TIME_SECONDS: u64 = SEGMENT_SECONDS;
 enum ProbeFailure {
     /// FFprobe could not run, failed, or timed out and was reaped.
     Unavailable,
+    /// The process exited unsuccessfully or exceeded the output bound.
+    InvalidOutput,
     /// It timed out and did not exit when killed: ownership must be retained.
     Stalled(tokio::process::Child),
 }
@@ -909,6 +1051,194 @@ async fn probe_descriptor(
         PROBE_DEADLINE,
     )
     .await
+}
+
+/// The display sets of bitmap subtitle stream `index` in the
+/// `BURN_LOOKBACK_MS` before `start_ms` (file time), read from the validated
+/// descriptor without decoding video. PGS sets come from the stream's own
+/// segments (each composition's state says whether a decoder can start
+/// there); DVD and DVB subpictures from their decoded frames, with any end
+/// they carry. Ok(None) when they cannot be read. A probe that does not
+/// exit when killed is handed to the lease until it does, and is an error:
+/// the generation must not start on that lease.
+async fn bitmap_display_sets(
+    app: &App,
+    input: &std::fs::File,
+    index: u32,
+    start_ms: u64,
+    lease: &execution::Lease,
+) -> Result<Option<Vec<playscale_core::delivery::DisplaySet>>, StuckProbe> {
+    let mut stuck = false;
+    let sets = bitmap_display_sets_inner(app, input, index, start_ms, lease, &mut stuck).await;
+    if stuck { Err(StuckProbe) } else { Ok(sets) }
+}
+
+/// A lookback probe that did not exit when killed.
+struct StuckProbe;
+
+async fn bitmap_display_sets_inner(
+    app: &App,
+    input: &std::fs::File,
+    index: u32,
+    start_ms: u64,
+    lease: &execution::Lease,
+    stuck: &mut bool,
+) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
+    use playscale_core::delivery::{BURN_LOOKBACK_MS, DisplaySet};
+    let mut owned = |result: Result<Vec<u8>, ProbeFailure>| match result {
+        Ok(output) => Some(output),
+        Err(ProbeFailure::Stalled(mut child)) => {
+            lease.stuck(async move {
+                let _ = child.wait().await;
+            });
+            *stuck = true;
+            None
+        }
+        Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => None,
+    };
+    let stream = format!("s:{index}");
+    let info: serde_json::Value = serde_json::from_slice(&owned(
+        probe_descriptor(
+            app,
+            input,
+            &[
+                "-select_streams",
+                &stream,
+                "-show_entries",
+                "format=start_time:stream=codec_name",
+                "-of",
+                "json",
+            ],
+        )
+        .await,
+    )?)
+    .ok()?;
+    // Container timestamps start at the container's start time; FFmpeg's
+    // -ss is relative to it.
+    let origin = info["format"]["start_time"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(0.0);
+    let from = start_ms.saturating_sub(BURN_LOOKBACK_MS);
+    let seconds = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    if info["streams"][0]["codec_name"] == "hdmv_pgs_subtitle" {
+        let map = format!("0:s:{index}");
+        let (from_at, to_at) = (seconds(from), seconds(start_ms + 1));
+        let offset = format!("-{origin:.6}");
+        let segments = owned(
+            run_descriptor(
+                &app.processing.settings.ffmpeg,
+                input,
+                &[
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-copyts",
+                    "-ss",
+                    &from_at,
+                    "-to",
+                    &to_at,
+                    "-i",
+                    "/dev/fd/3",
+                    "-map",
+                    &map,
+                    "-c",
+                    "copy",
+                    // File time (from the container's start): SUP keeps only
+                    // 32-bit 90 kHz timestamps, which absolute ones overflow.
+                    "-output_ts_offset",
+                    &offset,
+                    "-f",
+                    "sup",
+                    "pipe:1",
+                ],
+                MAX_PGS_PROBE_OUTPUT,
+                PROBE_DEADLINE,
+            )
+            .await,
+        )?;
+        return pgs_display_sets(&segments);
+    }
+    let interval = format!(
+        "{:.3}%{:.3}",
+        origin + from as f64 / 1000.0,
+        origin + start_ms as f64 / 1000.0 + 0.001
+    );
+    let frames: serde_json::Value = serde_json::from_slice(&owned(
+        probe_descriptor(
+            app,
+            input,
+            &[
+                "-read_intervals",
+                &interval,
+                "-select_streams",
+                &stream,
+                "-show_frames",
+                "-show_entries",
+                "frame=pts_time,num_rects,end_display_time",
+                "-of",
+                "json",
+            ],
+        )
+        .await,
+    )?)
+    .ok()?;
+    frames["frames"]
+        .as_array()?
+        .iter()
+        .map(|frame| {
+            let at = frame["pts_time"].as_str()?.parse::<f64>().ok()? - origin;
+            if !(at.is_finite() && at >= 0.0) {
+                return None;
+            }
+            let at_ms = (at * 1000.0).round() as u64;
+            // An end of u32::MAX (or none) means "until the next one".
+            let end = frame["end_display_time"]
+                .as_u64()
+                .filter(|end| *end > 0 && *end < u64::from(u32::MAX));
+            Some(DisplaySet {
+                at_ms,
+                draws: frame["num_rects"].as_u64()? > 0,
+                until_ms: end.map(|end| at_ms + end),
+                acquisition: true,
+            })
+        })
+        .collect()
+}
+
+/// Largest raw PGS segment stream read for the lookback (bitmaps included).
+const MAX_PGS_PROBE_OUTPUT: u64 = 64 * 1024 * 1024;
+
+/// The display sets of a raw PGS segment stream (`.sup`: "PG", 90 kHz PTS,
+/// DTS, type, size, payload): one per presentation composition, with
+/// whether it shows objects and whether its composition state (epoch start
+/// or acquisition point) lets a decoder start there. None if malformed.
+fn pgs_display_sets(bytes: &[u8]) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
+    let mut sets = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let header = bytes.get(at..at + 13)?;
+        if &header[..2] != b"PG" {
+            return None;
+        }
+        let pts = u32::from_be_bytes(header[2..6].try_into().ok()?);
+        let size = usize::from(u16::from_be_bytes(header[11..13].try_into().ok()?));
+        let payload = bytes.get(at + 13..at + 13 + size)?;
+        if header[10] == 0x16 {
+            // Presentation composition: state at byte 7, object count at 10.
+            let state = *payload.get(7)?;
+            let objects = *payload.get(10)?;
+            sets.push(playscale_core::delivery::DisplaySet {
+                at_ms: u64::from(pts) / 90,
+                draws: objects > 0,
+                until_ms: None,
+                acquisition: state & 0xC0 != 0,
+            });
+        }
+        at += 13 + size;
+    }
+    Some(sets)
 }
 
 /// Run a media tool reading the validated descriptor as fd 3 and collect its
@@ -948,7 +1278,11 @@ async fn run_descriptor(
     let overflow = output.len() as u64 > max_output;
     match finished {
         Ok(Ok(status)) if status.success() && !overflow && rewind() => Ok(output),
-        Ok(_) => {
+        Ok(Ok(_)) => {
+            rewind();
+            Err(ProbeFailure::InvalidOutput)
+        }
+        Ok(Err(_)) => {
             rewind();
             Err(ProbeFailure::Unavailable)
         }
@@ -957,7 +1291,11 @@ async fn run_descriptor(
             match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
                 Ok(_) => {
                     rewind();
-                    Err(ProbeFailure::Unavailable)
+                    Err(if overflow {
+                        ProbeFailure::InvalidOutput
+                    } else {
+                        ProbeFailure::Unavailable
+                    })
                 }
                 Err(_) => Err(ProbeFailure::Stalled(child)),
             }
@@ -968,6 +1306,42 @@ async fn run_descriptor(
 /// Observe the details stream copy eligibility needs, before any admission
 /// transaction (a probe must not hold the database writer).
 async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
+    let artifact = app
+        .processing
+        .artifacts
+        .pin([file_id.to_owned()])
+        .ok_or_else(ApiError::not_found)?;
+    let slot = app
+        .processing
+        .deliveries
+        .copy_probe_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "probe_unavailable",
+                "Source probes are busy; try again",
+            )
+        })?;
+    let admission = Arc::new((slot, artifact));
+    let app = app.clone();
+    let file_id = file_id.to_owned();
+    // The owner survives a cancelled planning/admission waiter, including
+    // uncancellable source opens and a child that has not acknowledged kill.
+    tokio::spawn(async move { probe_copy_details_owned(&app, &file_id, admission).await })
+        .await
+        .map_err(ApiError::internal)?
+}
+
+async fn probe_copy_details_owned(
+    app: &App,
+    file_id: &str,
+    admission: Arc<(
+        tokio::sync::OwnedSemaphorePermit,
+        Arc<crate::artifact_leases::Lease>,
+    )>,
+) -> Result<CopyDetails, ApiError> {
     let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(file_id)
         .fetch_optional(&app.db)
@@ -984,7 +1358,7 @@ async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, Api
         root_identity,
         fingerprint: file.fingerprint.clone(),
     };
-    let input = tokio::task::spawn_blocking(move || source_valid(&source))
+    let input = admitted_blocking(admission.clone(), move || source_valid(&source))
         .await
         .map_err(ApiError::internal)?
         .map_err(|error| {
@@ -1018,6 +1392,7 @@ async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, Api
                 // Not tied to execution capacity: admission has not reserved any.
                 tracing::error!(file_id, "source probe did not exit when killed");
                 tokio::spawn(async move {
+                    let _admission = admission;
                     let _ = child.wait().await;
                 });
             }
@@ -1068,6 +1443,7 @@ async fn copy_keyframe(
     start_ms: u64,
     duration_ms: Option<u64>,
     lease: &execution::Lease,
+    artifacts: Arc<crate::artifact_leases::Lease>,
 ) -> Option<(u64, u64)> {
     let from = start_ms.saturating_sub(COPY_TARGET_SECONDS * 1000);
     let mut until = start_ms + 60_000 + COPY_TARGET_SECONDS * 1000;
@@ -1102,11 +1478,12 @@ async fn copy_keyframe(
         Ok(stdout) => stdout,
         Err(ProbeFailure::Stalled(mut child)) => {
             lease.stuck(async move {
+                let _artifacts = artifacts;
                 let _ = child.wait().await;
             });
             return None;
         }
-        Err(ProbeFailure::Unavailable) => return None,
+        Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => return None,
     };
     let mut keyframes_us = Vec::new();
     let mut last_us = 0;
@@ -1567,7 +1944,7 @@ async fn run_generation(
     // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
     // (core `parts::locate`) seeks to its offset; later parts follow whole.
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-    let part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
+    let mut part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
         None
     } else if session.canvas.is_none()
         || (audio.is_some() && pin.parts.iter().any(|p| p.audio.is_none()))
@@ -1584,9 +1961,15 @@ async fn run_generation(
         Some(
             (first..durations.len())
                 .map(|i| {
-                    let fd = if i == 0 { 3 } else { 4 + i as u32 };
                     let seek = if i == first { offset } else { 0 };
-                    (fd, seek, durations[i] - seek, pin.parts[i].audio)
+                    PartInput {
+                        fd: if i == 0 { 3 } else { 4 + i as u32 },
+                        seek,
+                        length: durations[i] - seek,
+                        audio: pin.parts[i].audio,
+                        burn: pin.parts[i].burn,
+                        lookback: 0,
+                    }
                 })
                 .collect(),
         )
@@ -1649,7 +2032,15 @@ async fn run_generation(
     let (copy_start, seek_ms) = if copies_video(operation) {
         // Bounded by its own deadline; not abandoned on stop, which would leave
         // the probe unowned.
-        let probed = copy_keyframe(&app, &input, start_ms, duration_ms, &lease).await;
+        let probed = copy_keyframe(
+            &app,
+            &input,
+            start_ms,
+            duration_ms,
+            &lease,
+            session._artifacts.clone(),
+        )
+        .await;
         if stop.is_cancelled() {
             return stopped(&app, &session);
         }
@@ -1661,10 +2052,79 @@ async fn run_generation(
     } else {
         (None, start_ms)
     };
-    let mut supervisor = Command::new(&app.processing.supervisor);
+    // A burned text subtitle is extracted once per delivery, with its fonts,
+    // before the encoder starts; it renders nothing it could not read.
+    if let Some(Burn::Text { index, attachments }) = pinned_burn(&pin) {
+        let extracted = ensure_burn_text(&app, &session, index, attachments).await;
+        if stop.is_cancelled() {
+            return stopped(&app, &session);
+        }
+        if let Err(error) = extracted {
+            let (_, code, _) = error.parts();
+            tracing::warn!(delivery=%session.id, generation, code, "burned subtitle unavailable");
+            return fail(&app, &session);
+        }
+    }
+    // A burned bitmap subtitle of one file: where to read from so a cue still
+    // showing at the start is drawn (core `burn_read_from`, from the display
+    // sets the stream holds in the window before the start).
+    let burn_from = match pinned_burn(&pin) {
+        Some(Burn::Bitmap(index)) if durations.is_empty() && !copies_video(operation) => {
+            let start = seek_ms + pin.clip.map_or(0, |clip| clip.start_ms);
+            let sets = match bitmap_display_sets(&app, &input, index, start, &lease).await {
+                Ok(sets) => sets,
+                // Its reaper now owns the lease's release: nothing may start
+                // on it.
+                Err(StuckProbe) => {
+                    tracing::warn!(delivery=%session.id, generation, "subtitle lookback probe did not exit");
+                    return fail(&app, &session);
+                }
+            };
+            if stop.is_cancelled() {
+                return stopped(&app, &session);
+            }
+            Some(playscale_core::delivery::burn_read_from(
+                start,
+                sets.as_deref(),
+            ))
+        }
+        _ => None,
+    };
+    // A burned bitmap subtitle across parts: the part playback starts in is
+    // read early enough for a cue still showing at its seek (later parts
+    // play from their beginning).
+    if let Some(head) = part_inputs
+        .as_mut()
+        .and_then(|inputs| inputs.first_mut())
+        .filter(|head| head.burn.is_some() && head.seek > 0 && !copies_video(operation))
+    {
+        let descriptor = if head.fd == 3 {
+            &input
+        } else {
+            &later[(head.fd - 5) as usize]
+        };
+        let index = head.burn.unwrap_or_default();
+        let sets = match bitmap_display_sets(&app, descriptor, index, head.seek, &lease).await {
+            Ok(sets) => sets,
+            Err(StuckProbe) => {
+                tracing::warn!(delivery=%session.id, generation, "subtitle lookback probe did not exit");
+                return fail(&app, &session);
+            }
+        };
+        if stop.is_cancelled() {
+            return stopped(&app, &session);
+        }
+        head.lookback =
+            head.seek - playscale_core::delivery::burn_read_from(head.seek, sets.as_deref());
+    }
+    // Relative filter inputs (a burned subtitle) resolve from the generation
+    // directory, so executables given as relative paths are resolved against
+    // the server's own working directory first; bare names still use PATH.
+    let mut supervisor = Command::new(resolved_executable(&app.processing.supervisor));
+    supervisor.current_dir(&directory);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
-        .arg(&app.processing.settings.ffmpeg)
+        .arg(resolved_executable(&app.processing.settings.ffmpeg))
         .args(arguments(
             operation,
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
@@ -1673,10 +2133,12 @@ async fn run_generation(
             pin.clip.map(|clip| clip.end_ms),
             audio,
             pinned_burn(&pin),
+            burn_from,
             part_inputs.as_deref().zip(session.canvas),
             pin.max_bitrate_bps
                 .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
             pin.adaptive,
+            pin.tone_map,
             &directory,
         ))
         .stdin(Stdio::piped())
@@ -2655,35 +3117,101 @@ fn pinned_subtitle(pin: &Pin) -> Option<u32> {
 
 const SIDECAR_TRACK: &str = "subtitle-sidecar:";
 const BURN_TRACK: &str = "subtitle-burn:";
+const BURN_TEXT_TRACK: &str = "subtitle-burn-text:";
+/// Font attachments extracted for one burned text subtitle, at most.
+pub(crate) const MAX_BURN_ATTACHMENTS: u32 = 64;
 
-/// A bitmap subtitle stream burned into this generation's video.
-fn pinned_burn(pin: &Pin) -> Option<u32> {
-    pin.tracks
-        .iter()
-        .find_map(|t| t.strip_prefix(BURN_TRACK).and_then(|i| i.parse().ok()))
+/// An embedded subtitle stream burned into converted video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Burn {
+    /// Bitmap subpictures (PGS, DVD, DVB), overlaid.
+    Bitmap(u32),
+    /// Text or styled (ASS/SSA) subtitles rendered by libass with the file's
+    /// font attachments (`attachments` of them).
+    Text { index: u32, attachments: u32 },
 }
 
-/// Pin a burned bitmap subtitle in place of an absent text one.
-fn with_burn(mut pin: Pin, burn: Option<u32>) -> Pin {
-    if let Some(index) = burn {
+impl Burn {
+    /// The burned embedded subtitle stream.
+    pub(crate) fn index(self) -> u32 {
+        match self {
+            Burn::Bitmap(index) | Burn::Text { index, .. } => index,
+        }
+    }
+}
+
+/// A bitmap burn serializes as its bare stream number, as before text burns
+/// existed, so request digests of bitmap burns are unchanged.
+impl serde::Serialize for Burn {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Burn::Bitmap(index) => serializer.serialize_u32(index),
+            Burn::Text { index, attachments } => {
+                serde_json::json!({"text": index, "attachments": attachments}).serialize(serializer)
+            }
+        }
+    }
+}
+
+/// The subtitle stream burned into this generation's video.
+fn pinned_burn(pin: &Pin) -> Option<Burn> {
+    pin.tracks.iter().find_map(|t| {
+        if let Some(rest) = t.strip_prefix(BURN_TEXT_TRACK) {
+            let (index, attachments) = rest.split_once(':')?;
+            return Some(Burn::Text {
+                index: index.parse().ok()?,
+                attachments: attachments.parse().ok()?,
+            });
+        }
+        t.strip_prefix(BURN_TRACK)?.parse().ok().map(Burn::Bitmap)
+    })
+}
+
+/// Pin a burned subtitle in place of an absent text one.
+fn with_burn(mut pin: Pin, burn: Option<Burn>) -> Pin {
+    if let Some(burn) = burn {
         for track in &mut pin.tracks {
             if track == "subtitle:none" {
-                *track = format!("{BURN_TRACK}{index}");
+                *track = match burn {
+                    Burn::Bitmap(index) => format!("{BURN_TRACK}{index}"),
+                    Burn::Text { index, attachments } => {
+                        format!("{BURN_TEXT_TRACK}{index}:{attachments}")
+                    }
+                };
             }
         }
     }
     pin
 }
 
-/// A burned subtitle must be an embedded bitmap stream, and burn-in is a
-/// video transform: only a transcode can carry it.
+/// The font attachments of `file` a text burn-in extracts, bounded.
+pub(crate) fn burn_attachments(file: &db::ItemRow) -> u32 {
+    let Ok(streams) = serde_json::from_str::<Vec<db::Track>>(&file.tracks_json) else {
+        return 0;
+    };
+    let attachments: Vec<(Option<&str>, Option<u64>)> = streams
+        .iter()
+        .filter(|t| t.kind == "attachment")
+        .map(|t| (t.mimetype.as_deref(), t.attachment_bytes))
+        .collect();
+    core::burn_fonts(&attachments).min(MAX_BURN_ATTACHMENTS)
+}
+
+/// A burned subtitle must be an embedded stream the kind of burn renders
+/// (`core::presentation`): bitmap subpictures, or text/styled subtitles with
+/// the observed libass filter. Burn-in is a video transform: only a
+/// transcode can carry it.
 fn validate_burn(
     file: &db::ItemRow,
-    burn: Option<u32>,
+    burn: Option<Burn>,
     operation: Operation,
+    libass: bool,
 ) -> Result<(), ApiError> {
-    let Some(index) = burn else {
+    let Some(burn) = burn else {
         return Ok(());
+    };
+    let index = match burn {
+        Burn::Bitmap(index) | Burn::Text { index, .. } => index,
     };
     let streams: Vec<db::Track> =
         serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
@@ -2693,15 +3221,35 @@ fn validate_burn(
         .nth(index as usize)
         .map(|t| t.codec.as_str())
         .ok_or_else(|| ApiError::bad("Unknown subtitle track"))?;
-    if operation == Operation::VideoTranscode && core::burnable_subtitle(codec) {
+    let renders = match burn {
+        Burn::Bitmap(_) => core::burnable_subtitle(codec),
+        Burn::Text { attachments, .. } => {
+            libass
+                && (core::sidecar_subtitle(codec) || core::styled_subtitle(codec))
+                && attachments == burn_attachments(file)
+        }
+    };
+    if operation == Operation::VideoTranscode && renders {
         Ok(())
     } else {
         Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "subtitle_unsupported",
-            "Only bitmap subtitles are burned, and only into a transcode",
+            "This subtitle cannot be burned here, and only a transcode burns subtitles",
         ))
     }
+}
+
+/// Whether subtitle stream `ordinal` of `file` is a bitmap subtitle a
+/// conversion overlays.
+fn bitmap_stream(file: &db::ItemRow, ordinal: u32) -> bool {
+    serde_json::from_str::<Vec<db::Track>>(&file.tracks_json).is_ok_and(|streams| {
+        streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(ordinal as usize)
+            .is_some_and(|t| core::burnable_subtitle(&t.codec))
+    })
 }
 
 /// A pinned plain-text sidecar: (fingerprint, file name).
@@ -2802,6 +3350,7 @@ fn pin(
     subtitle: Option<u32>,
     operation: Operation,
     hardware: bool,
+    tone_map: Option<playscale_core::color::ToneMap>,
 ) -> Pin {
     let recipe = match operation {
         Operation::Remux => REMUX_RECIPE,
@@ -2819,17 +3368,70 @@ fn pin(
         parts: vec![],
         max_bitrate_bps: None,
         adaptive: false,
+        tone_map: tone_map.filter(|_| operation == Operation::VideoTranscode),
     }
 }
 
 /// Whether a live software transcode of `file` with this audio stream is
 /// admissible here (the core live-route rule, a probed duration, Unix).
-pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool {
+/// `filters` is given only where a tone-mapped conversion can be delivered
+/// (one file, observed filters); otherwise HDR sources are not transcodable.
+pub(crate) fn live_transcodable(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    filters: Option<playscale_core::color::Filters>,
+) -> bool {
     cfg!(unix)
         && file
             .duration_seconds
             .is_some_and(|d| d.is_finite() && d > 0.0)
-        && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
+        && validate_route(file, audio, Operation::VideoTranscode, false, None, filters).is_ok()
+}
+
+/// The tone map a conversion of `file` applies (`color::tone_map` over its
+/// video stream's probed facts); None for SDR, for refused sources and where
+/// no filters were observed.
+pub(crate) fn tone_map_for(
+    file: &db::ItemRow,
+    filters: Option<playscale_core::color::Filters>,
+) -> Option<playscale_core::color::ToneMap> {
+    let streams: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+    let video = streams.iter().find(|t| t.kind == "video")?;
+    playscale_core::color::tone_map(&video.color_facts(), filters?)
+        .ok()
+        .flatten()
+}
+
+/// Why HDR video cannot take this route, for the refusal message.
+fn hdr_refusal(
+    file: &db::ItemRow,
+    operation: Operation,
+    filters: Option<playscale_core::color::Filters>,
+) -> &'static str {
+    use playscale_core::color::Refusal;
+    if operation != Operation::VideoTranscode {
+        return "HDR video is never copied into an SDR route";
+    }
+    let Some(filters) = filters else {
+        return "HDR conversion is available only for single-file timelines";
+    };
+    let streams: Vec<db::Track> = serde_json::from_str(&file.tracks_json).unwrap_or_default();
+    let refusal = streams
+        .iter()
+        .find(|t| t.kind == "video")
+        .and_then(|v| playscale_core::color::tone_map(&v.color_facts(), filters).err());
+    match refusal {
+        Some(Refusal::ToolsUnavailable) => {
+            "This server's FFmpeg lacks the filters for HDR-to-SDR conversion"
+        }
+        Some(Refusal::DolbyVisionUnsupported) => {
+            "This Dolby Vision configuration has no HDR10 or HLG base layer to convert"
+        }
+        Some(Refusal::ColorUnknown) => {
+            "The HDR source's colour properties are unknown or unsupported; rescan it"
+        }
+        None => "Live conversion of HDR video is not supported",
+    }
 }
 
 /// What a plan observes about live hardware encoding here.
@@ -2865,10 +3467,10 @@ pub(crate) fn copy_candidate(
     file: &db::ItemRow,
     audio: Option<u32>,
 ) -> Option<Operation> {
-    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio) {
+    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio, None) {
         return None;
     }
-    with_streams(file, audio, None, core::copy_operation)
+    with_streams(file, audio, None, None, core::copy_operation)
         .ok()
         .flatten()
 }
@@ -2912,7 +3514,7 @@ pub(crate) fn copy_supported(
     details: &CopyDetails,
 ) -> bool {
     copies_video(operation)
-        && with_streams(file, audio, Some(details), |s| {
+        && with_streams(file, audio, Some(details), None, |s| {
             core::live_route_supported(operation, s)
         })
         .unwrap_or(false)
@@ -2937,6 +3539,7 @@ fn byte_pin(
         parts: vec![],
         max_bitrate_bps: None,
         adaptive: false,
+        tone_map: None,
     }
 }
 
@@ -2977,6 +3580,7 @@ fn with_streams<R>(
     file: &db::ItemRow,
     audio: Option<u32>,
     details: Option<&CopyDetails>,
+    filters: Option<playscale_core::color::Filters>,
     decide: impl FnOnce(&core::SourceStreams<'_>) -> R,
 ) -> Result<R, ApiError> {
     let streams: Vec<db::Track> =
@@ -2996,11 +3600,20 @@ fn with_streams<R>(
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
-    );
+    ) || video.dolby_vision.is_some();
+    // A tone map is considered only where the caller can deliver one (one
+    // file, observed filters) and the core accepts the source's colour facts.
+    let tone_map = filters.is_some_and(|f| {
+        matches!(
+            playscale_core::color::tone_map(&video.color_facts(), f),
+            Ok(Some(_))
+        )
+    });
     Ok(decide(&core::SourceStreams {
         video: Some(video.codec.as_str()),
         audio: selected.map(|t| t.codec.as_str()),
         hdr,
+        tone_map,
         // Every stream, not only the video: the earliest one is the container
         // start that input seeking is relative to.
         starts_at_zero: streams
@@ -3020,6 +3633,7 @@ fn validate_route(
     operation: Operation,
     copy_enabled: bool,
     details: Option<&CopyDetails>,
+    filters: Option<playscale_core::color::Filters>,
 ) -> Result<(), ApiError> {
     if copies_video(operation) && !copy_enabled {
         return Err(ApiError::new(
@@ -3028,18 +3642,17 @@ fn validate_route(
             "Live stream-copy routes are not enabled on this server",
         ));
     }
-    let (supported, hdr) = with_streams(file, audio, details, |s| {
+    let (supported, hdr) = with_streams(file, audio, details, filters, |s| {
         (core::live_route_supported(operation, s), s.hdr)
     })?;
     if supported {
         return Ok(());
     }
     Err(if hdr {
-        // No live route has a qualified tone-mapping path.
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "hdr_unsupported",
-            "Live conversion of HDR video is not supported",
+            hdr_refusal(file, operation, filters),
         )
     } else {
         ApiError::new(
@@ -3114,8 +3727,8 @@ pub(crate) struct Planned {
     pub network: &'static str,
     /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
     pub sidecar: Option<Sidecar>,
-    /// An embedded bitmap subtitle burned into the converted video.
-    pub burn: Option<u32>,
+    /// An embedded subtitle burned into the converted video.
+    pub burn: Option<Burn>,
     /// The interval of the file the planned timeline is.
     pub clip: Option<playscale_core::parts::Clip>,
     /// Every part of a multipart timeline, in order; empty for one file.
@@ -3288,7 +3901,7 @@ pub(crate) struct Selection {
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
     pub sidecar: Option<Sidecar>,
-    pub burn: Option<u32>,
+    pub burn: Option<Burn>,
     pub clip: Option<playscale_core::parts::Clip>,
     pub parts: Vec<playscale_core::parts::PartPin>,
     pub max_bitrate_bps: Option<u64>,
@@ -3348,7 +3961,17 @@ pub(crate) async fn change_live(
                         Operation::Original,
                     )
                 }
-                Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
+                // A replan keeps the text subtitle the rendition carries
+                // (`processing::carries` decided it at planning).
+                Route::Prepared => {
+                    validate_subtitle(&file, selection.subtitle)?;
+                    byte_pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        Operation::Prepared,
+                    )
+                }
                 Route::Remux | Route::AudioConvert => {
                     let operation = selection.route.operation();
                     validate_route(
@@ -3357,9 +3980,17 @@ pub(crate) async fn change_live(
                         operation,
                         app.processing.settings.experimental_copy_routes,
                         selection.copy_details.as_ref(),
+                        None,
                     )?;
                     validate_subtitle(&file, selection.subtitle)?;
-                    pin(&file, selection.audio, selection.subtitle, operation, false)
+                    pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        operation,
+                        false,
+                        None,
+                    )
                 }
                 Route::Transcode | Route::HardwareTranscode => {
                     let hardware = selection.route == Route::HardwareTranscode;
@@ -3372,12 +4003,21 @@ pub(crate) async fn change_live(
                     {
                         return Err(backend_unavailable());
                     }
+                    // Tone mapping is decided for one file from the cached
+                    // filter observation (the v2 command warms it first).
+                    let filters = app
+                        .processing
+                        .filters
+                        .get()
+                        .copied()
+                        .filter(|_| selection.parts.is_empty());
                     validate_route(
                         &file,
                         selection.audio,
                         Operation::VideoTranscode,
                         app.processing.settings.experimental_copy_routes,
                         None,
+                        filters,
                     )?;
                     validate_subtitle(&file, selection.subtitle)?;
                     pin(
@@ -3386,11 +4026,17 @@ pub(crate) async fn change_live(
                         selection.subtitle,
                         Operation::VideoTranscode,
                         hardware,
+                        tone_map_for(&file, filters),
                     )
                 }
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
-            validate_burn(&file, selection.burn, pin.operation)?;
+            validate_burn(
+                &file,
+                selection.burn,
+                pin.operation,
+                app.processing.filters.get().is_some_and(|f| f.subtitles),
+            )?;
             // The timeline's interval and part layout are fixed for the
             // delivery; the selected audio in each part may change.
             if selection.clip != basis.clip
@@ -3769,6 +4415,17 @@ async fn admit_owned(
         }
     }
     authority.fresh()?;
+    let artifacts = app
+        .processing
+        .artifacts
+        .pin(
+            std::iter::once(r.file_id.clone()).chain(
+                planned
+                    .iter()
+                    .flat_map(|p| p.parts.iter().map(|p| p.file.clone())),
+            ),
+        )
+        .ok_or_else(ApiError::not_found)?;
     if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3811,6 +4468,14 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
+    // One file's conversion may tone-map HDR, decided from the cached filter
+    // observation (the v2 command warms it before this transaction).
+    let filters = app
+        .processing
+        .filters
+        .get()
+        .copied()
+        .filter(|_| planned.as_ref().is_none_or(|p| p.parts.is_empty()) && !original);
     if !original {
         validate_route(
             &file,
@@ -3818,13 +4483,19 @@ async fn admit_owned(
             operation,
             app.processing.settings.experimental_copy_routes,
             copy_details.as_ref(),
+            filters,
         )?;
     }
     validate_subtitle(&file, r.subtitle_track)?;
     let sidecar = planned.as_ref().and_then(|p| p.sidecar.as_ref());
     validate_sidecar(&mut transaction, &file.id, sidecar).await?;
     let burn = planned.as_ref().and_then(|p| p.burn);
-    validate_burn(&file, burn, operation)?;
+    validate_burn(
+        &file,
+        burn,
+        operation,
+        app.processing.filters.get().is_some_and(|f| f.subtitles),
+    )?;
     // An interval is a clip of the file: only a conversion presents it, and
     // the delivery's logical duration is the interval's.
     let clip = planned.as_ref().and_then(|p| p.clip);
@@ -3873,6 +4544,23 @@ async fn admit_owned(
             "An interval of a file is delivered only by a conversion",
         ));
     }
+    // A bitmap burned across parts is pinned in every part, and only then;
+    // each part's pinned stream is a bitmap subtitle of that revision.
+    let burns_bitmap = matches!(burn, Some(Burn::Bitmap(_)));
+    if !parts.is_empty()
+        && (parts.iter().any(|p| p.burn.is_some() != burns_bitmap)
+            || matches!(burn, Some(Burn::Text { .. }))
+            || parts.first().is_some_and(|p| {
+                p.burn
+                    .is_some_and(|b| Some(Burn::Bitmap(b)) != burn || !bitmap_stream(&file, b))
+            }))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "A subtitle is burned across parts only as a bitmap pinned in every part",
+        ));
+    }
     // Every later part must still be the pinned revision, available, in the
     // first part's library (whose root its source is opened under).
     let mut part_sources = Vec::new();
@@ -3889,6 +4577,13 @@ async fn admit_owned(
                 "A part of the timeline changed; plan again",
             ));
         };
+        if part.burn.is_some_and(|b| !bitmap_stream(&row, b)) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subtitle_unsupported",
+                "A part's burned subtitle is not a bitmap subtitle",
+            ));
+        }
         part_sources.push((row.id, row.revision, row.relative_path, row.fingerprint));
     }
     let duration_ms = match clip {
@@ -3930,7 +4625,14 @@ async fn admit_owned(
                     if original {
                         byte_pin(&file, r.audio_track, r.subtitle_track, operation)
                     } else {
-                        pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+                        pin(
+                            &file,
+                            r.audio_track,
+                            r.subtitle_track,
+                            operation,
+                            hardware,
+                            tone_map_for(&file, filters),
+                        )
                     },
                     sidecar,
                 ),
@@ -3944,6 +4646,7 @@ async fn admit_owned(
     .map_err(error)?;
     let session = Arc::new(Session {
         id: new_id(),
+        _artifacts: artifacts,
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
@@ -3994,7 +4697,7 @@ async fn admit_owned(
             changes: Default::default(),
             copy_peaks: HashMap::new(),
         }),
-        subtitles: tokio::sync::Mutex::new(()),
+        subtitles: Arc::new(tokio::sync::Mutex::new(())),
         telemetry: Arc::new({
             let telemetry = crate::playback_monitor::Telemetry::new(
                 planned.as_ref().map_or("unknown", |p| p.network),
@@ -4230,19 +4933,21 @@ pub async fn change(
                     "Create a new delivery",
                 ));
             }
+            // This (v1) change path never tone-maps: HDR stays refused.
             validate_route(
                 &file,
                 audio,
                 operation,
                 app.processing.settings.experimental_copy_routes,
                 details.as_ref(),
+                None,
             )?;
             validate_subtitle(&file, subtitle)?;
             Some((
                 current,
                 (
                     file.edition_id.clone(),
-                    pin(&file, audio, subtitle, operation, hardware),
+                    pin(&file, audio, subtitle, operation, hardware, None),
                 ),
             ))
         }
@@ -4609,6 +5314,15 @@ async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<Pat
         }
         let pin = &d.generations[&generation].pin;
         match (pinned_subtitle(pin), pinned_sidecar(pin)) {
+            // A multipart timeline pins each part's occurrence of the text
+            // subtitle component.
+            (Some(_), _) if !pin.parts.is_empty() => SubtitleSource::Parts(
+                pin.parts
+                    .iter()
+                    .map(|p| Some((p.subtitle?, p.duration_ms)))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(ApiError::not_found)?,
+            ),
             (Some(index), _) => SubtitleSource::Embedded(index),
             (None, Some((fingerprint, name))) => SubtitleSource::Sidecar(Sidecar {
                 name: name.to_owned(),
@@ -4623,6 +5337,11 @@ async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<Pat
             use sha2::{Digest, Sha256};
             let digest = Sha256::digest(format!("{}/{}", sidecar.fingerprint, sidecar.name));
             format!("subtitles-sidecar-{:x}.vtt", digest)
+        }
+        SubtitleSource::Parts(parts) => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{parts:?}"));
+            format!("subtitles-parts-{:x}.vtt", digest)
         }
     };
     let path = app
@@ -4702,7 +5421,8 @@ pub(crate) async fn subtitle_segment(
         })
     };
     let (from, duration, offset) = window.ok_or_else(ApiError::not_found)?;
-    let text = tokio::task::spawn_blocking(move || {
+    let permit = Arc::new(permit);
+    let text = admitted_blocking(permit.clone(), move || {
         let text = std::fs::read_to_string(path).ok()?;
         let cues = playscale_core::subtitles::parse_webvtt(&text)?;
         Some(playscale_core::subtitles::webvtt_segment(
@@ -4721,6 +5441,18 @@ pub(crate) async fn subtitle_segment(
         yield Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
     });
     Ok((stream_headers("text/vtt; charset=utf-8"), body).into_response())
+}
+
+// Cancellation of an async waiter cannot cancel running blocking I/O. Its
+// admission remains owned by that work until the operation actually returns.
+fn admitted_blocking<A: Send + Sync + 'static, T: Send + 'static>(
+    admission: Arc<A>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        work()
+    })
 }
 
 /// Largest sidecar accepted from the converter.
@@ -4743,6 +5475,11 @@ enum SubtitleSource {
     Embedded(u32),
     /// A plain-text sidecar next to the delivered file.
     Sidecar(Sidecar),
+    /// A multipart timeline's text subtitle: each part's embedded subtitle
+    /// stream and pinned duration, in part order (the first part is the
+    /// session's source, the later ones its validated `parts`). Converted
+    /// part by part and joined in timeline time (`subtitles::join_parts`).
+    Parts(Vec<(u32, u64)>),
 }
 
 async fn ensure_subtitles(
@@ -4751,21 +5488,32 @@ async fn ensure_subtitles(
     selected: SubtitleSource,
     path: PathBuf,
 ) -> Result<(), ApiError> {
-    let _extraction = session.subtitles.lock().await;
+    let extraction = session.subtitles.clone().lock_owned().await;
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Ok(());
     }
-    let _slot = app
+    let slot = app
         .processing
         .deliveries
         .subtitle_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
+    let admission = Arc::new((extraction, slot, session._artifacts.clone()));
     // A sidecar is opened like the media file: under the same validated root,
     // and only while its fingerprint is still the pinned one.
-    let (source, format, map) = match &selected {
-        SubtitleSource::Embedded(index) => (session.source.clone(), None, format!("0:s:{index}")),
+    let text = match &selected {
+        SubtitleSource::Embedded(index) => {
+            convert_subtitle(
+                &app,
+                &session.id,
+                session.source.clone(),
+                None,
+                *index,
+                admission.clone(),
+            )
+            .await?
+        }
         SubtitleSource::Sidecar(sidecar) => {
             let format = match sidecar
                 .name
@@ -4786,19 +5534,177 @@ async fn ensure_subtitles(
                 fingerprint: sidecar.fingerprint.clone(),
                 ..session.source.clone()
             };
-            (source, Some(format), "0:s:0".to_owned())
+            convert_subtitle(
+                &app,
+                &session.id,
+                source,
+                Some(format),
+                0,
+                admission.clone(),
+            )
+            .await?
+        }
+        SubtitleSource::Parts(parts) => {
+            if parts.len() != session.parts.len() + 1 {
+                return Err(ApiError::not_found());
+            }
+            let sources = std::iter::once(&session.source).chain(&session.parts);
+            let mut converted = Vec::with_capacity(parts.len());
+            for (source, (index, duration)) in sources.zip(parts) {
+                let text = convert_subtitle(
+                    &app,
+                    &session.id,
+                    source.clone(),
+                    None,
+                    *index,
+                    admission.clone(),
+                )
+                .await?;
+                let cues = std::str::from_utf8(&text)
+                    .ok()
+                    .and_then(playscale_core::subtitles::parse_webvtt)
+                    .ok_or_else(subtitles_unavailable)?;
+                converted.push((cues, *duration));
+            }
+            let joined = playscale_core::subtitles::webvtt(&playscale_core::subtitles::join_parts(
+                &converted,
+            ));
+            if joined.len() as u64 > MAX_SUBTITLE_BYTES {
+                return Err(subtitles_unavailable());
+            }
+            joined.into_bytes()
         }
     };
+    // Publish into the existing delivery directory only: if cleanup removed it,
+    // the delivery is gone and nothing is resurrected.
+    let partial = path.with_extension("vtt.partial");
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &text).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&partial, &path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::not_found());
+    }
+    Ok(())
+}
+
+/// An available file at exactly `revision`, as a source to open beneath its
+/// library root (`source_valid`); a changed revision is a conflict.
+async fn source_of(app: &App, file_id: &str, revision: &str) -> Result<Source, ApiError> {
+    let file: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT f.relative_path,f.fingerprint,l.root,l.root_identity FROM media_files f JOIN libraries l ON l.id=f.library_id \
+         WHERE f.id=? AND f.revision=? AND f.available=1 AND l.enabled=1",
+    )
+    .bind(file_id)
+    .bind(revision)
+    .fetch_optional(&app.db)
+    .await?;
+    let (relative, fingerprint, root, root_identity) =
+        file.ok_or_else(|| ApiError::conflict("source_revision_changed", "The file changed"))?;
+    Ok(Source {
+        root: root.into(),
+        relative: relative.into(),
+        root_identity,
+        fingerprint,
+    })
+}
+
+/// Open an available file at exactly `revision` beneath its validated root,
+/// only while its fingerprint is the recorded one: the descriptor and that
+/// fingerprint, so a reader can observe it unchanged afterwards.
+pub(crate) async fn open_source(
+    app: &App,
+    file_id: &str,
+    revision: &str,
+    lease: std::sync::Arc<crate::execution::Lease>,
+    stop: &CancellationToken,
+) -> Result<(std::fs::File, String), ApiError> {
+    let source = source_of(app, file_id, revision).await?;
+    let fingerprint = source.fingerprint.clone();
+    let opened = crate::execution::prepare(
+        lease,
+        stop,
+        PROBE_DEADLINE,
+        move || source_valid(&source),
+        || {},
+    )
+    .await
+    .ok_or_else(|| ApiError::conflict("source_unavailable", "The file could not be opened"))?
+    .map_err(ApiError::internal)?
+    .map_err(|_| ApiError::conflict("source_revision_changed", "The file changed"))?;
+    Ok((opened, fingerprint))
+}
+
+/// Convert subtitle stream `index` of an available file at exactly
+/// `revision` to WebVTT in its file time, for a download (`owner`). The file
+/// is opened beneath its library root only while its fingerprint is the
+/// recorded one, as for a delivery, and one of the subtitle conversion slots
+/// is held. The result is bounded and parses as WebVTT.
+pub(crate) async fn download_subtitles(
+    app: &App,
+    owner: &str,
+    file_id: &str,
+    revision: &str,
+    index: u32,
+) -> Result<Vec<u8>, ApiError> {
+    let artifacts = app
+        .processing
+        .artifacts
+        .pin([file_id.to_owned()])
+        .ok_or_else(subtitles_unavailable)?;
+    let source = source_of(app, file_id, revision).await?;
+    let slot = app
+        .processing
+        .deliveries
+        .subtitle_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| subtitles_unavailable())?;
+    let admission = Arc::new((slot, artifacts));
+    let text = convert_subtitle(app, owner, source, None, index, admission).await?;
+    if !std::str::from_utf8(&text)
+        .ok()
+        .is_some_and(|t| playscale_core::subtitles::parse_webvtt(t).is_some())
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_conversion_failed",
+            "The converted subtitle is invalid",
+        ));
+    }
+    Ok(text)
+}
+
+/// Convert subtitle stream `index` of `source` (opened beneath its validated
+/// root, only while its fingerprint is the pinned one) to WebVTT in its file
+/// time, observing the descriptor again before the result is used.
+async fn convert_subtitle<A: Send + Sync + 'static>(
+    app: &App,
+    owner: &str,
+    source: Source,
+    format: Option<&'static str>,
+    index: u32,
+    admission: Arc<A>,
+) -> Result<Vec<u8>, ApiError> {
     let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
-        tokio::task::spawn_blocking(move || source_valid(&source)),
+        admitted_blocking(admission.clone(), move || source_valid(&source)),
     )
     .await
     .map_err(|_| subtitles_unavailable())?
     .map_err(ApiError::internal)?;
     let input = opened
         .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
+    let map = format!("0:s:{index}");
     let mut args = vec!["-v", "error", "-nostdin"];
     if let Some(format) = format {
         args.extend(["-f", format]);
@@ -4824,9 +5730,16 @@ async fn ensure_subtitles(
     .await;
     let text = match converted {
         Ok(text) if text.starts_with(b"WEBVTT") => text,
-        Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
+        Ok(_) | Err(ProbeFailure::InvalidOutput) => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subtitle_conversion_failed",
+                "The selected subtitle cannot be converted within the supported bounds",
+            ));
+        }
+        Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
         Err(ProbeFailure::Stalled(mut child)) => {
-            tracing::error!(delivery=%session.id, "subtitle conversion did not exit when killed");
+            tracing::error!(%owner, "subtitle conversion did not exit when killed");
             // Keep the lock and slot until the converter is actually gone.
             let _ = child.wait().await;
             return Err(subtitles_unavailable());
@@ -4835,6 +5748,130 @@ async fn ensure_subtitles(
     // The converter read the descriptor after it was validated: an in-place
     // edit in between would be published under the pinned fingerprint.
     // Observe the descriptor again before publishing.
+    let unchanged = tokio::time::timeout(
+        PROBE_DEADLINE,
+        admitted_blocking(admission.clone(), move || {
+            input
+                .metadata()
+                .is_ok_and(|m| scan::fingerprint(&m) == expected)
+        }),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?;
+    if !unchanged {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Create a new delivery",
+        ));
+    }
+    Ok(text)
+}
+
+/// Extract (once per delivery) the embedded subtitle stream `index` as ASS
+/// and its `attachments` font attachments, from the validated source, into
+/// the delivery directory beside the generations. Attachments are written
+/// under fixed names, never the names the media file carries.
+async fn ensure_burn_text(
+    app: &App,
+    session: &Arc<Session>,
+    index: u32,
+    attachments: u32,
+) -> Result<(), ApiError> {
+    let _extraction = session.subtitles.lock().await;
+    let directory = app.processing.deliveries.root.join(&session.id);
+    let path = directory.join(format!("{BURN_TEXT}{index}.ass"));
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let _slot = app
+        .processing
+        .deliveries
+        .subtitle_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| subtitles_unavailable())?;
+    let fonts = directory.join(format!("{BURN_FONTS}{index}"));
+    // The pinned attachments were admitted by their probed sizes
+    // (`core::burn_fonts`); room for the largest admissible set is required.
+    if attachments > 0 {
+        let floor = app.storage.settings.min_free_bytes;
+        let directory = directory.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::storage::require_space(&directory, core::MAX_FONTS_TOTAL_BYTES, floor)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(|_| subtitles_unavailable())?;
+    }
+    let _ = tokio::fs::remove_dir_all(&fonts).await;
+    tokio::fs::create_dir_all(&fonts)
+        .await
+        .map_err(ApiError::internal)?;
+    let source = session.source.clone();
+    let expected = source.fingerprint.clone();
+    let input = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || source_valid(&source)),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?
+    .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
+    let mut args: Vec<String> = ["-v", "error", "-nostdin", "-y"]
+        .map(str::to_owned)
+        .to_vec();
+    for attachment in 0..attachments.min(MAX_BURN_ATTACHMENTS) {
+        args.push(format!("-dump_attachment:t:{attachment}"));
+        args.push(
+            fonts
+                .join(format!("font{attachment}"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.extend(
+        [
+            "-i",
+            "/dev/fd/3",
+            "-map",
+            &format!("0:s:{index}"),
+            "-c:s",
+            "ass",
+            "-f",
+            "ass",
+            "pipe:1",
+        ]
+        .map(str::to_owned),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let converted = run_descriptor(
+        &app.processing.settings.ffmpeg,
+        &input,
+        &args,
+        MAX_SUBTITLE_BYTES,
+        Duration::from_secs(120),
+    )
+    .await;
+    let text = match converted {
+        Ok(text)
+            if text.starts_with(b"[Script Info]")
+                || text.starts_with(b"\xEF\xBB\xBF[Script Info]") =>
+        {
+            text
+        }
+        Ok(_) | Err(ProbeFailure::Unavailable | ProbeFailure::InvalidOutput) => {
+            return Err(subtitles_unavailable());
+        }
+        Err(ProbeFailure::Stalled(mut child)) => {
+            tracing::error!(delivery=%session.id, "subtitle extraction did not exit when killed");
+            let _ = child.wait().await;
+            return Err(subtitles_unavailable());
+        }
+    };
+    // The extractor read the descriptor after it was validated: observe it
+    // again before publishing under the pinned fingerprint.
     let unchanged = tokio::time::timeout(
         PROBE_DEADLINE,
         tokio::task::spawn_blocking(move || {
@@ -4852,9 +5889,7 @@ async fn ensure_subtitles(
             "Create a new delivery",
         ));
     }
-    // Publish into the existing delivery directory only: if cleanup removed it,
-    // the delivery is gone and nothing is resurrected.
-    let partial = path.with_extension("vtt.partial");
+    let partial = path.with_extension("ass.partial");
     let written = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -4895,7 +5930,58 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn subtitle_admission_survives_cancelled_blocking_waiter() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let extraction = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let admission = std::sync::Arc::new((
+            extraction.clone().lock_owned().await,
+            slots.clone().try_acquire_owned().unwrap(),
+        ));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = super::admitted_blocking(admission.clone(), move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        ready.await.unwrap();
+        task.abort();
+        drop(task);
+        drop(admission);
+        assert_eq!(slots.available_permits(), 0);
+        assert!(extraction.try_lock().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extraction.try_lock().is_ok());
+        drop(permit);
+    }
+
     use super::{CopyDetails, Operation, db, parse_copy_details, validate_route};
+
+    #[test]
+    fn executables_survive_a_changed_working_directory() {
+        use std::path::Path;
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            super::resolved_executable(Path::new("ffmpeg")),
+            Path::new("ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("/opt/ff/ffmpeg")),
+            Path::new("/opt/ff/ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("./tools/ffmpeg")),
+            cwd.join("./tools/ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("tools/ffmpeg")),
+            cwd.join("tools/ffmpeg")
+        );
+    }
 
     #[test]
     fn copy_details_parse_profile_level_field_order_and_rotation() {
@@ -4955,6 +6041,7 @@ mod tests {
             duration_seconds: Some(60.0),
             tracks_json,
             available: true,
+            chapters_json: None,
         };
         async fn code(result: Result<(), crate::api::ApiError>) -> Option<String> {
             let response = result.err()?.into_response();
@@ -4981,26 +6068,48 @@ mod tests {
                 Some(0),
                 Operation::Remux,
                 true,
-                Some(&stale)
+                Some(&stale),
+                None
             ))
             .await
             .as_deref(),
             Some("route_unsupported")
         );
-        assert!(validate_route(&eligible, Some(0), Operation::Remux, true, Some(&details)).is_ok());
+        assert!(
+            validate_route(
+                &eligible,
+                Some(0),
+                Operation::Remux,
+                true,
+                Some(&details),
+                None
+            )
+            .is_ok()
+        );
         assert_eq!(
             code(validate_route(
                 &eligible,
                 Some(0),
                 Operation::Remux,
                 false,
-                Some(&details)
+                Some(&details),
+                None
             ))
             .await
             .as_deref(),
             Some("route_unqualified")
         );
-        assert!(validate_route(&eligible, Some(0), Operation::VideoTranscode, false, None).is_ok());
+        assert!(
+            validate_route(
+                &eligible,
+                Some(0),
+                Operation::VideoTranscode,
+                false,
+                None,
+                None
+            )
+            .is_ok()
+        );
         // Audio starting before zero moves the container start; 10-bit video
         // cannot be copied into the browser pipeline.
         for ineligible in [
@@ -5013,7 +6122,8 @@ mod tests {
                     Some(0),
                     Operation::Remux,
                     true,
-                    Some(&details)
+                    Some(&details),
+                    None
                 ))
                 .await
                 .as_deref(),
@@ -5040,6 +6150,7 @@ mod tests {
                 parts: vec![],
                 max_bitrate_bps: None,
                 adaptive: false,
+                tone_map: None,
             },
             0,
             Some(60_000),

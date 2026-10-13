@@ -31,6 +31,7 @@ use playscale_core::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sqlx::SqliteConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn routes() -> Router<App> {
@@ -55,7 +56,7 @@ pub fn routes() -> Router<App> {
         )
         .route(
             "/catalog/items/{item_id}/artwork/selection",
-            put(select_artwork),
+            get(get_artwork_selection).put(select_artwork),
         )
         .route(
             "/media/assets/{asset_id}/content",
@@ -331,13 +332,61 @@ struct CandidateBody {
     confidence: Option<f64>,
 }
 
+/// What a proposal is about, readably: the file's name and the title it is
+/// currently cataloged under when the caller may read that title.
+#[derive(Serialize, Clone, Default)]
+struct SubjectBody {
+    file_name: String,
+    item_id: Option<String>,
+    title: Option<String>,
+}
+
 #[derive(Serialize)]
 struct MatchBody {
     id: String,
     revision: String,
     file: FileRef,
+    subject: SubjectBody,
     status: Status,
     candidates: Vec<CandidateBody>,
+}
+
+/// Readable subjects of proposals whose files lie in the caller's scope (as
+/// every listed or read proposal's does). The current title is named only
+/// when the caller may read it; otherwise only the file name is shown.
+async fn subjects(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    proposals: &[Proposal],
+) -> Result<std::collections::HashMap<String, SubjectBody>, Problem> {
+    let mut out = std::collections::HashMap::new();
+    for p in proposals {
+        if out.contains_key(&p.file_id) {
+            continue;
+        }
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT f.relative_path,i.id,i.title FROM media_files f LEFT JOIN editions e ON e.id=f.edition_id LEFT JOIN items i ON i.id=e.item_id WHERE f.id=?",
+        )
+        .bind(&p.file_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((path, item, title)) = row else {
+            continue;
+        };
+        let visible = match &item {
+            Some(item) => visible_item(conn, scope, item).await?,
+            None => false,
+        };
+        out.insert(
+            p.file_id.clone(),
+            SubjectBody {
+                file_name: path.rsplit(['/', '\\']).next().unwrap_or(&path).to_owned(),
+                item_id: item.filter(|_| visible),
+                title: title.filter(|_| visible),
+            },
+        );
+    }
+    Ok(out)
 }
 
 const PROPOSAL: &str = "p.id,p.revision,p.file_id,p.file_revision,p.status,p.candidates_json,p.decision_json FROM match_proposals p JOIN media_files f ON f.id=p.file_id";
@@ -362,10 +411,15 @@ async fn readable_items(
     Ok(readable)
 }
 
-fn match_body(p: Proposal, readable: &BTreeSet<String>) -> MatchBody {
+fn match_body(
+    p: Proposal,
+    readable: &BTreeSet<String>,
+    subjects: &std::collections::HashMap<String, SubjectBody>,
+) -> MatchBody {
     MatchBody {
         id: p.id,
         revision: p.revision.to_string(),
+        subject: subjects.get(&p.file_id).cloned().unwrap_or_default(),
         file: FileRef {
             file_id: p.file_id,
             file_revision: p.file_revision,
@@ -415,8 +469,9 @@ async fn respond_match(
     proposal: Proposal,
 ) -> Result<(MatchBody, u64), Problem> {
     let readable = readable_items(conn, scope, std::slice::from_ref(&proposal)).await?;
+    let subjects = subjects(conn, scope, std::slice::from_ref(&proposal)).await?;
     let revision = proposal.revision;
-    Ok((match_body(proposal, &readable), revision))
+    Ok((match_body(proposal, &readable, &subjects), revision))
 }
 
 fn matching_problem(e: MatchingError) -> Problem {
@@ -492,9 +547,10 @@ async fn list_matches(
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(Problem::internal)?;
     let readable = readable_items(&mut tx, &scope, &proposals).await?;
+    let subjects = subjects(&mut tx, &scope, &proposals).await?;
     let rows = proposals
         .into_iter()
-        .map(|p| (p.id.clone(), match_body(p, &readable)))
+        .map(|p| (p.id.clone(), match_body(p, &readable, &subjects)))
         .collect();
     let page = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;
@@ -576,7 +632,15 @@ async fn create_match(
             .ok_or_else(|| Problem::internal("invalid match receipt"))?;
         // A saved acknowledgement is not an authorization snapshot. Keep its
         // revision/outcome, but hide candidates no longer visible to this caller.
-        load_match(&mut tx, &scope, id).await?;
+        let proposal = load_match(&mut tx, &scope, id).await?;
+        let current_subjects = subjects(&mut tx, &scope, std::slice::from_ref(&proposal)).await?;
+        body["subject"] = serde_json::to_value(
+            current_subjects
+                .get(&proposal.file_id)
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(Problem::internal)?;
         let candidates = body["candidates"]
             .as_array_mut()
             .ok_or_else(|| Problem::internal("invalid match candidates"))?;
@@ -683,6 +747,21 @@ async fn decide_match(
             )));
         }
     }
+    if let Decision::Accept { candidate_id } = &decision {
+        let subject: String = sqlx::query_scalar("SELECT item_id FROM catalog_files WHERE id=?")
+            .bind(&proposal.file_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        super::catalog::curatable_item(&mut tx, &scope, &subject, false).await?;
+        if let Some(target) = proposal
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.id == candidate_id)
+            .and_then(|candidate| candidate.item_id.as_deref())
+        {
+            super::catalog::authorize_merge_scope(&mut tx, &scope, &[subject], target).await?;
+        }
+    }
     let decided = service::decide_in_transaction(&mut tx, &id, expected, decision)
         .await
         .map_err(|e| match e {
@@ -700,7 +779,7 @@ async fn decide_match(
 // ----------------------------------------------------------------- artwork
 
 /// Artwork assets are immutable and content-addressed by their SHA-256.
-const ASSET_REVISION: u64 = 1;
+pub(crate) const ASSET_REVISION: u64 = 1;
 
 #[derive(Serialize)]
 struct AssetBody {
@@ -981,6 +1060,78 @@ async fn upload_artwork(
     tx.commit().await?;
     Ok(tagged(StatusCode::CREATED, &value, 1))
 }
+#[derive(Serialize)]
+pub(crate) struct ResolvedArtwork {
+    role: String,
+    pub(crate) asset_id: Option<String>,
+    selection_revision: String,
+    pinned: bool,
+    sources: Vec<String>,
+    conflict: bool,
+}
+
+/// The same role resolver supplies item posters and explicit selection reads.
+pub(crate) async fn resolved_artwork(
+    conn: &mut SqliteConnection,
+    item: &str,
+    role: &str,
+) -> Result<ResolvedArtwork, Problem> {
+    let selection: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT asset_id,revision FROM artwork_selections WHERE item_id=? AND role=?",
+    )
+    .bind(item)
+    .bind(role)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let contributions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role=? ORDER BY source",
+    ).bind(item).bind(role).fetch_all(&mut *conn).await?;
+    let pin = selection.as_ref().and_then(|(asset, _)| asset.clone());
+    let local = contributions
+        .iter()
+        .find(|(source, _)| source == "local")
+        .map(|(_, asset)| asset.clone());
+    let candidates = contributions
+        .iter()
+        .map(|(_, asset)| asset.clone())
+        .collect();
+    let pinned = pin.is_some();
+    let (asset_id, conflict) = playscale_core::artwork::resolve(pin, local, &candidates);
+    let sources = contributions
+        .into_iter()
+        .filter(|(_, asset)| asset_id.as_ref().is_none_or(|selected| selected == asset))
+        .map(|(source, _)| source)
+        .collect();
+    Ok(ResolvedArtwork {
+        role: role.into(),
+        asset_id,
+        selection_revision: selection.map_or(0, |(_, revision)| revision).to_string(),
+        pinned,
+        sources,
+        conflict,
+    })
+}
+
+async fn get_artwork_selection(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let mut tx = app.db.begin().await?;
+    let (item, _) =
+        super::catalog::load_item(&mut tx, &core::catalog_scope(&caller.principal), &id, true)
+            .await?;
+    let mut roles = Vec::new();
+    for role in ["poster", "backdrop", "thumbnail", "banner"] {
+        roles.push(resolved_artwork(&mut tx, &item.id, role).await?);
+    }
+    let body =
+        serde_json::json!({"item_id":item.id,"revision":item.revision.to_string(),"roles":roles});
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, &body, item.revision as u64))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtworkSelectionInput {
@@ -1061,7 +1212,7 @@ async fn refresh_metadata(
         return Ok(replayed(stored.unwrap()));
     }
     let job = crate::new_id();
-    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) VALUES (?,?,?,?,?,'queued',?)").bind(&job).bind(&id).bind(&principal.id).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).bind(crate::now()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) VALUES (?,?,?,?,?,'queued',?)").bind(&job).bind(&id).bind(&principal.id).bind(caller.credential().map(|(hash,_)|hash)).bind(caller.ingress_device_id()).bind(crate::now()).execute(&mut *tx).await?;
     let value = serde_json::json!({"id":job,"revision":"1","kind":"metadata","phase":"queued","attempt_generation":"0","progress":Value::Null,"error_code":Value::Null,"result_ids":[],"requester_id":principal.id});
     record
         .save(&mut tx, &digest, StatusCode::ACCEPTED, Some(&value), None)

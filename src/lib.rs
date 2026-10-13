@@ -1,5 +1,6 @@
 pub mod administration;
 pub mod api;
+pub mod artifact_leases;
 pub mod artwork;
 pub mod catalog;
 pub mod components;
@@ -29,6 +30,7 @@ pub mod renditions;
 pub mod scan;
 pub mod scans;
 pub mod search;
+pub mod signin_protocol;
 pub mod storage;
 pub mod upgrade;
 pub mod v2;

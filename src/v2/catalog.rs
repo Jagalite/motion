@@ -98,7 +98,7 @@ fn replayed(stored: Stored) -> Response {
     response
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -254,7 +254,7 @@ fn curation_problem(e: crate::curation::CurationError) -> Problem {
 // URL-safe base64 without padding, for opaque cursors and plan tokens.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64_encode(bytes: &[u8]) -> String {
+pub(super) fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 4 / 3 + 3);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -270,7 +270,7 @@ fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn b64_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn b64_decode(text: &str) -> Option<Vec<u8>> {
     let values = text
         .bytes()
         .map(|c| B64.iter().position(|&b| b == c).map(|p| p as u32))
@@ -428,6 +428,30 @@ pub(crate) async fn curatable_item(
     Ok(row)
 }
 
+/// Every work whose relationships or order membership a merge can mutate
+/// must be writable. Call under the same writer reservation as the mutation.
+pub(crate) async fn authorize_merge_scope(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    sources: &[String],
+    target: &str,
+) -> Result<(), Problem> {
+    let mut affected: BTreeSet<String> = sources.iter().cloned().collect();
+    affected.insert(target.to_owned());
+    for source in sources.iter().filter(|source| source.as_str() != target) {
+        let owners: Vec<String> = sqlx::query_scalar(
+            "SELECT source_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT target_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT owner.item_id FROM timelines t JOIN editions moved ON moved.id=t.edition_id JOIN order_groups g ON g.id=t.order_group_id JOIN editions owner ON owner.id=g.edition_id WHERE moved.item_id=?",
+        )
+        .bind(source).bind(source).bind(source).bind(source).bind(source)
+        .fetch_all(&mut *conn).await?;
+        affected.extend(owners);
+    }
+    for item in affected {
+        curatable_item(conn, scope, &item, false).await?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ExternalIdentity {
     provider: String,
@@ -484,25 +508,9 @@ pub(crate) async fn item_body(
         namespace_version: String::new(),
     })
     .collect();
-    let pinned: Option<String> = sqlx::query_scalar(
-        "SELECT asset_id FROM artwork_selections WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_optional(&mut *conn)
-    .await?
-    .flatten();
-    let contributions: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let local = contributions
-        .iter()
-        .find(|(s, _)| s == "local")
-        .map(|(_, a)| a.clone());
-    let candidates = contributions.into_iter().map(|(_, a)| a).collect();
-    let (artwork_id, _) = playscale_core::artwork::resolve(pinned, local, &candidates);
+    let artwork_id = super::metadata::resolved_artwork(conn, &row.id, "poster")
+        .await?
+        .asset_id;
     // Count only visible timelines: a hidden edition must not alter the
     // viewer's default selection or disclose itself through that count.
     let (clause, all, ids) = scope_clause(scope, "f.library_id");
@@ -572,6 +580,9 @@ pub struct ItemQuery {
     parent_id: Option<String>,
     q: Option<String>,
     sort: Option<Sort>,
+    /// Comma-separated live item IDs (at most 100): a batched read. Merged
+    /// aliases and unreadable or unknown IDs match nothing.
+    ids: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -589,6 +600,26 @@ struct Filter {
     kind: Option<MediaKind>,
     parent_id: Option<String>,
     q: Option<String>,
+    /// A JSON array of item IDs, when filtering by identity.
+    ids: Option<String>,
+}
+
+/// The `ids` query: 1-100 distinct valid IDs, as a JSON array for `json_each`.
+fn id_list(ids: &Option<String>) -> Result<Option<String>, Problem> {
+    let Some(ids) = ids else { return Ok(None) };
+    let list: Vec<String> = ids.split(',').map(str::to_owned).collect();
+    if list.len() > 100
+        || list.iter().any(|id| !valid_id(id))
+        || list.iter().collect::<std::collections::BTreeSet<_>>().len() != list.len()
+    {
+        return Err(Problem::bad(
+            "invalid_query",
+            "ids must list 1-100 distinct valid IDs",
+        ));
+    }
+    Ok(Some(
+        serde_json::to_string(&list).map_err(Problem::internal)?,
+    ))
 }
 
 fn query_id(field: &str, id: &Option<String>) -> Result<(), Problem> {
@@ -655,6 +686,13 @@ async fn browse(
     };
     let scope = access::catalog_scope(&caller.principal);
     let (clause, all, ids) = scope_clause(&scope, "f.library_id");
+    // The batched ID filter is emitted only when given, as a direct predicate
+    // SQLite resolves by primary-key lookups (an optional `OR` would scan).
+    let by_id = if filter.ids.is_some() {
+        "i.id IN (SELECT value FROM json_each(?))"
+    } else {
+        "? IS NULL"
+    };
     let sql = format!(
         "{ITEM_SELECT} WHERE i.id NOT IN (SELECT alias_id FROM item_aliases)
          AND (? OR EXISTS (SELECT 1 FROM media_files f JOIN editions e ON e.id=f.edition_id WHERE e.item_id=i.id AND f.generated=0 AND {clause}))
@@ -662,6 +700,7 @@ async fn browse(
          AND ? AND (? IS NULL OR coalesce(s.media_type,'unclassified')=?) AND (? IS NULL OR i.kind=?)
          AND (? IS NULL OR s.parent_id=?)
          AND (? IS NULL OR instr(lower(i.title),lower(?))>0)
+         AND {by_id}
          AND (? OR i.title>? OR (i.title=? AND i.id>?))
          ORDER BY i.title,i.id LIMIT ?"
     );
@@ -684,6 +723,7 @@ async fn browse(
         .bind(&filter.parent_id)
         .bind(&filter.q)
         .bind(&filter.q)
+        .bind(&filter.ids)
         .bind(after.is_none())
         .bind(&after_title)
         .bind(&after_title)
@@ -718,6 +758,7 @@ pub async fn list_items(
         kind: q.kind,
         parent_id: q.parent_id,
         q: q.q,
+        ids: id_list(&q.ids)?,
     };
     let page = PageQuery {
         cursor: q.cursor,
@@ -1315,11 +1356,7 @@ async fn plan(
 ) -> Result<(Reviewed, Vec<String>, Vec<String>), Problem> {
     match preview {
         Preview::Merge(request) => {
-            let participants: BTreeSet<&String> =
-                request.sources.iter().chain([&request.target]).collect();
-            for participant in participants {
-                curatable_item(conn, scope, participant, false).await?;
-            }
+            authorize_merge_scope(conn, scope, &request.sources, &request.target).await?;
             let plan = crate::curation::preview_merge_on(conn, request)
                 .await
                 .map_err(curation_problem)?;
@@ -1542,11 +1579,7 @@ pub async fn commit_reconciliation(
     let envelope = open_plan(&app, &input.plan_token, &principal.id)?;
     let result = match &envelope.change {
         Reviewed::Merge { plan } => {
-            let participants: BTreeSet<&String> =
-                plan.retired.iter().chain([&plan.target]).collect();
-            for participant in participants {
-                curatable_item(&mut tx, &scope, participant, false).await?;
-            }
+            authorize_merge_scope(&mut tx, &scope, &plan.retired, &plan.target).await?;
             crate::curation::merge_in_transaction(&mut tx, plan)
                 .await
                 .map_err(curation_problem)?;

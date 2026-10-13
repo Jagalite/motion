@@ -53,8 +53,11 @@ pub struct SourceStreams<'a> {
     pub video: Option<&'a str>,
     /// The selected audio stream; None when audio is omitted.
     pub audio: Option<&'a str>,
-    /// PQ or HLG transfer: no live route has a qualified tone-mapping path.
+    /// PQ or HLG transfer.
     pub hdr: bool,
+    /// An HDR source this conversion may tone-map to SDR (`color::tone_map`
+    /// accepted its facts with the observed filters). Copies never do.
+    pub tone_map: bool,
     /// Every source stream (hence the container) starts at media time zero.
     /// Stream copy keeps source timestamps, which equal timeline time only then.
     pub starts_at_zero: bool,
@@ -160,11 +163,141 @@ pub fn burnable_subtitle(codec: &str) -> bool {
     matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle")
 }
 
+/// How far before a start the bitmap subtitle stream is examined for a
+/// display set still showing there.
+pub const BURN_LOOKBACK_MS: u64 = 300_000;
+/// How far before a start a burned-bitmap conversion reads when the stream
+/// could not be examined.
+pub const BURN_FALLBACK_LOOKBACK_MS: u64 = 20_000;
+
+/// A bitmap subtitle display set observed before a start, in file time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplaySet {
+    pub at_ms: u64,
+    /// It draws something (a clearing set draws nothing).
+    pub draws: bool,
+    /// When it stops showing by itself, if it says (DVD subpictures carry
+    /// an end; PGS cues show until the next set).
+    pub until_ms: Option<u64>,
+    /// A decoder can start here: it carries every object and palette it
+    /// shows (a PGS epoch start or acquisition point; every DVD subpicture).
+    pub acquisition: bool,
+}
+
+/// Where a conversion burning a bitmap subtitle starts reading so that a cue
+/// still showing at `start_ms` is drawn. `display_sets` are the stream's
+/// sets in the `BURN_LOOKBACK_MS` before the start; None when they could not
+/// be read. The last set at or before the start decides: if it draws and
+/// has not expired, reading starts at the latest acquisition point at or
+/// before it (where its objects are defined), so the cue decodes as in the
+/// file; if that point is outside the window, the cue is not restored.
+/// Otherwise nothing earlier than the start is needed. Unknown: the bounded
+/// fallback lookback.
+pub fn burn_read_from(start_ms: u64, display_sets: Option<&[DisplaySet]>) -> u64 {
+    let Some(sets) = display_sets else {
+        return start_ms.saturating_sub(BURN_FALLBACK_LOOKBACK_MS);
+    };
+    let floor = start_ms.saturating_sub(BURN_LOOKBACK_MS);
+    let window = || {
+        sets.iter()
+            .filter(|s| (floor..=start_ms).contains(&s.at_ms))
+    };
+    let Some(last) = window().max_by_key(|s| s.at_ms) else {
+        return start_ms;
+    };
+    if !last.draws || last.until_ms.is_some_and(|until| until <= start_ms) {
+        return start_ms;
+    }
+    window()
+        .filter(|s| s.acquisition && s.at_ms <= last.at_ms)
+        .map(|s| s.at_ms)
+        .max()
+        .unwrap_or(start_ms)
+}
+
+/// Styled text codecs (ASS/SSA): rendered faithfully only by libass, so only
+/// burned into converted video, never flattened to WebVTT.
+pub fn styled_subtitle(codec: &str) -> bool {
+    matches!(codec, "ass" | "ssa")
+}
+
+/// Font attachments extracted for one burned subtitle: at most this many,
+/// each at most `MAX_FONT_BYTES`, together at most `MAX_FONTS_TOTAL_BYTES`.
+pub const MAX_FONTS: usize = 64;
+pub const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_FONTS_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many of a file's attachments (probed MIME type and size, in stream
+/// order) a burned subtitle extracts as fonts: all of them when every one is
+/// a font of known size within the bounds, otherwise none (libass then uses
+/// system fonts). Unknown sizes are never trusted.
+pub fn burn_fonts(attachments: &[(Option<&str>, Option<u64>)]) -> u32 {
+    let font = |mime: &str| {
+        mime.starts_with("font/")
+            || matches!(
+                mime,
+                "application/x-truetype-font"
+                    | "application/x-font-ttf"
+                    | "application/x-font-otf"
+                    | "application/vnd.ms-opentype"
+                    | "application/font-sfnt"
+            )
+    };
+    let mut total = 0u64;
+    for (mime, bytes) in attachments {
+        let Some(bytes) = *bytes else { return 0 };
+        total = total.saturating_add(bytes);
+        if !mime.is_some_and(font) || bytes > MAX_FONT_BYTES {
+            return 0;
+        }
+    }
+    if attachments.len() > MAX_FONTS || total > MAX_FONTS_TOTAL_BYTES {
+        return 0;
+    }
+    attachments.len() as u32
+}
+
+/// How a selected embedded subtitle stream reaches the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Presentation {
+    /// Delivered as WebVTT (sidecar or in-manifest rendition).
+    Text,
+    /// Bitmap subpictures overlaid on converted video.
+    BurnBitmap,
+    /// Text or styled subtitles rendered by libass into converted video.
+    BurnText,
+}
+
+/// The presentation of an embedded subtitle stream with `codec` for a client
+/// that presents text (`accepts_text`) or burned subtitles
+/// (`accepts_burned`), given whether this server's FFmpeg has libass
+/// (`libass`). Plain text prefers a text track; styled text is only burned;
+/// bitmaps are only overlaid. None: this client cannot be given it.
+pub fn presentation(
+    codec: &str,
+    accepts_text: bool,
+    accepts_burned: bool,
+    libass: bool,
+) -> Option<Presentation> {
+    if burnable_subtitle(codec) {
+        return accepts_burned.then_some(Presentation::BurnBitmap);
+    }
+    let plain = sidecar_subtitle(codec);
+    if plain && accepts_text {
+        return Some(Presentation::Text);
+    }
+    ((plain || styled_subtitle(codec)) && accepts_burned && libass)
+        .then_some(Presentation::BurnText)
+}
+
 /// Whether a live segmented route can serve these streams. Stream copy is only
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.
 pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool {
-    if s.hdr || s.video.is_none() {
+    // HDR pixels are only ever converted to SDR by an explicit tone map.
+    let hdr_ok = !s.hdr || (s.tone_map && operation == Operation::VideoTranscode);
+    if !hdr_ok || s.video.is_none() {
         return false;
     }
     let details = s.details.is_some_and(|d| {
@@ -214,6 +347,10 @@ pub struct Pin {
     /// (`playback_session::adaptive`). Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adaptive: bool,
+    /// The HDR-to-SDR tone map this conversion applies (`color::tone_map`).
+    /// Omitted for SDR sources and byte routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone_map: Option<crate::color::ToneMap>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1152,6 +1289,83 @@ pub fn media_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bitmap_cue_showing_at_the_start_is_read_from_its_acquisition_point() {
+        let set = |at_ms, draws, acquisition| DisplaySet {
+            at_ms,
+            draws,
+            until_ms: None,
+            acquisition,
+        };
+        let start = 400_000;
+        // A self-contained cue drawn at 200 s and not cleared before the start.
+        assert_eq!(
+            burn_read_from(start, Some(&[set(200_000, true, true)])),
+            200_000
+        );
+        // Cleared before the start: nothing earlier is needed.
+        assert_eq!(
+            burn_read_from(
+                start,
+                Some(&[set(200_000, true, true), set(300_000, false, false)])
+            ),
+            start
+        );
+        // The latest set decides, whatever the order read.
+        assert_eq!(
+            burn_read_from(
+                start,
+                Some(&[set(390_000, true, true), set(300_000, false, false)])
+            ),
+            390_000
+        );
+        // A composition reusing objects defined earlier is read from where
+        // they were defined (its epoch's acquisition point).
+        assert_eq!(
+            burn_read_from(
+                start,
+                Some(&[
+                    set(120_000, true, true),
+                    set(150_000, false, false),
+                    set(380_000, true, false)
+                ])
+            ),
+            120_000
+        );
+        // Its acquisition point is outside the window: not restored.
+        assert_eq!(
+            burn_read_from(start, Some(&[set(380_000, true, false)])),
+            start
+        );
+        // A subpicture that ended by itself before the start.
+        let expired = DisplaySet {
+            until_ms: Some(12_000),
+            ..set(10_000, true, true)
+        };
+        assert_eq!(burn_read_from(290_000, Some(&[expired])), 290_000);
+        let showing = DisplaySet {
+            until_ms: Some(295_000),
+            ..set(280_000, true, true)
+        };
+        assert_eq!(burn_read_from(290_000, Some(&[showing])), 280_000);
+        // No sets in the window, or sets outside it: from the start.
+        assert_eq!(burn_read_from(start, Some(&[])), start);
+        assert_eq!(
+            burn_read_from(start, Some(&[set(50_000, true, true)])),
+            start
+        );
+        assert_eq!(
+            burn_read_from(start, Some(&[set(401_000, true, true)])),
+            start
+        );
+        // Unknown: the bounded fallback.
+        assert_eq!(
+            burn_read_from(start, None),
+            start - BURN_FALLBACK_LOOKBACK_MS
+        );
+        assert_eq!(burn_read_from(5_000, None), 0);
+    }
     fn pin(tracks: &[&str]) -> Pin {
         Pin {
             source_file: "f".into(),
@@ -1163,6 +1377,7 @@ mod tests {
             parts: vec![],
             max_bitrate_bps: None,
             adaptive: false,
+            tone_map: None,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {
@@ -1564,6 +1779,7 @@ mod tests {
             video,
             audio,
             hdr,
+            tone_map: false,
             starts_at_zero: true,
             eight_bit_420: true,
             details: Some(VideoDetails {
@@ -1590,6 +1806,15 @@ mod tests {
             Operation::VideoTranscode,
             &streams(Some("hevc"), None, true)
         ));
+        // An accepted tone map admits HDR to a conversion only, never a copy.
+        let mapped = SourceStreams {
+            tone_map: true,
+            ..streams(Some("h264"), Some("aac"), true)
+        };
+        assert!(live_route_supported(Operation::VideoTranscode, &mapped));
+        assert!(!live_route_supported(Operation::Remux, &mapped));
+        assert!(!live_route_supported(Operation::AudioConvert, &mapped));
+        assert_eq!(copy_operation(&mapped), None);
         assert!(!live_route_supported(Operation::Original, &h264_aac));
         let offset = SourceStreams {
             starts_at_zero: false,
@@ -1716,6 +1941,54 @@ mod tests {
             "",
         ] {
             assert!(!sidecar_subtitle(codec), "{codec}");
+        }
+    }
+
+    #[test]
+    fn only_bounded_font_attachments_are_extracted() {
+        let font = (Some("font/ttf"), Some(1_000));
+        assert_eq!(burn_fonts(&[]), 0);
+        assert_eq!(
+            burn_fonts(&[font, (Some("application/x-truetype-font"), Some(5))]),
+            2
+        );
+        // Unknown size, a non-font, an oversized font: none at all.
+        assert_eq!(burn_fonts(&[font, (Some("font/otf"), None)]), 0);
+        assert_eq!(burn_fonts(&[font, (Some("image/jpeg"), Some(10))]), 0);
+        assert_eq!(burn_fonts(&[(None, Some(10))]), 0);
+        assert_eq!(
+            burn_fonts(&[(Some("font/ttf"), Some(MAX_FONT_BYTES + 1))]),
+            0
+        );
+        let big = (Some("font/ttf"), Some(MAX_FONT_BYTES));
+        assert_eq!(burn_fonts(&[big; 4]), 4);
+        assert_eq!(burn_fonts(&[big; 5]), 0, "aggregate bound");
+        assert_eq!(burn_fonts(&[(Some("font/ttf"), Some(1)); MAX_FONTS + 1]), 0);
+    }
+
+    #[test]
+    fn subtitles_are_presented_without_losing_meaning() {
+        use Presentation::*;
+        let cases = [
+            // codec, text, burned, libass, expected
+            ("subrip", true, true, true, Some(Text)),
+            ("subrip", false, true, true, Some(BurnText)),
+            ("subrip", false, true, false, None),
+            ("subrip", false, false, true, None),
+            ("ass", true, true, true, Some(BurnText)),
+            ("ass", true, false, true, None),
+            ("ass", true, true, false, None),
+            ("ssa", false, true, true, Some(BurnText)),
+            ("hdmv_pgs_subtitle", true, true, false, Some(BurnBitmap)),
+            ("dvd_subtitle", true, false, true, None),
+            ("eia_608", true, true, true, None),
+        ];
+        for (codec, text, burned, libass, expected) in cases {
+            assert_eq!(
+                presentation(codec, text, burned, libass),
+                expected,
+                "{codec} {text} {burned} {libass}"
+            );
         }
     }
 }

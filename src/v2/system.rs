@@ -111,6 +111,8 @@ pub async fn capabilities(
             playscale_core::access::IDEMPOTENCY_RETENTION_SECONDS.to_string(),
         ),
     ]);
+    let filters = crate::processing::filters(&app).await;
+    let tone_mapping = filters.zscale && filters.tonemap;
     let mut playback = feature("playback.v2", true, true);
     playback.limits = BTreeMap::from([
         (
@@ -134,7 +136,19 @@ pub async fn capabilities(
         ("timeline_binding", "whole,interval,multipart".into()),
         (
             "subtitles",
-            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,text_hls_rendition_on_live_routes_for_hls_text_clients,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+            {
+                let mut modes = vec![
+                    "text_webvtt_on_original:embedded_or_srt_vtt_sidecar",
+                    "text_hls_rendition_on_live_routes_for_hls_text_clients",
+                    "bitmap_burned_in_conversion",
+                ];
+                // Only where this server's FFmpeg has libass.
+                if filters.subtitles {
+                    modes.push("embedded_text_and_styled_burned_in_conversion_with_font_attachments");
+                }
+                modes.push("automatic_by_profile_language_and_role");
+                modes.join(",")
+            },
         ),
         ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
         ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
@@ -148,7 +162,34 @@ pub async fn capabilities(
             }
             .into(),
         ),
-        ("unsupported", "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast".into()),
+        (
+            "hdr",
+            // Tone mapping is advertised only when this server's FFmpeg has
+            // the filters; the source facts still decide per title.
+            if tone_mapping {
+                "preserve_original_for_hdr_clients,tone_map_to_sdr_on_single_file_conversions:pq,hlg,dolby_vision_7_8_with_hdr10_or_hlg_base"
+            } else {
+                "preserve_original_for_hdr_clients"
+            }
+            .into(),
+        ),
+        (
+            "unsupported",
+            {
+                let mut unsupported = vec![];
+                if !filters.subtitles {
+                    unsupported.extend(["styled_subtitles", "text_burn_in"]);
+                }
+                unsupported.extend(["sidecar_burn_in", "subtitles_on_multipart", "prepared_track_pins"]);
+                if tone_mapping {
+                    unsupported.extend(["hdr_conversion_on_multipart", "hdr_preparation"]);
+                } else {
+                    unsupported.push("hdr_conversion");
+                }
+                unsupported.push("cast");
+                unsupported.join(",")
+            },
+        ),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);
@@ -162,10 +203,16 @@ pub async fn capabilities(
         ("interval_seconds", "10".into()),
         ("retention_seconds", "86400".into()),
     ]);
+    let (oidc_enabled,email_enabled):(bool,bool)=sqlx::query_as("SELECT EXISTS(SELECT 1 FROM signin_providers WHERE enabled=1) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL,coalesce(json_extract(s.email_json,'$.enabled'),0) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL FROM signin_settings s CROSS JOIN server_identity x").fetch_one(&app.db).await?;
     let features = vec![
         api,
         feature("identity.pairing", true, true),
+        feature("identity.access_management", true, true),
+        feature("identity.invitations", true, true),
         feature("identity.browser_sessions", true, true),
+        feature("identity.oidc", true, oidc_enabled),
+        feature("identity.email_codes", true, email_enabled),
+        feature("identity.action_proofs", true, true),
         feature(
             "identity.trusted_private_ingress",
             true,
@@ -186,11 +233,17 @@ pub async fn capabilities(
         .server_hash
         .get_or_init(|| async {
             let exe = std::env::current_exe().ok()?;
-            tokio::task::spawn_blocking(move || std::fs::read(exe).ok())
-                .await
-                .ok()
-                .flatten()
-                .map(|bytes| format!("sha256:{}", super::sha256(&bytes)))
+            // Reading and hashing a large executable must both stay off the
+            // async worker. The once-cell retains the same process-lifetime
+            // artifact identity for subsequent capabilities requests.
+            tokio::task::spawn_blocking(move || {
+                std::fs::read(exe)
+                    .ok()
+                    .map(|bytes| format!("sha256:{}", super::sha256(&bytes)))
+            })
+            .await
+            .ok()
+            .flatten()
         })
         .await
     {

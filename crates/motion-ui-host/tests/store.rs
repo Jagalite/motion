@@ -36,6 +36,9 @@ fn entry(id: &str, bytes: &[u8]) -> CachedDownload {
         size: bytes.len() as u64,
         content_type: "video/mp4".into(),
         resume_position_ms: None,
+        artwork: None,
+        subtitles: None,
+        metadata: None,
     }
 }
 
@@ -254,7 +257,9 @@ fn acknowledged_events_compact_without_renumbering_and_rebase_resumes() {
         log,
         EventLog {
             base_sequence: 3,
-            events: vec![]
+            events: vec![],
+            // The compaction point remembers the history it belonged to.
+            base_viewing_epoch: Some("server:restore".into()),
         }
     );
     assert!(
@@ -299,6 +304,7 @@ fn a_conflicting_event_is_never_compacted_by_the_watermark() {
         serde_json::to_vec(&EventLog {
             base_sequence: 0,
             events: vec![event(&identity, 1), event(&identity, 2)],
+            base_viewing_epoch: None,
         })
         .unwrap(),
     )
@@ -372,6 +378,7 @@ fn compaction_keeps_the_resume_checkpoint_without_moving_the_base() {
         serde_json::to_vec(&EventLog {
             base_sequence: 0,
             events: vec![event(&identity, 1), event(&identity, 2)],
+            base_viewing_epoch: None,
         })
         .unwrap(),
     )
@@ -427,4 +434,550 @@ fn recoverable_leftovers_count_against_the_quota() {
     .unwrap();
     assert_eq!(store.usage().unwrap(), 10);
     assert!(!store.admits_transfer(1, 10, 0).unwrap());
+}
+
+/// A title the person removes stays removed: the intent is durable, the
+/// copy and its blob go, and neither publication nor recovery saves it
+/// again until the server's answer settles the removal.
+#[test]
+fn a_removed_title_is_never_saved_again_until_the_server_confirms() {
+    use playscale_core::offline::Deletion;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"removed media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    assert!(
+        !store.remove_by_person("unknown").unwrap(),
+        "only a saved title"
+    );
+    assert!(store.remove_by_person("d1").unwrap());
+    assert!(store.manifest().downloads.is_empty());
+    assert!(blobs(&root).is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+    // Neither a new transfer nor a crash leftover is saved again.
+    stage(&root, "d1", media);
+    assert!(store.publish(entry("d1", media)).is_err());
+    assert!(store.recover(entry("d1", media)).is_err());
+    drop(store);
+    // Durable: a reopened writer still refuses it.
+    let mut store = Store::open(&root, &scope()).unwrap();
+    assert_eq!(store.removals(), ["d1"]);
+    assert!(!store.settle_removal("d1", Deletion::Failed).unwrap());
+    assert_eq!(store.removals(), ["d1"]);
+    assert!(store.settle_removal("d1", Deletion::Absent).unwrap());
+    assert!(store.removals().is_empty());
+    // Settled: a new demand may save it again.
+    stage(&root, "d1", media);
+    assert_eq!(
+        store.publish(entry("d1", media)).unwrap(),
+        Publication::Published
+    );
+    // A staged (unpublished) transfer can be removed too.
+    stage(&root, "d2", b"partial");
+    assert!(store.remove_by_person("d2").unwrap());
+    assert!(store.staged().unwrap().is_empty());
+    assert_eq!(store.removals(), ["d2"]);
+}
+
+/// The running host removes titles as the writer under the lock it holds;
+/// another handle that merely names a file is refused.
+#[test]
+fn only_the_held_lock_of_this_root_admits_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"held media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    drop(store);
+    let host = Cache::open(&root).unwrap();
+    let elsewhere = dir.path().join("other.lock");
+    std::fs::write(&elsewhere, b"").unwrap();
+    assert!(
+        Store::open_held(&root, &scope(), std::fs::File::open(&elsewhere).unwrap()).is_err(),
+        "a handle on another file is not this root's lock"
+    );
+    assert!(host.remove("d1").unwrap());
+    assert!(!host.remove("d1").unwrap());
+    drop(host);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert!(store.manifest().downloads.is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+}
+
+/// A crash after the removal intent was written but before the copy went:
+/// the next writer or host completes the removal before presenting titles.
+#[test]
+fn an_interrupted_removal_is_completed_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"interrupted media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    drop(store);
+    // The intent is durable; the copy is still there.
+    std::fs::write(root.join("removals.json"), br#"["d1"]"#).unwrap();
+    let host = Cache::open(&root).unwrap();
+    assert!(!host.presents("d1"), "the host never presents it");
+    drop(host);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert!(store.manifest().downloads.is_empty());
+    assert!(blobs(&root).is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+}
+
+/// A removal whose local cleanup failed keeps its intent even after the
+/// server confirms the deletion: the intent is all that suppresses the copy.
+#[cfg(unix)]
+#[test]
+fn a_removal_is_settled_only_once_its_copy_is_gone() {
+    use playscale_core::offline::Deletion;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"stuck media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    // A partial re-transfer that cannot be deleted (read-only staging).
+    stage(&root, "d1", b"partial");
+    let staging = root.join("staging");
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(store.remove_by_person("d1").is_err(), "the cleanup failed");
+    assert_eq!(store.removals(), ["d1"]);
+    assert_eq!(
+        store.manifest().downloads.len(),
+        1,
+        "the copy is still listed"
+    );
+    // The server deleted it, but the copy is still here: not settled.
+    assert!(!store.settle_removal("d1", Deletion::Deleted).unwrap());
+    drop(store);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert_eq!(store.removals(), ["d1"], "a reopen keeps the intent too");
+    drop(store);
+    let host = Cache::open(&root).unwrap();
+    assert!(!host.presents("d1"));
+    drop(host);
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut store = Store::open(&root, &scope()).unwrap();
+    assert!(store.settle_removal("d1", Deletion::Deleted).unwrap());
+    assert!(store.manifest().downloads.is_empty() && store.removals().is_empty());
+}
+
+/// After a server restore the first batch under the new history carries a
+/// re-anchor from the history the log's compaction point belongs to.
+#[test]
+fn a_compaction_point_of_an_earlier_history_is_reanchored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"restored media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    let identity = entry("d1", media).identity;
+    let write = |log: &EventLog| {
+        std::fs::write(root.join("events.json"), serde_json::to_vec(log).unwrap()).unwrap();
+    };
+    // Compacted through 2 in "server:before"; event 3 is under the new history.
+    write(&EventLog {
+        base_sequence: 2,
+        events: vec![event(&identity, 3)],
+        base_viewing_epoch: Some("server:before".into()),
+    });
+    assert_eq!(
+        store.pending_reanchor().unwrap(),
+        Some(playscale_core::offline::Reanchor {
+            from_viewing_epoch: "server:before".into(),
+            through: 2,
+        })
+    );
+    // Once compacted in the current history, nothing more is needed.
+    store.acknowledge(3).unwrap();
+    assert_eq!(
+        store.events().unwrap().base_viewing_epoch.as_deref(),
+        Some("server:restore")
+    );
+    write(&EventLog {
+        base_sequence: 3,
+        events: vec![event(&identity, 4)],
+        base_viewing_epoch: Some("server:restore".into()),
+    });
+    assert_eq!(store.pending_reanchor().unwrap(), None);
+}
+
+/// Progress recorded before a server restore is re-applied onto the
+/// downloads' current pins or discarded, by the person's choice, in one
+/// durable write; the next batch then re-anchors past the old events.
+#[test]
+fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
+    use motion_ui_host::store::{RestoreChoice, RestoreOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"choice media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    // The manifest pin is already the restored history ("server:restore").
+    let mut before = entry("d1", media).identity;
+    before.viewing_epoch = Some("server:before".into());
+    before.base_viewing_revision = "4".into();
+    let log = EventLog {
+        base_sequence: 2,
+        events: vec![event(&before, 3), event(&before, 4)],
+        base_viewing_epoch: Some("server:before".into()),
+    };
+    let write = |log: &EventLog| {
+        std::fs::write(root.join("events.json"), serde_json::to_vec(log).unwrap()).unwrap();
+    };
+    write(&log);
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Discard, "bad", &[])
+            .is_err()
+    );
+    // The restored pin: this download's base as restored, under the current
+    // history. A pin for another history or download is refused.
+    let mut restored = entry("d1", media).identity;
+    restored.base_viewing_revision = "7".into();
+    let mut foreign = restored.clone();
+    foreign.viewing_epoch = Some("server:other".into());
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Reapply, "server:restore", &[foreign])
+            .is_err()
+    );
+    let mut unknown = restored.clone();
+    unknown.download_id = "d9".into();
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Reapply, "server:restore", &[unknown])
+            .is_err()
+    );
+    let kept = store
+        .resolve_restore(
+            RestoreChoice::Reapply,
+            "server:restore",
+            std::slice::from_ref(&restored),
+        )
+        .unwrap();
+    assert_eq!(
+        kept,
+        RestoreOutcome {
+            reapplied: 2,
+            ..Default::default()
+        }
+    );
+    let after = store.events().unwrap();
+    assert_eq!(after.base_sequence, 4);
+    let pin = restored.clone();
+    assert_eq!(
+        after
+            .events
+            .iter()
+            .map(|e| (e.device_sequence.as_str(), e.position_ms, &e.media))
+            .collect::<Vec<_>>(),
+        [("5", 3_000, &pin), ("6", 4_000, &pin)]
+    );
+    assert_eq!(
+        store.pending_reanchor().unwrap().map(|r| r.through),
+        Some(4)
+    );
+    // Nothing earlier is left: a second choice changes nothing.
+    assert_eq!(
+        store
+            .resolve_restore(RestoreChoice::Discard, "server:restore", &[])
+            .unwrap(),
+        RestoreOutcome::default()
+    );
+    // Discarding instead drops them; the host still opens the log.
+    write(&log);
+    let dropped = store
+        .resolve_restore(RestoreChoice::Discard, "server:restore", &[])
+        .unwrap();
+    assert_eq!(dropped.discarded, 2);
+    let after = store.events().unwrap();
+    assert_eq!((after.base_sequence, after.events.len()), (4, 0));
+    drop(store);
+    Cache::open(&root).unwrap();
+}
+
+/// A poster is verified into its own blob before the entry that names it;
+/// a mismatch publishes nothing; removal and collection treat it as the
+/// entry's bytes.
+#[test]
+fn a_poster_is_published_and_released_with_its_download() {
+    use motion_ui::offline::CachedArtwork;
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"titled media";
+    let poster = b"poster bytes";
+    let with_poster = |poster: &[u8]| CachedDownload {
+        artwork: Some(CachedArtwork {
+            sha256: format!("{:x}", Sha256::digest(poster)),
+            size: poster.len() as u64,
+            content_type: "image/png".into(),
+        }),
+        ..entry("d1", media)
+    };
+    let stage_poster = |bytes: &[u8]| {
+        std::fs::write(
+            root.join("staging")
+                .join(artwork_staging_name("d1").unwrap()),
+            bytes,
+        )
+        .unwrap()
+    };
+    // A poster whose bytes do not match: nothing is published.
+    stage(&root, "d1", media);
+    stage_poster(b"other bytes!");
+    assert!(store.publish(with_poster(poster)).is_err());
+    assert!(store.manifest().downloads.is_empty());
+    stage_poster(poster);
+    assert_eq!(
+        store.publish(with_poster(poster)).unwrap(),
+        Publication::Published
+    );
+    let poster_blob = format!("{:x}", Sha256::digest(poster));
+    assert!(blobs(&root).contains(&poster_blob));
+    // Collection keeps a referenced poster; removal releases it.
+    store.collect().unwrap();
+    assert!(blobs(&root).contains(&poster_blob));
+    assert!(store.remove("d1").unwrap());
+    assert!(blobs(&root).is_empty());
+}
+
+/// Saved metadata is kept within its bounds; out of bounds it is dropped
+/// rather than refusing the title.
+#[test]
+fn metadata_is_kept_within_bounds_and_never_refuses_a_title() {
+    use playscale_core::offline::OfflineMetadata;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let described = OfflineMetadata {
+        release_year: Some(1999),
+        description: Some("Saved with its description".into()),
+        genres: vec!["Drama".into()],
+    };
+    for (id, bytes, metadata, kept) in [
+        (
+            "d1",
+            &b"first"[..],
+            described.clone(),
+            Some(described.clone()),
+        ),
+        (
+            "d2",
+            &b"second"[..],
+            OfflineMetadata {
+                genres: vec!["g".into(); 11],
+                ..described.clone()
+            },
+            None,
+        ),
+    ] {
+        stage(&root, id, bytes);
+        let entry = CachedDownload {
+            metadata: Some(metadata),
+            ..entry(id, bytes)
+        };
+        assert_eq!(store.publish(entry).unwrap(), Publication::Published);
+        let saved = store
+            .manifest()
+            .downloads
+            .iter()
+            .find(|d| d.identity.download_id == id)
+            .unwrap()
+            .metadata
+            .clone();
+        assert_eq!(saved, kept, "{id}");
+    }
+}
+
+/// Metadata never fills the manifest: once it would exceed its budget,
+/// later titles are saved without it, and every title is still saved.
+#[test]
+fn metadata_never_stops_a_title_from_being_saved() {
+    use playscale_core::offline::{MAX_DESCRIPTION_CHARS, OfflineMetadata};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    // The largest description: 4,000 four-byte characters.
+    let metadata = OfflineMetadata {
+        description: Some("\u{1F3AC}".repeat(MAX_DESCRIPTION_CHARS)),
+        ..Default::default()
+    };
+    for n in 0..140 {
+        let id = format!("d{n}");
+        let bytes = format!("media {n}");
+        stage(&root, &id, bytes.as_bytes());
+        let entry = CachedDownload {
+            metadata: Some(metadata.clone()),
+            ..entry(&id, bytes.as_bytes())
+        };
+        assert_eq!(
+            store.publish(entry).unwrap(),
+            Publication::Published,
+            "{id}"
+        );
+    }
+    let downloads = &store.manifest().downloads;
+    assert_eq!(downloads.len(), 140);
+    let described = downloads.iter().filter(|d| d.metadata.is_some()).count();
+    assert!((100..140).contains(&described), "{described}");
+    assert!(downloads[..described].iter().all(|d| d.metadata.is_some()));
+    assert!(std::fs::metadata(root.join("manifest.json")).unwrap().len() <= 2 * 1024 * 1024);
+}
+
+/// A corrupt optional poster never blocks recovering verified media: the
+/// recovery with it declines and discards it, the one without it succeeds.
+#[test]
+fn a_corrupt_poster_does_not_block_recovering_its_media() {
+    use motion_ui::offline::CachedArtwork;
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"verified before the crash";
+    let poster = b"poster bytes";
+    let poster_sha = format!("{:x}", Sha256::digest(poster));
+    let with_poster = CachedDownload {
+        artwork: Some(CachedArtwork {
+            sha256: poster_sha.clone(),
+            size: poster.len() as u64,
+            content_type: "image/png".into(),
+        }),
+        ..entry("d1", media)
+    };
+    std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
+    // A corrupt poster blob left in place.
+    std::fs::write(root.join("blobs").join(&poster_sha), b"corrupt poster").unwrap();
+    assert!(!store.recover(with_poster.clone()).unwrap());
+    assert!(!blobs(&root).contains(&poster_sha), "discarded");
+    // A corrupt staged poster likewise.
+    let staged = root
+        .join("staging")
+        .join(artwork_staging_name("d1").unwrap());
+    std::fs::write(&staged, b"also corrupt").unwrap();
+    assert!(!store.recover(with_poster.clone()).unwrap());
+    assert!(!staged.exists());
+    assert!(store.manifest().downloads.is_empty());
+    // Corrupt staging must not mask an already verified shared blob.
+    std::fs::write(&staged, b"corrupt again").unwrap();
+    std::fs::write(root.join("blobs").join(&poster_sha), poster).unwrap();
+    assert!(store.recover(with_poster).unwrap());
+    assert!(store.manifest().downloads[0].artwork.is_some());
+    store.remove("d1").unwrap();
+    std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
+    // The media alone is still recovered.
+    assert!(store.recover(entry("d1", media)).unwrap());
+    assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
+}
+
+/// Saved subtitles are verified into their own blob before the entry names
+/// them, and released with it; a staged file alone is a staged download.
+#[test]
+fn subtitles_are_published_verified_and_released_with_their_download() {
+    use motion_ui::offline::CachedSubtitles;
+    use motion_ui_host::store::subtitles_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"subtitled media";
+    let vtt = b"WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n";
+    let with_subtitles = CachedDownload {
+        subtitles: Some(CachedSubtitles {
+            sha256: format!("{:x}", Sha256::digest(vtt)),
+            size: vtt.len() as u64,
+        }),
+        ..entry("d1", media)
+    };
+    let staged = root
+        .join("staging")
+        .join(subtitles_staging_name("d1").unwrap());
+    stage(&root, "d1", media);
+    // Bytes that do not match: nothing is published, the staged file is gone.
+    std::fs::write(&staged, b"WEBVTT\n\nother").unwrap();
+    assert_eq!(store.staged().unwrap(), ["d1"]);
+    assert!(store.publish(with_subtitles.clone()).is_err());
+    assert!(store.manifest().downloads.is_empty());
+    assert!(!staged.exists());
+    // Missing entirely: refused as well (they are part of the entry).
+    assert!(store.publish(with_subtitles.clone()).is_err());
+    std::fs::write(&staged, vtt).unwrap();
+    assert_eq!(
+        store.publish(with_subtitles.clone()).unwrap(),
+        Publication::Published
+    );
+    let blob = format!("{:x}", Sha256::digest(vtt));
+    assert!(blobs(&root).contains(&blob));
+    store.collect().unwrap();
+    assert!(blobs(&root).contains(&blob));
+    assert!(store.remove("d1").unwrap());
+    assert!(blobs(&root).is_empty());
+    // Recovery needs them in place and verified; a corrupt blob is discarded.
+    std::fs::write(root.join("blobs").join(&with_subtitles.sha256), media).unwrap();
+    std::fs::write(root.join("blobs").join(&blob), b"corrupt").unwrap();
+    assert!(!store.recover(with_subtitles.clone()).unwrap());
+    assert!(!blobs(&root).contains(&blob));
+    std::fs::write(&staged, vtt).unwrap();
+    assert!(store.recover(with_subtitles.clone()).unwrap());
+    assert_eq!(store.manifest().downloads, vec![with_subtitles]);
+}
+
+/// A staged poster alone still belongs to its download's lifecycle.
+#[test]
+fn a_staged_poster_alone_is_a_staged_download() {
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    std::fs::write(
+        root.join("staging")
+            .join(artwork_staging_name("d1").unwrap()),
+        b"poster",
+    )
+    .unwrap();
+    stage(&root, "d2", b"partial");
+    std::fs::write(
+        root.join("staging")
+            .join(artwork_staging_name("d2").unwrap()),
+        b"poster",
+    )
+    .unwrap();
+    assert_eq!(store.staged().unwrap(), ["d1", "d2"]);
+    assert!(!store.remove("d1").unwrap(), "nothing published");
+    assert_eq!(store.staged().unwrap(), ["d2"]);
+}
+
+#[test]
+fn an_existing_compacted_log_learns_its_confirmed_epoch_before_a_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    stage(&root, "d1", b"media");
+    store.publish(entry("d1", b"media")).unwrap();
+    std::fs::write(
+        root.join("events.json"),
+        serde_json::to_vec(&EventLog {
+            base_sequence: 7,
+            base_viewing_epoch: None,
+            events: vec![],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .rebase("d1", "0", "0", "server:restore", None)
+        .unwrap();
+    assert_eq!(
+        store.events().unwrap().base_viewing_epoch.as_deref(),
+        Some("server:restore")
+    );
 }

@@ -39,6 +39,7 @@ fn pin(tracks: &[&str], operation: Operation) -> Pin {
         parts: vec![],
         max_bitrate_bps: None,
         adaptive: false,
+        tone_map: None,
     }
 }
 

@@ -282,6 +282,34 @@ impl Fixture {
         (device, token)
     }
 
+    async fn assign_user(&self, device: &str) {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, Some(&format!("playback-owner-{}", uuid::Uuid::new_v4())),
+            json!({"name":"Playback owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+    }
+
     async fn policy(&self, device: &str, libraries: &[&str], permissions: &[&str], tag: &str) {
         let replaced = self
             .call(
@@ -1017,7 +1045,7 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         .await;
     assert_eq!(m.status, StatusCode::OK);
     let text = String::from_utf8(m.bytes).unwrap();
-    assert!(text.contains("CODECS=\"avc1.64001f,mp4a.40.2\""), "{text}");
+    assert!(text.contains("CODECS=\"avc1."), "{text}");
     assert!(text.contains("variants/main/index.m3u8"), "{text}");
     let (_, other) = f.device(&["default"], PLAYER).await;
     problem(
@@ -1048,6 +1076,21 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         )
         .await;
     assert_eq!(init.status, StatusCode::OK);
+    let avcc = init
+        .bytes
+        .windows(4)
+        .position(|w| w == b"avcC")
+        .expect("H.264 initialization");
+    let actual = format!(
+        "avc1.{:02x}{:02x}{:02x}",
+        init.bytes[avcc + 5],
+        init.bytes[avcc + 6],
+        init.bytes[avcc + 7]
+    );
+    assert!(
+        text.contains(&format!("CODECS=\"{actual},mp4a.40.2\"")),
+        "{text}"
+    );
     let first = f
         .call(
             "GET",
@@ -1267,6 +1310,16 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         restored_epoch,
         identity_before["restore_epoch"].as_str().unwrap()
     );
+    let denied = restored
+        .call("GET", "/api/v2/profiles", None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::UNAUTHORIZED,
+        "restored credentials must be paired again"
+    );
+    // The operator can still exercise the independent history-epoch fence.
+    let auth = bearer(OPERATOR);
     for (method, target, body, extra) in [
         (
             "POST",
@@ -1725,7 +1778,51 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
 
     // The profile's completion threshold drives automatic, sticky completion.
     let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    assert_eq!(
+        prefs.body["max_bitrate_bps"],
+        Value::Null,
+        "no limit by default"
+    );
     let mut document = prefs.body.clone();
+    // A streaming limit is a positive decimal string.
+    for bad in [
+        json!("0"),
+        json!("08"),
+        json!(8000000),
+        json!("8e6"),
+        json!(u64::MAX.to_string()),
+    ] {
+        let mut invalid = document.clone();
+        invalid["max_bitrate_bps"] = bad;
+        let refused = f
+            .call(
+                "PUT",
+                "/api/v2/profiles/default/preferences",
+                Some(invalid),
+                &[
+                    ("authorization", &auth),
+                    ("if-match", prefs.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert!(refused.status.is_client_error(), "{:?}", refused.body);
+    }
+    let mut original_capped = document.clone();
+    original_capped["quality_mode"] = json!("original");
+    original_capped["max_bitrate_bps"] = json!("8000000");
+    let refused = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(original_capped),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert!(refused.status.is_client_error());
+    document["max_bitrate_bps"] = json!("8000000");
     document["completion_percent"] = json!(50);
     let replaced = f
         .call(
@@ -1739,6 +1836,13 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
         )
         .await;
     assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    assert_eq!(replaced.body["max_bitrate_bps"], "8000000");
+    assert_eq!(
+        f.get("/api/v2/profiles/default/preferences", &auth)
+            .await
+            .body["max_bitrate_bps"],
+        "8000000"
+    );
     problem(
         &f.call(
             "PUT",
@@ -1997,6 +2101,17 @@ async fn planning_skips_originals_outside_the_callers_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn playback_only_observations_advance_live_conversion_and_revocation_stops_worker() {
+    live_conversion_access_withdrawal("device").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn administrator_user_narrowing_stops_live_conversion() {
+    live_conversion_access_withdrawal("narrow").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn administrator_user_disable_stops_live_conversion() {
+    live_conversion_access_withdrawal("disable").await;
+}
+async fn live_conversion_access_withdrawal(action: &str) {
     assert!(
         tools_available(),
         "this qualification requires ffmpeg and ffprobe"
@@ -2008,6 +2123,9 @@ async fn playback_only_observations_advance_live_conversion_and_revocation_stops
     let (device, auth) = f
         .device(&["default"], &["catalog:read", "playback:request"])
         .await;
+    if action != "device" {
+        f.assign_user(&device).await;
+    }
     let caps = f.get("/api/v2/system/capabilities", &auth).await;
     assert_eq!(caps.status, StatusCode::OK);
     for id in ["catalog.v2", "playback.v2"] {
@@ -2124,21 +2242,50 @@ async fn playback_only_observations_advance_live_conversion_and_revocation_stops
     let operator = bearer(OPERATOR);
     let row = f.get(&format!("/api/v2/devices/{device}"), &operator).await;
     let start = std::time::Instant::now();
-    let revoked = f
-        .call(
-            "DELETE",
-            &format!("/api/v2/devices/{device}"),
-            None,
-            &[
-                ("authorization", &operator),
-                ("if-match", row.headers["etag"].to_str().unwrap()),
-            ],
-        )
-        .await;
-    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    if action == "device" {
+        let revoked = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/devices/{device}"),
+                None,
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    } else {
+        let path = format!("/api/v2/users/{}", row.body["user_id"].as_str().unwrap());
+        let user = f.get(&path, &operator).await;
+        let mut edit = user.body.clone();
+        edit.as_object_mut().unwrap().remove("id");
+        edit.as_object_mut().unwrap().remove("revision");
+        if action == "disable" {
+            edit["disabled"] = json!(true);
+        } else {
+            edit["permissions"] = json!(["catalog:read"]);
+        }
+        let result = f
+            .call(
+                "PUT",
+                &path,
+                Some(edit),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", user.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(result.status, StatusCode::OK, "{}", result.body);
+    }
     assert_eq!(
         f.get(manifest, &auth).await.status,
-        StatusCode::UNAUTHORIZED
+        if action == "narrow" {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        }
     );
     tokio::time::timeout(Duration::from_secs(10), async {
         while f.server.app.processing.deliveries.is_live(id) {
@@ -4130,6 +4277,553 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
+
+    // A live v2 byte delivery pins this generated artifact without creating a
+    // legacy playback_sessions row. Retention must honor that real ownership.
+    sqlx::query("UPDATE processing_jobs SET updated_at=0 WHERE id=?")
+        .bind(&job)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let delivery = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("prepared-gc-pin-0001"),
+            json!({"plan_token":pinned.body["plan_token"],"start_ms":0}),
+        )
+        .await;
+    assert_eq!(delivery.status, StatusCode::CREATED, "{}", delivery.body);
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT available FROM media_files WHERE id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap(),
+        1
+    );
+    let id = delivery.body["id"].as_str().unwrap();
+    let generation = delivery.body["active"]["generation"].as_str().unwrap();
+    // Retain an admitted response without polling its body. It must own the
+    // generated file independently of the delivery's runtime lifetime.
+    let expected = std::fs::read(Path::new(&path.0).join(&path.1)).unwrap();
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v2/streams/{id}/{generation}/content"))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let removed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.server.app.processing.deliveries.is_live(id) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("closed prepared delivery did not retire");
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0,
+        "an admitted response must retain its artifact after delivery retirement"
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), expected.as_slice());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let removed = playscale::maintenance::clean(&f.server.app).await.unwrap();
+            if removed == 1 {
+                break;
+            }
+            assert_eq!(removed, 0);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("generated artifact stayed pinned after its last reader completed");
+    assert!(!Path::new(&path.0).join(&path.1).exists());
+    let cleaned: (i64, i64, i64) = sqlx::query_as(
+        "SELECT f.available,p.expired,p.cache_cleaned FROM processing_jobs p JOIN media_files f ON f.id=p.output_file_id WHERE p.id=?",
+    )
+    .bind(&job)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(cleaned, (0, 1, 1));
+}
+
+/// A preparation keeps the selected audio component and an explicitly chosen
+/// text subtitle of its exact source revision. Playback serves that rendition
+/// only for exactly that selection, delivering the subtitle from the
+/// rendition's own bytes; other selections are never substituted.
+#[tokio::test(flavor = "multi_thread")]
+async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    let original = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &original).unwrap();
+    let srt = f.dir.path().join("captions.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nKept caption\n").unwrap();
+    f.media(
+        "film.mp4",
+        &[
+            "-i",
+            original.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:a:0",
+            "language=eng",
+            "-metadata:s:a:1",
+            "language=jpn",
+            "-metadata:s:s:0",
+            "language=eng",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let component = |kind, language: &str| {
+        components
+            .iter()
+            .find(|c| c.kind == kind && c.language.as_deref() == Some(language))
+            .unwrap()
+            .id
+            .clone()
+    };
+    use playscale_core::components::Kind;
+    let japanese = component(Kind::Audio, "jpn");
+    let captions = component(Kind::Subtitle, "eng");
+    let operator = bearer(OPERATOR);
+    let prepare = |tracks: Value, key: &'static str| {
+        let f = &f;
+        let operator = operator.clone();
+        let source = source.clone();
+        let timeline = timeline.clone();
+        async move {
+            f.post(
+                "/api/v2/processing/preparations",
+                &operator,
+                Some(key),
+                json!({"source": source, "timeline_id": timeline, "recipe_id": "remux_mp4",
+                    "tracks": tracks}),
+            )
+            .await
+        }
+    };
+    let tracks = |audio_component: Value,
+                  subtitle_component: Value,
+                  policy: &str,
+                  audio: Value,
+                  subtitle: Value| {
+        json!({"audio_component_id": audio_component, "subtitle_component_id": subtitle_component,
+            "subtitle_policy": policy, "audio_track_id": audio, "subtitle_track_id": subtitle})
+    };
+    // Refused: automatic subtitles, an explicit one with off, disagreeing
+    // pins, a component absent from this revision.
+    for (selection, status, code, key) in [
+        (
+            tracks(Value::Null, Value::Null, "auto", Value::Null, Value::Null),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preparation_tracks_unsupported",
+            "prepare-refused-000001",
+        ),
+        (
+            tracks(
+                Value::Null,
+                json!(captions),
+                "off",
+                Value::Null,
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_policy_conflict",
+            "prepare-refused-000002",
+        ),
+        (
+            tracks(
+                json!(japanese),
+                Value::Null,
+                "off",
+                json!("a0"),
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "track_component_conflict",
+            "prepare-refused-000003",
+        ),
+        (
+            tracks(
+                json!("not-a-component"),
+                Value::Null,
+                "off",
+                Value::Null,
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "component_unavailable",
+            "prepare-refused-000004",
+        ),
+    ] {
+        problem(&prepare(selection, key).await, status, code);
+    }
+    let prepared = prepare(
+        tracks(
+            json!(japanese),
+            json!(captions),
+            "require",
+            Value::Null,
+            Value::Null,
+        ),
+        "prepare-component-subtitle-1",
+    )
+    .await;
+    assert_eq!(prepared.status, StatusCode::ACCEPTED, "{}", prepared.body);
+    let job = prepared.body["id"].as_str().unwrap().to_owned();
+    // The record names the streams of this revision the components resolved to.
+    let recorded: String =
+        sqlx::query_scalar("SELECT tracks_json FROM preparations WHERE job_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        (&recorded["audio_track_id"], &recorded["subtitle_track_id"]),
+        (&json!("a1"), &json!("s0")),
+        "{recorded}"
+    );
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(playscale::processing::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let (phase, error): (String, Option<String>) =
+                sqlx::query_as("SELECT phase,error FROM processing_jobs WHERE id=?")
+                    .bind(&job)
+                    .fetch_one(&f.server.app.db)
+                    .await
+                    .unwrap();
+            if phase == "completed" {
+                break;
+            }
+            assert!(
+                !["failed", "cancelled"].contains(&phase.as_str()),
+                "{phase} {error:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("preparation did not complete");
+    stop.cancel();
+    let _ = worker.await;
+    let rendition: String =
+        sqlx::query_scalar("SELECT file_id FROM renditions WHERE external_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    // The rendition holds the Japanese (22.05 kHz) audio and one mov_text subtitle.
+    let path: (String, String) = sqlx::query_as(
+        "SELECT l.root,f.relative_path FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+    )
+    .bind(&rendition)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,sample_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(Path::new(&path.0).join(&path.1))
+        .output()
+        .unwrap();
+    let streams = String::from_utf8(probe.stdout).unwrap();
+    assert!(streams.contains("aac,audio,22050"), "{streams}");
+    assert_eq!(streams.matches(",audio,").count(), 1, "{streams}");
+    assert_eq!(streams.matches("mov_text,subtitle").count(), 1, "{streams}");
+    let plan = |audio: &str, subtitle: Option<&str>| {
+        let mut input = pinned_plan_input(
+            "default",
+            &timeline,
+            "convert",
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        input["tracks"]["subtitle_track_id"] = json!(subtitle);
+        input["tracks"]["subtitle_policy"] =
+            json!(if subtitle.is_some() { "require" } else { "off" });
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // Exactly the prepared selection: the rendition, with its own subtitle.
+    let kept = plan("a1", Some("s0")).await;
+    assert_eq!(kept.body["operation"], "prepared", "{}", kept.body);
+    assert_eq!(kept.body["source"]["file_id"], rendition.as_str());
+    // Without the subtitle, or with other audio: never the rendition.
+    for (audio, subtitle) in [("a1", None), ("a0", Some("s0"))] {
+        let other = plan(audio, subtitle).await;
+        assert_ne!(other.body["operation"], "prepared", "{}", other.body);
+    }
+    // Automatic selection must happen before testing prepared candidates.
+    let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    let mut document = prefs.body.clone();
+    document["subtitle_mode"] = json!("always");
+    document["subtitle_languages"] = json!(["eng"]);
+    let updated = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK);
+    let mut automatic = pinned_plan_input(
+        "default",
+        &timeline,
+        "convert",
+        "a1",
+        &["http_range", "hls"],
+        &source,
+    );
+    automatic["tracks"]["subtitle_policy"] = json!("auto");
+    let automatic = f
+        .post("/api/v2/playback/plans", &auth, None, automatic)
+        .await;
+    assert_eq!(
+        automatic.body["operation"], "prepared",
+        "{}",
+        automatic.body
+    );
+    assert_eq!(automatic.body["tracks"]["subtitle_track_id"], "s0");
+    // The subtitle is delivered from the rendition's bytes.
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("prepared-subtitles-01"),
+            json!({"plan_token": kept.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let url = admitted.body["active"]["subtitles_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}", admitted.body))
+        .to_owned();
+    let vtt = f.call("GET", &url, None, &[("authorization", &auth)]).await;
+    assert_eq!(vtt.status, StatusCode::OK);
+    let vtt = String::from_utf8(vtt.bytes).unwrap();
+    assert!(
+        vtt.contains("00:01.000 --> 00:03.000") && vtt.contains("Kept caption"),
+        "{vtt}"
+    );
+    // A device downloads exactly this prepared version (5E): the same recipe
+    // and selection; any other selection is refused, never substituted.
+    let (saver, saver_auth) = f
+        .device(
+            &["default"],
+            &["catalog:read", "downloads:manage", "viewing:write"],
+        )
+        .await;
+    let download = |key: &'static str, audio: &str, subtitle: Option<&str>| {
+        let f = &f;
+        let saver_auth = saver_auth.clone();
+        let body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+            "version_id": null, "recipe_id": "remux_mp4",
+            "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                "subtitle_policy": if subtitle.is_some() { "require" } else { "off" },
+                "audio_track_id": audio, "subtitle_track_id": subtitle}});
+        async move {
+            f.post("/api/v2/downloads", &saver_auth, Some(key), body)
+                .await
+        }
+    };
+    let saved = download("prepared-download-0001", "a1", Some("s0")).await;
+    assert_eq!(saved.status, StatusCode::ACCEPTED, "{}", saved.body);
+    let pinned = f
+        .get(
+            &format!(
+                "/api/v2/downloads/{}/manifest",
+                saved.body["id"].as_str().unwrap()
+            ),
+            &saver_auth,
+        )
+        .await;
+    let rendition_revision: String =
+        sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        pinned.body["files"][0]["digest"],
+        format!("sha256:{rendition_revision}"),
+        "{}",
+        pinned.body
+    );
+    // The subtitle policy follows the same rule as preparing (kept only
+    // when explicit and required).
+    for (key, policy, subtitle, code) in [
+        (
+            "prepared-download-0004",
+            "off",
+            json!("s0"),
+            "subtitle_policy_conflict",
+        ),
+        (
+            "prepared-download-0005",
+            "require",
+            Value::Null,
+            "preparation_tracks_unsupported",
+        ),
+        (
+            "prepared-download-0006",
+            "auto",
+            json!("s0"),
+            "preparation_tracks_unsupported",
+        ),
+    ] {
+        let body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+            "version_id": null, "recipe_id": "remux_mp4",
+            "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                "subtitle_policy": policy, "audio_track_id": "a1", "subtitle_track_id": subtitle}});
+        let refused = f
+            .post("/api/v2/downloads", &saver_auth, Some(key), body)
+            .await;
+        assert_eq!(refused.body["code"], code, "{}", refused.body);
+    }
+    // Another generated version binding only an interval of the same output
+    // (sorting first) is never the listed pin: it cannot be downloaded.
+    let output_revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&rendition)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_versions(id,timeline_id,origin,equivalence) VALUES ('0-interval',?,'generated','declared')")
+        .bind(&timeline)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision,start_ms,end_ms) VALUES ('0-interval',1,?,?,0,1000)")
+        .bind(&rendition)
+        .bind(&output_revision)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    // The rendition's generated version (as listed) pins exactly it.
+    let listed = f
+        .get(
+            &format!("/api/v2/processing/renditions?timeline_id={timeline}"),
+            &operator,
+        )
+        .await;
+    let version = listed.body["items"][0]["version_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(version, "0-interval");
+    let pinned_body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+        "version_id": version, "recipe_id": "remux_mp4",
+        "tracks": listed.body["items"][0]["tracks"].clone()});
+    let exact = f
+        .post(
+            "/api/v2/downloads",
+            &saver_auth,
+            Some("prepared-download-0007"),
+            pinned_body,
+        )
+        .await;
+    assert_eq!(exact.status, StatusCode::ACCEPTED, "{}", exact.body);
+    for (key, audio, subtitle) in [
+        ("prepared-download-0002", "a0", Some("s0")),
+        ("prepared-download-0003", "a1", None),
+    ] {
+        let refused = download(key, audio, subtitle).await;
+        assert_eq!(
+            refused.body["code"], "download_preparation_unavailable",
+            "{}",
+            refused.body
+        );
+    }
+    // A replan of the prepared delivery for the same selection keeps it.
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let again = plan("a1", Some("s0")).await;
+    assert_eq!(again.body["operation"], "prepared", "{}", again.body);
+    let staged = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("prepared-subtitles-replan-1"),
+            json!({"kind":"replan", "expected_generation":"1",
+                "plan_token":again.body["plan_token"], "position_ms":1500}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    assert!(
+        staged.body["pending"]["subtitles_url"].is_string(),
+        "{}",
+        staged.body
+    );
+    // The rendition's source changes: the prepared download is no longer
+    // current for it and expires (never served from a stale preparation).
+    sqlx::query("UPDATE media_files SET revision='changed-source' WHERE id=?")
+        .bind(source["file_id"].as_str().unwrap())
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let expired = f
+        .get(
+            &format!("/api/v2/downloads/{}", saved.body["id"].as_str().unwrap()),
+            &saver_auth,
+        )
+        .await;
+    assert_eq!(expired.body["state"], "expired", "{}", expired.body);
 }
 
 /// One gray frame of `path` at `at` seconds (320x240 sources).
@@ -4434,7 +5128,7 @@ async fn multipart_versions_play_their_parts_in_order() {
     );
     assert_eq!(
         plan("auto", "require").await.body["reason_codes"][0],
-        "subtitle_multipart_unavailable"
+        "subtitle_unavailable"
     );
     let converted = plan("auto", "auto").await;
     assert_eq!(
@@ -4630,6 +5324,312 @@ async fn multipart_versions_play_their_parts_in_order() {
     // Like a changed single source: every current generation fails.
     let fenced = f.until(&id, &auth, |d| d["status"] == "failed").await;
     assert_eq!(fenced["status"], "failed", "{fenced}");
+}
+
+/// An explicitly chosen text subtitle of a multipart version is delivered
+/// across its parts: each part's own stream of the component, its cues moved
+/// by the parts before it into timeline time, as the live generation's
+/// subtitle rendition. A part without the component refuses the choice.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_text_subtitles_are_joined_in_timeline_time() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let captions = |name: &str, cues: &str| {
+        let path = f.dir.path().join(name);
+        std::fs::write(&path, cues).unwrap();
+        path
+    };
+    let first_cues = captions(
+        "first.srt",
+        "1\n00:00:01,000 --> 00:00:02,000\nfirst part\n\n2\n00:00:04,000 --> 00:00:05,000\nfirst late\n",
+    );
+    let second_cues = captions(
+        "second.srt",
+        "1\n00:00:01,000 --> 00:00:02,000\nsecond part\n",
+    );
+    for (name, cues) in [
+        ("a-part1.mp4", Some(&first_cues)),
+        ("b-part2.mp4", Some(&second_cues)),
+        ("c-nosubs.mp4", None),
+    ] {
+        let mut args = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+        ];
+        if let Some(cues) = cues {
+            args.extend([
+                "-i",
+                cues.to_str().unwrap(),
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+            ]);
+            args.extend(["-c:s", "mov_text", "-metadata:s:s:0", "language=eng"]);
+        }
+        args.extend([
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+            "-metadata:s:a:0",
+            "language=eng",
+        ]);
+        f.media(name, &args);
+    }
+    f.scan().await;
+    let file = |name: &str| {
+        let db = f.server.app.db.clone();
+        let name = name.to_owned();
+        async move {
+            sqlx::query_as::<_, (String, String, f64)>(
+                "SELECT id,revision,duration_seconds FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _, first_seconds) = file("a-part1.mp4").await;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) \
+         WHERE relative_path IN ('b-part2.mp4','c-nosubs.mp4')",
+    )
+    .bind(&first)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let bind_second = |name: &'static str| {
+        let db = f.server.app.db.clone();
+        let version = version.clone();
+        let file = file(name);
+        async move {
+            let (id, revision, _) = file.await;
+            sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=2")
+                .bind(&version)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+            )
+            .bind(&version)
+            .bind(id)
+            .bind(revision)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    // The English subtitle component, as the timeline's components name it.
+    let subtitle_component = || {
+        let db = f.server.app.db.clone();
+        let timeline = timeline.clone();
+        async move {
+            playscale::components::timeline_components(&db, &timeline)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|c| c.kind == playscale_core::components::Kind::Subtitle)
+                .unwrap()
+                .id
+        }
+    };
+    let plan = |policy: &'static str, modes: Value| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_component_id"] = json!(subtitle_component().await);
+            input["tracks"]["subtitle_policy"] = json!(policy);
+            input["client"]["subtitle_modes"] = modes;
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    let text = || json!(["text", "hls_text"]);
+    // A part without the chosen subtitle component cannot carry it.
+    bind_second("c-nosubs.mp4").await;
+    let refused = plan("require", text()).await;
+    assert_eq!(
+        refused.body["reason_codes"][0], "subtitle_multipart_unavailable",
+        "{}",
+        refused.body
+    );
+    bind_second("b-part2.mp4").await;
+    let planned = plan("require", text()).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-subtitles-1"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let url = done["active"]["subtitles_url"].as_str().unwrap().to_owned();
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            String::from_utf8(reply.bytes).unwrap()
+        }
+    };
+    // Every segment of the rendition, its cues in media time.
+    let playlist = get(url).await;
+    let mut cues = std::collections::BTreeMap::new();
+    for name in playlist.lines().filter_map(|l| l.strip_prefix("../../")) {
+        let segment = get(format!("/api/v2/streams/{id}/1/{name}")).await;
+        for block in segment.split("\n\n").skip(1) {
+            let mut lines = block.lines();
+            let timing = lines.next().unwrap().to_owned();
+            cues.insert(lines.collect::<Vec<_>>().join("\n"), timing);
+        }
+    }
+    let origin = done["active"]["media_time_origin_ms"].as_u64().unwrap();
+    let at = |ms: u64| {
+        let ms = ms - origin;
+        let (s, ms) = (ms / 1000, ms % 1000);
+        format!("{:02}:{:02}:{:02}.{ms:03}", s / 3600, s / 60 % 60, s % 60)
+    };
+    // The second part's cue follows the first part's pinned duration.
+    let offset = (first_seconds * 1000.0) as u64;
+    assert_eq!(
+        cues.get("first part"),
+        Some(&format!("{} --> {}", at(1_000), at(2_000))),
+        "{cues:?}"
+    );
+    assert_eq!(
+        cues.get("first late"),
+        Some(&format!("{} --> {}", at(4_000), at(5_000))),
+        "{cues:?}"
+    );
+    assert_eq!(
+        cues.get("second part"),
+        Some(&format!(
+            "{} --> {}",
+            at(offset + 1_000),
+            at(offset + 2_000)
+        )),
+        "{cues:?}"
+    );
+    assert_eq!(cues.len(), 3, "{cues:?}");
+    // Automatic selection across parts: the profile's English subtitles,
+    // only as a text component every part carries.
+    let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    let mut document = prefs.body.clone();
+    document["subtitle_mode"] = json!("always");
+    document["audio_languages"] = json!(["eng"]);
+    document["subtitle_languages"] = json!(["eng"]);
+    let replaced = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    let automatic = |policy: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_policy"] = json!(policy);
+            input["client"]["subtitle_modes"] = json!(["text", "hls_text"]);
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    // A part without the component: "auto" plays without subtitles and
+    // "require" is refused, never another part's track alone.
+    bind_second("c-nosubs.mp4").await;
+    let without = automatic("auto").await;
+    assert_eq!(without.body["status"], "ready", "{}", without.body);
+    assert_eq!(without.body["tracks"]["subtitle_track_id"], Value::Null);
+    assert_eq!(
+        automatic("require").await.body["reason_codes"][0],
+        "subtitle_unavailable"
+    );
+    bind_second("b-part2.mp4").await;
+    let selected = automatic("auto").await;
+    assert_eq!(selected.body["status"], "ready", "{}", selected.body);
+    assert_eq!(selected.body["tracks"]["subtitle_track_id"], "s0");
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-subtitles-auto"),
+            json!({"plan_token": selected.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let auto_id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&auto_id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let playlist = get(done["active"]["subtitles_url"].as_str().unwrap().to_owned()).await;
+    let mut joined = String::new();
+    for name in playlist.lines().filter_map(|l| l.strip_prefix("../../")) {
+        joined += &get(format!("/api/v2/streams/{auto_id}/1/{name}")).await;
+    }
+    assert!(
+        joined.contains("first part") && joined.contains("second part"),
+        "{joined}"
+    );
+    // Burned subtitles are not delivered across parts.
+    let burned = plan("require", json!(["burned"])).await;
+    assert_eq!(burned.body["status"], "blocked", "{}", burned.body);
 }
 
 /// A bitrate cap is kept by a capped conversion: byte delivery cannot promise
@@ -5920,4 +6920,1792 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     assert_eq!(entry["end_reason"], "interrupted");
     assert_eq!(entry["bytes_sent"], (10_000 + rest).to_string());
     assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
+}
+
+/// A uniform 10-bit limited-range picture (luma `code`, neutral chroma) with
+/// stereo silence, tagged with `params` (`setparams` options), as lossless
+/// FFV1 in Matroska. Written by the host ffmpeg; the tags are what the scanner
+/// probes.
+fn uniform_hdr_mkv(f: &Fixture, name: &str, code: u16, params: &str) {
+    let (width, height, frames) = (320usize, 180usize, 100usize);
+    let mut frame = Vec::with_capacity(width * height * 3);
+    for _ in 0..width * height {
+        frame.extend_from_slice(&code.to_le_bytes());
+    }
+    for _ in 0..width * height / 2 {
+        frame.extend_from_slice(&512u16.to_le_bytes());
+    }
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p10le",
+        ])
+        .args(["-s", "320x180", "-r", "25", "-i", "-"])
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "4"])
+        .args(["-vf", &format!("setparams={params}")])
+        .args(["-c:v", "ffv1", "-c:a", "aac", "-shortest"])
+        .arg(f.dir.path().join("media").join(name))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut input = child.stdin.take().unwrap();
+        for _ in 0..frames {
+            input.write_all(&frame).unwrap();
+        }
+    }
+    assert!(child.wait().unwrap().success());
+}
+
+/// Mean limited-range luma code of the 320x180 frame at `at` seconds: the
+/// Y plane of 8-bit yuv420p as coded (converting to `gray` would expand it
+/// to full range).
+fn mean_luma(path: &Path, at: &str) -> f64 {
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", at, "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let luma = &frame[..320 * 180];
+    assert_eq!(frame.len(), 320 * 180 * 3 / 2, "{at}");
+    luma.iter().map(|v| f64::from(*v)).sum::<f64>() / luma.len() as f64
+}
+
+async fn hdr_plan(f: &Fixture, auth: &str, timeline: &str) -> Reply {
+    let input = plan_input("default", timeline, "auto", None, &["http_range", "hls"]);
+    f.post("/api/v2/playback/plans", auth, None, input).await
+}
+
+/// 10-bit limited-range PQ code value of a 100-nit neutral patch (ST 2084).
+const PQ_100_NITS: u16 = 509;
+
+/// HDR10 sources play to SDR clients through a tone-mapped conversion whose
+/// pixels (not only tags) are SDR, decided from probed colour facts and the
+/// observed filters. Unknown facts and missing filters are refused. Needs an
+/// FFmpeg with zimg and tonemap: `MOTION_FILTER_FFMPEG` (for example the
+/// N2 media-tools build); the refusals run without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let tagged = "color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv";
+
+    // Without the filters (an FFmpeg that cannot even list them): refused,
+    // and capabilities do not advertise tone mapping.
+    let none = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: "/usr/bin/false".into(),
+        ..Default::default()
+    })
+    .await;
+    uniform_hdr_mkv(&none, "hdr10.mkv", PQ_100_NITS, tagged);
+    none.scan().await;
+    let (timeline, _) = none.timeline().await;
+    let (_, auth) = none.device(&["default"], PLAYER).await;
+    let refused = hdr_plan(&none, &auth, &timeline).await;
+    assert_eq!(refused.body["status"], "blocked", "{}", refused.body);
+    let capabilities = none
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert!(
+        !capabilities.body.to_string().contains("tone_map_to_sdr"),
+        "{}",
+        capabilities.body
+    );
+
+    let Ok(ffmpeg) = std::env::var("MOTION_FILTER_FFMPEG") else {
+        eprintln!("SKIPPED (tone mapping): MOTION_FILTER_FFMPEG is not set");
+        return;
+    };
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: ffmpeg.into(),
+        ..Default::default()
+    })
+    .await;
+    uniform_hdr_mkv(&f, "hdr10.mkv", PQ_100_NITS, tagged);
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    // A row probed before colour facts were recorded is probed again by the
+    // next ordinary scan instead of being refused forever.
+    sqlx::query("UPDATE media_files SET tracks_json=json_remove(tracks_json,'$[0].probe_version','$[0].color_primaries','$[0].color_space','$[0].color_range')")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        hdr_plan(&f, &auth, &timeline).await.body["status"],
+        "blocked"
+    );
+    f.scan().await;
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM catalog_files")
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    assert!(
+        tracks.contains("\"color_primaries\":\"bt2020\""),
+        "{tracks}"
+    );
+
+    let planned = hdr_plan(&f, &auth, &timeline).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("hdr-tone-map-0000001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("tone-mapped.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Hable for a 1,000-nit peak maps 100-nit diffuse white to about 151 in
+    // 8-bit limited BT.709 (pixel-verified in scripts/test_media_transforms.py);
+    // retagging the PQ code as BT.709 would give about 127.
+    let luma = mean_luma(&fragment, "0.5");
+    assert!((147.0..=155.0).contains(&luma), "tone-mapped luma {luma}");
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .args([
+            "stream=color_primaries,color_transfer,color_space,color_range",
+            "-of",
+            "json",
+        ])
+        .arg(&fragment)
+        .output()
+        .unwrap()
+        .stdout;
+    let tags: Value = serde_json::from_slice(&probe).unwrap();
+    assert_eq!(
+        tags["streams"][0],
+        json!({"color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"})
+    );
+    let capabilities = f
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert!(capabilities.body.to_string().contains("tone_map_to_sdr"));
+
+    // Unknown primaries and matrix: refused, never guessed.
+    let g = Fixture::with_settings(f.server.app.processing.settings.clone()).await;
+    uniform_hdr_mkv(
+        &g,
+        "untagged.mkv",
+        PQ_100_NITS,
+        "color_trc=smpte2084:range=tv",
+    );
+    g.scan().await;
+    let (timeline, _) = g.timeline().await;
+    let (_, auth) = g.device(&["default"], PLAYER).await;
+    let unknown = hdr_plan(&g, &auth, &timeline).await;
+    assert_eq!(unknown.body["status"], "blocked", "{}", unknown.body);
+}
+
+/// An ASS script whose one event draws a filled white rectangle (a drawing,
+/// so no font is needed) from `start` to `end` on a 320x240 canvas.
+fn ass_box(rectangle: (u32, u32, u32, u32), start: &str, end: &str) -> String {
+    let (x0, y0, x1, y1) = rectangle;
+    format!(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n\
+         [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n\
+         [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an7\\pos(0,0)\\p1}}m {x0} {y0} l {x1} {y0} {x1} {y1} {x0} {y1}{{\\p0}}\n"
+    )
+}
+
+/// Styled (ASS) subtitles are burned into conversions by libass from the
+/// exact selected stream, at the right file time after a seek, with the
+/// file's attachments extracted; never flattened to WebVTT, and refused
+/// where the FFmpeg lacks libass. Needs `MOTION_FILTER_FFMPEG` (an FFmpeg with
+/// libass); the refusals run without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn styled_subtitles_are_burned_by_libass_from_the_exact_stream() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let build = |f: &Fixture| {
+        two_audio_mp4(f, "20");
+        let base = f.dir.path().join("base.mp4");
+        std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+        // Two English tracks: the selected one draws high, the other low.
+        let high = f.dir.path().join("high.ass");
+        let low = f.dir.path().join("low.ass");
+        std::fs::write(
+            &high,
+            ass_box((40, 40, 260, 100), "0:00:02.00", "0:00:15.00"),
+        )
+        .unwrap();
+        std::fs::write(
+            &low,
+            ass_box((40, 140, 260, 200), "0:00:00.00", "0:00:20.00"),
+        )
+        .unwrap();
+        let font = f.dir.path().join("font.ttf");
+        std::fs::write(&font, b"not really a font").unwrap();
+        f.media(
+            "film.mkv",
+            &[
+                "-i",
+                base.to_str().unwrap(),
+                "-i",
+                high.to_str().unwrap(),
+                "-i",
+                low.to_str().unwrap(),
+                "-attach",
+                font.to_str().unwrap(),
+                "-metadata:s:t",
+                "mimetype=font/ttf",
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:1",
+                "language=eng",
+                "-c",
+                "copy",
+            ],
+        );
+    };
+    let input = |timeline: &str, source: &Value, modes: &[&str]| {
+        let mut input = plan_input("default", timeline, "auto", None, &["http_range", "hls"]);
+        input["source"] = source.clone();
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(modes);
+        input
+    };
+
+    // Without libass: styled subtitles are refused, never sent as WebVTT.
+    let plain = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: "/usr/bin/false".into(),
+        ..Default::default()
+    })
+    .await;
+    build(&plain);
+    plain.scan().await;
+    // An attachment recorded before its MIME type and size were probed is
+    // probed again by the next ordinary scan (fonts are bounded by them).
+    let attachment = |f: &Fixture| {
+        let db = f.server.app.db.clone();
+        async move {
+            let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            let tracks: Value = serde_json::from_str(&tracks).unwrap();
+            tracks
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["kind"] == "attachment")
+                .cloned()
+                .unwrap()
+        }
+    };
+    let probed = attachment(&plain).await;
+    assert_eq!(
+        (
+            probed["mimetype"].as_str(),
+            probed["attachment_bytes"].as_u64()
+        ),
+        (Some("font/ttf"), Some(17))
+    );
+    // As written by an intermediate probe: colour facts recorded (its old
+    // `color_probed` flag set) but no attachment facts and no probe version.
+    sqlx::query("UPDATE media_files SET tracks_json=(SELECT json_group_array(json_set(json_remove(value,'$.probe_version','$.mimetype','$.attachment_bytes'),'$.color_probed',json('true'))) FROM json_each(tracks_json))")
+        .execute(&plain.server.app.db)
+        .await
+        .unwrap();
+    assert!(attachment(&plain).await["mimetype"].is_null());
+    plain.scan().await;
+    assert_eq!(
+        attachment(&plain).await["attachment_bytes"].as_u64(),
+        Some(17)
+    );
+    let (timeline, _) = plain.timeline().await;
+    let (_, auth) = plain.device(&["default"], PLAYER).await;
+    let source = plain.source().await;
+    let refused = plain
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            input(&timeline, &source, &["text", "burned"]),
+        )
+        .await;
+    assert_eq!(
+        refused.body["reason_codes"][0], "subtitle_format_unsupported",
+        "{}",
+        refused.body
+    );
+
+    let Ok(ffmpeg) = std::env::var("MOTION_FILTER_FFMPEG") else {
+        eprintln!("SKIPPED (libass): MOTION_FILTER_FFMPEG is not set");
+        return;
+    };
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: ffmpeg.into(),
+        ..Default::default()
+    })
+    .await;
+    build(&f);
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let plan = |modes: &'static [&'static str]| {
+        let body = input(&timeline, &source, modes);
+        let f = &f;
+        let auth = auth.clone();
+        async move { f.post("/api/v2/playback/plans", &auth, None, body).await }
+    };
+    // A text-only client cannot be given styled subtitles.
+    assert_eq!(
+        plan(&["text"]).await.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    // The fragment's mean luma inside the selected track's box and the other
+    // track's box, `at` seconds into the first segment.
+    let boxes = |id: String, at: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let mut bytes = Vec::new();
+            for path in ["variants/main/init.mp4", "segments/0.m4s"] {
+                let reply = f
+                    .call(
+                        "GET",
+                        &format!("/api/v2/streams/{id}/1/{path}"),
+                        None,
+                        &[("authorization", &auth)],
+                    )
+                    .await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                bytes.extend(reply.bytes);
+            }
+            let fragment = f.dir.path().join(format!("styled-{id}-{at}.mp4"));
+            std::fs::write(&fragment, bytes).unwrap();
+            let frame = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&fragment)
+                .args([
+                    "-ss",
+                    at,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(frame.len(), 320 * 240);
+            let mean = |y0: usize| {
+                let mut sum = 0usize;
+                for y in y0 + 10..y0 + 50 {
+                    sum += frame[y * 320 + 60..y * 320 + 240]
+                        .iter()
+                        .map(|&p| p as usize)
+                        .sum::<usize>();
+                }
+                sum / (180 * 40)
+            };
+            (mean(40), mean(140))
+        }
+    };
+    for (key, start_ms, before, during) in [
+        // From the start: nothing before 2 s, the box from then on.
+        ("styled-burn-0000001", 0, Some("1"), "3"),
+        // A seek into the event: drawn although its start precedes the seek.
+        ("styled-burn-0000002", 8000, None, "0.5"),
+    ] {
+        let planned = plan(&["text", "burned"]).await;
+        assert_eq!(
+            planned.body["operation"], "video_transcode",
+            "{}",
+            planned.body
+        );
+        let admitted = f
+            .post(
+                "/api/v2/playback/delivery-sessions",
+                &auth,
+                Some(key),
+                json!({"plan_token": planned.body["plan_token"], "start_ms": start_ms}),
+            )
+            .await;
+        assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+        let id = admitted.body["id"].as_str().unwrap().to_owned();
+        let ready = f
+            .until(&id, &auth, |d| {
+                d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start_ms
+                    || d["active"]["status"] == "failed"
+            })
+            .await;
+        assert_ne!(ready["active"]["status"], "failed", "{ready}");
+        assert_eq!(
+            ready["active"]["subtitles_url"],
+            Value::Null,
+            "burned, not a track"
+        );
+        if let Some(at) = before {
+            let (selected, other) = boxes(id.clone(), at).await;
+            assert!(
+                selected < 200 && other < 200,
+                "before the cue: {selected}, {other}"
+            );
+        }
+        let (selected, other) = boxes(id.clone(), during).await;
+        // Only the selected stream is drawn, not its same-language sibling.
+        assert!(
+            selected > 225 && other < 200,
+            "cue {selected}, other track {other}"
+        );
+        // The file's attachment was extracted under a fixed name.
+        let fonts = f
+            .server
+            .app
+            .processing
+            .deliveries
+            .root
+            .join(&id)
+            .join("burn-fonts-0/font0");
+        assert_eq!(std::fs::read(&fonts).unwrap(), b"not really a font");
+        assert_eq!(
+            f.call(
+                "DELETE",
+                &format!("/api/v2/playback/delivery-sessions/{id}"),
+                None,
+                &[("authorization", &auth)]
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+/// Chapters a file's container records become embedded chapter markers of
+/// its timeline (6B): derived at read time at the timeline's current
+/// revision, outranked by a manual chapter, and probed alone (without
+/// hashing the file again) for files scanned before chapters were recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn container_chapters_are_embedded_markers_of_the_timeline() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let chapters = f.dir.path().join("chapters.txt");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=6000\ntitle=Middle\n",
+    )
+    .unwrap();
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-i",
+            chapters.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map_metadata",
+            "1",
+            "-map_chapters",
+            "1",
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let path = format!("/api/v2/catalog/timelines/{timeline}/markers");
+    let read = |query: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        let path = path.clone();
+        async move { f.get(&format!("{path}{query}"), &auth).await.body }
+    };
+    let labels = |page: &Value| -> Vec<(String, String)> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["label"].as_str().unwrap_or("").to_owned(),
+                    m["provenance"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let embedded = vec![
+        ("Opening".to_owned(), "embedded".to_owned()),
+        ("Middle".to_owned(), "embedded".to_owned()),
+    ];
+    assert_eq!(labels(&read("").await), embedded);
+    assert_eq!(labels(&read("?effective=true").await), embedded);
+    // A timeline edit keeps them in effect (file facts follow the timeline).
+    sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id=?")
+        .bind(&timeline)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(labels(&read("?effective=true").await), embedded);
+    // A manual chapter outranks the file's chapters; they stay listed.
+    let revision = f
+        .get(&format!("/api/v2/catalog/timelines/{timeline}"), &auth)
+        .await
+        .body["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let created = f
+        .post(
+            &path,
+            &bearer(OPERATOR),
+            Some("manual-chapter-0001"),
+            json!({"timeline_revision": revision, "kind": "chapter", "start_ms": 1000, "end_ms": null, "label": "Mine"}),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(
+        labels(&read("?effective=true").await),
+        [("Mine".to_owned(), "manual".to_owned())]
+    );
+    assert_eq!(read("").await["items"].as_array().unwrap().len(), 3);
+    // A file scanned before chapters were recorded is probed for them alone.
+    sqlx::query("UPDATE media_files SET chapters_json=NULL")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    f.scan().await;
+    let stored: Option<String> = sqlx::query_scalar("SELECT chapters_json FROM media_files")
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    assert!(
+        stored.as_deref().is_some_and(|c| c.contains("Opening")),
+        "{stored:?}"
+    );
+    // A scan-created timeline records no duration; the file's own bounds
+    // the chapters, so one past the media's end is dropped.
+    let db = &f.server.app.db;
+    sqlx::query("UPDATE timelines SET duration_ms=NULL WHERE id=?")
+        .bind(&timeline)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"UPDATE media_files SET chapters_json='[{"start_ms":0,"end_ms":2000,"title":"Opening"},{"start_ms":9000,"end_ms":null,"title":"Past the end"}]'"#,
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        labels(&read("").await)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect::<Vec<_>>(),
+        ["Opening", "Mine"]
+    );
+    // Replaced content whose chapters cannot be probed keeps none of the
+    // old ones: they belonged to the previous revision.
+    let before: String = sqlx::query_scalar("SELECT revision FROM media_files")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    std::fs::write(
+        f.dir.path().join("media").join("film.mp4"),
+        b"not a media file any more",
+    )
+    .unwrap();
+    f.scan().await;
+    let (after, stored): (String, Option<String>) =
+        sqlx::query_as("SELECT revision,chapters_json FROM media_files")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_ne!(after, before);
+    assert_eq!(stored, None, "stale chapters on a new revision");
+}
+
+/// Embedded chapters come only from an original the caller may read: a
+/// chaptered copy of the same timeline in another library discloses
+/// nothing to a caller scoped to the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_chapters_come_only_from_readable_originals() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    f.scan().await;
+    let other_root = f.dir.path().join("other");
+    std::fs::create_dir(&other_root).unwrap();
+    let chapters = f.dir.path().join("chapters.txt");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\ntitle=Hidden\n",
+    )
+    .unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+        ])
+        .arg("-i")
+        .arg(&chapters)
+        .args([
+            "-map",
+            "0",
+            "-map_chapters",
+            "1",
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(other_root.join("cut.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let other = db::add_library(&f.server.app.db, "Other", &other_root)
+        .await
+        .unwrap()
+        .id;
+    f.scan_library(&other).await;
+    let db = &f.server.app.db;
+    let (timeline, edition): (String, String) = sqlx::query_as(
+        "SELECT t.id,t.edition_id FROM timelines t JOIN media_files f ON f.edition_id=t.edition_id WHERE f.relative_path='film.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let (file, version): (String, String) = sqlx::query_as(
+        "SELECT f.id,b.version_id FROM media_files f JOIN version_files b ON b.file_id=f.id WHERE f.relative_path='cut.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media_files SET edition_id=? WHERE id=?")
+        .bind(&edition)
+        .bind(&file)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_versions SET timeline_id=? WHERE id=?")
+        .bind(&timeline)
+        .bind(&version)
+        .execute(db)
+        .await
+        .unwrap();
+    for (library, expected) in [(f.library.clone(), 0), (other.clone(), 1)] {
+        let (device, auth) = f.device(&["default"], PLAYER).await;
+        f.policy(&device, &[library.as_str()], PLAYER, "\"r-2\"")
+            .await;
+        let page = f
+            .get(
+                &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+                &auth,
+            )
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        let embedded: Vec<_> = page.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["provenance"] == "embedded")
+            .collect();
+        assert_eq!(embedded.len(), expected, "{library}: {}", page.body);
+    }
+    // A hundred chaptered copies the caller cannot read, ordered before the
+    // readable one, never hide its chapters.
+    let film: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE relative_path='film.mp4'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let film_version: String =
+        sqlx::query_scalar("SELECT version_id FROM version_files WHERE file_id=?")
+            .bind(&film)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    for n in 0..100 {
+        for sql in [
+            "CREATE TEMP TABLE copy_file AS SELECT * FROM media_files WHERE id=?1",
+            "UPDATE copy_file SET id='copy-file-'||?2,relative_path='copy-'||?2||'.mp4',chapters_json='[{\"start_ms\":0,\"end_ms\":null,\"title\":\"Copy\"}]'",
+            "INSERT INTO media_files SELECT * FROM copy_file",
+            "CREATE TEMP TABLE copy_version AS SELECT * FROM media_versions WHERE id=?3",
+            "UPDATE copy_version SET id='0000-copy-'||?2",
+            "INSERT INTO media_versions SELECT * FROM copy_version",
+            "CREATE TEMP TABLE copy_binding AS SELECT * FROM version_files WHERE version_id=?3",
+            "UPDATE copy_binding SET version_id='0000-copy-'||?2,file_id='copy-file-'||?2",
+            "INSERT INTO version_files SELECT * FROM copy_binding",
+            "DROP TABLE copy_file",
+            "DROP TABLE copy_version",
+            "DROP TABLE copy_binding",
+        ] {
+            sqlx::query(sql)
+                .bind(&film)
+                .bind(format!("{n:03}"))
+                .bind(&film_version)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&device, &[other.as_str()], PLAYER, "\"r-2\"")
+        .await;
+    let page = f
+        .get(
+            &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+            &auth,
+        )
+        .await;
+    let labels: Vec<_> = page.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["provenance"] == "embedded")
+        .map(|m| m["label"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(labels, ["Hidden"], "{}", page.body);
+    // The first readable original has no chapters: later chaptered copies
+    // must not contribute marker positions from a different cut.
+    sqlx::query("UPDATE media_files SET chapters_json=NULL WHERE id='copy-file-000'")
+        .execute(db)
+        .await
+        .unwrap();
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&device, &[f.library.as_str()], PLAYER, "\"r-2\"")
+        .await;
+    let page = f
+        .get(
+            &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+            &auth,
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(
+        page.body["items"].as_array().unwrap().is_empty(),
+        "{}",
+        page.body
+    );
+}
+
+/// A burned bitmap cue whose display set began long before a start (beyond
+/// what reading the video earlier would cover) is still drawn: the subtitle
+/// is read from its own descriptor of the source, BURN_LOOKBACK_MS earlier.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cues_established_long_before_a_start_are_drawn() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "50");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("box.sup");
+    // One cue on a 640x480 canvas over 320x240 video; muxing places its
+    // display set at the file's start, and its clearing set 44 s later.
+    std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 1000, 45000)).unwrap();
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+    input["source"] = f.source().await;
+    input["tracks"]["subtitle_track_id"] = json!("s0");
+    input["tracks"]["subtitle_policy"] = json!("require");
+    input["client"]["subtitle_modes"] = json!(["burned"]);
+    let planned = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    // Starting at 40 s: the cue's display set is 40 s earlier, beyond any
+    // fixed short lookback.
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-lookback-001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 40000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 40000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    assert_eq!(ready["active"]["media_time_origin_ms"], 40000, "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base_url = format!("/api/v2/streams/{id}/1");
+    let fragment = f.dir.path().join("lookback.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mean = |x0: usize, y0: usize| {
+        let mut sum = 0usize;
+        for y in y0..y0 + 40 {
+            sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                .iter()
+                .map(|&p| p as usize)
+                .sum::<usize>();
+        }
+        sum / (220 * 40)
+    };
+    let (inside, below) = (mean(50, 50), mean(50, 150));
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    // Starting after the cue was cleared: nothing is drawn, and the
+    // conversion plays on (no earlier reading, no waiting for cues).
+    let planned = {
+        let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+        input["source"] = f.source().await;
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(["burned"]);
+        f.post("/api/v2/playback/plans", &auth, None, input).await
+    };
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-lookback-002"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 46000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 46000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let base_url = format!("/api/v2/streams/{id}/1");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mut sum = 0usize;
+    for y in 50..90 {
+        sum += frame[y * 320 + 50..y * 320 + 270]
+            .iter()
+            .map(|&p| p as usize)
+            .sum::<usize>();
+    }
+    let cleared = sum / (220 * 40);
+    assert!(cleared < 200, "box still drawn: {cleared}");
+}
+
+/// A PGS stream whose composition at 30 s reuses the object and palette its
+/// epoch defined at 0 s (shown 0-10 s, cleared, shown again from 30 s).
+fn pgs_reuse() -> Vec<u8> {
+    let (width, height, x, y, w, h) = (640u16, 480u16, 80u16, 80u16, 480u16, 120u16);
+    let be = |v: u16| v.to_be_bytes();
+    let segment = |pts_ms: u32, kind: u8, payload: &[u8]| {
+        let mut out = b"PG".to_vec();
+        out.extend((pts_ms * 90).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.push(kind);
+        out.extend((payload.len() as u16).to_be_bytes());
+        out.extend(payload);
+        out
+    };
+    let window = [&[1u8, 0][..], &be(x), &be(y), &be(w), &be(h)].concat();
+    let mut rle = Vec::new();
+    for _ in 0..h {
+        rle.extend([
+            0x00,
+            0xC0 | (w >> 8) as u8,
+            (w & 0xff) as u8,
+            0x01,
+            0x00,
+            0x00,
+        ]);
+    }
+    let mut ods = vec![0, 0, 0, 0xC0];
+    ods.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+    ods.extend(be(w));
+    ods.extend(be(h));
+    ods.extend(&rle);
+    let pcs = |number: u16, state: u8, objects: bool| {
+        let mut p = [
+            &be(width)[..],
+            &be(height),
+            &[0x10],
+            &be(number),
+            &[state, 0, 0],
+        ]
+        .concat();
+        if objects {
+            p.extend([1, 0, 0, 0, 0]);
+            p.extend(be(x));
+            p.extend(be(y));
+        } else {
+            p.push(0);
+        }
+        p
+    };
+    [
+        segment(0, 0x16, &pcs(0, 0x80, true)),
+        segment(0, 0x17, &window),
+        segment(0, 0x14, &[0, 0, 1, 235, 128, 128, 255]),
+        segment(0, 0x15, &ods),
+        segment(0, 0x80, &[]),
+        segment(10000, 0x16, &pcs(1, 0x00, false)),
+        segment(10000, 0x17, &window),
+        segment(10000, 0x80, &[]),
+        // A normal composition: no palette or object of its own.
+        segment(30000, 0x16, &pcs(2, 0x00, true)),
+        segment(30000, 0x17, &window),
+        segment(30000, 0x80, &[]),
+        segment(45000, 0x16, &pcs(3, 0x00, false)),
+        segment(45000, 0x17, &window),
+        segment(45000, 0x80, &[]),
+    ]
+    .concat()
+}
+
+/// A PGS cue whose composition reuses objects its epoch defined earlier is
+/// read from that epoch, so a start inside it draws it (a decoder started
+/// at the composition itself has no palette or object to show).
+#[tokio::test(flavor = "multi_thread")]
+async fn pgs_compositions_reusing_objects_are_read_from_their_epoch() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "50");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("reuse.sup");
+    std::fs::write(&sup, pgs_reuse()).unwrap();
+    // A container that starts at 50,000 s (as some recordings do): the
+    // lookback works in file time whatever the container's timestamps.
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-output_ts_offset",
+            "50000",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+    input["source"] = f.source().await;
+    input["tracks"]["subtitle_track_id"] = json!("s0");
+    input["tracks"]["subtitle_policy"] = json!("require");
+    input["client"]["subtitle_modes"] = json!(["burned"]);
+    let planned = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-epoch-001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 38000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 38000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base_url = format!("/api/v2/streams/{id}/1");
+    let fragment = f.dir.path().join("epoch.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mut sum = 0usize;
+    for y in 50..90 {
+        sum += frame[y * 320 + 50..y * 320 + 270]
+            .iter()
+            .map(|&p| p as usize)
+            .sum::<usize>();
+    }
+    let inside = sum / (220 * 40);
+    assert!(inside > 225, "reused cue not drawn: {inside}");
+}
+
+/// A bitmap subtitle component present in every part is burned into each
+/// part's own pictures for a client that accepts burned subtitles, and a
+/// start inside a later part still draws that part's cue showing there.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_subtitles_are_burned_across_parts() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Two 8 s parts, each with its own English PGS cue over most of it.
+    for name in ["a-part1", "b-part2"] {
+        let base = f.dir.path().join(format!("{name}.mp4"));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-t",
+                "8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+            ])
+            .arg(&base)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let sup = f.dir.path().join(format!("{name}.sup"));
+        std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 0, 7000)).unwrap();
+        // Part 2's audio starts 0.5 s after its pictures.
+        let delay = if name == "b-part2" { "0.5" } else { "0" };
+        f.media(
+            &format!("{name}.mkv"),
+            &[
+                "-i",
+                base.to_str().unwrap(),
+                "-itsoffset",
+                delay,
+                "-i",
+                base.to_str().unwrap(),
+                "-i",
+                sup.to_str().unwrap(),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2",
+                "-c",
+                "copy",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:s:0",
+                "language=eng",
+            ],
+        );
+    }
+    f.scan().await;
+    let file = |name: &'static str| {
+        let db = f.server.app.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, f64)>(
+                "SELECT id,revision,duration_seconds FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _, first_seconds) = file("a-part1.mkv").await;
+    let (second, second_revision, _) = file("b-part2.mkv").await;
+    let db = &f.server.app.db;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+        .bind(&first)
+        .bind(&second)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(&second)
+    .bind(&second_revision)
+    .execute(db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let component = playscale::components::timeline_components(db, &timeline)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.kind == playscale_core::components::Kind::Subtitle)
+        .unwrap()
+        .id;
+    let plan = |modes: Value| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        let component = component.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_component_id"] = json!(component);
+            input["tracks"]["subtitle_policy"] = json!("require");
+            input["client"]["subtitle_modes"] = modes;
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    // A client that presents only text cannot be given a bitmap.
+    assert_eq!(plan(json!(["text"])).await.body["status"], "blocked");
+    let burned = plan(json!(["burned"])).await;
+    assert_eq!(
+        burned.body["operation"], "video_transcode",
+        "{}",
+        burned.body
+    );
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let offset = (first_seconds * 1000.0) as u64;
+    for (n, start) in [(1, 0), (2, offset + 2000), (3, offset + 250)] {
+        let planned = plan(json!(["burned"])).await;
+        let admitted = f
+            .post(
+                "/api/v2/playback/delivery-sessions",
+                &auth,
+                Some(&format!("burned-parts-session-{n}")),
+                json!({"plan_token": planned.body["plan_token"], "start_ms": start}),
+            )
+            .await;
+        assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+        let id = admitted.body["id"].as_str().unwrap().to_owned();
+        let ready = f
+            .until(&id, &auth, |d| {
+                d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start
+                    || d["active"]["status"] == "failed"
+            })
+            .await;
+        assert_ne!(ready["active"]["status"], "failed", "{ready}");
+        let base_url = format!("/api/v2/streams/{id}/1");
+        let fragment = f.dir.path().join(format!("parts-{n}.mp4"));
+        std::fs::write(
+            &fragment,
+            [
+                get(format!("{base_url}/variants/main/init.mp4")).await,
+                get(format!("{base_url}/segments/0.m4s")).await,
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let frame = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&fragment)
+            .args([
+                "-ss",
+                "0.5",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(frame.len(), 320 * 240);
+        let mean = |x0: usize, y0: usize| {
+            let mut sum = 0usize;
+            for y in y0..y0 + 40 {
+                sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                    .iter()
+                    .map(|&p| p as usize)
+                    .sum::<usize>();
+            }
+            sum / (220 * 40)
+        };
+        let (inside, below) = (mean(50, 50), mean(50, 150));
+        assert!(
+            inside > 225 && below < 200,
+            "start {start}: box {inside}, picture {below}"
+        );
+        // Read early for the cue, part 2's delayed audio keeps its offset:
+        // from 0.25 s into the part, sound begins 0.25 s into the output.
+        if n == 3 {
+            let detect = |range: &str| {
+                let out = Command::new("ffmpeg")
+                    .args(["-v", "info", "-i"])
+                    .arg(&fragment)
+                    .args(["-af", &format!("{range},volumedetect"), "-f", "null", "-"])
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stderr).into_owned();
+                text.lines()
+                    .find_map(|l| l.split("max_volume: ").nth(1))
+                    .and_then(|v| v.trim_end_matches(" dB").parse::<f64>().ok())
+                    .unwrap()
+            };
+            assert!(detect("atrim=end=0.2") < -60.0, "audio not delayed");
+            assert!(detect("atrim=start=0.4:end=1") > -40.0, "audio missing");
+        }
+        let closed = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/playback/delivery-sessions/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    }
+}
+
+/// Trick-play previews (6C): requested once per file revision, rendered by
+/// the bounded worker into thumbnail sheets of the promised layout, served
+/// only for the current revision to a caller who may read the file, never
+/// rendered once cancelled, and retired when the revision changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn previews_are_rendered_once_served_by_revision_and_retired() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // 25 s whose brightness is the second it shows (9 levels per second),
+    // so each thumbnail's content says which picture it is.
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x120:r=24:d=25,format=gray,geq=lum='trunc(T)*9'",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "24",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let operator = bearer(OPERATOR);
+    let path = format!("/api/v2/catalog/timelines/{timeline}/previews");
+    let manifest = f.get(&path, &auth).await;
+    assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
+    assert_eq!(manifest.body["status"], "none");
+    // A reader cannot request rendering.
+    let refused = f
+        .post(&path, &auth, Some("preview-request-0001"), json!(null))
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    // A cancelled queued job is never rendered; a new request queues again.
+    let first = f
+        .post(&path, &operator, Some("preview-request-0002"), json!(null))
+        .await;
+    assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
+    let cancelled_id = first.body["job_id"].as_str().unwrap().to_owned();
+    let again = f
+        .post(&path, &operator, Some("preview-request-0003"), json!(null))
+        .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(
+        again.body["job_id"],
+        cancelled_id.as_str(),
+        "never duplicated"
+    );
+    let cancel = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/cancel"),
+            &operator,
+            Some("preview-cancel-0001"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(cancel.status, StatusCode::OK, "{}", cancel.body);
+    assert_eq!(cancel.body["phase"], "cancelled");
+    let queued = f
+        .post(&path, &operator, Some("preview-request-0004"), json!(null))
+        .await;
+    assert_eq!(queued.status, StatusCode::ACCEPTED, "{}", queued.body);
+    assert_ne!(queued.body["job_id"], cancelled_id.as_str());
+    assert_eq!(queued.body["status"], "pending");
+    // Retrying the cancelled job alongside the active one is refused.
+    let retried = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/retry"),
+            &operator,
+            Some("preview-retry-00001"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(retried.status, StatusCode::CONFLICT, "{}", retried.body);
+    assert_eq!(retried.body["code"], "preview_duplicate");
+    assert_eq!(f.get(&path, &auth).await.body["status"], "pending");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(playscale::v2::previews::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    let mut ready = Value::Null;
+    for _ in 0..600 {
+        ready = f.get(&path, &auth).await.body;
+        if ready["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(ready["status"], "ready", "{ready}");
+    assert_eq!(ready["job_id"], queued.body["job_id"]);
+    // 25 s at one thumbnail per 10 s: 3 tiles of 160x120 on one sheet.
+    assert_eq!(
+        (
+            &ready["interval_ms"],
+            &ready["tiles"],
+            &ready["tile_width"],
+            &ready["tile_height"]
+        ),
+        (&json!(10000), &json!(3), &json!(160), &json!(120))
+    );
+    let sheets = ready["sheets"].as_array().unwrap();
+    assert_eq!(sheets.len(), 1);
+    let url = sheets[0].as_str().unwrap().to_owned();
+    let sheet = f.call("GET", &url, None, &[("authorization", &auth)]).await;
+    assert_eq!(sheet.status, StatusCode::OK);
+    assert_eq!(sheet.headers["content-type"], "image/jpeg");
+    let image = f.dir.path().join("sheet.jpg");
+    std::fs::write(&image, &sheet.bytes).unwrap();
+    let size = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&image)
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(String::from_utf8_lossy(&size).trim(), "1600,1200");
+    // Thumbnail n shows the picture at n * 10 s (the frame at or before it).
+    for (n, second) in [(0u32, 0u32), (1, 10), (2, 20)] {
+        let tile = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&image)
+            .args([
+                "-vf",
+                &format!("crop=40:40:{}:40", n * 160 + 60),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        let mean = tile.iter().map(|&p| u32::from(p)).sum::<u32>() / tile.len() as u32;
+        assert!(
+            mean.abs_diff(second * 9) <= 6,
+            "thumbnail {n} shows brightness {mean}, not second {second}"
+        );
+    }
+    // The cancelled job rendered nothing, and its record says so.
+    let cancelled = f
+        .get(&format!("/api/v2/jobs/{cancelled_id}"), &operator)
+        .await;
+    assert_eq!(cancelled.body["phase"], "cancelled");
+    // Only the current revision, an existing sheet, and a reader.
+    let other = url.replace("/previews/1?", "/previews/2?");
+    assert_eq!(
+        f.call("GET", &other, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.call("GET", &url, None, &[]).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // A device that may not read this library sees neither.
+    let (scoped, scoped_auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&scoped, &[], PLAYER, "\"r-2\"").await;
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &scoped_auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.get(&path, &scoped_auth).await.status,
+        StatusCode::NOT_FOUND
+    );
+    // A new request for the same revision answers with the rendering job.
+    let done = f
+        .post(&path, &operator, Some("preview-request-0005"), json!(null))
+        .await;
+    assert_eq!(
+        (done.status, &done.body["job_id"]),
+        (StatusCode::OK, &queued.body["job_id"])
+    );
+    assert_eq!(done.body["status"], "ready");
+    // Technical metadata changes invalidate previews and retries even when bytes do not.
+    let ready_file = ready["file_id"].as_str().unwrap();
+    sqlx::query("UPDATE media_files SET duration_seconds=30 WHERE id=?")
+        .bind(ready_file)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "none");
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let stale_retry = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/retry"),
+            &operator,
+            Some("preview-stale-retry-01"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(stale_retry.status, StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE media_files SET duration_seconds=25 WHERE id=?")
+        .bind(ready_file)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "ready");
+    // Sheets missing on disk (a database restored without them): retention
+    // withdraws the previews, and a request renders them again.
+    let file_id = ready["file_id"].as_str().unwrap().to_owned();
+    let revision = ready["file_revision"].as_str().unwrap().to_owned();
+    let root = &f.server.app.processing.root;
+    let published = root
+        .parent()
+        .unwrap_or(root)
+        .join("previews")
+        .join(&file_id)
+        .join(&revision);
+    // A corrupted sparse sheet is refused without loading its full length.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(published.join("sheet-1.jpg"))
+        .unwrap()
+        .set_len(playscale_core::previews::MAX_SHEET_BYTES + 1)
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    std::fs::remove_file(published.join("sheet-1.jpg")).unwrap();
+    playscale::v2::previews::retain(&f.server.app)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "none");
+    let rebuilt = f
+        .post(&path, &operator, Some("preview-request-0006"), json!(null))
+        .await;
+    assert_eq!(rebuilt.status, StatusCode::ACCEPTED, "{}", rebuilt.body);
+    for _ in 0..600 {
+        if f.get(&path, &auth).await.body["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(f.get(&path, &auth).await.body["status"], "ready");
+    // The file changes: its previews retire with the old revision.
+    sqlx::query("UPDATE media_files SET revision='0000000000000000000000000000000000000000000000000000000000000001'")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    playscale::v2::previews::retain(&f.server.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    stop.cancel();
+    worker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn planning_uses_one_pool_slot_for_components_and_preferences() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "2");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let auth = bearer(OPERATOR);
+    let mut occupied = Vec::new();
+    for _ in 0..3 {
+        occupied.push(f.server.app.db.acquire().await.unwrap());
+    }
+    for policy in ["off", "auto"] {
+        let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            f.post("/api/v2/playback/plans", &auth, None, input),
+        )
+        .await
+        .expect("planning must not acquire a second pool connection");
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+        assert_eq!(response.body["status"], "ready");
+    }
 }

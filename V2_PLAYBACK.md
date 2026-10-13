@@ -127,12 +127,18 @@ What remains:
   live presentation is never used: Shaka 5.2.11 throws 4033 for it. The
   pair is verified in headless Chromium with the pinned Shaka, not yet
   qualified in Chromium/Electron product builds. Text burn-in, including
-  styled (ASS/SSA) subtitles and their fonts, needs libass. Subtitles on
-  multipart versions are refused. Burned bitmap cues displayed more than
-  20 s before a start or seek are not restored.
-- Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
-  the production bridge sends `null` and nothing in the product supplies a
-  value yet.
+  styled (ASS/SSA) subtitles and their fonts, needs libass. On multipart
+  versions a text subtitle component that occurs in every part is delivered
+  (chosen explicitly or automatically by the profile), each part's own
+  stream joined in timeline time, and a bitmap component in every part is
+  burned into each part's own pictures for a client that accepts burned
+  subtitles; sidecars and burned text (libass) across parts are refused. Before a burned bitmap subtitle is converted from a
+  start or seek, its display sets in the 5 minutes before are probed; a cue
+  still showing at the start is read from its own display set, so it is
+  drawn. Cues established earlier than that are not restored.
+- Client bitrate caps are supplied by profile preferences and the player quality
+  control. The bridge passes the selected limit as `max_bitrate_bps`. A bitrate
+  cap does not select resolution; live conversion still uses its qualified recipe.
 - Content access issues a file-revision ticket or a delivery-generation
   playback ticket. Generation tickets authorize only that generation's bytes,
   its HLS manifests and children, and its selected subtitle. Every read

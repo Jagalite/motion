@@ -45,6 +45,28 @@ pub struct PartPin {
     /// Omitted when absent, so pins without it serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<u32>,
+    /// The zero-based subtitle stream of this part that carries the selected
+    /// text subtitle component, delivered as WebVTT joined across the parts
+    /// (`subtitles::join_parts`); None when no subtitle is selected. Omitted
+    /// when absent, so pins without it serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u32>,
+    /// The zero-based subtitle stream of this part that carries the selected
+    /// bitmap subtitle component, burned into this part's own pictures
+    /// (`burnable_subtitle` in every part); None when none is burned.
+    /// Omitted when absent, so pins without it serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn: Option<u32>,
+}
+
+/// Whether a bitmap subtitle component can be burned across parts: it
+/// occurs in every part and each occurrence is a bitmap subtitle a
+/// conversion overlays (`delivery::burnable_subtitle`).
+pub fn burnable_across(codecs: &[Option<&str>]) -> bool {
+    !codecs.is_empty()
+        && codecs
+            .iter()
+            .all(|c| c.is_some_and(crate::delivery::burnable_subtitle))
 }
 
 /// Whether two multipart layouts are the same timeline: the same files,
@@ -137,9 +159,46 @@ pub fn locate(durations: &[u64], logical_ms: u64) -> Option<(usize, u64)> {
     None
 }
 
+/// Whether a subtitle component can be delivered across parts: it occurs
+/// in every part (one codec per part, none missing) and each occurrence is
+/// plain text, joined in timeline time (`subtitles::join_parts`). A burned
+/// or styled occurrence in any part is not delivered across parts.
+pub fn joinable_subtitle(codecs: &[Option<&str>]) -> bool {
+    !codecs.is_empty()
+        && codecs
+            .iter()
+            .all(|c| c.is_some_and(crate::delivery::sidecar_subtitle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bitmap_subtitle_burns_across_parts_only_as_a_bitmap_in_every_part() {
+        assert!(burnable_across(&[
+            Some("hdmv_pgs_subtitle"),
+            Some("dvd_subtitle")
+        ]));
+        assert!(!burnable_across(&[Some("hdmv_pgs_subtitle"), None]));
+        assert!(!burnable_across(&[
+            Some("hdmv_pgs_subtitle"),
+            Some("subrip")
+        ]));
+        assert!(!burnable_across(&[]));
+    }
+
+    #[test]
+    fn a_subtitle_joins_across_parts_only_as_text_in_every_part() {
+        assert!(joinable_subtitle(&[Some("mov_text"), Some("subrip")]));
+        assert!(!joinable_subtitle(&[Some("mov_text"), None]));
+        assert!(!joinable_subtitle(&[
+            Some("mov_text"),
+            Some("hdmv_pgs_subtitle")
+        ]));
+        assert!(!joinable_subtitle(&[Some("ass"), Some("ass")]));
+        assert!(!joinable_subtitle(&[]));
+    }
     fn part(part: u32, duration: Option<u64>, start: Option<u64>, end: Option<u64>) -> BoundPart {
         BoundPart {
             part,
@@ -244,23 +303,37 @@ mod tests {
     }
 
     #[test]
-    fn layouts_compare_parts_not_audio_selection() {
+    fn layouts_compare_parts_not_track_selection() {
         let pin = |file: &str, audio| PartPin {
             file: file.into(),
             revision: "r".into(),
             duration_ms: 1_000,
             audio,
+            subtitle: None,
+            burn: None,
         };
         assert!(same_layout(
             &[pin("a", Some(0)), pin("b", Some(1))],
             &[pin("a", Some(1)), pin("b", Some(0))]
         ));
+        let subtitled = PartPin {
+            subtitle: Some(2),
+            ..pin("a", None)
+        };
+        assert!(same_layout(
+            std::slice::from_ref(&subtitled),
+            &[pin("a", None)]
+        ));
+        assert_eq!(
+            serde_json::to_string(&subtitled).unwrap(),
+            r#"{"file":"a","revision":"r","duration_ms":1000,"subtitle":2}"#
+        );
         assert!(!same_layout(&[pin("a", None)], &[pin("b", None)]));
         assert!(!same_layout(
             &[pin("a", None)],
             &[pin("a", None), pin("b", None)]
         ));
-        // Absent audio serializes as before the field existed.
+        // Absent audio and subtitle serialize as before the field existed.
         assert_eq!(
             serde_json::to_string(&pin("a", None)).unwrap(),
             r#"{"file":"a","revision":"r","duration_ms":1000}"#

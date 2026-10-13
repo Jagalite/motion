@@ -54,6 +54,14 @@ test('audio, version and quality choices replan only the same timeline input', (
   assert.equal(back.source, null);
   assert.equal(back.quality.mode, 'convert');
   assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x', audioSource}), /Invalid audio/);
+  // A streaming limit replaces the plan's cap; none clears it; absent keeps it.
+  const limited = replanInput(input, {version: '', quality: 'auto', audio: '', audioSource, limit: '8000000'});
+  assert.equal(limited.quality.max_bitrate_bps, '8000000');
+  assert.equal(replanInput(limited, {version: '', quality: 'auto', audio: '', audioSource}).quality.max_bitrate_bps, '8000000');
+  assert.equal(replanInput(limited, {version: '', quality: 'auto', audio: '', audioSource, limit: ''}).quality.max_bitrate_bps, null);
+  for (const limit of ['0', '08', '1e6', '-1', '123456789012345678901']) {
+    assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '', audioSource, limit}), /Invalid streaming limit/, limit);
+  }
 });
 
 test('only a plan for the same file revision replans in place', () => {
@@ -466,4 +474,118 @@ test('a live generation selects its in-manifest subtitle rendition, never an ext
   calls.length = 0;
   await assert.rejects(prepare(generation, 12000, () => true), /cannot present the selected subtitle/);
   assert.deepEqual(calls.map(c => c[0]), ['open', 'seek', 'destroy', 'remove']);
+});
+
+test('skip buttons are shown only inside their marker interval', () => {
+  const buttons = [
+    {dataset: {markerStart: '5000', markerEnd: '65000'}, hidden: true},
+    {dataset: {markerStart: '3000000', markerEnd: '3100000'}, hidden: true},
+  ];
+  const {showSkips} = runInNewContext(source.replace('export {close, maintainLease};', '({showSkips});'), {
+    document: {getElementById: () => null, querySelector: () => null, querySelectorAll: () => buttons, addEventListener() {}},
+    addEventListener() {},
+  });
+  showSkips(4999);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, true]);
+  showSkips(5000);
+  assert.deepEqual(buttons.map(b => b.hidden), [false, true]);
+  showSkips(65000);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, true]);
+  showSkips(3050000);
+  assert.deepEqual(buttons.map(b => b.hidden), [true, false]);
+});
+
+test('a skip to the end of the title seeks just before it', () => {
+  const {seekTarget} = runInNewContext(source.replace('export {close, maintainLease};', '({seekTarget});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  assert.equal(seekTarget(65000, 120000), 65000);
+  assert.equal(seekTarget(120000, 120000), 119999, 'credits ending at the duration');
+  assert.equal(seekTarget(500, 0), 500, 'unknown duration');
+  assert.equal(seekTarget(-1, 1000), 0);
+  assert.equal(seekTarget(Number.NaN, 1000), 0);
+});
+
+test('server thumbnails are cropped from their sheet at or before a position', () => {
+  const {previewFrame} = runInNewContext(source.replace('export {close, maintainLease};', '({previewFrame});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL,
+  });
+  const origin = 'https://motion.test';
+  const sheet = n => `/api/v2/media/files/f1/previews/${n}?revision=r1`;
+  const manifest = {status: 'ready', interval_ms: 10000, tile_width: 160, tile_height: 90, columns: 10, rows: 10, tiles: 150,
+    sheets: [sheet(1), sheet(2)]};
+  const first = previewFrame(manifest, 0, origin);
+  assert.equal(first.time, 0);
+  assert.equal(first.image.uris[0], 'https://motion.test/api/v2/media/files/f1/previews/1?revision=r1');
+  assert.deepEqual({...first.image.crop}, {x: 0, y: 0, width: 160, height: 90});
+  // 125 s is thumbnail 12 (at 120 s): column 2, row 1 of the first sheet.
+  const mid = previewFrame(manifest, 125, origin);
+  assert.equal(mid.time, 120);
+  assert.deepEqual({...mid.image.crop}, {x: 320, y: 90, width: 160, height: 90});
+  // Thumbnail 105 is on the second sheet.
+  const late = previewFrame(manifest, 1055, origin);
+  assert.equal(late.image.uris[0], 'https://motion.test/api/v2/media/files/f1/previews/2?revision=r1');
+  assert.deepEqual({...late.image.crop}, {x: 800, y: 0, width: 160, height: 90});
+  // Beyond the last thumbnail, or a manifest that is not ready or points elsewhere: none.
+  assert.equal(previewFrame(manifest, 1500, origin), null);
+  assert.equal(previewFrame({...manifest, status: 'pending'}, 0, origin), null);
+  assert.equal(previewFrame({...manifest, sheets: ['https://elsewhere.test/x.jpg']}, 0, origin), null);
+  assert.equal(previewFrame({...manifest, interval_ms: 0}, 0, origin), null);
+  assert.equal(previewFrame(manifest, -1, origin), null);
+});
+
+test('a superseded thumbnail lookup settles at once and a retired player releases its sheets synchronously', async () => {
+  const revoked = [];
+  const FakeURL = class extends URL {};
+  FakeURL.revokeObjectURL = url => revoked.push(url);
+  const {unlessAborted, releaseSheets, sheetUrls} = runInNewContext(
+    source.replace('export {close, maintainLease};', '({unlessAborted, releaseSheets, sheetUrls});'), {
+      document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL: FakeURL,
+    });
+  // Aborting settles the wait with nothing while the download goes on.
+  let finish;
+  const download = new Promise(resolve => { finish = resolve; });
+  const controller = new AbortController();
+  const waiting = unlessAborted(download, controller.signal);
+  controller.abort();
+  assert.equal(await waiting, null);
+  finish('blob:late');
+  assert.equal(await unlessAborted(Promise.resolve('blob:ok'), new AbortController().signal), 'blob:ok');
+  assert.equal(await unlessAborted(Promise.resolve('blob:x'), AbortSignal.abort()), null);
+  // Release: downloads cancelled, made URLs revoked, nothing awaited.
+  const element = {};
+  const held = {sheets: new Map([['/a', new Promise(() => {})]]), made: new Set(['blob:1', 'blob:2']), controller: new AbortController()};
+  sheetUrls.set(element, held);
+  assert.equal(releaseSheets(element), undefined);
+  assert.equal(held.controller.signal.aborted, true);
+  assert.deepEqual(revoked, ['blob:1', 'blob:2']);
+  assert.equal(sheetUrls.has(element), false);
+  releaseSheets(element);
+  assert.deepEqual(revoked, ['blob:1', 'blob:2'], 'released once');
+});
+
+test('next-title navigation retains the selected profile after teardown', async () => {
+  const navigated = [];
+  const requests = [];
+  const host = {dataset: {profileId: 'guest-profile', timelineId: 'episode-1'}, querySelector: () => ({setAttribute() {}})};
+  const playNext = runInNewContext(source.replace('if (host) void start();', '').replace('export {close, maintainLease};', 'playNext;'), {
+    document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null, addEventListener() {}},
+    addEventListener() {}, AbortSignal,
+    fetch: async path => { requests.push(path); return {ok: true, status: 200, json: async () => ({items: [{id: 'episode-2'}]})}; },
+    location: {assign: path => navigated.push(path)},
+  });
+  await playNext();
+  assert.deepEqual(requests, ['/api/v2/profiles/guest-profile/timelines/episode-1/next']);
+  assert.deepEqual(navigated, ['/play/episode-2?play=1&profile=guest-profile']);
+});
+
+test('authored previews require the exact playing file and revision', () => {
+  const {matchingPreviewSource} = runInNewContext(source.replace('export {close, maintainLease};', '({matchingPreviewSource});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const manifest = {file_id: 'cut-a', file_revision: 'r1'};
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r1'}), true);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-b', file_revision: 'r1'}), false);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r2'}), false);
+  assert.equal(matchingPreviewSource(manifest, null), false);
 });

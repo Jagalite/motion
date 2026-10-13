@@ -1,7 +1,9 @@
 //! Deterministic decisions. No clocks, database connections, tasks, or file handles.
 pub mod access;
+pub mod access_admin;
 pub mod artwork;
 pub mod catalog;
+pub mod color;
 pub mod components;
 pub mod delivery;
 pub mod delivery_admission;
@@ -23,6 +25,7 @@ pub mod parts;
 pub mod playback;
 pub mod playback_monitor;
 pub mod playback_session;
+pub mod previews;
 pub mod processing;
 pub mod ranges;
 pub mod renditions;
@@ -35,3 +38,5 @@ pub mod timeline_viewing;
 pub mod viewing;
 pub mod watch;
 pub mod work;
+
+pub mod signin;

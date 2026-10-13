@@ -6,7 +6,7 @@
 // events (motion-ui-host cache, playscale_core::offline). This adapter only
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
-import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeSync, createWriteStream} from 'node:fs';
+import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -14,11 +14,20 @@ import {pipeline} from 'node:stream/promises';
 const CONTENT_TYPES = {mp4: 'video/mp4', webm: 'video/webm', m4a: 'audio/mp4', mp3: 'audio/mpeg', ogg: 'audio/ogg'};
 const UNKNOWN_DEVICE_TIME = '1970-01-01T00:00:00Z';
 const SYNC_BATCH = 200;
+// Refusals that consume nothing (playscale_core::offline::consumed).
+const NOT_CONSUMED = ['sequence_gap', 'event_conflict', 'sequence_acknowledged', 'acknowledgement_required'];
 // playscale_core::downloads::MAX_MEDIA_BYTES; the server refuses larger originals too.
 const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
 // The offline host copies a title into a private snapshot on the cache's own
 // volume before playing it and keeps 512 MiB free besides (new_snapshot).
 const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
+/** Posters saved with a download, by file extension. */
+const IMAGE_TYPES = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp'};
+const MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
+// Largest subtitle file a download carries (the cache tool's bound).
+const MAX_SUBTITLE_BYTES = 16 * 1024 * 1024;
+/** Transfer progress is reported to the server at most this often. */
+const PROGRESS_INTERVAL_MS = 15_000;
 
 export const rootName = scope => createHash('sha256')
   .update([scope.server_id, scope.principal_id, scope.profile_id, scope.device_id].join('\n')).digest('hex').slice(0, 32);
@@ -34,6 +43,29 @@ function writeAtomically(path, value) {
 }
 
 /** The cache stores titles of at most 1,024 UTF-8 bytes; shorten on a character boundary. */
+/**
+ * The manifest's descriptive metadata as the cache records it: only the
+ * known fields of the expected types (the cache refuses unknown ones, and
+ * drops values out of its bounds), or null.
+ */
+export function cacheMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const kept = {};
+  if (Number.isInteger(metadata.release_year) && Math.abs(metadata.release_year) <= 9999) kept.release_year = metadata.release_year;
+  if (typeof metadata.description === 'string') kept.description = metadata.description;
+  if (Array.isArray(metadata.genres) && metadata.genres.every(g => typeof g === 'string')) kept.genres = metadata.genres;
+  return Object.keys(kept).length ? kept : null;
+}
+
+/**
+ * Whether a manifest URL is one the agent may fetch from its server: media
+ * and artwork content, or exactly a download's subtitle file at a digest.
+ */
+export function transferLocation(url) {
+  return typeof url === 'string' && (url.startsWith('/api/v2/media/')
+    || /^\/api\/v2\/downloads\/[A-Za-z0-9_-]{1,128}\/subtitles\?digest=sha256:[0-9a-f]{64}$/.test(url));
+}
+
 export function cacheTitle(title) {
   const encoder = new TextEncoder();
   if (encoder.encode(title).length <= 1024) return title;
@@ -49,8 +81,32 @@ function readJson(path, fallback) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; }
 }
 
-/** The cache root to open offline: the most recently synchronized one. */
-export function currentRoot(base) {
+/**
+ * Every cache root on this device holding at least one saved title, with a
+ * label to choose it by (the server it came from and the profile), newest
+ * synchronized first marked current. Read-only; never opens a cache.
+ */
+export function offlineRoots(base) {
+  const roots = readJson(join(base, 'roots.json'), {});
+  const labels = readJson(join(base, 'labels.json'), {});
+  const current = readJson(join(base, 'current.json'), null)?.root;
+  return Object.entries(roots)
+    .filter(([name, scope]) => /^[0-9a-f]{32}$/.test(name) && scope && rootName(scope) === name)
+    .map(([name, scope]) => ({name, scope, titles: readJson(join(base, name, 'manifest.json'), null)?.downloads?.length ?? 0}))
+    .filter(root => root.titles > 0)
+    .map(({name, scope, titles}) => ({name, titles, current: name === current,
+      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id} · account ${scope.principal_id} · device ${scope.device_id}`}));
+}
+
+/**
+ * The cache root to open offline: the chosen one when it is a saved root of
+ * this device (`offlineRoots`), else the most recently synchronized one.
+ */
+export function currentRoot(base, choice = null) {
+  if (choice !== null) {
+    if (!offlineRoots(base).some(root => root.name === choice)) throw new Error('That offline library is not on this device');
+    return join(base, choice);
+  }
   if (existsSync(join(base, 'manifest.json'))) return base; // A single root (development fixture).
   const name = readJson(join(base, 'current.json'), null)?.root;
   if (typeof name !== 'string' || !/^[0-9a-f]{32}$/.test(name) || !existsSync(join(base, name, 'manifest.json'))) {
@@ -77,7 +133,7 @@ export function wireEvent(event) {
  * @param {(root: string, scope: object, args: string[], input?: string) => Promise<any>} options.cache
  */
 export function createDownloadAgent({base, identity, api, fetchMedia, cache, quota, headroom = 1024 ** 3, status = () => {}, signal,
-  stallMs = 60_000}) {
+  stallMs = 60_000, serverLabel = null}) {
   mkdirSync(base, {recursive: true, mode: 0o700});
   const index = join(base, 'roots.json');
   const scopeFor = profile_id => ({...identity, profile_id});
@@ -88,6 +144,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const name = rootName(scope);
     const roots = readJson(index, {});
     if (!roots[name]) writeAtomically(index, {...roots, [name]: scope});
+    // A display label only (offlineRoots); never part of the cache scope.
+    const labels = readJson(join(base, 'labels.json'), {});
+    if (serverLabel && labels[name]?.server !== serverLabel) writeAtomically(join(base, 'labels.json'), {...labels, [name]: {server: serverLabel}});
     return {path: join(base, name), name, scope};
   }
 
@@ -115,46 +174,177 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         await cache(target.path, target.scope, ['remove', '--download-id', id]);
         removed++;
       }
+      // No demand on this root is wanted any more, so an unreferenced blob
+      // (a crash leftover) can never be recovered: release its space.
+      await cache(target.path, target.scope, ['collect']);
     }
     if (removed > 0) status('Downloads were removed from this device because it may no longer keep them. Offline progress was kept.');
+  }
+
+  /**
+   * Send every owned root's retained events. Syncing is authorized by
+   * `viewing:write` alone, so it does not depend on the download list; the
+   * server refuses it when viewing authority is gone and the events stay.
+   */
+  async function reconcileOwned() {
+    for (const target of ownedRoots()) {
+      if (signal?.aborted) return;
+      try { await reconcile(target); }
+      catch (error) {
+        if (signal?.aborted) throw error;
+        status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
+      }
+    }
   }
 
   async function listDownloads() {
     const items = [];
     let cursor = null;
+    const seen = new Set();
     do {
-      const page = await api(`/api/v2/downloads?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      // MAX_ACTIVE_PER_DEVICE=500 includes expired, uncancelled demands.
+      // Return only a complete inventory: callers remove copies absent from it.
+      if (seen.size >= 3 || seen.has(cursor)) throw new Error('Download inventory did not complete within its bound');
+      seen.add(cursor);
+      const page = await api(`/api/v2/downloads?active_only=true&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      if (!Array.isArray(page.items) || page.items.length > 200) throw new Error('Invalid download inventory page');
       items.push(...page.items);
+      if (items.length > 500) throw new Error('Download inventory exceeds device limit');
       cursor = page.next_cursor;
     } while (cursor);
     return items;
   }
 
+  /**
+   * Report this device's copy of a download to the server (best effort; a
+   * failed report is superseded by the next). Reports carry this device's
+   * own increasing sequence, persisted per download, and the download
+   * revision it listed; the server stores them as reported.
+   */
+  const reports = join(base, 'transfer-reports.json');
+  /**
+   * Copies this device removed whose `removed` report the server has not
+   * accepted yet: kept (durably) until it does, so the report is retried on
+   * later passes even when the server never heard of the copy.
+   */
+  const removedReports = join(base, 'transfer-removed.json');
+  const pendingRemoved = () => new Set(readJson(removedReports, []));
+  /** Durably note a removal before it happens; false when that failed. */
+  function noteRemoved(id) {
+    try { writeAtomically(removedReports, [...new Set([...pendingRemoved(), id])]); return true; } catch { return false; }
+  }
+  function forgetRemoved(id) {
+    try { writeAtomically(removedReports, [...pendingRemoved()].filter(other => other !== id)); } catch { /* retried next pass */ }
+  }
+
+  /** Report a state; true when the server accepted it (or it was a duplicate). */
+  async function report(download, state, bytes) {
+    if (!download?.revision) return false;
+    // A sequence is sent only once it is persisted; failing to persist it is
+    // a reporting failure only, never a transfer failure.
+    let sequence;
+    try {
+      const sequences = readJson(reports, {});
+      sequence = (Number(sequences[download.id]) || 0) + 1;
+      writeAtomically(reports, {...sequences, [download.id]: sequence});
+    } catch {
+      return false;
+    }
+    try {
+      await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/transfer`, {method: 'PUT',
+        body: {sequence: String(sequence), download_revision: String(download.revision), state, bytes_received: String(bytes)}});
+      return true;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return false;
+    }
+  }
+
+  /** Fetch, verify and stage a poster; its cache description, or null. */
+  /**
+   * Fetch a small file whole, verify its size and digest, and stage it as
+   * `<id>.<suffix>` for the cache tool to verify again and publish. Bounded
+   * whatever the connection does. Null when it cannot be saved.
+   */
+  async function saveWhole(id, url, sha256, size, suffix, target) {
+    const deadline = AbortSignal.timeout(60000);
+    const response = await fetchMedia(url, {range: null, signal: signal ? AbortSignal.any([signal, deadline]) : deadline});
+    if (response.status !== 200) return null;
+    const chunks = [];
+    let received = 0;
+    for await (const chunk of Readable.fromWeb(response.body)) {
+      received += chunk.length;
+      if (received > size) return null;
+      chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+    if (bytes.length !== size || createHash('sha256').update(bytes).digest('hex') !== sha256) return null;
+    mkdirSync(join(target.path, 'staging'), {recursive: true, mode: 0o700});
+    writeFileSync(join(target.path, 'staging', `${id}.${suffix}`), bytes, {mode: 0o600});
+    return true;
+  }
+
+  async function savePoster(id, poster, target) {
+    const sha256 = /^sha256:([0-9a-f]{64})$/.exec(poster.digest ?? '')?.[1];
+    const type = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(poster.relative_name ?? '')?.[1]];
+    const size = Number(poster.size_bytes);
+    if (!sha256 || !type || !(size > 0) || size > MAX_ARTWORK_BYTES) return null;
+    // An unavailable optional poster never holds up the title or the
+    // downloads after it.
+    return await saveWhole(id, poster.media_url, sha256, size, 'artwork', target) ? {sha256, size, content_type: type} : null;
+  }
+
   async function transfer(download, target) {
     const manifest = await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/manifest`);
-    const [file] = manifest.files;
+    // One media file, at most one poster and at most one subtitle file;
+    // anything else is not saved yet.
+    const media = manifest.files.filter(f => f.role === 'media');
+    const posters = manifest.files.filter(f => f.role === 'artwork');
+    const subtitleFiles = manifest.files.filter(f => f.role === 'subtitle');
+    const [file] = media;
     const digest = /^sha256:([0-9a-f]{64})$/.exec(file?.digest ?? '')?.[1];
     const contentType = CONTENT_TYPES[/\.([a-z0-9]+)$/.exec(file?.relative_name ?? '')?.[1]];
-    if (manifest.files.length !== 1 || file.role !== 'media' || !digest || !contentType) {
-      status(`"${manifest.title}" needs files this device cannot save yet (subtitles, artwork or multiple parts).`);
+    // The selected subtitles are required: the title is saved with them or
+    // not at all.
+    const subtitleSha = /^sha256:([0-9a-f]{64})$/.exec(subtitleFiles[0]?.digest ?? '')?.[1];
+    const subtitleBytes = Number(subtitleFiles[0]?.size_bytes);
+    const subtitles = subtitleFiles.length && subtitleSha && subtitleBytes > 0 && subtitleBytes <= MAX_SUBTITLE_BYTES
+      ? {sha256: subtitleSha, size: subtitleBytes} : null;
+    if (media.length !== 1 || posters.length > 1 || subtitleFiles.length > 1 || (subtitleFiles.length && !subtitles)
+        || media.length + posters.length + subtitleFiles.length !== manifest.files.length || !digest || !contentType) {
+      status(`"${manifest.title}" needs files this device cannot save yet (artwork, subtitles or multiple parts).`);
       return false;
     }
     const size = Number(file.size_bytes);
+    const transferSize = size + (subtitles?.size ?? 0);
+    download = {...download, revision: manifest.download_revision ?? download.revision, size_bytes: String(transferSize)};
     if (!(size > 0) || size > MAX_MEDIA_BYTES) {
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
     }
-    const entry = JSON.stringify({
+    const metadata = cacheMetadata(manifest.metadata);
+    const entryFor = artwork => JSON.stringify({
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
-      title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType});
+      title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
+      ...(artwork ? {artwork} : {}), ...(subtitles ? {subtitles} : {}), ...(metadata ? {metadata} : {})});
+    const posterBytes = posters.length ? Math.max(0, Number(posters[0].size_bytes) || 0) : 0;
+    // The poster as the cache would record it, when its description is valid.
+    const posterSha = /^sha256:([0-9a-f]{64})$/.exec(posters[0]?.digest ?? '')?.[1];
+    const posterType = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(posters[0]?.relative_name ?? '')?.[1]];
+    const posterIdentity = posterSha && posterType && posterBytes > 0 && posterBytes <= MAX_ARTWORK_BYTES
+      ? {sha256: posterSha, size: posterBytes, content_type: posterType} : null;
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     // A publication that crashed after verifying its blob needs no new
     // transfer or space: the cache tool re-verifies and publishes it.
-    if (have === 0 && (await cache(target.path, target.scope, ['recover'], entry)).recovered) {
+    // Recovered with its poster when that is verified in place too (the
+    // cache checks), otherwise without it.
+    if (have === 0 && ((posterIdentity && (await cache(target.path, target.scope, ['recover'], entryFor(posterIdentity))).recovered)
+        || (await cache(target.path, target.scope, ['recover'], entryFor(null))).recovered)) {
       writeAtomically(join(base, 'current.json'), {root: target.name});
+      await report(download, 'verified_local', transferSize);
       return true;
     }
     if (have > size) { truncateSync(staged, 0); have = 0; }
@@ -169,12 +359,28 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const largest = Math.max(size, ...(await Promise.all(managedRoots().map(async other =>
       Math.max(0, ...(await cache(other.path, other.scope, ['status'])).manifest.downloads.map(d => d.size ?? 0))))));
     const reserve = Math.max(headroom, largest + SNAPSHOT_RESERVE);
-    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(remaining), '--headroom', String(reserve)]);
+    // Subtitles an interrupted pass already staged are reused when they
+    // verify (the cache counts them as used already); anything else staged
+    // beside the media is discarded before admission, never counted twice.
+    const stagedSubtitles = join(target.path, 'staging', `${download.id}.subtitles`);
+    const subtitlesStaged = Boolean(subtitles) && existsSync(stagedSubtitles) && (() => {
+      const bytes = readFileSync(stagedSubtitles);
+      return bytes.length === subtitles.size && createHash('sha256').update(bytes).digest('hex') === subtitles.sha256;
+    })();
+    if (!subtitlesStaged) rmSync(stagedSubtitles, {force: true});
+    rmSync(join(target.path, 'staging', `${download.id}.artwork`), {force: true});
+    // The poster and subtitles count against the same admission; without
+    // room for the optional poster the title is saved without one.
+    const admit = incoming => cache(target.path, target.scope, ['admit', '--incoming', String(incoming), '--quota', String(remaining), '--headroom', String(reserve)]);
+    const required = size - have + (subtitles && !subtitlesStaged ? subtitles.size : 0);
+    const withPoster = posterBytes > 0 && (await admit(required + posterBytes)).admitted;
+    const admitted = withPoster ? {admitted: true} : await admit(required);
     if (!admitted.admitted) {
       status(`Not enough space to save "${manifest.title}". Free space or remove downloads, then reconnect.`);
       return false;
     }
     if (have < size) {
+      await report(download, 'transferring', have);
       const ticket = await api('/api/v2/content-access', {method: 'POST', idempotent: true,
         body: {purpose: 'download', delivery_id: null, generation: null, file: null, download_id: download.id, ttl_seconds: 3600}});
       // An inactivity deadline (not a total one: large transfers are slow but
@@ -199,9 +405,16 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
           throw new Error(`The server refused the transfer (${response.status})`);
         }
         let written = have;
+        let reported = Date.now();
         const bounded = new Transform({transform(chunk, _encoding, done) {
           alive();
           written += chunk.length;
+          // Progress at most every 15 s; out-of-order arrivals are refused
+          // by sequence on the server, never applied backward.
+          if (Date.now() - reported >= PROGRESS_INTERVAL_MS && written <= size) {
+            reported = Date.now();
+            void report(download, 'transferring', written).catch(() => {});
+          }
           done(written > size ? new Error('The transfer is larger than its manifest') : null, chunk);
         }});
         await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream(staged, {flags: have > 0 ? 'a' : 'w', mode: 0o600}), {signal: transferSignal});
@@ -212,12 +425,27 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         clearTimeout(timer);
       }
     }
+    // The poster last, once the media is staged and its space admitted;
+    // fetched whole and verified, it never blocks the title.
+    // Only the poster's own failures are tolerated: a disconnect stops here,
+    // before publication, like any other transfer.
+    const artwork = withPoster ? await savePoster(download.id, posters[0], target).catch(error => {
+      if (signal?.aborted) throw error;
+      return null;
+    }) : null;
+    if (signal?.aborted) throw signal.reason ?? new Error('Downloads stopped');
+    // The selected subtitles, whole and verified; without them nothing is
+    // published and the next pass tries again.
+    if (subtitles && !subtitlesStaged && !await saveWhole(download.id, subtitleFiles[0].media_url, subtitles.sha256, subtitles.size, 'subtitles', target)) {
+      throw new Error(`The subtitles of "${manifest.title}" could not be saved`);
+    }
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.
-    await cache(target.path, target.scope, ['publish'], entry);
+    await cache(target.path, target.scope, ['publish'], entryFor(artwork));
     // Openable offline as soon as one verified copy exists, even if a later
     // transfer in this pass fails.
     writeAtomically(join(base, 'current.json'), {root: target.name});
+    await report(download, 'verified_local', transferSize);
     return true;
   }
 
@@ -241,15 +469,20 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       }
       let result;
       try {
+        // Report this log's compaction point so the server can prune what it
+        // will never be sent again (playscale_core::downloads::retain).
+        // After a server restore, the first batch under the new history
+        // carries the re-anchor the cache computed (offline::reanchor).
         result = await api('/api/v2/offline/sync', {method: 'POST', headers: {'X-Motion-Viewing-Epoch': history},
-          body: {device_id: identity.device_id, events: batch.map(wireEvent)}});
+          body: {device_id: identity.device_id, events: batch.map(wireEvent), acknowledged_through: String(log.base_sequence),
+            ...(log.reanchor ? {reanchor: log.reanchor} : {})}});
       } catch (error) {
         if (error.code !== 'viewing_epoch_changed') throw error;
-        status('The server was restored or replaced since these were saved. Offline progress stays on this device.');
+        status('The server was restored from a backup since this progress was saved. Choose whether to keep it or discard it; it stays on this device until you do.');
         return false;
       }
       const after = await cache(target.path, target.scope, ['acknowledge'], JSON.stringify(result));
-      const blocked = result.results.find(r => r.outcome === 'rejected' && ['sequence_gap', 'event_conflict'].includes(r.code));
+      const blocked = result.results.find(r => r.outcome === 'rejected' && NOT_CONSUMED.includes(r.code));
       if (blocked || after.base_sequence === log.base_sequence) {
         status(`Offline progress could not be reconciled (${blocked?.code ?? 'no_progress'}). It stays on this device.`);
         return false;
@@ -276,13 +509,86 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     }
   }
 
+  /** The server's current history identity (`server_id:restore_epoch`), if it is this root's server. */
+  async function currentHistory() {
+    const capabilities = await api('/api/v2/system/capabilities');
+    if (capabilities.server_id !== identity.server_id || !capabilities.restore_epoch) return null;
+    return `${capabilities.server_id}:${capabilities.restore_epoch}`;
+  }
+
+  /**
+   * Profiles holding offline progress recorded before the server was
+   * restored from a backup: those events can never be sent as they are.
+   * The person chooses for each whether to keep (re-apply) or discard it.
+   */
+  async function restoreChoices() {
+    const current = await currentHistory();
+    if (!current) return [];
+    const choices = [];
+    for (const target of ownedRoots()) {
+      const log = await cache(target.path, target.scope, ['events']);
+      const earlier = [];
+      for (const event of log.events) {
+        if (!event.media.viewing_epoch || event.media.viewing_epoch === current) break;
+        earlier.push(event);
+      }
+      if (earlier.length > 0) {
+        choices.push({root: target.name, profile_id: target.scope.profile_id, events: earlier.length,
+          titles: new Set(earlier.map(e => e.media.download_id)).size});
+      }
+    }
+    return choices;
+  }
+
+  /**
+   * Apply the person's choice for one root. `reapply`: the cache re-records
+   * the earlier progress against each download's viewing base *as restored*
+   * (offline::reapply), so viewing written on the restored server since then
+   * wins; downloads whose restored base is unknown lose that progress.
+   * `discard` drops it (offline::discard). The next pass sends what remains
+   * and then re-pins the downloads as usual.
+   */
+  async function resolveRestore(rootName, choice) {
+    if (!['discard', 'reapply'].includes(choice)) throw new Error('Unknown choice');
+    const target = ownedRoots().find(root => root.name === rootName);
+    if (!target) throw new Error('That offline library is not on this device');
+    const current = await currentHistory();
+    if (!current) throw new Error('The server identity could not be confirmed');
+    if (choice === 'discard') return cache(target.path, target.scope, ['restore', '--choice', 'discard', '--viewing-epoch', current]);
+    const pins = [];
+    for (const entry of (await cache(target.path, target.scope, ['status'])).manifest.downloads) {
+      let pinned;
+      try { pinned = await api(`/api/v2/downloads/${encodeURIComponent(entry.identity.download_id)}/manifest`); }
+      catch (error) {
+        if (error.status === 409 || error.status === 404) continue;
+        throw error;
+      }
+      // Restored again meanwhile: nothing changes, and the choice is offered again.
+      if (pinned.viewing_epoch !== current) throw new Error('The server changed again. Choose again.');
+      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) throw new Error("Cannot keep progress: the restored server baseline is unknown. Your saved progress has been retained.");
+      pins.push({...entry.identity, base_viewing_revision: pinned.restored_viewing_revision,
+        base_manual_epoch: pinned.restored_manual_epoch, viewing_epoch: current});
+    }
+    const outcome = await cache(target.path, target.scope, ['restore', '--choice', 'reapply', '--viewing-epoch', current], JSON.stringify(pins));
+    // The kept events carry the restored base; observations from now on use
+    // the current one. Re-pin now, not at the next pass (which may not run
+    // before the title is played offline). A crash in between only offers
+    // the choice again for observations made meanwhile.
+    await rebase(target, (await cache(target.path, target.scope, ['status'])).manifest);
+    return outcome;
+  }
+
   /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */
   async function pass() {
     let downloads;
     try { downloads = await listDownloads(); }
     catch (error) {
-      // A definitive authorization refusal withdraws local copies.
-      if (error.status === 403) return withdraw();
+      // A definitive refusal of the download list withdraws local copies.
+      // Offline progress is reconciled first and independently.
+      if (error.status === 403) {
+        await reconcileOwned();
+        return withdraw();
+      }
       throw error;
     }
     const profiles = new Set(downloads.map(d => d.profile_id));
@@ -299,14 +605,64 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         if (signal?.aborted) throw error;
         status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
       }
-      const before = await cache(target.path, target.scope, ['status']);
+      let before = await cache(target.path, target.scope, ['status']);
+      // Every title removed on this device stays out of this pass, settled or
+      // not: the download list was read before the server deleted it.
+      const removed = new Set(before.removals ?? []);
+      // Titles the person removed on this device: delete each download on
+      // the server, then settle the removal with its answer. Until it is
+      // settled the cache refuses to save that download again.
+      if ((before.removals ?? []).length > 0) {
+        for (const id of before.removals) {
+          if (signal?.aborted) return;
+          let outcome = 'deleted';
+          try { await api(`/api/v2/downloads/${encodeURIComponent(id)}`, {method: 'DELETE'}); }
+          catch (error) {
+            if (signal?.aborted) throw error;
+            outcome = error.status === 404 ? 'absent' : 'failed';
+            if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
+          }
+          // Settle only once the removal is noted for its report; otherwise
+          // the intent stays and this is retried next pass.
+          if (!noteRemoved(id)) continue;
+          await cache(target.path, target.scope, ['settle-removal', '--download-id', id, '--outcome', outcome]);
+        }
+        before = await cache(target.path, target.scope, ['status']);
+      }
       let local = before.manifest;
-      const wanted = downloads.filter(d => d.profile_id === profile);
+      const wanted = downloads.filter(d => d.profile_id === profile && !removed.has(d.id));
       // Cancelled, expired and no-longer-visible downloads leave this device,
       // published copies and unpublished staged transfers alike.
       const present = new Set([...local.downloads.map(entry => entry.identity.download_id), ...before.staged]);
       for (const id of present) {
-        if (wanted.find(d => d.id === id)?.state !== 'ready') await cache(target.path, target.scope, ['remove', '--download-id', id]);
+        const listed = wanted.find(d => d.id === id);
+        if (listed?.state !== 'ready') {
+          // Remove only once the removal is noted for its report; otherwise
+          // the copy stays until a later pass can note it.
+          if (!noteRemoved(id)) continue;
+          await cache(target.path, target.scope, ['remove', '--download-id', id]);
+          // An ended download still listed learns that its copy is gone.
+          if (listed && await report(listed, 'removed', 0)) forgetRemoved(id);
+        }
+      }
+      // Bring the server's view of this device's copies up to date: a
+      // terminal report that failed earlier, copies saved before reports
+      // existed, and copies removed through the offline window. Only what
+      // the device knows locally is reported.
+      const saved = new Set(local.downloads.map(entry => entry.identity.download_id));
+      const pending = pendingRemoved();
+      for (const listed of downloads.filter(d => d.profile_id === profile)) {
+        if (signal?.aborted) return;
+        const reported = listed.device_transfer;
+        const current = reported && reported.download_revision === listed.revision;
+        if (listed.state === 'ready' && saved.has(listed.id) && !(current && reported.state === 'verified_local')) {
+          await report(listed, 'verified_local', Number(listed.size_bytes) || 0);
+        } else if (listed.state !== 'ready' && !saved.has(listed.id) && !before.staged.includes(listed.id)
+          && (pending.has(listed.id) || reported) && !(current && reported.state === 'removed')) {
+          if (await report(listed, 'removed', 0)) forgetRemoved(listed.id);
+        } else if (current && reported.state === 'removed') {
+          forgetRemoved(listed.id);
+        }
       }
       let failed = false;
       for (const download of wanted.filter(d => d.state === 'ready')) {
@@ -318,6 +674,8 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
           if (signal?.aborted) throw error;
           failed = true;
           status(`A download could not be saved yet: ${error.message}`);
+          const staged = join(target.path, 'staging', `${download.id}.part`);
+          await report(download, 'failed', Math.min(existsSync(staged) ? statSync(staged).size : 0, Number(download.size_bytes) || 0));
         }
       }
       // Every still-ready demand has now had its chance to recover a verified
@@ -337,5 +695,14 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (current) writeAtomically(join(base, 'current.json'), {root: current});
   }
 
-  return {pass, root, transfer, reconcile, withdraw};
+  // A pass and a restore choice each read and rewrite the same cache roots
+  // and causal pins: one at a time, in arrival order, whoever starts them.
+  let exclusive = Promise.resolve();
+  const serialized = operation => (...args) => {
+    const run = exclusive.then(() => operation(...args));
+    exclusive = run.catch(() => {});
+    return run;
+  };
+  return {pass: serialized(pass), root, transfer, reconcile, withdraw, restoreChoices,
+    resolveRestore: serialized(resolveRestore)};
 }

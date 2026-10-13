@@ -255,12 +255,55 @@ async fn read(
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, value))
 }
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum Order {
+    #[default]
+    Id,
+    Recent,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    order: Order,
+    library_id: Option<String>,
+}
+/// Keyset cursor for newest-first pages: the durable admission sequence of
+/// the last row (migration 0046). It only grows, unlike capture times (whole
+/// seconds, possibly stepping back with the clock) or rowids (reused after
+/// the newest rows are deleted).
+fn recent_cursor(sequence: i64) -> String {
+    super::catalog::b64_encode(sequence.to_string().as_bytes())
+}
+fn decode_recent(cursor: &str) -> Result<i64, Problem> {
+    super::catalog::b64_decode(cursor)
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Problem::bad("invalid_cursor", "The page cursor is invalid"))
+}
 async fn list(
     State(app): State<App>,
     caller: Caller,
-    Query(q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::SourcesManage)?;
+    if query
+        .library_id
+        .as_deref()
+        .is_some_and(|id| !super::catalog::valid_id(id))
+    {
+        return Err(Problem::bad(
+            "invalid_query",
+            "library_id must be a valid ID",
+        ));
+    }
+    let q = PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    };
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
@@ -271,10 +314,69 @@ async fn list(
         }
         _ => "[]".into(),
     };
-    let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM scan_requests WHERE id>? AND (? OR library_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?").bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    // Authorization and the optional library filter apply before ordering
+    // and the limit, so hidden scans never shape a page. Optional predicates
+    // are emitted only when present, so SQLite can seek its indexes.
+    let scoped = "(? OR library_id IN (SELECT value FROM json_each(?)))";
+    let library = if query.library_id.is_some() {
+        " AND library_id=?"
+    } else {
+        ""
+    };
+    let keyed: Vec<(String, String)> = match query.order {
+        Order::Id => {
+            let sql = format!(
+                "SELECT id FROM scan_requests WHERE id>? AND {scoped}{library} ORDER BY id LIMIT ?"
+            );
+            let mut rows = sqlx::query_scalar::<_, String>(&sql)
+                .bind(q.after()?)
+                .bind(all)
+                .bind(&ids);
+            if let Some(library) = &query.library_id {
+                rows = rows.bind(library);
+            }
+            rows.bind(i64::from(limit) + 1)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|id| (id.clone(), id))
+                .collect()
+        }
+        Order::Recent => {
+            // Newest admission first. A scan admitted mid-read has a larger
+            // sequence than every cursor, so it never shifts a later page.
+            let after = match q.after()? {
+                "" => None,
+                cursor => Some(decode_recent(cursor)?),
+            };
+            let before = if after.is_some() {
+                " AND admission<?"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT admission,id FROM scan_requests WHERE {scoped}{library}{before} ORDER BY admission DESC LIMIT ?"
+            );
+            let mut rows = sqlx::query_as::<_, (i64, String)>(&sql)
+                .bind(all)
+                .bind(&ids);
+            if let Some(library) = &query.library_id {
+                rows = rows.bind(library);
+            }
+            if let Some(after) = after {
+                rows = rows.bind(after);
+            }
+            rows.bind(i64::from(limit) + 1)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|(sequence, id)| (recent_cursor(sequence), id))
+                .collect()
+        }
+    };
     let mut rows = Vec::new();
-    for id in ids {
-        rows.push((id.clone(), wire(&mut tx, &id, &caller.principal).await?));
+    for (cursor, id) in keyed {
+        rows.push((cursor, wire(&mut tx, &id, &caller.principal).await?));
     }
     let value = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;

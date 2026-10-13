@@ -39,6 +39,36 @@ pub struct NewMarker<'a> {
     pub provenance: Provenance,
 }
 
+/// Whether the timeline may hold one more marker (core `admits_another`),
+/// counted in the caller's write transaction. Every creation path checks it,
+/// so every marker of a timeline stays readable.
+pub(crate) async fn admission(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+) -> Result<Result<(), MarkerError>, sqlx::Error> {
+    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM markers WHERE timeline_id=?")
+        .bind(timeline)
+        .fetch_one(conn)
+        .await?;
+    Ok(core::admits_another(existing.max(0) as usize))
+}
+
+/// Allocate explicit durable correction order in the caller's write transaction.
+pub(crate) async fn next_creation_order(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+) -> Result<i64, sqlx::Error> {
+    let latest: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(creation_order),0) FROM markers WHERE timeline_id=?",
+    )
+    .bind(timeline)
+    .fetch_one(conn)
+    .await?;
+    latest
+        .checked_add(1)
+        .ok_or_else(|| sqlx::Error::Protocol("marker creation order exhausted".into()))
+}
+
 /// Add a marker validated against the reviewed timeline revision.
 pub async fn create(
     app: &App,
@@ -71,9 +101,13 @@ pub async fn create(
         duration.and_then(|d| u64::try_from(d).ok()),
     )
     .map_err(MarkersError::Rejected)?;
+    admission(&mut tx, timeline)
+        .await?
+        .map_err(MarkersError::Rejected)?;
     let id = new_id();
+    let creation_order = next_creation_order(&mut tx, timeline).await?;
     let as_i64 = |v: u64| i64::try_from(v).map_err(|e| MarkersError::Storage(e.into()));
-    sqlx::query("INSERT INTO markers (id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) VALUES (?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO markers (id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance,creation_order) VALUES (?,?,?,?,?,?,?,?,?)")
         .bind(&id)
         .bind(timeline)
         .bind(as_i64(revision)?)
@@ -82,6 +116,7 @@ pub async fn create(
         .bind(end_ms.map(as_i64).transpose()?)
         .bind(label.map(str::trim))
         .bind(name(&provenance))
+        .bind(creation_order)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -127,18 +162,20 @@ pub async fn list(
         Option<String>,
         String,
         i64,
+        i64,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision FROM markers WHERE timeline_id=? ORDER BY start_ms,id",
+        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision,creation_order FROM markers WHERE timeline_id=? ORDER BY start_ms,id",
     )
     .bind(timeline)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
     let mut markers = Vec::with_capacity(rows.len());
-    for (id, kind, start, end, label, provenance, recorded) in rows {
+    for (id, kind, start, end, label, provenance, recorded, creation_order) in rows {
         markers.push(Marker {
             id,
+            creation_order: creation_order.max(0) as u64,
             kind: value(&kind)?,
             start_ms: u64::try_from(start).map_err(storage)?,
             end_ms: end.and_then(|e| u64::try_from(e).ok()),

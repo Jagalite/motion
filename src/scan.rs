@@ -23,9 +23,97 @@ pub struct Found {
     pub bytes: i64,
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
+    /// Container chapters; None when not probed (kept as stored).
+    pub chapters: Option<Vec<playscale_core::markers::FileChapter>>,
     pub reused: bool,
     /// Sidecar NFO observed and parsed beside the file (outside the writer).
     pub nfo: crate::nfo::Sidecar,
+}
+
+/// The chapters of an ffprobe JSON document, in file milliseconds.
+fn chapters_of(value: &serde_json::Value) -> Vec<playscale_core::markers::FileChapter> {
+    let millis = |v: &serde_json::Value| {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map(|s| (s * 1000.0).round() as u64)
+    };
+    value["chapters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(1000)
+        .filter_map(|c| {
+            Some(playscale_core::markers::FileChapter {
+                start_ms: millis(&c["start_time"])?,
+                end_ms: millis(&c["end_time"]),
+                title: c["tags"]["title"]
+                    .as_str()
+                    .filter(|t| t.len() <= 1000)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// Probe only the chapters of an unchanged file (one probed before chapters
+/// were recorded), bound to the same opened file and fingerprint. None when
+/// it cannot be read now; the next scan tries again.
+async fn probe_chapters(
+    root: PathBuf,
+    relative: PathBuf,
+    ffprobe: &Path,
+    expected: &str,
+) -> Option<Vec<playscale_core::markers::FileChapter>> {
+    let (file, check) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let file = open_file(&root, &relative)?;
+        let check = file.try_clone()?;
+        Ok((file, check))
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let mut child = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "chapter=start_time,end_time:chapter_tags=title",
+            "-of",
+            "json",
+            "-i",
+            "pipe:0",
+        ])
+        .stdin(file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut output = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        (&mut stdout)
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut output)
+            .await
+            .ok()?;
+        child.wait().await.ok().filter(|s| s.success())
+    })
+    .await
+    .ok()
+    .flatten();
+    finished.filter(|_| output.len() <= 1024 * 1024)?;
+    let unchanged =
+        tokio::task::spawn_blocking(move || check.metadata().map(|m| fingerprint(&m)).ok())
+            .await
+            .ok()
+            .flatten()?;
+    if unchanged != expected {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output).ok()?;
+    Some(chapters_of(&value))
 }
 
 pub fn fingerprint(meta: &std::fs::Metadata) -> String {
@@ -155,6 +243,42 @@ fn inventory_with(
     file_limit: usize,
     device_of: &dyn Fn(&Path, &std::fs::Metadata) -> u64,
 ) -> anyhow::Result<Inventory> {
+    inventory_bounded(
+        root,
+        exclusions,
+        stop,
+        file_limit,
+        InventoryLimits::default(),
+        device_of,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct InventoryLimits {
+    entries: usize,
+    per_directory: usize,
+    directories: usize,
+    depth: usize,
+}
+impl Default for InventoryLimits {
+    fn default() -> Self {
+        Self {
+            entries: 200_000,
+            per_directory: 10_000,
+            directories: 20_000,
+            depth: 64,
+        }
+    }
+}
+
+fn inventory_bounded(
+    root: &Path,
+    exclusions: &[String],
+    stop: &CancellationToken,
+    file_limit: usize,
+    limits: InventoryLimits,
+    device_of: &dyn Fn(&Path, &std::fs::Metadata) -> u64,
+) -> anyhow::Result<Inventory> {
     let out_of_scope =
         |path: &Path| key(path).is_some_and(|k| playscale_core::sources::excluded(&k, exclusions));
     let root_device = device_of(Path::new(""), &std::fs::symlink_metadata(root)?);
@@ -162,28 +286,56 @@ fn inventory_with(
     let mut pending = vec![PathBuf::new()];
     let mut first = true;
     let mut subtitle_count = 0usize;
+    let mut entry_count = 0usize;
+    let mut directory_count = 1usize;
     while let Some(relative) = pending.pop() {
         anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
-        let Some(name) = key(&relative) else {
-            continue; // Non-UTF-8 directories hold no catalogable paths.
-        };
-        let listing = std::fs::read_dir(root.join(&relative))
-            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
-        let mut entries = match listing {
+        let name = key(&relative).expect("only representable paths are queued");
+        let listing = match std::fs::read_dir(root.join(&relative)) {
             Ok(entries) => entries,
-            Err(error) if first => {
-                return Err(error).context("source root could not be listed");
-            }
+            Err(error) if first => return Err(error).context("source root could not be listed"),
             Err(_) => {
                 out.incomplete.insert(name, "unreadable");
                 continue;
             }
         };
         first = false;
-        entries.sort_by_key(|e| e.file_name());
+        // ReadDir itself is lazy. Bound and check cancellation before retaining
+        // entries, including ignored files, and sort only this bounded batch.
+        let mut entries = Vec::new();
         let mut reason = None;
+        for entry in listing {
+            anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
+            if entry_count >= limits.entries {
+                // Unvisited scopes are all unknown. A single root boundary
+                // bounds coverage too and cannot prove any old path absent.
+                out.complete.clear();
+                out.incomplete.clear();
+                out.incomplete.insert(String::new(), "entry_limit");
+                out.files.sort();
+                return Ok(out);
+            }
+            entry_count += 1;
+            if entries.len() >= limits.per_directory {
+                reason = Some("directory_entry_limit");
+                break;
+            }
+            match entry {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    reason = Some("unreadable_entry");
+                    break;
+                }
+            }
+        }
+        entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
             let child = relative.join(entry.file_name());
+            if key(&child).is_none() {
+                reason = Some("non_utf8_path");
+                continue;
+            }
             // Excluded paths are outside the source's scope: neither listed,
             // inspected, nor counted as unproven.
             if out_of_scope(&child) {
@@ -195,7 +347,16 @@ fn inventory_with(
             };
             if kind.is_dir() {
                 match entry.metadata() {
-                    Ok(meta) if device_of(&child, &meta) == root_device => pending.push(child),
+                    Ok(meta) if device_of(&child, &meta) == root_device => {
+                        if directory_count >= limits.directories {
+                            reason = Some("directory_limit");
+                        } else if child.components().count() > limits.depth {
+                            reason = Some("depth_limit");
+                        } else {
+                            directory_count += 1;
+                            pending.push(child);
+                        }
+                    }
                     Ok(_) => {
                         if let Some(dir) = key(&child) {
                             out.incomplete.insert(dir, "mount_boundary");
@@ -271,6 +432,8 @@ pub(crate) async fn inspect(
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled")
         .to_string();
+    let chapter_root = root.clone();
+    let chapter_relative = relative.clone();
     let hashing_permit = permit.clone();
     let (file, revision, stamp, bytes) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -303,7 +466,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype,rotate:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,rotation,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -348,6 +511,17 @@ pub(crate) async fn inspect(
         .into_iter()
         .flatten()
         .map(|s| Track {
+            rotation_degrees: s["side_data_list"]
+                .as_array()
+                .and_then(|items| items.iter().find_map(|item| item["rotation"].as_f64()))
+                .or_else(|| {
+                    s["tags"]["rotate"]
+                        .as_str()
+                        .and_then(|r| r.parse::<f64>().ok())
+                })
+                .filter(|r| r.is_finite())
+                .map(|r| r.round() as i32)
+                .unwrap_or(0),
             index: s["index"].as_i64().unwrap_or(0),
             kind: s["codec_type"].as_str().unwrap_or("unknown").into(),
             codec: s["codec_name"].as_str().unwrap_or("unknown").into(),
@@ -383,8 +557,32 @@ pub(crate) async fn inspect(
                 .as_str()
                 .filter(|t| t.len() <= 200)
                 .map(str::to_owned),
+            probe_version: db::PROBE_VERSION,
+            mimetype: s["tags"]["mimetype"]
+                .as_str()
+                .filter(|_| s["codec_type"] == "attachment")
+                .filter(|m| m.len() <= 200)
+                .map(str::to_owned),
+            attachment_bytes: s["extradata_size"]
+                .as_u64()
+                .filter(|_| s["codec_type"] == "attachment"),
+            color_primaries: s["color_primaries"].as_str().map(str::to_owned),
+            color_space: s["color_space"].as_str().map(str::to_owned),
+            color_range: s["color_range"].as_str().map(str::to_owned),
+            mastering_peak_nits: side_data(s, "Mastering display metadata")
+                .and_then(|d| nits(&d["max_luminance"])),
+            max_cll_nits: side_data(s, "Content light level metadata")
+                .and_then(|d| nits(&d["max_content"])),
+            dolby_vision: side_data(s, "DOVI configuration record").and_then(|d| {
+                Some((
+                    u8::try_from(d["dv_profile"].as_u64()?).ok()?,
+                    u8::try_from(d["dv_bl_signal_compatibility_id"].as_u64()?).ok()?,
+                ))
+            }),
         })
         .collect();
+    // Optional chapter overflow/failure must not erase successful stream facts.
+    let chapters = probe_chapters(chapter_root, chapter_relative, ffprobe, &stamp).await;
     Ok(Found {
         relative: rel,
         title,
@@ -393,6 +591,7 @@ pub(crate) async fn inspect(
         bytes,
         duration,
         tracks,
+        chapters,
         reused: false,
         nfo: crate::nfo::Sidecar::Absent,
     })
@@ -464,6 +663,13 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                     if stamp != row.fingerprint {
                         return Ok(None);
                     }
+                    // Streams probed before the facts later policies need
+                    // were recorded are inspected again (HDR colour facts,
+                    // attachment MIME types and sizes).
+                    let tracks: Vec<Track> = serde_json::from_str(&row.tracks_json)?;
+                    if tracks.iter().any(Track::lacks_probe_facts) {
+                        return Ok(None);
+                    }
                     Ok(Some(Found {
                         relative: row.relative_path,
                         title: row.title,
@@ -471,7 +677,13 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         fingerprint: stamp,
                         bytes: row.bytes,
                         duration: row.duration_seconds,
-                        tracks: serde_json::from_str(&row.tracks_json)?,
+                        tracks,
+                        // Stored chapters, or None when never probed (then
+                        // probed alone below, without hashing the file again).
+                        chapters: row
+                            .chapters_json
+                            .as_deref()
+                            .and_then(|j| serde_json::from_str(j).ok()),
                         reused: true,
                         nfo: crate::nfo::Sidecar::Absent,
                     }))
@@ -485,7 +697,29 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         continue;
                     }
                 };
-            if let Some(file) = reused {
+            if let Some(mut file) = reused {
+                if file.chapters.is_none() {
+                    // Interruptible like a full inspection: dropping the
+                    // probe kills its ffprobe child.
+                    let probe = probe_chapters(
+                        path.clone(),
+                        relative.clone(),
+                        &app.ffprobe,
+                        &file.fingerprint,
+                    );
+                    tokio::pin!(probe);
+                    file.chapters = loop {
+                        tokio::select! {
+                            chapters = &mut probe => break chapters,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                let current = db::get_job(&app.db, &job.id).await?;
+                                if shutdown.is_cancelled() || !current.state()?.executing(job.attempt.try_into()?) {
+                                    stop.cancel(); anyhow::bail!("scan interrupted");
+                                }
+                            }
+                        }
+                    };
+                }
                 found.push(file);
                 continue;
             }
@@ -691,8 +925,8 @@ async fn finish(
             let file_id = id.clone();
             let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
-            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
-                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=CASE WHEN excluded.chapters_json IS NOT NULL THEN excluded.chapters_json WHEN media_files.revision=excluded.revision THEN media_files.chapters_json END WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
+                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).bind(file.chapters.as_ref().map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
             if first_version {
                 // Unknown equivalence is permitted only in the new, empty timeline.
                 crate::curation::create_version(
@@ -840,6 +1074,50 @@ mod inventory_tests {
     }
 
     #[test]
+    fn inventory_bounds_ignored_entries_directories_and_depth() {
+        let dir = tree(&["a.txt", "b.txt", "c.txt", "d.txt", "nested/deeper/file.mkv"]);
+        let stop = CancellationToken::new();
+        let limits = InventoryLimits {
+            entries: 2,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert!(found.complete.is_empty());
+        assert_eq!(found.incomplete.get(""), Some(&"entry_limit"));
+        let limits = InventoryLimits {
+            per_directory: 2,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert!(!found.complete.contains(""));
+        assert!(found.incomplete.contains_key(""));
+        let limits = InventoryLimits {
+            directories: 1,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert_eq!(found.incomplete.get(""), Some(&"directory_limit"));
+        let limits = InventoryLimits {
+            depth: 1,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert_eq!(found.incomplete.get("nested"), Some(&"depth_limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_directory_names_leave_parent_coverage_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tree(&["valid.mkv"]);
+        std::fs::create_dir(dir.path().join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
+        let found = inventory(dir.path(), &[], &CancellationToken::new()).unwrap();
+        assert_eq!(found.files, vec![PathBuf::from("valid.mkv")]);
+        assert_eq!(found.incomplete.get(""), Some(&"non_utf8_path"));
+        assert!(!found.complete.contains(""));
+    }
+
+    #[test]
     fn the_file_limit_leaves_overflow_and_unvisited_directories_unproven() {
         let dir = tree(&[
             "a/1.mkv", "a/2.mkv", "b/3.mkv", "b/4.mkv", "c/5.mkv", "top.mkv",
@@ -896,5 +1174,123 @@ mod inventory_tests {
         assert_eq!(found.incomplete.get("Mounted"), Some(&"mount_boundary"));
         assert!(found.complete.contains(""));
         assert!(!found.complete.contains("Mounted") && !found.complete.contains("Mounted/deeper"));
+    }
+}
+
+/// One entry of a stream's probed side data, by type.
+fn side_data<'a>(stream: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    stream["side_data_list"]
+        .as_array()?
+        .iter()
+        .find(|d| d["side_data_type"] == kind)
+}
+
+/// A luminance in whole nits from ffprobe: an integer, or a rational string
+/// such as `"10000000/10000"`.
+fn nits(value: &serde_json::Value) -> Option<u32> {
+    let nits = match value {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => match s.split_once('/') {
+            Some((n, d)) => n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?,
+            None => s.trim().parse().ok()?,
+        },
+        _ => return None,
+    };
+    (nits.is_finite() && nits >= 1.0 && nits <= f64::from(u32::MAX)).then(|| nits.round() as u32)
+}
+
+#[cfg(test)]
+mod color_probe_tests {
+    use super::{nits, side_data};
+    use serde_json::json;
+
+    #[test]
+    fn side_data_luminance_parses_rationals_and_integers() {
+        let stream = json!({"side_data_list":[
+            {"side_data_type":"Mastering display metadata","max_luminance":"10000000/10000"},
+            {"side_data_type":"Content light level metadata","max_content":1200},
+            {"side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1}
+        ]});
+        assert_eq!(
+            side_data(&stream, "Mastering display metadata")
+                .and_then(|d| nits(&d["max_luminance"])),
+            Some(1000)
+        );
+        assert_eq!(nits(&json!(1200)), Some(1200));
+        assert_eq!(nits(&json!("0/1")), None);
+        assert_eq!(nits(&json!("1/0")), None);
+        assert_eq!(nits(&json!("x")), None);
+        assert!(side_data(&json!({}), "Mastering display metadata").is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod chapter_probe_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn optional_chapter_overflow_preserves_base_media_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("film.mkv"), b"fixture").unwrap();
+        let probe = directory.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\ncase \"$*\" in\n *chapter=*) head -c 1048577 /dev/zero ;;\n *) printf '%s' '{\"format\":{\"duration\":\"120\"},\"streams\":[{\"index\":0,\"codec_type\":\"video\",\"codec_name\":\"h264\"}]}' ;;\nesac\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let permit = std::sync::Arc::new(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        let found = inspect(
+            directory.path().to_owned(),
+            "film.mkv".into(),
+            &probe,
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.duration, Some(120.0));
+        assert_eq!(found.tracks.len(), 1);
+        assert_eq!(found.tracks[0].codec, "h264");
+        assert_eq!(found.chapters, None);
+    }
+
+    #[tokio::test]
+    async fn scanner_requests_and_retains_display_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("film.mkv"), b"fixture").unwrap();
+        let probe = directory.path().join("probe");
+        // A probe cannot return facts excluded by -show_entries. Refuse the
+        // fixture unless both modern display-matrix and legacy tag fields
+        // are requested by the production scanner.
+        std::fs::write(&probe, r#"#!/bin/sh
+case "$*" in
+ *chapter=*) printf '%s' '{"chapters":[]}' ;;
+ *stream_tags=language,title,mimetype,rotate:*stream_side_data=side_data_type,rotation,*)
+ printf '%s' '{"format":{"duration":"120"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"video","codec_name":"h264","tags":{"rotate":"270"}}]}' ;;
+ *) exit 1 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let permit = std::sync::Arc::new(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        let found = inspect(
+            directory.path().to_owned(),
+            "film.mkv".into(),
+            &probe,
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.tracks.len(), 2);
+        assert_eq!(found.tracks[0].rotation_degrees, 90);
+        assert_eq!(found.tracks[1].rotation_degrees, 270);
     }
 }

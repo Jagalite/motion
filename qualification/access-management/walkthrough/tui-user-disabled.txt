@@ -1,0 +1,50 @@
+⌕ Search titles                                                                             Profile: Everyone   E
+ ▶ Motion               ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ MONITOR                   Users and access  n new · a approve · e edit · d deny/revoke
+  ◉  Overview
+  ▶  Now playing           ╭─ Users and access ──────────────────────────────────────────────────────────────────────────────────────────────╮
+  ◔  History               │ e edit name, grants and enabled state · n new user                                                              │
+  ◷  Processing            │ Ratings:  · Blocked labels:                                                                                     │
+  ↻  Scans                 │ User edits narrow existing devices; widening requires a new device approval.                                    │
+  ≡  Activity              │ Profiles: Everyone                                                                                              │
+  ◈  Server                │ Libraries: none                                                                                                 │
+                           │ Permissions: catalog:read, viewing:write, playback:request                                                      │
+ LIBRARY                   │ Device: Walkthrough terminal · motion-terminal · revoked                                                        │
+  ⌂  Browse                │ Device: Web browser · Motion web · revoked                                                                      │
+  ▤  All titles            │ Device: Web browser · Motion web · revoked                                                                      │
+                           ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ADMIN                     ╭─ Viewing profiles ──────────────────────────────────────────────────────────────────────────────────────────────╮
+  ▥  Sources               │  User                      Status      Scope                       Permissions                                  │
+  ⇄  Pairing requests      │  Walkthrough household     disabled    1 profiles · 0 libraries    catalog:read, viewing:write, playback:requ…  │
+▎ ♙  Users and access      │  Device identity: Access…  enabled     1 profiles · 0 libraries    system:admin                                 │
+  ✉  Invitations           ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ▢  Devices
+  ☺  Profiles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ● Live · 127.0.0.1:18795   Access updated.                                                          ←↑↓→ select  esc sidebar  r refresh  ? help

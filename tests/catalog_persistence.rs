@@ -801,3 +801,172 @@ async fn timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomicall
             .unwrap();
     assert_eq!(retained, 5.0);
 }
+
+/// A restore captures each timeline's viewing as restored, under the new
+/// history, in the same transaction that starts it: kept offline progress
+/// is pinned to this baseline (completion 5C).
+#[tokio::test]
+async fn restore_captures_the_viewing_baseline_of_the_new_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let live = db::connect(&path).await.unwrap();
+    sqlx::query("INSERT OR IGNORE INTO profiles(id,name) VALUES ('default','Default')")
+        .execute(&live)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,updated_at) VALUES ('default','t1',5,1,0)")
+        .execute(&live)
+        .await
+        .unwrap();
+    live.close().await;
+    let destination = dir.path().join("restored").join("motion.sqlite");
+    let receipt = db::restore_into(&path, &destination).await.unwrap();
+    let pool = SqlitePool::connect(&format!("sqlite://{}", destination.display()))
+        .await
+        .unwrap();
+    let baseline: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT profile_id,timeline_id,revision,manual_epoch FROM restore_baselines",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(baseline, [("default".into(), "t1".into(), 5, 1)]);
+    let (captured, current): (String, String) = sqlx::query_as(
+        "SELECT (SELECT restore_epoch FROM restore_baseline_epoch),(SELECT restore_epoch FROM server_identity)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(captured, current);
+    assert_eq!(Some(current), receipt.restore_epoch);
+    pool.close().await;
+}
+
+/// The supported restore tool (scripts/backup.py) only records the new
+/// epoch as a pending baseline; the first start captures it after
+/// migrations, before serving, and never again for that epoch.
+#[tokio::test]
+async fn the_first_start_after_a_restore_captures_its_viewing_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let db = db::connect(&path).await.unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,updated_at) VALUES ('default','t1',5,1,0)")
+        .execute(&db)
+        .await
+        .unwrap();
+    // What the restore tool leaves: a rotated epoch and a pending baseline.
+    sqlx::query("UPDATE server_identity SET restore_epoch='restored-by-tool'")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,'restored-by-tool',0)")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let captured: (String, i64) =
+        sqlx::query_as("SELECT restore_epoch,captured FROM restore_baseline_epoch")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(captured, ("restored-by-tool".into(), 1));
+    let baseline: (i64, i64) = sqlx::query_as(
+        "SELECT revision,manual_epoch FROM restore_baselines WHERE timeline_id='t1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(baseline, (5, 1));
+    // Viewing written afterwards never moves the baseline.
+    sqlx::query("UPDATE timeline_viewing SET revision=6")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM restore_baselines WHERE timeline_id='t1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revision, 5);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn restore_withdraws_saved_authority_without_changing_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("backup.sqlite");
+    let source = db::connect(&path).await.unwrap();
+    for sql in [
+        "INSERT INTO devices(id,name,client_name,revision,profile_ids,permissions,policy,created_at) VALUES ('d','Device','test',1,'[]','[]','{}',0)",
+        "INSERT INTO credentials(token_hash,device_id,kind,generation,expires_at) VALUES ('secret','d','device',0,9223372036854775807)",
+        "INSERT INTO credentials(token_hash,device_id,kind,generation,expires_at,parent_hash,csrf_token) VALUES ('cookie','d','session',0,9223372036854775807,'secret','csrf')",
+        "INSERT INTO content_tickets(id,token_hash,principal_id,credential_hash,file_id,file_revision,purpose,expires_at) VALUES ('t','ticket','d','secret','f','r','playback',9223372036854775807)",
+        "INSERT INTO content_tickets(id,token_hash,principal_id,file_id,file_revision,purpose,expires_at) VALUES ('o','operator-ticket','operator','f','r','playback',9223372036854775807)",
+        "INSERT INTO pairings(id,device_code_hash,user_code,device_name,client_name,expires_at,phase,device_id) VALUES ('p','code','CODE','Device','test',9223372036854775807,'approved','d')",
+        "INSERT INTO idempotency_records(principal_id,operation,target,key,digest,status,issued_nonce,expires_at) VALUES ('d','pair','d','key','digest',200,'secret-replay',9223372036854775807)",
+        "INSERT INTO access_users(id,name,revision,profile_ids,permissions,policy,created_at) VALUES ('u','Owner',1,'[]','[]','{}',0)",
+        "INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,profile_ids,permissions,policy,created_at,expires_at) VALUES ('invite','code','u',1,'d',1,'[]','[]','{}',0,9223372036854775807)",
+        "INSERT INTO signin_identities(id,user_id,kind,address,profile_ids,permissions,policy,created_at) VALUES ('identity','u','email','person@example.test','[]','[]','{}',0)",
+        "INSERT INTO signin_families(id,device_id,user_id,identity_id,identity_revision,method_revision,epoch,issued_at,authenticated_at,expires_at,parent_hash,session_hash) SELECT 'family','d','u','identity',1,1,restore_epoch,0,0,9223372036854775807,'secret','cookie' FROM server_identity",
+        "INSERT INTO signin_transactions(id,state_json,return_to,created_at,expires_at) VALUES ('transaction','{}','/',0,9223372036854775807)",
+        "INSERT INTO signin_outbox(id,transaction_id,payload,next_attempt,expires_at,config_revision,destination_hash,created_at) VALUES ('mail','transaction','secret-email',0,9223372036854775807,1,'destination',0)",
+        "INSERT INTO signin_proofs(id,actor_id,action,target,epoch,code_hash,expires_at,created_at) VALUES ('proof','d','grant','u','old','code',9223372036854775807,0)",
+        "INSERT INTO signin_audit(actor,target,action,outcome,at) VALUES ('d','u','grant','ok',0)",
+    ] {
+        sqlx::query(sql).execute(&source).await.unwrap();
+    }
+    source.close().await;
+    let destination = dir.path().join("restored.sqlite");
+    db::restore_into(&path, &destination).await.unwrap();
+    let restored = db::connect(&destination).await.unwrap();
+    for table in [
+        "credentials",
+        "content_tickets",
+        "pairings",
+        "idempotency_records",
+        "access_invitations",
+        "signin_transactions",
+        "signin_outbox",
+        "signin_proofs",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    let revoked: bool = sqlx::query_scalar("SELECT revoked FROM devices WHERE id='d'")
+        .fetch_one(&restored)
+        .await
+        .unwrap();
+    assert!(revoked);
+    let family: (bool, i64) =
+        sqlx::query_as("SELECT revoked,revision FROM signin_families WHERE id='family'")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+    assert_eq!(family, (true, 2));
+    let needs_review: bool = sqlx::query_scalar(
+        "SELECT reviewed_epoch != restore_epoch FROM signin_settings CROSS JOIN server_identity",
+    )
+    .fetch_one(&restored)
+    .await
+    .unwrap();
+    assert!(needs_review);
+    for table in ["access_users", "signin_identities", "signin_audit"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "retained {table}");
+    }
+    let source = db::connect(&path).await.unwrap();
+    let still_saved: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&source)
+        .await
+        .unwrap();
+    assert_eq!(still_saved, 2);
+}

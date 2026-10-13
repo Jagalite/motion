@@ -202,6 +202,35 @@ impl Fixture {
         )
     }
 
+    async fn assign_user(&self, device: &str) -> String {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, &format!("download-owner-{}", uuid::Uuid::new_v4()),
+            json!({"name":"Download owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+        user.body["id"].as_str().unwrap().into()
+    }
+
     /// Scan `name` into the library; returns (timeline_id, file_id, revision).
     async fn scanned(&self, name: &str, bytes: &[u8]) -> (String, String, String) {
         std::fs::write(self.dir.path().join("media").join(name), bytes).unwrap();
@@ -283,6 +312,7 @@ async fn downloads_pin_exact_originals_and_grant_only_their_bytes() {
     // Explicit refusals never substitute another selection.
     let mut recipe = input(&device, &timeline);
     recipe["recipe_id"] = json!("x");
+    recipe["tracks"]["subtitle_policy"] = json!("off");
     problem(
         &f.post("/api/v2/downloads", &auth, "download-key-0001", recipe)
             .await,
@@ -844,6 +874,145 @@ async fn offline_sync_consumes_sequences_once_and_never_overwrites_newer_authori
 }
 
 #[tokio::test]
+async fn offline_event_retention_follows_the_devices_acknowledgement() {
+    let mut f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"retained film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let history = format!("{server}:{restore}");
+    let base = ("0", "0");
+    // Macros, not closures: the fixture is reopened in between.
+    macro_rules! sync {
+        ($events:expr, $acknowledged:expr) => {
+            retention_sync(&f, &device, &auth, &history, $events, $acknowledged).await
+        };
+    }
+    macro_rules! retained {
+        () => {
+            (
+                retention_value(&f, &device, "count(*)", "offline_events").await,
+                retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+            )
+        };
+    }
+
+    // An older agent reports nothing: every consumed event is retained.
+    let first = vec![
+        event(1, &timeline, base, 10_000, "paused"),
+        event(2, &timeline, base, 20_000, "paused"),
+    ];
+    let reply = sync!(first.clone(), Value::Null);
+    assert_eq!(outcomes(&reply).len(), 2);
+    assert_eq!(retained!(), (2, 0));
+
+    // The device compacted 1 and 2 and says so with its next batch.
+    let third = vec![event(3, &timeline, base, 30_000, "paused")];
+    let reply = sync!(third.clone(), json!("2"));
+    assert_eq!(reply.body["next_device_sequence"], "4");
+    assert_eq!(retained!(), (1, 2));
+    // Its response was lost: the retry with the same report is a duplicate.
+    let retry = sync!(third.clone(), json!("2"));
+    assert_eq!(outcomes(&retry)[0].0, "duplicate");
+    assert_eq!(retry.body["next_device_sequence"], "4");
+
+    // The floor and records survive a restart (a reopened database).
+    f.app.db.close().await;
+    f.app.db = db::connect(&f.dir.path().join("db.sqlite")).await.unwrap();
+    assert_eq!(retained!(), (1, 2));
+
+    // A stale copy of the device resends a pruned event: refused, nothing
+    // consumed, and an older report never moves the floor back.
+    let stale = sync!(first[..1].to_vec(), json!("0"));
+    assert_eq!(
+        outcomes(&stale),
+        vec![("rejected".into(), json!("sequence_acknowledged"))]
+    );
+    assert_eq!(stale.body["next_device_sequence"], "4");
+    assert_eq!(retained!(), (1, 2));
+
+    // A report beyond what was consumed, or a malformed one, is refused
+    // before anything is pruned or consumed.
+    let fourth = vec![event(4, &timeline, base, 40_000, "paused")];
+    problem(
+        &sync!(fourth.clone(), json!("4")),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "acknowledgement_ahead",
+    );
+    problem(
+        &sync!(fourth.clone(), json!("x")),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_acknowledgement",
+    );
+    // A batch refused for an unusable profile prunes nothing either.
+    let mut kids = fourth[0].clone();
+    kids["profile_id"] = json!("kids");
+    problem(
+        &sync!(vec![kids], json!("3")),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    assert_eq!(retained!(), (1, 2));
+
+    // The bound: with 10,000 consumed events unacknowledged, a new event
+    // waits (not consumed) until the device reports its compaction.
+    let limit = playscale_core::downloads::MAX_RETAINED_EVENTS as i64;
+    sqlx::query("UPDATE offline_sequences SET next_sequence=? WHERE device_id=?")
+        .bind(2 + limit + 1)
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let next = (2 + limit + 1) as u64;
+    let waiting = vec![event(next, &timeline, base, 50_000, "paused")];
+    let legacy = sync!(waiting.clone(), Value::Null);
+    assert_eq!(
+        outcomes(&legacy),
+        vec![("rejected".into(), json!("sequence_gap"))]
+    );
+    assert_eq!(legacy.body["next_device_sequence"], next.to_string());
+    let full = sync!(waiting.clone(), json!("2"));
+    assert_eq!(
+        outcomes(&full),
+        vec![("rejected".into(), json!("acknowledgement_required"))]
+    );
+    assert_eq!(full.body["next_device_sequence"], next.to_string());
+    let accepted = sync!(waiting, json!((next - 1).to_string()));
+    assert_ne!(outcomes(&accepted)[0].0, "rejected");
+    assert_eq!(
+        accepted.body["next_device_sequence"],
+        (next + 1).to_string()
+    );
+    assert_eq!(retained!(), (1, next as i64 - 1));
+}
+
+async fn retention_sync(
+    f: &Fixture,
+    device: &str,
+    auth: &str,
+    history: &str,
+    events: Vec<Value>,
+    acknowledged: Value,
+) -> Reply {
+    let body = json!({"device_id":device,"events":events,"acknowledged_through":acknowledged});
+    f.call(
+        "POST",
+        "/api/v2/offline/sync",
+        Some(body),
+        &[("authorization", auth), ("x-motion-viewing-epoch", history)],
+    )
+    .await
+}
+
+async fn retention_value(f: &Fixture, device: &str, column: &str, table: &str) -> i64 {
+    f.count(&format!(
+        "SELECT {column} FROM {table} WHERE device_id='{device}'"
+    ))
+    .await
+}
+
+#[tokio::test]
 async fn reconciliation_uses_the_downloads_effective_duration() {
     let f = Fixture::new().await;
     let (timeline, file, _) = f.scanned("film.mp4", b"probed only").await;
@@ -940,6 +1109,77 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
 }
 
 #[tokio::test]
+async fn download_query_accepts_limits_and_pages_active_and_historical_demands() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"pagination").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "download-query-0001",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap();
+    for (id, state) in [("zz-cancelled", "cancelled"), ("zz-ready", "ready")] {
+        sqlx::query("INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) SELECT ?,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,?,created_at,updated_at FROM downloads WHERE id=?")
+            .bind(id).bind(state).bind(created.body["id"].as_str().unwrap())
+            .execute(&f.app.db).await.unwrap();
+    }
+    for active in [None, Some(false), Some(true)] {
+        let filter = active
+            .map(|value| format!("&active_only={value}"))
+            .unwrap_or_default();
+        let first = f
+            .get(&format!("/api/v2/downloads?limit=1{filter}"), &auth)
+            .await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+        assert_eq!(first.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first.body["items"][0]["id"], id);
+        let cursor = first.body["next_cursor"].as_str().unwrap();
+        let next = f
+            .get(
+                &format!("/api/v2/downloads?limit=2&cursor={cursor}{filter}"),
+                &auth,
+            )
+            .await;
+        assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+        let ids: Vec<&str> = next.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            if active == Some(true) {
+                vec!["zz-ready"]
+            } else {
+                vec!["zz-cancelled", "zz-ready"]
+            }
+        );
+        assert!(next.body["next_cursor"].is_null());
+    }
+    for query in [
+        "limit=0",
+        "limit=201",
+        "limit=oops",
+        "active_only=oops",
+        "unexpected=true",
+    ] {
+        let result = f.get(&format!("/api/v2/downloads?{query}"), &auth).await;
+        assert_eq!(
+            result.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            result.body
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_downloads_page_lists_every_actionable_record() {
     let f = Fixture::new().await;
     let (timeline, file, revision) = f.scanned("film.mp4", b"paged").await;
@@ -953,6 +1193,10 @@ async fn the_downloads_page_lists_every_actionable_record() {
         )
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    // A long cancelled history sorts before the actionable records. Filtering
+    // after a fixed number of history pages would make this UI unavailable.
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5001) INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) SELECT printf('history-%05d',n.x),1,d.principal_id,d.device_id,d.profile_id,d.timeline_id,d.timeline_revision,d.version_id,d.file_id,d.file_revision,d.content_type,d.size_bytes,d.duration_ms,'cancelled',0,0 FROM downloads d CROSS JOIN n WHERE d.id=?")
+        .bind(created.body["id"].as_str().unwrap()).execute(&f.app.db).await.unwrap();
     // More records than one API page: 205 ready and one cancelled.
     for n in 0..206 {
         sqlx::query(
@@ -977,4 +1221,872 @@ async fn the_downloads_page_lists_every_actionable_record() {
         "the last page is listed"
     );
     assert!(!html.contains("zz-205"), "cancelled records need no action");
+}
+
+/// After the server is restored from a backup, a device whose compaction
+/// point belongs to the earlier history continues its sequence with its
+/// first batch under the new one (`downloads::reanchor`); without the
+/// re-anchor it would stop at a gap forever. Only this server's own earlier
+/// history is accepted, and a retry changes nothing.
+#[tokio::test]
+async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"restored film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let (server, restore) = playscale::v2::system::server_identity(&f.app)
+        .await
+        .unwrap();
+    let before = format!("{server}:{restore}");
+    let base = ("0", "0");
+    let sync = |history: String, events: Vec<Value>, acknowledged: Value, reanchor: Value| {
+        let body = json!({"device_id":device,"events":events,"acknowledged_through":acknowledged,"reanchor":reanchor});
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            f.call(
+                "POST",
+                "/api/v2/offline/sync",
+                Some(body),
+                &[
+                    ("authorization", &auth),
+                    ("x-motion-viewing-epoch", &history),
+                ],
+            )
+            .await
+        }
+    };
+    let first = vec![
+        event(1, &timeline, base, 10_000, "paused"),
+        event(2, &timeline, base, 20_000, "paused"),
+    ];
+    let reply = sync(before.clone(), first, Value::Null, Value::Null).await;
+    assert_eq!(reply.body["next_device_sequence"], "3", "{:?}", reply.body);
+    // The database is restored from a backup taken before the device synced:
+    // a new restore epoch and no record of this device's sequence.
+    sqlx::query("UPDATE server_identity SET restore_epoch='restored-backup'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    for table in ["offline_events", "offline_sequences"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE device_id=?"))
+            .bind(&device)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let after = format!("{server}:restored-backup");
+    let third = vec![event(3, &timeline, base, 30_000, "paused")];
+    // The device compacted 1 and 2 in the earlier history: without a
+    // re-anchor its report is ahead of this server and nothing proceeds.
+    problem(
+        &sync(after.clone(), third.clone(), json!("2"), Value::Null).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "acknowledgement_ahead",
+    );
+    let inconsistent = json!({"from_viewing_epoch": before, "through": "100"});
+    problem(
+        &sync(after.clone(), third.clone(), json!("2"), inconsistent).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_reanchor",
+    );
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM offline_sequences").await,
+        0,
+        "an invalid reanchor must not create sequence state"
+    );
+    let reanchor = json!({"from_viewing_epoch": before, "through": "2"});
+    let continued = sync(after.clone(), third.clone(), json!("2"), reanchor.clone()).await;
+    assert_eq!(continued.status, StatusCode::OK, "{:?}", continued.body);
+    assert_ne!(
+        outcomes(&continued)[0].0,
+        "rejected",
+        "{:?}",
+        continued.body
+    );
+    assert_eq!(continued.body["next_device_sequence"], "4");
+    assert_eq!(
+        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+        2
+    );
+    // A lost response: the retry is a duplicate and the anchor stays.
+    let retry = sync(after.clone(), third, json!("2"), reanchor).await;
+    assert_eq!(outcomes(&retry)[0].0, "duplicate");
+    assert_eq!(retry.body["next_device_sequence"], "4");
+    // Never the current history, another server, or a malformed sequence.
+    let fourth = vec![event(4, &timeline, base, 40_000, "paused")];
+    for reanchor in [
+        json!({"from_viewing_epoch": after, "through": "3"}),
+        json!({"from_viewing_epoch": "another-server:r1", "through": "3"}),
+        json!({"from_viewing_epoch": format!("{server}:invented"), "through": "1000"}),
+        json!({"from_viewing_epoch": before, "through": "x"}),
+    ] {
+        problem(
+            &sync(after.clone(), fourth.clone(), json!("3"), reanchor).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_reanchor",
+        );
+    }
+    assert_eq!(
+        retention_value(&f, &device, "next_sequence", "offline_sequences").await,
+        4
+    );
+    // A backup that already held later sequences: the sequence stays and the
+    // floor still moves to the acknowledged compacted prefix. The retained
+    // batch starts at the next event already expected by the server.
+    sqlx::query("UPDATE offline_sequences SET next_sequence=10,pruned_through=0 WHERE device_id=?")
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let later = sync(
+        after.clone(),
+        vec![event(10, &timeline, base, 50_000, "paused")],
+        json!("9"),
+        json!({"from_viewing_epoch": before, "through": "9"}),
+    )
+    .await;
+    assert_eq!(later.body["next_device_sequence"], "11", "{:?}", later.body);
+    assert_eq!(
+        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+        9
+    );
+}
+
+/// The manifest names the viewing base as restored only when the current
+/// history began with a restore whose baseline was captured.
+#[tokio::test]
+async fn manifests_name_the_restored_base_only_for_a_captured_restore() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"baseline film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "baseline-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    macro_rules! manifest {
+        () => {
+            f.get(&path, &auth).await.body
+        };
+    }
+    let never = manifest!();
+    assert_eq!(
+        (
+            &never["restored_viewing_revision"],
+            &never["restored_manual_epoch"]
+        ),
+        (&Value::Null, &Value::Null)
+    );
+    // A captured baseline of another (earlier) history is not this one's.
+    sqlx::query("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,'earlier',1)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(manifest!()["restored_viewing_revision"], Value::Null);
+    // The current history's captured baseline: as restored, or 0 without a row.
+    sqlx::query("UPDATE restore_baseline_epoch SET restore_epoch=(SELECT restore_epoch FROM server_identity)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let none = manifest!();
+    assert_eq!(
+        (
+            &none["restored_viewing_revision"],
+            &none["restored_manual_epoch"]
+        ),
+        (&json!("0"), &json!("0"))
+    );
+    sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) VALUES ('default',?,7,2)")
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let restored = manifest!();
+    assert_eq!(
+        (
+            &restored["restored_viewing_revision"],
+            &restored["restored_manual_epoch"]
+        ),
+        (&json!("7"), &json!("2"))
+    );
+    // Pending (not captured yet): unknown.
+    sqlx::query("UPDATE restore_baseline_epoch SET captured=0")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(manifest!()["restored_viewing_revision"], Value::Null);
+}
+
+/// The download's own device reports its copy; the server stores it as
+/// reported (never derived from its own state), in the device's order,
+/// about the current revision, and after the download ends only removal.
+#[tokio::test]
+async fn devices_report_their_own_copies_in_their_own_order() {
+    let f = Fixture::new().await;
+    let media: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    let (timeline, _, _) = f.scanned("film.mp4", &media).await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "transfer-download-01",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    // Ready on the server is not a verified local copy.
+    assert_eq!(created.body["state"], "ready");
+    assert_eq!(
+        f.get(&format!("/api/v2/downloads/{id}"), &auth).await.body["device_transfer"],
+        Value::Null
+    );
+    let path = format!("/api/v2/downloads/{id}/transfer");
+    let report = |sequence: u64, revision: &str, state: &str, bytes: u64| {
+        json!({"sequence": sequence.to_string(), "download_revision": revision,
+            "state": state, "bytes_received": bytes.to_string()})
+    };
+    let put = |body: Value, auth: String| {
+        let f = &f;
+        let path = path.clone();
+        async move {
+            f.call("PUT", &path, Some(body), &[("authorization", &auth)])
+                .await
+        }
+    };
+    let partial = put(report(1, "1", "transferring", 400), auth.clone()).await;
+    assert_eq!(partial.status, StatusCode::OK, "{:?}", partial.body);
+    assert_eq!(partial.body["device_transfer"]["state"], "transferring");
+    assert_eq!(partial.body["device_transfer"]["bytes_received"], "400");
+    // An exact retry; an earlier or reused sequence; another revision.
+    assert_eq!(
+        put(report(1, "1", "transferring", 400), auth.clone())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    problem(
+        &put(report(1, "1", "transferring", 500), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "transfer_report_conflict",
+    );
+    let verified = put(report(3, "1", "verified_local", 1000), auth.clone()).await;
+    assert_eq!(verified.body["device_transfer"]["state"], "verified_local");
+    problem(
+        &put(report(2, "1", "transferring", 900), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "transfer_report_stale",
+    );
+    problem(
+        &put(report(4, "2", "removed", 0), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "download_changed",
+    );
+    // Beyond the stored range: refused, never a server error.
+    problem(
+        &put(
+            json!({"sequence": "9223372036854775808", "download_revision": "1",
+                "state": "transferring", "bytes_received": "1"}),
+            auth.clone(),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_transfer",
+    );
+    // Never verified while incomplete, never beyond the size.
+    for bad in [
+        report(4, "1", "verified_local", 999),
+        report(4, "1", "transferring", 1001),
+    ] {
+        problem(
+            &put(bad, auth.clone()).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_transfer",
+        );
+    }
+    // Another device of the principal cannot report it.
+    let (_, other) = f.device(&["default"], &PERMISSIONS).await;
+    problem(
+        &put(report(5, "1", "removed", 0), other).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // The listing carries the report as stored.
+    let listed = f.get("/api/v2/downloads?limit=10", &auth).await;
+    assert_eq!(listed.body["items"][0]["device_transfer"]["sequence"], "3");
+    // After cancellation only the copy's removal is accepted.
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/downloads/{id}"),
+            None,
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    problem(
+        &put(report(5, "2", "transferring", 1), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "download_ended",
+    );
+    let removed = put(report(5, "2", "removed", 0), auth.clone()).await;
+    assert_eq!(removed.body["device_transfer"]["state"], "removed");
+    assert_eq!(removed.body["state"], "cancelled");
+}
+
+/// The title's selected poster travels with the download, pinned by its
+/// content digest; without one the manifest names only the media.
+#[tokio::test]
+async fn manifests_pin_the_titles_poster_by_digest() {
+    use sha2::Digest;
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"postered film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "poster-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let path = format!(
+        "/api/v2/downloads/{}/manifest",
+        created.body["id"].as_str().unwrap()
+    );
+    let roles = |m: &Value| -> Vec<String> {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["role"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(roles(&f.get(&path, &auth).await.body), ["media"]);
+    let poster = b"\x89PNG poster bytes".to_vec();
+    let digest = format!("{:x}", sha2::Sha256::digest(&poster));
+    sqlx::query("INSERT INTO artwork_assets(id,mime,width,height,bytes) VALUES (?,?,1,1,?)")
+        .bind(&digest)
+        .bind("image/png")
+        .bind(&poster)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO artwork_selections(item_id,role,asset_id,revision) SELECT e.item_id,'poster',?,1 FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?")
+        .bind(&digest)
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    // Selected but not an asset of the title (unfetchable): not offered.
+    assert_eq!(roles(&f.get(&path, &auth).await.body), ["media"]);
+    sqlx::query("INSERT INTO item_artwork_assets(item_id,asset_id) SELECT e.item_id,? FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?")
+        .bind(&digest)
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let manifest = f.get(&path, &auth).await.body;
+    assert_eq!(roles(&manifest), ["media", "artwork"]);
+    let art = &manifest["files"][1];
+    assert_eq!(art["digest"], format!("sha256:{digest}"));
+    assert_eq!(art["size_bytes"], poster.len().to_string());
+    assert_eq!(art["relative_name"], "poster.png");
+    // The device can fetch exactly those bytes.
+    let (status, bytes) = f
+        .bytes(
+            art["media_url"].as_str().unwrap(),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!((status, bytes), (StatusCode::OK, poster));
+}
+
+/// The manifest carries the title's descriptive metadata as the catalog
+/// resolves it (a local correction outranks the NFO), bounded for the
+/// device, and nothing when the title has none.
+#[tokio::test]
+async fn manifests_carry_the_titles_bounded_metadata() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"described film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "metadata-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let path = format!(
+        "/api/v2/downloads/{}/manifest",
+        created.body["id"].as_str().unwrap()
+    );
+    let manifest = f.get(&path, &auth).await.body;
+    assert!(manifest.get("metadata").is_none(), "{manifest}");
+    let item: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&timeline)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    let genres: Vec<String> = (0..12).map(|n| format!("Genre {n}")).collect();
+    for (source, values) in [
+        (
+            "nfo",
+            json!({"release_year": 1999, "description": "From the NFO", "genres": genres}),
+        ),
+        (
+            "local",
+            json!({"description": "A corrected description.", "cast": [{"name": "Not offline"}]}),
+        ),
+    ] {
+        sqlx::query("INSERT INTO metadata_documents VALUES (?,?,1,NULL,?,1)")
+            .bind(&item)
+            .bind(source)
+            .bind(json!({"values": values, "tags": [], "excluded_tags": []}).to_string())
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let manifest = f.get(&path, &auth).await.body;
+    assert_eq!(
+        manifest["metadata"],
+        json!({
+            "release_year": 1999,
+            "description": "A corrected description.",
+            "genres": genres[..10],
+        })
+    );
+}
+
+/// An original's selected text subtitle travels beside it as WebVTT: pinned
+/// by digest in the manifest, served at exactly that digest, and released
+/// with the download. Only text subtitles of the exact revision qualify.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: ffmpeg not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let srt = f.dir.path().join("film.srt");
+    std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:01,500\nHello offline\n").unwrap();
+    let media = f.dir.path().join("subtitled.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10",
+            "-i",
+        ])
+        .arg(&srt)
+        .args([
+            "-t",
+            "2",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:s",
+            "mov_text",
+        ])
+        .arg(&media)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (timeline, _, _) = f.scanned("film.mp4", &std::fs::read(&media).unwrap()).await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let with_subtitle = |track: &str, policy: &str| {
+        let mut body = input(&device, &timeline);
+        body["tracks"]["subtitle_track_id"] = json!(track);
+        body["tracks"]["subtitle_policy"] = json!(policy);
+        body
+    };
+    // Named without `require`: a whole file cannot honour it.
+    problem(
+        &f.post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0001",
+            with_subtitle("s0", "off"),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "download_tracks_unavailable",
+    );
+    // No such text subtitle in this revision.
+    problem(
+        &f.post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0002",
+            with_subtitle("s1", "require"),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "download_subtitle_unavailable",
+    );
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0003",
+            with_subtitle("s0", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    assert_eq!(created.body["subtitle_track_id"], "s0");
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    // Concurrent first reads share one conversion and name the same file.
+    let conversions = playscale::v2::downloads::subtitle_conversions;
+    let before = conversions();
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let (manifest, second, third) = tokio::join!(
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        f.get(&path, &auth)
+    );
+    assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
+    assert_eq!(second.body["files"], manifest.body["files"]);
+    assert_eq!(third.body["files"], manifest.body["files"]);
+    assert_eq!(conversions() - before, 1);
+    let file = manifest.body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["role"] == "subtitle")
+        .unwrap()
+        .clone();
+    assert_eq!(file["relative_name"], "subtitles.vtt");
+    let url = file["media_url"].as_str().unwrap();
+    let (status, bytes) = f.bytes(url, &[("authorization", &auth)]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.starts_with("WEBVTT") && text.contains("Hello offline"),
+        "{text}"
+    );
+    use sha2::Digest;
+    assert_eq!(
+        file["digest"],
+        format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
+    );
+    assert_eq!(file["size_bytes"], bytes.len().to_string());
+    let current = f.get(&format!("/api/v2/downloads/{id}"), &auth).await;
+    assert_ne!(current.body["revision"], created.body["revision"]);
+    let media_size = created.body["size_bytes"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(
+        current.body["size_bytes"],
+        (media_size + bytes.len() as u64).to_string()
+    );
+    let report = |count| json!({"sequence":"1", "download_revision":current.body["revision"], "state":"verified_local", "bytes_received":count});
+    let partial = f
+        .call(
+            "PUT",
+            &format!("/api/v2/downloads/{id}/transfer"),
+            Some(report(media_size.to_string())),
+            &[("authorization", &auth)],
+        )
+        .await;
+    problem(
+        &partial,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_transfer",
+    );
+    let verified = f
+        .call(
+            "PUT",
+            &format!("/api/v2/downloads/{id}/transfer"),
+            Some(report((media_size + bytes.len() as u64).to_string())),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(verified.status, StatusCode::OK, "{}", verified.body);
+
+    // The same bytes on every manifest read; another digest is refused.
+    let again = f
+        .get(&format!("/api/v2/downloads/{id}/manifest"), &auth)
+        .await;
+    assert_eq!(again.body["files"], manifest.body["files"]);
+    let (status, _) = f
+        .bytes(
+            &format!(
+                "/api/v2/downloads/{id}/subtitles?digest=sha256:{}",
+                "0".repeat(64)
+            ),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Cancelling the download releases its subtitle file.
+    let root = &f.app.processing.root;
+    let kept = root
+        .parent()
+        .unwrap_or(root)
+        .join("download-subtitles")
+        .join(format!("{id}.vtt"));
+    assert!(kept.exists());
+    let cancelled = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/downloads/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    let released = async {
+        while kept.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), released)
+        .await
+        .expect("released");
+    let (status, _) = f.bytes(url, &[("authorization", &auth)]).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // A cancellation ordered while a conversion waits for the download's
+    // subtitle lock: nothing is converted or published afterwards.
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0004",
+            with_subtitle("s0", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let before = conversions();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let cancelling = async {
+        // Let the read reach the lock first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cancelled = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/downloads/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        drop(held);
+        cancelled
+    };
+    let (read, cancelled) = tokio::join!(f.get(&path, &auth), cancelling);
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    problem(&read, StatusCode::CONFLICT, "download_cancelled");
+    assert_eq!(conversions() - before, 0);
+    let kept = root
+        .parent()
+        .unwrap_or(root)
+        .join("download-subtitles")
+        .join(format!("{id}.vtt"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!kept.exists());
+
+    // A failing conversion (the revision's facts name a text subtitle the
+    // file does not carry) is attempted once for the reads waiting on it;
+    // a later read tries again.
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let mut tracks: Vec<Value> = serde_json::from_str(&tracks).unwrap();
+    let mut phantom = tracks
+        .iter()
+        .find(|t| t["kind"] == "subtitle")
+        .unwrap()
+        .clone();
+    phantom["codec"] = json!("subrip");
+    phantom["index"] = json!(99);
+    tracks.push(phantom);
+    sqlx::query("UPDATE media_files SET tracks_json=?")
+        .bind(serde_json::to_string(&tracks).unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0005",
+            with_subtitle("s1", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let before = conversions();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+    };
+    let (first, second, third, ()) = tokio::join!(
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        release
+    );
+    for read in [&first, &second, &third] {
+        problem(
+            read,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_conversion_failed",
+        );
+    }
+    assert_eq!(conversions() - before, 1);
+    let again = f.get(&path, &auth).await;
+    problem(
+        &again,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "subtitle_conversion_failed",
+    );
+    assert_eq!(conversions() - before, 1);
+    // Clear only the test's terminal artifact to exercise transient failure replay.
+    sqlx::query("DELETE FROM download_subtitle_artifacts WHERE download_id=?")
+        .bind(&id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    // A waiting read replays the failure it waited for as it was: an
+    // expired source stays expired (not a retry)...
+    let downloads = &playscale::v2::downloads::remember_subtitle_failure;
+    let before = conversions();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let fail = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        downloads(&f.app, &id, true);
+        drop(held);
+    };
+    let (read, ()) = tokio::join!(f.get(&path, &auth), fail);
+    problem(&read, StatusCode::CONFLICT, "download_expired");
+    // ...and a cancellation after the failure still answers as cancelled.
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let fail_then_cancel = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        downloads(&f.app, &id, false);
+        let cancelled = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/downloads/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        drop(held);
+        cancelled
+    };
+    let (read, cancelled) = tokio::join!(f.get(&path, &auth), fail_then_cancel);
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    problem(&read, StatusCode::CONFLICT, "download_cancelled");
+    assert_eq!(conversions() - before, 0);
+}
+
+#[tokio::test]
+async fn administrator_user_changes_fence_download_tickets_and_keep_history() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("user-download.mp4", b"0123456789").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let user_id = f.assign_user(&device).await;
+    let create = input(&device, &timeline);
+    let download = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "user-download-create",
+            create.clone(),
+        )
+        .await;
+    assert_eq!(download.status, StatusCode::ACCEPTED, "{}", download.body);
+    let id = download.body["id"].as_str().unwrap();
+    let ticket = f
+        .post(
+            "/api/v2/content-access",
+            &auth,
+            "user-download-ticket",
+            download_ticket(id),
+        )
+        .await;
+    assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
+    let url = ticket.body["url"].as_str().unwrap();
+    let operator = bearer(OPERATOR);
+    let path = format!("/api/v2/users/{user_id}");
+    let user = f.get(&path, &operator).await;
+    let mut edit = user.body;
+    edit.as_object_mut().unwrap().remove("id");
+    edit.as_object_mut().unwrap().remove("revision");
+    edit["permissions"] = json!(["catalog:read", "viewing:write"]);
+    let narrowed = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit.clone()),
+            &[
+                ("authorization", &operator),
+                ("if-match", user.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+    for method in ["GET", "HEAD"] {
+        assert_eq!(
+            f.raw(f.request(method, url, None, &[])).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        f.post("/api/v2/downloads", &auth, "user-download-create", create)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    edit["disabled"] = json!(true);
+    let disabled = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit),
+            &[
+                ("authorization", &operator),
+                ("if-match", narrowed.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(disabled.status, StatusCode::OK, "{}", disabled.body);
+    assert_eq!(f.bytes(url, &[]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(f.count("SELECT count(*) FROM downloads").await, 1);
+    assert_eq!(f.count("SELECT count(*) FROM devices").await, 1);
+    assert_eq!(f.count("SELECT count(*) FROM credentials").await, 0);
+    assert_eq!(f.count("SELECT count(*) FROM content_tickets").await, 0);
 }

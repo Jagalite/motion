@@ -56,6 +56,23 @@ enum CacheCommand {
         #[arg(long)]
         download_id: String,
     },
+    /// The person's choice for progress recorded before a server restore:
+    /// discard or reapply, against the server's current history. Reapply
+    /// reads the downloads' restored pins (a JSON array) from stdin.
+    Restore {
+        #[arg(long)]
+        choice: String,
+        #[arg(long)]
+        viewing_epoch: String,
+    },
+    /// Settle a removal the person made on this device with the server's
+    /// answer to deleting the download: deleted, absent or failed.
+    SettleRemoval {
+        #[arg(long)]
+        download_id: String,
+        #[arg(long)]
+        outcome: String,
+    },
     /// Delete blobs no manifest entry references (crash leftovers whose
     /// demand ended).
     Collect,
@@ -86,7 +103,8 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
         CacheCommand::Status => {
             let events = store.events()?;
             json!({"manifest":store.manifest(),"staged":store.staged()?,"usage":store.usage()?.to_string(),
-                "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string())})
+                "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string()),
+                "removals":store.removals()})
         }
         CacheCommand::Admit {
             incoming,
@@ -108,11 +126,42 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
+        CacheCommand::Restore {
+            choice,
+            viewing_epoch,
+        } => {
+            let choice = serde_json::from_value(serde_json::Value::String(choice))?;
+            // Re-applying reads the restored pins from stdin.
+            let pins: Vec<playscale_core::offline::DownloadIdentity> =
+                if matches!(choice, motion_ui_host::store::RestoreChoice::Reapply) {
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .take(1024 * 1024)
+                        .read_to_string(&mut input)?;
+                    serde_json::from_str(&input)?
+                } else {
+                    vec![]
+                };
+            serde_json::to_value(store.resolve_restore(choice, &viewing_epoch, &pins)?)?
+        }
+        CacheCommand::SettleRemoval {
+            download_id,
+            outcome,
+        } => {
+            let outcome = serde_json::from_value(serde_json::Value::String(outcome))?;
+            json!({"settled": store.settle_removal(&download_id, outcome)?})
+        }
         CacheCommand::Collect => {
             store.collect()?;
             json!({"collected": true})
         }
-        CacheCommand::Events => serde_json::to_value(store.events()?)?,
+        CacheCommand::Events => {
+            let mut value = serde_json::to_value(store.events()?)?;
+            value["reanchor"] = json!(store.pending_reanchor()?.map(|r| {
+                json!({"from_viewing_epoch": r.from_viewing_epoch, "through": r.through.to_string()})
+            }));
+            value
+        }
         CacheCommand::Acknowledge => {
             #[derive(serde::Deserialize)]
             struct Result {

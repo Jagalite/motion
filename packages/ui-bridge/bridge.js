@@ -57,10 +57,30 @@ function bodyOf(form) {
       case 'list': place(body, name, input.value.split(',').map(v => v.trim()).filter(Boolean)); break;
       case 'json': place(body, name, JSON.parse(input.value)); break;
       case 'minutes': place(body, input.dataset.target, Math.round(Number(input.value) * 60)); break;
+      // Seconds entered, whole milliseconds sent; blank is null.
+      case 'seconds-ms': place(body, name, text === '' ? null : Math.round(Number(text) * 1000)); break;
+      // Rates entered in Mbps or kbps, whole bits per second sent.
+      case 'mbps': place(body, name, Math.round(Number(text) * 1e6)); break;
+      case 'kbps': place(body, name, Math.round(Number(text) * 1e3)); break;
+      // A chosen subtitle is required; none turns subtitles off.
+      case 'subtitle-choice':
+        place(body, name, text === '' ? null : input.value);
+        place(body, input.dataset.policy, text === '' ? 'off' : 'require');
+        break;
       // Blank optional fields are omitted: the server reads absence as "no value".
       case 'optional': if (text !== '') place(body, name, input.value); break;
       case 'optional-int': if (text !== '') place(body, name, Number(text)); break;
       case 'nullable': place(body, name, text === '' ? null : input.value); break;
+      // One typed filter term ({field, operator, value}) appended to the
+      // array at `name`, only when a value is chosen; the array always exists.
+      case 'term': {
+        const terms = body[name] ??= [];
+        if (text === '') break;
+        const value = input.dataset.valueType === 'int' ? Number(text)
+          : input.dataset.valueType === 'bool' ? text === 'true' : text;
+        terms.push({field: input.dataset.field, operator: input.dataset.operator, value});
+        break;
+      }
       case 'member': {
         const path = name.split('.');
         let target = body;
@@ -95,6 +115,9 @@ async function call(method, path, body, headers = {}) {
 }
 
 function message(error) {
+  if (error.code === 'pairing_denied') return 'An administrator denied this pairing request. Ask them before starting a new request.';
+  if (error.code === 'pairing_expired') return 'The pairing code expired before it was approved. Start a new pairing request.';
+  if (error.code === 'invitation_unavailable') return 'This invitation is no longer available. Ask an administrator for a new code.';
   if (error.status === 409 || error.status === 412) return 'This changed somewhere else. Reload the page to see the latest version, then try again.';
   if (error.status === 401) return 'Your session has ended. Sign in again.';
   if (error.status === 403) return 'You are not allowed to do that.';
@@ -139,9 +162,56 @@ function definitelyRejected(error) {
   return Boolean(error.status) && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
 }
 
+// After a command the page is rendered again by the server. A keyboard or
+// screen-reader user keeps their place: the form that ran gets focus again
+// and its status says the command was done. A form is recognised by what it
+// acts on (its command, fixed fields and fixed body, not its revision or
+// revision preconditions), and
+// only when exactly one form on the new page matches; otherwise (it is gone,
+// or several look alike) focus goes to the main content. Never another
+// entry's action, which a repeated key press would then run.
+const AFTER_COMMAND = 'motion:after-command';
+// Revision preconditions (expected_revision, expected_group_revision,
+// timeline_revision, …) change with every successful command; they say
+// which state an action applies to, not which action it is.
+const PRECONDITION = /(^|\.)expected_|revision$/;
+function formIdentity(form) {
+  const fixed = [...form.querySelectorAll('input[type="hidden"][name]')]
+    .filter(input => !PRECONDITION.test(input.name))
+    .map(input => `${input.name}=${input.value}`);
+  const body = form.querySelector('[data-json-body]')?.value ?? '';
+  return JSON.stringify([form.dataset.command, fixed, body]);
+}
+function reloadAfter(form) {
+  try {
+    sessionStorage.setItem(AFTER_COMMAND, JSON.stringify({page: location.pathname + location.search, form: formIdentity(form)}));
+  } catch { /* Without storage the page reloads at its top, as before. */ }
+  location.reload();
+}
+function restoreAfterReload() {
+  let saved = null;
+  try {
+    saved = JSON.parse(sessionStorage.getItem(AFTER_COMMAND) ?? 'null');
+    sessionStorage.removeItem(AFTER_COMMAND);
+  } catch { return; }
+  if (!saved || saved.page !== location.pathname + location.search) return;
+  if (document.activeElement?.matches?.('main [role="alert"]')) return;
+  const matches = [...document.querySelectorAll('form[data-command]')].filter(f => formIdentity(f) === saved.form);
+  const form = matches.length === 1 ? matches[0] : null;
+  // A form inside closed disclosures is shown again before it takes focus.
+  for (let parent = form?.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName === 'DETAILS') parent.open = true;
+  }
+  const status = form?.querySelector('.command-status');
+  if (status) status.textContent = 'Done.';
+  (form?.querySelector('button[type="submit"]:not([disabled])') ?? document.getElementById('main'))?.focus();
+}
+restoreAfterReload();
+
 const submitting = new WeakSet();
 async function submitCommand(form) {
   if (submitting.has(form)) return;
+  if (form.classList.contains('invitation')) return redeemBrowserInvitation(form);
   submitting.add(form);
   const [method, path] = form.dataset.command.split(' ');
   const status = form.querySelector('.command-status');
@@ -177,7 +247,7 @@ async function submitCommand(form) {
       }
       return showPlan(form, result, body);
     }
-    location.reload();
+    reloadAfter(form);
   } catch (error) {
     // Only a definite rejection ends this request's identity; 5xx, 408/429
     // and network failures may have been applied, so a retry reuses the key.
@@ -232,7 +302,7 @@ function showPlan(form, plan, request = {}) {
     try {
       await call(method, path, {plan_token: plan.plan_token}, {'Idempotency-Key': keyFor(identity)});
       settleKey(identity);
-      location.reload();
+      reloadAfter(form);
     } catch (error) {
       if (definitelyRejected(error)) settleKey(identity);
       if (status) {
@@ -261,7 +331,7 @@ async function pair(form, pairing) {
       return;
     } catch (error) {
       // Not approved yet, polling too fast, or no response: keep trying until expiry.
-      const transient = !error.status || error.status === 409 || error.status === 429 || error.status >= 500;
+      const transient = !error.status || error.code === 'pairing_pending' || error.status === 429 || error.status >= 500;
       if (!transient) {
         status.textContent = message(error);
         status.setAttribute('role', 'alert');
@@ -317,3 +387,34 @@ document.addEventListener('click', event => {
   event.preventDefault();
   history.back();
 });
+
+// Invitation secrets and retry identities stay only in memory, never in URL,
+// logs or the ordinary command idempotency storage (whose key includes a body).
+const invitationClaims = new WeakMap();
+async function redeemBrowserInvitation(form) {
+  if (submitting.has(form)) return;
+  submitting.add(form);
+  const status = form.querySelector('.command-status');
+  const button = form.querySelector('button[type="submit"]');
+  const input = bodyOf(form);
+  let claim = invitationClaims.get(form);
+  if (!claim || claim.body.code !== input.code) {
+    claim = {body: {...input, claim_id: newKey()}, credential: null};
+    invitationClaims.set(form, claim);
+  }
+  try {
+    button?.setAttribute('disabled', '');
+    status.textContent = 'Redeeming invitation…';
+    claim.credential ??= await call('POST', '/api/v2/auth/invitations/redeem', claim.body);
+    await call('POST', '/api/v2/auth/session', {kind: 'credential', credential: claim.credential.access_token});
+    invitationClaims.delete(form);
+    form.reset?.();
+    location.reload();
+  } catch (error) {
+    status.textContent = message(error);
+    status.setAttribute('role', 'alert');
+  } finally {
+    submitting.delete(form);
+    button?.removeAttribute('disabled');
+  }
+}

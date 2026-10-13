@@ -12,7 +12,7 @@ async function request(path, body) {
   const response = await fetch(path, {method: body ? 'POST' : 'GET', credentials: 'same-origin', redirect: 'error', cache: 'no-store',
     headers: body ? {'Content-Type': 'application/json', 'X-Motion-Cache': '1'} : {},
     body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(path.startsWith('/cache/open/') ? 120000 : 10000)});
-  if (!response.ok) throw new Error(`Local download request failed (${response.status}). Keep this window open and retry.`);
+  if (!response.ok) throw Object.assign(new Error(`Local download request failed (${response.status}). Keep this window open and retry.`), {status: response.status});
   return response.json();
 }
 function flush() {
@@ -40,6 +40,24 @@ function observe(state, force = false) {
   latest = {position_ms: Math.min(context.duration_ms, Math.max(0, Math.round(state.currentTime * 1000))), status: state.status};
   void flush().catch(fail);
 }
+function snapshotClosePath() {
+  const ticket = /^\/cache\/media\/([a-f0-9]{32})$/.exec(context?.media_url ?? '')?.[1];
+  return ticket ? `/cache/close/${ticket}` : null;
+}
+async function releaseSnapshot() {
+  const path = snapshotClosePath();
+  if (path) await request(path, {});
+}
+async function disposePlayer() {
+  try {
+    await element?.destroy();
+  } finally {
+    // A decoder/provider teardown failure must not retain the host's disk copy.
+    // Readers already admitted by the host keep their own file handle.
+    element?.remove();
+    await releaseSnapshot();
+  }
+}
 async function close() {
   if (closing) return closing;
   closing = (async () => {
@@ -47,8 +65,7 @@ async function close() {
     unsubscribe?.();
     if (element?.player) observe({...element.player.state, status: element.player.state.status === 'ended' ? 'ended' : 'stopped'}, true);
     await flush(); // Failure keeps native close/navigation retryable.
-    await element?.destroy();
-    element?.remove();
+    await disposePlayer();
   })().catch(error => { closing = null; fail(error); throw error; });
   return closing;
 }
@@ -58,13 +75,28 @@ async function start() {
   if (retired) return;
   definePlayerElement();
   context = await request(`/cache/open/${encodeURIComponent(host.dataset.downloadId)}`, {});
-  if (retired) return;
+  if (retired) { await releaseSnapshot(); return; }
   element = document.createElement('demuxe-player');
   element.setAttribute('asset-base', base);
   element.controls = true; element.showSourceControls = false; element.allowFileDrop = false;
   host.append(element);
   await element.open(context.media_url, {startTime: context.position_ms / 1000});
-  if (retired) { await element.destroy(); return; }
+  if (retired) { await disposePlayer(); return; }
+  // The subtitles saved with the download (verified WebVTT in file time).
+  // A player that cannot show them is not left playing without them (or
+  // without progress recording): it is disposed and the page says why.
+  if (host.dataset.subtitlesUrl) {
+    try {
+      if (typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the saved subtitles.');
+      await element.player.addTextTrack({src: new URL(host.dataset.subtitlesUrl, location.origin).href, label: 'Subtitles', default: true});
+    } catch (error) {
+      const failed = element;
+      element = null;
+      await failed.destroy();
+      failed.remove();
+      throw error;
+    }
+  }
   host.querySelector('.status-panel')?.remove();
   host.dataset.state = 'ready';
   unsubscribe = element.player.subscribe(state => observe(state));
@@ -80,6 +112,32 @@ document.addEventListener('click', event => {
   event.preventDefault();
   void close().then(() => location.assign(link.href)).catch(() => {});
 });
-addEventListener('pagehide', () => { retired = true; unsubscribe?.(); void element?.destroy(); });
+// Removing a saved title asks first; the host keeps its offline progress.
+document.addEventListener('click', event => {
+  const button = event.target?.closest?.('[data-remove-download]');
+  if (!button || button.disabled) return;
+  const id = button.dataset.removeDownload;
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return;
+  const title = button.closest('.card')?.querySelector('.card-title')?.textContent ?? 'this title';
+  if (!confirm(`Remove "${title}" from this device? Its saved progress is kept.`)) return;
+  const status = document.getElementById('offline-removal');
+  button.disabled = true;
+  void request(`/cache/remove/${encodeURIComponent(id)}`, {}).then(() => location.reload(), error => {
+    // Already gone (an earlier attempt completed it): show the current list.
+    if (error.status === 404) { location.reload(); return; }
+    button.disabled = false;
+    if (status) { status.textContent = 'This title could not be removed now. Close any title that is playing and try again.'; status.setAttribute('role', 'alert'); }
+    else fail(error);
+  });
+});
+addEventListener('pagehide', () => {
+  retired = true; unsubscribe?.(); void element?.destroy();
+  const path = snapshotClosePath();
+  if (path) void fetch(path, {method: 'POST', credentials: 'same-origin', redirect: 'error', keepalive: true,
+    headers: {'Content-Type': 'application/json', 'X-Motion-Cache': '1'}, body: '{}'}).catch(() => {});
+});
 addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
-if (host) void start().catch(error => { host.dataset.state = 'failed'; fail(error); });
+if (host) void start().catch(async error => {
+  host.dataset.state = 'failed'; fail(error);
+  await disposePlayer().catch(() => {});
+});

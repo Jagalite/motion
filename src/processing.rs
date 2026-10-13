@@ -105,12 +105,15 @@ pub struct Runtime {
     pub io: Arc<Semaphore>,
     pub inspection: Arc<Semaphore>,
     pub maintenance: tokio::sync::Mutex<()>,
+    pub artifacts: Arc<crate::artifact_leases::Registry>,
     /// Shared encoder capacity; released only after confirmed worker termination.
     pub execution: Arc<crate::execution::Coordinator>,
     /// Hardware encoder sessions, accounted like CPU capacity.
     pub hardware: Arc<crate::execution::Coordinator>,
     /// Whether this machine can open a VideoToolbox encoder session (probed once).
     pub videotoolbox: tokio::sync::OnceCell<bool>,
+    /// The tone-mapping filters the configured FFmpeg has (probed once).
+    pub filters: tokio::sync::OnceCell<playscale_core::color::Filters>,
     /// Executable that accepts `--internal-ffmpeg-supervisor`.
     pub supervisor: PathBuf,
     /// Live delivery sessions share the execution infrastructure.
@@ -123,9 +126,11 @@ impl Runtime {
             io: Arc::new(Semaphore::new(1)),
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
+            artifacts: Arc::default(),
             execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
             hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
             videotoolbox: tokio::sync::OnceCell::new(),
+            filters: tokio::sync::OnceCell::new(),
             supervisor: std::env::current_exe().unwrap_or_default(),
             deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
             root,
@@ -732,20 +737,33 @@ async fn convert(
             .await?;
     let selected: Option<crate::v2::processing::Tracks> =
         selected.as_deref().map(serde_json::from_str).transpose()?;
-    let audio = selected
-        .and_then(|tracks| tracks.audio_track_id)
-        .map(|id| format!("0:a:{}", &id[1..]))
-        .unwrap_or_else(|| "0:a:0?".into());
-    cmd.args([
-        "-map",
-        "0:v:0?",
-        "-map",
-        &audio,
-        "-sn",
-        "-dn",
-        "-map_metadata",
-        "-1",
-    ]);
+    // The request recorded the selection resolved on this source revision
+    // (`v2::processing`): `a{n}` and `s{n}` stream ordinals.
+    let ordinal = |id: Option<&String>, prefix: char| -> anyhow::Result<Option<u32>> {
+        id.map(|id| {
+            id.strip_prefix(prefix)
+                .and_then(|n| n.parse().ok())
+                .context("unreadable track selection")
+        })
+        .transpose()
+    };
+    let audio = ordinal(
+        selected.as_ref().and_then(|t| t.audio_track_id.as_ref()),
+        'a',
+    )?
+    .map(|n| format!("0:a:{n}"))
+    .unwrap_or_else(|| "0:a:0?".into());
+    let subtitle = ordinal(
+        selected.as_ref().and_then(|t| t.subtitle_track_id.as_ref()),
+        's',
+    )?;
+    cmd.args(["-map", "0:v:0?", "-map", &audio]);
+    match subtitle {
+        // A selected text subtitle is kept as the output's only subtitle.
+        Some(n) => cmd.args(["-map", &format!("0:s:{n}")]),
+        None => cmd.arg("-sn"),
+    };
+    cmd.args(["-dn", "-map_metadata", "-1"]);
     match job.recipe.as_str() {
         "remux_mp4" => {
             cmd.args(["-c", "copy"]);
@@ -773,6 +791,10 @@ async fn convert(
             cmd.args(profile.arguments(job.backend == "videotoolbox"));
         }
         _ => anyhow::bail!("unknown recipe"),
+    }
+    if subtitle.is_some() {
+        // After the recipe's codecs: MP4 carries text subtitles as mov_text.
+        cmd.args(["-c:s", "mov_text"]);
     }
     cmd.args(["-movflags", "+faststart", "-fs"])
         .arg(app.processing.settings.max_output_bytes.to_string())
@@ -829,6 +851,7 @@ async fn convert(
                     frame_rate: p.frame_rate.as_ref().and_then(|r| r.value()),
                 }
             }),
+            subtitle: subtitle.is_some(),
         },
     )
     .map_err(anyhow::Error::msg)?;
@@ -858,6 +881,36 @@ async fn convert(
         media_ms,
     )
     .await?;
+    if subtitle.is_some() {
+        // Probe shape alone does not prove the selected subtitle decodes.
+        let mut decode_subtitle = Command::new(&app.processing.settings.ffmpeg);
+        decode_subtitle
+            .args(["-v", "error", "-xerror", "-nostdin", "-y", "-i"])
+            .arg(&output)
+            .args([
+                "-map",
+                "0:s:0",
+                "-c:s",
+                "webvtt",
+                "-progress",
+                "pipe:1",
+                "-f",
+                "webvtt",
+            ])
+            .arg(directory.join("validated-subtitles.vtt"));
+        command(
+            app,
+            job,
+            stop,
+            lease,
+            &directory.join(".owner"),
+            &mut decode_subtitle,
+            false,
+            media_ms,
+        )
+        .await?;
+        tokio::fs::remove_file(directory.join("validated-subtitles.vtt")).await?;
+    }
     let (root, identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&source.library_id)
@@ -1040,6 +1093,60 @@ pub async fn videotoolbox_available(app: &App) -> bool {
             )
         })
         .await
+}
+
+/// Which tone-mapping filters the configured FFmpeg lists (`ffmpeg -filters`),
+/// cached for the process. Unknown (a failed or slow probe) reports none, so
+/// HDR conversion is refused rather than attempted.
+pub async fn filters(app: &App) -> playscale_core::color::Filters {
+    *app.processing
+        .filters
+        .get_or_init(|| async {
+            let probe = Command::new(&app.processing.settings.ffmpeg)
+                .args(["-hide_banner", "-nostdin", "-filters"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(Duration::from_secs(20), probe).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    listed_filters(&String::from_utf8_lossy(&output.stdout))
+                }
+                _ => Default::default(),
+            }
+        })
+        .await
+}
+
+/// Parse `ffmpeg -filters`: each filter line is flags, name, pads, description.
+fn listed_filters(text: &str) -> playscale_core::color::Filters {
+    let names: std::collections::BTreeSet<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let flags = fields.next()?;
+            (flags.len() <= 3 && flags.chars().all(|c| matches!(c, '.' | 'T' | 'S' | 'C')))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .collect();
+    playscale_core::color::Filters {
+        zscale: names.contains("zscale"),
+        tonemap: names.contains("tonemap"),
+        subtitles: names.contains("subtitles"),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    #[test]
+    fn filters_are_read_from_the_listing_not_descriptions() {
+        let listing = "Filters:\n  T.. = Timeline support\n ---\n .S zscale            V->V       Apply resizing.\n .S tonemap           V->V       Conversion to/from different dynamic ranges.\n";
+        let found = super::listed_filters(listing);
+        assert!(found.zscale && found.tonemap && !found.subtitles);
+        let without = " .. scale  V->V  Mentions zscale and tonemap in a description.\n";
+        assert_eq!(super::listed_filters(without), Default::default());
+    }
 }
 
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
@@ -1545,6 +1652,7 @@ mod publication_tests {
                 bytes: 1,
                 duration: Some(1.0),
                 tracks: vec![],
+                chapters: None,
                 reused: false,
                 nfo: crate::nfo::Sidecar::Absent,
             };
@@ -1620,6 +1728,7 @@ mod publication_tests {
                     bytes: 1,
                     duration: Some(1.0),
                     tracks: vec![],
+                    chapters: None,
                     reused: false,
                     nfo: crate::nfo::Sidecar::Absent,
                 },

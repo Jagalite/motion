@@ -4,7 +4,7 @@ use crate::{
     assets,
     facade::{BoxFuture, UiResult},
 };
-use playscale_core::offline::{CacheScope, DownloadIdentity};
+use playscale_core::offline::{CacheScope, DownloadIdentity, OfflineMetadata};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use topcoat::{
@@ -27,6 +27,34 @@ pub struct CachedDownload {
     /// resume offline once local events were acknowledged and compacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_position_ms: Option<u64>,
+    /// The title's poster, saved and verified with the download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<CachedArtwork>,
+    /// The selected text subtitle, saved and verified with the download as
+    /// WebVTT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitles: Option<CachedSubtitles>,
+    /// The title's descriptive metadata from the manifest
+    /// (`offline::kept_metadata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<OfflineMetadata>,
+}
+
+/// A verified image saved with a download (its blob is named by SHA-256).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedArtwork {
+    pub sha256: String,
+    pub size: u64,
+    pub content_type: String,
+}
+
+/// Verified WebVTT saved with a download (its blob is named by SHA-256).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedSubtitles {
+    pub sha256: String,
+    pub size: u64,
 }
 
 pub trait OfflinePresentationReader: Send + Sync + 'static {
@@ -68,8 +96,21 @@ async fn downloads(cx: &Cx) -> Result<impl View> {
         <p>"Server: " (scope.server_id.as_str()) " · Profile: " (scope.profile_id.as_str())</p>
         if downloads.is_empty() { <p class="status-panel">"No verified downloads are available for this profile."</p> }
         <ul class="grid" aria-label="Downloads">
-        for item in downloads { <li class="card"><a href=(format!("/download/{}",item.identity.download_id))><span class="card-title">(item.title)</span><span class="card-meta">"Saved on this device"</span></a></li> }
+        for item in downloads {
+            <li class="card"><a href=(format!("/download/{}",item.identity.download_id))>
+                if item.artwork.is_some() {
+                    <img class="card-art" src=(format!("/cache/artwork/{}", item.identity.download_id)) alt="" loading="lazy" decoding="async">
+                }
+                <span class="card-title">(item.title.as_str())</span>
+                <span class="card-meta">
+                    if let Some(year) = item.metadata.as_ref().and_then(|m| m.release_year) { (year.to_string()) " · " }
+                    "Saved on this device"
+                </span></a>
+                <button type="button" class="card-action" data-remove-download=(item.identity.download_id.as_str())>"Remove from this device"</button></li>
+        }
         </ul>
+        <p id="offline-removal" role="status"></p>
+        <p class="muted small">"Removing a title frees its space on this device only. Progress saved here is kept and sent to your server later, and the download is removed from your server's list when this device next connects."</p>
     })
 }
 
@@ -86,7 +127,18 @@ async fn player(cx: &Cx) -> Result<impl View> {
         .ok_or_else(topcoat::router::error::not_found)?;
     Ok(view! {
         <h1>(item.title)</h1>
-        <div id="motion-offline-player" class="player-host" data-download-id=(item.identity.download_id) data-demuxe-base=(assets::DEMUXE_BASE)>
+        if let Some(metadata) = &item.metadata {
+            if metadata.release_year.is_some() || !metadata.genres.is_empty() {
+                <p class="muted">
+                    if let Some(year) = metadata.release_year { (year.to_string()) }
+                    if metadata.release_year.is_some() && !metadata.genres.is_empty() { " · " }
+                    (metadata.genres.join(", "))
+                </p>
+            }
+            if let Some(description) = &metadata.description { <p class="overview">(description.as_str())</p> }
+        }
+        <div id="motion-offline-player" class="player-host" data-download-id=(item.identity.download_id.as_str()) data-demuxe-base=(assets::DEMUXE_BASE)
+            data-subtitles-url=(item.subtitles.as_ref().map(|_| format!("/cache/subtitles/{}", item.identity.download_id)).unwrap_or_default())>
             <p class="status-panel" role="status">"Verifying saved media…"</p>
         </div>
         <p id="offline-progress" role="status">"Playback progress is saved locally."</p>

@@ -123,6 +123,35 @@ pub struct TimelineView {
     /// None means the viewing service is unavailable, not an unstarted title.
     pub viewing: Option<TimelineViewing>,
     pub versions: Vec<VersionView>,
+    /// Ready prepared versions a device may save instead of the original,
+    /// each with exactly the selection it kept.
+    pub prepared_downloads: Vec<PreparedDownload>,
+    /// More prepared versions exist than were read for the offer.
+    pub prepared_incomplete: bool,
+    /// Originals a download may save with one of their text subtitles.
+    pub subtitle_downloads: Vec<SubtitleDownload>,
+}
+
+/// A whole single-file original whose text subtitles a download can carry
+/// (as WebVTT), pinned to exactly this version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtitleDownload {
+    pub version_id: String,
+    pub label: String,
+    /// (track ID `s{n}` of the file's revision, label).
+    pub tracks: Vec<(String, String)>,
+}
+
+/// A ready prepared version offered for download.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDownload {
+    /// Recipe and kept tracks, in words.
+    pub label: String,
+    pub recipe_id: String,
+    /// The selection it kept (TrackSelection JSON), sent unchanged.
+    pub tracks_json: String,
+    /// Its generated version: the download pins exactly this rendition.
+    pub version_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +186,20 @@ pub struct PlayerView {
     pub audio_version: Option<String>,
     /// The exact file revision `audio_tracks` describe; a chosen track pins it.
     pub audio_file: Option<(String, String)>,
+    /// Markers in effect for the timeline's current revision, by start.
+    pub markers: Vec<MarkerView>,
+}
+
+/// A chapter or a skippable interval (intro, recap, credits) of a timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerView {
+    /// chapter | intro | recap | credits
+    pub kind: String,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub label: Option<String>,
+    /// Found automatically and not confirmed: shown as uncertain.
+    pub detected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +221,8 @@ pub struct PreferencesView {
     pub allow_client_software_decode: bool,
     pub autoplay: bool,
     pub completion_percent: f64,
+    /// Streaming limit in bits per second; None means no limit.
+    pub max_bitrate_bps: Option<u64>,
     pub etag: String,
 }
 
@@ -310,6 +355,9 @@ pub struct FileRow {
     pub availability: Availability,
     /// Audio streams as (planning track ID `a{n}`, label).
     pub audio_tracks: Vec<(String, String)>,
+    /// Text subtitle streams a preparation can keep, as (track ID `s{n}`,
+    /// label); `n` counts every subtitle stream of the revision.
+    pub subtitle_tracks: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,11 +401,62 @@ pub struct MembershipRow {
     pub toggle_body: String,
 }
 
+/// A title that could be merged into the one being managed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeCandidate {
+    pub id: String,
+    pub title: String,
+    pub revision: String,
+}
+
+/// One version of a title's timelines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionRow {
+    pub id: String,
+    pub label: String,
+}
+
+/// An explicit play order (aired, DVD, absolute, custom) of one edition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderGroupView {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub edition: String,
+    /// The group revision a placement is fenced with.
+    pub revision: String,
+}
+
+/// One of the title's timelines and its current place in an order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedTimeline {
+    pub id: String,
+    pub edition: String,
+    pub etag: String,
+    pub group_id: Option<String>,
+    pub position: Option<u64>,
+}
+
+/// The title's explicit play orders and where its timelines are placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderingView {
+    /// (edition ID, label) an order can be created for.
+    pub editions: Vec<(String, String)>,
+    pub groups: Vec<OrderGroupView>,
+    pub timelines: Vec<OrderedTimeline>,
+}
+
 /// Everything the title management page shows. Sections are `None` when the
 /// principal lacks the permission or the read is unavailable; the page says which.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemManageView {
     pub item: ItemCard,
+    /// The item's catalog revision (merge and split plans are fenced by it).
+    pub item_revision: String,
+    /// Other readable titles with this one's title, as merge sources.
+    pub merge_candidates: Option<Vec<MergeCandidate>>,
+    /// Every version of the item's timelines, as split choices.
+    pub versions: Option<Vec<VersionRow>>,
     pub library_ids: Vec<String>,
     pub match_state: String,
     pub item_etag: String,
@@ -368,6 +467,32 @@ pub struct ItemManageView {
     pub timelines: Option<Vec<PrepareTimeline>>,
     pub collections: Option<Vec<MembershipRow>>,
     pub playlists: Option<Vec<MembershipRow>>,
+    /// Play orders (catalog:write).
+    pub ordering: Option<OrderingView>,
+    /// Chapters and skip markers per timeline (catalog:write).
+    pub markers: Option<Vec<TimelineMarkersView>>,
+}
+
+/// One stored marker as listed for correction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredMarkerView {
+    pub kind: String,
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub label: Option<String>,
+    /// embedded | manual | detected | imported
+    pub provenance: String,
+    /// Validated against the timeline's current revision (else not in effect).
+    pub current: bool,
+}
+
+/// A timeline's markers and the revision a new one is checked against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimelineMarkersView {
+    pub timeline_id: String,
+    pub edition: String,
+    pub revision: String,
+    pub markers: Vec<StoredMarkerView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +501,10 @@ pub struct CollectionView {
     pub name: String,
     /// manual | smart
     pub kind: String,
+    /// The saved filter a smart collection follows.
+    pub filter_id: Option<String>,
+    /// Readable members in all (a smart collection shows only its first few).
+    pub member_count: usize,
     pub etag: String,
     pub items: Vec<ItemCard>,
     /// Exact replacement bodies removing each listed item, in `items` order.
@@ -399,11 +528,32 @@ pub struct PlaylistView {
     pub entry_bodies: Vec<(String, Option<String>)>,
 }
 
+/// One condition of a saved filter, as the API stores it (`FilterTerm`); the
+/// value is rendered as text (`true`, `1990`, `movie`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterTermView {
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+}
+
+/// A saved filter of the current profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFilterView {
+    pub id: String,
+    pub name: String,
+    pub etag: String,
+    pub terms: Vec<FilterTermView>,
+    /// A smart collection uses it (the server refuses deleting it).
+    pub in_use: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrganizeView {
     pub profile_id: String,
     pub collections: Vec<CollectionView>,
     pub playlists: Vec<PlaylistView>,
+    pub filters: Vec<SavedFilterView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -426,6 +576,9 @@ pub struct DownloadRow {
     /// ready | cancelled | expired
     pub state: String,
     pub size_bytes: u64,
+    /// What the device last reported about its copy (state, bytes), as it
+    /// reported it; None when it reported nothing.
+    pub device_transfer: Option<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

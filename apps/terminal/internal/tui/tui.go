@@ -69,6 +69,8 @@ type notice struct {
 
 // Model is the interface state.
 type Model struct {
+	access      *accessDialog
+	accessEpoch int
 	ctx         context.Context
 	backend     Backend
 	server      string
@@ -311,6 +313,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case accessDone:
+		return m.accessFinished(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case spinner.TickMsg:
@@ -368,6 +372,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.signedOut(msg.err)
 			return nil
 		}
+		if (msg.key == keyUsers || msg.key == keyPairings || msg.key == keyInvitations || msg.key == keyDevices) && revoked(msg.err) {
+			m.forgetAccess()
+			return m.load(keySession)
+		}
 		if (msg.key == keyPlayback || msg.key == keyHistory) && (!m.watchesPlayback() || revoked(msg.err)) {
 			// A late answer after access ended, or the server withdrawing it.
 			m.forgetPlayback()
@@ -396,6 +404,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 			if !m.admin() {
 				m.forgetMetrics()
+				m.forgetAccess()
 			}
 			var leave tea.Cmd
 			if !m.watchesPlayback() {
@@ -580,6 +589,9 @@ func (m Model) navIndex() int {
 func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.String() == "ctrl+c" {
 		return tea.Quit
+	}
+	if m.access != nil {
+		return m.accessKey(msg)
 	}
 	if m.confirm != "" {
 		switch {
@@ -799,6 +811,7 @@ func unauthenticated(err error) bool {
 // device's credential: nothing it showed may stay on screen, not even the
 // sidebar's libraries, until the user refreshes after pairing again.
 func (m *Model) signedOut(err error) {
+	m.forgetAccess()
 	for key := range m.cache.slots {
 		m.drop(key)
 	}

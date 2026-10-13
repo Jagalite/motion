@@ -25,6 +25,8 @@ pub struct Track {
     #[serde(default)]
     pub height: Option<u32>,
     #[serde(default)]
+    pub rotation_degrees: i32,
+    #[serde(default)]
     pub average_frame_rate: Option<crate::encoding::FrameRate>,
     #[serde(default)]
     pub bitrate: Option<u64>,
@@ -45,6 +47,70 @@ pub struct Track {
     pub commentary: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The version of the probe that recorded this stream. Version 1
+    /// (completion item 3) records colour facts beyond the transfer and
+    /// attachment MIME types and sizes; streams recorded by an older probe
+    /// that later policies need facts from are probed again by the next scan
+    /// (`lacks_probe_facts`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub probe_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_primaries: Option<String>,
+    /// Matrix coefficients (ffprobe `color_space`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mastering_peak_nits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cll_nits: Option<u32>,
+    /// Dolby Vision profile and base-layer signal compatibility ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dolby_vision: Option<(u8, u8)>,
+    /// An attachment's declared MIME type and size (bounds font extraction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_bytes: Option<u64>,
+}
+
+/// The scanner's current stream probe version (`Track::probe_version`).
+pub const PROBE_VERSION: u32 = 2;
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+impl Track {
+    pub fn display_dimensions(&self) -> (u32, u32) {
+        let size = (self.width.unwrap_or(0), self.height.unwrap_or(0));
+        if matches!(self.rotation_degrees.rem_euclid(360), 90 | 270) {
+            (size.1, size.0)
+        } else {
+            size
+        }
+    }
+
+    /// The probed colour facts the core HDR policy decides from.
+    pub fn color_facts(&self) -> playscale_core::color::ColorFacts<'_> {
+        playscale_core::color::ColorFacts {
+            transfer: self.color_transfer.as_deref(),
+            primaries: self.color_primaries.as_deref(),
+            matrix: self.color_space.as_deref(),
+            range: self.color_range.as_deref(),
+            mastering_peak_nits: self.mastering_peak_nits,
+            max_cll_nits: self.max_cll_nits,
+            dolby_vision: self.dolby_vision,
+        }
+    }
+
+    /// A stream probed before the facts later policies need were recorded:
+    /// an HDR video stream's colour facts, or an attachment's MIME type and
+    /// size (which bound burned-subtitle fonts). The next scan probes it again.
+    pub fn lacks_probe_facts(&self) -> bool {
+        self.probe_version < PROBE_VERSION && matches!(self.kind.as_str(), "video" | "attachment")
+    }
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Item {
@@ -78,6 +144,10 @@ pub struct ItemRow {
     pub duration_seconds: Option<f64>,
     pub tracks_json: String,
     pub available: bool,
+    /// Probed container chapters (`media_files.chapters_json`); None until
+    /// probed.
+    #[sqlx(default)]
+    pub chapters_json: Option<String>,
 }
 impl ItemRow {
     pub fn public(self) -> Item {
@@ -173,7 +243,41 @@ pub async fn connect_with(
         });
     }
     crate::upgrade::run(&db, backup.as_ref()).await?;
+    capture_restore_baseline(&db).await?;
     Ok(db)
+}
+
+/// After a restore (a pending `restore_baseline_epoch` for the current
+/// restore epoch), capture each timeline's viewing as restored: after
+/// migrations, before anything is served, in one transaction.
+async fn capture_restore_baseline(db: &SqlitePool) -> anyhow::Result<()> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('restore_baseline_epoch','restore_baselines','timeline_viewing','server_identity')",
+    )
+    .fetch_one(db)
+    .await?;
+    if tables < 4 {
+        return Ok(());
+    }
+    let mut tx = begin_write(db).await?;
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT b.restore_epoch FROM restore_baseline_epoch b JOIN server_identity s ON s.restore_epoch=b.restore_epoch WHERE b.singleton=1 AND b.captured=0",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if pending.is_some() {
+        sqlx::query("DELETE FROM restore_baselines")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) SELECT profile_id,timeline_id,revision,manual_epoch FROM timeline_viewing")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE restore_baseline_epoch SET captured=1 WHERE singleton=1")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn prepare_upgrade(
@@ -593,6 +697,10 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    // The final path must not become bootable until authority withdrawal commits.
+    // VACUUM creates this unique staging file exclusively; publication below also
+    // refuses an existing destination even if it appeared during the restore.
+    let staging = destination.with_file_name(format!(".motion-restore-{}.sqlite", new_id()));
     // Copy through SQLite so committed WAL content is included and the
     // destination is a single clean file, never a torn file-level copy.
     {
@@ -602,15 +710,15 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         )
         .await?;
         sqlx::query("VACUUM INTO ?")
-            .bind(destination.to_str().context("destination must be UTF-8")?)
+            .bind(staging.to_str().context("destination must be UTF-8")?)
             .execute(&mut source)
             .await?;
         source.close().await?;
     }
-    let restored = match connect(destination).await {
+    let restored = match connect(&staging).await {
         Ok(db) => db,
         Err(error) => {
-            let _ = tokio::fs::remove_file(destination).await;
+            let _ = tokio::fs::remove_file(&staging).await;
             return Err(error.context("restored database could not be upgraded"));
         }
     };
@@ -633,10 +741,40 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
             .fetch_one(&restored)
             .await?;
+        // The new history and its pending baseline in one transaction; the
+        // database is migrated already, so the baseline is captured now.
+        let mut tx = restored.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO server_viewing_histories(viewing_epoch) SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .execute(&mut *tx).await?;
         sqlx::query("UPDATE server_identity SET restore_epoch=?")
             .bind(&epoch)
-            .execute(&restored)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("INSERT INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,?,0) ON CONFLICT(singleton) DO UPDATE SET restore_epoch=excluded.restore_epoch,captured=0")
+            .bind(&epoch)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO server_viewing_histories(viewing_epoch) SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .execute(&mut *tx).await?;
+        // A snapshot cannot prove post-snapshot revocations. Withdraw saved
+        // authority atomically with the new restore history and baseline.
+        for statement in [
+            "DELETE FROM access_invitations",
+            "DELETE FROM signin_outbox",
+            "DELETE FROM signin_transactions",
+            "DELETE FROM signin_requests",
+            "DELETE FROM signin_proofs",
+            "UPDATE signin_families SET revoked=1,revision=revision+1",
+            "DELETE FROM content_tickets",
+            "DELETE FROM pairings",
+            "DELETE FROM idempotency_records",
+            "DELETE FROM credentials",
+            "UPDATE devices SET revoked=1",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        capture_restore_baseline(&restored).await?;
         Some(epoch)
     } else {
         None
@@ -658,6 +796,36 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         .bind(serde_json::to_string(&receipt)?)
         .execute(&restored)
         .await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&restored)
+        .await?;
     restored.close().await;
+    tokio::fs::File::open(&staging).await?.sync_all().await?;
+    // A hard link publishes atomically without replacing a concurrent destination.
+    tokio::fs::hard_link(&staging, destination).await?;
+    tokio::fs::remove_file(&staging).await?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tokio::fs::File::open(parent).await?.sync_all().await?;
     Ok(receipt)
+}
+
+#[cfg(test)]
+#[test]
+fn preview_geometry_uses_display_rotation() {
+    for rotation in [0, 90, -90, 180, 270] {
+        let track: Track = serde_json::from_value(serde_json::json!({"index":0,"kind":"video","codec":"h264","language":null,"width":1920,"height":1080,"rotation_degrees":rotation})).unwrap();
+        let expected = if matches!(rotation, 90 | -90 | 270) {
+            (1080, 1920)
+        } else {
+            (1920, 1080)
+        };
+        assert_eq!(track.display_dimensions(), expected);
+        assert!(
+            track.lacks_probe_facts(),
+            "old video probe must refresh orientation"
+        );
+    }
 }

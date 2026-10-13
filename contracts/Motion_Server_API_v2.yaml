@@ -197,6 +197,54 @@ paths:
         '503':
           $ref: '#/components/responses/E503'
   /api/v2/auth/pairings:
+    get:
+      operationId: listPairings
+      summary: List pairing requests and recent outcomes
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: List permitted devices.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/PairingSummaryPage"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/Cursor"
+      - "$ref": "#/components/parameters/Limit"
     post:
       operationId: createPairing
       summary: Create a rate-limited pairing request
@@ -798,6 +846,470 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/AccessPolicyInput'
+  "/api/v2/users":
+    get:
+      operationId: listAccessUsers
+      summary: List named access users
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: List permitted devices.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessUserPage"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/Cursor"
+      - "$ref": "#/components/parameters/Limit"
+    post:
+      operationId: createAccessUser
+      summary: Create an access identity
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '201':
+          description: Create a profile.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessUser"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/IdempotencyKey"
+      - "$ref": "#/components/parameters/Csrf"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/AccessUserInput"
+  "/api/v2/users/{user_id}":
+    parameters:
+    - name: user_id
+      in: path
+      required: true
+      schema:
+        "$ref": "#/components/schemas/Id"
+    get:
+      operationId: getAccessUser
+      summary: Read an access user
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: Read a device and its revision.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessUser"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+    put:
+      operationId: replaceAccessUser
+      summary: Replace user grants and enabled state
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: Replace mutable profile settings.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessUser"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+        '412':
+          "$ref": "#/components/responses/E412"
+        '428':
+          "$ref": "#/components/responses/E428"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/IfMatch"
+      - "$ref": "#/components/parameters/Csrf"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/AccessUserInput"
+      description: If-Match protects the reviewed user revision. Changes atomically
+        narrow all owned devices and advance their revisions. Disabling deletes their
+        credentials and dependent tickets. Widening never silently widens existing devices.
+        The last usable administrator cannot be disabled or demoted. Offline bytes cannot
+        be retroactively erased; unsynchronized viewing records remain retained.
+  "/api/v2/auth/pairings/{pairing_id}/deny":
+    parameters:
+    - name: pairing_id
+      in: path
+      required: true
+      schema:
+        "$ref": "#/components/schemas/Id"
+    post:
+      operationId: denyPairing
+      summary: Deny a pending pairing request
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '204':
+          description: Revoke device credentials and fence its deliveries.
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+        '412':
+          "$ref": "#/components/responses/E412"
+        '428':
+          "$ref": "#/components/responses/E428"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/IdempotencyKey"
+      - "$ref": "#/components/parameters/Csrf"
+      description: The immutable pending request is the decision precondition; deny
+        and approve compete atomically. Repeating the same denial key returns its saved
+        acknowledgement.
+  "/api/v2/auth/invitations":
+    get:
+      operationId: listAccessInvitations
+      summary: List invitation metadata without codes
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: List permitted devices.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessInvitationPage"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/Cursor"
+      - "$ref": "#/components/parameters/Limit"
+    post:
+      operationId: createAccessInvitation
+      summary: Issue a single-use access invitation
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '201':
+          description: Create a profile.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/AccessInvitation"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/IdempotencyKey"
+      - "$ref": "#/components/parameters/Csrf"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/AccessInvitationInput"
+  "/api/v2/auth/invitations/{invitation_id}":
+    parameters:
+    - name: invitation_id
+      in: path
+      required: true
+      schema:
+        "$ref": "#/components/schemas/Id"
+    delete:
+      operationId: revokeAccessInvitation
+      summary: Revoke an unused invitation
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '204':
+          description: Revoke device credentials and fence its deliveries.
+        '400':
+          "$ref": "#/components/responses/E400"
+        '401':
+          "$ref": "#/components/responses/E401"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '404':
+          "$ref": "#/components/responses/E404"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+        '412':
+          "$ref": "#/components/responses/E412"
+        '428':
+          "$ref": "#/components/responses/E428"
+      x-required-permission: system:admin
+      parameters:
+      - "$ref": "#/components/parameters/IfMatch"
+      - "$ref": "#/components/parameters/Csrf"
+  "/api/v2/auth/invitations/redeem":
+    post:
+      operationId: redeemAccessInvitation
+      summary: Redeem preapproved access
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      responses:
+        '200':
+          description: Claim approved device credentials.
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/Credential"
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                "$ref": "#/components/schemas/Id"
+        '400':
+          "$ref": "#/components/responses/E400"
+        '403':
+          "$ref": "#/components/responses/E403"
+        '409':
+          "$ref": "#/components/responses/E409"
+        '413':
+          "$ref": "#/components/responses/E413"
+        '422':
+          "$ref": "#/components/responses/E422"
+        '429':
+          "$ref": "#/components/responses/E429"
+        '500':
+          "$ref": "#/components/responses/E500"
+        '503':
+          "$ref": "#/components/responses/E503"
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              "$ref": "#/components/schemas/InvitationRedemption"
   /api/v2/profiles:
     get:
       operationId: listProfiles
@@ -1844,6 +2356,23 @@ paths:
       parameters:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/Limit'
+      - name: order
+        in: query
+        required: false
+        description: '`id` (default) pages by scan ID. `recent` pages newest first in admission order; its
+          cursors stay stable while new scans are admitted, which appear only on a fresh first page.'
+        schema:
+          type: string
+          enum:
+          - id
+          - recent
+      - name: library_id
+        in: query
+        required: false
+        description: Only scans of this library. Narrows the authorized rows; an unknown or unreadable library
+          yields an empty page.
+        schema:
+          $ref: '#/components/schemas/Id'
   /api/v2/scans/{scan_id}:
     parameters:
     - name: scan_id
@@ -2021,6 +2550,14 @@ paths:
         schema:
           type: string
           maxLength: 200
+      - name: ids
+        in: query
+        required: false
+        description: A batched read of 1-100 distinct comma-separated live item IDs. Authorization applies as for
+          any page; merged aliases and unknown or unreadable IDs match nothing.
+        schema:
+          type: string
+          maxLength: 12900
       - name: sort
         in: query
         required: false
@@ -3840,6 +4377,31 @@ paths:
       required: true
       schema:
         $ref: '#/components/schemas/Id'
+    get:
+      operationId: getArtworkSelection
+      summary: Read effective artwork and selection provenance for every role
+      tags: [metadata]
+      x-owner: A04
+      x-milestone: M3
+      x-status: implementation_target
+      x-required-permission: catalog:read
+      responses:
+        '200':
+          description: Role selections with item ETag, immutable asset identities, local selection revisions and contributing sources.
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtworkSelectionView'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
     put:
       operationId: selectArtwork
       summary: Select artwork for a logical item
@@ -3898,6 +4460,164 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/ArtworkSelection'
+  /api/v2/catalog/timelines/{timeline_id}/previews:
+    parameters:
+    - name: timeline_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    get:
+      operationId: getTimelinePreviews
+      summary: Read the trick-play previews of a timeline's original
+      description: Thumbnail sheets of the timeline's whole single-file original at its current revision,
+        ready (with their layout and sheet URLs), pending (a job is rendering them) or none. Thumbnail n
+        (from 0) shows the picture at n * interval_ms; it is tile n mod (columns*rows) of sheet n div
+        (columns*rows) + 1, row by row.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The timeline's previews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelinePreviews'
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: catalog:read
+    post:
+      operationId: createTimelinePreviews
+      summary: Render trick-play previews of a timeline's original
+      description: Queues a preview job for the original's current revision and answers with the pending
+        manifest (202), or answers with the manifest as it already is, pending or ready (200); never
+        duplicated. The job is named by job_id; its details are its requester's (getJob). preview_unavailable
+        when the timeline has no whole single-file original with a known duration and picture.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: This revision's previews are already rendering or ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelinePreviews'
+        '202':
+          description: A preview job was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimelinePreviews'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: processing:request
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/Csrf'
+  /api/v2/media/files/{file_id}/previews/{sheet}:
+    parameters:
+    - name: file_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    - name: sheet
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+    - name: revision
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    - name: layout
+      in: query
+      required: true
+      description: Opaque layout identity from the manifest sheet URL; changes with technical metadata.
+      schema:
+        type: string
+    get:
+      operationId: getPreviewSheet
+      summary: Read one trick-play preview sheet
+      description: A published sheet (JPEG) of the file's current revision, only to a caller who may read
+        the file.
+      tags:
+      - media
+      x-owner: A06
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The sheet.
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: catalog:read
   /api/v2/catalog/timelines/{timeline_id}/markers:
     parameters:
     - name: timeline_id
@@ -3953,6 +4673,17 @@ paths:
       parameters:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/Limit'
+      - name: effective
+        in: query
+        required: false
+        description: Only the markers in effect for the timeline's current revision (a manual correction
+          outranks embedded, imported and detected markers). Otherwise every marker, each with the timeline
+          revision it was validated against and its provenance. The effective set is decided over every
+          marker, so a page cursor of this view is bound to the set it was read from; if markers or the
+          timeline change between pages, the next page is refused with 409 `markers_changed` and the
+          reader starts again.
+        schema:
+          type: boolean
     post:
       operationId: createMarker
       summary: Add a manually corrected marker
@@ -5055,6 +5786,13 @@ paths:
       parameters:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/Limit'
+      - name: timeline_id
+        in: query
+        required: false
+        description: Only renditions prepared for this timeline. Narrows the authorized rows; an unknown or
+          unreadable timeline yields an empty page.
+        schema:
+          $ref: '#/components/schemas/Id'
   /api/v2/jobs:
     get:
       operationId: listJobs
@@ -6632,6 +7370,12 @@ paths:
       parameters:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/Limit'
+      - name: active_only
+        in: query
+        description: Filter cancelled history before pagination. Uncancelled demands are capped at 500 per device, including derived-expired demands.
+        schema:
+          type: boolean
+          default: false
   /api/v2/downloads/{download_id}:
     parameters:
     - name: download_id
@@ -6770,6 +7514,124 @@ paths:
         '503':
           $ref: '#/components/responses/E503'
       x-required-permission: downloads:manage
+  /api/v2/downloads/{download_id}/subtitles:
+    parameters:
+    - name: download_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    - name: digest
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Digest'
+    get:
+      operationId: getDownloadSubtitles
+      summary: Read a download's subtitle file at the digest its manifest names
+      description: The selected text subtitle of the pinned file as WebVTT, converted once for the download.
+        Served only while the download is ready and only at exactly the digest its manifest names; otherwise
+        409 download_subtitles_changed (read the manifest again) or download_expired.
+      tags:
+      - offline
+      x-owner: A13
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The WebVTT bytes the manifest pins.
+          content:
+            text/vtt:
+              schema:
+                type: string
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: downloads:manage
+  /api/v2/downloads/{download_id}/transfer:
+    parameters:
+    - name: download_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    put:
+      operationId: reportDownloadTransfer
+      summary: Report this device's copy of its download
+      description: Only the download's own device reports what it holds (queued, transferring, verified_local,
+        failed or removed, with the bytes it has). Reports carry the device's own increasing sequence and the
+        download revision the device observed; an exact retry changes nothing, an earlier sequence is refused
+        as transfer_report_stale and a reused one with other content as transfer_report_conflict, a report
+        about another revision as download_changed, and after the download ended only removed is accepted
+        (download_ended). verified_local requires every byte. The server stores the report as reported and
+        never derives one from its own state.
+      tags:
+      - offline
+      x-owner: A13
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The download with this device's stored report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Download'
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong resource ETag where a resource revision is returned.
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '413':
+          $ref: '#/components/responses/E413'
+        '422':
+          $ref: '#/components/responses/E422'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: downloads:manage
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadTransferInput'
   /api/v2/offline/sync:
     post:
       operationId: syncOffline
@@ -9097,6 +9959,1691 @@ paths:
       - bearerAuth: []
       - cookieAuth: []
       - mediaTicket: []
+  /api/v2/devices/{device_id}/user:
+    parameters:
+    - name: device_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    put:
+      operationId: assignDeviceUser
+      summary: Assign an unassigned device to an explicit local user
+      description: Requires the current device ETag and target user revision. Atomically intersects the
+        device approval with the user ceiling and preserves the last usable administrator. Does not transfer
+        an already owned device or revive a revoked device. Device principal and viewing identities remain
+        unchanged. Legacy devices remain unassigned until this explicit action.
+      tags:
+      - identity
+      x-owner: A08
+      x-milestone: M1
+      x-status: implementation_target
+      x-required-permission: system:admin
+      parameters:
+      - $ref: '#/components/parameters/IfMatch'
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceUserInput'
+      responses:
+        '200':
+          description: The explicitly owned device and its new revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+          headers:
+            ETag:
+              schema:
+                type: string
+                maxLength: 256
+              description: Strong device revision ETag.
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '413':
+          $ref: '#/components/responses/E413'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+  /api/v2/auth/methods:
+    get:
+      operationId: getSigninMethods
+      summary: Get signin methods
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninMethods'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+  /api/v2/auth/oidc/{provider_id}/start:
+    post:
+      operationId: startOidcSignin
+      summary: Start oidc signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Login is public. Link, reauthentication and disabled-provider tests require current initiating
+        credentials. Link/test require fresh proof. Sets a separate HttpOnly SameSite=Lax browser-binding
+        cookie. Uses configured public origin, PKCE, nonce and random state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninStarted'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - name: provider_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninStart'
+  /api/v2/auth/oidc/callback:
+    get:
+      operationId: finishOidcSignin
+      summary: Finish oidc signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Browser-bound callback. Durably reserves the exchange, verifies the provider response,
+        and atomically consumes the transaction with linking or bounded family issuance. Unknown identities
+        receive a request only; approval requires a new login. Provider tokens are discarded. Redirects
+        to local sign-in status with no-store and no-referrer.
+      responses:
+        '303':
+          description: Completed.
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - name: state
+        in: query
+        required: true
+        schema:
+          type: string
+      - name: code
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: error
+        in: query
+        required: false
+        schema:
+          type: string
+  /api/v2/auth/email/start:
+    post:
+      operationId: startEmailSignin
+      summary: Start email signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Opt-in. Generic response for known, unknown and disabled recipients. Enrollment requires
+        an owned initiating device and fresh proof; login never enrolls an address. Delivery uses a bounded
+        encrypted outbox and same-browser code entry.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailStarted'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailStart'
+  /api/v2/auth/email/{transaction_id}/finish:
+    post:
+      operationId: finishEmailSignin
+      summary: Finish email signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: POST-only code consumption requires exact Origin and the requesting browser binding.
+        Five attempts, expiry, current revisions and restore epoch are enforced atomically. No GET consumes
+        a code.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninFinished'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - name: transaction_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailFinish'
+  /api/v2/auth/transactions/{transaction_id}:
+    get:
+      operationId: getSigninTransaction
+      summary: Get signin transaction
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Only the bound initiating browser can read this transaction status.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninTransaction'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - name: transaction_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+  /api/v2/auth/me:
+    get:
+      operationId: getMySignin
+      summary: Get my signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninMe'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+  /api/v2/auth/identities:
+    get:
+      operationId: listMySigninIdentitys
+      summary: List my signin identitys
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninIdentityPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/auth/sessions:
+    get:
+      operationId: listMySigninSessions
+      summary: List my signin sessions
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninSessionPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/admin/auth/identities:
+    get:
+      operationId: listAdminSigninIdentitys
+      summary: List admin signin identitys
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninIdentityPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/admin/auth/sessions:
+    get:
+      operationId: listAdminSigninSessions
+      summary: List admin signin sessions
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninSessionPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/auth/identities/{id}:
+    delete:
+      operationId: unlinkSigninIdentity
+      summary: Unlink signin identity
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '204':
+          description: Completed.
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+  /api/v2/auth/sessions/{id}:
+    delete:
+      operationId: revokeSigninSession
+      summary: Revoke signin session
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '204':
+          description: Completed.
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+  /api/v2/auth/proofs:
+    post:
+      operationId: createSigninProof
+      summary: Create signin proof
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProofCreated'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninProofInput'
+  /api/v2/auth/proofs/{id}:
+    get:
+      operationId: getSigninProof
+      summary: Get signin proof
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProof'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+  /api/v2/auth/proofs/{id}/approve:
+    post:
+      operationId: approveSigninProof
+      summary: Approve signin proof
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Authority is rechecked against current user, device and method state.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProofResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninProofApproval'
+  /api/v2/admin/auth/fresh-approvals:
+    get:
+      operationId: listSigninProofs
+      summary: List signin proofs
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProofPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/admin/auth/overview:
+    get:
+      operationId: getSigninOverview
+      summary: Get signin overview
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninOverview'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+  /api/v2/admin/auth/settings:
+    put:
+      operationId: replaceSigninSettings
+      summary: Replace signin settings
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninSettings'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninSettingsInput'
+  /api/v2/admin/auth/restore-review:
+    get:
+      operationId: getSigninRestoreReview
+      summary: Get signin restore review
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninOverview'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+    post:
+      operationId: reviewRestoredSignin
+      summary: Review restored signin
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Verified local operator only. Acknowledge review of restored users, grants and provider
+        settings before allowing new SSO/email sign-ins. Does not revive pre-restore families or transactions;
+        legacy pairing restore behavior is separate.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninRestoreResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+  /api/v2/admin/auth/providers:
+    get:
+      operationId: listSigninProviders
+      summary: List signin providers
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProviderPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+    post:
+      operationId: createSigninProvider
+      summary: Create signin provider
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '201':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProvider'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninProviderInput'
+  /api/v2/admin/auth/providers/{id}:
+    put:
+      operationId: replaceSigninProvider
+      summary: Replace signin provider
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninProvider'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninProviderInput'
+  /api/v2/admin/auth/providers/{id}/test:
+    post:
+      operationId: testSigninProvider
+      summary: Test signin provider
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: SystemAdmin and fresh proof. Test discovery/configuration for the saved revision; actual
+        administrator-bound browser login must also pass before enabling the draft.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninTestResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+  /api/v2/admin/auth/email:
+    get:
+      operationId: getSigninEmailSettings
+      summary: Get signin email settings
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailSettings'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+    put:
+      operationId: replaceSigninEmailSettings
+      summary: Replace signin email settings
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailSettings'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailInput'
+  /api/v2/admin/auth/email/test:
+    post:
+      operationId: testSigninEmail
+      summary: Test signin email
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninTestResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailTest'
+  /api/v2/admin/auth/requests:
+    get:
+      operationId: listSigninRequests
+      summary: List signin requests
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninRequestPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/admin/auth/requests/{id}/approve:
+    post:
+      operationId: approveSigninRequest
+      summary: Approve signin request
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninRequestResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninRequestApproval'
+  /api/v2/admin/auth/requests/{id}/deny:
+    post:
+      operationId: denySigninRequest
+      summary: Deny signin request
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninRequestResult'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+  /api/v2/admin/auth/users/{id}:
+    get:
+      operationId: getSigninUserDetails
+      summary: Get signin user details
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninUserDetails'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+  /api/v2/admin/auth/users/{id}/revoke:
+    post:
+      operationId: revokeSigninUser
+      summary: Revoke signin user
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '204':
+          description: Completed.
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+  /api/v2/admin/auth/audit:
+    get:
+      operationId: listSigninAudit
+      summary: List signin audit
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninAuditPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
 components:
   securitySchemes:
     bearerAuth:
@@ -9478,6 +12025,10 @@ components:
           anyOf:
           - $ref: '#/components/schemas/Id'
           - type: 'null'
+        user_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
         profile_ids:
           type: array
           items:
@@ -9496,6 +12047,7 @@ components:
       required:
       - id
       - device_id
+      - user_id
       - profile_ids
       - permissions
       - policy_revision
@@ -9512,6 +12064,312 @@ components:
       - ttl_seconds
       description: Issue short-lived API access from the authenticated device or integration credential.
         Scope is inherited and never expanded; revocation is checked against the parent credential.
+    GrantPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        library_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+          maxItems: 200
+        allow_unrated:
+          type: boolean
+        allowed_ratings:
+          type: array
+          items:
+            type: string
+            maxLength: 64
+          maxItems: 200
+        deny_rated:
+          type: boolean
+          default: false
+          description: Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains
+            independent.
+        blocked_labels:
+          type: array
+          items:
+            type: string
+            maxLength: 100
+          maxItems: 200
+      required:
+      - library_ids
+      - allow_unrated
+      - allowed_ratings
+      - blocked_labels
+    AccessUserInput:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        disabled:
+          type: boolean
+        profile_ids:
+          type: array
+          maxItems: 200
+          items:
+            "$ref": "#/components/schemas/Id"
+        permissions:
+          "$ref": "#/components/schemas/Permissions"
+        policy:
+          "$ref": "#/components/schemas/GrantPolicy"
+      required:
+      - name
+      - disabled
+      - profile_ids
+      - permissions
+      - policy
+    AccessUser:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          "$ref": "#/components/schemas/Id"
+        revision:
+          "$ref": "#/components/schemas/Revision"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        disabled:
+          type: boolean
+        profile_ids:
+          type: array
+          maxItems: 200
+          items:
+            "$ref": "#/components/schemas/Id"
+        permissions:
+          "$ref": "#/components/schemas/Permissions"
+        policy:
+          "$ref": "#/components/schemas/GrantPolicy"
+      required:
+      - id
+      - revision
+      - name
+      - disabled
+      - profile_ids
+      - permissions
+      - policy
+    PairingSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          "$ref": "#/components/schemas/Id"
+        device_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        client_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        user_code:
+          type: string
+          minLength: 1
+          maxLength: 32
+        created_at:
+          "$ref": "#/components/schemas/Timestamp"
+        expires_at:
+          "$ref": "#/components/schemas/Timestamp"
+        status:
+          type: string
+          enum:
+          - pending
+          - approved
+          - denied
+          - claimed
+          - expired
+      required:
+      - id
+      - device_name
+      - client_name
+      - user_code
+      - created_at
+      - expires_at
+      - status
+    AccessInvitationInput:
+      type: object
+      additionalProperties: false
+      properties:
+        user_id:
+          "$ref": "#/components/schemas/Id"
+        user_revision:
+          "$ref": "#/components/schemas/Revision"
+        profile_ids:
+          type: array
+          maxItems: 200
+          items:
+            "$ref": "#/components/schemas/Id"
+        permissions:
+          "$ref": "#/components/schemas/Permissions"
+        policy:
+          "$ref": "#/components/schemas/GrantPolicy"
+        ttl_seconds:
+          type: integer
+          minimum: 60
+          maximum: 86400
+      required:
+      - user_id
+      - user_revision
+      - profile_ids
+      - permissions
+      - policy
+      - ttl_seconds
+      description: Explicit grant bounded by the selected user revision. Administration
+        is never selected by default. Any later user edit or issuer credential/revision
+        loss invalidates unused invitations and claim retries.
+    AccessInvitation:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          "$ref": "#/components/schemas/Id"
+        user_id:
+          "$ref": "#/components/schemas/Id"
+        revision:
+          "$ref": "#/components/schemas/Revision"
+        profile_ids:
+          type: array
+          maxItems: 200
+          items:
+            "$ref": "#/components/schemas/Id"
+        permissions:
+          "$ref": "#/components/schemas/Permissions"
+        policy:
+          "$ref": "#/components/schemas/GrantPolicy"
+        created_at:
+          "$ref": "#/components/schemas/Timestamp"
+        expires_at:
+          "$ref": "#/components/schemas/Timestamp"
+        status:
+          type: string
+          enum:
+          - unused
+          - claimed
+          - revoked
+          - expired
+          - invalidated
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+      required:
+      - id
+      - user_id
+      - revision
+      - profile_ids
+      - permissions
+      - policy
+      - created_at
+      - expires_at
+      - status
+      description: Code is a scoped bearer secret returned only on creation or an authorized
+        creation retry; never in lists, logs, events or URLs. Claim consumes it atomically
+        with one device credential. Revoke a claimed invitation by revoking its device.
+    InvitationRedemption:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 128
+        claim_id:
+          type: string
+          pattern: "^[0-9a-fA-F]{32}$"
+        device_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        client_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+      required:
+      - code
+      - claim_id
+      - device_name
+      - client_name
+      description: Generate a random 128-bit claim_id; retain the exact body across transport
+        retries. A different claimant cannot replay an issued credential. Global durable
+        admission is 30 attempts per 60 seconds, including unknown codes, and survives
+        restart.
+    AccessUserPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            "$ref": "#/components/schemas/AccessUser"
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - "$ref": "#/components/schemas/Cursor"
+          - type: 'null'
+        read_revision:
+          "$ref": "#/components/schemas/Revision"
+        event_cursor:
+          "$ref": "#/components/schemas/Cursor"
+      required:
+      - items
+      - next_cursor
+      - read_revision
+      - event_cursor
+      description: One committed read snapshot per response. Subsequent cursor pages are
+        not a frozen database snapshot. See the event reset protocol in the design.
+    PairingSummaryPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            "$ref": "#/components/schemas/PairingSummary"
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - "$ref": "#/components/schemas/Cursor"
+          - type: 'null'
+        read_revision:
+          "$ref": "#/components/schemas/Revision"
+        event_cursor:
+          "$ref": "#/components/schemas/Cursor"
+      required:
+      - items
+      - next_cursor
+      - read_revision
+      - event_cursor
+      description: One committed read snapshot per response. Subsequent cursor pages are
+        not a frozen database snapshot. See the event reset protocol in the design.
+    AccessInvitationPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            "$ref": "#/components/schemas/AccessInvitation"
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - "$ref": "#/components/schemas/Cursor"
+          - type: 'null'
+        read_revision:
+          "$ref": "#/components/schemas/Revision"
+        event_cursor:
+          "$ref": "#/components/schemas/Cursor"
+      required:
+      - items
+      - next_cursor
+      - read_revision
+      - event_cursor
+      description: One committed read snapshot per response. Subsequent cursor pages are
+        not a frozen database snapshot. See the event reset protocol in the design.
     PairingRequest:
       type: object
       additionalProperties: false
@@ -9564,14 +12422,24 @@ components:
         profile_ids:
           type: array
           items:
-            $ref: '#/components/schemas/Id'
+            "$ref": "#/components/schemas/Id"
           maxItems: 200
         permissions:
-          $ref: '#/components/schemas/Permissions'
+          "$ref": "#/components/schemas/Permissions"
+        user_id:
+          "$ref": "#/components/schemas/Id"
+        user_revision:
+          "$ref": "#/components/schemas/Revision"
+        policy:
+          "$ref": "#/components/schemas/GrantPolicy"
       required:
       - user_code
       - profile_ids
       - permissions
+      description: Select an explicit user and its revision; grant must fit the user ceiling.
+        Omitted user_id preserves the legacy single-device identity workflow. Compare
+        the displayed user code with the requesting device; names are untrusted. Concurrent
+        deny/approve are mutually exclusive.
     PairingClaim:
       type: object
       additionalProperties: false
@@ -9642,21 +12510,29 @@ components:
       additionalProperties: false
       properties:
         id:
-          $ref: '#/components/schemas/Id'
+          "$ref": "#/components/schemas/Id"
         name:
           type: string
           maxLength: 100
         revision:
-          $ref: '#/components/schemas/Revision'
+          "$ref": "#/components/schemas/Revision"
         profile_ids:
           type: array
           items:
-            $ref: '#/components/schemas/Id'
+            "$ref": "#/components/schemas/Id"
           maxItems: 200
         permissions:
-          $ref: '#/components/schemas/Permissions'
+          "$ref": "#/components/schemas/Permissions"
         revoked:
           type: boolean
+        user_id:
+          anyOf:
+          - "$ref": "#/components/schemas/Id"
+          - type: 'null'
+        client_name:
+          type: string
+          minLength: 1
+          maxLength: 100
       required:
       - id
       - name
@@ -9664,6 +12540,8 @@ components:
       - profile_ids
       - permissions
       - revoked
+      - user_id
+      - client_name
     ProfileInput:
       type: object
       additionalProperties: false
@@ -9726,6 +12604,13 @@ components:
           type: number
           minimum: 50
           maximum: 100
+        max_bitrate_bps:
+          anyOf:
+          - type: string
+            pattern: ^[1-9][0-9]{0,19}$
+          - type: 'null'
+          description: The profile's streaming limit in bits per second, which its players send as a plan's
+            quality.max_bitrate_bps. Null or absent means no limit; the document is replaced as a whole.
       required:
       - audio_languages
       - subtitle_languages
@@ -9754,6 +12639,11 @@ components:
             type: string
             maxLength: 64
           maxItems: 200
+        deny_rated:
+          type: boolean
+          default: false
+          description: Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains
+            independent.
         blocked_labels:
           type: array
           items:
@@ -9786,6 +12676,11 @@ components:
             type: string
             maxLength: 64
           maxItems: 200
+        deny_rated:
+          type: boolean
+          default: false
+          description: Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains
+            independent.
         blocked_labels:
           type: array
           items:
@@ -10839,6 +13734,29 @@ components:
           $ref: '#/components/schemas/Revision'
         file:
           $ref: '#/components/schemas/FileRef'
+        subject:
+          type: object
+          additionalProperties: false
+          description: The proposal's file, readably. title and item_id name the title the file is currently
+            cataloged under only when the caller may read it; otherwise both are null and only the file name
+            is shown.
+          properties:
+            file_name:
+              type: string
+              maxLength: 4096
+            item_id:
+              anyOf:
+              - $ref: '#/components/schemas/Id'
+              - type: 'null'
+            title:
+              anyOf:
+              - type: string
+                maxLength: 500
+              - type: 'null'
+          required:
+          - file_name
+          - item_id
+          - title
         status:
           type: string
           enum:
@@ -10857,6 +13775,7 @@ components:
       - id
       - revision
       - file
+      - subject
       - status
       - candidates
     MatchDecision:
@@ -10933,6 +13852,41 @@ components:
       - size_bytes
       - content_url
       - source_revision
+    ArtworkSelectionView:
+      type: object
+      additionalProperties: false
+      required: [item_id, revision, roles]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        roles:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: object
+            additionalProperties: false
+            required: [role, asset_id, selection_revision, pinned, sources, conflict]
+            properties:
+              role:
+                type: string
+                enum: [poster, backdrop, thumbnail, banner]
+              asset_id:
+                anyOf:
+                - $ref: '#/components/schemas/Id'
+                - type: 'null'
+              selection_revision:
+                $ref: '#/components/schemas/Revision'
+              pinned:
+                type: boolean
+              sources:
+                type: array
+                items:
+                  type: string
+              conflict:
+                type: boolean
     ArtworkSelection:
       type: object
       additionalProperties: false
@@ -11915,7 +14869,13 @@ components:
           - type: 'null'
           description: Required exactly when recipe_id is video_profile. All values are included in the immutable preparation digest.
         tracks:
-          $ref: '#/components/schemas/TrackSelection'
+          allOf:
+          - $ref: '#/components/schemas/TrackSelection'
+          description: Streams of the exact source revision the preparation keeps. Audio may be chosen by track
+            or component (they must agree). A subtitle is kept only when chosen explicitly with subtitle_policy
+            require, and only an embedded text subtitle (SubRip, mov_text or WebVTT), as the output's only subtitle;
+            subtitle_policy auto is refused because automatic selection depends on a profile. A rendition serves
+            playback only for exactly the selection it kept.
       required:
       - source
       - timeline_id
@@ -11950,6 +14910,21 @@ components:
           - stale
           - failed
           - expired
+        recipe_id:
+          description: The recipe it was prepared with.
+          $ref: '#/components/schemas/Id'
+        tracks:
+          description: The selection it kept, as recorded on its source revision (track pins resolved to
+            that revision's streams). createDownload with this recipe_id and selection downloads exactly it.
+          anyOf:
+          - $ref: '#/components/schemas/TrackSelection'
+          - type: 'null'
+        version_id:
+          description: The generated version binding its output to the timeline; pin it (createDownload
+            version_id) to save exactly this rendition. Null before it is published.
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
       required:
       - id
       - revision
@@ -12353,6 +15328,48 @@ components:
       - current_entry_id
       - repeat
       - shuffle_seed
+    TimelinePreviews:
+      type: object
+      additionalProperties: false
+      properties:
+        timeline_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          type: string
+          enum:
+          - ready
+          - pending
+          - none
+        file_id:
+          $ref: '#/components/schemas/Id'
+        file_revision:
+          $ref: '#/components/schemas/Id'
+        job_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        interval_ms:
+          type: integer
+          minimum: 1
+        tile_width:
+          type: integer
+        tile_height:
+          type: integer
+        columns:
+          type: integer
+        rows:
+          type: integer
+        tiles:
+          type: integer
+        sheets:
+          type: array
+          maxItems: 1000
+          items:
+            type: string
+            maxLength: 4096
+      required:
+      - timeline_id
+      - status
     DownloadInput:
       type: object
       additionalProperties: false
@@ -12368,6 +15385,14 @@ components:
           - $ref: '#/components/schemas/Id'
           - type: 'null'
         recipe_id:
+          description: Null downloads the original file whole; tracks may then only name one text subtitle
+            track of its exact revision with subtitle_policy require, which travels beside it as WebVTT
+            (download_subtitle_unavailable when it is not a text subtitle). Audio pins and components are
+            refused for an original. A recipe
+            downloads the ready prepared version of that recipe that is current for its source and carries
+            exactly the selected tracks (resolved like createPreparation on the source revision it was prepared
+            from); otherwise download_preparation_unavailable. Nothing is prepared on request and another
+            selection is never substituted.
           anyOf:
           - $ref: '#/components/schemas/Id'
           - type: 'null'
@@ -12416,6 +15441,18 @@ components:
           anyOf:
           - $ref: '#/components/schemas/Id'
           - type: 'null'
+        subtitle_track_id:
+          description: The text subtitle track of the pinned file saved beside it as WebVTT (a subtitle
+            file in the manifest); null for none.
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        device_transfer:
+          description: What the download's own device last reported about its copy (reportDownloadTransfer), as
+            reported; null when it reported nothing. The server's state above never implies it.
+          anyOf:
+          - $ref: '#/components/schemas/DownloadTransfer'
+          - type: 'null'
       required:
       - id
       - revision
@@ -12426,6 +15463,54 @@ components:
       - manifest_asset_id
       - size_bytes
       - job_id
+    DownloadTransferState:
+      type: string
+      enum:
+      - queued
+      - transferring
+      - verified_local
+      - failed
+      - removed
+    DownloadTransferInput:
+      type: object
+      additionalProperties: false
+      description: Every number must not exceed 9223372036854775807 (invalid_transfer).
+      properties:
+        sequence:
+          $ref: '#/components/schemas/Revision'
+        download_revision:
+          $ref: '#/components/schemas/Revision'
+        state:
+          $ref: '#/components/schemas/DownloadTransferState'
+        bytes_received:
+          $ref: '#/components/schemas/UInt64'
+      required:
+      - sequence
+      - download_revision
+      - state
+      - bytes_received
+    DownloadTransfer:
+      type: object
+      additionalProperties: false
+      properties:
+        sequence:
+          $ref: '#/components/schemas/Revision'
+        download_revision:
+          $ref: '#/components/schemas/Revision'
+        state:
+          $ref: '#/components/schemas/DownloadTransferState'
+        bytes_received:
+          $ref: '#/components/schemas/UInt64'
+        reported_at:
+          type: string
+          format: date-time
+          description: When the server received the report (the device's clock is not used).
+      required:
+      - sequence
+      - download_revision
+      - state
+      - bytes_received
+      - reported_at
     DownloadFile:
       type: object
       additionalProperties: false
@@ -12456,12 +15541,36 @@ components:
       - size_bytes
       - media_url
       - role
+    OfflineMetadata:
+      type: object
+      additionalProperties: false
+      description: The title's descriptive metadata as the catalog resolves it, bounded for a device and
+        shown offline. Absent when the title has none. Carried in the manifest, so the manifest pins it.
+      properties:
+        release_year:
+          type: integer
+          minimum: 1
+          maximum: 9999
+        description:
+          type: string
+          maxLength: 16000
+          description: At most 4000 characters.
+        genres:
+          type: array
+          maxItems: 10
+          items:
+            type: string
+            maxLength: 256
+            description: At most 64 characters.
     DownloadManifest:
       type: object
       additionalProperties: false
       properties:
         download_id:
           $ref: '#/components/schemas/Id'
+        download_revision:
+          $ref: '#/components/schemas/Revision'
+          description: Current download revision after required artifacts are prepared; use for transfer reports.
         timeline_id:
           $ref: '#/components/schemas/Id'
         timeline_revision:
@@ -12486,6 +15595,20 @@ components:
           maxLength: 257
           description: server_id:restore_epoch of the history viewing_revision and manual_epoch belong
             to. Send it as X-Motion-Viewing-Epoch when synchronizing events based on this manifest.
+        restored_viewing_revision:
+          description: When this history began with a restore from a backup, the timeline's viewing revision
+            as restored (0 when it had none); null when unknown. Offline progress recorded before the restore
+            that the person keeps is based on it, so viewing written on the restored server since then wins.
+          anyOf:
+          - $ref: '#/components/schemas/Revision'
+          - type: 'null'
+        restored_manual_epoch:
+          description: The manual epoch as restored, with restored_viewing_revision; null when unknown.
+          anyOf:
+          - $ref: '#/components/schemas/Revision'
+          - type: 'null'
+        metadata:
+          $ref: '#/components/schemas/OfflineMetadata'
       required:
       - download_id
       - timeline_id
@@ -12554,14 +15677,46 @@ components:
           items:
             $ref: '#/components/schemas/OfflineEvent'
           maxItems: 200
+        acknowledged_through:
+          description: The device sequence through which this device has compacted its own log after earlier
+            results; it never resends those events. The server deletes its records through this sequence and
+            refuses a later unrecorded event at or below it as sequence_acknowledged. It must not exceed the
+            sequences the server consumed (acknowledgement_ahead). Without it nothing is pruned, and at most
+            10,000 unacknowledged consumed events are retained per device and profile; further new events are
+            refused as acknowledgement_required.
+          anyOf:
+          - $ref: '#/components/schemas/Revision'
+          - type: 'null'
+        reanchor:
+          description: Sent with the first batch under a server history other than the one the device's
+            compaction point (acknowledged_through) belongs to, after the server was restored from a backup.
+            The device never sends a sequence at or below `through`; the restored server, which never consumed
+            those events, continues the device's sequence after it and retains nothing at or below it. Only this
+            server's own earlier history is accepted (from_viewing_epoch is `server_id:restore_epoch` with this
+            server's ID and another restore epoch); otherwise invalid_reanchor. A retried re-anchor changes
+            nothing.
+          anyOf:
+          - type: object
+            additionalProperties: false
+            properties:
+              from_viewing_epoch:
+                type: string
+                minLength: 3
+                maxLength: 257
+              through:
+                $ref: '#/components/schemas/Revision'
+            required:
+            - from_viewing_epoch
+            - through
+          - type: 'null'
       required:
       - device_id
       - events
     OfflineEventResult:
       type: object
-      description: applied and history_only (with the reason code) and rejected events other than sequence_gap
-        and event_conflict consume their device sequence; duplicate reports an exact retry and its original
-        outcome in code. sequence_gap and event_conflict consume nothing.
+      description: applied and history_only (with the reason code) and rejected events other than sequence_gap,
+        event_conflict, sequence_acknowledged and acknowledgement_required consume their device sequence; duplicate
+        reports an exact retry and its original outcome in code. Those four rejections consume nothing.
       additionalProperties: false
       properties:
         event_id:
@@ -13859,3 +17014,875 @@ components:
       - event_cursor
       description: One committed read snapshot per response. Subsequent cursor pages are not a frozen
         database snapshot. See the event reset protocol in the design.
+    DeviceUserInput:
+      type: object
+      additionalProperties: false
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        user_revision:
+          $ref: '#/components/schemas/Revision'
+      required:
+      - user_id
+      - user_revision
+    SigninDestination:
+      type: object
+      additionalProperties: false
+      properties:
+        origin:
+          type: string
+          format: uri
+        address:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - origin
+      - address
+    SigninSecretUpdate:
+      oneOf:
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: retain
+        required:
+        - action
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: clear
+        required:
+        - action
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: replace
+          value:
+            type: string
+            minLength: 1
+            maxLength: 8192
+            writeOnly: true
+        required:
+        - action
+        - value
+    SigninProviderInput:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        issuer:
+          type: string
+        client_id:
+          type: string
+        enabled:
+          type: boolean
+        destinations:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninDestination'
+          maxItems: 200
+        client_secret:
+          $ref: '#/components/schemas/SigninSecretUpdate'
+      required:
+      - name
+      - issuer
+      - client_id
+    SigninProvider:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        name:
+          type: string
+        issuer:
+          type: string
+        client_id:
+          type: string
+        enabled:
+          type: boolean
+        destinations:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninDestination'
+          maxItems: 200
+        has_secret:
+          type: boolean
+        last_test_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        last_test_ok:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+        last_login_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        callback_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - id
+      - revision
+      - name
+      - issuer
+      - client_id
+      - enabled
+      - destinations
+      - has_secret
+      - last_test_at
+      - last_test_ok
+      - last_login_at
+      - callback_url
+    SigninProviderPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninProvider'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    SigninMethods:
+      type: object
+      additionalProperties: false
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              id:
+                $ref: '#/components/schemas/Id'
+              name:
+                type: string
+            required:
+            - id
+            - name
+          maxItems: 200
+        email_enabled:
+          type: boolean
+        pairing_enabled:
+          type: boolean
+      required:
+      - providers
+      - email_enabled
+      - pairing_enabled
+    SigninStart:
+      type: object
+      additionalProperties: false
+      properties:
+        purpose:
+          type: string
+          enum:
+          - login
+          - link
+          - test
+          - reauth
+        return_to:
+          type: string
+          maxLength: 512
+      required:
+      - purpose
+    SigninStarted:
+      type: object
+      additionalProperties: false
+      properties:
+        transaction_id:
+          $ref: '#/components/schemas/Id'
+        authorization_url:
+          type: string
+          format: uri
+      required:
+      - transaction_id
+      - authorization_url
+    SigninTransaction:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+        detail:
+          type: string
+        redirect_to:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - status
+      - detail
+      - redirect_to
+    SigninEmailStart:
+      type: object
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+          maxLength: 254
+        purpose:
+          type: string
+          enum:
+          - login
+          - enroll
+          - reauth
+      required:
+      - address
+      - purpose
+    SigninEmailStarted:
+      type: object
+      additionalProperties: false
+      properties:
+        transaction_id:
+          $ref: '#/components/schemas/Id'
+        message:
+          type: string
+      required:
+      - transaction_id
+      - message
+    SigninEmailFinish:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          minLength: 8
+          maxLength: 8
+          pattern: ^[0-9]{8}$
+          writeOnly: true
+      required:
+      - code
+    SigninFinished:
+      type: object
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+        redirect_to:
+          type: string
+      required:
+      - status
+      - redirect_to
+    SigninEmailInput:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+        from:
+          type: string
+        loopback_test:
+          type: boolean
+        password:
+          $ref: '#/components/schemas/SigninSecretUpdate'
+      required:
+      - enabled
+      - host
+      - port
+      - username
+      - from
+      - loopback_test
+    SigninEmailSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        username:
+          anyOf:
+          - type: string
+          - type: 'null'
+        from:
+          type: string
+        loopback_test:
+          type: boolean
+        revision:
+          $ref: '#/components/schemas/Revision'
+        has_password:
+          type: boolean
+        last_test_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        last_test_ok:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+      required:
+      - enabled
+      - host
+      - port
+      - username
+      - from
+      - loopback_test
+      - revision
+      - has_password
+      - last_test_at
+      - last_test_ok
+    SigninEmailTest:
+      type: object
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+          maxLength: 254
+      required:
+      - address
+    SigninTestResult:
+      type: object
+      additionalProperties: false
+      properties:
+        ok:
+          type: boolean
+        accepted:
+          type: boolean
+        tested_at:
+          type: integer
+          format: int64
+        revision:
+          $ref: '#/components/schemas/Revision'
+      required:
+      - revision
+    SigninSettingsInput:
+      type: object
+      additionalProperties: false
+      properties:
+        public_origin:
+          type: string
+          format: uri
+      required:
+      - public_origin
+    SigninSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        public_origin:
+          type: string
+        revision:
+          $ref: '#/components/schemas/Revision'
+      required:
+      - public_origin
+      - revision
+    SigninOverview:
+      type: object
+      additionalProperties: false
+      properties:
+        revision:
+          $ref: '#/components/schemas/Revision'
+        public_origin:
+          anyOf:
+          - type: string
+          - type: 'null'
+        usable_administrators:
+          type: integer
+          format: int64
+          description: Number of currently usable administrator device principals, not distinct users or independent recovery accounts. Several devices can belong to one user.
+        pending_requests:
+          type: integer
+          format: int64
+        restored_hold:
+          type: boolean
+        configuration_errors:
+          type: array
+          items:
+            type: string
+          maxItems: 200
+      required:
+      - revision
+      - public_origin
+      - usable_administrators
+      - pending_requests
+      - restored_hold
+      - configuration_errors
+    SigninRestoreResult:
+      type: object
+      additionalProperties: false
+      properties:
+        restored_hold:
+          type: boolean
+      required:
+      - restored_hold
+    SigninRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        provider_id:
+          $ref: '#/components/schemas/Id'
+        issuer:
+          type: string
+        subject:
+          type: string
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+        status:
+          type: string
+        created_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        user_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+      required:
+      - id
+      - revision
+      - provider_id
+      - issuer
+      - subject
+      - email
+      - name
+      - status
+      - created_at
+      - expires_at
+      - user_id
+    SigninRequestPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninRequest'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    SigninRequestApproval:
+      type: object
+      additionalProperties: false
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        user_revision:
+          $ref: '#/components/schemas/Revision'
+        recovery:
+          const: true
+      required:
+      - user_id
+      - user_revision
+      - recovery
+    SigninRequestResult:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        status:
+          type: string
+        user_id:
+          $ref: '#/components/schemas/Id'
+        fresh_login_required:
+          type: boolean
+      required:
+      - id
+      - revision
+      - status
+    SigninProofInput:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+        target:
+          type: string
+      required:
+      - action
+      - target
+    SigninProof:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        actor:
+          type: string
+        action:
+          type: string
+        target:
+          type: string
+        status:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+        created_at:
+          type: integer
+          format: int64
+      required:
+      - id
+      - actor
+      - action
+      - target
+      - status
+      - expires_at
+      - created_at
+    SigninProofPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninProof'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    SigninProofCreated:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        code:
+          type: string
+        status:
+          type: string
+        action:
+          type: string
+        target:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+      required:
+      - id
+      - code
+      - status
+      - action
+      - target
+      - expires_at
+    SigninProofApproval:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          maxLength: 32
+          writeOnly: true
+      required:
+      - code
+    SigninProofResult:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        status:
+          type: string
+      required:
+      - id
+      - status
+    SigninIdentity:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        kind:
+          type: string
+          enum:
+          - oidc
+          - email
+        provider_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        provider_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+        issuer:
+          anyOf:
+          - type: string
+          - type: 'null'
+        subject:
+          anyOf:
+          - type: string
+          - type: 'null'
+        address:
+          anyOf:
+          - type: string
+          - type: 'null'
+        enabled:
+          type: boolean
+        created_at:
+          type: integer
+          format: int64
+      required:
+      - id
+      - revision
+      - user_id
+      - kind
+      - provider_id
+      - provider_name
+      - issuer
+      - subject
+      - address
+      - enabled
+      - created_at
+    SigninIdentityPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninIdentity'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    SigninSession:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        device_id:
+          $ref: '#/components/schemas/Id'
+        device_name:
+          type: string
+        user_id:
+          $ref: '#/components/schemas/Id'
+        user_name:
+          type: string
+        method:
+          type: string
+        provider_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        issued_at:
+          type: integer
+          format: int64
+        expires_at:
+          type: integer
+          format: int64
+        last_seen_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        revoked:
+          type: boolean
+      required:
+      - id
+      - revision
+      - device_id
+      - device_name
+      - user_id
+      - user_name
+      - method
+      - provider_id
+      - issued_at
+      - expires_at
+      - last_seen_at
+      - revoked
+    SigninSessionPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninSession'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    SigninMe:
+      type: object
+      additionalProperties: false
+      properties:
+        device_id:
+          $ref: '#/components/schemas/Id'
+        user:
+          anyOf:
+          - $ref: '#/components/schemas/AccessUser'
+          - type: 'null'
+        identities:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninIdentity'
+          maxItems: 200
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninSession'
+          maxItems: 200
+        fresh_until:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        detail_limit:
+          type: integer
+          format: int64
+      required:
+      - device_id
+      - user
+      - identities
+      - sessions
+      - fresh_until
+      - detail_limit
+    SigninUserDetails:
+      type: object
+      additionalProperties: false
+      properties:
+        user:
+          $ref: '#/components/schemas/AccessUser'
+        identities:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninIdentity'
+          maxItems: 200
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninSession'
+          maxItems: 200
+        devices:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              id:
+                $ref: '#/components/schemas/Id'
+              name:
+                type: string
+              revision:
+                $ref: '#/components/schemas/Revision'
+              revoked:
+                type: boolean
+              client_name:
+                type: string
+            required:
+            - id
+            - name
+            - revision
+            - revoked
+            - client_name
+          maxItems: 200
+        detail_limit:
+          type: integer
+          format: int64
+      required:
+      - user
+      - identities
+      - sessions
+      - devices
+      - detail_limit
+    SigninAudit:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        actor:
+          type: string
+        target:
+          type: string
+        action:
+          type: string
+        outcome:
+          type: string
+        at:
+          type: integer
+          format: int64
+      required:
+      - id
+      - actor
+      - target
+      - action
+      - outcome
+      - at
+    SigninAuditPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SigninAudit'
+          maxItems: 200
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor

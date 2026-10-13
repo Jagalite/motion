@@ -7,10 +7,7 @@
 //! stream, a policy change resets it, and a resource that left the
 //! subscriber's scope while the stream was suspended is never named. No
 //! database connection is held while a hint waits for the client.
-use super::{
-    Problem,
-    auth::{self, Caller},
-};
+use super::{Problem, auth::Caller};
 use crate::App;
 use axum::{
     extract::{Query, State},
@@ -129,7 +126,7 @@ async fn classify(
     principal: &Principal,
     row: &Row,
 ) -> Result<Resource, sqlx::Error> {
-    let (_, topic, id, _, scope) = row;
+    let (_, topic, id, _, scope, prior_profile) = row;
     let prior = scope.iter().cloned().collect();
     Ok(match topic.as_str() {
         "libraries" => Resource::Library(id.clone()),
@@ -158,8 +155,13 @@ async fn classify(
             .bind(id)
             .fetch_optional(conn)
             .await?;
-            owner.map_or(Resource::Administrative, Resource::Profile)
+            Resource::Organization { current_profile: owner, prior_profile: prior_profile.clone() }
         }
+        "schedules" => Resource::Schedule {
+            current_library: sqlx::query_scalar("SELECT library_id FROM api_schedules WHERE id=?")
+                .bind(id).fetch_optional(conn).await?,
+            prior_library: scope.clone(),
+        },
         "devices" => Resource::Device(id.clone()),
         "scan" | "processing" | "job" => {
             let requester:Option<String>=sqlx::query_scalar("SELECT requester_id FROM api_jobs WHERE id=?")
@@ -171,34 +173,15 @@ async fn classify(
 }
 
 async fn reauthenticate(app: &App, caller: &Caller) -> Result<Principal, AccessError> {
-    let Some((hash, _)) = &caller.credential else {
-        let Some(device_id) = &caller.ingress else {
-            return Ok(Principal::operator());
-        };
-        let mut conn = app
-            .db
-            .acquire()
-            .await
-            .map_err(|_| AccessError::Unauthenticated)?;
-        let device = auth::load_device(&mut conn, device_id)
-            .await
-            .map_err(|_| AccessError::Unauthenticated)?;
-        return playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device));
-    };
-    let now = crate::now();
     let mut conn = app
         .db
         .acquire()
         .await
         .map_err(|_| AccessError::Unauthenticated)?;
-    let stored = auth::load_credential(&mut conn, hash)
+    caller
+        .reauthenticate(&mut conn)
         .await
-        .map_err(|_| AccessError::Unauthenticated)?
-        .ok_or(AccessError::CredentialRevoked)?;
-    match auth::authenticate_stored(&mut conn, &stored, now).await {
-        Ok((principal, _)) => Ok(principal),
-        Err(_) => Err(AccessError::CredentialRevoked),
-    }
+        .map_err(|_| AccessError::CredentialRevoked)
 }
 
 fn reset(epoch: &str, principal: &Principal, position: i64, reason: ResetReason) -> Event {
@@ -224,8 +207,8 @@ fn reset(epoch: &str, principal: &Principal, position: i64, reason: ResetReason)
         .data(serde_json::to_string(&hint).unwrap())
 }
 
-/// id, topic, resource_id, kind, scope_library
-type Row = (i64, String, String, String, Option<String>);
+/// id, topic, resource_id, kind, prior library and profile (survive deletion).
+type Row = (i64, String, String, String, Option<String>, Option<String>);
 type Batch = (i64, i64, String, Vec<Row>);
 
 async fn batch(app: &App, after: i64) -> Result<Batch, sqlx::Error> {
@@ -239,7 +222,7 @@ async fn batch(app: &App, after: i64) -> Result<Batch, sqlx::Error> {
             .fetch_one(&mut *tx)
             .await?;
     let rows = sqlx::query_as(
-        "SELECT id,topic,resource_id,kind,scope_library FROM change_events WHERE id>? ORDER BY id LIMIT ?",
+        "SELECT id,topic,resource_id,kind,scope_library,scope_profile FROM change_events WHERE id>? ORDER BY id LIMIT ?",
     )
     .bind(after)
     .bind(BATCH)
@@ -340,7 +323,7 @@ pub async fn subscribe(
                     let Ok(resource) = classify(&mut conn, &principal, &row).await else { break 'stream };
                     disclose(&principal, &resource)
                 };
-                let (id, topic, resource_id, kind, _) = row;
+                let (id, topic, resource_id, kind, _, _) = row;
                 position = id;
                 match disclosure {
                     Disclosure::Withhold => continue,

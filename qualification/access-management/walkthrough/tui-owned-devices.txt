@@ -1,0 +1,50 @@
+⌕ Search titles                                                                             Profile: Everyone   E
+ ▶ Motion               ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ MONITOR                   Devices  3 devices
+  ◉  Overview
+  ▶  Now playing           ╭─ Active ─────────────────────────────────────────────╮  ╭─ Revoked ─────────────────────────────────────────────╮
+  ◔  History               │ 3  paired devices                                    │  │ 0  credentials withdrawn                              │
+  ◷  Processing            ╰──────────────────────────────────────────────────────╯  ╰───────────────────────────────────────────────────────╯
+  ↻  Scans                 ╭─ Paired devices ────────────────────────────────────────────────────────────────────────────────────────────────╮
+  ≡  Activity              │  Device              State       Access           ID                                                            │
+  ◈  Server                │  Walkthrough termi…  ● active    3 permissions    15713969-d10f-44da-adbc-f64e20068e70                          │
+                           │  Access review ter…  ● active    1 permission     2e65df81-dfdc-4d8e-bcda-3be5a280a902                          │
+ LIBRARY                   │  Web browser         ● active    3 permissions    36fa9d44-f128-4fe4-8392-aea048031bc0                          │
+  ⌂  Browse                ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ▤  All titles            ╭─ Walkthrough terminal ─────────────────────────────────────────────────────────────────────────────── ● active ─╮
+                           │ Owner: Walkthrough household · Client: motion-terminal · d revoke device                                        │
+ ADMIN                     │  catalog:read   viewing:write   playback:request                                                                │
+  ▥  Sources               │                                                                                                                 │
+  ⇄  Pairing requests      ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ♙  Users and access
+  ✉  Invitations
+▎ ▢  Devices
+  ☺  Profiles
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ● Live · 127.0.0.1:18795                                                                            ←↑↓→ select  esc sidebar  r refresh  ? help

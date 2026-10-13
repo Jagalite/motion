@@ -80,12 +80,40 @@ def backup(data, output):
     return manifest
 
 
+# The same DDL as migration 0047, which creates these tables IF NOT EXISTS.
+RESTORE_BASELINE_EPOCH = """CREATE TABLE IF NOT EXISTS restore_baseline_epoch (
+ singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+ restore_epoch TEXT NOT NULL,
+ captured INTEGER NOT NULL DEFAULT 0 CHECK(captured IN (0,1))
+)"""
+
+
 def rotate_restore_epoch(database):
-    """A restored database has a different history: event cursors issued
-    against the original must reset rather than resume overlapping positions."""
+    """Start a new history, capture its pending viewing baseline, and withdraw
+    saved authority atomically. Post-snapshot revocations cannot be recovered;
+    restored devices must pair again. The server captures the baseline before
+    serving requests after migration. Older schemas may lack authority tables.
+    """
     with sqlite3.connect(database) as db:
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_identity'").fetchone():
+        db.execute('PRAGMA foreign_keys=ON')
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'server_identity' in tables:
+            db.execute("CREATE TABLE IF NOT EXISTS server_viewing_histories (viewing_epoch TEXT PRIMARY KEY)")
+            db.execute("INSERT OR IGNORE INTO server_viewing_histories SELECT server_id || ':' || restore_epoch FROM server_identity")
             db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
+            db.execute("INSERT OR IGNORE INTO server_viewing_histories SELECT server_id || ':' || restore_epoch FROM server_identity")
+            db.execute(RESTORE_BASELINE_EPOCH)
+            db.execute("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) "
+                       "SELECT 1,restore_epoch,0 FROM server_identity WHERE singleton=1")
+        for table in ('access_invitations', 'signin_outbox', 'signin_transactions',
+                      'signin_requests', 'signin_proofs', 'content_tickets', 'pairings',
+                      'idempotency_records', 'credentials'):
+            if table in tables:
+                db.execute(f'DELETE FROM {table}')
+        if 'signin_families' in tables:
+            db.execute('UPDATE signin_families SET revoked=1,revision=revision+1')
+        if 'devices' in tables:
+            db.execute('UPDATE devices SET revoked=1')
     db.close()
 
 

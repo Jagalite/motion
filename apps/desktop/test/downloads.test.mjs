@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import {mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {cacheTitle, createDownloadAgent, currentRoot, rootName, wireEvent} from '../src/downloads.mjs';
+import {cacheMetadata, cacheTitle, createDownloadAgent, transferLocation, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
 
 const identity = {server_id: 'server', principal_id: 'device1', device_id: 'device1'};
 const media = Buffer.from('0123456789abcdefghij');
@@ -27,10 +28,12 @@ function fakeCache() {
     const s = state(root);
     switch (args[0]) {
       case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads}, usage: String(s.downloads.reduce((n, d) => n + (d.size ?? 0), 0)),
-        staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5))};
+        staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5)), removals: s.removals ?? []};
       case 'admit': return {admitted: Number(args[2]) <= 1000};
       case 'publish': {
         const entry = JSON.parse(input);
+        // Mirrors offline::may_publish: a pending removal is never saved again.
+        if ((s.removals ?? []).includes(entry.identity.download_id)) throw new Error('this download was removed on this device');
         const staged = join(root, 'staging', `${entry.identity.download_id}.part`);
         const bytes = readFileSync(staged);
         if (createHash('sha256').update(bytes).digest('hex') !== entry.sha256) throw new Error('transfer checksum mismatch');
@@ -41,12 +44,12 @@ function fakeCache() {
         rmSync(join(root, 'staging', `${args[2]}.part`), {force: true});
         s.downloads = s.downloads.filter(d => d.identity.download_id !== args[2]);
         return {removed: true};
-      case 'events': return {base_sequence: String(s.base), events: s.events};
+      case 'events': return {base_sequence: String(s.base), events: s.events, reanchor: s.reanchor ?? null};
       case 'acknowledge': {
         // Mirrors offline::acknowledged_through: the leading run confirmed by identity.
         const {results, next_device_sequence: next} = JSON.parse(input);
         const consumed = r => ['applied', 'history_only', 'duplicate'].includes(r.outcome)
-          || (r.outcome === 'rejected' && !['sequence_gap', 'event_conflict'].includes(r.code));
+          || (r.outcome === 'rejected' && !['sequence_gap', 'event_conflict', 'sequence_acknowledged', 'acknowledgement_required'].includes(r.code));
         let through = s.base;
         for (const [i, e] of s.events.entries()) {
           const r = results[i];
@@ -57,6 +60,14 @@ function fakeCache() {
         s.base = through;
         return {base_sequence: String(s.base), events: s.events};
       }
+      case 'settle-removal': {
+        // Mirrors offline::settles: the server's confirmation, and no copy left here.
+        const [, id, , outcome] = args.slice(1);
+        if (!['deleted', 'absent'].includes(outcome) || s.downloads.some(d => d.identity.download_id === id)) return {settled: false};
+        s.removals = (s.removals ?? []).filter(r => r !== id);
+        return {settled: true};
+      }
+      case 'restore': return {discarded: args[2] === 'discard' ? 1 : 0, reapplied: args[2] === 'reapply' ? 1 : 0, dropped: 0};
       case 'rebase': return {rebased: true};
       case 'collect': return {collected: true};
       case 'recover': {
@@ -130,7 +141,9 @@ test('unsupported manifests are reported instead of silently dropping files', as
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   const statuses = [];
   const withSubtitle = manifest('d1');
-  withSubtitle.files.push({...withSubtitle.files[0], role: 'subtitle', relative_name: 'subtitle.vtt'});
+  // Two subtitle files: at most one is saved with a title.
+  withSubtitle.files.push({...withSubtitle.files[0], role: 'subtitle', relative_name: 'subtitle.vtt'},
+    {...withSubtitle.files[0], role: 'subtitle', relative_name: 'other.vtt'});
   const agent = createDownloadAgent({base, identity, cache: fakeCache().cache, quota: 1000, status: m => statuses.push(m),
     api: async () => withSubtitle, fetchMedia: async () => assert.fail('no transfer')});
   assert.equal(await agent.transfer({id: 'd1'}, agent.root('default')), false);
@@ -145,14 +158,16 @@ const event = (sequence, extra = {}) => ({scope: {...identity, profile_id: 'defa
 function syncAgent(fake, statuses, reply) {
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   const sent = [];
+  const acks = [];
   const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
     fetchMedia: async () => assert.fail('no transfer'),
     api: async (path, init) => {
       assert.equal(path, '/api/v2/offline/sync');
       sent.push([init.headers['X-Motion-Viewing-Epoch'], init.body.events.map(e => e.device_sequence)]);
+      acks.push(init.body.acknowledged_through);
       return reply(init.body.events);
     }});
-  return {agent, sent};
+  return {agent, sent, acks};
 }
 
 test('reconciliation compacts only events the server confirmed by identity', async () => {
@@ -170,6 +185,29 @@ test('reconciliation compacts only events the server confirmed by identity', asy
   assert.match(statuses[0], /event_conflict/);
   assert.equal(wireEvent(event(2)).device_time, '1970-01-01T00:00:00Z');
   assert.equal(wireEvent(event(1, {device_time: 'x'})).device_time, 'x');
+});
+
+test('every batch reports the log\'s compaction point, and a stale-copy refusal erases nothing', async () => {
+  const fake = fakeCache();
+  const statuses = [];
+  let round = 0;
+  const {agent, sent, acks} = syncAgent(fake, statuses, events => (++round === 1
+    ? {results: events.slice(0, 1).map(e => ({event_id: e.event_id, outcome: 'applied', code: null})), next_device_sequence: '2'}
+    : {results: events.map(e => ({event_id: e.event_id, outcome: 'rejected', code: 'acknowledgement_required'})), next_device_sequence: '2'}));
+  const target = agent.root('default');
+  fake.state(target.path).events = [event(1), event(2)];
+  assert.equal(await agent.reconcile(target), false);
+  assert.deepEqual(sent.map(s => s[1]), [['1', '2'], ['2']]);
+  assert.deepEqual(acks, ['0', '1'], 'the second batch reports the compaction of the first');
+  assert.deepEqual(fake.state(target.path).events.map(e => e.event_id), ['e2']);
+  assert.match(statuses.at(-1), /acknowledgement_required/);
+  const stale = fakeCache();
+  const second = syncAgent(stale, [], events => ({results: events.map(e => ({event_id: e.event_id, outcome: 'rejected', code: 'sequence_acknowledged'})),
+    next_device_sequence: '9'}));
+  const root2 = second.agent.root('default');
+  stale.state(root2.path).events = [event(1)];
+  assert.equal(await second.agent.reconcile(root2), false);
+  assert.equal(stale.state(root2.path).events.length, 1);
 });
 
 test('a conflict on the first event erases nothing', async () => {
@@ -194,7 +232,7 @@ test('a restored server history keeps every offline event', async () => {
   assert.equal(await agent.reconcile(target), false);
   assert.equal(fake.state(target.path).events.length, 2);
   assert.ok(!fake.calls.some(c => c[1] === 'acknowledge'));
-  assert.match(statuses[0], /restored or replaced/);
+  assert.match(statuses[0], /restored from a backup.*keep it or discard it/);
   // Batches never mix histories: only the leading run of one identity is sent.
   const mixed = fakeCache();
   const second = syncAgent(mixed, [], events => ({results: events.map(e => ({event_id: e.event_id, outcome: 'applied', code: null})),
@@ -317,8 +355,62 @@ test('losing downloads:manage withdraws every owned copy but keeps offline progr
   fake.state(target.path).events = [event(1)];
   await agent.pass();
   assert.equal(fake.state(target.path).downloads.length, 0);
-  assert.equal(fake.state(target.path).events.length, 1);
-  assert.match(statuses[0], /removed from this device/);
+  assert.equal(fake.state(target.path).events.length, 1, 'a refused sync (no viewing:write either) keeps the events');
+  assert.ok(!fake.calls.some(c => c[1] === 'acknowledge'));
+  assert.match(statuses.at(-1), /removed from this device/);
+});
+
+test('without downloads:manage, viewing:write still reconciles retained events by exact identity', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const sent = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: () => {},
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init) => {
+      if (path === '/api/v2/offline/sync') {
+        sent.push([init.headers['X-Motion-Viewing-Epoch'], init.body.events.map(e => e.event_id)]);
+        // A lost response: the first answer never arrives; the retry is a duplicate.
+        if (sent.length === 1) throw Object.assign(new Error('connection reset'), {code: 'ECONNRESET'});
+        return {results: init.body.events.map(e => ({event_id: e.event_id, outcome: sent.length === 2 ? 'duplicate' : 'applied', code: 'applied'})),
+          next_device_sequence: String(Number(init.body.events.at(-1).device_sequence) + 1)};
+      }
+      if (path.startsWith('/api/v2/downloads')) throw Object.assign(new Error('forbidden'), {status: 403, code: 'forbidden'});
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  fake.state(target.path).downloads.push({identity: {download_id: 'd1'}});
+  fake.state(target.path).events = [event(1), event(2)];
+  await agent.pass();
+  assert.equal(fake.state(target.path).events.length, 2, 'nothing is compacted without a response');
+  assert.equal(fake.state(target.path).downloads.length, 0, 'a failed sync never blocks withdrawal');
+  await agent.pass();
+  assert.deepEqual(sent, [['server:r1', ['e1', 'e2']], ['server:r1', ['e1', 'e2']]], 'the retry resends the same events and history');
+  assert.equal(fake.state(target.path).events.length, 0);
+  assert.equal(fake.state(target.path).base, 2);
+});
+
+test('withdrawal collects crash leftovers on owned roots only', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: () => {},
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async () => { throw Object.assign(new Error('forbidden'), {status: 403, code: 'forbidden'}); }});
+  const target = agent.root('default');
+  const other = createDownloadAgent({base, identity: {...identity, server_id: 'other'}, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail(), api: async () => assert.fail()}).root('default');
+  for (const root of [target, other]) {
+    mkdirSync(root.path, {recursive: true});
+    writeFileSync(join(root.path, 'manifest.json'), '{}');
+  }
+  fake.state(other.path).downloads.push({identity: {download_id: 'x1'}, size: 5});
+  await agent.pass();
+  const collected = fake.calls.filter(c => c[1] === 'collect').map(c => c[0]);
+  assert.deepEqual(collected, [target.path], 'only the withdrawn root is collected');
+  const removeThenCollect = fake.calls.filter(c => c[0] === target.path).map(c => c[1]);
+  assert.deepEqual(removeThenCollect.slice(-2), ['status', 'collect']);
+  assert.equal(fake.state(other.path).downloads.length, 1, 'another server\'s copy is untouched');
 });
 
 test('long titles are shortened to the cache bound on a character boundary', () => {
@@ -387,4 +479,577 @@ test('a stalled transfer fails alone and keeps its staged bytes for resume', asy
   await assert.rejects(agent.transfer({id: 'd1'}, target), /stalled/);
   assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.part')), media.subarray(0, 8));
   assert.ok(!fake.calls.some(c => c[1] === 'publish'));
+});
+
+test('several offline libraries are listed with labels and only saved roots can be chosen', () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const make = (server, label, profile, titles) => {
+    const agent = createDownloadAgent({base, identity: {...identity, server_id: server}, cache: fake.cache, quota: 1000,
+      fetchMedia: async () => assert.fail(), api: async () => assert.fail(), serverLabel: label});
+    const target = agent.root(profile);
+    mkdirSync(target.path, {recursive: true});
+    writeFileSync(join(target.path, 'manifest.json'), JSON.stringify({protocol: 1, downloads: Array(titles).fill({})}));
+    return target;
+  };
+  const home = make('server-a', 'motion.home', 'default', 2);
+  const cabin = make('server-b', 'motion.cabin', 'kids', 1);
+  const empty = make('server-c', 'motion.empty', 'default', 0);
+  writeFileSync(join(base, 'current.json'), JSON.stringify({root: cabin.name}));
+  const roots = offlineRoots(base);
+  assert.deepEqual(roots.map(r => [r.label, r.titles, r.current]).sort(), [
+    ['motion.cabin · profile kids · account device1 · device device1', 1, true],
+    ['motion.home · profile default · account device1 · device device1', 2, false],
+  ]);
+  assert.equal(currentRoot(base), cabin.path);
+  assert.equal(currentRoot(base, home.name), home.path);
+  // A root with nothing saved, or any other name, is not openable.
+  assert.throws(() => currentRoot(base, empty.name), /not on this device/);
+  assert.throws(() => currentRoot(base, '0'.repeat(32)), /not on this device/);
+});
+
+test('a title removed on this device is deleted on the server and never saved again until settled', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const deletes = [];
+  let answer = 'fail';
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('a removed title is never transferred'),
+    api: async (path, init = {}) => {
+      // Listed until the server no longer has it.
+      if (path.startsWith('/api/v2/downloads?')) return {items: answer === 'fail' ? [{id: 'gone', profile_id: 'default', state: 'ready'}] : [], next_cursor: null};
+      if (path === '/api/v2/downloads/gone' && init.method === 'DELETE') {
+        deletes.push(answer);
+        if (answer === 'fail') throw Object.assign(new Error('offline'), {status: 503, code: 'unavailable'});
+        if (answer === 'absent') throw Object.assign(new Error('not found'), {status: 404, code: 'not_found'});
+        return null;
+      }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).removals = ['gone'];
+  // The server cannot be reached: the removal stays pending and the still
+  // listed download is not saved again.
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, ['gone']);
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  assert.match(statuses.join('\n'), /still listed by the server/);
+  // The server confirms it is gone (here: already absent): settled.
+  answer = 'absent';
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, []);
+  assert.deepEqual(deletes, ['fail', 'absent']);
+  assert.ok(!statuses.some(m => /could not be saved/.test(m)), 'nothing was transferred');
+  assert.deepEqual(fake.calls.filter(c => c[1] === 'settle-removal').map(c => c[2]),
+    [['--download-id', 'gone', '--outcome', 'failed'], ['--download-id', 'gone', '--outcome', 'absent']]);
+});
+
+test('a removal settled in this pass is not transferred from the list read before it', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('a removed title is never transferred'),
+    api: async (path, init = {}) => {
+      // The list was read before the deletion.
+      if (path.startsWith('/api/v2/downloads?')) return {items: [{id: 'gone', profile_id: 'default', state: 'ready'}], next_cursor: null};
+      if (path === '/api/v2/downloads/gone' && init.method === 'DELETE') return null;
+      if (path.startsWith('/api/v2/downloads/gone')) assert.fail('no manifest is read for it');
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).removals = ['gone'];
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, []);
+  assert.ok(!statuses.some(m => /could not be saved/.test(m)), statuses.join('\n'));
+  assert.ok(fake.calls.some(c => c[1] === 'collect'), 'blob collection still runs');
+});
+
+test('the first batch after a server restore carries the cache\'s re-anchor', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const bodies = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path === '/api/v2/offline/sync') {
+        bodies.push(init.body);
+        return {results: init.body.events.map(e => ({event_id: e.event_id, outcome: 'applied', code: null})), next_device_sequence: '9'};
+      }
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  const state = fake.state(target.path);
+  state.base = 7;
+  state.events = [{...event(8), media: {...event(8).media, viewing_epoch: 'server:r2'}}];
+  state.reanchor = {from_viewing_epoch: 'server:r1', through: '7'};
+  assert.equal(await agent.reconcile(target), true);
+  assert.deepEqual(bodies[0].reanchor, {from_viewing_epoch: 'server:r1', through: '7'});
+  assert.equal(bodies[0].acknowledged_through, '7');
+  // Without one, nothing is added.
+  state.reanchor = null;
+  state.events = [{...event(9), media: {...event(9).media, viewing_epoch: 'server:r2'}}];
+  await agent.reconcile(target);
+  assert.equal('reanchor' in bodies[1], false);
+});
+
+test('progress from before a server restore waits for the person\'s choice', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const paths = [];
+  let epoch = 'server:r2';
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async path => {
+      paths.push(path);
+      if (path === '/api/v2/system/capabilities') return {server_id: 'server', restore_epoch: 'r2'};
+      if (path.endsWith('/manifest')) return {...manifest('d1'), viewing_revision: '9', viewing_epoch: epoch,
+        restored_viewing_revision: '4', restored_manual_epoch: '0'};
+      if (path.includes('/viewing')) return {watched: false, position_ms: 0};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  const state = fake.state(target.path);
+  state.downloads.push({identity: {download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
+    base_viewing_revision: '3', base_manual_epoch: '0', viewing_epoch: 'server:r1'}});
+  const old = e => ({...e, media: {...e.media, viewing_epoch: 'server:r1'}});
+  state.events = [old(event(1)), old(event(2)), {...event(3), media: {...event(3).media, viewing_epoch: 'server:r2'}}];
+  // Two positions from before the restore (r1); the third is current.
+  assert.deepEqual(await agent.restoreChoices(),
+    [{root: target.name, profile_id: 'default', events: 2, titles: 1}]);
+  await assert.rejects(agent.resolveRestore(target.name, 'merge'), /Unknown choice/);
+  await assert.rejects(agent.resolveRestore('0'.repeat(32), 'discard'), /not on this device/);
+  // Keeping pins the earlier progress to each download's base as restored.
+  paths.length = 0;
+  await agent.resolveRestore(target.name, 'reapply');
+  const restore = fake.calls.find(c => c[1] === 'restore');
+  assert.deepEqual(restore[2], ['--choice', 'reapply', '--viewing-epoch', 'server:r2']);
+  assert.deepEqual(JSON.parse(restore[3]), [{download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
+    base_viewing_revision: '4', base_manual_epoch: '0', viewing_epoch: 'server:r2'}]);
+  assert.ok(paths.includes('/api/v2/downloads/d1/manifest'));
+  const order = fake.calls.map(c => c[1]);
+  assert.ok(order.indexOf('restore') < order.lastIndexOf('rebase'),
+    'kept events first, then the downloads are re-pinned for observations from now on');
+  assert.deepEqual(fake.calls.filter(c => c[1] === 'rebase').map(c => c[2].slice(0, 2)), [['--download-id', 'd1']]);
+  // Restored again meanwhile: nothing is changed and the choice is offered again.
+  fake.calls.length = 0;
+  epoch = 'server:r3';
+  await assert.rejects(agent.resolveRestore(target.name, 'reapply'), /changed again/);
+  assert.ok(!fake.calls.some(c => c[1] === 'restore'));
+  epoch = 'server:r2';
+  // Discarding needs no server state beyond its identity.
+  fake.calls.length = 0;
+  await agent.resolveRestore(target.name, 'discard');
+  assert.deepEqual(fake.calls.filter(c => c[1] !== 'status').map(c => [c[1], ...c[2]]),
+    [['restore', '--choice', 'discard', '--viewing-epoch', 'server:r2']]);
+});
+
+test('a restore choice never interleaves with a download pass', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const order = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    order.push(args[0]);
+    return fake.cache(root, scope, args, input);
+  }, quota: 1000, fetchMedia: async () => assert.fail('no transfer'),
+  api: async path => {
+    if (path.startsWith('/api/v2/downloads?')) { order.push('list'); await gate; return {items: [], next_cursor: null}; }
+    if (path === '/api/v2/system/capabilities') return {server_id: 'server', restore_epoch: 'r2'};
+    throw new Error(path);
+  }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  const passing = agent.pass();
+  const choosing = agent.resolveRestore(target.name, 'discard');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(!order.includes('restore'), 'the choice waits for the pass in progress');
+  release();
+  await passing;
+  await choosing;
+  assert.ok(order.lastIndexOf('collect') < order.indexOf('restore'), order.join(','));
+});
+
+test('the device reports its own copy in its own order, never blocking a transfer', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache} = fakeCache();
+  const reports = [];
+  let refuse = true;
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async (path, init = {}) => {
+      if (init.method === 'PUT' && path === '/api/v2/downloads/d1/transfer') {
+        reports.push(init.body);
+        // A failed report never stops the transfer.
+        if (refuse) { refuse = false; throw Object.assign(new Error('busy'), {status: 503}); }
+        return {};
+      }
+      return path.endsWith('/manifest') ? manifest('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'};
+    },
+    fetchMedia: async () => response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1', revision: '3'}, target), true);
+  assert.deepEqual(reports.map(r => [r.sequence, r.download_revision, r.state, r.bytes_received]),
+    [['1', '3', 'transferring', '0'], ['2', '3', 'verified_local', String(media.length)]]);
+  // The sequence persists across agents (restarts) and keeps increasing.
+  const again = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async (path, init = {}) => { if (init.method === 'PUT') reports.push(init.body); return path.endsWith('/manifest') ? manifest('d1') : {}; },
+    fetchMedia: async () => assert.fail('already saved')});
+  await again.transfer({id: 'd1', revision: '3'}, target).catch(() => {});
+  assert.ok(reports.slice(2).every(r => Number(r.sequence) > 2), JSON.stringify(reports));
+});
+
+test('reports are reconciled on later passes and never block downloads', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const reports = [];
+  const listed = [
+    // Saved here (before reports existed, or its final report was lost).
+    {id: 'kept', profile_id: 'default', state: 'ready', revision: '2', size_bytes: '20', device_transfer: null},
+    // Removed through the offline window, cancelled since; last reported saved.
+    {id: 'gone', profile_id: 'default', state: 'cancelled', revision: '3', size_bytes: '20',
+      device_transfer: {state: 'verified_local', download_revision: '2'}},
+    // Already reported as removed under its current revision: nothing to say.
+    {id: 'done', profile_id: 'default', state: 'cancelled', revision: '3', size_bytes: '20',
+      device_transfer: {state: 'removed', download_revision: '3'}},
+  ];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: listed, next_cursor: null};
+      if (init.method === 'PUT' && path.endsWith('/transfer')) { reports.push([path.split('/')[4], init.body.state, init.body.download_revision]); return {}; }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'kept'}, size: 20});
+  await agent.pass();
+  assert.deepEqual(reports, [['kept', 'verified_local', '2'], ['gone', 'removed', '3']]);
+  // A sequence that cannot be persisted is not sent, and nothing else fails.
+  rmSync(join(base, 'transfer-reports.json'), {force: true});
+  mkdirSync(join(base, 'transfer-reports.json'));
+  reports.length = 0;
+  await agent.pass();
+  assert.deepEqual(reports, []);
+});
+
+test('a removal report is retried until accepted, even if the server never heard of the copy', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const reports = [];
+  let accept = false;
+  let listed = [{id: 'once', profile_id: 'default', state: 'cancelled', revision: '2', size_bytes: '20', device_transfer: null}];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: listed, next_cursor: null};
+      if (init.method === 'PUT' && path.endsWith('/transfer')) {
+        reports.push(init.body.state);
+        if (!accept) throw Object.assign(new Error('offline'), {status: 503});
+        listed = listed.map(d => ({...d, device_transfer: {state: 'removed', download_revision: '2'}}));
+        return {};
+      }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  // A copy saved before reports existed; its download was cancelled.
+  fake.state(target.path).downloads.push({identity: {download_id: 'once'}, size: 20});
+  await agent.pass();
+  assert.deepEqual(reports, ['removed'], 'removed, but the report was refused');
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  // Later passes retry until the server accepts it, then stop.
+  accept = true;
+  await agent.pass();
+  await agent.pass();
+  assert.deepEqual(reports, ['removed', 'removed']);
+});
+
+test('a copy is removed only once its removal is noted for reporting', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: [{id: 'ended', profile_id: 'default', state: 'cancelled', revision: '2', size_bytes: '20', device_transfer: null}], next_cursor: null};
+      if (init.method === 'PUT') throw Object.assign(new Error('offline'), {status: 503});
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'ended'}, size: 20});
+  // The journal cannot be written: the copy stays for a later pass.
+  mkdirSync(join(base, 'transfer-removed.json'));
+  await agent.pass();
+  assert.equal(fake.state(target.path).downloads.length, 1);
+  rmSync(join(base, 'transfer-removed.json'), {recursive: true});
+  await agent.pass();
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  assert.deepEqual(JSON.parse(readFileSync(join(base, 'transfer-removed.json'), 'utf8')), ['ended'],
+    'kept until its removed report is accepted');
+});
+
+test('a verified poster is saved with the title; a bad one never blocks it', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const poster = Buffer.from('poster image bytes');
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  let served = poster;
+  const withPoster = id => ({...manifest(id), files: [...manifest(id).files,
+    {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+      media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]});
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async path => path.endsWith('/manifest') ? withPoster(path.split('/')[4]) : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => url.includes('/assets/') ? response(200, served) : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const published = JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]);
+  assert.deepEqual(published.artwork, {sha256: posterDigest, size: poster.length, content_type: 'image/png'});
+  assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.artwork')), poster);
+  // Bytes that do not match the digest: the title is saved without a poster.
+  served = Buffer.from('other image bytes!');
+  assert.equal(await agent.transfer({id: 'd2'}, target), true);
+  assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
+});
+
+test('a poster is saved only within the admitted space; without room the title is saved alone', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const poster = Buffer.alloc(2000, 7);
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async path => path.endsWith('/manifest') ? {...manifest('d1'), files: [...manifest('d1').files,
+      {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+        media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]} : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => url.includes('/assets/') ? assert.fail('no poster beyond the admitted space') : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const admits = calls.filter(c => c[1] === 'admit').map(c => c[2][1]);
+  assert.deepEqual(admits, [String(media.length + poster.length), String(media.length)]);
+  assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
+  assert.ok(!existsSync(join(target.path, 'staging', 'd1.artwork')));
+});
+
+test('a disconnect during the poster stops before publication; recovery keeps a verified poster', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const poster = Buffer.from('poster image bytes');
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  const withPoster = id => ({...manifest(id), files: [...manifest(id).files,
+    {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+      media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]});
+  const controller = new AbortController();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 100000, signal: controller.signal,
+    api: async path => path.endsWith('/manifest') ? withPoster(path.split('/')[4]) : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => {
+      if (url.includes('/assets/')) { controller.abort(new Error('disconnected')); throw new Error('aborted'); }
+      return response(200, media);
+    }});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  await assert.rejects(agent.transfer({id: 'd1'}, target), /disconnected|aborted/);
+  assert.ok(!fake.calls.some(c => c[1] === 'publish'), 'nothing published after the disconnect');
+  // Crash recovery: offered first with the poster.
+  const recovering = fakeCache();
+  recovering.state(agent.root('default').path).recoverable = ['d2'];
+  const again = createDownloadAgent({base, identity, cache: recovering.cache, quota: 100000,
+    api: async path => withPoster(path.split('/')[4]), fetchMedia: async () => assert.fail('no transfer')});
+  assert.equal(await again.transfer({id: 'd2'}, again.root('default')), true);
+  const recovered = JSON.parse(recovering.calls.find(c => c[1] === 'recover')[3]);
+  assert.equal(recovered.artwork.sha256, posterDigest);
+});
+
+/** The real `motion-ui-host cache` writer, when a built binary is named. */
+function realCache(binary) {
+  return (root, scope, args, input) => new Promise((resolve, reject) => {
+    const child = spawn(binary, ['cache', '--cache-dir', root, '--scope', JSON.stringify(scope), ...args], {stdio: ['pipe', 'pipe', 'ignore']});
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.once('error', reject);
+    child.stdin.on('error', reject);
+    child.once('exit', code => {
+      let value;
+      try { value = JSON.parse(output); } catch { return reject(new Error('The offline cache tool failed')); }
+      if (code === 0) resolve(value); else reject(new Error(value.error ?? 'The offline cache tool failed'));
+    });
+    child.stdin.end(input ?? '');
+  });
+}
+
+test('with the real cache, a corrupt poster never blocks recovering verified media',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const poster = Buffer.from('poster image bytes');
+    const posterDigest = createHash('sha256').update(poster).digest('hex');
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => path.endsWith('/manifest') ? {...manifest('d1'), files: [...manifest('d1').files,
+        {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+          media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]} : {},
+      fetchMedia: async () => assert.fail('no transfer')});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    // A crash left the verified media blob, and a corrupt poster blob.
+    writeFileSync(join(target.path, 'blobs', digest), media);
+    writeFileSync(join(target.path, 'blobs', posterDigest), 'corrupt poster');
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(saved.downloads.map(d => [d.identity.download_id, d.artwork ?? null]), [['d1', null]]);
+    assert.ok(!existsSync(join(target.path, 'blobs', posterDigest)), 'the corrupt poster is discarded');
+  });
+
+test('only the known, well-typed metadata fields are handed to the cache', () => {
+  assert.equal(cacheMetadata(undefined), null);
+  assert.equal(cacheMetadata([]), null);
+  assert.equal(cacheMetadata({rating: 'PG'}), null);
+  assert.deepEqual(cacheMetadata({release_year: 1999, description: 'Plot', genres: ['Drama'], rating: 'PG'}),
+    {release_year: 1999, description: 'Plot', genres: ['Drama']});
+  assert.deepEqual(cacheMetadata({release_year: 1e12, description: 3, genres: ['Drama', 4]}), null);
+});
+
+test('with the real cache, a title is saved with its metadata, and bad metadata never blocks it',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const metadata = {d1: {release_year: 1999, description: 'Plot', genres: ['Drama'], future_field: true},
+      d2: {genres: Array.from({length: 11}, (_, n) => `Genre ${n}`)}};
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => {
+        const id = path.split('/')[4];
+        return path.endsWith('/manifest') ? {...manifest(id), metadata: metadata[id]} : path.endsWith('/transfer') ? {} : {url: '/api/v2/media/files/f1/content?ticket=t'};
+      },
+      fetchMedia: async () => response(200, media)});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    assert.equal(await agent.transfer({id: 'd2'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(Object.fromEntries(saved.downloads.map(d => [d.identity.download_id, d.metadata ?? null])),
+      {d1: {release_year: 1999, description: 'Plot', genres: ['Drama']}, d2: null});
+  });
+test('a repeating inventory cursor fails before removing any saved copies', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  let pages = 0;
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => { throw new Error('must not transfer a partial inventory'); },
+    api: async path => {
+      assert.ok(path.includes('active_only=true'));
+      pages++;
+      return {items: [], next_cursor: 'repeated'};
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'saved', timeline_id: 't'}});
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  await assert.rejects(agent.pass(), /inventory did not complete/);
+  assert.equal(pages, 2);
+  assert.ok(!fake.calls.some(c => c[1] === 'remove'));
+  assert.equal(fake.state(target.path).downloads[0].identity.download_id, 'saved');
+});
+
+
+const vtt = Buffer.from('WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n');
+const vttDigest = createHash('sha256').update(vtt).digest('hex');
+const withSubtitles = id => ({...manifest(id), files: [...manifest(id).files,
+  {asset_id: `${id}-subtitles`, relative_name: 'subtitles.vtt', digest: `sha256:${vttDigest}`, size_bytes: String(vtt.length),
+    media_url: `/api/v2/downloads/${id}/subtitles?digest=sha256:${vttDigest}`, role: 'subtitle'}]});
+
+test('selected subtitles are required: saved and verified with the title, or nothing is published', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  let serveSubtitles = false;
+  const admits = [];
+  const reports = [];
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    if (args[0] === 'admit') admits.push(args[2]);
+    return cache(root, scope, args, input);
+  }, quota: 100000,
+    api: async (path, options) => {
+      if (path.endsWith('/manifest')) return {...withSubtitles('d1'), download_revision: '2'};
+      if (path.endsWith('/transfer')) { reports.push(options.body); return {}; }
+      return {url: '/api/v2/media/files/f1/content?ticket=t'};
+    },
+    fetchMedia: async url => url.includes('/subtitles') ? (serveSubtitles ? response(200, vtt) : response(503, '')) : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  await assert.rejects(agent.transfer({id: 'd1'}, target), /subtitles/);
+  assert.ok(!calls.some(c => c[1] === 'publish'), 'nothing published without them');
+  // Admitted with the media: they count against the same space.
+  assert.equal(admits[0], String(media.length + vtt.length));
+  serveSubtitles = true;
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const published = JSON.parse(calls.find(c => c[1] === 'publish')[3]);
+  assert.deepEqual(published.subtitles, {sha256: vttDigest, size: vtt.length});
+  const verified = reports.findLast(r => r.state === 'verified_local');
+  assert.equal(verified.download_revision, '2');
+  assert.equal(verified.bytes_received, String(media.length + vtt.length));
+  assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.subtitles')), vtt);
+});
+
+test('with the real cache, a title is saved with its subtitles',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : path.endsWith('/transfer') ? {} : {url: '/api/v2/media/files/f1/content?ticket=t'},
+      fetchMedia: async url => response(200, url.includes('/subtitles') ? vtt : media)});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(saved.downloads[0].subtitles, {sha256: vttDigest, size: vtt.length});
+    assert.deepEqual(readFileSync(join(target.path, 'blobs', vttDigest)), vtt);
+  });
+
+test('the agent fetches only media, artwork and a download\'s subtitles at a digest', () => {
+  assert.ok(transferLocation('/api/v2/media/files/f1/content?ticket=t'));
+  assert.ok(transferLocation(`/api/v2/downloads/d-1/subtitles?digest=sha256:${vttDigest}`));
+  for (const url of ['/api/v2/downloads/d-1/manifest', '/api/v2/downloads/d-1/subtitles', `/api/v2/downloads/../subtitles?digest=sha256:${vttDigest}`,
+    `https://elsewhere.example/api/v2/media/x`, `/api/v2/downloads/d-1/subtitles?digest=sha256:${vttDigest}&x=1`, null]) {
+    assert.equal(transferLocation(url), false, String(url));
+  }
+});
+
+test('subtitles staged by an interrupted pass are reused, never admitted twice', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const admits = [];
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    if (args[0] === 'admit') admits.push(args[2]);
+    return cache(root, scope, args, input);
+  }, quota: 100000,
+    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async () => assert.fail('nothing left to fetch')});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  // The whole media and verified subtitles were staged before the stop.
+  writeFileSync(join(target.path, 'staging', 'd1.part'), media);
+  writeFileSync(join(target.path, 'staging', 'd1.subtitles'), vtt);
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  assert.deepEqual(admits, ['0']);
+  assert.deepEqual(JSON.parse(calls.find(c => c[1] === 'publish')[3]).subtitles, {sha256: vttDigest, size: vtt.length});
+  // Staged bytes that do not verify are discarded and fetched again.
+  const second = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fetched = [];
+  const again = createDownloadAgent({base: second, identity, cache: fakeCache().cache, quota: 100000,
+    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => { fetched.push(url); return response(200, vtt); }});
+  const other = again.root('default');
+  mkdirSync(join(other.path, 'staging'), {recursive: true});
+  writeFileSync(join(other.path, 'staging', 'd1.part'), media);
+  writeFileSync(join(other.path, 'staging', 'd1.subtitles'), 'WEBVTT\n\nstale');
+  assert.equal(await again.transfer({id: 'd1'}, other), true);
+  assert.equal(fetched.length, 1);
+  assert.match(fetched[0], /\/subtitles\?digest=/);
 });

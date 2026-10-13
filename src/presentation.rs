@@ -103,6 +103,87 @@ fn size(bytes: u64) -> String {
     }
 }
 /// A file of an item, labelled without its server path.
+/// A version as a person can tell it apart: its label (or origin when it
+/// has none), the size and length of its first file, and a short ID, which
+/// is always distinct.
+fn version_label(edition: &str, v: &Value, item_files: &[Value]) -> String {
+    let name = match text(v, "label") {
+        label if !label.is_empty() => label,
+        _ => format!("{} version", text(v, "origin")),
+    };
+    let mut parts = vec![edition.to_owned(), name];
+    let first = v["files"][0]["file"]["file_id"].as_str();
+    if let Some(file) = item_files
+        .iter()
+        .find(|f| first.is_some_and(|id| f["id"] == id))
+    {
+        if let Ok(bytes) = text(file, "size_bytes").parse::<f64>() {
+            parts.push(format!("{:.1} GB", bytes / 1e9));
+        }
+        if let Some(ms) = file["duration_ms"]
+            .as_u64()
+            .or_else(|| text(file, "duration_ms").parse().ok())
+        {
+            parts.push(format!(
+                "{}:{:02}:{:02}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1000 % 60
+            ));
+        }
+    }
+    let id = text(v, "id");
+    parts.push(format!("#{}", &id[..id.len().min(8)]));
+    parts.join(" · ")
+}
+
+/// A prepared version in words: its recipe and the tracks it kept.
+fn prepared_label(r: &Value) -> String {
+    let recipe = match r["recipe_id"].as_str().unwrap_or("") {
+        "remux_mp4" => "MP4 copy",
+        "audio_aac" => "AAC audio",
+        "h264720p" => "H.264 720p",
+        "video_profile" => "Custom profile",
+        other => other,
+    };
+    let ordinal = |key: &str, prefix: char| {
+        r["tracks"][key]
+            .as_str()
+            .and_then(|id| id.strip_prefix(prefix)?.parse::<u32>().ok())
+    };
+    let mut parts = vec![recipe.to_owned()];
+    parts.extend(ordinal("audio_track_id", 'a').map(|n| format!("audio {}", n + 1)));
+    parts.extend(ordinal("subtitle_track_id", 's').map(|n| format!("subtitle {}", n + 1)));
+    parts.join(" · ")
+}
+
+/// A file's text subtitle streams, as (track ID `s{n}`, label): what a
+/// preparation can keep, and what a download can carry as WebVTT. `n`
+/// counts every subtitle stream of the revision.
+fn text_subtitle_tracks(v: &Value) -> Vec<(String, String)> {
+    v["tracks"]
+        .as_array()
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter(|t| t["kind"] == "subtitle")
+                .enumerate()
+                .filter(|(_, t)| {
+                    t["codec"]
+                        .as_str()
+                        .is_some_and(playscale_core::delivery::sidecar_subtitle)
+                })
+                .map(|(n, t)| {
+                    let mut label = vec![format!("Subtitle {}", n + 1)];
+                    label.extend(t["language"].as_str().map(str::to_owned));
+                    label.extend(t["title"].as_str().map(str::to_owned));
+                    (format!("s{n}"), label.join(" · "))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
     let audio_tracks = v["tracks"]
         .as_array()
@@ -121,6 +202,8 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
                 .collect()
         })
         .unwrap_or_default();
+    // Only text subtitles can be kept by a preparation (as mov_text).
+    let subtitle_tracks = text_subtitle_tracks(v);
     let mut label = format!("File {} · {}", n + 1, size(count(&v["size_bytes"])));
     if let Some(ms) = v["duration_ms"].as_u64() {
         label.push_str(&format!(" · {} min", ms.div_ceil(60_000)));
@@ -132,8 +215,17 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
         label,
         availability: availability(v),
         audio_tracks,
+        subtitle_tracks,
     }
 }
+/// Members of a smart collection shown on the organize page.
+const SMART_PREVIEW: usize = 24;
+
+/// Bounds on the per-title reads of the organize page: distinct playlist
+/// timelines, and titles a batched read did not return.
+const ORGANIZE_TIMELINE_READS: usize = 500;
+const ORGANIZE_FALLBACK_READS: usize = 100;
+
 fn segment(s: &str) -> String {
     let mut url = url::Url::parse("http://local/").unwrap();
     url.path_segments_mut().unwrap().push(s);
@@ -260,9 +352,65 @@ impl Queries {
         (Some((version, file, revision)), options)
     }
 
-    /// Every row of a paged list, bounded to `pages` pages of 200. Lists are
-    /// ordered by random ID, so callers needing recency must read them whole;
-    /// beyond the bound this reports unavailable rather than a partial view.
+    /// Every row of a paged list, bounded to `pages` pages of 200. Callers
+    /// use server filters and orderings to keep the read narrow; beyond the
+    /// bound this reports unavailable rather than a partial view.
+    /// Every page of a timeline's effective markers (a timeline holds at
+    /// most `MAX_MARKERS`). Pages are bound to one snapshot: a change between
+    /// pages is refused, and the read starts again a few times before showing
+    /// none, never a mix of two effective sets.
+    async fn effective_markers(&self, timeline_id: &str) -> Vec<Value> {
+        let path = format!(
+            "/catalog/timelines/{}/markers?effective=true",
+            segment(timeline_id)
+        );
+        for _ in 0..3 {
+            if let Ok(markers) = self
+                .list_all(
+                    &path,
+                    (playscale_core::markers::MAX_MARKERS
+                        + playscale_core::markers::MAX_EMBEDDED_CHAPTERS)
+                        .div_ceil(200),
+                )
+                .await
+            {
+                return markers;
+            }
+        }
+        vec![]
+    }
+
+    /// Up to `pages` pages of a listing: the rows read, and whether that
+    /// was all of them (the rows are kept either way).
+    async fn list_up_to(&self, path: &str, pages: usize) -> UiResult<(Vec<Value>, bool)> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..pages {
+            let url = match &cursor {
+                Some(c) => {
+                    let q = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("cursor", c)
+                        .finish();
+                    format!("{path}{separator}limit=200&{q}")
+                }
+                None => format!("{path}{separator}limit=200"),
+            };
+            let page = self.read(&url).await?;
+            rows.extend(
+                page["items"]
+                    .as_array()
+                    .ok_or(UiError::Unavailable)?
+                    .clone(),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => return Ok((rows, true)),
+            }
+        }
+        Ok((rows, false))
+    }
+
     async fn list_all(&self, path: &str, pages: usize) -> UiResult<Vec<Value>> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let mut rows = Vec::new();
@@ -290,6 +438,51 @@ impl Queries {
             }
         }
         Err(UiError::Unavailable)
+    }
+
+    /// Title cards for `ids`, read 100 at a time through the catalog's
+    /// batched `ids` filter. An ID a batch does not return (a merged alias,
+    /// or a hidden or removed title) gets one individual read, which resolves
+    /// aliases and maps hidden titles to `None`, up to a bound; past it the
+    /// ID is left out (not loaded).
+    async fn cards(
+        &self,
+        ids: &[String],
+    ) -> UiResult<std::collections::HashMap<String, Option<ItemCard>>> {
+        let mut unique: Vec<&String> = Vec::new();
+        for id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        let mut cards = std::collections::HashMap::new();
+        for chunk in unique.chunks(100) {
+            let list = chunk
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let q = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("ids", &list)
+                .finish();
+            for v in self.list(&format!("/catalog/items?limit=100&{q}")).await? {
+                cards.insert(text(&v, "id"), Some(item(&v)));
+            }
+        }
+        let mut fallback = ORGANIZE_FALLBACK_READS;
+        for id in unique {
+            if cards.contains_key(id) || fallback == 0 {
+                continue;
+            }
+            fallback -= 1;
+            let card = match self.read(&format!("/catalog/items/{}", segment(id))).await {
+                Ok(v) => Some(item(&v)),
+                Err(UiError::NotFound) => None,
+                Err(e) => return Err(e),
+            };
+            cards.insert(id.clone(), card);
+        }
+        Ok(cards)
     }
 
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
@@ -500,6 +693,14 @@ impl UiQueryFacade for Queries {
             let rows = self
                 .complete_list(&format!("{path}/timelines?limit=20"))
                 .await?;
+            // The item's files, for the subtitles a download may carry.
+            let item_files = if who.can("downloads:manage") {
+                self.complete_list(&format!("{path}/files?limit=200"))
+                    .await
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
             let mut timelines = Vec::new();
             for row in rows {
                 let timeline = text(&row, "id");
@@ -507,12 +708,45 @@ impl UiQueryFacade for Queries {
                     .iter()
                     .find(|e| e["id"] == row["edition_id"])
                     .ok_or(UiError::Unavailable)?;
-                let versions = self
+                let version_rows = self
                     .complete_list(&format!(
                         "/catalog/timelines/{}/versions?limit=200",
                         segment(&timeline)
                     ))
-                    .await?
+                    .await?;
+                // Whole single-file originals with text subtitles: a download
+                // may carry one of them, pinned to that exact version.
+                let subtitle_downloads = version_rows
+                    .iter()
+                    .filter(|v| v["origin"] == "original")
+                    .filter_map(|v| {
+                        let [binding] = v["files"].as_array()?.as_slice() else {
+                            return None;
+                        };
+                        if binding["part"] != 1
+                            || !binding["start_ms"].is_null()
+                            || !binding["end_ms"].is_null()
+                        {
+                            return None;
+                        }
+                        let file = item_files.iter().find(|f| {
+                            f["id"] == binding["file"]["file_id"]
+                                && f["revision"] == binding["file"]["file_revision"]
+                        })?;
+                        let tracks = text_subtitle_tracks(file);
+                        let label = text(v, "label");
+                        (!tracks.is_empty()).then(|| SubtitleDownload {
+                            version_id: text(v, "id"),
+                            label: if label.trim().is_empty() {
+                                "Unnamed version".into()
+                            } else {
+                                label
+                            },
+                            tracks,
+                        })
+                    })
+                    .collect();
+                let versions = version_rows
                     .iter()
                     .map(|v| {
                         let label = text(v, "label");
@@ -532,12 +766,47 @@ impl UiQueryFacade for Queries {
                     position_ms: v["position_ms"].as_u64().unwrap_or(0),
                     watched: v["watched"].as_bool().unwrap_or(false),
                 });
+                // Ready prepared versions, when this caller may save and read
+                // them; each is offered with exactly the selection it kept.
+                let mut prepared_incomplete = false;
+                let prepared_downloads =
+                    if who.can("downloads:manage") && who.can("processing:request") {
+                        // Every page: ready versions may follow pending ones.
+                        let query = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("timeline_id", &timeline)
+                            .finish();
+                        // The ready ones among those read are kept even when
+                        // more remain (`prepared_incomplete` says so).
+                        let (rows, complete) = self
+                            .list_up_to(&format!("/processing/renditions?{query}"), 5)
+                            .await
+                            .unwrap_or((vec![], true));
+                        prepared_incomplete = !complete;
+                        rows.iter()
+                            .filter(|r| {
+                                r["status"] == "ready"
+                                    && r["tracks"].is_object()
+                                    && r["version_id"].is_string()
+                            })
+                            .map(|r| PreparedDownload {
+                                label: prepared_label(r),
+                                recipe_id: text(r, "recipe_id"),
+                                tracks_json: r["tracks"].to_string(),
+                                version_id: text(r, "version_id"),
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
                 timelines.push(TimelineView {
                     id: timeline,
                     edition: text(edition, "label"),
                     duration_ms: row["duration_ms"].as_u64(),
                     viewing,
                     versions,
+                    prepared_downloads,
+                    prepared_incomplete,
+                    subtitle_downloads,
                 });
             }
             // The planner decides per request; this only offers the action
@@ -592,6 +861,19 @@ impl UiQueryFacade for Queries {
                 audio_tracks,
                 audio_version: audio_source.as_ref().map(|s| s.0.clone()),
                 audio_file: audio_source.map(|(_, file, revision)| (file, revision)),
+                // Chapters and skip markers in effect; none if unreadable.
+                markers: self
+                    .effective_markers(timeline_id)
+                    .await
+                    .iter()
+                    .map(|m| MarkerView {
+                        kind: text(m, "kind"),
+                        start_ms: m["start_ms"].as_u64().unwrap_or(0),
+                        end_ms: m["end_ms"].as_u64(),
+                        label: m["label"].as_str().map(str::to_owned),
+                        detected: m["provenance"] == "detected",
+                    })
+                    .collect(),
             })
         })
     }
@@ -626,6 +908,9 @@ impl UiQueryFacade for Queries {
                         .unwrap_or(true),
                     autoplay: prefs["autoplay"].as_bool().unwrap_or(false),
                     completion_percent: prefs["completion_percent"].as_f64().unwrap_or(90.0),
+                    max_bitrate_bps: prefs["max_bitrate_bps"]
+                        .as_str()
+                        .and_then(|b| b.parse().ok()),
                     etag: etag.ok_or(UiError::Unavailable)?,
                 },
             })
@@ -654,36 +939,30 @@ impl UiQueryFacade for Queries {
             };
             // Recent scans, newest first. A scan read failure is shown as
             // unavailable, never as an empty history.
-            let scans = match self.list_all("/scans", 5).await {
-                Ok(mut rows) => {
-                    rows.sort_by_key(|a| std::cmp::Reverse(text(a, "captured_after")));
-                    Some(
-                        rows.iter()
-                            .take(20)
-                            .map(|v| ScanRow {
-                                id: text(v, "id"),
-                                library_name: library_name(v["library_id"].as_str().unwrap_or("")),
-                                status: text(v, "status"),
-                                started: text(v, "captured_after"),
-                                sources: v["sources"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .map(|r| ScanSourceRow {
-                                        source_name: source_name(
-                                            r["source_id"].as_str().unwrap_or(""),
-                                        ),
-                                        status: text(r, "status"),
-                                        observed_files: count(&r["observed_files"]),
-                                        complete_directories: count(&r["complete_directories"]),
-                                        incomplete_directories: count(&r["incomplete_directories"]),
-                                        error_codes: strings(&r["error_codes"]),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                    )
-                }
+            let scans = match self.list("/scans?order=recent&limit=20").await {
+                Ok(rows) => Some(
+                    rows.iter()
+                        .map(|v| ScanRow {
+                            id: text(v, "id"),
+                            library_name: library_name(v["library_id"].as_str().unwrap_or("")),
+                            status: text(v, "status"),
+                            started: text(v, "captured_after"),
+                            sources: v["sources"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|r| ScanSourceRow {
+                                    source_name: source_name(r["source_id"].as_str().unwrap_or("")),
+                                    status: text(r, "status"),
+                                    observed_files: count(&r["observed_files"]),
+                                    complete_directories: count(&r["complete_directories"]),
+                                    incomplete_directories: count(&r["incomplete_directories"]),
+                                    error_codes: strings(&r["error_codes"]),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
                 Err(_) => None,
             };
             let schedules = match self.list_all("/schedules", 5).await {
@@ -746,7 +1025,17 @@ impl UiQueryFacade for Queries {
                     let candidates = v["candidates"].as_array().ok_or(UiError::Unavailable)?;
                     Ok(MatchRow {
                         id: text(v, "id"),
-                        subject: format!("File {}", text(&v["file"], "file_id")),
+                        // The title the file is cataloged under, when
+                        // readable; otherwise its file name.
+                        subject: match v["subject"]["title"].as_str() {
+                            Some(title) => {
+                                format!("{title} ({})", text(&v["subject"], "file_name"))
+                            }
+                            None => match v["subject"]["file_name"].as_str() {
+                                Some(name) if !name.is_empty() => name.to_owned(),
+                                _ => format!("File {}", text(&v["file"], "file_id")),
+                            },
+                        },
                         status: text(v, "status"),
                         etag: v2::etag(revision).to_str().unwrap().to_owned(),
                         candidates: candidates
@@ -791,11 +1080,10 @@ impl UiQueryFacade for Queries {
     fn downloads<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>> {
         Box::pin(async move {
             let mut rows = Vec::new();
-            // Every record, not the first page; past the bound the page
-            // reports unavailable rather than a partial list. Cancelled
-            // records need no action and are not shown.
+            // The server caps uncancelled demands at 500 per device. Filter
+            // history before pagination so cancelled transfers cannot hide them.
             for v in self
-                .list_all("/downloads", 25)
+                .list_all("/downloads?active_only=true", 3)
                 .await?
                 .into_iter()
                 .filter(|v| v["state"] != "cancelled")
@@ -819,6 +1107,14 @@ impl UiQueryFacade for Queries {
                     title,
                     state: text(&v, "state"),
                     size_bytes: text(&v, "size_bytes").parse().unwrap_or(0),
+                    device_transfer: v["device_transfer"].is_object().then(|| {
+                        (
+                            text(&v["device_transfer"], "state"),
+                            text(&v["device_transfer"], "bytes_received")
+                                .parse()
+                                .unwrap_or(0),
+                        )
+                    }),
                 });
             }
             Ok(rows)
@@ -883,6 +1179,12 @@ impl UiQueryFacade for Queries {
                         .await?;
                     let mut originals = std::collections::HashSet::new();
                     let mut out = Vec::new();
+                    let mut version_rows = Vec::new();
+                    // File facts to tell unlabeled versions apart (size, length).
+                    let item_files = self
+                        .complete_list(&format!("{path}/files?limit=200"))
+                        .await
+                        .unwrap_or_default();
                     for row in rows {
                         let timeline = text(&row, "id");
                         let edition = editions
@@ -896,6 +1198,12 @@ impl UiQueryFacade for Queries {
                                 segment(&timeline)
                             ))
                             .await?;
+                        for v in &versions {
+                            version_rows.push(VersionRow {
+                                id: text(v, "id"),
+                                label: version_label(&edition, v, &item_files),
+                            });
+                        }
                         let mut whole = Vec::new();
                         for v in versions.iter().filter(|v| v["origin"] == "original") {
                             let bindings = v["files"].as_array().cloned().unwrap_or_default();
@@ -920,7 +1228,7 @@ impl UiQueryFacade for Queries {
                         }
                         out.push((timeline, edition, whole));
                     }
-                    UiResult::Ok((out, originals))
+                    UiResult::Ok((out, originals, version_rows))
                 }
                 .await
                 .ok()
@@ -930,7 +1238,7 @@ impl UiQueryFacade for Queries {
             // Original files, with the item library that holds each file's
             // source (a match proposal is scoped to that library).
             let files = match &structure {
-                Some((_, originals)) => {
+                Some((_, originals, _)) => {
                     let libraries = self.complete_list("/libraries?limit=200").await.ok();
                     self.complete_list(&format!("{path}/files?limit=200"))
                         .await
@@ -1036,14 +1344,14 @@ impl UiQueryFacade for Queries {
                 None
             };
             let (recipes, timelines) = if prepare {
-                // `video_profile` needs a full profile body; it stays an API operation.
+                // `video_profile` is offered by its own custom-profile form.
                 let recipes = self
                     .complete_list("/processing/recipes?limit=200")
                     .await
                     .ok()
                     .map(|rows| {
                         rows.iter()
-                            .filter(|r| r["purpose"] == "rendition" && r["id"] != "video_profile")
+                            .filter(|r| r["purpose"] == "rendition")
                             .map(|r| RecipeOption {
                                 id: text(r, "id"),
                                 name: text(r, "name"),
@@ -1052,15 +1360,25 @@ impl UiQueryFacade for Queries {
                             })
                             .collect()
                     });
-                // Renditions have no timeline filter; past the read bound they
-                // are reported unknown while preparing stays available.
-                let renditions = self.list_all("/processing/renditions", 5).await.ok();
-                let timelines = structure.as_ref().map(|(rows, _)| {
+                // Each timeline's renditions are read through the server's
+                // timeline filter. Past the read bound (or on a failed read)
+                // they are reported unknown while preparing stays available.
+                let mut renditions = std::collections::HashMap::new();
+                for (timeline, _, _) in structure.iter().flat_map(|(rows, _, _)| rows) {
+                    let rows = self
+                        .list_all(
+                            &format!("/processing/renditions?timeline_id={}", segment(timeline)),
+                            5,
+                        )
+                        .await
+                        .ok();
+                    renditions.insert(timeline.clone(), rows);
+                }
+                let timelines = structure.as_ref().map(|(rows, _, _)| {
                     rows.iter()
                         .map(|(timeline, edition, whole)| PrepareTimeline {
-                            renditions: renditions.as_ref().map(|all| {
+                            renditions: renditions.get(timeline).cloned().flatten().map(|all| {
                                 all.iter()
-                                    .filter(|r| r["timeline_id"] == timeline.as_str())
                                     .map(|r| RenditionRow {
                                         id: text(r, "id"),
                                         status: text(r, "status"),
@@ -1158,8 +1476,178 @@ impl UiQueryFacade for Queries {
             } else {
                 (None, None)
             };
+            // Play orders of this title's editions and its timelines' places.
+            let ordering = if write {
+                async {
+                    let editions = self
+                        .complete_list(&format!("{path}/editions?limit=200"))
+                        .await?;
+                    let label = |id: &Value| {
+                        editions
+                            .iter()
+                            .find(|e| e["id"] == *id)
+                            .map(|e| text(e, "label"))
+                            .unwrap_or_default()
+                    };
+                    let groups = self
+                        .complete_list(&format!("{path}/order-groups?limit=200"))
+                        .await?
+                        .iter()
+                        .map(|g| OrderGroupView {
+                            id: text(g, "id"),
+                            name: text(g, "name"),
+                            kind: text(g, "kind"),
+                            edition: label(&g["edition_id"]),
+                            revision: text(g, "revision"),
+                        })
+                        .collect();
+                    // Cross-work play orders may include descendant episodes.
+                    // Read every candidate through the scoped API, never raw SQL.
+                    let mut pending = vec![(text(&value, "id"), card.title.clone())];
+                    let mut seen = std::collections::HashSet::new();
+                    let mut candidate_rows = Vec::new();
+                    while let Some((item, title)) = pending.pop() {
+                        if !seen.insert(item.clone()) {
+                            continue;
+                        }
+                        if seen.len() > 1000 {
+                            return Err(UiError::Unavailable);
+                        }
+                        let item_path = format!("/catalog/items/{}", segment(&item));
+                        let descendants = self
+                            .complete_list(&format!(
+                                "/catalog/items?parent_id={}&limit=200",
+                                segment(&item)
+                            ))
+                            .await?;
+                        pending.extend(
+                            descendants
+                                .iter()
+                                .map(|child| (text(child, "id"), text(child, "title"))),
+                        );
+                        let rows = self
+                            .complete_list(&format!("{item_path}/timelines?limit=200"))
+                            .await?;
+                        candidate_rows.extend(rows.into_iter().map(|mut row| {
+                            row["placement_title"] = Value::String(title.clone());
+                            row
+                        }));
+                    }
+                    let timelines = candidate_rows
+                        .iter()
+                        .map(|t| {
+                            Ok(OrderedTimeline {
+                                id: text(t, "id"),
+                                edition: format!(
+                                    "{} · {}",
+                                    text(t, "placement_title"),
+                                    label(&t["edition_id"])
+                                ),
+                                etag: tag(t)?,
+                                group_id: t["order_group_id"].as_str().map(str::to_owned),
+                                position: t["order_position"].as_u64(),
+                            })
+                        })
+                        .collect::<UiResult<Vec<_>>>()?;
+                    UiResult::Ok(OrderingView {
+                        editions: editions
+                            .iter()
+                            .map(|e| (text(e, "id"), text(e, "label")))
+                            .collect(),
+                        groups,
+                        timelines,
+                    })
+                }
+                .await
+                .ok()
+            } else {
+                None
+            };
+            // Merge candidates: other readable titles found by this one's
+            // title, each with the exact revisions a merge plan is fenced by.
+            let item_revision = text(&value, "revision");
+            let merge_candidates = if write {
+                let q = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("q", &card.title)
+                    .finish();
+                self.list(&format!("/catalog/search?limit=20&{q}"))
+                    .await
+                    .ok()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter(|r| r["id"] != item_id.as_str())
+                            .map(|r| MergeCandidate {
+                                id: text(r, "id"),
+                                title: text(r, "title"),
+                                revision: text(r, "revision"),
+                            })
+                            .collect()
+                    })
+            } else {
+                None
+            };
+            let versions = if write {
+                structure.as_ref().map(|(_, _, versions)| versions.clone())
+            } else {
+                None
+            };
+            // Chapters and skip markers of each timeline, all of them (stale
+            // and uncertain ones shown as such), for correction.
+            let markers = if write {
+                async {
+                    let editions = self
+                        .complete_list(&format!("{path}/editions?limit=200"))
+                        .await?;
+                    let mut out = Vec::new();
+                    for t in self
+                        .complete_list(&format!("{path}/timelines?limit=20"))
+                        .await?
+                    {
+                        let revision = text(&t, "revision");
+                        // Every page; past the bound the section is
+                        // reported unavailable, never as a shorter list.
+                        let rows = self
+                            .list_all(
+                                &format!("/catalog/timelines/{}/markers", segment(&text(&t, "id"))),
+                                (playscale_core::markers::MAX_MARKERS
+                                    + playscale_core::markers::MAX_EMBEDDED_CHAPTERS)
+                                    .div_ceil(200),
+                            )
+                            .await?;
+                        out.push(TimelineMarkersView {
+                            timeline_id: text(&t, "id"),
+                            edition: editions
+                                .iter()
+                                .find(|e| e["id"] == t["edition_id"])
+                                .map(|e| text(e, "label"))
+                                .unwrap_or_default(),
+                            markers: rows
+                                .iter()
+                                .map(|m| StoredMarkerView {
+                                    kind: text(m, "kind"),
+                                    start_ms: m["start_ms"].as_u64().unwrap_or(0),
+                                    end_ms: m["end_ms"].as_u64(),
+                                    label: m["label"].as_str().map(str::to_owned),
+                                    provenance: text(m, "provenance"),
+                                    current: text(m, "timeline_revision") == revision,
+                                })
+                                .collect(),
+                            revision,
+                        });
+                    }
+                    UiResult::Ok(out)
+                }
+                .await
+                .ok()
+            } else {
+                None
+            };
             Ok(ItemManageView {
                 item: card,
+                markers,
+                item_revision,
+                merge_candidates,
+                versions,
                 library_ids,
                 match_state: text(&value, "match_state"),
                 item_etag: item_etag.ok_or(UiError::Unavailable)?,
@@ -1170,6 +1658,7 @@ impl UiQueryFacade for Queries {
                 timelines,
                 collections,
                 playlists,
+                ordering,
             })
         })
     }
@@ -1180,35 +1669,74 @@ impl UiQueryFacade for Queries {
                 return Err(UiError::Denied);
             }
             let mine = |v: &&Value| v["profile_id"] == who.profile_id.as_str();
-            // Titles are read one by one; bound the page rather than drain it.
-            let mut budget = 300usize;
-            let mut titles: std::collections::HashMap<String, Option<ItemCard>> =
+            let collection_rows: Vec<Value> = self
+                .list_all("/collections", 5)
+                .await?
+                .into_iter()
+                .filter(|v| mine(&v))
+                .collect();
+            let playlist_rows: Vec<Value> = self
+                .list_all("/playlists", 5)
+                .await?
+                .into_iter()
+                .filter(|v| mine(&v))
+                .collect();
+            // Playlist entries name timelines: one read per distinct timeline,
+            // bounded. Past the bound an entry stays listed and removable
+            // with its title not loaded, rather than failing the page.
+            let mut timeline_items: std::collections::HashMap<String, Option<String>> =
                 Default::default();
-            let mut collections = Vec::new();
-            for c in self.list_all("/collections", 5).await?.iter().filter(mine) {
-                // A smart collection's members follow its filter and are not
-                // listed or edited here, so they spend none of the read budget.
-                let ids = if c["kind"] == "smart" {
-                    Vec::new()
+            let mut timeline_reads = ORGANIZE_TIMELINE_READS;
+            for p in &playlist_rows {
+                for e in p["entries"].as_array().ok_or(UiError::Unavailable)? {
+                    let timeline = text(e, "timeline_id");
+                    if timeline_items.contains_key(&timeline) || timeline_reads == 0 {
+                        continue;
+                    }
+                    timeline_reads -= 1;
+                    // Playlists hide entries by title visibility; the timeline
+                    // read also requires its edition. An entry readable only in
+                    // part stays listed (removable) without disclosing a title.
+                    let owner = match self
+                        .read(&format!("/catalog/timelines/{}", segment(&timeline)))
+                        .await
+                    {
+                        Ok(t) => Some(text(&t, "item_id")),
+                        Err(UiError::NotFound) => None,
+                        Err(e) => return Err(e),
+                    };
+                    timeline_items.insert(timeline, owner);
+                }
+            }
+            // Every title the page shows, read in batches. A smart collection's
+            // members follow its filter (the server evaluates it): the first
+            // few are shown, read-only.
+            let shown = |c: &Value| {
+                let ids = strings(&c["item_ids"]);
+                if c["kind"] == "smart" {
+                    ids.into_iter().take(SMART_PREVIEW).collect()
                 } else {
-                    strings(&c["item_ids"])
-                };
+                    ids
+                }
+            };
+            let mut wanted: Vec<String> = Vec::new();
+            for c in &collection_rows {
+                wanted.extend(shown(c));
+            }
+            wanted.extend(timeline_items.values().flatten().cloned());
+            let titles = self.cards(&wanted).await?;
+            let mut collections = Vec::new();
+            for c in &collection_rows {
+                let smart = c["kind"] == "smart";
+                let ids = shown(c);
                 let mut items = Vec::new();
                 let mut remove_bodies = Vec::new();
                 for item_id in &ids {
-                    if !titles.contains_key(item_id) {
-                        budget = budget.checked_sub(1).ok_or(UiError::Unavailable)?;
-                        let card = match self
-                            .read(&format!("/catalog/items/{}", segment(item_id)))
-                            .await
-                        {
-                            Ok(v) => Some(item(&v)),
-                            Err(UiError::NotFound) => None,
-                            Err(e) => return Err(e),
-                        };
-                        titles.insert(item_id.clone(), card);
-                    }
-                    if let Some(card) = titles[item_id].clone() {
+                    if let Some(Some(card)) = titles.get(item_id).cloned() {
+                        if smart {
+                            items.push(card);
+                            continue;
+                        }
                         let rest: Vec<&String> = ids.iter().filter(|i| *i != item_id).collect();
                         remove_bodies.push(
                             serde_json::json!({
@@ -1224,41 +1752,29 @@ impl UiQueryFacade for Queries {
                     id: text(c, "id"),
                     name: text(c, "name"),
                     kind: text(c, "kind"),
+                    filter_id: c["filter_id"].as_str().map(str::to_owned),
                     etag: tag(c)?,
+                    member_count: c["item_ids"].as_array().map_or(0, Vec::len),
                     items,
                     remove_bodies,
                 });
             }
-            let mut timeline_titles: std::collections::HashMap<String, String> = Default::default();
             let mut playlists = Vec::new();
-            for p in self.list_all("/playlists", 5).await?.iter().filter(mine) {
+            for p in &playlist_rows {
                 let entries = p["entries"].as_array().ok_or(UiError::Unavailable)?.clone();
                 let mut views = Vec::new();
                 let mut bodies = Vec::new();
                 for (n, e) in entries.iter().enumerate() {
                     let timeline = text(e, "timeline_id");
-                    if !timeline_titles.contains_key(&timeline) {
-                        budget = budget.checked_sub(2).ok_or(UiError::Unavailable)?;
-                        // Playlists hide entries by title visibility; the timeline
-                        // read also requires its edition. An entry readable only in
-                        // part stays listed (removable) without disclosing a title.
-                        let title = match self
-                            .read(&format!("/catalog/timelines/{}", segment(&timeline)))
-                            .await
-                        {
-                            Ok(t) => match self
-                                .read(&format!("/catalog/items/{}", segment(&text(&t, "item_id"))))
-                                .await
-                            {
-                                Ok(w) => text(&w, "title"),
-                                Err(UiError::NotFound) => "Unavailable title".into(),
-                                Err(e) => return Err(e),
-                            },
-                            Err(UiError::NotFound) => "Unavailable title".into(),
-                            Err(e) => return Err(e),
-                        };
-                        timeline_titles.insert(timeline.clone(), title);
-                    }
+                    let title = match timeline_items.get(&timeline) {
+                        None => "Title not loaded".into(),
+                        Some(None) => "Unavailable title".into(),
+                        Some(Some(item)) => match titles.get(item) {
+                            Some(Some(card)) => card.title.clone(),
+                            Some(None) => "Unavailable title".into(),
+                            None => "Title not loaded".into(),
+                        },
+                    };
                     let body = |entries: Vec<&Value>| {
                         serde_json::json!({"name": p["name"], "profile_id": p["profile_id"], "entries": entries})
                             .to_string()
@@ -1277,7 +1793,7 @@ impl UiQueryFacade for Queries {
                     bodies.push((remove, up));
                     views.push(PlaylistEntryView {
                         entry_id: text(e, "entry_id"),
-                        title: timeline_titles[&timeline].clone(),
+                        title,
                         timeline_id: timeline,
                     });
                 }
@@ -1289,11 +1805,67 @@ impl UiQueryFacade for Queries {
                     entry_bodies: bodies,
                 });
             }
+            // The profile's saved filters, with whether a smart collection
+            // still uses each (deleting one in use is refused).
+            let mut filters = Vec::new();
+            for f in self
+                .list_all("/catalog/filters", 5)
+                .await?
+                .iter()
+                .filter(mine)
+            {
+                let id = text(f, "id");
+                filters.push(SavedFilterView {
+                    in_use: collections
+                        .iter()
+                        .any(|c| c.filter_id.as_deref() == Some(id.as_str())),
+                    id,
+                    name: text(f, "name"),
+                    etag: tag(f)?,
+                    terms: f["all"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|t| FilterTermView {
+                            field: text(t, "field"),
+                            operator: text(t, "operator"),
+                            value: match &t["value"] {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            },
+                        })
+                        .collect(),
+                });
+            }
             Ok(OrganizeView {
                 profile_id: who.profile_id.clone(),
                 collections,
                 playlists,
+                filters,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod version_label_tests {
+    use serde_json::json;
+
+    #[test]
+    fn unlabeled_versions_are_told_apart() {
+        let files = [json!({"id":"f1","size_bytes":"4200000000","duration_ms":6130000})];
+        let unlabeled = |id: &str| json!({"id":id,"label":"","origin":"original","files":[{"file":{"file_id":"f1"}}]});
+        let a = super::version_label("Original", &unlabeled("aaaaaaaa-1"), &files);
+        let b = super::version_label("Original", &unlabeled("bbbbbbbb-2"), &files);
+        assert_eq!(
+            a,
+            "Original · original version · 4.2 GB · 1:42:10 · #aaaaaaaa"
+        );
+        assert_ne!(a, b);
+        let labeled = json!({"id":"c1","label":"Director's cut","origin":"original","files":[]});
+        assert_eq!(
+            super::version_label("Original", &labeled, &[]),
+            "Original · Director's cut · #c1"
+        );
     }
 }

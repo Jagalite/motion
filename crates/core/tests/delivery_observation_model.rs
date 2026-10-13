@@ -40,6 +40,7 @@ impl Model for Observations {
             parts: vec![],
             max_bitrate_bps: None,
             adaptive: false,
+            tone_map: None,
         };
         let (delivery, _) = Delivery::admit("t".into(), pin, 0, Some(1000), 0).unwrap();
         Ok(State { delivery, steps: 0 })

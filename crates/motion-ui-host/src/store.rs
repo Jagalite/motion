@@ -30,7 +30,30 @@ pub struct Store {
     staging: Dir,
     _lock: std::fs::File,
     manifest: CacheManifest,
+    /// Downloads the person removed on this device whose deletion the server
+    /// has not confirmed yet (`removals.json`): never published again
+    /// (`offline::may_publish`) until settled (`offline::settles`).
+    removals: Vec<String>,
 }
+
+/// The person's choice for progress recorded before a server restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreChoice {
+    Discard,
+    Reapply,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RestoreOutcome {
+    pub discarded: usize,
+    pub reapplied: usize,
+    pub dropped: usize,
+}
+
+/// At most this many unsettled removals are kept.
+const MAX_REMOVALS: usize = 500;
+const MAX_REMOVALS_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +92,50 @@ fn subdirectory(root: &Dir, path: &Path, name: &str) -> anyhow::Result<(Dir, std
     Ok((dir, handle))
 }
 
+/// The staging file name for a download's poster.
+pub fn artwork_staging_name(download_id: &str) -> anyhow::Result<String> {
+    ensure!(
+        offline::identifier(download_id),
+        "invalid download identity"
+    );
+    Ok(format!("{download_id}.artwork"))
+}
+
+/// The staging file name for a download's subtitles.
+pub fn subtitles_staging_name(download_id: &str) -> anyhow::Result<String> {
+    ensure!(
+        offline::identifier(download_id),
+        "invalid download identity"
+    );
+    Ok(format!("{download_id}.subtitles"))
+}
+
+/// The verified files an entry names beside its media (its poster and its
+/// subtitles): staging name, digest and size. Each is published into its own
+/// blob before the entry, and released with it.
+fn side_files(entry: &CachedDownload) -> anyhow::Result<Vec<(String, String, u64)>> {
+    let id = &entry.identity.download_id;
+    let mut files = Vec::new();
+    if let Some(art) = &entry.artwork {
+        files.push((artwork_staging_name(id)?, art.sha256.clone(), art.size));
+    }
+    if let Some(subtitles) = &entry.subtitles {
+        files.push((
+            subtitles_staging_name(id)?,
+            subtitles.sha256.clone(),
+            subtitles.size,
+        ));
+    }
+    Ok(files)
+}
+
+/// Every blob an entry names: its media and its side files.
+fn blobs_of(entry: &CachedDownload) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(entry.sha256.clone())
+        .chain(entry.artwork.as_ref().map(|a| a.sha256.clone()))
+        .chain(entry.subtitles.as_ref().map(|s| s.sha256.clone()))
+}
+
 /// The staging file name for a download's transfer.
 pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
     ensure!(
@@ -78,9 +145,30 @@ pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
     Ok(format!("{download_id}.part"))
 }
 
+/// The manifest size up to which a new entry keeps its optional metadata:
+/// the manifest bound less room for other entries' later growth (resume
+/// positions, rebases).
+const METADATA_BUDGET: u64 = crate::MAX_MANIFEST - 256 * 1024;
+
 impl Store {
     /// Open (creating when absent) the cache root for exactly `scope`.
     pub fn open(path: &Path, scope: &CacheScope) -> anyhow::Result<Self> {
+        Self::open_with(path, scope, None)
+    }
+
+    /// Open the root as the writer that already holds its exclusive lock:
+    /// `lock` is a handle on this root's `events.lock` whose lock the caller
+    /// (the running offline host) holds, so no other writer can run. Like
+    /// `open`, it replays pending removals best effort.
+    pub fn open_held(path: &Path, scope: &CacheScope, lock: std::fs::File) -> anyhow::Result<Self> {
+        Self::open_with(path, scope, Some(lock))
+    }
+
+    fn open_with(
+        path: &Path,
+        scope: &CacheScope,
+        held: Option<std::fs::File>,
+    ) -> anyhow::Result<Self> {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -88,17 +176,36 @@ impl Store {
         builder.create(path)?;
         let root = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
         let root_sync = sync_handle(path, &root)?;
-        let lock = root
-            .open_with(
-                "events.lock",
-                cap_std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true),
-            )?
-            .into_std();
-        lock.try_lock_exclusive()
-            .context("the offline cache is in use")?;
+        let lock = match held {
+            Some(lock) => {
+                // The handle must be this root's lock file, not any file.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let (a, b) = (root.metadata("events.lock")?, lock.metadata()?);
+                    ensure!(
+                        cap_std::fs::MetadataExt::dev(&a) == b.dev()
+                            && cap_std::fs::MetadataExt::ino(&a) == b.ino(),
+                        "the held lock is not this cache's"
+                    );
+                }
+                lock
+            }
+            None => {
+                let lock = root
+                    .open_with(
+                        "events.lock",
+                        cap_std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true),
+                    )?
+                    .into_std();
+                lock.try_lock_exclusive()
+                    .context("the offline cache is in use")?;
+                lock
+            }
+        };
         let (blobs, blobs_sync) = subdirectory(&root, path, "blobs")?;
         let (staging, _) = subdirectory(&root, path, "staging")?;
         let manifest = match root.open("manifest.json") {
@@ -129,7 +236,16 @@ impl Store {
             }
             Err(e) => return Err(e.into()),
         };
-        Ok(Self {
+        let removals: Vec<String> = match root.open("removals.json") {
+            Ok(file) => serde_json::from_slice(&bounded(file, MAX_REMOVALS_BYTES)?)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e.into()),
+        };
+        ensure!(
+            removals.len() <= MAX_REMOVALS && removals.iter().all(|id| offline::identifier(id)),
+            "invalid removal record"
+        );
+        let mut store = Self {
             path: path.to_owned(),
             root,
             root_sync,
@@ -138,11 +254,106 @@ impl Store {
             staging,
             _lock: lock,
             manifest,
-        })
+            removals,
+        };
+        // A removal whose intent is durable but whose copy a crash left in
+        // place is completed now, best effort: whatever fails is retried at
+        // the next open, and meanwhile the title is neither published nor
+        // presented (`offline::may_publish` over the durable intents).
+        let _ = store.replay_removals();
+        Ok(store)
+    }
+
+    /// Complete every pending removal whose copy is still here.
+    pub fn replay_removals(&mut self) -> anyhow::Result<()> {
+        for id in self.removals.clone() {
+            self.remove(&id)?;
+        }
+        Ok(())
     }
 
     pub fn manifest(&self) -> &CacheManifest {
         &self.manifest
+    }
+
+    /// Removals the server has not confirmed yet.
+    pub fn removals(&self) -> &[String] {
+        &self.removals
+    }
+
+    fn write_removals(&mut self, removals: Vec<String>) -> anyhow::Result<()> {
+        ensure!(
+            removals.len() <= MAX_REMOVALS,
+            "too many removals await the server"
+        );
+        replace_durably(
+            &self.root,
+            &self.root_sync,
+            "removals.json",
+            &serde_json::to_vec(&removals)?,
+        )?;
+        self.removals = removals; // Only after the durable rename.
+        Ok(())
+    }
+
+    /// The person removes a saved download from this device. The intent is
+    /// durable before the copy goes, so a crash in between leaves a removal
+    /// the next pass completes, never a copy the agent saves again.
+    /// Offline progress already recorded for it is kept.
+    pub fn remove_by_person(&mut self, download_id: &str) -> anyhow::Result<bool> {
+        ensure!(
+            offline::identifier(download_id),
+            "invalid download identity"
+        );
+        let saved = self
+            .manifest
+            .downloads
+            .iter()
+            .any(|d| d.identity.download_id == download_id)
+            || self.staged()?.iter().any(|id| id == download_id);
+        if !saved {
+            return Ok(false);
+        }
+        if offline::may_publish(download_id, &self.removals) {
+            let mut next = self.removals.clone();
+            next.push(download_id.to_owned());
+            self.write_removals(next)?;
+        }
+        self.remove(download_id)?;
+        Ok(true)
+    }
+
+    /// Settle a pending removal with the server's answer to deleting the
+    /// download and whether its copy is gone here (`offline::settles`).
+    /// Returns whether it is now settled.
+    pub fn settle_removal(
+        &mut self,
+        download_id: &str,
+        outcome: offline::Deletion,
+    ) -> anyhow::Result<bool> {
+        if offline::may_publish(download_id, &self.removals) {
+            return Ok(true);
+        }
+        // Complete the local removal first (best effort); the intent stays
+        // while any copy remains (`offline::settles`).
+        let _ = self.remove(download_id);
+        let saved = self
+            .manifest
+            .downloads
+            .iter()
+            .any(|d| d.identity.download_id == download_id)
+            || self.staged()?.iter().any(|id| id == download_id);
+        if !offline::settles(outcome, saved) {
+            return Ok(false);
+        }
+        let next = self
+            .removals
+            .iter()
+            .filter(|id| *id != download_id)
+            .cloned()
+            .collect();
+        self.write_removals(next)?;
+        Ok(true)
     }
 
     /// Downloads with a staged (unpublished) transfer. These are lifecycle
@@ -151,13 +362,20 @@ impl Store {
         let mut ids = Vec::new();
         for entry in self.staging.entries()? {
             let name = entry?.file_name();
-            if let Some(id) = name.to_string_lossy().strip_suffix(".part")
+            let name = name.to_string_lossy();
+            // A staged transfer, poster or subtitles: each belongs to the
+            // download's lifecycle (cancellation, expiry, withdrawal).
+            if let Some(id) = name
+                .strip_suffix(".part")
+                .or_else(|| name.strip_suffix(".artwork"))
+                .or_else(|| name.strip_suffix(".subtitles"))
                 && offline::identifier(id)
             {
                 ids.push(id.to_owned());
             }
         }
         ids.sort();
+        ids.dedup();
         Ok(ids)
     }
 
@@ -230,15 +448,54 @@ impl Store {
     /// Verify the staged transfer of `entry` and publish it atomically.
     /// A failed verification removes the staged bytes and changes nothing
     /// visible; an exact repeat is idempotent.
-    pub fn publish(&mut self, entry: CachedDownload) -> anyhow::Result<Publication> {
+    pub fn publish(&mut self, mut entry: CachedDownload) -> anyhow::Result<Publication> {
+        // Optional metadata never refuses a title: what is out of bounds is
+        // dropped (`offline::kept_metadata`).
+        entry.metadata = offline::kept_metadata(entry.metadata.take());
         validate_download(&entry)?;
         let id = entry.identity.download_id.clone();
+        ensure!(
+            offline::may_publish(&id, &self.removals),
+            "this download was removed on this device"
+        );
         let staged = staging_name(&id)?;
+        let sides = side_files(&entry)?;
         if self.manifest.downloads.iter().any(|d| {
-            d.identity.download_id == id && d.sha256 == entry.sha256 && d.size == entry.size
+            d.identity.download_id == id
+                && d.sha256 == entry.sha256
+                && d.size == entry.size
+                && d.artwork == entry.artwork
+                && d.subtitles == entry.subtitles
         }) {
             let _ = self.staging.remove_file(&staged);
+            for (name, _, _) in &sides {
+                let _ = self.staging.remove_file(name);
+            }
             return Ok(Publication::AlreadyPublished);
+        }
+        // Side files first: each verified into its blob before the media,
+        // so a published entry never names a missing or unverified file.
+        for (name, sha256, size) in &sides {
+            match self.staging.open(name) {
+                Ok(mut file) => {
+                    if let Err(e) = Self::verify(&mut file, *size, sha256) {
+                        drop(file);
+                        self.staging.remove_file(name)?;
+                        return Err(e);
+                    }
+                    file.sync_all()?;
+                    self.staging.rename(name, &self.blobs, sha256)?;
+                    self.blobs_sync.sync_all()?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let mut blob = self
+                        .blobs
+                        .open(sha256)
+                        .context("no staged file for this download")?;
+                    Self::verify(&mut blob, *size, sha256)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         match self.staging.open(&staged) {
             Ok(mut file) => {
@@ -262,21 +519,30 @@ impl Store {
             Err(e) => return Err(e.into()),
         }
         let mut next = self.manifest.clone();
-        let replaced = next
+        let replaced: Vec<String> = next
             .downloads
             .iter()
-            .find(|d| d.identity.download_id == id)
-            .map(|d| d.sha256.clone());
+            .filter(|d| d.identity.download_id == id)
+            .flat_map(blobs_of)
+            .collect();
         next.downloads.retain(|d| d.identity.download_id != id);
         ensure!(
             next.downloads.len() < MAX_DOWNLOADS,
             "the cache holds the maximum number of downloads"
         );
         next.downloads.push(entry);
+        // Optional metadata is kept only while the manifest stays within
+        // its budget (leaving room for the entries' later growth), so it can
+        // never stop a title from being saved.
+        if serde_json::to_vec(&next)?.len() as u64 > METADATA_BUDGET
+            && let Some(last) = next.downloads.last_mut()
+        {
+            last.metadata = None;
+        }
         self.write_manifest(next)?;
         // Only bytes this publication superseded; other unreferenced blobs
         // may still be recovered by their own ready demand (see `collect`).
-        if let Some(old) = replaced {
+        for old in replaced {
             self.release(&old)?;
         }
         Ok(Publication::Published)
@@ -285,34 +551,48 @@ impl Store {
     /// Remove a download's entry, staged bytes and (when unshared) its blob.
     /// Removal only affects this device; it cannot reach other copies.
     pub fn remove(&mut self, download_id: &str) -> anyhow::Result<bool> {
-        let staged = staging_name(download_id)?;
-        match self.staging.remove_file(&staged) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        for staged in [
+            staging_name(download_id)?,
+            artwork_staging_name(download_id)?,
+            subtitles_staging_name(download_id)?,
+        ] {
+            match self.staging.remove_file(&staged) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         let mut next = self.manifest.clone();
-        let blob = next
+        let blobs: Vec<String> = next
             .downloads
             .iter()
-            .find(|d| d.identity.download_id == download_id)
-            .map(|d| d.sha256.clone());
+            .filter(|d| d.identity.download_id == download_id)
+            .flat_map(blobs_of)
+            .collect();
         next.downloads
             .retain(|d| d.identity.download_id != download_id);
         let removed = next.downloads.len() != self.manifest.downloads.len();
         if removed {
             self.write_manifest(next)?;
         }
-        if let Some(blob) = blob {
+        for blob in blobs {
             self.release(&blob)?;
         }
         Ok(removed)
     }
 
+    /// Whether a published entry names this blob (its media or a side file).
+    fn referenced(&self, sha256: &str) -> bool {
+        self.manifest
+            .downloads
+            .iter()
+            .any(|d| blobs_of(d).any(|b| b == sha256))
+    }
+
     /// Delete one blob a write just stopped referencing, unless another
     /// entry still shares it.
     fn release(&self, sha256: &str) -> anyhow::Result<()> {
-        if self.manifest.downloads.iter().any(|d| d.sha256 == sha256) {
+        if self.referenced(sha256) {
             return Ok(());
         }
         match self.blobs.remove_file(sha256) {
@@ -331,7 +611,7 @@ impl Store {
         for entry in self.blobs.entries()? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
-            if !self.manifest.downloads.iter().any(|d| d.sha256 == name) {
+            if !self.referenced(&name) {
                 self.blobs.remove_file(name.as_ref())?;
             }
         }
@@ -349,6 +629,98 @@ impl Store {
         Ok(log)
     }
 
+    /// Apply the person's choice for progress recorded against an earlier
+    /// history of a restored server (`current` is the server's history now):
+    /// discard it (`offline::discard`), or re-apply it pinned to each
+    /// download's restored pin (`offline::reapply`; `pins`, read by the agent
+    /// from the restored server: the viewing base as restored, under
+    /// `current`, for a download of this cache with its pinned timeline and
+    /// source). One durable replacement of the event log; the next batch
+    /// re-anchors past the old events. Returns how many events were
+    /// discarded, re-applied and dropped.
+    pub fn resolve_restore(
+        &mut self,
+        choice: RestoreChoice,
+        current: &str,
+        pins: &[offline::DownloadIdentity],
+    ) -> anyhow::Result<RestoreOutcome> {
+        ensure!(offline::viewing_epoch(current), "invalid server history");
+        let log = self.events()?;
+        let foreign = offline::foreign_events(&log.events, current);
+        if foreign == 0 {
+            return Ok(RestoreOutcome::default());
+        }
+        let resolved = match choice {
+            RestoreChoice::Discard => offline::discard(
+                log.base_sequence,
+                log.base_viewing_epoch.as_deref(),
+                &log.events,
+                current,
+            ),
+            RestoreChoice::Reapply => {
+                for pin in pins {
+                    let entry = self
+                        .manifest
+                        .downloads
+                        .iter()
+                        .find(|d| d.identity.download_id == pin.download_id)
+                        .context("a pin names a download this cache does not hold")?;
+                    ensure!(
+                        pin.viewing_epoch.as_deref() == Some(current)
+                            && pin.timeline_id == entry.identity.timeline_id
+                            && pin.timeline_revision == entry.identity.timeline_revision
+                            && pin.source_revision == entry.identity.source_revision
+                            && offline::sequence(&pin.base_viewing_revision).is_some()
+                            && offline::sequence(&pin.base_manual_epoch).is_some(),
+                        "a pin does not describe this cache's download under the current history"
+                    );
+                }
+                offline::reapply(
+                    log.base_sequence,
+                    log.base_viewing_epoch.as_deref(),
+                    &log.events,
+                    pins,
+                    current,
+                )
+                .context("the device sequence is exhausted")?
+            }
+        };
+        let next = EventLog {
+            base_sequence: resolved.base,
+            events: resolved.events,
+            base_viewing_epoch: resolved.base_epoch,
+        };
+        next.validate(&self.manifest.scope)?;
+        let bytes = serde_json::to_vec(&next)?;
+        ensure!(bytes.len() as u64 <= MAX_LOG, "event storage is full");
+        replace_durably(&self.root, &self.root_sync, "events.json", &bytes)?;
+        Ok(match choice {
+            RestoreChoice::Discard => RestoreOutcome {
+                discarded: foreign,
+                ..Default::default()
+            },
+            RestoreChoice::Reapply => RestoreOutcome {
+                reapplied: foreign - resolved.dropped,
+                dropped: resolved.dropped,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// The re-anchor the next batch (sent under its first event's history)
+    /// must carry (`offline::reanchor`): the log's compaction point belongs
+    /// to another history of the server, which a restored server never saw.
+    pub fn pending_reanchor(&self) -> anyhow::Result<Option<offline::Reanchor>> {
+        let log = self.events()?;
+        Ok(log
+            .events
+            .first()
+            .and_then(|e| e.media.viewing_epoch.as_deref())
+            .and_then(|epoch| {
+                offline::reanchor(log.base_sequence, log.base_viewing_epoch.as_deref(), epoch)
+            }))
+    }
+
     /// Compact the events the server acknowledged through `through` (its
     /// `next_device_sequence - 1`). An acknowledgement beyond anything this
     /// log wrote is refused and erases nothing.
@@ -360,6 +732,12 @@ impl Store {
             bail!("the server acknowledged sequences this device never wrote");
         };
         let next = EventLog {
+            base_viewing_epoch: offline::compacted_epoch(
+                log.base_viewing_epoch.as_deref(),
+                &log.events,
+                log.base_sequence,
+                base_sequence,
+            ),
             base_sequence,
             events,
         };
@@ -420,6 +798,10 @@ impl Store {
     /// or transferring again. Returns whether the download is now published.
     pub fn recover(&mut self, entry: CachedDownload) -> anyhow::Result<bool> {
         validate_download(&entry)?;
+        ensure!(
+            offline::may_publish(&entry.identity.download_id, &self.removals),
+            "this download was removed on this device"
+        );
         let staged = staging_name(&entry.identity.download_id)?;
         let staged_exists = match self.staging.metadata(&staged) {
             Ok(_) => true,
@@ -431,7 +813,12 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        if staged_exists || !blob_exists {
+        // Its side files must be in place too (staged or as blobs).
+        let sides = side_files(&entry)?;
+        let sides_ready = sides.iter().all(|(name, sha256, _)| {
+            self.staging.metadata(name).is_ok() || self.blobs.metadata(sha256).is_ok()
+        });
+        if staged_exists || !blob_exists || !sides_ready {
             return Ok(false);
         }
         let mut blob = self.blobs.open(&entry.sha256)?;
@@ -449,6 +836,36 @@ impl Store {
                 self.blobs_sync.sync_all()?;
             }
             return Ok(false);
+        }
+        // Side files are verified here as well: a corrupt one is discarded
+        // and recovery declines, so the caller recovers without an optional
+        // poster, or transfers a required subtitle file again, rather than
+        // failing every pass.
+        for (name, sha256, size) in &sides {
+            let (mut file, from_staging) = match self.staging.open(name) {
+                Ok(file) => (file, true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    (self.blobs.open(sha256)?, false)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if Self::verify(&mut file, *size, sha256).is_err() {
+                drop(file);
+                if from_staging {
+                    self.staging.remove_file(name)?;
+                    // A verified content-addressed copy may already be shared
+                    // by another title even when this staging attempt is bad.
+                    if let Ok(mut blob) = self.blobs.open(sha256)
+                        && Self::verify(&mut blob, *size, sha256).is_ok()
+                    {
+                        continue;
+                    }
+                } else if !self.referenced(sha256) {
+                    self.blobs.remove_file(sha256)?;
+                    self.blobs_sync.sync_all()?;
+                }
+                return Ok(false);
+            }
         }
         self.publish(entry)?;
         Ok(true)
@@ -479,6 +896,22 @@ impl Store {
         else {
             return Ok(false);
         };
+        let mut log = self.events()?;
+        if offline::may_backfill_epoch(
+            log.base_sequence,
+            log.base_viewing_epoch.as_deref(),
+            &log.events,
+            entry.identity.viewing_epoch.as_deref(),
+            viewing_epoch,
+        ) {
+            log.base_viewing_epoch = Some(viewing_epoch.to_owned());
+            replace_durably(
+                &self.root,
+                &self.root_sync,
+                "events.json",
+                &serde_json::to_vec(&log)?,
+            )?;
+        }
         let resume = resume_position_ms.filter(|p| *p < entry.duration_ms);
         if entry.identity.base_viewing_revision == viewing_revision
             && entry.identity.base_manual_epoch == manual_epoch

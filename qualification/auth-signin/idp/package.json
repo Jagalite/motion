@@ -1,0 +1,11 @@
+{
+  "name": "motion-signin-provider-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node provider.mjs"
+  },
+  "dependencies": {
+    "oidc-provider": "9.12.2"
+  }
+}

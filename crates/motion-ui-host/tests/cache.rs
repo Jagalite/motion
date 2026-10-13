@@ -40,6 +40,9 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
             size: 10,
             content_type: "video/mp4".into(),
             resume_position_ms: None,
+            artwork: None,
+            subtitles: None,
+            metadata: None,
         }],
     };
     std::fs::write(
@@ -418,4 +421,412 @@ async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
     assert_eq!(history, vec![event]);
     drop(app);
     assert!(Cache::open(&moved).is_ok());
+}
+
+/// The offline page removes a saved title through the host: authenticated
+/// like every cache write, the title leaves the page and the cache, an open
+/// player's ticket stops serving it, and recorded progress is kept.
+#[tokio::test]
+async fn a_saved_title_is_removed_from_the_offline_host() {
+    let (dir, _) = fixture();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(body).unwrap();
+    assert!(
+        page.contains(r#"data-remove-download="download""#),
+        "{page}"
+    );
+    // Without the cache cookie nothing is removed.
+    let (status, _, _) = request(&app, "POST", "/cache/remove/download", "", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!dir.path().join("blobs").read_dir().unwrap().any(|_| true));
+}
+
+/// The manifest write commits but releasing the blob fails: the removal is
+/// reported, the host presents exactly what was committed and the open
+/// ticket stops serving.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partially_committed_removal_is_what_the_host_presents() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, _) = fixture();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    let blobs = dir.path().join("blobs");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The removal committed; only freeing the blob failed (collected later).
+    assert_eq!(status, StatusCode::OK, "the committed removal is reported");
+    assert!(!cache.presents("download"));
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// An earlier removal of A recorded its intent but stopped before its copy
+/// went (a crash or failed write). A is no longer presented; retrying A
+/// reports success, and removing B completes A and invalidates A's ticket.
+#[tokio::test]
+async fn interrupted_removals_are_never_presented_and_complete_later() {
+    let (dir, mut manifest) = fixture();
+    let mut second = manifest.downloads[0].clone();
+    second.identity.download_id = "second".into();
+    manifest.downloads.push(second);
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    // The intent of an interrupted removal of "download" is durable; the
+    // running host learns of it with the next removal it performs.
+    std::fs::write(dir.path().join("removals.json"), br#"["download"]"#).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/second",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!cache.presents("download") && !cache.presents("second"));
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the completed removal's ticket is gone"
+    );
+    drop(app);
+    drop(cache);
+    // A host opened over an intent whose copy is still there, and which
+    // cannot even complete it (the root is read-only, so the manifest write
+    // fails), presents nothing of it.
+    let (dir, _) = fixture();
+    std::fs::write(dir.path().join("removals.json"), br#"["download"]"#).unwrap();
+    std::fs::write(dir.path().join("events.lock"), b"").unwrap();
+    std::fs::create_dir(dir.path().join("staging")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["downloads"].as_array().unwrap().len(),
+        1,
+        "the copy is still listed"
+    );
+    assert!(!cache.presents("download"));
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
+}
+
+/// The offline page shows a saved poster, served from its verified blob.
+#[tokio::test]
+async fn a_saved_poster_is_shown_offline() {
+    let (dir, mut manifest) = fixture();
+    let poster = b"poster image";
+    let digest = format!("{:x}", Sha256::digest(poster));
+    std::fs::write(dir.path().join("blobs").join(&digest), poster).unwrap();
+    manifest.downloads[0].artwork = Some(motion_ui::offline::CachedArtwork {
+        sha256: digest,
+        size: poster.len() as u64,
+        content_type: "image/png".into(),
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        String::from_utf8(page)
+            .unwrap()
+            .contains(r#"src="/cache/artwork/download""#)
+    );
+    let (status, headers, bytes) =
+        request(&app, "GET", "/cache/artwork/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(bytes, poster);
+    let (status, _, _) = request(&app, "GET", "/cache/artwork/download", "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The offline pages show the saved metadata, escaped like every value.
+#[tokio::test]
+async fn saved_metadata_is_shown_offline() {
+    let (dir, mut manifest) = fixture();
+    manifest.downloads[0].metadata = Some(playscale_core::offline::OfflineMetadata {
+        release_year: Some(1999),
+        description: Some("A <described> title.".into()),
+        genres: vec!["Drama".into(), "Mystery".into()],
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(String::from_utf8(page).unwrap().contains("1999 · "));
+    let (status, _, page) = request(&app, "GET", "/download/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.contains("1999 · Drama, Mystery"), "{page}");
+    assert!(page.contains("A &lt;described&gt; title."), "{page}");
+}
+
+#[tokio::test]
+async fn snapshot_retirement_is_exact_and_reopening_invalidates_the_old_ticket() {
+    let (dir, _) = fixture();
+    let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let (status, _, bytes) = request(
+            &app,
+            "POST",
+            "/cache/open/download",
+            &cookie,
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let opened: Value = serde_json::from_slice(&bytes).unwrap();
+        urls.push(opened["media_url"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(urls[0], urls[1]);
+    assert_eq!(
+        request(&app, "GET", &urls[0], &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let old_close = urls[0].replace("/cache/media/", "/cache/close/");
+    assert_eq!(
+        request(&app, "POST", &old_close, &cookie, Some(json!({})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &urls[1], &cookie, None).await.0,
+        StatusCode::OK
+    );
+    let close = urls[1].replace("/cache/media/", "/cache/close/");
+    for _ in 0..2 {
+        assert_eq!(
+            request(&app, "POST", &close, &cookie, Some(json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        request(&app, "GET", &urls[1], &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn snapshot_retirement_preserves_already_admitted_readers() {
+    let (dir, _) = fixture();
+    let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
+    let (status, _, bytes) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&bytes).unwrap();
+    let url = opened["media_url"].as_str().unwrap();
+    let reader = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(url)
+                .header("Host", "127.0.0.1:1234")
+                .header("Cookie", &cookie)
+                .header("Range", "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reader.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            &url.replace("/cache/media/", "/cache/close/"),
+            &cookie,
+            Some(json!({})),
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", url, &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // Closing prevents new readers, while the body admitted before close owns
+    // its snapshot until its actual read completes.
+    assert_eq!(
+        reader
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .as_ref(),
+        b"2345"
+    );
+}
+
+/// Saved subtitles are served offline from their verified blob, and the
+/// player page names them; a blob that no longer matches is not served.
+#[tokio::test]
+async fn saved_subtitles_are_served_offline() {
+    let (dir, mut manifest) = fixture();
+    let vtt = b"WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n";
+    let digest = format!("{:x}", Sha256::digest(vtt));
+    std::fs::write(dir.path().join("blobs").join(&digest), vtt).unwrap();
+    manifest.downloads[0].subtitles = Some(motion_ui::offline::CachedSubtitles {
+        sha256: digest.clone(),
+        size: vtt.len() as u64,
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/download/download", &cookie, None).await;
+    assert!(
+        String::from_utf8(page)
+            .unwrap()
+            .contains(r#"data-subtitles-url="/cache/subtitles/download""#)
+    );
+    let (status, headers, bytes) =
+        request(&app, "GET", "/cache/subtitles/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/vtt; charset=utf-8");
+    assert_eq!(bytes, vtt);
+    let (status, _, _) = request(&app, "GET", "/cache/subtitles/download", "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    std::fs::write(dir.path().join("blobs").join(&digest), b"WEBVTT\n\nchanged").unwrap();
+    let (status, _, _) = request(&app, "GET", "/cache/subtitles/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }

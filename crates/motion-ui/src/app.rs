@@ -52,6 +52,9 @@ pub fn router(facade: Facade) -> Router {
         .page(crate::screens::manage_item)
         .page(crate::screens::organize)
         .page(crate::screens::downloads)
+        .page(crate::access_screens::access)
+        .page(crate::access_screens::my_signin)
+        .page(crate::access_screens::signin)
         .build()
 }
 
@@ -250,6 +253,12 @@ fn manage_links(who: &UiPrincipal) -> Vec<ManageLink> {
         ),
         ("downloads:manage", "/downloads", "Downloads", "download"),
         ("system:admin", "/diagnostics", "Diagnostics", "diagnostics"),
+        (
+            "system:admin",
+            "/settings/access",
+            "Authentication & Access",
+            "manage",
+        ),
     ]
     .into_iter()
     .filter(|(permission, ..)| who.can(permission))
@@ -347,6 +356,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     </ul>
                                 }
                                 <ul class="nav-list nav-foot">
+                                    nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
                                     nav_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profiles".to_string(), icon_name: "profiles", current: path.starts_with("/profiles"))
                                 </ul>
                             </nav>
@@ -409,6 +419,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                             <h1>(title)</h1>
                                             <p>(message)</p>
                                             if sign_in {
+                                                <p><a class="button primary" href="/signin">"Sign in with SSO or email"</a></p>
                                                 crate::screens::pairing_form()
                                             }
                                         </section>
@@ -428,7 +439,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             tab_link(href: href!(search).resolve(cx), label: "Search", icon_name: "search", current: path.starts_with("/search"))
                             if can_manage {
                                 tab_link(href: href!(manage).resolve(cx), label: "Manage", icon_name: "manage",
-                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/organize", "/diagnostics"].iter().any(|p| path.starts_with(p)))
+                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/organize", "/diagnostics", "/settings/access"].iter().any(|p| path.starts_with(p)))
                             }
                             tab_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profile", icon_name: "profiles", current: path.starts_with("/profiles"))
                         </nav>
@@ -638,7 +649,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                     </a>
                                 }
                                 if who.can("downloads:manage") {
-                                    download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone())
+                                    download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone(), prepared: timeline.prepared_downloads.clone(), incomplete: timeline.prepared_incomplete, subtitled: timeline.subtitle_downloads.clone())
                                 }
                                 if let Some(viewing) = &timeline.viewing {
                                     if viewing.watched {
@@ -701,7 +712,7 @@ async fn search(cx: &Cx) -> Result<impl View> {
             <label class="visually-hidden" for="page-search">"Search the catalog"</label>
             icon(name: "search")
             <input id="page-search" type="search" name="q" placeholder="Search titles" autocomplete="off"
-                enterkeyhint="search">
+                enterkeyhint="search" value=(view_model.query.as_str())>
         </form>
         <header class="page-header">
             <h1 class="page-title">(heading.as_str())</h1>
@@ -817,6 +828,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-autoplay=(if preferences.autoplay { "true" } else { "false" })
             data-subtitle-policy=(preferences.subtitle_mode.as_str())
             data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
+            data-max-bitrate=(preferences.max_bitrate_bps.map(|b| b.to_string()).unwrap_or_default())
             data-resume-ms=(view_model.resume_ms)
             data-duration-ms=(view_model.duration_ms.unwrap_or(0))
             data-demuxe-base=(assets::DEMUXE_BASE)>
@@ -830,6 +842,28 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <button type="button" data-player-action="next">icon(name: "next") <span>"Next title"</span></button>
                 <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
             </div>
+            // Skip buttons appear while playback is inside their interval
+            // (the player shows them); chapters are always listed.
+            for marker in view_model.markers.iter().filter(|m| m.kind != "chapter" && m.end_ms.is_some()) {
+                <button type="button" class="player-skip" hidden=(true)
+                    data-player-seek=(marker.end_ms.unwrap_or(0)) data-marker-start=(marker.start_ms) data-marker-end=(marker.end_ms.unwrap_or(0))>
+                    (match marker.kind.as_str() { "intro" => "Skip intro", "recap" => "Skip recap", _ => "Skip credits" })
+                    if marker.detected { <span class="muted small">" (detected)"</span> }
+                </button>
+            }
+            if view_model.markers.iter().any(|m| m.kind == "chapter") {
+                <details class="player-chapters">
+                    <summary>"Chapters"</summary>
+                    <ol class="rows">
+                        for (n, marker) in view_model.markers.iter().filter(|m| m.kind == "chapter").enumerate() {
+                            <li><button type="button" data-player-seek=(marker.start_ms)>
+                                (format!("{} · {}", clock(marker.start_ms), marker.label.clone().unwrap_or_else(|| format!("Chapter {}", n + 1))))
+                                if marker.detected { <span class="muted small">" (detected)"</span> }
+                            </button></li>
+                        }
+                    </ol>
+                </details>
+            }
             <details class="player-options">
                 <summary>"Playback options"</summary>
                 <div class="player-options-body">
@@ -850,6 +884,11 @@ async fn play(cx: &Cx) -> Result<impl View> {
                         }
                     </select></label>
                     <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
+                    <label>"Limit "<select name="limit">
+                        for (value, text, selected) in crate::screens::bitrate_options(preferences.max_bitrate_bps) {
+                            <option value=(value) selected=(selected)>(text)</option>
+                        }
+                    </select></label>
                     <button type="button" data-player-action="quality">"Apply quality"</button>
                 </div>
             </details>

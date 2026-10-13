@@ -75,7 +75,7 @@ These are named on the page or listed here. Nothing is silently substituted.
   scoped file→title read for a proposal; the manage page is the readable path.
 - **Scan progress** is pull-only (reload). The event stream exists but the
   Topcoat pages have no live runtime by design.
-- **Lists are bounded.** Lists are ordered by random ID with no server filter
+- **Lists are bounded.** *(Superseded by completion item 2: scan history is read newest first, renditions by timeline and organize titles in batches; see the [completion ledger](../completion/README.md). The text below records the N1 state.)* Lists are ordered by random ID with no server filter
   or recency order, so the pages read them whole, up to 1000 rows (5 pages).
   Past that the section says it cannot be shown rather than truncating:
   - Scan history: "Scan now" stays offered. `scan_requests` is never pruned,

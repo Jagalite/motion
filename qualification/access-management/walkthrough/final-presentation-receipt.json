@@ -1,0 +1,37 @@
+{
+  "application_source": "b183d5482a4bc145919e2a3b723e188c3dc73d73",
+  "checkout_head": "3fde243e89557ba7525627a8ed4140416109974d",
+  "server_kyoto_job": "970b895cd7f6468e8e122a0d4e14aa86",
+  "terminal_kyoto_job": "08fdacd250e54ac19732cb34319ed0ad",
+  "server_sha256": "8fae66085eb7d9095f545d76ee96845a95a07a8aaf3f8c887c418d88a8022ecc",
+  "terminal_sha256": "7c1fd5e9d8dde21dcbf5afb8d10c489ac03eca1901666ccdf1e247502faa08f3",
+  "bridge_sha256": "f7c96b55a41769f2c78a6d058d80d3444efda878c8982417c4c37600c05200f8",
+  "source_trees": {
+    "src": "90fe958cb4be82384a80f1f5371ed6a7851b9ad4",
+    "crates": "bb653d04a12a5f2206ade888f5728db8d1afcf48",
+    "migrations": "61bf317d24d159bd244be9591a2641d1cf555e6c",
+    "contracts": "c23a0403ac684e99a38509044969bc8614eed29a",
+    "apps/terminal": "ea4f5be38b4466434d1ce8ee89a3c1868d0f8349",
+    "packages/ui-bridge": "113b9e58704e0189495a7e83e060d94f125a4556"
+  },
+  "status": "passed",
+  "served_bridge_matches_source": true,
+  "browser_statuses": [
+    {
+      "role": "alert",
+      "text": "An administrator denied this pairing request. Ask them before starting a new request."
+    },
+    {
+      "role": "alert",
+      "text": "This invitation is no longer available. Ask an administrator for a new code."
+    }
+  ],
+  "browser_url": "http://127.0.0.1:18795/",
+  "secret_in_session_storage": false,
+  "tui_list_titles": [
+    "Pairing requests",
+    "Users and access",
+    "Access invitations"
+  ],
+  "screenshot_limit": "T3 snapshot failed on the final pass; native browser click/type/evaluate succeeded. Final DOM observations and terminal snapshots are retained; earlier walkthrough PNGs remain."
+}

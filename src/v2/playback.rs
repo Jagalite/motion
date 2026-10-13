@@ -238,7 +238,16 @@ fn preferences_json(state: &legacy::PreferenceState) -> Value {
         "allow_client_software_decode": p.allow_client_software_decode,
         "autoplay": p.autoplay,
         "completion_percent": p.completion_percent,
+        "max_bitrate_bps": p.max_bitrate_bps.map(|b| b.to_string()),
     })
+}
+
+/// A canonical decimal bit rate: digits only, no leading zero, within u64.
+fn bitrate(b: &str) -> Option<u64> {
+    b.parse::<u64>()
+        .ok()
+        .filter(|_| b.len() <= 20 && (b == "0" || !b.starts_with('0')))
+        .filter(|_| b.bytes().all(|c| c.is_ascii_digit()))
 }
 
 fn tagged(status: StatusCode, body: Value, revision: i64) -> Response {
@@ -275,6 +284,9 @@ pub struct PreferencesInput {
     allow_client_software_decode: bool,
     autoplay: bool,
     completion_percent: f64,
+    /// Absent or null: no limit (the document is replaced as a whole).
+    #[serde(default)]
+    max_bitrate_bps: Option<String>,
 }
 
 pub async fn put_preferences(
@@ -296,6 +308,26 @@ pub async fn put_preferences(
         return Err(Problem::invalid(
             "invalid_preferences",
             "Unknown subtitle or quality mode, or completion outside 50-100",
+        ));
+    }
+    // A limit is a positive decimal like a plan's (`bitrate`).
+    let max_bitrate_bps = match input.max_bitrate_bps.as_deref() {
+        None => None,
+        Some(b) => Some(
+            bitrate(b)
+                .filter(|b| playscale_core::playback_session::rate_cap(*b, 3_000).is_some())
+                .ok_or_else(|| {
+                    Problem::invalid(
+                        "invalid_preferences",
+                        "max_bitrate_bps must be a supported positive streaming limit",
+                    )
+                })?,
+        ),
+    };
+    if input.quality_mode == "original" && max_bitrate_bps.is_some() {
+        return Err(Problem::invalid(
+            "invalid_preferences",
+            "Original-only playback requires no streaming limit",
         ));
     }
     let mut languages = [input.audio_languages, input.subtitle_languages];
@@ -356,6 +388,7 @@ pub async fn put_preferences(
             allow_client_software_decode: input.allow_client_software_decode,
             autoplay: input.autoplay,
             completion_percent: input.completion_percent,
+            max_bitrate_bps,
         },
     };
     sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
@@ -523,9 +556,9 @@ async fn multipart_of(
                 continue 'versions;
             };
             // Every part must pass the core live-conversion rule itself (no
-            // HDR: there is no tone mapping), not only the first.
+            // HDR: a multipart join is never tone-mapped), not only the first.
             if !core::readable(principal, file_facts(conn, file).await?.as_ref())
-                || !delivery::live_transcodable(&row, None)
+                || !delivery::live_transcodable(&row, None, None)
                 || rows.first().is_some_and(|first: &db::ItemRow| {
                     first.library_id != row.library_id || !compatible_parts(first, &row)
                 })
@@ -553,8 +586,11 @@ async fn multipart_of(
                 file: row.id.clone(),
                 revision: row.revision.clone(),
                 duration_ms,
-                // Set from the plan's audio component (`multipart_audio`).
+                // Set from the plan's audio and subtitle components
+                // (`multipart_tracks`).
                 audio: None,
+                subtitle: None,
+                burn: None,
             })
             .collect();
         return Ok(Some(Bound {
@@ -886,7 +922,7 @@ fn client_support(
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
-    );
+    ) || video.dolby_vision.is_some();
     if hdr && (require_sdr || client.hdr != "supported") {
         return Support::Unsupported;
     }
@@ -998,6 +1034,8 @@ pub async fn plan(
     body: Body<PlanInput>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::PlaybackRequest)?;
+    // Which tone-mapping filters this server's FFmpeg has (cached once).
+    let filters = crate::processing::filters(&app).await;
     let input = body.value;
     if !matches!(
         input.tracks.subtitle_policy.as_str(),
@@ -1014,18 +1052,12 @@ pub async fn plan(
     }
     let max_bitrate = match input.quality.max_bitrate_bps.as_deref() {
         None => None,
-        Some(b) => Some(
-            b.parse::<u64>()
-                .ok()
-                .filter(|_| b.len() <= 20 && (b == "0" || !b.starts_with('0')))
-                .filter(|_| b.bytes().all(|c| c.is_ascii_digit()))
-                .ok_or_else(|| {
-                    Problem::invalid(
-                        "invalid_plan_input",
-                        "max_bitrate_bps must be a decimal string",
-                    )
-                })?,
-        ),
+        Some(b) => Some(bitrate(b).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_plan_input",
+                "max_bitrate_bps must be a decimal string",
+            )
+        })?),
     };
     let mode = match input.quality.mode.as_str() {
         "auto" => Mode::Auto,
@@ -1049,7 +1081,8 @@ pub async fn plan(
     }
     let require_sdr = input.quality.hdr_policy == "require_sdr";
     let principal = &caller.principal;
-    let mut conn = app.db.acquire().await?;
+    // All planning observations share one read snapshot and one pool slot.
+    let mut conn = app.db.begin().await?;
     usable_profile(&mut conn, principal, &input.profile_id).await?;
     readable_timeline(&mut conn, principal, &input.timeline_id).await?;
     // A pinned generated version names the original it renders; only that
@@ -1148,7 +1181,7 @@ pub async fn plan(
     let audios = streams.iter().filter(|t| t.kind == "audio").count();
     let subtitles = streams.iter().filter(|t| t.kind == "subtitle").count();
     let default_audio = (audios > 0).then_some(0);
-    let components = crate::components::timeline_components(&app.db, &input.timeline_id)
+    let components = crate::components::timeline_components_in(&mut conn, &input.timeline_id)
         .await
         .map_err(Problem::internal)?;
     let component_index = |id: &Option<String>, kind, name: &str| -> Option<u32> {
@@ -1215,9 +1248,11 @@ pub async fn plan(
     // A multipart timeline plays the selected audio component in every part:
     // each part's own occurrence of it, never the first part's position.
     if let Some(audio) = audio.filter(|_| !bound.parts.is_empty()) {
-        match multipart_audio(&mut conn, &components, &bound, &streams, audio).await? {
+        use playscale_core::components::Kind;
+        match multipart_tracks(&mut conn, &components, &bound, Kind::Audio, &streams, audio).await?
+        {
             Some(per_part) => {
-                for (part, ordinal) in bound.parts.iter_mut().zip(per_part) {
+                for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
                     part.audio = Some(ordinal);
                 }
             }
@@ -1227,15 +1262,49 @@ pub async fn plan(
         }
     }
     let explicit = cs.or(sub);
-    // Subtitle streams and sidecars belong to one file: a multipart timeline
-    // has no subtitle to deliver across its parts yet.
+    // A multipart timeline delivers an embedded subtitle component that
+    // occurs in every part, chosen explicitly or automatically: as text,
+    // each part's own stream joined in timeline time, or as a bitmap burned
+    // into each part's own pictures. Sidecars belong to one file, and
+    // burned text (libass) is not delivered across parts yet.
     let multipart = !bound.parts.is_empty();
-    if multipart
-        && (explicit.is_some()
-            || sidecar_name.is_some()
-            || input.tracks.subtitle_policy == "require")
-    {
+    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
+    if multipart && sidecar_name.is_some() {
         return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
+    if let Some(chosen) = explicit.filter(|_| multipart) {
+        use playscale_core::components::Kind;
+        match multipart_tracks(
+            &mut conn,
+            &components,
+            &bound,
+            Kind::Subtitle,
+            &streams,
+            chosen,
+        )
+        .await?
+        {
+            Some(per_part) => {
+                let codecs: Vec<_> = per_part.iter().map(|(_, c)| Some(c.as_str())).collect();
+                if playscale_core::parts::joinable_subtitle(&codecs) {
+                    for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
+                        part.subtitle = Some(ordinal);
+                    }
+                } else if accepts_burned && playscale_core::parts::burnable_across(&codecs) {
+                    for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
+                        part.burn = Some(ordinal);
+                    }
+                } else {
+                    return Ok(
+                        Json(blocked(&input, "subtitle_multipart_unavailable")).into_response()
+                    );
+                }
+            }
+            _ => {
+                return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+            }
+        }
     }
     // An explicit choice (embedded or sidecar) conflicts with "off".
     if input.tracks.subtitle_policy == "off" && (explicit.is_some() || sidecar_name.is_some()) {
@@ -1244,8 +1313,6 @@ pub async fn plan(
             "Explicit subtitles conflict with off",
         ));
     }
-    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
-    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
     // The client selects an in-manifest HLS subtitle rendition on a live
     // presentation (an external track there is refused by the player).
     let live_text = accepts_text && accepts("hls_text");
@@ -1256,10 +1323,8 @@ pub async fn plan(
     use playscale_core::components::{
         AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
     };
-    let automatic = !multipart
-        && explicit.is_none()
-        && sidecar_name.is_none()
-        && input.tracks.subtitle_policy != "off";
+    let automatic =
+        explicit.is_none() && sidecar_name.is_none() && input.tracks.subtitle_policy != "off";
     let require = input.tracks.subtitle_policy == "require";
     let candidates = if automatic {
         subtitle_candidates(
@@ -1269,6 +1334,7 @@ pub async fn plan(
             &streams,
             accepts_text,
             accepts_burned,
+            filters.subtitles,
         )
         .await?
     } else {
@@ -1276,7 +1342,7 @@ pub async fn plan(
     };
     let preferences = if automatic {
         Some(
-            legacy::prefs(&app, &input.profile_id)
+            legacy::prefs_in(&mut conn, &input.profile_id)
                 .await
                 .map_err(problem)?
                 .preferences,
@@ -1302,7 +1368,37 @@ pub async fn plan(
                 language: c.language.clone(),
                 roles: c.roles.clone(),
                 deliverable: c.deliverable
-                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text)),
+                    && route.is_none_or(|r| {
+                        core::presents_subtitle(r, c.burned, live_text, false)
+                            || (!multipart
+                                && accepts_burned
+                                && filters.subtitles
+                                && c.choice.1.is_none()
+                                && c.choice
+                                    .0
+                                    .and_then(|index| {
+                                        streams
+                                            .iter()
+                                            .filter(|t| t.kind == "subtitle")
+                                            .nth(index as usize)
+                                    })
+                                    .is_some_and(|track| {
+                                        playscale_core::delivery::presentation(
+                                            &track.codec,
+                                            false,
+                                            true,
+                                            true,
+                                        )
+                                        .is_some()
+                                    })
+                                && matches!(
+                                    r,
+                                    Route::Remux
+                                        | Route::AudioConvert
+                                        | Route::Transcode
+                                        | Route::HardwareTranscode
+                                ))
+                    }),
             })
             .collect();
         let mode = match preferences.subtitle_mode.as_str() {
@@ -1324,7 +1420,17 @@ pub async fn plan(
         _ if !automatic => (explicit, sidecar_name),
         _ if require => match choose(None) {
             AutomaticSubtitle::None => (None, None),
-            AutomaticSubtitle::Selected(i) => candidates[i].choice.clone(),
+            AutomaticSubtitle::Selected(i) => {
+                // Across parts: each part's own occurrence of the component.
+                for (part, ordinal) in bound.parts.iter_mut().zip(&candidates[i].parts) {
+                    if candidates[i].burned {
+                        part.burn = Some(*ordinal);
+                    } else {
+                        part.subtitle = Some(*ordinal);
+                    }
+                }
+                candidates[i].choice.clone()
+            }
             AutomaticSubtitle::Unavailable => {
                 return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
             }
@@ -1334,12 +1440,13 @@ pub async fn plan(
         },
         _ => (None, None),
     };
-    let (subtitle, sidecar, burn) = match resolve_subtitle(
+    let (mut subtitle, sidecar, mut burn) = match resolve_subtitle(
         &mut conn,
         &bound.file,
         &streams,
         accepts_text,
         accepts_burned,
+        filters.subtitles,
         subtitle,
         sidecar_name,
     )
@@ -1348,6 +1455,17 @@ pub async fn plan(
         Ok(resolved) => resolved,
         Err(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
+    // Across parts a burned subtitle is a bitmap pinned in every part; burned
+    // text is not delivered across parts.
+    if multipart
+        && match burn {
+            Some(delivery::Burn::Bitmap(_)) => !bound.parts.iter().all(|p| p.burn.is_some()),
+            Some(delivery::Burn::Text { .. }) => true,
+            None => false,
+        }
+    {
+        return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
     let height = streams
         .iter()
         .find(|t| t.kind == "video")
@@ -1413,7 +1531,31 @@ pub async fn plan(
     let audio_chosen = input.tracks.audio_track_id.is_some()
         || input.tracks.audio_component_id.is_some()
         || audio != default_audio;
-    let subtitle_selected = subtitle.is_some() || sidecar.is_some() || burn.is_some();
+    use playscale_core::processing::{Wanted, WantedSubtitle};
+    let prepared_subtitle = if automatic && !require {
+        // Choose the source text first; carries() below proves the rendition contains it.
+        match choose(Some(Route::Original)) {
+            AutomaticSubtitle::Selected(i)
+                if !candidates[i].burned && candidates[i].choice.1.is_none() =>
+            {
+                candidates[i].choice.0
+            }
+            _ => None,
+        }
+    } else {
+        subtitle
+    };
+    let wanted = Wanted {
+        audio,
+        audio_chosen,
+        default_audio,
+        subtitle: match (prepared_subtitle, &sidecar, &burn) {
+            (None, None, None) => WantedSubtitle::None,
+            // A text subtitle presented as text; a rendition may carry it.
+            (Some(index), None, None) => WantedSubtitle::Text(index),
+            _ => WantedSubtitle::Other,
+        },
+    };
     let mut carries = Vec::with_capacity(prepared.len());
     for p in &prepared {
         let recorded: Option<(String, String, String)> = sqlx::query_as(
@@ -1423,35 +1565,36 @@ pub async fn plan(
         .bind(&p.file.id)
         .fetch_optional(&mut *conn)
         .await?;
-        let encoded = recorded
-            .filter(|(file, revision, _)| {
-                *file == bound.file.id && *revision == bound.file.revision
+        use playscale_core::processing::{Carried, Encoded};
+        let ordinal = |id: Option<String>, prefix: char| -> Result<Option<u32>, ()> {
+            id.map(|id| {
+                id.strip_prefix(prefix)
+                    .and_then(|n| n.parse().ok())
+                    .ok_or(())
             })
-            .and_then(|(_, _, tracks)| {
-                serde_json::from_str::<super::processing::Tracks>(&tracks).ok()
-            })
-            .map(|tracks| match tracks.audio_track_id {
-                // `a{n}`: the n-th audio stream of the source revision; an
-                // unreadable record describes nothing.
-                Some(id) => id
-                    .strip_prefix('a')
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .map(Some)
-                    .ok_or(()),
-                // No selection: the recipe encodes the first audio stream,
-                // or none when the source has no audio.
-                None => Ok(default_audio),
-            });
+            .transpose()
+        };
+        // `a{n}` and `s{n}`: streams of the source revision the preparation
+        // recorded; an unreadable record describes nothing.
+        let carried = match recorded.filter(|(file, revision, _)| {
+            *file == bound.file.id && *revision == bound.file.revision
+        }) {
+            None => Carried::Unrecorded,
+            Some((_, _, tracks)) => serde_json::from_str::<super::processing::Tracks>(&tracks)
+                .ok()
+                .and_then(|tracks| {
+                    Some(Encoded {
+                        audio: ordinal(tracks.audio_track_id, 'a').ok()?,
+                        subtitle: ordinal(tracks.subtitle_track_id, 's').ok()?,
+                    })
+                })
+                .map_or(Carried::Unreadable, Carried::Encoded),
+        };
         // A pinned version plays its own default streams (track and component
         // pins were refused above).
         carries.push(
-            !subtitle_selected
-                && (pinned_prepared
-                    || match encoded {
-                        Some(Ok(encoded)) => encoded == audio,
-                        Some(Err(())) => false,
-                        None => !audio_chosen,
-                    }),
+            (pinned_prepared && wanted.subtitle == WantedSubtitle::None)
+                || playscale_core::processing::carries(carried, wanted),
         );
     }
     let mut source = core::SourceFacts {
@@ -1473,8 +1616,10 @@ pub async fn plan(
                 carries_selection,
             })
             .collect(),
+        // One file's conversion may tone-map HDR to SDR (`color::tone_map`);
+        // a multipart join never does.
         transcodable: input.quality.hdr_policy != "reject_conversion"
-            && delivery::live_transcodable(&bound.file, audio),
+            && delivery::live_transcodable(&bound.file, audio, (!multipart).then_some(filters)),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
         // A requested cap is kept when the conversion can be capped at it
@@ -1490,7 +1635,7 @@ pub async fn plan(
         clipped: bound.clip.is_some(),
         multipart,
     };
-    let request = core::Request {
+    let mut request = core::Request {
         mode,
         range: input.client.transports.iter().any(|t| t == "http_range"),
         hls: input.client.transports.iter().any(|t| t == "hls"),
@@ -1517,7 +1662,7 @@ pub async fn plan(
             }
             _ => core::StreamCopy::Ineligible,
         };
-        conn = app.db.acquire().await?;
+        conn = app.db.begin().await?;
         decided = core::plan(&bound.file.id, &source, &request);
         if decided == core::Plan::Observe {
             return Err(Problem::internal(
@@ -1525,16 +1670,78 @@ pub async fn plan(
             ));
         }
     }
-    // A prepared plan pins the chosen rendition and plays its default streams.
-    let (route, chosen, audio) = match decided {
-        core::Plan::Ready(route) => (route, bound, audio),
+    // A route that cannot carry external text may still render the selected
+    // embedded text via libass. Decide again with the burn fact so stream-copy
+    // never silently drops it and conversion remains subject to normal policy.
+    let mut automatic_burn_resolved = false;
+    if let core::Plan::Ready(route) = decided
+        && !multipart
+        && sidecar.is_none()
+        && burn.is_none()
+        && !core::presents_subtitle(route, false, live_text, true)
+        && accepts_burned
+        && filters.subtitles
+    {
+        let candidate = if automatic && !require {
+            match choose(Some(route)) {
+                AutomaticSubtitle::Selected(i) if candidates[i].choice.1.is_none() => {
+                    candidates[i].choice.0
+                }
+                _ => None,
+            }
+        } else {
+            subtitle
+        };
+        if let Some(index) = candidate
+            && let Ok((_, _, Some(selected_burn))) = resolve_subtitle(
+                &mut conn,
+                &bound.file,
+                &streams,
+                false,
+                accepts_burned,
+                filters.subtitles,
+                Some(index),
+                None,
+            )
+            .await?
+        {
+            subtitle = None;
+            burn = Some(selected_burn);
+            request.burn_in = true;
+            decided = core::plan(&bound.file.id, &source, &request);
+            automatic_burn_resolved = automatic && !require;
+        }
+    }
+    // A prepared plan pins the chosen rendition and plays its default streams:
+    // its only audio and, when it carries the selected text subtitle
+    // (`processing::carries`), its only subtitle.
+    let (route, mut chosen, audio, subtitle) = match decided {
+        core::Plan::Ready(route) => (route, bound, audio, subtitle),
         core::Plan::Prepared(i) => {
             let p = prepared
                 .into_iter()
                 .nth(i)
                 .ok_or_else(|| Problem::internal("prepared plan without rendition"))?;
             let audio = first_audio(&p.file);
-            (Route::Prepared, p, audio)
+            let subtitle = match prepared_subtitle {
+                None => None,
+                Some(_) => {
+                    let streams: Vec<db::Track> =
+                        serde_json::from_str(&p.file.tracks_json).map_err(Problem::internal)?;
+                    let subtitles: Vec<&db::Track> =
+                        streams.iter().filter(|t| t.kind == "subtitle").collect();
+                    match subtitles.as_slice() {
+                        [only] if playscale_core::delivery::sidecar_subtitle(&only.codec) => {
+                            Some(0)
+                        }
+                        _ => {
+                            return Ok(Json(blocked(&input, "subtitle_conversion_unavailable"))
+                                .into_response());
+                        }
+                    }
+                }
+            };
+            (Route::Prepared, p, audio, subtitle)
         }
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
         core::Plan::Observe => return Err(Problem::internal("undecided plan")),
@@ -1542,35 +1749,44 @@ pub async fn plan(
     // Selected text subtitles are a WebVTT sidecar with byte delivery of the
     // original, or an HLS subtitle rendition on a live route for a client that
     // selects in-manifest live text. Shaka refuses an external text track on a
-    // live presentation, and burning text in needs libass, which the bundled
-    // FFmpeg does not include.
+    // live presentation. Text burned in by libass (`burn`) is a conversion.
+    // A prepared rendition presents only the text subtitle it carries.
     if (subtitle.is_some() || sidecar.is_some())
-        && !core::presents_subtitle(route, false, live_text)
+        && !core::presents_subtitle(route, false, live_text, sidecar.is_none())
     {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }
     // "auto" adds a subtitle only if the planned route presents it; otherwise
     // the plan proceeds without one, as it would with no subtitles at all.
-    let (subtitle, sidecar, burn) = match automatic && !require {
-        true => match choose(Some(route)) {
-            AutomaticSubtitle::Selected(i) => {
-                let (embedded, name) = candidates[i].choice.clone();
-                resolve_subtitle(
-                    &mut conn,
-                    &chosen.file,
-                    &streams,
-                    accepts_text,
-                    accepts_burned,
-                    embedded,
-                    name,
-                )
-                .await?
-                .unwrap_or((None, None, None))
-            }
-            _ => (None, None, None),
-        },
-        false => (subtitle, sidecar, burn),
-    };
+    let (subtitle, sidecar, burn) =
+        match automatic && !require && route != Route::Prepared && !automatic_burn_resolved {
+            true => match choose(Some(route)) {
+                AutomaticSubtitle::Selected(i) => {
+                    let (embedded, name) = candidates[i].choice.clone();
+                    for (part, ordinal) in chosen.parts.iter_mut().zip(&candidates[i].parts) {
+                        if candidates[i].burned {
+                            part.burn = Some(*ordinal);
+                        } else {
+                            part.subtitle = Some(*ordinal);
+                        }
+                    }
+                    resolve_subtitle(
+                        &mut conn,
+                        &chosen.file,
+                        &streams,
+                        accepts_text,
+                        accepts_burned,
+                        filters.subtitles,
+                        embedded,
+                        name,
+                    )
+                    .await?
+                    .unwrap_or((None, None, None))
+                }
+                _ => (None, None, None),
+            },
+            false => (subtitle, sidecar, burn),
+        };
     let expires_at = now() + core::PLAN_TTL_SECONDS;
     let claims = Claims {
         principal: principal.id.clone(),
@@ -1587,7 +1803,12 @@ pub async fn plan(
                 name: sidecar.name,
                 fingerprint: sidecar.fingerprint,
             }),
-            (None, None, Some(index)) => Some(core::Subtitle::Bitmap(index)),
+            (None, None, Some(delivery::Burn::Bitmap(index))) => {
+                Some(core::Subtitle::Bitmap(index))
+            }
+            (None, None, Some(delivery::Burn::Text { index, attachments })) => {
+                Some(core::Subtitle::BurnedText { index, attachments })
+            }
             (None, None, None) => None,
         },
         clip: chosen.clip,
@@ -1622,7 +1843,7 @@ pub async fn plan(
         "operation": serde_json::to_value(route.operation()).map_err(Problem::internal)?,
         "reason_codes": [],
         "warnings": warnings,
-        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn)),
+        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn.map(delivery::Burn::index))),
     }))
     .into_response())
 }
@@ -1712,28 +1933,34 @@ async fn may_probe(
     .map_err(plan_problem)
 }
 
-/// The audio stream ordinal, in each part of a multipart binding, of the
-/// component that the first part's audio stream `audio` belongs to. None when
-/// that component has no single occurrence in some part.
-async fn multipart_audio(
+/// The stream ordinal of `kind` (audio or subtitle), in each part of a
+/// multipart binding, of the component that the first part's stream
+/// `ordinal` belongs to, with that stream's codec. None when that component
+/// has no single embedded occurrence in some part.
+async fn multipart_tracks(
     conn: &mut sqlx::SqliteConnection,
     components: &[playscale_core::components::Component],
     bound: &Bound,
+    kind: playscale_core::components::Kind,
     streams: &[db::Track],
-    audio: u32,
-) -> Result<Option<Vec<u32>>, Problem> {
+    ordinal: u32,
+) -> Result<Option<Vec<(u32, String)>>, Problem> {
     use playscale_core::components::{Kind, component_of, per_file_tracks};
+    let name = match kind {
+        Kind::Audio => "audio",
+        Kind::Subtitle => "subtitle",
+    };
     let Some(index) = streams
         .iter()
-        .filter(|t| t.kind == "audio")
-        .nth(audio as usize)
+        .filter(|t| t.kind == name)
+        .nth(ordinal as usize)
         .map(|t| t.index)
     else {
         return Ok(None);
     };
     let Some(component) = component_of(
         components,
-        Kind::Audio,
+        kind,
         &bound.version,
         &bound.file.id,
         &bound.file.revision,
@@ -1757,14 +1984,15 @@ async fn multipart_audio(
             .await?;
         let part_streams: Vec<db::Track> =
             serde_json::from_str(&json).map_err(Problem::internal)?;
-        let Some(ordinal) = part_streams
+        let Some((ordinal, stream)) = part_streams
             .iter()
-            .filter(|t| t.kind == "audio")
-            .position(|t| t.index == track)
+            .filter(|t| t.kind == name)
+            .enumerate()
+            .find(|(_, t)| t.index == track)
         else {
             return Ok(None);
         };
-        ordinals.push(ordinal as u32);
+        ordinals.push((ordinal as u32, stream.codec.clone()));
     }
     Ok(Some(ordinals))
 }
@@ -1779,6 +2007,9 @@ struct SubtitleCandidate {
     burned: bool,
     /// This client can be given it on some route.
     deliverable: bool,
+    /// Across parts: its subtitle ordinal in every part, in part order
+    /// (empty for one file).
+    parts: Vec<u32>,
 }
 
 /// The timeline's subtitle components that occur on exactly the bound file
@@ -1790,6 +2021,7 @@ async fn subtitle_candidates(
     streams: &[db::Track],
     accepts_text: bool,
     accepts_burned: bool,
+    libass: bool,
 ) -> Result<Vec<SubtitleCandidate>, Problem> {
     use playscale_core::components::{Kind, SubtitleOccurrence, subtitle_occurrence};
     let mut out = Vec::new();
@@ -1810,14 +2042,57 @@ async fn subtitle_candidates(
                 else {
                     continue;
                 };
-                let text = playscale_core::delivery::sidecar_subtitle(&track.codec);
-                let bitmap = playscale_core::delivery::burnable_subtitle(&track.codec);
+                // Across parts: a component occurring in every part, as text
+                // (joined) for a client that presents text, else as a bitmap
+                // burned into each part for one that accepts burned ones.
+                if !bound.parts.is_empty() {
+                    let per_part = multipart_tracks(
+                        conn,
+                        components,
+                        bound,
+                        Kind::Subtitle,
+                        streams,
+                        position as u32,
+                    )
+                    .await?;
+                    let codecs: Vec<_> = per_part
+                        .iter()
+                        .flatten()
+                        .map(|(_, c)| Some(c.as_str()))
+                        .collect();
+                    let text = per_part.is_some()
+                        && playscale_core::parts::joinable_subtitle(&codecs)
+                        && accepts_text;
+                    let bitmap = per_part.is_some()
+                        && playscale_core::parts::burnable_across(&codecs)
+                        && accepts_burned;
+                    out.push(SubtitleCandidate {
+                        language: component.language.clone(),
+                        roles: component.roles.clone(),
+                        choice: (Some(position as u32), None),
+                        burned: !text && bitmap,
+                        deliverable: text || bitmap,
+                        parts: per_part
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(ordinal, _)| ordinal)
+                            .collect(),
+                    });
+                    continue;
+                }
+                use playscale_core::delivery::{Presentation, presentation};
+                let presented = presentation(&track.codec, accepts_text, accepts_burned, libass);
                 (
                     (Some(position as u32), None),
-                    bitmap && accepts_burned,
-                    (text && accepts_text) || (bitmap && accepts_burned),
+                    matches!(
+                        presented,
+                        Some(Presentation::BurnBitmap | Presentation::BurnText)
+                    ),
+                    presented.is_some(),
                 )
             }
+            // A sidecar belongs to one file.
+            Some(SubtitleOccurrence::Sidecar(_)) if !bound.parts.is_empty() => continue,
             Some(SubtitleOccurrence::Sidecar(name)) => {
                 let format: Option<String> = sqlx::query_scalar(
                     "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
@@ -1840,25 +2115,39 @@ async fn subtitle_candidates(
             choice,
             burned,
             deliverable,
+            parts: vec![],
         });
     }
     Ok(out)
 }
 
-/// Resolve a subtitle choice on `file`: an embedded text subtitle for a
-/// client that presents text, an embedded bitmap one burned for a client that
-/// accepts burned subtitles, or a plain-text sidecar pinned with the
-/// fingerprint it was scanned with. Anything else is a blocked reason, never
-/// a substitute.
+/// Resolve a subtitle choice on `file` by core `presentation`: an embedded
+/// text subtitle for a client that presents text, an embedded bitmap one, or
+/// a text or styled one rendered by libass, burned for a client that accepts
+/// burned subtitles, or a plain-text sidecar pinned with the fingerprint it
+/// was scanned with. Anything else is a blocked reason, never a substitute.
+#[allow(clippy::type_complexity)]
 async fn resolve_subtitle(
     conn: &mut sqlx::SqliteConnection,
     file: &db::ItemRow,
     streams: &[db::Track],
     accepts_text: bool,
     accepts_burned: bool,
+    libass: bool,
     embedded: Option<u32>,
     sidecar: Option<String>,
-) -> Result<Result<(Option<u32>, Option<delivery::Sidecar>, Option<u32>), &'static str>, Problem> {
+) -> Result<
+    Result<
+        (
+            Option<u32>,
+            Option<delivery::Sidecar>,
+            Option<delivery::Burn>,
+        ),
+        &'static str,
+    >,
+    Problem,
+> {
+    use playscale_core::delivery::{Presentation, presentation};
     if let Some(index) = embedded {
         let codec = &streams
             .iter()
@@ -1867,12 +2156,20 @@ async fn resolve_subtitle(
             .ok_or_else(|| Problem::internal("selected subtitle stream missing"))?
             .codec;
         return Ok(
-            if playscale_core::delivery::burnable_subtitle(codec) && accepts_burned {
-                Ok((None, None, Some(index)))
-            } else if playscale_core::delivery::sidecar_subtitle(codec) && accepts_text {
-                Ok((Some(index), None, None))
-            } else {
-                Err("subtitle_format_unsupported")
+            match presentation(codec, accepts_text, accepts_burned, libass) {
+                Some(Presentation::Text) => Ok((Some(index), None, None)),
+                Some(Presentation::BurnBitmap) => {
+                    Ok((None, None, Some(delivery::Burn::Bitmap(index))))
+                }
+                Some(Presentation::BurnText) => Ok((
+                    None,
+                    None,
+                    Some(delivery::Burn::Text {
+                        index,
+                        attachments: delivery::burn_attachments(file),
+                    }),
+                )),
+                None => Err("subtitle_format_unsupported"),
             },
         );
     }
@@ -1902,9 +2199,12 @@ fn embedded_subtitle(claims: &Claims) -> Option<u32> {
     }
 }
 
-fn burned_subtitle(claims: &Claims) -> Option<u32> {
+fn burned_subtitle(claims: &Claims) -> Option<delivery::Burn> {
     match claims.subtitle {
-        Some(core::Subtitle::Bitmap(index)) => Some(index),
+        Some(core::Subtitle::Bitmap(index)) => Some(delivery::Burn::Bitmap(index)),
+        Some(core::Subtitle::BurnedText { index, attachments }) => {
+            Some(delivery::Burn::Text { index, attachments })
+        }
         _ => None,
     }
 }
@@ -2009,6 +2309,7 @@ pub async fn create_delivery(
 ) -> Result<Response, Problem> {
     caller.require(Permission::PlaybackRequest)?;
     let key = idempotency_key(&headers)?;
+
     let input = body.value;
     let claims = open(&app, &input.plan_token)?;
     if claims.principal != caller.principal.id {
@@ -2019,6 +2320,16 @@ pub async fn create_delivery(
     // rechecks everything, including for an exact retry.
     if matches!(claims.route, Route::Remux | Route::AudioConvert) {
         may_probe(&app, &caller, &claims, None).await?;
+    }
+    let receipt_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM delivery_admissions WHERE principal=? AND request_key=?)",
+    )
+    .bind(&caller.principal.id)
+    .bind(&key)
+    .fetch_one(&app.db)
+    .await?;
+    if !receipt_exists && matches!(claims.route, Route::Transcode | Route::HardwareTranscode) {
+        crate::processing::filters(&app).await;
     }
     let owner = owner_of(&claims);
     let request = delivery::CreateRequest {
@@ -2256,6 +2567,28 @@ pub async fn change_delivery(
     body: Body<DeliveryChange>,
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
+    // Exact receipts replay before external tool probes. Recheck below after
+    // observation, because another request may record the same key meanwhile.
+    {
+        let (mut tx, principal, _) = command(&app, &caller, &id).await?;
+        let durable = Scope {
+            principal: &principal.id,
+            operation: "changeDelivery",
+            target: &id,
+            key: &key,
+        };
+        if let Some(replay) = durable_replay(&mut tx, &durable, &body.digest).await? {
+            return Ok(replay);
+        }
+        tx.commit().await?;
+    }
+    if let DeliveryChange::Replan { plan_token, .. } = &body.value
+        && let Ok(claims) = open(&app, plan_token)
+        && claims.principal == caller.principal.id
+        && matches!(claims.route, Route::Transcode | Route::HardwareTranscode)
+    {
+        crate::processing::filters(&app).await;
+    }
     // A stream-copy replan needs the source's bitstream details: observe them
     // before the write transaction. A probe failure is reported only for a new
     // change, after an exact retry had the chance to replay.
@@ -2565,21 +2898,12 @@ pub async fn master_playlist(
         .flatten()
         .find(|g| g.generation == generation && g.transport == "hls" && g.manifest_url.is_some())
         .ok_or_else(Problem::not_found)?;
-    // A stream copy keeps the source's H.264 profile/level and AAC object
-    // type: describe its own output. A transcode keeps its recipe's existing
-    // description (H.264 High, AAC-LC stereo).
-    // An adaptive ladder describes each variant from its own init segment.
-    let (codecs, size) =
-        if matches!(serving.operation.as_str(), "remux" | "audio_convert") || serving.adaptive {
-            delivery::init_codecs(&app, &id, &generation, None)
-                .await
-                .map_err(stream_problem)?
-                .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
-        } else if serving.audio_track.is_some() {
-            ("avc1.64001f,mp4a.40.2".into(), None)
-        } else {
-            ("avc1.64001f".into(), None)
-        };
+    // Encoder choice and output resolution can change profile/level. Advertise
+    // the actual initialization segment for every route, including transcodes.
+    let (codecs, size) = delivery::init_codecs(&app, &id, &generation, None)
+        .await
+        .map_err(stream_problem)?
+        .ok_or_else(|| Problem::internal("stream codecs could not be described"))?;
     // Ladder rungs carry their sizes so a client can tell them apart.
     let resolution = |size: Option<(u32, u32)>| {
         size.filter(|_| serving.adaptive)

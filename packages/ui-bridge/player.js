@@ -120,14 +120,17 @@ async function openGeneration(element, generation, position, origin) {
 // A version, quality or audio choice replans the same timeline. An audio
 // track other than the default asks the planner for a conversion that carries
 // exactly that stream; the server decides whether one is admissible.
-function replanInput(input, {version, quality, audio, audioSource}) {
+function replanInput(input, {version, quality, audio, audioSource, limit}) {
   if (audio && !/^a[0-9]{1,4}$/.test(audio)) throw new Error('Invalid audio track');
+  // A streaming limit in bits per second ('' for none); absent keeps the current one.
+  if (limit && !/^[1-9][0-9]{0,19}$/.test(limit)) throw new Error('Invalid streaming limit');
+  const maxBitrate = limit === undefined ? input.quality.max_bitrate_bps : limit || null;
   // Track IDs are ordinals of one file revision's streams. A chosen track pins
   // the exact version and file revision the options describe (the planner
   // rejects a changed revision); a different version drops the choice.
   const pinned = audio && audioSource?.version && audioSource.file_id && audioSource.file_revision;
   if (audio && (!pinned || (version && version !== audioSource.version))) audio = null;
-  return {...input, failed_candidate_ids: [], quality: {...input.quality, mode: quality},
+  return {...input, failed_candidate_ids: [], quality: {...input.quality, mode: quality, max_bitrate_bps: maxBitrate},
     version_id: audio ? audioSource.version : version || null,
     source: audio ? {file_id: audioSource.file_id, file_revision: audioSource.file_revision} : null,
     tracks: {...input.tracks, audio_track_id: audio || null}};
@@ -162,7 +165,7 @@ async function playNext(current = () => true) {
     const finishing = close();
     const closedEpoch = state.epoch;
     await finishing;
-    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}?play=1`);
+    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}?play=1&profile=${encodeURIComponent(host.dataset.profileId)}`);
   } catch (error) { if (current()) status(`Next title could not start: ${error.message}`, 'alert'); }
   finally { advancing = false; }
 }
@@ -388,6 +391,7 @@ function observeViewing(element, generation, writer, current) {
     const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
     const output = document.getElementById('motion-position');
     if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
+    if (Number.isSafeInteger(logical)) showSkips(logical);
     if (!writer) {
       if (observation.status === 'ended' && host.dataset.autoplay === 'true') void playNext(current);
       return;
@@ -445,9 +449,115 @@ async function disposePlayer(element) {
   if (!element) return;
   await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
   element.remove();
+  releaseSheets(element);
 }
 
-async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false} = {}) {
+/**
+ * The trick-play thumbnail for `seconds` from a ready previews manifest
+ * (getTimelinePreviews): the thumbnail at or before it (core
+ * `previews::tile_at`), as its sheet and the crop within it. Null beyond the
+ * last thumbnail, or for a manifest this page cannot trust.
+ */
+function previewFrame(manifest, seconds, origin) {
+  if (manifest?.status !== 'ready' || !(seconds >= 0)) return null;
+  const {interval_ms: interval, tile_width: width, tile_height: height, columns, rows, tiles, sheets} = manifest;
+  if (![interval, width, height, columns, rows, tiles].every(n => Number.isInteger(n) && n > 0) || !Array.isArray(sheets)) return null;
+  const index = Math.floor(seconds * 1000 / interval);
+  if (index >= tiles) return null;
+  const perSheet = columns * rows;
+  const sheet = sheets[Math.floor(index / perSheet)];
+  // Only this server's own sheet route.
+  if (typeof sheet !== 'string' || !sheet.startsWith('/api/v2/media/files/')) return null;
+  const within = index % perSheet;
+  return {
+    time: index * interval / 1000, width, height,
+    image: {uris: [new URL(sheet, origin).href], crop: {x: (within % columns) * width, y: Math.floor(within / columns) * height, width, height}},
+    path: 'motion-previews', temporalAccuracy: 'approximate', timestampKind: 'interval',
+  };
+}
+
+/**
+ * Each player's thumbnail sheets: downloads by sheet URL (resolving to a
+ * local object URL, or null), the object URLs made, and the downloads'
+ * shared cancellation.
+ */
+const sheetUrls = new WeakMap();
+
+/**
+ * Release a retired player's sheets without waiting for anything: pending
+ * downloads are cancelled and every object URL made is revoked.
+ */
+function releaseSheets(element) {
+  const held = sheetUrls.get(element);
+  if (!held) return;
+  sheetUrls.delete(element);
+  held.controller.abort();
+  for (const url of held.made) URL.revokeObjectURL(url);
+  held.made.clear();
+}
+
+/** A value, or null as soon as `signal` aborts (the value may still settle later). */
+function unlessAborted(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const abort = () => resolve(null);
+    signal.addEventListener('abort', abort, {once: true});
+    promise.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, () => resolve(null));
+  });
+}
+
+/**
+ * Offer the timeline's server-rendered thumbnails to the player's preview
+ * lane (Demuxe `AuthoredPreviewProvider`) when they are ready. Demuxe
+ * fetches preview images without credentials, so each sheet is fetched once
+ * here with this session and handed over as a local `blob:` URL (revoked
+ * with the player). Optional: without them, or on any failure, the player
+ * keeps its own previews.
+ */
+function matchingPreviewSource(manifest, source) {
+  return !!source && manifest?.file_id === source.file_id && manifest?.file_revision === source.file_revision;
+}
+async function attachPreviews(element, base, timeline, source) {
+  try {
+    const {AuthoredPreviewProvider} = await import(`${base}web/generated/index.js`);
+    if (typeof AuthoredPreviewProvider !== 'function' || typeof element.player?.preview?.addProvider !== 'function') return;
+    const manifest = await api('GET', `/api/v2/catalog/timelines/${encodeURIComponent(timeline)}/previews`, undefined, undefined, AbortSignal.timeout(10000));
+    if (manifest?.status !== 'ready' || !element.isConnected || !matchingPreviewSource(manifest, source)) return;
+    const held = {sheets: new Map(), made: new Set(), controller: new AbortController()};
+    sheetUrls.set(element, held);
+    const {sheets, made, controller} = held;
+    const local = url => {
+      if (!sheets.has(url)) {
+        sheets.set(url, fetch(url, {credentials: 'same-origin', redirect: 'error',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)])})
+          .then(response => response.ok ? response.blob() : null)
+          .then(blob => {
+            // Released meanwhile: nothing is made that could outlive it.
+            if (!blob || blob.size > 4 * 1024 * 1024 || controller.signal.aborted) return null;
+            const local = URL.createObjectURL(blob);
+            made.add(local);
+            return local;
+          })
+          .catch(() => null)
+          // A sheet that could not be read is tried again on a later lookup.
+          .then(local => { if (!local) sheets.delete(url); return local; }));
+      }
+      return sheets.get(url);
+    };
+    // A superseded lookup settles at once (Demuxe aborts its signal), even
+    // while the shared download continues for later lookups.
+    element.player.preview.addProvider(new AuthoredPreviewProvider(async ({time, signal}) => {
+      const frame = previewFrame(manifest, time, location.origin);
+      const url = frame && await unlessAborted(local(frame.image.uris[0]), signal);
+      return url && !signal?.aborted ? {...frame, image: {...frame.image, uris: [url]}} : null;
+    }));
+  } catch {
+    // Previews are an enhancement; playback never depends on them.
+  }
+}
+
+async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false, source = state.delivery?.source} = {}) {
   const data = host.dataset;
   const previous = state.element?.player.state;
   const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate} : null);
@@ -467,6 +577,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await openGeneration(element, generation, position, location.origin);
+    if (element.controls) void attachPreviews(element, data.demuxeBase, data.timelineId, source);
     if (generation.subtitles_url && generation.transport === 'hls') {
       // A live generation's selected subtitle is its manifest's subtitle
       // rendition: select that (the only in-manifest subtitle) and show it.
@@ -637,7 +748,7 @@ async function switchDelivery(plan) {
         return renewed;
       },
       failed: error => { leaseFailure = error; }});
-    element = await preparePlayer(generation, position, current, preferences, {inert: true});
+    element = await preparePlayer(generation, position, current, preferences, {inert: true, source: ready.source});
     if (!current()) throw new Error('Playback ownership changed.');
     if (leaseFailure) throw leaseFailure;
     if (state.viewing) {
@@ -727,7 +838,7 @@ async function start() {
     state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
       tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: subtitlePolicy(data.subtitlePolicy), audio_track_id: null, subtitle_track_id: null},
-      quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
+      quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: /^[1-9][0-9]{0,19}$/.test(data.maxBitrate ?? '') ? data.maxBitrate : null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
       client: observedCapability(shared), failed_candidate_ids: [],
     };
     const opened = await openCandidates(state.planInput, {
@@ -851,9 +962,26 @@ function close({unloading = false} = {}) {
     state.element = null;
     if (element) await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
     element?.remove();
+    if (element) releaseSheets(element);
     await retiring;
   })();
   return state.closing;
+}
+
+/**
+ * A marker's seek position as the delivery accepts it: strictly before the
+ * duration (credits may end exactly at it), never negative.
+ */
+function seekTarget(position, duration) {
+  if (!Number.isSafeInteger(position) || position < 0) return 0;
+  return duration > 0 && position >= duration ? Math.max(0, duration - 1) : position;
+}
+
+/** Show each skip button only while playback is inside its marker's interval. */
+function showSkips(logical) {
+  for (const button of document.querySelectorAll('[data-marker-end]')) {
+    button.hidden = !(logical >= Number(button.dataset.markerStart) && logical < Number(button.dataset.markerEnd));
+  }
 }
 
 const controls = document.getElementById('motion-playback-controls');
@@ -864,6 +992,12 @@ controls?.addEventListener('submit', event => {
   // Explicit logical seek uses the generation API, including range routes,
   // so the server preserves source and generation preconditions consistently.
   void changePlayback({kind: 'seek', position_ms: position});
+});
+// Chapters and skip buttons seek through the generation API, like the form.
+document.addEventListener('click', event => {
+  const target = event.target?.closest?.('[data-player-seek]');
+  if (!target || !state.element || state.changing) return;
+  void changePlayback({kind: 'seek', position_ms: seekTarget(Number(target.dataset.playerSeek), Number(host.dataset.durationMs))});
 });
 controls?.addEventListener('click', event => {
   // Buttons hold an icon and a label; the click may land on either.
@@ -878,7 +1012,7 @@ controls?.addEventListener('click', event => {
     if (action === 'quality') {
       const epoch = state.epoch;
       const next = replanInput(state.planInput, {version: controls.elements.version.value,
-        quality: controls.elements.quality.value, audio: controls.elements.audio?.value,
+        quality: controls.elements.quality.value, audio: controls.elements.audio?.value, limit: controls.elements.limit?.value,
         audioSource: {version: controls.elements.audio?.dataset.version, file_id: controls.elements.audio?.dataset.fileId,
           file_revision: controls.elements.audio?.dataset.fileRevision}});
       const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));

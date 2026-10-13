@@ -1,0 +1,24 @@
+{
+  "passed": true,
+  "failure": null,
+  "checks": {
+    "download_transferred_verified_and_published": true,
+    "repeat_pass_is_idempotent": true,
+    "offline_cold_start_serves_verified_ranges": true,
+    "offline_restart_resumes_saved_progress": true,
+    "reconnect_reconciles_once_and_compacts": true,
+    "newer_manual_state_is_not_overwritten": true,
+    "restored_server_neither_applies_nor_erases_offline_progress": true,
+    "cancellation_removes_the_device_copy": true
+  },
+  "server_sha256": "fce5d33d5b66403128c93eca3c2876fdce1e09abdc7c667e49021ee3fd41724a",
+  "host_sha256": "e51ec3a988b0d8167f91b561671d9c5a1d3e70fb0763a5226cae58e2759f42b6",
+  "media_sha256": "f7c5cb6b947171872df862cd2639ecac03b454e09ae3a9d73d7d43e6d0b4e27d",
+  "commit": "ae35385d17015abc2da89b09fdd0870082947fcf",
+  "recorded_at": "2026-10-13T00:41:31.630Z",
+  "artifacts": "$TMPDIR/motion-download-workflow-QZDh4d",
+  "limitations": [
+    "Node runner without Electron: playback is represented by verified range reads and the offline player's event protocol.",
+    "One device, one profile, one complete MP4 original; macOS arm64 debug binaries."
+  ]
+}

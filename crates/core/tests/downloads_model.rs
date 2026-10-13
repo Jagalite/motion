@@ -4,11 +4,18 @@
 //! log (`offline::admit`), synchronizes in order (`downloads::reconcile`),
 //! loses responses, retries, compacts acknowledged events (`offline::compact`)
 //! and rebases onto newer server state, interleaved with online progress,
-//! manual overrides and timeline edits on the server. The oracle does not
-//! re-run the policy: it tracks whether any other authority touched the
-//! timeline since the download's base and derives the required outcome.
+//! manual overrides and timeline edits on the server. Each sync reports the
+//! device's compaction point and the server prunes its records through it
+//! (`downloads::retain`) under a small retention limit; a stale device copy
+//! replays its first event after pruning. After a server restore the device
+//! re-anchors its sequence (`offline::reanchor`, `downloads::reanchor`) with
+//! its first batch under the new history. The oracle does not re-run the
+//! policy: it tracks whether any other authority touched the timeline since
+//! the download's base and derives the required outcome.
 use playscale_core::{
-    downloads::{self, Code, Decision, Lineage, OfflineEvent, Outcome, Recorded, Target},
+    downloads::{
+        self, Code, Decision, Lineage, OfflineEvent, Outcome, Recorded, Retention, Target,
+    },
     offline::{self, Admission, CacheScope, DownloadIdentity},
     timeline_viewing::{self, Status, View},
 };
@@ -19,6 +26,8 @@ use stateless::{
 
 const DURATION: u64 = 100_000;
 const MAX_SEQUENCES: u64 = 4;
+/// Small enough that a four-event log fills it before acknowledging.
+const RETENTION_LIMIT: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Input {
@@ -32,6 +41,9 @@ enum Input {
     SyncLost,
     /// Resend the oldest recorded event with altered content.
     AlteredRetry,
+    /// A stale copy of the device (say, a restored backup) resends its first
+    /// event, reporting no compaction.
+    StaleReplay,
     /// Skip a sequence.
     Gap,
     /// After a complete sync, re-read the manifest base.
@@ -43,6 +55,11 @@ enum Input {
     /// The server database is restored from a backup taken at the start; its
     /// history identity (restore epoch) changes.
     Restore,
+    /// The person discards progress recorded against the earlier history.
+    Discard,
+    /// The person keeps it: the download is re-pinned to the restored
+    /// server's state and the progress re-recorded against it.
+    Reapply,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,12 +75,19 @@ struct World {
     timeline_revision: u64,
     // Server reconciliation state for this device and profile.
     next_sequence: u64,
+    /// Records at or below this sequence were pruned.
+    pruned: u64,
     recorded: Vec<Recorded>,
     lineage: Option<Lineage>,
     // Device state.
     download: Option<DownloadIdentity>,
     base: u64,
     log: Vec<offline::OfflineEvent>,
+    /// The server history the device's compaction point belongs to
+    /// (`offline::compacted_epoch`); None before anything was compacted.
+    base_epoch: Option<u8>,
+    /// The device's first event, as a stale copy would resend it.
+    first: Option<OfflineEvent>,
     // Oracle facts since the download's base.
     other_viewing: bool,
     other_manual: bool,
@@ -73,6 +97,11 @@ struct World {
     /// The server's restore epoch and how many restores happened.
     epoch: u8,
     restores: u8,
+    /// Server: the viewing base as restored (`restore_baselines`).
+    restored_base: (u64, u64),
+    /// Oracle facts since the restore: another authority wrote viewing.
+    viewing_since_restore: bool,
+    manual_since_restore: bool,
 }
 
 fn scope() -> CacheScope {
@@ -123,7 +152,30 @@ fn identity(w: &World) -> DownloadIdentity {
 }
 
 fn history(w: &World) -> String {
-    format!("server:{}", w.epoch)
+    epoch_name(w.epoch)
+}
+
+fn epoch_name(epoch: u8) -> String {
+    format!("server:{epoch}")
+}
+
+/// The log starts with progress recorded against an earlier history.
+fn earlier_progress(w: &World) -> bool {
+    header(&w.log).is_some_and(|h| h != history(w))
+}
+
+fn epoch_number(epoch: Option<String>) -> Option<u8> {
+    epoch.map(|e| e.strip_prefix("server:").unwrap().parse().unwrap())
+}
+
+/// The device's compaction point belongs to an earlier server history.
+fn foreign_base(w: &World) -> bool {
+    w.base_epoch.is_some_and(|e| e != w.epoch)
+}
+
+/// The re-anchor the device sends with a batch under `header`.
+fn device_reanchor(w: &World, header: Option<&str>) -> Option<offline::Reanchor> {
+    offline::reanchor(w.base, w.base_epoch.map(epoch_name).as_deref(), header?)
 }
 
 /// The history identity a batch is sent under: that of its events' base.
@@ -137,6 +189,8 @@ fn sync(
     w: &mut World,
     events: &[OfflineEvent],
     header: Option<&str>,
+    acknowledged: Option<u64>,
+    reanchor: Option<&offline::Reanchor>,
 ) -> Vec<Option<(Outcome, Option<Code>)>> {
     // The adapter checks the history identity first, inside the transaction.
     let current = history(w);
@@ -148,6 +202,33 @@ fn sync(
     if !accepted {
         return vec![None; events.len()];
     }
+    let mut retention = Retention {
+        pruned_through: w.pruned,
+        limit: RETENTION_LIMIT,
+    };
+    if let Some(r) = reanchor {
+        let Ok((next, moved)) = downloads::reanchor(
+            current.split_once(':').unwrap(),
+            &r.from_viewing_epoch,
+            (0..=w.epoch).any(|epoch| epoch_name(epoch) == r.from_viewing_epoch),
+            r.through,
+            w.next_sequence,
+            retention,
+        ) else {
+            return vec![None; events.len()];
+        };
+        w.next_sequence = next;
+        w.pruned = moved.pruned_through;
+        w.recorded
+            .retain(|x| x.event.sequence > moved.pruned_through);
+        retention = moved;
+    }
+    let Ok(retention) = downloads::retain(w.next_sequence, retention, acknowledged) else {
+        return vec![None; events.len()];
+    };
+    w.pruned = retention.pruned_through;
+    w.recorded
+        .retain(|r| r.event.sequence > retention.pruned_through);
     let mut results = vec![];
     for event in events {
         let prior: Vec<Recorded> = w
@@ -161,6 +242,7 @@ fn sync(
             duration_ms: Some(DURATION),
         };
         match downloads::reconcile(
+            retention,
             w.next_sequence,
             &prior,
             event,
@@ -170,7 +252,10 @@ fn sync(
             90.0,
         ) {
             Decision::Duplicate(r) => results.push(Some((r.outcome, r.code))),
-            Decision::Conflict | Decision::SequenceGap => results.push(None),
+            Decision::Conflict
+            | Decision::SequenceGap
+            | Decision::Acknowledged
+            | Decision::RetentionFull => results.push(None),
             Decision::Consumed {
                 recorded,
                 view,
@@ -210,8 +295,8 @@ impl Model for Downloads {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-download-reconciliation".into(),
-            model_version: 2,
-            properties_version: 2,
+            model_version: 6,
+            properties_version: 6,
             codec_version: 1,
             build: concat!(
                 include_str!("../src/downloads.rs"),
@@ -226,11 +311,14 @@ impl Model for Downloads {
             view: View::default(),
             timeline_revision: 1,
             next_sequence: 1,
+            pruned: 0,
             recorded: vec![],
             lineage: None,
             download: None,
             base: 0,
             log: vec![],
+            base_epoch: None,
+            first: None,
             other_viewing: false,
             other_manual: false,
             online: 0,
@@ -238,6 +326,9 @@ impl Model for Downloads {
             edits: 0,
             epoch: 0,
             restores: 0,
+            restored_base: (0, 0),
+            viewing_since_restore: false,
+            manual_since_restore: false,
         })
     }
 
@@ -248,14 +339,25 @@ impl Model for Downloads {
                 w.recorded
                     .iter()
                     .enumerate()
-                    .all(|(i, r)| r.event.sequence == i as u64 + 1)
-                    && w.next_sequence == w.recorded.len() as u64 + 1,
+                    .all(|(i, r)| r.event.sequence == w.pruned + i as u64 + 1)
+                    && w.next_sequence == w.pruned + w.recorded.len() as u64 + 1,
+            ),
+            check(
+                "retention.never_prunes_beyond_device_compaction",
+                // Within the device's compaction history; a restored server
+                // knows nothing of an earlier one until it is re-anchored.
+                foreign_base(w) || w.pruned <= w.base,
+            ),
+            check(
+                "retention.bounded",
+                w.recorded.len() as u64 <= RETENTION_LIMIT,
             ),
             check(
                 "reconcile.device_never_compacts_unrecorded_events",
-                // A restore rewinds the server below what the device already
-                // compacted against the previous history.
-                w.restores > 0 || w.base < w.next_sequence,
+                // A restore rewinds the server below what the device compacted
+                // in the previous history; once the device compacts in the
+                // current one (after re-anchoring), the server is past it.
+                foreign_base(w) || w.base < w.next_sequence,
             ),
         ])
     }
@@ -290,13 +392,24 @@ impl Model for Downloads {
                     let admitted =
                         offline::admit(w.base, &w.log, &event, &scope(), media, DURATION * 2, 8);
                     if admitted == Admission::Append {
+                        if next == 1 {
+                            n.first = Some(wire(&event));
+                        }
                         n.log.push(event);
                     }
                 }
             }
             Input::Sync | Input::SyncLost => {
                 let events: Vec<_> = w.log.iter().map(wire).collect();
-                out = sync(&mut n, &events, header(&w.log).as_deref());
+                let head = header(&w.log);
+                let reanchor = device_reanchor(w, head.as_deref());
+                out = sync(
+                    &mut n,
+                    &events,
+                    head.as_deref(),
+                    Some(w.base),
+                    reanchor.as_ref(),
+                );
                 if *input == Input::Sync {
                     // The device compacts only what the results confirm.
                     let acks: Vec<_> = w
@@ -311,6 +424,13 @@ impl Model for Downloads {
                     let through =
                         offline::acknowledged_through(w.base, &w.log, &acks, n.next_sequence);
                     if let Some((base, log)) = offline::compact(w.base, &w.log, through) {
+                        n.base_epoch = offline::compacted_epoch(
+                            w.base_epoch.map(epoch_name).as_deref(),
+                            &w.log,
+                            w.base,
+                            base,
+                        )
+                        .map(|e| e.strip_prefix("server:").unwrap().parse().unwrap());
                         n.base = base;
                         n.log = log;
                     }
@@ -320,7 +440,18 @@ impl Model for Downloads {
                 if let Some(first) = w.recorded.first() {
                     let mut altered = first.event.clone();
                     altered.position_ms += 1;
-                    out = sync(&mut n, &[altered], Some(&history(w)));
+                    out = sync(&mut n, &[altered], Some(&history(w)), None, None);
+                }
+            }
+            Input::StaleReplay if w.next_sequence > 1 && w.restores == 0 => {
+                if let Some(first) = &w.first {
+                    out = sync(
+                        &mut n,
+                        std::slice::from_ref(first),
+                        Some(&history(w)),
+                        Some(0),
+                        None,
+                    );
                 }
             }
             Input::Gap => {
@@ -335,7 +466,7 @@ impl Model for Downloads {
                         device_time: None,
                     });
                     e.device_time = "gap".into();
-                    out = sync(&mut n, &[e], Some(&history(w)));
+                    out = sync(&mut n, &[e], Some(&history(w)), None, None);
                 }
             }
             Input::Rebase if w.download.is_some() && w.log.is_empty() => {
@@ -350,6 +481,7 @@ impl Model for Downloads {
                 n.view.revision += 1;
                 n.view.position_ms = 5_000;
                 n.other_viewing = true;
+                n.viewing_since_restore = true;
             }
             Input::ManualOverride if w.manual < 1 => {
                 n.manual += 1;
@@ -358,20 +490,60 @@ impl Model for Downloads {
                 n.view.manual_watched = Some(false);
                 n.view.position_ms = 0;
                 n.other_manual = true;
+                n.manual_since_restore = true;
             }
             Input::TimelineEdit if w.edits < 1 => {
                 n.edits += 1;
                 n.timeline_revision += 1;
+            }
+            Input::Discard if earlier_progress(w) => {
+                let r = offline::discard(
+                    w.base,
+                    w.base_epoch.map(epoch_name).as_deref(),
+                    &w.log,
+                    &history(w),
+                );
+                n.base = r.base;
+                n.base_epoch = epoch_number(r.base_epoch);
+                n.log = r.events;
+            }
+            Input::Reapply if earlier_progress(w) && w.download.is_some() => {
+                // Kept progress is pinned to the viewing base as restored,
+                // never the current one: anything written since the restore
+                // is newer (the oracle's facts since the restore).
+                let mut pin = identity(w);
+                pin.timeline_revision = w.download.as_ref().unwrap().timeline_revision.clone();
+                pin.base_viewing_revision = w.restored_base.0.to_string();
+                pin.base_manual_epoch = w.restored_base.1.to_string();
+                n.download = Some(pin.clone());
+                n.other_viewing = w.viewing_since_restore;
+                n.other_manual = w.manual_since_restore;
+                let r = offline::reapply(
+                    w.base,
+                    w.base_epoch.map(epoch_name).as_deref(),
+                    &w.log,
+                    std::slice::from_ref(&pin),
+                    &history(w),
+                )
+                .unwrap();
+                n.base = r.base;
+                n.base_epoch = epoch_number(r.base_epoch);
+                n.log = r.events;
             }
             Input::Restore if w.restores < 1 => {
                 // Back to the empty backup; the device keeps everything.
                 n.view = View::default();
                 n.timeline_revision = 1;
                 n.next_sequence = 1;
+                n.pruned = 0;
                 n.recorded = vec![];
                 n.lineage = None;
                 n.epoch += 1;
                 n.restores += 1;
+                // The baseline is captured with the new history.
+                n.restored_base = (n.view.revision, n.view.manual_epoch);
+                n.viewing_since_restore = false;
+                n.manual_since_restore = false;
             }
             _ => {}
         }
@@ -390,7 +562,11 @@ impl Model for Downloads {
                 "reconcile.manual_state_is_never_overwritten",
                 !matches!(
                     input,
-                    Input::Sync | Input::SyncLost | Input::AlteredRetry | Input::Gap
+                    Input::Sync
+                        | Input::SyncLost
+                        | Input::AlteredRetry
+                        | Input::Gap
+                        | Input::StaleReplay
                 ) || (n.view.manual_epoch == w.view.manual_epoch
                     && n.view.manual_watched == w.view.manual_watched),
             ),
@@ -413,7 +589,14 @@ impl Model for Downloads {
                     .map(|d| d.timeline_revision.parse::<u64>().unwrap());
                 let mut expected = vec![];
                 let same_history = header(&w.log) == Some(history(w));
-                let mut next = w.next_sequence;
+                // A batch under the current history re-anchors a compaction
+                // point of the previous one: the server continues after it.
+                let reanchored = device_reanchor(w, header(&w.log).as_deref())
+                    .filter(|_| same_history)
+                    .map_or(0, |r| r.through + 1);
+                let mut next = w.next_sequence.max(reanchored);
+                // The device reports its base, so the floor becomes the base.
+                let floor = w.pruned.max(w.base);
                 for e in &w.log {
                     let sequence: u64 = e.device_sequence.parse().unwrap();
                     if !same_history {
@@ -422,7 +605,7 @@ impl Model for Downloads {
                     } else if let Some(r) = w.recorded.iter().find(|r| r.event.sequence == sequence)
                     {
                         expected.push(Some((r.outcome, r.code)));
-                    } else if sequence != next {
+                    } else if sequence != next || next - 1 - floor >= RETENTION_LIMIT {
                         expected.push(None);
                     } else if e.position_ms > DURATION + 1_000 {
                         next += 1;
@@ -475,10 +658,52 @@ impl Model for Downloads {
                     },
                 ));
             }
+            Input::Discard if earlier_progress(w) => {
+                let earlier = offline::foreign_events(&w.log, &history(w));
+                checks.push(check(
+                    "restore.discard_drops_exactly_the_earlier_progress",
+                    !earlier_progress(n)
+                        && n.log == w.log[earlier..]
+                        && n.base == w.base + earlier as u64,
+                ));
+            }
+            Input::Reapply if earlier_progress(w) && w.download.is_some() => {
+                let observed = |log: &[offline::OfflineEvent]| {
+                    log.iter()
+                        .map(|e| (e.position_ms, e.status.clone()))
+                        .collect::<Vec<_>>()
+                };
+                checks.push(check(
+                    "restore.reapply_keeps_every_observation_in_order_under_the_current_history",
+                    !earlier_progress(n)
+                        && observed(&n.log) == observed(&w.log)
+                        && n.log.iter().all(|e| {
+                            e.media.viewing_epoch == Some(history(w))
+                                && Some(&e.media) == n.download.as_ref()
+                                && e.media.base_viewing_revision == w.restored_base.0.to_string()
+                        })
+                        && n.base + n.log.len() as u64 >= w.base + w.log.len() as u64,
+                ));
+            }
             Input::AlteredRetry | Input::Gap => checks.push(check(
                 "reconcile.conflicts_and_gaps_change_nothing",
                 n == w && t.outputs.iter().all(Option::is_none),
             )),
+            Input::StaleReplay if w.next_sequence > 1 && w.restores == 0 => {
+                // Pruned: refused; still retained: the exact duplicate.
+                let expected = if w.pruned >= 1 {
+                    None
+                } else {
+                    w.recorded
+                        .iter()
+                        .find(|r| r.event.sequence == 1)
+                        .map(|r| (r.outcome, r.code))
+                };
+                checks.push(check(
+                    "retention.stale_copies_change_nothing",
+                    n == w && t.outputs == vec![expected],
+                ));
+            }
             _ => {}
         }
         Ok(checks)
@@ -495,12 +720,15 @@ impl Enumerate for Downloads {
             Input::Sync,
             Input::SyncLost,
             Input::AlteredRetry,
+            Input::StaleReplay,
             Input::Gap,
             Input::Rebase,
             Input::OnlineProgress,
             Input::ManualOverride,
             Input::TimelineEdit,
             Input::Restore,
+            Input::Discard,
+            Input::Reapply,
         ])
     }
 }
@@ -547,7 +775,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore; download/rebase, partial/complete/beyond, sync, lost response, altered retry, gap",
+        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring and a discard or re-apply (onto the restored baseline) choice, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
         report.states, report.transitions
     );
 }
@@ -565,6 +793,143 @@ fn checks_detect_overwriting_newer_authority() {
     let mut bad = w.clone();
     bad.view.position_ms = 40_000;
     bad.view.revision += 1;
+    let mutation = Transition::accepted(bad, vec![Some((Outcome::Applied, None))]);
+    assert!(
+        Downloads
+            .check_transition(&w, &Input::Sync, &mutation.as_ref())
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
+    );
+}
+
+#[test]
+fn checks_detect_pruning_beyond_the_devices_compaction() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Play(Position::Partial),
+        Input::SyncLost,
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    // The server consumed 1 and 2 but the device never saw the response:
+    // its base is 0, so nothing may be pruned yet.
+    assert_eq!((w.next_sequence, w.base, w.pruned), (3, 0, 0));
+    let mut bad = w.clone();
+    bad.pruned = 2;
+    bad.recorded.clear();
+    assert!(
+        Downloads
+            .check_state(&bad)
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
+    );
+    // The device's retry after such pruning would be refused instead of
+    // being recognized as a duplicate; the oracle demands the duplicate.
+    let retry = Downloads.step(&w, &Input::Sync).unwrap();
+    assert!(
+        retry
+            .outputs
+            .iter()
+            .all(|o| matches!(o, Some((Outcome::Applied, None))))
+    );
+}
+
+#[test]
+fn a_restored_server_continues_after_the_devices_compaction() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Restore,
+        Input::Rebase,
+        Input::Play(Position::Partial),
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    // The device compacted 1 in history 0; the restored server is at 1 again.
+    assert_eq!(
+        (w.base, w.base_epoch, w.epoch, w.next_sequence),
+        (1, Some(0), 1, 1)
+    );
+    let synced = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(synced.outputs, vec![Some((Outcome::Applied, None))]);
+    let n = synced.state;
+    assert_eq!((n.base, n.base_epoch, n.next_sequence), (2, Some(1), 3));
+    // A server that ignored the re-anchor would stop the device at a gap;
+    // the oracle requires the event to be decided normally.
+    let stuck = Transition::accepted(w.clone(), vec![None]);
+    assert!(
+        Downloads
+            .check_transition(&w, &Input::Sync, &stuck.as_ref())
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
+    );
+}
+
+#[test]
+fn reapplied_progress_is_applied_on_the_restored_server() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Play(Position::Complete),
+        Input::Restore,
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    // The completion was recorded before the restore and is stuck.
+    assert!(earlier_progress(&w));
+    let stuck = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(stuck.outputs, vec![None]);
+    let kept = Downloads.step(&w, &Input::Reapply).unwrap().state;
+    let synced = Downloads.step(&kept, &Input::Sync).unwrap();
+    assert_eq!(synced.outputs, vec![Some((Outcome::Applied, None))]);
+    assert!(
+        synced.state.view.automatic_watched,
+        "the kept completion counts"
+    );
+    // Discarding sends nothing and leaves the restored server's state.
+    let dropped = Downloads.step(&w, &Input::Discard).unwrap().state;
+    assert!(dropped.log.is_empty());
+    let synced = Downloads.step(&dropped, &Input::Sync).unwrap();
+    assert!(synced.outputs.is_empty() && synced.state.view == w.view);
+}
+
+#[test]
+fn viewing_written_after_the_restore_wins_over_kept_progress() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Play(Position::Complete),
+        Input::Restore,
+        // Another session watches on the restored server before the choice.
+        Input::OnlineProgress,
+        Input::Reapply,
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    let synced = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(
+        synced.outputs,
+        vec![Some((Outcome::HistoryOnly, Some(Code::ViewingNewer)))]
+    );
+    assert_eq!(
+        synced.state.view.position_ms, 5_000,
+        "the newer session stands"
+    );
+    // A policy that pinned kept progress to the current view would apply it;
+    // the oracle refuses that.
+    let mut bad = synced.state.clone();
+    bad.view.position_ms = DURATION;
     let mutation = Transition::accepted(bad, vec![Some((Outcome::Applied, None))]);
     assert!(
         Downloads

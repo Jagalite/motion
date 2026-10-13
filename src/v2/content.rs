@@ -246,9 +246,9 @@ pub async fn create(
     };
     // Reauthorize exact issuance retries as well as first admissions.
     let facts = file_facts(&mut tx, &file.file_id).await?;
-    let parent_expiry = caller.credential.as_ref().map(|(_, c)| c.expires_at);
+    let parent_expiry = caller.credential().map(|(_, c)| c.expires_at);
     // Ingress without a durable parent credential cannot mint a bearer grant.
-    if caller.credential.is_none() && principal.id != "operator" {
+    if caller.credential().is_none() && !caller.is_local_operator() {
         return Err(Problem::invalid(
             "ticket_parent_required",
             "Use a durable credential to issue content access",
@@ -291,7 +291,7 @@ pub async fn create(
         .bind(&id)
         .bind(auth::token_hash(&token))
         .bind(&principal.id)
-        .bind(caller.credential.as_ref().map(|(h, _)| h.clone()))
+        .bind(caller.credential().map(|(h, _)| h))
         .bind(&file.file_id)
         .bind(&file.file_revision)
         .bind(match input.purpose {

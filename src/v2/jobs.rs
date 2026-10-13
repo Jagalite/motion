@@ -165,6 +165,38 @@ async fn control(
             )
         })?;
     }
+    // A preview retry is admitted like a new request: never alongside
+    // another active job or published previews of the same revision, and
+    // within the queue bound.
+    if retry && old.kind == "preview" {
+        let (file, revision, identity): (String, String, String) = sqlx::query_as(
+            "SELECT file_id,file_revision,layout_identity FROM preview_jobs WHERE id=?",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        match super::previews::admission(&mut tx, &principal, &file, &revision, &identity, &id)
+            .await?
+        {
+            playscale_core::previews::Admission::Enqueue => {}
+            playscale_core::previews::Admission::Invalid => return Err(Problem::not_found()),
+            playscale_core::previews::Admission::Existing => {
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    "preview_duplicate",
+                    "This revision's previews are already rendering or ready",
+                ));
+            }
+            playscale_core::previews::Admission::Full => {
+                return Err(Problem::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "processing_limit",
+                    "The preview queue is full",
+                ));
+            }
+        }
+    }
+
     let (next, _) = transition(&state, if retry { Input::Retry } else { Input::Cancel });
     if next != state {
         if old.kind == "scan" {
@@ -181,6 +213,12 @@ async fn control(
                 .await?;
         } else if old.kind == "backup" {
             sqlx::query("UPDATE backup_jobs SET phase=?,error=NULL WHERE id=?")
+                .bind(crate::db::phase_name(next.phase))
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+        } else if old.kind == "preview" {
+            sqlx::query("UPDATE preview_jobs SET phase=?,error=NULL WHERE id=?")
                 .bind(crate::db::phase_name(next.phase))
                 .bind(&id)
                 .execute(&mut *tx)

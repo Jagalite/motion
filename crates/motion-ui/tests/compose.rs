@@ -250,11 +250,27 @@ async fn series_navigation_and_generated_links() {
 #[tokio::test]
 async fn user_text_is_escaped_and_bounded() {
     let app = app(Some(principal("everyone", VIEWER)), None);
-    let (status, _, html) = get_page(&app, "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!html.contains("<script>alert(1)"));
-    assert!(html.contains("&lt;script&gt;"));
-    assert_strict_markup(&html);
+    for (query, attribute) in [
+        ("<script>alert(1)</script>", "<script>alert(1)</script>"),
+        (
+            "\"><script>alert(1)</script>& 雪",
+            "&quot;><script>alert(1)</script>&amp; 雪",
+        ),
+    ] {
+        let encoded: String = query.bytes().map(|b| format!("%{b:02X}")).collect();
+        let (status, _, html) = get_page(&app, &format!("/search?q={encoded}")).await;
+        assert_eq!(status, StatusCode::OK);
+        // Topcoat escapes quotes and ampersands in double-quoted attributes;
+        // angle brackets there are literal input text, not HTML elements.
+        // Verify the complete quoted value before checking executable markup
+        // outside it, including a query that attempts to end the attribute.
+        let value = format!("value=\"{attribute}\"");
+        assert!(html.contains(&value), "search value must round-trip safely");
+        let markup = html.replacen(&value, "value=\"\"", 1);
+        assert!(!markup.contains("<script>alert(1)"));
+        assert!(markup.contains("&lt;script&gt;"));
+        assert_strict_markup(&markup);
+    }
     let long = "a".repeat(201);
     let (status, _, _) = get_page(&app, &format!("/search?q={long}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -275,6 +291,22 @@ async fn player_page_emits_a_stable_host_and_external_module() {
     assert!(html.contains(r#"data-resume-ms="1830000""#));
     assert!(html.contains(r#"data-demuxe-base="/assets/demuxe/""#));
     assert!(html.contains(&format!(r#"src="{}""#, assets::PLAYER.url())));
+    // Markers: a skip button the player reveals inside its interval, marked
+    // uncertain when detected, and chapters that seek.
+    assert!(
+        html.contains(
+            r#"data-player-seek="65000" data-marker-start="5000" data-marker-end="65000""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("Skip intro") && html.contains("(detected)"));
+    assert!(html.contains(r#"data-player-seek="0""#) && html.contains("Departure"));
+    // The profile's streaming limit (none here) and a limit control.
+    assert!(html.contains(r#"data-max-bitrate="""#), "{html}");
+    assert!(
+        html.contains(r#"<select name="limit"><option value="" selected="">No limit</option>"#)
+    );
+    assert!(html.contains(r#"<option value="8000000">8 Mbps</option>"#));
     assert_strict_markup(&html);
 }
 
@@ -438,6 +470,17 @@ async fn command_forms_name_public_operations_with_preconditions() {
         sources.contains("Partial — some folders could not be read; nothing unseen was removed")
     );
     assert!(sources.contains("1 incomplete"));
+    // Deletion explains its exact effect, needs explicit confirmation and is
+    // guarded by the revision the page showed. A source a library still uses
+    // is not offered for removal.
+    assert!(sources.contains(r#"data-command="DELETE /api/v2/libraries/lib1" data-idempotent="false" data-if-match="&quot;r-4&quot;""#), "{sources}");
+    assert!(sources.contains("nothing is deleted from disk"));
+    assert!(
+        sources.contains(r#"<input type="checkbox" required="">"#),
+        "{sources}"
+    );
+    assert!(!sources.contains(r#"data-command="DELETE /api/v2/sources/src1""#));
+    assert!(sources.contains("Remove it from those libraries first"));
     let (_, _, matches) = get_page(&admin, "/matches").await;
     assert!(matches.contains(r#"data-command="PUT /api/v2/catalog/matches/m1/decision" data-idempotent="false" data-if-match="&quot;r1&quot;""#));
     assert!(matches.contains(r#"value="reject""#) && matches.contains(r#"value="defer""#));
@@ -492,6 +535,10 @@ async fn command_bodies_satisfy_required_contract_fields() {
     let (_, _, profiles) = get_page(&admin, "/profiles").await;
     // Preferences.completion_percent is required (50..=100); the input cannot be left empty.
     assert!(profiles.contains(r#"name="completion_percent" data-type="number" required="""#));
+    // The streaming limit is null (no limit) or a decimal string.
+    assert!(profiles.contains(
+        r#"<select name="max_bitrate_bps" data-type="nullable"><option value="" selected="">No limit</option>"#
+    ));
     let (_, _, matches) = get_page(&admin, "/matches").await;
     // A match without candidates cannot be accepted, but can be rejected or deferred.
     let m2 = &matches
@@ -607,10 +654,8 @@ async fn library_administration_offers_edit_relocation_and_schedules() {
     assert!(sources.contains(r#"data-type="minutes" data-target="interval_seconds""#));
     assert!(sources.contains(r#"value="1440""#));
     assert!(sources.contains(r#"<option value="metadata_refresh">"#));
-    assert!(
-        !sources.contains(r#"<option value="preview">"#)
-            && !sources.contains(r#"<option value="optimize">"#)
-    );
+    assert!(sources.contains(r#"<option value="preview">"#));
+    assert!(!sources.contains(r#"<option value="optimize">"#));
     let (_, _, processing) = get_page(&admin, "/processing").await;
     // The server retries failed and cancelled jobs; it takes no precondition.
     assert!(
@@ -643,6 +688,50 @@ async fn title_management_names_exact_operations_and_unsupported_parts() {
     assert!(html.contains(
         r#"data-command="POST /api/v2/catalog/items/item1/metadata/refresh" data-idempotent="true""#
     ));
+    // Merge and split preview first and commit exactly the shown plan.
+    assert!(
+        html.contains(
+            r#"data-command="POST /api/v2/catalog/items/item1/merge-plans" data-idempotent="true""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("&quot;expected_revisions&quot;:{&quot;dup1&quot;:&quot;2&quot;,&quot;item1&quot;:&quot;7&quot;}"), "{html}");
+    assert!(html.contains(r#"data-plan-commit="POST /api/v2/catalog/reconciliations""#));
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/items/item1/split-plans""#));
+    assert!(
+        html.contains(r#"name="version_ids" data-type="member" value="v2""#),
+        "{html}"
+    );
+    // Play orders: created against the item, placements fenced by the
+    // timeline and the destination group's revision.
+    assert!(html.contains("Aired (aired) · Original"), "{html}");
+    assert!(html.contains("position 3 in Aired"), "{html}");
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/items/item1/order-groups" data-idempotent="true" data-if-match="&quot;r-7&quot;""#), "{html}");
+    assert!(
+        html.contains(r#"data-if-match="&quot;r-2&quot;""#)
+            && html.contains(r#"/order" data-idempotent="false""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="expected_group_revision" data-type="text" value="4""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="order_position" data-type="number" value="3""#),
+        "{html}"
+    );
+    // Markers: listed with provenance and effect; a new one is checked
+    // against the timeline revision the page showed.
+    assert!(
+        html.contains("Intro 0:05–1:05 · detected, unconfirmed"),
+        "{html}"
+    );
+    assert!(html.contains("not in effect (earlier timeline)"));
+    assert!(html.contains(
+        r#"data-command="POST /api/v2/catalog/timelines/tl-mock/markers" data-idempotent="true""#
+    ));
+    assert!(html.contains(r#"name="timeline_revision" data-type="text" value="3""#));
+    assert!(html.contains(r#"name="start_ms" data-type="seconds-ms""#));
     // Artwork upload sends the file itself; selection is checked against the item.
     assert!(html.contains(
         r#"data-command="POST /api/v2/catalog/items/item1/artwork" data-idempotent="true""#
@@ -651,7 +740,8 @@ async fn title_management_names_exact_operations_and_unsupported_parts() {
     // Identification proposes against the exact file revision and library.
     assert!(html.contains(r#"data-command="POST /api/v2/catalog/matches" data-idempotent="true""#));
     assert!(html.contains(r#"value="{&quot;file_id&quot;:&quot;file-item1&quot;,&quot;file_revision&quot;:&quot;rev1&quot;}""#), "{html}");
-    // Preparation keeps the chosen audio track and says subtitles are not prepared.
+    // Preparation keeps the chosen audio track and, when chosen, a text
+    // subtitle (which then requires it).
     assert!(
         html.contains(
             r#"data-command="POST /api/v2/processing/preparations" data-idempotent="true""#
@@ -659,8 +749,32 @@ async fn title_management_names_exact_operations_and_unsupported_parts() {
     );
     assert!(html.contains(r#"name="tracks.audio_track_id" data-type="nullable""#));
     assert!(html.contains(r#"<option value="a1">"#));
-    assert!(html.contains(r#"name="tracks.subtitle_policy" data-type="text" value="off""#));
-    assert!(html.contains("subtitles cannot be included in prepared versions yet"));
+    assert!(html.contains(
+        r#"name="tracks.subtitle_track_id" data-type="subtitle-choice" data-policy="tracks.subtitle_policy""#
+    ));
+    assert!(html.contains(r#"<option value="s1">English · subrip</option>"#));
+    // The fixed recipes and the custom profile are separate forms: a fixed
+    // recipe never sends a video profile.
+    let fixed = &html[html.find(r#"name="recipe_id" data-type="text">"#).unwrap()..];
+    let fixed = &fixed[..fixed.find("</select>").unwrap()];
+    assert!(
+        fixed.contains("H.264 720p") && !fixed.contains("video_profile"),
+        "{fixed}"
+    );
+    assert!(html.contains("Prepare with a custom video profile"));
+    assert!(html.contains(r#"name="recipe_id" data-type="text" value="video_profile""#));
+    assert!(html.contains(r#"name="video_profile.version" data-type="number" value="1""#));
+    // Validated controls mirror VideoProfile's bounds.
+    assert!(html.contains(r#"name="video_profile.max_width" data-type="number" required="" min="128" max="3840" step="2""#), "{html}");
+    assert!(html.contains(r#"name="video_profile.max_height" data-type="number" required="" min="72" max="2160" step="2""#));
+    assert!(html.contains(
+        r#"name="video_profile.video_bitrate" data-type="mbps" required="" min="0.064" max="80""#
+    ));
+    assert!(html.contains(
+        r#"name="video_profile.audio_bitrate" data-type="kbps" required="" min="32" max="320""#
+    ));
+    assert!(html.contains(r#"<option value="{&quot;numerator&quot;:24000,&quot;denominator&quot;:1001}">23.976 fps</option>"#));
+    assert!(html.contains(r#"<option value="videotoolbox">VideoToolbox (hardware)</option>"#));
     // Collection membership is a full replacement guarded by the collection revision.
     assert!(html.contains(r#"data-command="PUT /api/v2/collections/col1" data-idempotent="false" data-if-match="&quot;r-1&quot;" data-body="json""#), "{html}");
     assert!(html.contains(r#"&quot;item_ids&quot;:[&quot;item1&quot;]"#));
@@ -704,6 +818,32 @@ async fn collections_page_creates_and_edits_with_exact_bodies() {
     assert!(html.contains(r#"data-command="POST /api/v2/playlists" data-idempotent="true""#));
     assert!(html.contains(r#"data-command="DELETE /api/v2/collections/col1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
     assert!(html.contains("Arrival of the Night Train"));
+    // Saved filters: readable conditions, a smart collection from exactly
+    // this filter, guarded edits that keep conditions the form cannot show.
+    assert!(html.contains("Unwatched 90s films"));
+    assert!(
+        html.contains("Kind is movie · From 1990 · Person p7"),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/filters" data-idempotent="true""#));
+    assert!(html.contains(r#"data-command="PUT /api/v2/catalog/filters/flt1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
+    assert!(html.contains(r#"data-command="DELETE /api/v2/catalog/filters/flt1""#));
+    assert!(
+        html.contains("&quot;kind&quot;:&quot;smart&quot;")
+            && html.contains("&quot;filter_id&quot;:&quot;flt1&quot;"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="movie" selected="">"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            r#"data-field="year" data-operator="gte" data-value-type="int" value="1990""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains(r#"type="hidden" name="all" data-type="term" data-field="person_id" data-operator="eq" data-value-type="text" value="p7""#), "{html}");
     let viewer = app(Some(principal("everyone", VIEWER)), None);
     let (status, _, _) = get_page(&viewer, "/organize").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -727,6 +867,11 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
     assert_eq!(status, StatusCode::OK);
     assert_strict_markup(&page);
     assert!(page.contains(r#"data-command="DELETE /api/v2/downloads/download1""#));
+    // The device's own report, in its words (512 MiB of 1.5 GB).
+    assert!(
+        page.contains("On the device") && page.contains("Saving — 35%"),
+        "{page}"
+    );
     assert!(page.contains("Ready to save"));
     let (_, _, home) = get_page(&saver, "/").await;
     assert!(home.contains(r#"href="/downloads""#));
@@ -747,4 +892,35 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
     ] {
         assert!(action.contains(field), "{field}");
     }
+    // A ready prepared version is offered too, with exactly its recipe and
+    // the selection it kept (5E).
+    let prepared = &item[item
+        .find("H.264 720p · audio 2 · subtitle 1")
+        .expect("prepared version")..];
+    let prepared = &prepared[..prepared.find("</form>").unwrap()];
+    assert!(prepared.contains(r#"name="recipe_id" data-type="text" value="h264720p""#));
+    assert!(prepared.contains(r#"name="version_id" data-type="text" value="ver-prepared-720p""#));
+    assert!(
+        prepared.contains(r#"&quot;audio_track_id&quot;:&quot;a1&quot;"#),
+        "{prepared}"
+    );
+    assert!(prepared.contains("Save this version for offline"));
+    // An original with text subtitles may be saved with one of them, pinned
+    // to exactly that version and required.
+    let subtitled = &item[item
+        .find("Save with subtitles")
+        .map(|end| item[..end].rfind("<form").unwrap())
+        .expect("subtitled original")..];
+    let subtitled = &subtitled[..subtitled.find("</form>").unwrap()];
+    assert!(subtitled.contains(r#"name="version_id" data-type="text" value="version-1""#));
+    assert!(
+        subtitled.contains(r#"<select name="tracks" data-type="json">"#),
+        "{subtitled}"
+    );
+    assert!(
+        subtitled.contains(r#"&quot;subtitle_policy&quot;:&quot;require&quot;"#)
+            && subtitled.contains(r#"&quot;subtitle_track_id&quot;:&quot;s1&quot;"#),
+        "{subtitled}"
+    );
+    assert!(subtitled.contains("Subtitle 2 · eng"));
 }

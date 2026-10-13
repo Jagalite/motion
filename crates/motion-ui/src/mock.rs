@@ -230,6 +230,18 @@ impl UiQueryFacade for MockUiQueryFacade {
                             availability: Availability::Available,
                             summary: "H.264 1920×1080 · audio: English 2ch, Français 2ch · subtitles: English SDH".into(),
                         }],
+                        prepared_downloads: vec![crate::facade::PreparedDownload {
+                            label: "H.264 720p · audio 2 · subtitle 1".into(),
+                            recipe_id: "h264720p".into(),
+                            version_id: "ver-prepared-720p".into(),
+                            tracks_json: r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"require","audio_track_id":"a1","subtitle_track_id":"s0"}"#.into(),
+                        }],
+                        prepared_incomplete: false,
+                        subtitle_downloads: vec![crate::facade::SubtitleDownload {
+                            version_id: "version-1".into(),
+                            label: "Original".into(),
+                            tracks: vec![("s1".into(), "Subtitle 2 · eng".into())],
+                        }],
                     }]
                 })
                 .unwrap_or_default();
@@ -292,6 +304,22 @@ impl UiQueryFacade for MockUiQueryFacade {
                 audio_tracks: vec![],
                 audio_version: None,
                 audio_file: None,
+                markers: vec![
+                    MarkerView {
+                        kind: "chapter".into(),
+                        start_ms: 0,
+                        end_ms: None,
+                        label: Some("Departure".into()),
+                        detected: false,
+                    },
+                    MarkerView {
+                        kind: "intro".into(),
+                        start_ms: 5_000,
+                        end_ms: Some(65_000),
+                        label: None,
+                        detected: true,
+                    },
+                ],
             })
         })
     }
@@ -309,6 +337,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     allow_client_software_decode: true,
                     autoplay: false,
                     completion_percent: 90.0,
+                    max_bitrate_bps: None,
                     etag: format!("\"prefs-{}-1\"", who.profile_id),
                 },
             })
@@ -449,6 +478,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 id: "download1".into(),
                 title: "Arrival".into(),
                 state: "ready".into(),
+                device_transfer: Some(("transferring".into(), 512 * 1024 * 1024)),
                 size_bytes: 1_500_000_000,
             }])
         })
@@ -497,6 +527,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     ("a0".into(), "English · AAC 2ch".into()),
                     ("a1".into(), "Français · AC-3 5.1".into()),
                 ],
+                subtitle_tracks: vec![("s1".into(), "English · subrip".into())],
             };
             let membership = |id: &str, name: &str, contains: bool| MembershipRow {
                 id: id.into(),
@@ -515,6 +546,26 @@ impl UiQueryFacade for MockUiQueryFacade {
             };
             Ok(ItemManageView {
                 item: card(title),
+                item_revision: "7".into(),
+                merge_candidates: write.then(|| {
+                    vec![MergeCandidate {
+                        id: "dup1".into(),
+                        title: title.title.into(),
+                        revision: "2".into(),
+                    }]
+                }),
+                versions: write.then(|| {
+                    vec![
+                        VersionRow {
+                            id: "v1".into(),
+                            label: "Original · original version · 4.2 GB · 1:42:10 · #v1".into(),
+                        },
+                        VersionRow {
+                            id: "v2".into(),
+                            label: "Original · Director's cut".into(),
+                        },
+                    ]
+                }),
                 library_ids: vec![title.library.into()],
                 match_state: if title.needs_review {
                     "ambiguous"
@@ -537,12 +588,20 @@ impl UiQueryFacade for MockUiQueryFacade {
                 artwork: write.then(Vec::new),
                 files: write.then(|| vec![file.clone()]),
                 recipes: prepare.then(|| {
-                    vec![RecipeOption {
-                        id: "h264720p".into(),
-                        name: "H.264 720p".into(),
-                        backends: vec!["software".into()],
-                        qualification: "partial".into(),
-                    }]
+                    vec![
+                        RecipeOption {
+                            id: "h264720p".into(),
+                            name: "H.264 720p".into(),
+                            backends: vec!["software".into()],
+                            qualification: "partial".into(),
+                        },
+                        RecipeOption {
+                            id: "video_profile".into(),
+                            name: "Bounded video profile".into(),
+                            backends: vec!["software".into(), "videotoolbox".into()],
+                            qualification: "unqualified".into(),
+                        },
+                    ]
                 }),
                 timelines: prepare.then(|| {
                     title
@@ -558,6 +617,52 @@ impl UiQueryFacade for MockUiQueryFacade {
                 }),
                 collections: organize.then(|| vec![membership("col1", "Weekend", false)]),
                 playlists: organize.then(Vec::new),
+                ordering: write.then(|| OrderingView {
+                    editions: vec![("ed1".into(), "Original".into())],
+                    groups: vec![OrderGroupView {
+                        id: "og1".into(),
+                        name: "Aired".into(),
+                        kind: "aired".into(),
+                        edition: "Original".into(),
+                        revision: "4".into(),
+                    }],
+                    timelines: title
+                        .timeline
+                        .map(|tl| OrderedTimeline {
+                            id: tl.into(),
+                            edition: "Original".into(),
+                            etag: "\"r-2\"".into(),
+                            group_id: Some("og1".into()),
+                            position: Some(3),
+                        })
+                        .into_iter()
+                        .collect(),
+                }),
+                markers: write.then(|| {
+                    vec![TimelineMarkersView {
+                        timeline_id: "tl-mock".into(),
+                        edition: "Original".into(),
+                        revision: "3".into(),
+                        markers: vec![
+                            StoredMarkerView {
+                                kind: "intro".into(),
+                                start_ms: 5_000,
+                                end_ms: Some(65_000),
+                                label: None,
+                                provenance: "detected".into(),
+                                current: true,
+                            },
+                            StoredMarkerView {
+                                kind: "chapter".into(),
+                                start_ms: 0,
+                                end_ms: None,
+                                label: Some("Old cut".into()),
+                                provenance: "embedded".into(),
+                                current: false,
+                            },
+                        ],
+                    }]
+                }),
             })
         })
     }
@@ -573,7 +678,9 @@ impl UiQueryFacade for MockUiQueryFacade {
                     id: "col1".into(),
                     name: "Weekend".into(),
                     kind: "manual".into(),
+                    filter_id: None,
                     etag: "\"r-1\"".into(),
+                    member_count: 1,
                     items: vec![card(&TITLES[0])],
                     remove_bodies: vec![format!(
                         r#"{{"name":"Weekend","profile_id":"{}","kind":"manual","item_ids":[],"filter_id":null}}"#,
@@ -581,6 +688,29 @@ impl UiQueryFacade for MockUiQueryFacade {
                     )],
                 }],
                 playlists: vec![],
+                filters: vec![SavedFilterView {
+                    id: "flt1".into(),
+                    name: "Unwatched 90s films".into(),
+                    etag: "\"r-1\"".into(),
+                    terms: vec![
+                        FilterTermView {
+                            field: "kind".into(),
+                            operator: "eq".into(),
+                            value: "movie".into(),
+                        },
+                        FilterTermView {
+                            field: "year".into(),
+                            operator: "gte".into(),
+                            value: "1990".into(),
+                        },
+                        FilterTermView {
+                            field: "person_id".into(),
+                            operator: "eq".into(),
+                            value: "p7".into(),
+                        },
+                    ],
+                    in_use: false,
+                }],
             })
         })
     }

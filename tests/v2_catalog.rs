@@ -2338,3 +2338,634 @@ async fn file_inventory_filters_scope_before_pagination() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Settled scan history beyond the old 1,000-row page bound, plus one still
+/// pending request, inserted directly; `minute` orders them.
+async fn scan_history(f: &Fixture, library: &str, prefix: &str, settled: usize) {
+    for n in 0..settled {
+        let id = format!("{prefix}-{n:04}");
+        sqlx::query(
+            "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,0,?)",
+        )
+        .bind(&id)
+        .bind(library)
+        .bind(1_000 + n as i64)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO scan_demands(id,request_id,source_id,barrier,verify,status) VALUES (?,?,?,0,0,'complete')")
+            .bind(format!("{id}-d"))
+            .bind(&id)
+            .bind(library)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    // The oldest request is still running: it is never pruned.
+    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-running',?,0,1)")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO scan_demands(id,request_id,source_id,barrier,verify,status) VALUES ('a-running-d','a-running',?,0,0,'pending')")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    scan_history(&f, &f.a, "a", 1_100).await;
+    scan_history(&f, &f.b, "b", 3).await;
+    let get = |path: String, auth: String| {
+        let f = &f;
+        async move {
+            f.call("GET", &path, None, &[("authorization", &auth)])
+                .await
+        }
+    };
+
+    // Newest first across pages; a scan admitted mid-read appears only on a
+    // fresh first page and never shifts or repeats a later one.
+    let first = get(
+        format!("/api/v2/scans?order=recent&limit=200&library_id={}", f.a),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(ids(&first)[..2], ["a-1099".to_owned(), "a-1098".to_owned()]);
+    // Admission order, not the clock: this one claims an older capture time.
+    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-late',?,0,0)")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut seen = ids(&first);
+    let mut cursor = first.body["next_cursor"].as_str().map(str::to_owned);
+    while let Some(c) = cursor {
+        let page = get(
+            format!(
+                "/api/v2/scans?order=recent&limit=200&library_id={}&cursor={c}",
+                f.a
+            ),
+            auth.clone(),
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        seen.extend(ids(&page));
+        cursor = page.body["next_cursor"].as_str().map(str::to_owned);
+    }
+    let mut expected: Vec<String> = (0..1_100).rev().map(|n| format!("a-{n:04}")).collect();
+    expected.push("a-running".into());
+    assert_eq!(seen, expected, "every existing scan once, newest first");
+    let fresh = get(
+        format!("/api/v2/scans?order=recent&limit=1&library_id={}", f.a),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(ids(&fresh), ["a-late"]);
+    sqlx::query("DELETE FROM scan_requests WHERE id='a-late'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    // The library filter and the caller's scope both narrow the rows; a
+    // filter naming a hidden library is an empty page, not an error.
+    let limited = f.device(&["catalog:read", "sources:manage"], &[&f.b]).await;
+    let mine = get("/api/v2/scans?order=recent".into(), limited.clone()).await;
+    assert_eq!(ids(&mine), ["b-0002", "b-0001", "b-0000"]);
+    // A real admission between two page reads, within the same second as
+    // the history it follows, appears only on a fresh first page.
+    sqlx::query("UPDATE scan_requests SET created_at=? WHERE id LIKE 'b-%'")
+        .bind(playscale::now())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let first = get("/api/v2/scans?order=recent&limit=2".into(), limited.clone()).await;
+    assert_eq!(ids(&first), ["b-0002", "b-0001"]);
+    let admitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-mid-read-00001"),
+            ],
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::ACCEPTED, "{}", admitted.body);
+    let next = get(
+        format!(
+            "/api/v2/scans?order=recent&limit=2&cursor={}",
+            first.body["next_cursor"].as_str().unwrap()
+        ),
+        limited.clone(),
+    )
+    .await;
+    assert_eq!(ids(&next), ["b-0000"]);
+    let fresh = get("/api/v2/scans?order=recent&limit=1".into(), limited.clone()).await;
+    assert_eq!(ids(&fresh), [admitted.body["id"].as_str().unwrap()]);
+    let hidden = get(
+        format!("/api/v2/scans?order=recent&library_id={}", f.a),
+        limited,
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::OK);
+    assert!(ids(&hidden).is_empty());
+    problem(
+        &get(
+            "/api/v2/scans?order=recent&cursor=not-a-cursor".into(),
+            auth.clone(),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_cursor",
+    );
+
+    // The newest history is deleted between page reads (as deleting its
+    // library does), then a scan is admitted: SQLite would reuse the deleted
+    // rowids, the admission sequence never is, so the new scan stays off the
+    // later page.
+    for (id, library) in [("seq-old", &f.b), ("seq-mid", &f.b), ("seq-new", &f.b)] {
+        sqlx::query(
+            "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,0,1)",
+        )
+        .bind(id)
+        .bind(library)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    }
+    let top = get("/api/v2/scans?order=recent&limit=1".into(), auth.clone()).await;
+    assert_eq!(ids(&top), ["seq-new"]);
+    sqlx::query("DELETE FROM scan_requests WHERE id IN ('seq-mid','seq-new')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let readmitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-after-delete-01"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        readmitted.status,
+        StatusCode::ACCEPTED,
+        "{}",
+        readmitted.body
+    );
+    let after = get(
+        format!(
+            "/api/v2/scans?order=recent&limit=1&cursor={}",
+            top.body["next_cursor"].as_str().unwrap()
+        ),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(ids(&after), ["seq-old"]);
+
+    // Admitting a scan bounds the library's settled history; the running
+    // request and the other library's history are kept.
+    let admitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.a),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-retention-00001"),
+            ],
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::ACCEPTED, "{}", admitted.body);
+    let count = |sql: &'static str| {
+        let f = &f;
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(&f.a)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE library_id=? AND (id LIKE 'a-0%' OR id LIKE 'a-1%')").await,
+        playscale_core::demands::RETAINED_SCANS_PER_LIBRARY as i64
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE library_id=? AND id='a-running'").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_demands WHERE request_id='a-0000' AND ?<>''").await,
+        0,
+        "demands cascade"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id LIKE 'b-%' AND ?<>''").await,
+        3
+    );
+    // The newest settled requests are the ones kept.
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id='a-1099' AND ?<>''").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id='a-0899' AND ?<>''").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn batched_item_reads_apply_the_catalog_scope_and_skip_aliases() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('rc','catalog:merge',0,'{}')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_aliases VALUES ('manual','film-a','rc')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let get = |path: &'static str, auth: String| {
+        let f = &f;
+        async move { f.call("GET", path, None, &[("authorization", &auth)]).await }
+    };
+    let operator = bearer(OPERATOR);
+    let all = get(
+        "/api/v2/catalog/items?ids=both,film-b,film-a,manual,missing",
+        operator.clone(),
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    // Title order, live items only: the alias and the unknown ID match nothing.
+    assert_eq!(ids(&all), ["film-a", "film-b", "both"]);
+    // A restricted reader sees only what it could browse; a hidden title is
+    // indistinguishable from an unknown one.
+    let limited = f.device(&["catalog:read"], &[&f.a]).await;
+    let mine = get(
+        "/api/v2/catalog/items?ids=both,film-b,film-a",
+        limited.clone(),
+    )
+    .await;
+    assert_eq!(ids(&mine), ["film-a", "both"]);
+    let hidden = get("/api/v2/catalog/items?ids=film-b", limited).await;
+    assert_eq!(hidden.status, StatusCode::OK);
+    assert!(ids(&hidden).is_empty());
+    for bad in [
+        "/api/v2/catalog/items?ids=film-a,film-a",
+        "/api/v2/catalog/items?ids=",
+        "/api/v2/catalog/items?ids=no%20spaces",
+    ] {
+        problem(
+            &get(bad, operator.clone()).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        );
+    }
+    let many: Vec<String> = (0..101).map(|n| format!("i{n}")).collect();
+    let path = format!("/api/v2/catalog/items?ids={}", many.join(","));
+    let reply = f
+        .call("GET", &path, None, &[("authorization", &operator)])
+        .await;
+    problem(&reply, StatusCode::BAD_REQUEST, "invalid_query");
+}
+
+#[tokio::test]
+async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    let op = bearer(OPERATOR);
+    let path = "/api/v2/catalog/timelines/film-a-ed/markers";
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-a-ed",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(timeline.status, StatusCode::OK, "{}", timeline.body);
+    let revision = timeline.body["revision"].as_str().unwrap().to_owned();
+    // A detected intro and embedded chapters, recorded against this revision.
+    for (id, kind, start, end, provenance) in [
+        ("det-intro", "intro", 1_000, Some(5_000), "detected"),
+        ("chap-1", "chapter", 0, None, "embedded"),
+        ("chap-2", "chapter", 60_000, None, "embedded"),
+    ] {
+        sqlx::query("INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) VALUES (?,'film-a-ed',?,?,?,?,NULL,?)")
+            .bind(id)
+            .bind(revision.parse::<i64>().unwrap())
+            .bind(kind)
+            .bind(start)
+            .bind(end)
+            .bind(provenance)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let all = f.call("GET", path, None, &[("authorization", &op)]).await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    assert_eq!(ids(&all), ["chap-1", "det-intro", "chap-2"]);
+    assert_eq!(all.body["items"][1]["provenance"], "detected");
+
+    // A manual correction outranks the detected intro in the effective view.
+    let input = json!({"timeline_revision":revision,"kind":"intro","start_ms":2000,"end_ms":6000,"label":"Opening"});
+    let headers = [
+        ("authorization", op.as_str()),
+        ("idempotency-key", "marker-create-0000001"),
+    ];
+    let created = f.call("POST", path, Some(input.clone()), &headers).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(created.body["provenance"], "manual");
+    let replay = f.call("POST", path, Some(input.clone()), &headers).await;
+    assert_eq!(replay.body, created.body);
+    let effective = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(
+        ids(&effective),
+        ["chap-1", created.body["id"].as_str().unwrap(), "chap-2"]
+    );
+
+    // Refusals: a stale revision, an open-ended intro, no write permission,
+    // a title outside the caller's scope.
+    let mut stale = input.clone();
+    stale["timeline_revision"] = json!("999");
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(stale),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000002"),
+            ],
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "timeline_changed",
+    );
+    let mut open = input.clone();
+    open["end_ms"] = Value::Null;
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(open),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000003"),
+            ],
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_interval",
+    );
+    let reader = f.device(&["catalog:read"], &[&f.a]).await;
+    assert_eq!(
+        f.call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &reader),
+                ("idempotency-key", "marker-create-0000004")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.call("GET", path, None, &[("authorization", &reader)])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let outsider = f.device(&["catalog:read", "catalog:write"], &[&f.b]).await;
+    assert_eq!(
+        f.call("GET", path, None, &[("authorization", &outsider)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    // Positions beyond playback's bound are refused even without a known
+    // duration (no unsafe JSON integers, no SQLite overflow).
+    let mut huge = input.clone();
+    huge["start_ms"] = json!(9_007_199_254_740_991_u64);
+    huge["end_ms"] = Value::Null;
+    huge["kind"] = json!("chapter");
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(huge),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000005"),
+            ],
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "outside_timeline",
+    );
+    // A timeline holds at most MAX_MARKERS; every one stays readable.
+    let max = playscale_core::markers::MAX_MARKERS;
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) SELECT printf('bulk-%04d',i),'film-a-ed',?,'chapter',i*1000,NULL,NULL,'embedded' FROM n")
+        .bind((max - 4) as i64)
+        .bind(revision.parse::<i64>().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000006"),
+            ],
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "marker_limit",
+    );
+    // The adapter's other creation path enforces the same bound.
+    assert!(matches!(
+        playscale::markers::create(
+            &f.app,
+            "film-a-ed",
+            revision.parse().unwrap(),
+            playscale::markers::NewMarker {
+                kind: playscale_core::markers::Kind::Chapter,
+                start_ms: 500,
+                end_ms: None,
+                label: None,
+                provenance: playscale_core::markers::Provenance::Detected,
+            },
+        )
+        .await,
+        Err(playscale::markers::MarkersError::Rejected(
+            playscale_core::markers::MarkerError::TooManyMarkers
+        ))
+    ));
+    let mut seen = 0;
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(c) => format!("{path}?limit=200&cursor={c}"),
+            None => format!("{path}?limit=200"),
+        };
+        let page = f.call("GET", &url, None, &[("authorization", &op)]).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        seen += page.body["items"].as_array().unwrap().len();
+        match page.body["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(seen, max, "every marker is readable across pages");
+    // Effective pages are bound to one snapshot (here the embedded chapters
+    // span several pages): any marker changing between pages refuses the
+    // next page instead of mixing two effective sets.
+    let effective = format!("{path}?effective=true&limit=200");
+    let first = f
+        .call("GET", &effective, None, &[("authorization", &op)])
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let next = first.body["next_cursor"].as_str().unwrap().to_owned();
+    let resumed = |cursor: &str| {
+        let q = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("cursor", cursor)
+            .finish();
+        format!("{effective}&{q}")
+    };
+    let unchanged = f
+        .call("GET", &resumed(&next), None, &[("authorization", &op)])
+        .await;
+    assert_eq!(unchanged.status, StatusCode::OK, "{}", unchanged.body);
+    sqlx::query("UPDATE markers SET revision=revision+1 WHERE id='chap-2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.call("GET", &resumed(&next), None, &[("authorization", &op)])
+            .await,
+        StatusCode::CONFLICT,
+        "markers_changed",
+    );
+    // A plain cursor is not accepted by the effective view.
+    let plain = f
+        .call(
+            "GET",
+            &format!("{path}?limit=200"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    problem(
+        &f.call(
+            "GET",
+            &resumed(plain.body["next_cursor"].as_str().unwrap()),
+            None,
+            &[("authorization", &op)],
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_cursor",
+    );
+    sqlx::query("DELETE FROM markers WHERE id LIKE 'bulk-%'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    // After the timeline changes, the old markers stay listed but none is in effect.
+    sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id='film-a-ed'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let effective = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert!(ids(&effective).is_empty(), "{}", effective.body);
+    assert_eq!(
+        ids(&f.call("GET", path, None, &[("authorization", &op)]).await).len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn later_manual_marker_correction_supersedes_earlier_value() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    let op = bearer(OPERATOR);
+    let path = "/api/v2/catalog/timelines/film-a-ed/markers";
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-a-ed",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    let input = json!({"timeline_revision":timeline.body["revision"],"kind":"intro","start_ms":1000,"end_ms":5000,"label":"章".repeat(100)});
+    let first = f
+        .call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "manual-correction-first"),
+            ],
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let mut correction = input;
+    correction["start_ms"] = json!(2000);
+    correction["end_ms"] = json!(6000);
+    let second = f
+        .call(
+            "POST",
+            path,
+            Some(correction),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "manual-correction-second"),
+            ],
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{}", second.body);
+    let page = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(ids(&page), [second.body["id"].as_str().unwrap()]);
+    let all = f.call("GET", path, None, &[("authorization", &op)]).await;
+    assert_eq!(all.body["items"].as_array().unwrap().len(), 2);
+}

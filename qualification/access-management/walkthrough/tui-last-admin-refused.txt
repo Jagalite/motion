@@ -1,0 +1,11 @@
+Edit access for Device identity: Access review terminal
+
+  last_administrator (409 Conflict): Keep another usable administrator device before removing this access
+
+  Confirm this access change? y apply · n edit · Esc cancel
+  User: Device identity: Access review terminal · DISABLED across ALL owned devices
+  Permissions: system:admin
+  Profiles: Everyone
+  Libraries: none
+  Device: Access review terminal · motion-terminal · enabled
+  Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.

@@ -84,10 +84,15 @@ fn validate(i: &Input, p: &access::Principal) -> Result<(), Problem> {
                 return Err(access::AccessError::Forbidden(Permission::CatalogWrite).into());
             }
         }
-        "preview" | "optimize" => {
+        "preview" => {
+            if !p.allows(Permission::ProcessingRequest) {
+                return Err(access::AccessError::Forbidden(Permission::ProcessingRequest).into());
+            }
+        }
+        "optimize" => {
             return Err(Problem::invalid(
                 "schedule_task_unavailable",
-                "This server has no scheduled preview or optimization service",
+                "This server has no scheduled optimization service",
             ));
         }
         _ => {
@@ -182,7 +187,7 @@ async fn create(
         return Ok(r);
     }
     let id = crate::new_id();
-    sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id,credential_hash,ingress_id) VALUES (?,?,?,?,?,?,?,?,?)").bind(&id).bind(i.library_id).bind(i.task).bind(i.interval_seconds).bind(i.enabled).bind(crate::now()+i.interval_seconds).bind(&p.id).bind(caller.credential.as_ref().map(|(h,_)|h)).bind(&caller.ingress).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id,credential_hash,ingress_id) VALUES (?,?,?,?,?,?,?,?,?)").bind(&id).bind(i.library_id).bind(i.task).bind(i.interval_seconds).bind(i.enabled).bind(crate::now()+i.interval_seconds).bind(&p.id).bind(caller.credential().map(|(h,_)|h)).bind(caller.ingress_device_id()).execute(&mut *tx).await?;
     let value = load(&mut tx, &p, &id).await?.wire();
     record
         .save(
@@ -218,7 +223,7 @@ async fn replace(
         || old.interval_seconds != i.interval_seconds
         || old.enabled != i.enabled;
     if let access::Revised::Next(rev) = access::revise(old.revision as u64, expected, changed)? {
-        sqlx::query("UPDATE api_schedules SET revision=?,library_id=?,task=?,interval_seconds=?,enabled=?,next_run=?,requester_id=?,credential_hash=?,ingress_id=? WHERE id=?").bind(rev as i64).bind(i.library_id).bind(i.task).bind(i.interval_seconds).bind(i.enabled).bind(crate::now()+i.interval_seconds).bind(&p.id).bind(caller.credential.as_ref().map(|(h,_)|h)).bind(&caller.ingress).bind(&id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE api_schedules SET revision=?,library_id=?,task=?,interval_seconds=?,enabled=?,next_run=?,requester_id=?,credential_hash=?,ingress_id=? WHERE id=?").bind(rev as i64).bind(i.library_id).bind(i.task).bind(i.interval_seconds).bind(i.enabled).bind(crate::now()+i.interval_seconds).bind(&p.id).bind(caller.credential().map(|(h,_)|h)).bind(caller.ingress_device_id()).bind(&id).execute(&mut *tx).await?;
     }
     let value = load(&mut tx, &p, &id).await?.wire();
     tx.commit().await?;
@@ -286,6 +291,9 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             }
         };
         let mut more = false;
+        // The preview queue was full: the cursor is kept and the schedule
+        // backs off instead of holding a dispatch slot.
+        let mut blocked = false;
         match row.task.as_str() {
             "scan" => {
                 match crate::scans::request_in(&mut tx, &row.library_id, None, false, false).await {
@@ -340,6 +348,101 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                         .await?;
                 }
             }
+            // Previews of the library's originals that have none: bounded
+            // per tick and by the preview queue, never duplicated (an active
+            // job or published previews of the revision skip it; the unique
+            // active index enforces it), only of files the requester reads.
+            "preview" if p.allows(Permission::ProcessingRequest) => {
+                let after: Option<String> = sqlx::query_scalar(
+                    "SELECT after_item FROM schedule_dispatch_progress WHERE schedule_id=?",
+                )
+                .bind(&row.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                type Candidate = (String, String, Option<f64>, String);
+                let mut files: Vec<Candidate> = sqlx::query_as(
+                    "SELECT DISTINCT f.id,f.revision,f.duration_seconds,f.tracks_json FROM media_files f \
+                     JOIN library_sources ls ON ls.source_id=f.library_id \
+                     JOIN version_files b ON b.file_id=f.id AND b.part=1 AND b.file_revision=f.revision \
+                     JOIN media_versions v ON v.id=b.version_id AND v.origin='original' \
+                     WHERE ls.library_id=? AND f.available=1 AND f.generated=0 \
+                     AND b.start_ms IS NULL AND b.end_ms IS NULL \
+                     AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+                     AND f.id>? ORDER BY f.id LIMIT 201",
+                )
+                .bind(&row.library_id)
+                .bind(after.unwrap_or_default())
+                .fetch_all(&mut *tx)
+                .await?;
+                more = files.len() > 200;
+                files.truncate(200);
+                let mut last = files.last().map(|f| f.0.clone());
+                for (n, (file, revision, seconds, tracks)) in files.iter().enumerate() {
+                    if !playscale_core::playback_session::readable(
+                        &p,
+                        super::content::file_facts(&mut tx, file)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                            .as_ref(),
+                    ) {
+                        continue;
+                    }
+                    let tracks: Vec<crate::db::Track> =
+                        serde_json::from_str(tracks).unwrap_or_default();
+                    let Some(video) = tracks.iter().find(|t| t.kind == "video") else {
+                        continue;
+                    };
+                    let duration = seconds
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .map(|s| (s * 1000.0).floor() as u64);
+                    if duration
+                        .and_then(|d| {
+                            playscale_core::previews::layout(
+                                d,
+                                video.display_dimensions().0,
+                                video.display_dimensions().1,
+                            )
+                        })
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let Some(identity) =
+                        super::previews::layout_identity(&mut tx, file, revision).await?
+                    else {
+                        continue;
+                    };
+                    match super::previews::admission(&mut tx, &p, file, revision, &identity, "")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                    {
+                        playscale_core::previews::Admission::Enqueue => {}
+                        playscale_core::previews::Admission::Existing
+                        | playscale_core::previews::Admission::Invalid => continue,
+                        playscale_core::previews::Admission::Full => {
+                            more = true;
+                            blocked = true;
+                            last = n.checked_sub(1).map(|p| files[p].0.clone());
+                            break;
+                        }
+                    }
+                    sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,layout_identity,requester_id,credential_hash,ingress_id,created_at) VALUES (?,?,?,?,?,?,?,?)")
+                        .bind(crate::new_id()).bind(file).bind(revision).bind(identity).bind(&p.id)
+                        .bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).execute(&mut *tx).await?;
+                }
+                match (more, last) {
+                    (true, Some(last)) => {
+                        sqlx::query("INSERT INTO schedule_dispatch_progress(schedule_id,after_item) VALUES (?,?) ON CONFLICT(schedule_id) DO UPDATE SET after_item=excluded.after_item").bind(&row.id).bind(last).execute(&mut *tx).await?;
+                    }
+                    (true, None) => {}
+                    (false, _) => {
+                        sqlx::query("DELETE FROM schedule_dispatch_progress WHERE schedule_id=?")
+                            .bind(&row.id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+            }
             _ => {
                 sqlx::query("UPDATE api_schedules SET enabled=0,revision=revision+1 WHERE id=?")
                     .bind(&row.id)
@@ -348,7 +451,16 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             }
         }
         sqlx::query("UPDATE api_schedules SET next_run=? WHERE id=?")
-            .bind(if more { row.next_run } else { next.next_run })
+            .bind(playscale_core::maintenance::next_run(
+                row.next_run,
+                &next,
+                crate::now(),
+                match (blocked, more) {
+                    (true, _) => playscale_core::maintenance::RunOutcome::Blocked,
+                    (false, true) => playscale_core::maintenance::RunOutcome::More,
+                    (false, false) => playscale_core::maintenance::RunOutcome::Done,
+                },
+            ))
             .bind(row.id)
             .execute(&mut *tx)
             .await?;

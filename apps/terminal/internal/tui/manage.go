@@ -22,7 +22,7 @@ const (
 
 func (m Model) kind() pageKind {
 	switch m.route.page {
-	case pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
+	case pagePairings, pageUsers, pageInvitations, pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
 		return kindTable
 	case pageOverview, pageActivity, pageServer:
 		return kindText
@@ -89,6 +89,8 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 	var rows []table.Row
 	var ids []string
 	switch m.route.page {
+	case pagePairings, pageUsers, pageInvitations:
+		return m.accessRows(width)
 	case pageNowPlaying, pageHistory:
 		return m.playbackRows(width)
 	case pageProcessing:
@@ -188,6 +190,12 @@ func project(width int, specs []column, rows []table.Row, ids []string) ([]table
 
 func (m Model) tableKey() string {
 	switch m.route.page {
+	case pageUsers:
+		return keyUsers
+	case pagePairings:
+		return keyPairings
+	case pageInvitations:
+		return keyInvitations
 	case pageProcessing:
 		return keyJobs
 	case pageScans:
@@ -206,6 +214,12 @@ func (m Model) tableKey() string {
 
 func (m Model) tableEmpty() string {
 	switch m.route.page {
+	case pageUsers:
+		return "No access users."
+	case pagePairings:
+		return "No pending pairing requests."
+	case pageInvitations:
+		return "No invitations."
 	case pageProcessing:
 		return "No jobs. Scans, matching and conversions appear here while they run."
 	case pageScans:
@@ -291,6 +305,9 @@ func (m Model) detail() string {
 }
 
 func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
+	if handled, cmd := m.accessAction(msg); handled {
+		return cmd
+	}
 	page := max(m.tvisible, 1) // as many rows as are on screen
 	m.tselID = ""              // moving by keys: the index leads
 	switch {

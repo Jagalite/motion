@@ -9,7 +9,8 @@
 //! timeline and key, so they are stable across rescans without storing a
 //! second copy of what probes already record.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type Id = String;
 
@@ -358,15 +359,26 @@ fn key(o: &Observed) -> (Kind, Option<String>, Roles, Option<String>) {
     )
 }
 
-/// Derive a timeline's components from its versions' observed tracks. Within
-/// one version, the n-th track with a key is component ordinal n; the same
-/// ordinal in another version is another occurrence of that component.
+/// Derive components from semantic evidence. An ambiguous key in any file
+/// does not establish correspondence with another file's track ordinal.
 pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component> {
-    #[allow(clippy::type_complexity)]
-    let mut components: BTreeMap<
-        (Kind, Option<String>, Roles, Option<String>, u32),
-        Component,
-    > = BTreeMap::new();
+    type Key = (Kind, Option<String>, Roles, Option<String>);
+    type ComponentKey = (Key, u32, Option<(Id, Id, String)>);
+    let mut ambiguous = BTreeSet::new();
+    for (_, tracks) in versions {
+        let mut counts = BTreeMap::new();
+        for track in tracks {
+            let k = key(track);
+            let count = counts
+                .entry((&track.file_id, &track.file_revision, k.clone()))
+                .or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                ambiguous.insert(k);
+            }
+        }
+    }
+    let mut components: BTreeMap<ComponentKey, Component> = BTreeMap::new();
     for (version, tracks) in versions {
         // Ordinals count same-key tracks within one file, so each part of a
         // multipart version continues the same components.
@@ -400,25 +412,51 @@ pub fn derive(timeline: &str, versions: &[(Id, Vec<Observed>)]) -> Vec<Component
             let (kind, language, roles, title) = k;
             let component = components
                 .entry((
-                    kind,
-                    language.clone(),
-                    roles.clone(),
-                    title.clone(),
+                    (kind, language.clone(), roles.clone(), title.clone()),
                     ordinal,
+                    ambiguous
+                        .contains(&(kind, language.clone(), roles.clone(), title.clone()))
+                        .then(|| {
+                            (
+                                version.clone(),
+                                track.file_id.clone(),
+                                track.file_revision.clone(),
+                            )
+                        }),
                 ))
                 .or_insert_with(|| Component {
-                    id: format!(
-                        "cmp:{timeline}:{}:{}:{}{}{}:{}:{ordinal}",
-                        match kind {
-                            Kind::Audio => "a",
-                            Kind::Subtitle => "s",
-                        },
-                        language.as_deref().unwrap_or("und"),
-                        u8::from(roles.forced),
-                        u8::from(roles.hearing_impaired),
-                        u8::from(roles.commentary),
-                        title.as_deref().unwrap_or("").replace([':', ' '], "_"),
-                    ),
+                    id: if ambiguous.contains(&(
+                        kind,
+                        language.clone(),
+                        roles.clone(),
+                        title.clone(),
+                    )) {
+                        // Bounded wire identity with unambiguous field boundaries.
+                        // Hash exactly the grouping key, not incidental observations.
+                        let identity = serde_json::to_vec(&(
+                            "motion-component-v2",
+                            timeline,
+                            (kind, &language, &roles, &title),
+                            ordinal,
+                            (version, &track.file_id, &track.file_revision),
+                        ))
+                        .expect("component identity is serializable");
+                        format!("cmp_{:x}", Sha256::digest(identity))
+                    } else {
+                        // Preserve existing unambiguous identities during the rewrite.
+                        format!(
+                            "cmp:{timeline}:{}:{}:{}{}{}:{}:{ordinal}",
+                            match kind {
+                                Kind::Audio => "a",
+                                Kind::Subtitle => "s",
+                            },
+                            language.as_deref().unwrap_or("und"),
+                            u8::from(roles.forced),
+                            u8::from(roles.hearing_impaired),
+                            u8::from(roles.commentary),
+                            title.as_deref().unwrap_or("").replace([':', ' '], "_"),
+                        )
+                    },
                     kind,
                     language,
                     title: track.title.clone(),
@@ -524,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn components_group_across_versions_by_key_and_ordinal() {
+    fn ambiguous_components_do_not_guess_cross_file_correspondence() {
         let commentary = Roles {
             commentary: true,
             ..Default::default()
@@ -539,7 +577,11 @@ mod tests {
             track("f2", 1, Kind::Audio, "en", Roles::default()),
         ];
         let c = derive("t", &[("v1".into(), v1), ("v2".into(), v2)]);
-        assert_eq!(c.len(), 3, "main, second main (ordinal 2), commentary");
+        assert_eq!(
+            c.len(),
+            4,
+            "three distinct ambiguous tracks and shared commentary"
+        );
         // A two-part version with one English track per part is one component.
         let parts = derive(
             "t",
@@ -564,7 +606,18 @@ mod tests {
             .iter()
             .find(|c| !c.roles.commentary && c.ordinal == 1)
             .unwrap();
-        assert_eq!(main.occurrences.len(), 2);
+        assert_eq!(main.occurrences.len(), 1);
+        assert_eq!(main.id.len(), 68);
+        assert!(
+            main.id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        );
+        assert!(
+            c.iter()
+                .filter(|c| !c.roles.commentary)
+                .all(|c| c.occurrences.len() == 1)
+        );
         let comm = c.iter().find(|c| c.roles.commentary).unwrap();
         assert_eq!(
             comm.occurrences
@@ -575,8 +628,8 @@ mod tests {
         );
         let second = c.iter().find(|c| c.ordinal == 2).unwrap();
         assert_eq!(second.occurrences.len(), 1);
-        // Deterministic identities.
-        assert_eq!(
+        // A formerly unambiguous identity must not select an ambiguous ordinal.
+        assert_ne!(
             derive(
                 "t",
                 &[(

@@ -65,12 +65,16 @@ pub struct Grant {
 }
 
 /// Resource restrictions beyond permissions. Rating and label restrictions are
-/// active when `allow_unrated` is false or either list is non-empty.
+/// active when rated or unrated eligibility is limited or a list is non-empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Policy {
     pub library_ids: BTreeSet<String>,
     pub allow_unrated: bool,
     pub allowed_ratings: BTreeSet<String>,
+    /// Explicit bottom for rated eligibility. An empty legacy allowlist alone
+    /// continues to mean every rating; disjoint ceilings must not become any.
+    #[serde(default)]
+    pub deny_rated: bool,
     pub blocked_labels: BTreeSet<String>,
 }
 
@@ -81,6 +85,7 @@ impl Default for Policy {
             library_ids: BTreeSet::new(),
             allow_unrated: true,
             allowed_ratings: BTreeSet::new(),
+            deny_rated: false,
             blocked_labels: BTreeSet::new(),
         }
     }
@@ -88,7 +93,64 @@ impl Default for Policy {
 
 impl Policy {
     pub fn rating_restricted(&self) -> bool {
-        !self.allow_unrated || !self.allowed_ratings.is_empty() || !self.blocked_labels.is_empty()
+        self.deny_rated
+            || !self.allow_unrated
+            || !self.allowed_ratings.is_empty()
+            || !self.blocked_labels.is_empty()
+    }
+
+    pub fn rating_eligibility(&self) -> RatingEligibility {
+        if self.deny_rated {
+            RatingEligibility::None
+        } else if self.allowed_ratings.is_empty() {
+            RatingEligibility::Any
+        } else {
+            RatingEligibility::Only(self.allowed_ratings.clone())
+        }
+    }
+
+    pub fn set_rating_eligibility(&mut self, eligibility: RatingEligibility) {
+        self.deny_rated = matches!(&eligibility, RatingEligibility::None)
+            || matches!(&eligibility, RatingEligibility::Only(ratings) if ratings.is_empty());
+        self.allowed_ratings = match eligibility {
+            RatingEligibility::Only(ratings) => ratings,
+            _ => BTreeSet::new(),
+        };
+    }
+}
+
+/// Semantic eligibility used by production grant composition. `None` applies
+/// only to rated content; the policy's `allow_unrated` remains independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RatingEligibility {
+    Any,
+    Only(BTreeSet<String>),
+    None,
+}
+
+impl RatingEligibility {
+    pub fn within(&self, ceiling: &Self) -> bool {
+        match (self, ceiling) {
+            (Self::None, _) | (_, Self::Any) => true,
+            (Self::Only(values), Self::Only(allowed)) => values.is_subset(allowed),
+            (Self::Only(values), Self::None) => values.is_empty(),
+            _ => false,
+        }
+    }
+
+    pub fn intersection(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::None, _) | (_, Self::None) => Self::None,
+            (Self::Any, value) | (value, Self::Any) => value.clone(),
+            (Self::Only(left), Self::Only(right)) => {
+                let values: BTreeSet<_> = left.intersection(right).cloned().collect();
+                if values.is_empty() {
+                    Self::None
+                } else {
+                    Self::Only(values)
+                }
+            }
+        }
     }
 }
 
@@ -157,6 +219,12 @@ pub enum AccessError {
     PairingExpired,
     PairingPending,
     PairingDecided,
+    PairingDenied,
+    UserDisabled,
+    GrantExceeded,
+    PolicyLimitExceeded,
+    LastAdministrator,
+    InvitationUnavailable,
     UserCodeMismatch,
     UnknownProfile,
     UnknownLibrary,
@@ -181,6 +249,12 @@ impl AccessError {
             Self::PairingExpired => "pairing_expired",
             Self::PairingPending => "pairing_pending",
             Self::PairingDecided => "pairing_already_decided",
+            Self::PairingDenied => "pairing_denied",
+            Self::UserDisabled => "user_disabled",
+            Self::GrantExceeded => "grant_exceeded",
+            Self::PolicyLimitExceeded => "policy_limit_exceeded",
+            Self::LastAdministrator => "last_administrator",
+            Self::InvitationUnavailable => "invitation_unavailable",
             Self::UserCodeMismatch => "user_code_mismatch",
             Self::UnknownProfile => "unknown_profile",
             Self::UnknownLibrary => "unknown_library",
@@ -197,6 +271,7 @@ impl AccessError {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PairingPhase {
     Pending,
+    Denied,
     Approved {
         device_id: String,
     },
@@ -341,6 +416,7 @@ pub fn claim(
     }
     let (device_id, claimed) = match &pairing.phase {
         PairingPhase::Pending => return Err(AccessError::PairingPending),
+        PairingPhase::Denied => return Err(AccessError::PairingDenied),
         PairingPhase::Approved { device_id } => (device_id, None),
         PairingPhase::Claimed {
             device_id,
@@ -405,6 +481,41 @@ pub struct Credential {
     pub kind: CredentialKind,
     pub generation: u64,
     pub expires_at: i64,
+}
+
+/// Authentication facts supplied by a trusted adapter, never deserialized from
+/// client input. Missing device/credential observations cannot select the local
+/// operator path: that source requires explicit proof from the adapter.
+pub enum Authentication<'a> {
+    VerifiedLocalOperator,
+    Credential {
+        credential: Option<&'a Credential>,
+        parent: Option<&'a Credential>,
+        device: Option<&'a Device>,
+    },
+    TrustedIngress {
+        device_id: &'a str,
+        device: Option<&'a Device>,
+    },
+}
+
+pub fn authenticate_caller(source: Authentication<'_>, now: i64) -> Result<Principal, AccessError> {
+    match source {
+        Authentication::VerifiedLocalOperator => Ok(Principal::operator()),
+        Authentication::Credential {
+            credential,
+            parent,
+            device,
+        } => authenticate(
+            credential.ok_or(AccessError::CredentialRevoked)?,
+            parent,
+            device,
+            now,
+        ),
+        Authentication::TrustedIngress { device_id, device } => {
+            authenticate_ingress(device.filter(|d| d.id == device_id))
+        }
+    }
 }
 
 /// Every request re-derives the principal from the current device row, so a
@@ -720,6 +831,14 @@ pub enum Resource {
         prior: BTreeSet<String>,
     },
     Profile(String),
+    Organization {
+        current_profile: Option<String>,
+        prior_profile: Option<String>,
+    },
+    Schedule {
+        current_library: Option<String>,
+        prior_library: Option<String>,
+    },
     Device(String),
     Job {
         requester: String,
@@ -748,6 +867,22 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
                     .any(|l| principal.policy.library_ids.contains(l))
         }
         Resource::Profile(id) => principal.may_use_profile(id),
+        Resource::Organization {
+            current_profile, ..
+        } => {
+            principal.allows(Permission::CollectionsWrite)
+                && current_profile
+                    .as_ref()
+                    .is_some_and(|id| principal.may_use_profile(id))
+        }
+        Resource::Schedule {
+            current_library, ..
+        } => {
+            principal.allows(Permission::SourcesManage)
+                && current_library
+                    .as_ref()
+                    .is_some_and(|id| catalog_scope(principal).library(id))
+        }
         Resource::Device(id) => principal.device_id.as_deref() == Some(id),
         Resource::Job { requester } => owns_job(principal, requester),
         Resource::Administrative => false,
@@ -841,6 +976,28 @@ pub fn disclose(principal: &Principal, resource: &Resource) -> Disclosure {
         && principal.allows(Permission::CatalogRead)
         && !principal.policy.rating_restricted();
     match resource {
+        Resource::Organization { prior_profile, .. }
+            if principal.allows(Permission::EventsRead)
+                && principal.allows(Permission::CollectionsWrite)
+                && prior_profile
+                    .as_ref()
+                    .map_or(!principal.grant.profile_ids.is_empty(), |id| {
+                        principal.may_use_profile(id)
+                    }) =>
+        {
+            Disclosure::Reset
+        }
+        Resource::Schedule { prior_library, .. }
+            if catalog
+                && principal.allows(Permission::SourcesManage)
+                && prior_library
+                    .as_ref()
+                    .map_or(!principal.policy.library_ids.is_empty(), |id| {
+                        catalog_scope(principal).library(id)
+                    }) =>
+        {
+            Disclosure::Reset
+        }
         Resource::Item { libraries, prior }
             if catalog
                 && (prior
@@ -1339,6 +1496,77 @@ mod tests {
             disclose(&Principal::operator(), &orphan),
             Disclosure::Deliver
         );
+    }
+
+    #[test]
+    fn organization_and_schedule_disclosure_preserves_prior_scope_without_naming_it() {
+        let mut cases = 0;
+        for mask in 0..64 {
+            let mut principal = authenticate(
+                &cred(CredentialKind::Device, 1000),
+                None,
+                Some(&device()),
+                0,
+            )
+            .unwrap();
+            principal.grant.permissions.clear();
+            for (bit, permission) in [
+                (1, Permission::EventsRead),
+                (2, Permission::CatalogRead),
+                (4, Permission::CollectionsWrite),
+                (8, Permission::SourcesManage),
+            ] {
+                if mask & bit != 0 {
+                    principal.grant.permissions.insert(permission);
+                }
+            }
+            let assigned = mask & 16 != 0;
+            principal.grant.profile_ids = if assigned {
+                ["visible".into()].into()
+            } else {
+                BTreeSet::new()
+            };
+            principal.policy.library_ids = principal.grant.profile_ids.clone();
+            principal.policy.allow_unrated = mask & 32 != 0;
+            for current in [None, Some("visible"), Some("hidden")] {
+                for prior in [None, Some("visible"), Some("hidden")] {
+                    for schedule in [false, true] {
+                        let resource = if schedule {
+                            Resource::Schedule {
+                                current_library: current.map(str::to_owned),
+                                prior_library: prior.map(str::to_owned),
+                            }
+                        } else {
+                            Resource::Organization {
+                                current_profile: current.map(str::to_owned),
+                                prior_profile: prior.map(str::to_owned),
+                            }
+                        };
+                        let permitted = mask & 1 != 0
+                            && assigned
+                            && if schedule {
+                                mask & 2 != 0 && mask & 8 != 0 && mask & 32 != 0
+                            } else {
+                                mask & 4 != 0
+                            };
+                        let expected = if permitted && current == Some("visible") {
+                            Disclosure::Deliver
+                        } else if permitted && prior != Some("hidden") {
+                            Disclosure::Reset
+                        } else {
+                            Disclosure::Withhold
+                        };
+                        assert_eq!(
+                            disclose(&principal, &resource),
+                            expected,
+                            "mask={mask}, resource={resource:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 1152);
     }
 
     #[test]

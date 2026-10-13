@@ -16,7 +16,7 @@ use topcoat::{
 
 use crate::{
     app::{availability_text, empty, facade, principal, ui_error},
-    facade::{Availability, MembershipRow},
+    facade::{Availability, FileRow, FilterTermView, MembershipRow, StoredMarkerView},
 };
 
 /// How the bridge encodes one form field into the JSON body.
@@ -42,6 +42,18 @@ enum Field {
     OptionalInt,
     /// Text sent as JSON null when blank.
     Nullable,
+    /// One typed filter term appended to the array named by the input, only
+    /// when a value is chosen (`data-field`, `data-operator`, `data-value-type`).
+    Term,
+    /// Seconds, sent as whole milliseconds (null when blank).
+    SecondsMs,
+    /// Megabits per second, sent as whole bits per second.
+    Mbps,
+    /// Kilobits per second, sent as whole bits per second.
+    Kbps,
+    /// A chosen subtitle (null when blank) that also sets the subtitle
+    /// policy named by `data-policy`: `require` when chosen, else `off`.
+    SubtitleChoice,
 }
 
 impl Field {
@@ -57,8 +69,66 @@ impl Field {
             Field::Optional => "optional",
             Field::OptionalInt => "optional-int",
             Field::Nullable => "nullable",
+            Field::Term => "term",
+            Field::SecondsMs => "seconds-ms",
+            Field::Mbps => "mbps",
+            Field::Kbps => "kbps",
+            Field::SubtitleChoice => "subtitle-choice",
         }
     }
+}
+
+/// Frame rates offered for a custom video profile, as the profile's JSON:
+/// null keeps the source's own cadence.
+const FRAME_RATES: [(&str, &str); 9] = [
+    ("null", "Same as the source"),
+    (r#"{"numerator":24000,"denominator":1001}"#, "23.976 fps"),
+    (r#"{"numerator":24,"denominator":1}"#, "24 fps"),
+    (r#"{"numerator":25,"denominator":1}"#, "25 fps"),
+    (r#"{"numerator":30000,"denominator":1001}"#, "29.97 fps"),
+    (r#"{"numerator":30,"denominator":1}"#, "30 fps"),
+    (r#"{"numerator":50,"denominator":1}"#, "50 fps"),
+    (r#"{"numerator":60000,"denominator":1001}"#, "59.94 fps"),
+    (r#"{"numerator":60,"denominator":1}"#, "60 fps"),
+];
+
+fn backend_text(backend: &str) -> &str {
+    match backend {
+        "software" => "Software",
+        "videotoolbox" => "VideoToolbox (hardware)",
+        other => other,
+    }
+}
+
+/// The track fields of a preparation form: the audio to keep, and a text
+/// subtitle to keep with it (which requires it: `subtitle_policy` require).
+#[component]
+async fn prepare_tracks(source: FileRow) -> Result<impl View> {
+    Ok(view! {
+        <label>"Audio "
+            <select name="tracks.audio_track_id" data-type=(kind(Field::Nullable))>
+                <option value="">"Default track"</option>
+                for (track, label) in source.audio_tracks.iter() {
+                    <option value=(track.as_str())>(label.as_str())</option>
+                }
+            </select>
+        </label>
+        if !source.subtitle_tracks.is_empty() {
+            <label>"Subtitle "
+                <select name="tracks.subtitle_track_id" data-type=(kind(Field::SubtitleChoice)) data-policy="tracks.subtitle_policy">
+                    <option value="">"None"</option>
+                    for (track, label) in source.subtitle_tracks.iter() {
+                        <option value=(track.as_str())>(label.as_str())</option>
+                    }
+                </select>
+            </label>
+        } else {
+            <input type="hidden" name="tracks.subtitle_track_id" data-type=(kind(Field::Json)) value="null">
+            <input type="hidden" name="tracks.subtitle_policy" data-type=(kind(Field::Text)) value="off">
+        }
+        <input type="hidden" name="tracks.audio_component_id" data-type=(kind(Field::Json)) value="null">
+        <input type="hidden" name="tracks.subtitle_component_id" data-type=(kind(Field::Json)) value="null">
+    })
 }
 
 /// A form the bridge turns into one public API call.
@@ -113,11 +183,50 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
             <input type="hidden" name="device_name" data-type=(kind(Field::Text)) value="Web browser">
             <input type="hidden" name="client_name" data-type=(kind(Field::Text)) value="Motion web">
         )
-        <p class="muted small">"Pairing creates a revocable credential for this browser after an administrator approves the code."</p>
+        <p class="muted small">"An administrator can approve the displayed code in Motion terminal → Pairing requests."</p>
+        command_form(command: "POST /api/v2/auth/invitations/redeem".to_string(), label: "Redeem invitation", class: Some("command invitation"),
+            <label>"Invitation code" <input type="password" name="code" data-type=(kind(Field::Text)) autocomplete="off" required=(true) maxlength="128"></label>
+            <input type="hidden" name="device_name" data-type=(kind(Field::Text)) value="Web browser">
+            <input type="hidden" name="client_name" data-type=(kind(Field::Text)) value="Motion web">
+        )
+        <p class="muted small">"An invitation grants the preapproved access once. Keep this page open if you need to retry."</p>
     })
 }
 
 // --- Profiles and preferences ---------------------------------------------
+
+/// Streaming limits offered to people, in bits per second (None: no limit),
+/// independent of resolution: a cap does not select an output height.
+const BITRATE_LIMITS: [(Option<u64>, &str); 8] = [
+    (None, "No limit"),
+    (Some(40_000_000), "40 Mbps"),
+    (Some(20_000_000), "20 Mbps"),
+    (Some(12_000_000), "12 Mbps"),
+    (Some(8_000_000), "8 Mbps"),
+    (Some(4_000_000), "4 Mbps"),
+    (Some(2_000_000), "2 Mbps"),
+    (Some(1_000_000), "1 Mbps — low bandwidth"),
+];
+
+/// The limit choices as (value, label, selected); a limit saved outside the
+/// list (through the API) is shown as its own choice rather than replaced.
+pub(crate) fn bitrate_options(current: Option<u64>) -> Vec<(String, String, bool)> {
+    let mut options: Vec<(String, String, bool)> = BITRATE_LIMITS
+        .iter()
+        .map(|(value, label)| {
+            (
+                value.map(|v| v.to_string()).unwrap_or_default(),
+                (*label).to_owned(),
+                *value == current,
+            )
+        })
+        .collect();
+    if let Some(custom) = current.filter(|c| !BITRATE_LIMITS.iter().any(|(v, _)| *v == Some(*c))) {
+        let mbps = custom as f64 / 1_000_000.0;
+        options.push((custom.to_string(), format!("{mbps} Mbps — custom"), true));
+    }
+    options
+}
 
 #[page("/profiles")]
 pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
@@ -158,6 +267,13 @@ pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
                 <select name="quality_mode" data-type=(kind(Field::Text))>
                     for (value, text) in quality_modes {
                         <option value=(value) selected=(prefs.quality_mode == value)>(text)</option>
+                    }
+                </select>
+            </label>
+            <label>"Streaming limit "
+                <select name="max_bitrate_bps" data-type=(kind(Field::Nullable))>
+                    for (value, text, selected) in bitrate_options(prefs.max_bitrate_bps) {
+                        <option value=(value) selected=(selected)>(text)</option>
                     }
                 </select>
             </label>
@@ -222,16 +338,32 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         .iter()
         .map(|l| (l.library.id.clone(), l.library.name.clone()))
         .collect();
+    // The libraries each source belongs to: a source is removable only once
+    // no library uses it (the server refuses otherwise).
+    let used_by = |source: &str| -> Vec<String> {
+        model
+            .libraries
+            .iter()
+            .filter(|l| l.source_ids.iter().any(|id| id == source))
+            .map(|l| l.library.name.clone())
+            .collect()
+    };
+    let source_users: Vec<Vec<String>> = model.sources.iter().map(|s| used_by(&s.id)).collect();
     let kinds = [
         ("movies", "Movies"),
         ("television", "Television"),
+        ("music", "Music"),
+        ("photos", "Photos"),
         ("personal_video", "Personal video"),
         ("mixed", "Mixed"),
     ];
-    let tasks = [
+    let mut tasks = vec![
         ("scan", "Scan for changes"),
         ("metadata_refresh", "Refresh local metadata"),
     ];
+    if who.can("processing:request") {
+        tasks.push(("preview", "Generate previews"));
+    }
     Ok(view! {
         <h1>"Sources and scans"</h1>
         <section aria-labelledby="sources-heading">
@@ -240,7 +372,7 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                 empty(message: "No sources yet. Add a folder on the server to start.")
             } else {
                 <ul class="rows">
-                    for source in model.sources {
+                    for (source, users) in model.sources.into_iter().zip(source_users) {
                         <li data-source=(source.id.as_str())><strong>(source.name.as_str())</strong> " · " (availability_text(source.availability))
                             <div class="muted small"><code>(source.root_path.as_str())</code></div>
                             <details class="disclosure">
@@ -250,6 +382,19 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                                     <input type="hidden" data-plan-commit=(format!("POST /api/v2/sources/{}/relocation", source.id))>
                                     <label>"New folder on the server " <input name="new_root_path" data-type=(kind(Field::Text)) required=(true) maxlength="4096" value=(source.root_path.as_str())></label>
                                 )
+                            </details>
+                            <details class="disclosure">
+                                <summary>"Remove this source…"</summary>
+                                if users.is_empty() && who.can("system:admin") {
+                                    <p class="muted small">"Nothing is deleted from the folder. If titles were found in it, the source is kept but disabled and its files are marked unavailable, keeping their history and corrections; otherwise its registration is removed. Not possible while a scan or preparation uses it."</p>
+                                    command_form(command: format!("DELETE /api/v2/sources/{}", source.id), label: "Remove source", if_match: Some(source.etag.clone()), class: Some("command inline"),
+                                        <label><input type="checkbox" required=(true)> " I understand what removing this source does"</label>
+                                    )
+                                } else if users.is_empty() {
+                                    <p class="muted small">"Source usage may include libraries outside your access. Ask a server administrator to review removal."</p>
+                                } else {
+                                    <p class="muted small">(format!("Used by {}. Remove it from those libraries first (Edit library).", users.join(", ")))</p>
+                                }
                             </details>
                         </li>
                     }
@@ -297,6 +442,13 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                                         <label><input type="checkbox" name="source_ids" value=(id.as_str()) data-type=(kind(Field::Member)) checked=(row.source_ids.contains(id))>" " (name.as_str())</label>
                                     }
                                 </fieldset>
+                            )
+                        </details>
+                        <details class="disclosure">
+                            <summary>"Delete this library…"</summary>
+                            <p class="muted small">"Removes only the library and its finished scan history. Its sources, files, titles, corrections, collections and viewing history stay, and nothing is deleted from disk. Not possible while one of its scans is pending."</p>
+                            command_form(command: format!("DELETE /api/v2/libraries/{}", row.library.id), label: "Delete library", if_match: Some(row.etag.clone()), class: Some("command inline"),
+                                <label><input type="checkbox" required=(true)> " I understand what deleting this library does"</label>
                             )
                         </details>
                     </li>
@@ -514,6 +666,25 @@ fn size_text(bytes: u64) -> String {
 
 /// This device's download demands. The desktop host transfers ready ones and
 /// removes local copies of cancelled or expired ones when it next connects.
+/// What the device reported about its copy, in its words: the server never
+/// infers it from its own state.
+fn device_transfer_text(report: Option<&(String, u64)>, size: u64) -> String {
+    let Some((state, bytes)) = report else {
+        return "Not reported yet".into();
+    };
+    let percent = (*bytes as f64 * 100.0 / size.max(1) as f64)
+        .floor()
+        .min(100.0);
+    match state.as_str() {
+        "queued" => "Waiting to save".into(),
+        "transferring" => format!("Saving — {percent:.0}%"),
+        "verified_local" => "Saved and verified".into(),
+        "failed" => format!("Saving stopped at {percent:.0}%; it retries"),
+        "removed" => "Removed from the device".into(),
+        _ => "Unknown".into(),
+    }
+}
+
 #[page("/downloads")]
 pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
@@ -526,7 +697,7 @@ pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
         } else {
             <div class="table-scroll" role="region" aria-label="Downloads" tabindex="0"><table>
                 <caption class="visually-hidden">"Downloads"</caption>
-                <thead><tr><th scope="col">"Title"</th><th scope="col">"State"</th><th scope="col">"Size"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
+                <thead><tr><th scope="col">"Title"</th><th scope="col">"State"</th><th scope="col">"On the device"</th><th scope="col">"Size"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
                 <tbody>
                     for row in rows {
                         <tr>
@@ -537,6 +708,7 @@ pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
                                 "cancelled" => "Cancelled",
                                 _ => "Unknown",
                             })</td>
+                            <td>(device_transfer_text(row.device_transfer.as_ref(), row.size_bytes))</td>
                             <td>(size_text(row.size_bytes))</td>
                             <td>
                                 if row.state != "cancelled" {
@@ -559,18 +731,60 @@ pub(crate) async fn download_form(
     device_id: String,
     profile_id: String,
     timeline_id: String,
+    #[default] prepared: Vec<crate::facade::PreparedDownload>,
+    #[default] incomplete: bool,
+    #[default] subtitled: Vec<crate::facade::SubtitleDownload>,
 ) -> Result<impl View> {
+    // The selected subtitle is required, from exactly that version's file.
+    let with_subtitle = |track: &str| {
+        serde_json::json!({"audio_component_id": null, "subtitle_component_id": null,
+            "subtitle_policy": "require", "audio_track_id": null, "subtitle_track_id": track})
+        .to_string()
+    };
     let tracks = r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"auto","audio_track_id":null,"subtitle_track_id":null}"#;
     Ok(view! {
         <div class="download-action" data-desktop-only="true" hidden=(true)>
             command_form(command: "POST /api/v2/downloads".to_string(), label: "Save for offline", idempotent: true, class: Some("command inline"),
-                <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id)>
-                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id)>
-                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id)>
+                <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
                 <input type="hidden" name="version_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
             )
+            // An original saved with one of its text subtitles (as WebVTT).
+            for original in subtitled.iter() {
+                command_form(command: "POST /api/v2/downloads".to_string(), label: "Save with subtitles", idempotent: true, class: Some("command inline"),
+                    <span class="small">(original.label.as_str())</span>
+                    <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                    <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                    <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
+                    <input type="hidden" name="version_id" data-type=(kind(Field::Text)) value=(original.version_id.as_str())>
+                    <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
+                    <label>"Subtitles "
+                        <select name="tracks" data-type=(kind(Field::Json))>
+                            for (track, label) in original.tracks.iter() {
+                                <option value=(with_subtitle(track))>(label.as_str())</option>
+                            }
+                        </select>
+                    </label>
+                )
+            }
+            if incomplete {
+                <p class="muted small">"Only the first prepared versions found are offered here."</p>
+            }
+            // A prepared version is saved with exactly the selection it kept.
+            for version in prepared.iter() {
+                command_form(command: "POST /api/v2/downloads".to_string(), label: "Save this version for offline", idempotent: true, class: Some("command inline"),
+                    <span class="small">(version.label.as_str())</span>
+                    <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                    <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                    <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
+                    <input type="hidden" name="version_id" data-type=(kind(Field::Text)) value=(version.version_id.as_str())>
+                    <input type="hidden" name="recipe_id" data-type=(kind(Field::Text)) value=(version.recipe_id.as_str())>
+                    <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(version.tracks_json.as_str())>
+                )
+            }
         </div>
     })
 }
@@ -737,12 +951,17 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                                     <img src=(art.content_url.as_str()) alt="" loading="lazy" decoding="async">
                                     if art.selected {
                                         <p class="small">"Current poster"</p>
-                                    } else {
-                                        command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/artwork/selection"), label: "Use as poster", if_match: Some(model.item_etag.clone()), class: Some("command inline"),
-                                            <input type="hidden" name="role" data-type=(kind(Field::Text)) value="poster">
-                                            <input type="hidden" name="asset_id" data-type=(kind(Field::Text)) value=(art.id.as_str())>
-                                        )
                                     }
+                                    command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/artwork/selection"), label: "Use", if_match: Some(model.item_etag.clone()), class: Some("command inline"),
+                                        <label>"As "
+                                            <select name="role" data-type=(kind(Field::Text))>
+                                                for (value, text) in [("poster", "Poster"), ("backdrop", "Backdrop"), ("banner", "Banner"), ("thumbnail", "Thumbnail")] {
+                                                    <option value=(value) selected=(value == "poster" && !art.selected)>(text)</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        <input type="hidden" name="asset_id" data-type=(kind(Field::Text)) value=(art.id.as_str())>
+                                    )
                                 </li>
                             }
                         </ul>
@@ -750,7 +969,7 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                     command_form(command: format!("POST /api/v2/catalog/items/{item_id}/artwork"), label: "Upload", idempotent: true, file_body: true, class: Some("command inline"),
                         <label>"Image " <input type="file" name="file" accept="image/png,image/jpeg,image/webp" required=(true)></label>
                     )
-                    <p class="muted small">"PNG, JPEG or WebP, up to 8 MB. Online artwork providers are not available yet."</p>
+                    <p class="muted small">"PNG, JPEG or WebP, up to 8 MB. Backdrop, banner and thumbnail choices are saved, but only the current poster is shown here. Online artwork providers are not available yet."</p>
                 } else {
                     empty(message: "Artwork is unavailable right now.")
                 }
@@ -790,7 +1009,7 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
             <section aria-labelledby="prepare-heading">
                 <h2 id="prepare-heading">"Prepared versions"</h2>
                 if let Some(timelines) = &model.timelines {
-                    <p class="muted small">"A prepared version is converted once and kept, so it plays without converting live. The chosen audio track is kept exactly; subtitles cannot be included in prepared versions yet."</p>
+                    <p class="muted small">"A prepared version is converted once and kept, so it plays without converting live. The chosen audio track is kept exactly, and a chosen text subtitle is kept with it; such a version plays only when that audio and subtitle are selected."</p>
                     for timeline in timelines.iter() {
                         <section class="edition" aria-label=(format!("Edition {}", timeline.edition))>
                             <h3>(timeline.edition.as_str())</h3>
@@ -816,36 +1035,103 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                             }
                             if !recipes.is_empty() {
                                 for source in timeline.sources.iter() {
+                                    if recipes.iter().any(|r| r.id != "video_profile") {
                                     command_form(command: "POST /api/v2/processing/preparations".to_string(), label: "Prepare", idempotent: true, class: Some("command inline"),
                                         <input type="hidden" name="source" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": source.file_id, "file_revision": source.file_revision}).to_string())>
                                         <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline.id.as_str())>
                                         <span class="small">(source.label.as_str())</span>
                                         <label>"Recipe "
                                             <select name="recipe_id" data-type=(kind(Field::Text))>
-                                                for recipe in recipes.iter() {
+                                                for recipe in recipes.iter().filter(|r| r.id != "video_profile") {
                                                     <option value=(recipe.id.as_str())>(recipe.name.as_str()) if recipe.qualification != "qualified" { " (" (recipe.qualification.as_str()) ")" }</option>
                                                 }
                                             </select>
                                         </label>
-                                        <label>"Audio "
-                                            <select name="tracks.audio_track_id" data-type=(kind(Field::Nullable))>
-                                                <option value="">"Default track"</option>
-                                                for (track, label) in source.audio_tracks.iter() {
-                                                    <option value=(track.as_str())>(label.as_str())</option>
-                                                }
-                                            </select>
-                                        </label>
-                                        <input type="hidden" name="tracks.audio_component_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_component_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_track_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_policy" data-type=(kind(Field::Text)) value="off">
+                                        prepare_tracks(source: source.clone())
                                     )
+                                    }
+                                    if let Some(custom) = recipes.iter().find(|r| r.id == "video_profile") {
+                                        <details class="custom-profile">
+                                            <summary>"Prepare with a custom video profile"</summary>
+                                            command_form(command: "POST /api/v2/processing/preparations".to_string(), label: "Prepare with this profile", idempotent: true, class: Some("command"),
+                                                <input type="hidden" name="source" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": source.file_id, "file_revision": source.file_revision}).to_string())>
+                                                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline.id.as_str())>
+                                                <input type="hidden" name="recipe_id" data-type=(kind(Field::Text)) value="video_profile">
+                                                <input type="hidden" name="video_profile.version" data-type=(kind(Field::Number)) value="1">
+                                                <span class="small">(source.label.as_str())</span>
+                                                if custom.backends.len() > 1 {
+                                                    <label>"Encoder "
+                                                        <select name="backend" data-type=(kind(Field::Text))>
+                                                            for backend in custom.backends.iter() {
+                                                                <option value=(backend.as_str())>(backend_text(backend))</option>
+                                                            }
+                                                        </select>
+                                                    </label>
+                                                }
+                                                <label>"Video codec "
+                                                    <select name="video_profile.codec" data-type=(kind(Field::Text))>
+                                                        <option value="h264">"H.264 (widest support)"</option>
+                                                        <option value="hevc">"HEVC (smaller files)"</option>
+                                                    </select>
+                                                </label>
+                                                <label>"Maximum width " <input type="number" name="video_profile.max_width" data-type=(kind(Field::Number)) required=(true) min="128" max="3840" step="2" value="1920"></label>
+                                                <label>"Maximum height " <input type="number" name="video_profile.max_height" data-type=(kind(Field::Number)) required=(true) min="72" max="2160" step="2" value="1080"></label>
+                                                <label>"Video bit rate (Mbps) " <input type="number" name="video_profile.video_bitrate" data-type=(kind(Field::Mbps)) required=(true) min="0.064" max="80" step="0.001" value="8"></label>
+                                                <label>"Audio bit rate (kbps) " <input type="number" name="video_profile.audio_bitrate" data-type=(kind(Field::Kbps)) required=(true) min="32" max="320" step="1" value="192"></label>
+                                                <label>"Frame rate "
+                                                    <select name="video_profile.frame_rate" data-type=(kind(Field::Json))>
+                                                        for (value, text) in FRAME_RATES {
+                                                            <option value=(value)>(text)</option>
+                                                        }
+                                                    </select>
+                                                </label>
+                                                <p class="muted small">"The picture keeps its shape within the maximum size and is never enlarged; even dimensions only. The bit rate is the encoder's target, not a guaranteed streaming rate."</p>
+                                                prepare_tracks(source: source.clone())
+                                            )
+                                        </details>
+                                    }
                                 }
                             }
                         </section>
                     }
                 } else {
                     empty(message: "Preparation is unavailable right now.")
+                }
+            </section>
+        }
+
+        if can_write {
+            <section aria-labelledby="markers-heading">
+                <h2 id="markers-heading">"Chapters and skip markers"</h2>
+                <p class="muted">"A marker you add here takes precedence over chapters from the file and over detected intros or credits; those stay listed. Markers recorded for an earlier version of the timeline are no longer in effect."</p>
+                if let Some(timelines) = model.markers.clone() {
+                    for (n, timeline) in timelines.iter().enumerate() {
+                        <h3>(format!("Timeline {} ({})", n + 1, timeline.edition))</h3>
+                        if timeline.markers.is_empty() {
+                            <p class="muted">"No markers."</p>
+                        } else {
+                            <ul class="rows">
+                                for marker in timeline.markers.iter() {
+                                    <li>(marker_text(marker))</li>
+                                }
+                            </ul>
+                        }
+                        command_form(command: format!("POST /api/v2/catalog/timelines/{}/markers", timeline.timeline_id), label: "Add marker", idempotent: true, class: Some("command inline"),
+                            <label>"Kind "
+                                <select name="kind" data-type=(kind(Field::Text))>
+                                    for (value, text) in [("chapter", "Chapter"), ("intro", "Intro"), ("recap", "Recap"), ("credits", "Credits")] {
+                                        <option value=(value)>(text)</option>
+                                    }
+                                </select>
+                            </label>
+                            <label>"Starts at (seconds) " <input type="number" min="0" step="0.1" required=(true) name="start_ms" data-type=(kind(Field::SecondsMs))></label>
+                            <label>"Ends at (seconds; needed except for chapters) " <input type="number" min="0" step="0.1" name="end_ms" data-type=(kind(Field::SecondsMs))></label>
+                            <label>"Label " <input name="label" data-type=(kind(Field::Nullable)) maxlength="200"></label>
+                            <input type="hidden" name="timeline_revision" data-type=(kind(Field::Text)) value=(timeline.revision.as_str())>
+                        )
+                    }
+                } else {
+                    empty(message: "Markers are unavailable right now.")
                 }
             </section>
         }
@@ -873,10 +1159,264 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                 }
             </section>
         }
+
+        if can_write {
+            <section aria-labelledby="reconcile-heading">
+                <h2 id="reconcile-heading">"Duplicates and versions"</h2>
+                <p class="muted">"Merging joins another title into this one; splitting moves versions to a new title. Each shows its effect first and changes nothing until you apply it. The old title’s address keeps working and viewing history stays with each timeline."</p>
+                if let Some(candidates) = model.merge_candidates.clone() {
+                    if candidates.is_empty() {
+                        <p class="muted">"No other title with this name was found."</p>
+                    } else {
+                        <h3>"Merge into this title"</h3>
+                        <ul class="rows">
+                            for candidate in candidates.iter() {
+                                <li><a href=(format!("/item/{}", candidate.id))>(candidate.title.as_str())</a>
+                                    command_form(command: format!("POST /api/v2/catalog/items/{item_id}/merge-plans"), label: "Check merge", idempotent: true, class: Some("command inline plan"),
+                                        json_body: Some(serde_json::json!({
+                                            "source_item_ids": [candidate.id],
+                                            "target_item_id": item_id,
+                                            "expected_revisions": {candidate.id.clone(): candidate.revision, item_id.clone(): model.item_revision},
+                                        }).to_string()),
+                                        <input type="hidden" data-plan-commit="POST /api/v2/catalog/reconciliations">
+                                    )
+                                </li>
+                            }
+                        </ul>
+                    }
+                } else {
+                    empty(message: "Possible duplicates are unavailable right now.")
+                }
+                if let Some(versions) = model.versions.clone() {
+                    if versions.len() > 1 {
+                        <h3>"Split versions into a new title"</h3>
+                        command_form(command: format!("POST /api/v2/catalog/items/{item_id}/split-plans"), label: "Check split", idempotent: true, class: Some("command plan"),
+                            <fieldset>
+                                <legend>"Versions to move"</legend>
+                                for version in versions.iter() {
+                                    <label><input type="checkbox" name="version_ids" data-type=(kind(Field::Member)) value=(version.id.as_str())> " " (version.label.as_str())</label>
+                                }
+                            </fieldset>
+                            <label>"New title " <input name="new_title" data-type=(kind(Field::Text)) required=(true) maxlength="500"></label>
+                            <input type="hidden" name="expected_revision" data-type=(kind(Field::Text)) value=(model.item_revision.as_str())>
+                            <input type="hidden" data-plan-commit="POST /api/v2/catalog/reconciliations">
+                        )
+                    }
+                }
+            </section>
+            <section aria-labelledby="order-heading">
+                <h2 id="order-heading">"Play order"</h2>
+                <p class="muted">"An explicit order (for example as aired or as on disc) decides what plays next. Placing a timeline keeps its files and viewing history."</p>
+                if let Some(ordering) = model.ordering.clone() {
+                    if ordering.groups.is_empty() {
+                        <p class="muted">"No play orders yet."</p>
+                    } else {
+                        <ul class="rows">
+                            for group in ordering.groups.iter() {
+                                <li>(format!("{} ({}) · {}", group.name, group.kind, group.edition))</li>
+                            }
+                        </ul>
+                    }
+                    if !ordering.timelines.is_empty() {
+                        <h3>"Timelines"</h3>
+                        <ul class="rows">
+                            for (n, timeline) in ordering.timelines.iter().enumerate() {
+                                <li>
+                                    (format!("Timeline {} ({})", n + 1, timeline.edition)) " · "
+                                    (match (timeline.group_id.as_ref().and_then(|g| ordering.groups.iter().find(|x| &x.id == g)), timeline.position) {
+                                        (Some(group), Some(position)) => format!("position {position} in {}", group.name),
+                                        _ => "not placed".to_string(),
+                                    })
+                                    for group in ordering.groups.iter() {
+                                        command_form(command: format!("PUT /api/v2/catalog/timelines/{}/order", timeline.id), label: "Place", if_match: Some(timeline.etag.clone()), class: Some("command inline"),
+                                            <label>(format!("Position in {} ", group.name))
+                                                <input type="number" min="0" max="4294967295" required=(true) name="order_position" data-type=(kind(Field::Number))
+                                                    value=(if timeline.group_id.as_deref() == Some(group.id.as_str()) { timeline.position.map(|p| p.to_string()).unwrap_or_default() } else { String::new() })>
+                                            </label>
+                                            <input type="hidden" name="order_group_id" data-type=(kind(Field::Text)) value=(group.id.as_str())>
+                                            <input type="hidden" name="expected_group_revision" data-type=(kind(Field::Text)) value=(group.revision.as_str())>
+                                        )
+                                    }
+                                </li>
+                            }
+                        </ul>
+                    }
+                    if !ordering.editions.is_empty() {
+                        <h3>"New play order"</h3>
+                        command_form(command: format!("POST /api/v2/catalog/items/{item_id}/order-groups"), label: "Create order", idempotent: true, if_match: Some(model.item_etag.clone()), class: Some("command inline"),
+                            <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200"></label>
+                            <label>"Kind "
+                                <select name="kind" data-type=(kind(Field::Text))>
+                                    for (value, text) in [("aired", "As aired"), ("dvd", "As on disc"), ("absolute", "Absolute"), ("custom", "Custom")] {
+                                        <option value=(value)>(text)</option>
+                                    }
+                                </select>
+                            </label>
+                            <label>"Edition "
+                                <select name="edition_id" data-type=(kind(Field::Text))>
+                                    for (id, label) in ordering.editions.iter() {
+                                        <option value=(id.as_str())>(label.as_str())</option>
+                                    }
+                                </select>
+                            </label>
+                        )
+                    }
+                } else {
+                    empty(message: "Play orders are unavailable right now.")
+                }
+            </section>
+        }
     })
 }
 
 // --- Collections and playlists ----------------------------------------------
+
+/// The filter conditions the form edits, one slot each: (field, operator,
+/// label, value type).
+const FILTER_SLOTS: [(&str, &str, &str, &str); 8] = [
+    ("kind", "eq", "Kind", "text"),
+    ("title", "contains", "Title contains", "text"),
+    ("genre", "eq", "Genre", "text"),
+    ("tag", "eq", "Tag", "text"),
+    ("year", "gte", "Year from", "int"),
+    ("year", "lte", "Year to", "int"),
+    ("watched", "eq", "Watched", "bool"),
+    ("availability", "eq", "Available", "bool"),
+];
+
+/// The terms a filter form shows in its slots (the first of each), and the
+/// rest, which it carries unchanged so editing never drops a condition.
+fn filter_slots(terms: &[FilterTermView]) -> (Vec<Option<String>>, Vec<FilterTermView>) {
+    let mut values = vec![None; FILTER_SLOTS.len()];
+    let mut rest = Vec::new();
+    for term in terms {
+        match FILTER_SLOTS
+            .iter()
+            .position(|(f, o, _, _)| *f == term.field && *o == term.operator)
+        {
+            Some(slot) if values[slot].is_none() => values[slot] = Some(term.value.clone()),
+            _ => rest.push(term.clone()),
+        }
+    }
+    (values, rest)
+}
+
+/// A filter's conditions in words.
+fn filter_text(terms: &[FilterTermView]) -> String {
+    if terms.is_empty() {
+        return "Every title".into();
+    }
+    terms
+        .iter()
+        .map(
+            |t| match (t.field.as_str(), t.operator.as_str(), t.value.as_str()) {
+                ("watched", _, "true") => "Watched".into(),
+                ("watched", _, _) => "Not watched".into(),
+                ("availability", _, "true") => "Available".into(),
+                ("availability", _, _) => "Unavailable".into(),
+                ("year", "gte", v) => format!("From {v}"),
+                ("year", "lte", v) => format!("Until {v}"),
+                ("title", "contains", v) => format!("Title contains “{v}”"),
+                ("person_id", _, v) => format!("Person {v}"),
+                (field, "contains", v) => format!("{} contains “{v}”", capitalized(field)),
+                (field, _, v) => format!("{} is {v}", capitalized(field)),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn capitalized(field: &str) -> String {
+    let mut chars = field.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// The condition fields of a saved filter form, prefilled from `terms`.
+#[component]
+async fn filter_fields(
+    name: String,
+    profile: String,
+    terms: Vec<FilterTermView>,
+) -> Result<impl View> {
+    let (values, rest) = filter_slots(&terms);
+    let value = move |slot: usize| values[slot].clone().unwrap_or_default();
+    Ok(view! {
+        <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200" value=(name.as_str())></label>
+        <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile.as_str())>
+        <fieldset class="filter-terms">
+            <legend>"Titles that match all of these (leave blank to ignore)"</legend>
+            <label>"Kind "
+                <select name="all" data-type=(kind(Field::Term)) data-field="kind" data-operator="eq" data-value-type="text">
+                    for (v, text) in [("", "Any"), ("movie", "Movie"), ("series", "Series"), ("season", "Season"), ("episode", "Episode"), ("unclassified", "Unclassified")] {
+                        <option value=(v) selected=(value(0) == v)>(text)</option>
+                    }
+                </select>
+            </label>
+            for slot in 1..4 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <input name="all" data-type=(kind(Field::Term)) data-field=(FILTER_SLOTS[slot].0) data-operator=(FILTER_SLOTS[slot].1) data-value-type="text" maxlength="256" value=(value(slot))>
+                </label>
+            }
+            for slot in 4..6 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <input type="number" min="1" max="9999" name="all" data-type=(kind(Field::Term)) data-field="year" data-operator=(FILTER_SLOTS[slot].1) data-value-type="int" value=(value(slot))>
+                </label>
+            }
+            for slot in 6..8 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <select name="all" data-type=(kind(Field::Term)) data-field=(FILTER_SLOTS[slot].0) data-operator="eq" data-value-type="bool">
+                        <option value="" selected=(value(slot).is_empty())>"Either"</option>
+                        <option value="true" selected=(value(slot) == "true")>"Yes"</option>
+                        <option value="false" selected=(value(slot) == "false")>"No"</option>
+                    </select>
+                </label>
+            }
+            if !rest.is_empty() {
+                <p class="muted small">(format!("Also kept unchanged: {}.", filter_text(&rest)))</p>
+                for term in rest.iter() {
+                    <input type="hidden" name="all" data-type=(kind(Field::Term)) data-field=(term.field.as_str()) data-operator=(term.operator.as_str())
+                        data-value-type=(match term.field.as_str() { "year" => "int", "watched" | "availability" => "bool", _ => "text" })
+                        value=(term.value.as_str())>
+                }
+            }
+        </fieldset>
+    })
+}
+
+/// A stored marker in words, with its provenance and whether it is in effect.
+fn marker_text(marker: &StoredMarkerView) -> String {
+    let at = |ms: u64| format!("{}:{:02}", ms / 60_000, ms / 1000 % 60);
+    let span = match marker.end_ms {
+        Some(end) => format!("{}–{}", at(marker.start_ms), at(end)),
+        None => at(marker.start_ms),
+    };
+    let kind = match marker.kind.as_str() {
+        "intro" => "Intro",
+        "recap" => "Recap",
+        "credits" => "Credits",
+        _ => "Chapter",
+    };
+    let origin = match marker.provenance.as_str() {
+        "manual" => "added here",
+        "embedded" => "from the file",
+        "detected" => "detected, unconfirmed",
+        _ => "imported",
+    };
+    let label = marker
+        .label
+        .as_deref()
+        .map(|l| format!(" “{l}”"))
+        .unwrap_or_default();
+    let stale = if marker.current {
+        ""
+    } else {
+        " · not in effect (earlier timeline)"
+    };
+    format!("{kind}{label} {span} · {origin}{stale}")
+}
 
 #[page("/organize")]
 pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
@@ -897,7 +1437,24 @@ pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
                             if collection.kind == "smart" { <span class="muted small">" · smart"</span> }
                         </h3>
                         if collection.kind == "smart" {
-                            <p class="muted">"Its titles follow a saved filter, which can be changed through the API only."</p>
+                            <p class="muted">
+                                (match model.filters.iter().find(|f| Some(&f.id) == collection.filter_id.as_ref()) {
+                                    Some(filter) => format!("Titles that match “{}”: {}. Change the conditions under Saved filters.", filter.name, filter_text(&filter.terms)),
+                                    None => "Its titles follow a saved filter of another profile or one you cannot read.".to_string(),
+                                })
+                            </p>
+                            if collection.items.is_empty() {
+                                <p class="muted">"No titles match yet."</p>
+                            } else {
+                                <ul class="rows">
+                                    for item in collection.items.iter() {
+                                        <li><a href=(format!("/item/{}", item.id))>(item.title.as_str())</a></li>
+                                    }
+                                </ul>
+                                if collection.member_count > collection.items.len() {
+                                    <p class="muted small">(format!("and {} more", collection.member_count - collection.items.len()))</p>
+                                }
+                            }
                         } else if collection.items.is_empty() {
                             <p class="muted">"Empty."</p>
                         } else {
@@ -920,6 +1477,37 @@ pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
                 <input type="hidden" name="kind" data-type=(kind(Field::Text)) value="manual">
                 <input type="hidden" name="item_ids" data-type=(kind(Field::Json)) value="[]">
                 <input type="hidden" name="filter_id" data-type=(kind(Field::Json)) value="null">
+            )
+        </section>
+        <section aria-labelledby="filters-heading">
+            <h2 id="filters-heading">"Saved filters"</h2>
+            <p class="muted">"A saved filter describes titles by their details. Make a smart collection from it to browse them; the collection follows later changes."</p>
+            if model.filters.is_empty() {
+                empty(message: "No saved filters yet.")
+            } else {
+                for filter in model.filters.iter() {
+                    <section class="collection" aria-labelledby=(format!("flt-{}", filter.id))>
+                        <h3 id=(format!("flt-{}", filter.id))>(filter.name.as_str())</h3>
+                        <p>(filter_text(&filter.terms))</p>
+                        command_form(command: "POST /api/v2/collections".to_string(), label: "Make smart collection", idempotent: true, class: Some("command inline"),
+                            json_body: Some(serde_json::json!({"name": filter.name, "profile_id": profile, "kind": "smart", "item_ids": [], "filter_id": filter.id}).to_string()))
+                        <details>
+                            <summary>"Change conditions"</summary>
+                            command_form(command: format!("PUT /api/v2/catalog/filters/{}", filter.id), label: "Save conditions", if_match: Some(filter.etag.clone()), class: Some("command"),
+                                filter_fields(name: filter.name.clone(), profile: profile.clone(), terms: filter.terms.clone())
+                            )
+                        </details>
+                        if filter.in_use {
+                            <p class="muted small">"A smart collection uses this filter; delete that collection first to delete the filter."</p>
+                        } else {
+                            command_form(command: format!("DELETE /api/v2/catalog/filters/{}", filter.id), label: "Delete filter", if_match: Some(filter.etag.clone()), class: Some("command inline"))
+                        }
+                    </section>
+                }
+            }
+            <h3>"New saved filter"</h3>
+            command_form(command: "POST /api/v2/catalog/filters".to_string(), label: "Save filter", idempotent: true, class: Some("command"),
+                filter_fields(name: String::new(), profile: profile.clone(), terms: Vec::new())
             )
         </section>
         <section aria-labelledby="playlists-heading">

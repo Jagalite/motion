@@ -84,6 +84,32 @@ pub fn webvtt_segment(cues: &[Cue], from_ms: u64, to_ms: u64, offset_ms: u64) ->
     out
 }
 
+/// The cues of a multipart timeline's subtitle in timeline time, from each
+/// part's cues in that part's file time and the part's pinned duration, in
+/// order. A part's cues move by the durations before it; a cue running past
+/// its part's end is cut there and one starting at or after it is dropped,
+/// so a part's subtitles never show over the next part's picture.
+pub fn join_parts(parts: &[(Vec<Cue>, u64)]) -> Vec<Cue> {
+    let mut joined = Vec::new();
+    let mut offset = 0u64;
+    for (cues, duration) in parts {
+        joined.extend(cues.iter().filter(|c| c.start_ms < *duration).map(|c| Cue {
+            start_ms: offset.saturating_add(c.start_ms),
+            end_ms: offset.saturating_add(c.end_ms.min(*duration)),
+            ..c.clone()
+        }));
+        offset = offset.saturating_add(*duration);
+    }
+    // Stable: cues starting together keep their order within the part.
+    joined.sort_by_key(|c| c.start_ms);
+    joined
+}
+
+/// A whole WebVTT document of `cues`, in their own time.
+pub fn webvtt(cues: &[Cue]) -> String {
+    webvtt_segment(cues, 0, u64::MAX, 0)
+}
+
 /// `[hh:]mm:ss.ttt` in milliseconds.
 fn parse_time(s: &str) -> Option<u64> {
     let (clock, millis) = s.split_once('.')?;
@@ -166,5 +192,44 @@ mod tests {
         assert!(
             webvtt_segment(&cues, 0, 4_000, 2_000).contains("00:00:00.000 --> 00:00:01.000\nfirst")
         );
+    }
+
+    #[test]
+    fn parts_join_in_timeline_time_without_crossing_their_ends() {
+        let cue = |start_ms, end_ms, payload: &str| Cue {
+            start_ms,
+            end_ms,
+            settings: String::new(),
+            payload: payload.into(),
+        };
+        let joined = join_parts(&[
+            (
+                vec![
+                    cue(0, 1_000, "a"),
+                    cue(9_500, 12_000, "runs past the end"),
+                    cue(10_000, 11_000, "after the end"),
+                ],
+                10_000,
+            ),
+            (vec![], 5_000),
+            (vec![cue(0, 500, "c"), cue(200, 300, "d")], 4_000),
+        ]);
+        assert_eq!(
+            joined
+                .iter()
+                .map(|c| (c.start_ms, c.end_ms, c.payload.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, 1_000, "a"),
+                (9_500, 10_000, "runs past the end"),
+                (15_000, 15_500, "c"),
+                (15_200, 15_300, "d"),
+            ]
+        );
+        let document = webvtt(&joined);
+        assert!(document.starts_with("WEBVTT\n"));
+        // The document round-trips through the parser used for segments.
+        assert_eq!(parse_webvtt(&document).unwrap(), joined);
+        assert_eq!(join_parts(&[]), vec![]);
     }
 }

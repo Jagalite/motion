@@ -265,3 +265,178 @@ test('desktop-only download actions are revealed only inside the desktop host', 
     assert.equal(action.hidden, !revealed);
   }
 });
+
+test('filter terms are typed and only chosen criteria are sent', () => {
+  const bridge = harness();
+  const term = (field, operator, valueType, value) =>
+    ({name: 'all', dataset: {type: 'term', field, operator, valueType}, value});
+  const body = bridge.bodyOf(form([
+    input('name', 'text', 'Unwatched 90s'),
+    term('kind', 'eq', 'text', 'movie'),
+    term('title', 'contains', 'text', ''),
+    term('year', 'gte', 'int', '1990'),
+    term('year', 'lte', 'int', ' 1999 '),
+    term('watched', 'eq', 'bool', 'false'),
+    term('availability', 'eq', 'bool', ''),
+  ]));
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), {name: 'Unwatched 90s', all: [
+    {field: 'kind', operator: 'eq', value: 'movie'},
+    {field: 'year', operator: 'gte', value: 1990},
+    {field: 'year', operator: 'lte', value: 1999},
+    {field: 'watched', operator: 'eq', value: false},
+  ]});
+  // No criteria at all is an empty conjunction, not a missing field.
+  assert.deepEqual(JSON.parse(JSON.stringify(bridge.bodyOf(form([term('title', 'contains', 'text', '')])))), {all: []});
+});
+
+test('seconds are sent as whole milliseconds and blank as null', () => {
+  const bridge = harness();
+  const body = bridge.bodyOf(form([input('start_ms', 'seconds-ms', '12.3456'), input('end_ms', 'seconds-ms', ' ')]));
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), {start_ms: 12346, end_ms: null});
+});
+
+test('a custom video profile sends whole bit rates and a chosen subtitle requires it', () => {
+  const bridge = harness();
+  const subtitle = Object.assign(input('tracks.subtitle_track_id', 'subtitle-choice', 's1'),
+    {dataset: {type: 'subtitle-choice', policy: 'tracks.subtitle_policy'}});
+  const fields = [
+    input('recipe_id', 'text', 'video_profile'),
+    input('video_profile.version', 'number', '1'),
+    input('video_profile.max_width', 'number', '1920'),
+    input('video_profile.video_bitrate', 'mbps', '8.5'),
+    input('video_profile.audio_bitrate', 'kbps', '192'),
+    input('video_profile.frame_rate', 'json', '{"numerator":24000,"denominator":1001}'),
+    subtitle,
+  ];
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields))),
+    '{"recipe_id":"video_profile","video_profile":{"version":1,"max_width":1920,"video_bitrate":8500000,'
+    + '"audio_bitrate":192000,"frame_rate":{"numerator":24000,"denominator":1001}},'
+    + '"tracks":{"subtitle_track_id":"s1","subtitle_policy":"require"}}');
+  // Floating-point input still yields whole bits per second.
+  fields[3].value = '0.064';
+  assert.equal(bridge.bodyOf(form(fields)).video_profile.video_bitrate, 64000);
+  subtitle.value = '';
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields)).tracks), '{"subtitle_track_id":null,"subtitle_policy":"off"}');
+});
+
+test('after a command reloads the page, focus returns to the same action, never to another entry', () => {
+  const storage = new Map();
+  const focused = [];
+  // A form acting on one entry: its command, its fixed entry field, and the
+  // disclosure (if any) it sits in.
+  const makeForm = (command, entry, details = null) => {
+    const status = {textContent: ''};
+    const button = {focus: () => focused.push(`${command} ${entry}`)};
+    const hidden = [{name: 'entry', value: entry}];
+    return {dataset: {command}, status, parentElement: details,
+      querySelectorAll: s => s.startsWith('input[type="hidden"]') ? hidden : [],
+      querySelector: s => s === '.command-status' ? status : s.startsWith('button') ? button : null};
+  };
+  let forms = [];
+  const main = {focus: () => focused.push('main')};
+  const context = (pathname = '/organize') => ({
+    document: {querySelector: () => null, querySelectorAll: () => forms, getElementById: id => id === 'main' ? main : null, addEventListener() {}},
+    sessionStorage: {getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k)},
+    crypto: webcrypto, location: {pathname, search: '', reload() {}}, setTimeout: fn => fn(), Blob,
+  });
+  const reorder = 'PUT /api/v2/playlists/p1/entries';
+  forms = [makeForm(reorder, 'A'), makeForm(reorder, 'B')];
+  const before = runInNewContext(`${source}\n({reloadAfter})`, context());
+  // "Move up B": after the reload B is first, and its own action gets focus.
+  before.reloadAfter(forms[1]);
+  forms = [makeForm(reorder, 'B'), makeForm(reorder, 'A')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused, [`${reorder} B`]);
+  assert.equal(forms[0].status.textContent, 'Done.');
+  assert.equal(forms[1].status.textContent, '', 'never another entry');
+  assert.equal(storage.size, 0, 'used once');
+  // "Remove B": B is gone, so the main content, never A's action.
+  before.reloadAfter(forms[0]);
+  forms = [makeForm(reorder, 'A')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'main');
+  // Two look-alike forms: ambiguous, so the main content.
+  before.reloadAfter(forms[0]);
+  forms = [makeForm(reorder, 'A'), makeForm(reorder, 'A')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'main');
+  // A form inside a closed disclosure is shown again before focus.
+  const details = {tagName: 'DETAILS', open: false, parentElement: null};
+  forms = [makeForm('PUT /api/v2/libraries/l1', 'l1', details)];
+  before.reloadAfter(forms[0]);
+  forms = [makeForm('PUT /api/v2/libraries/l1', 'l1', details)];
+  runInNewContext(source, context());
+  assert.equal(details.open, true);
+  assert.deepEqual(focused.at(-1), 'PUT /api/v2/libraries/l1 l1');
+  // A revision precondition that every success advances is not identity:
+  // "Place" is found again after its group revision moved on.
+  const place = (revision) => {
+    const form = makeForm('POST /api/v2/catalog/order-groups/g1/placements', 'g1');
+    const fields = [{name: 'timeline_id', value: 't1'}, {name: 'expected_group_revision', value: revision}];
+    form.querySelectorAll = s => s.startsWith('input[type="hidden"]') ? fields : [];
+    return form;
+  };
+  forms = [place('3')];
+  before.reloadAfter(forms[0]);
+  forms = [place('4')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'POST /api/v2/catalog/order-groups/g1/placements g1');
+  assert.equal(forms[0].status.textContent, 'Done.');
+  // A failed facade render already focused its error panel: retain it.
+  before.reloadAfter(forms[0]);
+  const errorContext = context();
+  errorContext.document.activeElement = {matches: selector => selector === 'main [role="alert"]'};
+  const errorFocusCount = focused.length;
+  runInNewContext(source, errorContext);
+  assert.equal(focused.length, errorFocusCount);
+  // Another page: nothing is moved.
+  const count = focused.length;
+  before.reloadAfter(forms[0]);
+  runInNewContext(source, context('/elsewhere'));
+  assert.equal(focused.length, count);
+});
+
+test('invitation redemption retains claim after lost response without storing the code', async () => {
+  const storage = new Map(), bodies = [], paths = [];
+  let first = true;
+  const bridge = harness(storage, async (path, options) => {
+    paths.push(path); bodies.push(JSON.parse(options.body));
+    if (first) {first = false; throw new Error('connection lost');}
+    return {ok: true, status: 200, json: async () => ({access_token: 'credential'})};
+  });
+  const f = form([input('code','text','private-invitation'),input('device_name','text','Browser'),input('client_name','text','Motion web')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f); await bridge.submitCommand(f);
+  assert.equal(paths.length, 3);
+  assert.equal(paths[2], '/api/v2/auth/session');
+  assert.deepEqual(bodies[0], bodies[1]);
+  assert.match(bodies[0].claim_id, /^[a-f0-9]{32}$/);
+  assert.equal(storage.size, 0);
+});
+
+test('denied and expired pairing stop polling and explain the actual outcome', async () => {
+  for (const [code, expected] of [
+    ['pairing_denied', 'An administrator denied this pairing request. Ask them before starting a new request.'],
+    ['pairing_expired', 'The pairing code expired before it was approved. Start a new pairing request.'],
+  ]) {
+    let calls = 0;
+    const bridge = harness(new Map(), async () => {
+      calls++;
+      return {ok:false, status:409, json:async()=>({code,detail:'Server detail'})};
+    });
+    const f = form();
+    await bridge.pair(f, {id:'pair',user_code:'CODE',device_code:'secret',poll_interval_seconds:0,expires_at:new Date(Date.now()+1000).toISOString()});
+    assert.equal(calls,1);
+    assert.equal(f.querySelector('.command-status').textContent, expected);
+  }
+});
+
+test('an unavailable invitation asks for a new code without saving the secret', async () => {
+  const storage = new Map();
+  const bridge = harness(storage, async () => ({ok:false, status:409, json:async()=>({code:'invitation_unavailable'})}));
+  const f = form([input('code', 'text', 'private-invitation')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f);
+  assert.equal(f.querySelector('.command-status').textContent, 'This invitation is no longer available. Ask an administrator for a new code.');
+  assert.equal(storage.size, 0);
+});
