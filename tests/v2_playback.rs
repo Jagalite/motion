@@ -7387,4 +7387,60 @@ async fn embedded_chapters_come_only_from_readable_originals() {
             .collect();
         assert_eq!(embedded.len(), expected, "{library}: {}", page.body);
     }
+    // A hundred chaptered copies the caller cannot read, ordered before the
+    // readable one, never hide its chapters.
+    let film: String =
+        sqlx::query_scalar("SELECT id FROM media_files WHERE relative_path='film.mp4'")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let film_version: String =
+        sqlx::query_scalar("SELECT version_id FROM version_files WHERE file_id=?")
+            .bind(&film)
+            .fetch_one(db)
+            .await
+            .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    for n in 0..100 {
+        for sql in [
+            "CREATE TEMP TABLE copy_file AS SELECT * FROM media_files WHERE id=?1",
+            "UPDATE copy_file SET id='copy-file-'||?2,relative_path='copy-'||?2||'.mp4',chapters_json='[{\"start_ms\":0,\"end_ms\":null,\"title\":\"Copy\"}]'",
+            "INSERT INTO media_files SELECT * FROM copy_file",
+            "CREATE TEMP TABLE copy_version AS SELECT * FROM media_versions WHERE id=?3",
+            "UPDATE copy_version SET id='0000-copy-'||?2",
+            "INSERT INTO media_versions SELECT * FROM copy_version",
+            "CREATE TEMP TABLE copy_binding AS SELECT * FROM version_files WHERE version_id=?3",
+            "UPDATE copy_binding SET version_id='0000-copy-'||?2,file_id='copy-file-'||?2",
+            "INSERT INTO version_files SELECT * FROM copy_binding",
+            "DROP TABLE copy_file",
+            "DROP TABLE copy_version",
+            "DROP TABLE copy_binding",
+        ] {
+            sqlx::query(sql)
+                .bind(&film)
+                .bind(format!("{n:03}"))
+                .bind(&film_version)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&device, &[other.as_str()], PLAYER, "\"r-2\"")
+        .await;
+    let page = f
+        .get(
+            &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+            &auth,
+        )
+        .await;
+    let labels: Vec<_> = page.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["provenance"] == "embedded")
+        .map(|m| m["label"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(labels, ["Hidden"], "{}", page.body);
 }

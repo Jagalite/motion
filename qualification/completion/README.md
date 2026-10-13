@@ -1349,6 +1349,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   After the fixes: `v2_playback` 32, `scans` 8, `v2_catalog` 20 passed; clippy clean.
 
+  Round 2 at `5f97d25` raised one P2 finding, fixed:
+  - **C5:** candidate sources were limited to 100 before the readability
+    check, so 100 unreadable (or unavailable) chaptered copies ordered
+    first hid a readable one. Candidates are now paged by (version, file)
+    until a readable available original is found. The integration test
+    adds 100 unreadable chaptered copies ordered first; the scoped caller
+    still sees its own chapters.
+
+  After the fix: `v2_playback` 32, `v2_catalog` 20 passed; clippy clean.
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |
