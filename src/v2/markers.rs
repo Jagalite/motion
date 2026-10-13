@@ -194,7 +194,6 @@ async fn embedded(
              AND b.start_ms IS NULL AND b.end_ms IS NULL \
              AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
              AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) \
-             AND f.chapters_json IS NOT NULL AND f.chapters_json<>'[]' \
              AND (v.id>? OR (v.id=? AND f.id>?)) ORDER BY v.id,f.id LIMIT 100",
         )
         .bind(timeline)
@@ -237,12 +236,12 @@ async fn embedded(
 /// timeline revision and every marker with its revision.
 fn snapshot(timeline_revision: i64, markers: &[(Marker, u64)]) -> String {
     use sha2::{Digest, Sha256};
-    let mut ids: Vec<(&str, u64)> = markers.iter().map(|(m, r)| (m.id.as_str(), *r)).collect();
-    ids.sort_unstable();
+    let mut facts: Vec<_> = markers.iter().collect();
+    facts.sort_by(|(a, _), (b, _)| a.id.cmp(&b.id));
     let mut digest = Sha256::new();
     digest.update(timeline_revision.to_string());
-    for (id, revision) in ids {
-        digest.update(format!("\n{id}/{revision}"));
+    for fact in facts {
+        digest.update(serde_json::to_vec(fact).expect("marker facts serialize"));
     }
     format!("{:x}", digest.finalize())[..32].to_owned()
 }
@@ -261,9 +260,10 @@ async fn load(
         String,
         i64,
         i64,
+        i64,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision,revision FROM markers WHERE timeline_id=? ORDER BY start_ms,id LIMIT ?",
+        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision,revision,creation_order FROM markers WHERE timeline_id=? ORDER BY start_ms,id LIMIT ?",
     )
     .bind(timeline)
     .bind(core::MAX_MARKERS as i64 + 1)
@@ -280,10 +280,11 @@ async fn load(
     }
     rows.into_iter()
         .map(
-            |(id, kind, start, end, label, provenance, recorded, revision)| {
+            |(id, kind, start, end, label, provenance, recorded, revision, creation_order)| {
                 Ok((
                     Marker {
                         id,
+                        creation_order: creation_order.max(0) as u64,
                         kind: serde_json::from_value(Value::String(kind))
                             .map_err(Problem::internal)?,
                         start_ms: start.max(0) as u64,
@@ -306,8 +307,18 @@ struct MarkerInput {
     timeline_revision: String,
     kind: Kind,
     start_ms: u64,
+    #[serde(deserialize_with = "nullable")]
     end_ms: Option<u64>,
+    #[serde(deserialize_with = "nullable")]
     label: Option<String>,
+}
+
+fn nullable<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
 }
 
 fn rejected(e: MarkerError) -> Problem {
@@ -402,7 +413,8 @@ async fn create(
     )
     .map_err(rejected)?;
     let id = new_id();
-    sqlx::query("INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) VALUES (?,?,?,?,?,?,?,'manual')")
+    let creation_order = crate::markers::next_creation_order(&mut tx, &timeline).await?;
+    sqlx::query("INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance,creation_order) VALUES (?,?,?,?,?,?,?,'manual',?)")
         .bind(&id)
         .bind(&timeline)
         .bind(revision)
@@ -410,12 +422,14 @@ async fn create(
         .bind(input.start_ms as i64)
         .bind(input.end_ms.map(|e| e as i64))
         .bind(label)
+        .bind(creation_order)
         .execute(&mut *tx)
         .await?;
     let created = body(
         &timeline,
         Marker {
             id,
+            creation_order: creation_order as u64,
             kind: input.kind,
             start_ms: input.start_ms,
             end_ms: input.end_ms,
@@ -439,4 +453,36 @@ async fn create(
     let mut response = (StatusCode::CREATED, Json(json)).into_response();
     response.headers_mut().insert(header::ETAG, etag(1));
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn nullable_fields_are_required_and_chapter_facts_change_snapshot() {
+        let input = serde_json::json!({"timeline_revision":"1","kind":"chapter","start_ms":0,"end_ms":null,"label":null});
+        assert!(serde_json::from_value::<MarkerInput>(input.clone()).is_ok());
+        for key in ["end_ms", "label"] {
+            let mut missing = input.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<MarkerInput>(missing).is_err());
+        }
+        let original = Marker {
+            id: "embedded-1".into(),
+            creation_order: 0,
+            kind: Kind::Chapter,
+            start_ms: 0,
+            end_ms: None,
+            label: Some("Before".into()),
+            provenance: Provenance::Embedded,
+            timeline_revision: 1,
+        };
+        let before = snapshot(1, &[(original.clone(), 1)]);
+        let mut changed = original.clone();
+        changed.label = Some("After".into());
+        assert_ne!(before, snapshot(1, &[(changed, 1)]));
+        let mut changed = original;
+        changed.start_ms = 100;
+        assert_ne!(before, snapshot(1, &[(changed, 1)]));
+    }
 }

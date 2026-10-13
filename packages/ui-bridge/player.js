@@ -971,7 +971,7 @@ function close({unloading = false} = {}) {
  */
 function seekTarget(position, duration) {
   if (!Number.isSafeInteger(position) || position < 0) return 0;
-  return duration > 0 && position >= duration ? Math.max(0, duration - 1000) : position;
+  return duration > 0 && position >= duration ? Math.max(0, duration - 1) : position;
 }
 
 /** Show each skip button only while playback is inside its marker's interval. */

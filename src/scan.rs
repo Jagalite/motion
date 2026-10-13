@@ -359,6 +359,8 @@ pub(crate) async fn inspect(
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled")
         .to_string();
+    let chapter_root = root.clone();
+    let chapter_relative = relative.clone();
     let hashing_permit = permit.clone();
     let (file, revision, stamp, bytes) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -391,7 +393,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:chapter=start_time,end_time:chapter_tags=title:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -495,7 +497,8 @@ pub(crate) async fn inspect(
             }),
         })
         .collect();
-    let chapters = matches!(result, Ok(Ok(()))).then(|| chapters_of(&value));
+    // Optional chapter overflow/failure must not erase successful stream facts.
+    let chapters = probe_chapters(chapter_root, chapter_relative, ffprobe, &stamp).await;
     Ok(Found {
         relative: rel,
         title,
@@ -1090,5 +1093,39 @@ mod color_probe_tests {
         assert_eq!(nits(&json!("1/0")), None);
         assert_eq!(nits(&json!("x")), None);
         assert!(side_data(&json!({}), "Mastering display metadata").is_none());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod chapter_probe_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn optional_chapter_overflow_preserves_base_media_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("film.mkv"), b"fixture").unwrap();
+        let probe = directory.path().join("probe");
+        std::fs::write(&probe, "#!/bin/sh\ncase \"$*\" in\n *chapter=*) head -c 1048577 /dev/zero ;;\n *) printf '%s' '{\"format\":{\"duration\":\"120\"},\"streams\":[{\"index\":0,\"codec_type\":\"video\",\"codec_name\":\"h264\"}]}' ;;\nesac\n").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let permit = std::sync::Arc::new(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        let found = inspect(
+            directory.path().to_owned(),
+            "film.mkv".into(),
+            &probe,
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.duration, Some(120.0));
+        assert_eq!(found.tracks.len(), 1);
+        assert_eq!(found.tracks[0].codec, "h264");
+        assert_eq!(found.chapters, None);
     }
 }

@@ -39,6 +39,9 @@ impl Provenance {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
     pub id: Id,
+    /// Durable creation order supplied by the transactional adapter; zero for legacy facts.
+    #[serde(default)]
+    pub creation_order: u64,
     pub kind: Kind,
     pub start_ms: u64,
     pub end_ms: Option<u64>,
@@ -92,6 +95,7 @@ pub fn embedded_chapters(
             .map(|t| t.chars().take(200).collect::<String>());
         starts.push(chapter.start_ms);
         markers.push(Marker {
+            creation_order: 0,
             id: format!("{id_prefix}-{}", markers.len()),
             kind: Kind::Chapter,
             start_ms: chapter.start_ms,
@@ -145,7 +149,7 @@ pub fn validate(
     if expected_timeline_revision != timeline_revision {
         return Err(MarkerError::StaleTimeline);
     }
-    if label.is_some_and(|l| l.trim().is_empty() || l.len() > 200) {
+    if label.is_some_and(|l| l.trim().is_empty() || l.chars().count() > 200) {
         return Err(MarkerError::InvalidLabel);
     }
     // Even without a known duration, positions stay within playback's bound
@@ -169,7 +173,7 @@ pub fn validate(
 /// Effective markers for the timeline's current revision: markers validated
 /// against an older revision are not effective (they stay listed). Then for
 /// intro, credits and recap the single marker of the highest provenance
-/// (earliest start, then ID, on ties); for chapters, the complete set from
+/// (latest manual creation order, then earliest start and ID on ties); for chapters, the complete set from
 /// the highest provenance present, in start order.
 pub fn effective(markers: &[Marker], timeline_revision: u64) -> Vec<Marker> {
     let current: Vec<Marker> = markers
@@ -183,11 +187,21 @@ pub fn effective(markers: &[Marker], timeline_revision: u64) -> Vec<Marker> {
         if let Some(best) = markers.iter().filter(|m| m.kind == kind).min_by(|a, b| {
             (
                 std::cmp::Reverse(a.provenance.precedence()),
+                std::cmp::Reverse(if a.provenance == Provenance::Manual {
+                    a.creation_order
+                } else {
+                    0
+                }),
                 a.start_ms,
                 &a.id,
             )
                 .cmp(&(
                     std::cmp::Reverse(b.provenance.precedence()),
+                    std::cmp::Reverse(if b.provenance == Provenance::Manual {
+                        b.creation_order
+                    } else {
+                        0
+                    }),
                     b.start_ms,
                     &b.id,
                 ))
@@ -251,6 +265,7 @@ mod tests {
         // A manual chapter wins over all of them in the effective view.
         let mut all = markers.clone();
         all.push(Marker {
+            creation_order: 0,
             id: "manual".into(),
             kind: Kind::Chapter,
             start_ms: 30_000,
@@ -275,6 +290,7 @@ mod tests {
     }
     fn m(id: &str, kind: Kind, start: u64, end: Option<u64>, p: Provenance) -> Marker {
         Marker {
+            creation_order: 0,
             id: id.into(),
             kind,
             start_ms: start,
@@ -333,6 +349,7 @@ mod tests {
         // After the timeline changes, old markers are not effective.
         let mut stale = markers.clone();
         stale.push(Marker {
+            creation_order: 0,
             timeline_revision: 2,
             ..m(
                 "new",
@@ -362,6 +379,31 @@ mod tests {
         assert_eq!(
             admits_another(MAX_MARKERS),
             Err(MarkerError::TooManyMarkers)
+        );
+    }
+    #[test]
+    fn newest_manual_correction_wins_independent_of_input_or_start_order() {
+        for kind in [Kind::Intro, Kind::Recap, Kind::Credits] {
+            let mut old = m("old", kind, 100, Some(200), Provenance::Manual);
+            old.creation_order = 1;
+            let mut corrected = m("new", kind, 150, Some(250), Provenance::Manual);
+            corrected.creation_order = 2;
+            for rows in [
+                vec![old.clone(), corrected.clone()],
+                vec![corrected.clone(), old.clone()],
+            ] {
+                assert_eq!(effective(&rows, 1), vec![corrected.clone()]);
+            }
+            corrected.timeline_revision = 2;
+            assert_eq!(effective(&[old.clone(), corrected], 1), vec![old]);
+        }
+        assert_eq!(
+            validate(Kind::Chapter, 0, None, Some(&"章".repeat(200)), 1, 1, None),
+            Ok(())
+        );
+        assert_eq!(
+            validate(Kind::Chapter, 0, None, Some(&"章".repeat(201)), 1, 1, None),
+            Err(MarkerError::InvalidLabel)
         );
     }
 }

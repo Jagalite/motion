@@ -375,11 +375,13 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                             </details>
                             <details class="disclosure">
                                 <summary>"Remove this source…"</summary>
-                                if users.is_empty() {
+                                if users.is_empty() && who.can("system:admin") {
                                     <p class="muted small">"Nothing is deleted from the folder. If titles were found in it, the source is kept but disabled and its files are marked unavailable, keeping their history and corrections; otherwise its registration is removed. Not possible while a scan or preparation uses it."</p>
                                     command_form(command: format!("DELETE /api/v2/sources/{}", source.id), label: "Remove source", if_match: Some(source.etag.clone()), class: Some("command inline"),
                                         <label><input type="checkbox" required=(true)> " I understand what removing this source does"</label>
                                     )
+                                } else if users.is_empty() {
+                                    <p class="muted small">"Source usage may include libraries outside your access. Ask a server administrator to review removal."</p>
                                 } else {
                                     <p class="muted small">(format!("Used by {}. Remove it from those libraries first (Edit library).", users.join(", ")))</p>
                                 }

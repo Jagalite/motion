@@ -7513,6 +7513,27 @@ async fn embedded_chapters_come_only_from_readable_originals() {
         .map(|m| m["label"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert_eq!(labels, ["Hidden"], "{}", page.body);
+    // The first readable original has no chapters: later chaptered copies
+    // must not contribute marker positions from a different cut.
+    sqlx::query("UPDATE media_files SET chapters_json=NULL WHERE id='copy-file-000'")
+        .execute(db)
+        .await
+        .unwrap();
+    let (device, auth) = f.device(&["default"], PLAYER).await;
+    f.policy(&device, &[f.library.as_str()], PLAYER, "\"r-2\"")
+        .await;
+    let page = f
+        .get(
+            &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+            &auth,
+        )
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(
+        page.body["items"].as_array().unwrap().is_empty(),
+        "{}",
+        page.body
+    );
 }
 
 /// A burned bitmap cue whose display set began long before a start (beyond

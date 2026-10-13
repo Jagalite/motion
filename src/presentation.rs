@@ -365,7 +365,15 @@ impl Queries {
             segment(timeline_id)
         );
         for _ in 0..3 {
-            if let Ok(markers) = self.list_all(&path, 5).await {
+            if let Ok(markers) = self
+                .list_all(
+                    &path,
+                    (playscale_core::markers::MAX_MARKERS
+                        + playscale_core::markers::MAX_EMBEDDED_CHAPTERS)
+                        .div_ceil(200),
+                )
+                .await
+            {
                 return markers;
             }
         }
@@ -1494,14 +1502,48 @@ impl UiQueryFacade for Queries {
                             revision: text(g, "revision"),
                         })
                         .collect();
-                    let timelines = self
-                        .complete_list(&format!("{path}/timelines?limit=20"))
-                        .await?
+                    // Cross-work play orders may include descendant episodes.
+                    // Read every candidate through the scoped API, never raw SQL.
+                    let mut pending = vec![(text(&value, "id"), card.title.clone())];
+                    let mut seen = std::collections::HashSet::new();
+                    let mut candidate_rows = Vec::new();
+                    while let Some((item, title)) = pending.pop() {
+                        if !seen.insert(item.clone()) {
+                            continue;
+                        }
+                        if seen.len() > 1000 {
+                            return Err(UiError::Unavailable);
+                        }
+                        let item_path = format!("/catalog/items/{}", segment(&item));
+                        let descendants = self
+                            .complete_list(&format!(
+                                "/catalog/items?parent_id={}&limit=200",
+                                segment(&item)
+                            ))
+                            .await?;
+                        pending.extend(
+                            descendants
+                                .iter()
+                                .map(|child| (text(child, "id"), text(child, "title"))),
+                        );
+                        let rows = self
+                            .complete_list(&format!("{item_path}/timelines?limit=200"))
+                            .await?;
+                        candidate_rows.extend(rows.into_iter().map(|mut row| {
+                            row["placement_title"] = Value::String(title.clone());
+                            row
+                        }));
+                    }
+                    let timelines = candidate_rows
                         .iter()
                         .map(|t| {
                             Ok(OrderedTimeline {
                                 id: text(t, "id"),
-                                edition: label(&t["edition_id"]),
+                                edition: format!(
+                                    "{} · {}",
+                                    text(t, "placement_title"),
+                                    label(&t["edition_id"])
+                                ),
                                 etag: tag(t)?,
                                 group_id: t["order_group_id"].as_str().map(str::to_owned),
                                 position: t["order_position"].as_u64(),
@@ -1568,7 +1610,9 @@ impl UiQueryFacade for Queries {
                         let rows = self
                             .list_all(
                                 &format!("/catalog/timelines/{}/markers", segment(&text(&t, "id"))),
-                                5,
+                                (playscale_core::markers::MAX_MARKERS
+                                    + playscale_core::markers::MAX_EMBEDDED_CHAPTERS)
+                                    .div_ceil(200),
                             )
                             .await?;
                         out.push(TimelineMarkersView {
