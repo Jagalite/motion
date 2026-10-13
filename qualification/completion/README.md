@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented (review pending); 5D–5F not started | offline-roots, offline-removal, restore-recovery and restore-choice PRs | Merge by user; then 5D |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D–5F not started | offline-roots, offline-removal, restore-recovery and restore-choice PRs | Merge by user; then 5D |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -912,6 +912,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   pinned behind the server. Fixed: the agent serializes passes and restore
   choices, in arrival order, whoever starts them. JS test: a choice made
   during a pass runs after it. JS 93 passed.
+
+  Round 4 at `27e2c8b`: clean.
 
 ### Remaining item 5 work (not started)
 
