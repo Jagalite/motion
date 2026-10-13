@@ -580,6 +580,7 @@ async fn multipart_of(
                 // (`multipart_tracks`).
                 audio: None,
                 subtitle: None,
+                burn: None,
             })
             .collect();
         return Ok(Some(Bound {
@@ -1250,11 +1251,14 @@ pub async fn plan(
         }
     }
     let explicit = cs.or(sub);
-    // A multipart timeline delivers an embedded text subtitle component
-    // that occurs in every part, chosen explicitly or automatically: each
-    // part's own stream, joined in timeline time. Sidecars and burned
-    // subtitles belong to one file and are not delivered across parts yet.
+    // A multipart timeline delivers an embedded subtitle component that
+    // occurs in every part, chosen explicitly or automatically: as text,
+    // each part's own stream joined in timeline time, or as a bitmap burned
+    // into each part's own pictures. Sidecars belong to one file, and
+    // burned text (libass) is not delivered across parts yet.
     let multipart = !bound.parts.is_empty();
+    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
+    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
     if multipart && sidecar_name.is_some() {
         return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
     }
@@ -1270,16 +1274,20 @@ pub async fn plan(
         )
         .await?
         {
-            Some(per_part)
-                if playscale_core::parts::joinable_subtitle(
-                    &per_part
-                        .iter()
-                        .map(|(_, c)| Some(c.as_str()))
-                        .collect::<Vec<_>>(),
-                ) =>
-            {
-                for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
-                    part.subtitle = Some(ordinal);
+            Some(per_part) => {
+                let codecs: Vec<_> = per_part.iter().map(|(_, c)| Some(c.as_str())).collect();
+                if playscale_core::parts::joinable_subtitle(&codecs) {
+                    for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
+                        part.subtitle = Some(ordinal);
+                    }
+                } else if accepts_burned && playscale_core::parts::burnable_across(&codecs) {
+                    for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
+                        part.burn = Some(ordinal);
+                    }
+                } else {
+                    return Ok(
+                        Json(blocked(&input, "subtitle_multipart_unavailable")).into_response()
+                    );
                 }
             }
             _ => {
@@ -1294,8 +1302,6 @@ pub async fn plan(
             "Explicit subtitles conflict with off",
         ));
     }
-    let accepts = |mode: &str| input.client.subtitle_modes.iter().any(|m| m == mode);
-    let (accepts_text, accepts_burned) = (accepts("text"), accepts("burned"));
     // The client selects an in-manifest HLS subtitle rendition on a live
     // presentation (an external track there is refused by the player).
     let live_text = accepts_text && accepts("hls_text");
@@ -1376,7 +1382,11 @@ pub async fn plan(
             AutomaticSubtitle::Selected(i) => {
                 // Across parts: each part's own occurrence of the component.
                 for (part, ordinal) in bound.parts.iter_mut().zip(&candidates[i].parts) {
-                    part.subtitle = Some(*ordinal);
+                    if candidates[i].burned {
+                        part.burn = Some(*ordinal);
+                    } else {
+                        part.subtitle = Some(*ordinal);
+                    }
                 }
                 candidates[i].choice.clone()
             }
@@ -1404,8 +1414,15 @@ pub async fn plan(
         Ok(resolved) => resolved,
         Err(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
-    // Across parts a subtitle is only delivered as text, never burned.
-    if multipart && burn.is_some() {
+    // Across parts a burned subtitle is a bitmap pinned in every part; burned
+    // text is not delivered across parts.
+    if multipart
+        && match burn {
+            Some(delivery::Burn::Bitmap(_)) => !bound.parts.iter().all(|p| p.burn.is_some()),
+            Some(delivery::Burn::Text { .. }) => true,
+            None => false,
+        }
+    {
         return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
     }
     let height = streams
@@ -1650,7 +1667,11 @@ pub async fn plan(
             AutomaticSubtitle::Selected(i) => {
                 let (embedded, name) = candidates[i].choice.clone();
                 for (part, ordinal) in chosen.parts.iter_mut().zip(&candidates[i].parts) {
-                    part.subtitle = Some(*ordinal);
+                    if candidates[i].burned {
+                        part.burn = Some(*ordinal);
+                    } else {
+                        part.subtitle = Some(*ordinal);
+                    }
                 }
                 resolve_subtitle(
                     &mut conn,
@@ -1924,8 +1945,9 @@ async fn subtitle_candidates(
                 else {
                     continue;
                 };
-                // Across parts only a text component occurring in every part
-                // is delivered (joined), never burned.
+                // Across parts: a component occurring in every part, as text
+                // (joined) for a client that presents text, else as a bitmap
+                // burned into each part for one that accepts burned ones.
                 if !bound.parts.is_empty() {
                     let per_part = multipart_tracks(
                         conn,
@@ -1936,20 +1958,23 @@ async fn subtitle_candidates(
                         position as u32,
                     )
                     .await?;
-                    let text = per_part.as_ref().is_some_and(|parts| {
-                        playscale_core::parts::joinable_subtitle(
-                            &parts
-                                .iter()
-                                .map(|(_, c)| Some(c.as_str()))
-                                .collect::<Vec<_>>(),
-                        )
-                    });
+                    let codecs: Vec<_> = per_part
+                        .iter()
+                        .flatten()
+                        .map(|(_, c)| Some(c.as_str()))
+                        .collect();
+                    let text = per_part.is_some()
+                        && playscale_core::parts::joinable_subtitle(&codecs)
+                        && accepts_text;
+                    let bitmap = per_part.is_some()
+                        && playscale_core::parts::burnable_across(&codecs)
+                        && accepts_burned;
                     out.push(SubtitleCandidate {
                         language: component.language.clone(),
                         roles: component.roles.clone(),
                         choice: (Some(position as u32), None),
-                        burned: false,
-                        deliverable: text && accepts_text,
+                        burned: !text && bitmap,
+                        deliverable: text || bitmap,
                         parts: per_part
                             .unwrap_or_default()
                             .into_iter()

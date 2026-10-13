@@ -574,13 +574,24 @@ const BURN_FONTS: &str = "burn-fonts-";
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
-/// A multipart generation's inputs, each (descriptor, seek and remaining
-/// duration in milliseconds, the part's own ordinal of the selected audio),
-/// and its picture canvas.
+/// A multipart generation's inputs and its picture canvas.
 type PartInputs<'a> = (&'a [PartInput], (u32, u32));
-/// One multipart input: descriptor, seek and remaining duration (ms), and the
-/// part's own ordinal of the selected audio.
-type PartInput = (u32, u64, u64, Option<u32>);
+/// One multipart input.
+#[derive(Clone, Copy, Debug)]
+struct PartInput {
+    /// The inherited validated descriptor.
+    fd: u32,
+    /// Where in the part playback starts, and how much of it remains (ms).
+    seek: u64,
+    length: u64,
+    /// The part's own ordinal of the selected audio.
+    audio: Option<u32>,
+    /// The part's own ordinal of a burned bitmap subtitle.
+    burn: Option<u32>,
+    /// How much earlier than `seek` it is read, so a burned cue still
+    /// showing at the seek is drawn (core `burn_read_from`); trimmed off.
+    lookback: u64,
+}
 
 /// FFmpeg arguments for a live generation reading the source from `start_ms`
 /// (file time) and, for an interval, stopping at `end_ms` (file time).
@@ -622,7 +633,8 @@ fn arguments(
     // start either way.
     let burn = burn.filter(|_| !copy);
     // libass reads every event of an extracted subtitle: no lookback.
-    let input_ms = if matches!(burn, Some(Burn::Bitmap(_))) {
+    // (Across parts each part's own lookback is trimmed in the graph.)
+    let input_ms = if matches!(burn, Some(Burn::Bitmap(_))) && parts.is_none() {
         burn_from
             .unwrap_or_else(|| playscale_core::delivery::burn_read_from(start_ms, None))
             .min(start_ms)
@@ -635,11 +647,12 @@ fn arguments(
         // seeks to its offset, the later parts play from their beginning.
         // Each is an inherited validated descriptor.
         Some((parts, _)) => {
-            for (fd, seek, _, _) in parts {
-                if *seek > 0 {
-                    args.extend(["-ss".to_owned(), at(*seek)]);
+            for part in parts {
+                let from = part.seek - part.lookback.min(part.seek);
+                if from > 0 {
+                    args.extend(["-ss".to_owned(), at(from)]);
                 }
-                args.extend(["-i".to_owned(), format!("/dev/fd/{fd}")]);
+                args.extend(["-i".to_owned(), format!("/dev/fd/{}", part.fd)]);
             }
         }
         None => {
@@ -692,18 +705,37 @@ fn arguments(
     let joined = parts.map(|(parts, (width, height))| {
         let mut graph = String::new();
         let mut inputs = String::new();
-        for (i, (_, _, length, part_audio)) in parts.iter().enumerate() {
-            let end = format!("{}.{:03}", length / 1000, length % 1000);
+        for (i, part) in parts.iter().enumerate() {
+            let end = format!("{}.{:03}", part.length / 1000, part.length % 1000);
+            // A burned bitmap subtitle is overlaid on the part's own
+            // pictures first (its canvas scaled to theirs); what was read
+            // early for it is trimmed off.
+            let mut picture = match part.burn {
+                Some(index) => format!(
+                    "[{i}:s:{index}][{i}:v:0]scale2ref=w=iw:h=ih[s{i}][r{i}];\
+                     [r{i}][s{i}]overlay=eof_action=pass:repeatlast=0[o{i}];[o{i}]"
+                ),
+                None => format!("[{i}:v:0]"),
+            };
+            let lookback = part.lookback.min(part.seek);
+            if lookback > 0 {
+                picture.push_str(&format!("trim=start={},setpts=PTS-STARTPTS,", at(lookback)));
+            }
             graph.push_str(&format!(
-                "[{i}:v:0]scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
+                "{picture}scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
                  scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,\
                  pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,\
                  tpad=stop_mode=clone:stop=-1,trim=end={end}[v{i}];"
             ));
             inputs.push_str(&format!("[v{i}]"));
-            if let Some(audio) = audio.and(*part_audio) {
+            if let Some(audio) = audio.and(part.audio) {
+                let trim = if lookback > 0 {
+                    format!("atrim=start={},asetpts=PTS-STARTPTS,", at(lookback))
+                } else {
+                    String::new()
+                };
                 graph.push_str(&format!(
-                    "[{i}:a:{audio}]aresample=48000:async=1:first_pts=0,\
+                    "[{i}:a:{audio}]{trim}aresample=48000:async=1:first_pts=0,\
                      aformat=channel_layouts=stereo,apad,atrim=end={end}[a{i}];"
                 ));
                 inputs.push_str(&format!("[a{i}]"));
@@ -1857,7 +1889,7 @@ async fn run_generation(
     // is fd 3, the witness fd 4, later parts fd 5 onward. The start's part
     // (core `parts::locate`) seeks to its offset; later parts follow whole.
     let durations: Vec<u64> = pin.parts.iter().map(|p| p.duration_ms).collect();
-    let part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
+    let mut part_inputs: Option<Vec<PartInput>> = if durations.is_empty() {
         None
     } else if session.canvas.is_none()
         || (audio.is_some() && pin.parts.iter().any(|p| p.audio.is_none()))
@@ -1874,9 +1906,15 @@ async fn run_generation(
         Some(
             (first..durations.len())
                 .map(|i| {
-                    let fd = if i == 0 { 3 } else { 4 + i as u32 };
                     let seek = if i == first { offset } else { 0 };
-                    (fd, seek, durations[i] - seek, pin.parts[i].audio)
+                    PartInput {
+                        fd: if i == 0 { 3 } else { 4 + i as u32 },
+                        seek,
+                        length: durations[i] - seek,
+                        audio: pin.parts[i].audio,
+                        burn: pin.parts[i].burn,
+                        lookback: 0,
+                    }
                 })
                 .collect(),
         )
@@ -1989,6 +2027,33 @@ async fn run_generation(
         }
         _ => None,
     };
+    // A burned bitmap subtitle across parts: the part playback starts in is
+    // read early enough for a cue still showing at its seek (later parts
+    // play from their beginning).
+    if let Some(head) = part_inputs
+        .as_mut()
+        .and_then(|inputs| inputs.first_mut())
+        .filter(|head| head.burn.is_some() && head.seek > 0 && !copies_video(operation))
+    {
+        let descriptor = if head.fd == 3 {
+            &input
+        } else {
+            &later[(head.fd - 5) as usize]
+        };
+        let index = head.burn.unwrap_or_default();
+        let sets = match bitmap_display_sets(&app, descriptor, index, head.seek, &lease).await {
+            Ok(sets) => sets,
+            Err(StuckProbe) => {
+                tracing::warn!(delivery=%session.id, generation, "subtitle lookback probe did not exit");
+                return fail(&app, &session);
+            }
+        };
+        if stop.is_cancelled() {
+            return stopped(&app, &session);
+        }
+        head.lookback =
+            head.seek - playscale_core::delivery::burn_read_from(head.seek, sets.as_deref());
+    }
     // Relative filter inputs (a burned subtitle) resolve from the generation
     // directory, so executables given as relative paths are resolved against
     // the server's own working directory first; bare names still use PATH.
@@ -3110,6 +3175,18 @@ fn validate_burn(
             "This subtitle cannot be burned here, and only a transcode burns subtitles",
         ))
     }
+}
+
+/// Whether subtitle stream `ordinal` of `file` is a bitmap subtitle a
+/// conversion overlays.
+fn bitmap_stream(file: &db::ItemRow, ordinal: u32) -> bool {
+    serde_json::from_str::<Vec<db::Track>>(&file.tracks_json).is_ok_and(|streams| {
+        streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(ordinal as usize)
+            .is_some_and(|t| core::burnable_subtitle(&t.codec))
+    })
 }
 
 /// A pinned plain-text sidecar: (fingerprint, file name).
@@ -4393,6 +4470,23 @@ async fn admit_owned(
             "An interval of a file is delivered only by a conversion",
         ));
     }
+    // A bitmap burned across parts is pinned in every part, and only then;
+    // each part's pinned stream is a bitmap subtitle of that revision.
+    let burns_bitmap = matches!(burn, Some(Burn::Bitmap(_)));
+    if !parts.is_empty()
+        && (parts.iter().any(|p| p.burn.is_some() != burns_bitmap)
+            || matches!(burn, Some(Burn::Text { .. }))
+            || parts.first().is_some_and(|p| {
+                p.burn
+                    .is_some_and(|b| Some(Burn::Bitmap(b)) != burn || !bitmap_stream(&file, b))
+            }))
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_unsupported",
+            "A subtitle is burned across parts only as a bitmap pinned in every part",
+        ));
+    }
     // Every later part must still be the pinned revision, available, in the
     // first part's library (whose root its source is opened under).
     let mut part_sources = Vec::new();
@@ -4409,6 +4503,13 @@ async fn admit_owned(
                 "A part of the timeline changed; plan again",
             ));
         };
+        if part.burn.is_some_and(|b| !bitmap_stream(&row, b)) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subtitle_unsupported",
+                "A part's burned subtitle is not a bitmap subtitle",
+            ));
+        }
         part_sources.push((row.id, row.revision, row.relative_path, row.fingerprint));
     }
     let duration_ms = match clip {

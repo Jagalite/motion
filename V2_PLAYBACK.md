@@ -130,8 +130,9 @@ What remains:
   styled (ASS/SSA) subtitles and their fonts, needs libass. On multipart
   versions a text subtitle component that occurs in every part is delivered
   (chosen explicitly or automatically by the profile), each part's own
-  stream joined in timeline time; sidecars and burned subtitles across
-  parts are refused. Before a burned bitmap subtitle is converted from a
+  stream joined in timeline time, and a bitmap component in every part is
+  burned into each part's own pictures for a client that accepts burned
+  subtitles; sidecars and burned text (libass) across parts are refused. Before a burned bitmap subtitle is converted from a
   start or seek, its display sets in the 5 minutes before are probed; a cue
   still showing at the start is read from its own display set, so it is
   drawn. Cues established earlier than that are not restored.

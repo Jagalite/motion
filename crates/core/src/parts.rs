@@ -51,6 +51,22 @@ pub struct PartPin {
     /// when absent, so pins without it serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle: Option<u32>,
+    /// The zero-based subtitle stream of this part that carries the selected
+    /// bitmap subtitle component, burned into this part's own pictures
+    /// (`burnable_subtitle` in every part); None when none is burned.
+    /// Omitted when absent, so pins without it serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn: Option<u32>,
+}
+
+/// Whether a bitmap subtitle component can be burned across parts: it
+/// occurs in every part and each occurrence is a bitmap subtitle a
+/// conversion overlays (`delivery::burnable_subtitle`).
+pub fn burnable_across(codecs: &[Option<&str>]) -> bool {
+    !codecs.is_empty()
+        && codecs
+            .iter()
+            .all(|c| c.is_some_and(crate::delivery::burnable_subtitle))
 }
 
 /// Whether two multipart layouts are the same timeline: the same files,
@@ -157,6 +173,20 @@ pub fn joinable_subtitle(codecs: &[Option<&str>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bitmap_subtitle_burns_across_parts_only_as_a_bitmap_in_every_part() {
+        assert!(burnable_across(&[
+            Some("hdmv_pgs_subtitle"),
+            Some("dvd_subtitle")
+        ]));
+        assert!(!burnable_across(&[Some("hdmv_pgs_subtitle"), None]));
+        assert!(!burnable_across(&[
+            Some("hdmv_pgs_subtitle"),
+            Some("subrip")
+        ]));
+        assert!(!burnable_across(&[]));
+    }
 
     #[test]
     fn a_subtitle_joins_across_parts_only_as_text_in_every_part() {
@@ -280,6 +310,7 @@ mod tests {
             duration_ms: 1_000,
             audio,
             subtitle: None,
+            burn: None,
         };
         assert!(same_layout(
             &[pin("a", Some(0)), pin("b", Some(1))],

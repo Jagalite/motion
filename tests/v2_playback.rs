@@ -7887,3 +7887,220 @@ async fn pgs_compositions_reusing_objects_are_read_from_their_epoch() {
     let inside = sum / (220 * 40);
     assert!(inside > 225, "reused cue not drawn: {inside}");
 }
+
+/// A bitmap subtitle component present in every part is burned into each
+/// part's own pictures for a client that accepts burned subtitles, and a
+/// start inside a later part still draws that part's cue showing there.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_subtitles_are_burned_across_parts() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    // Two 8 s parts, each with its own English PGS cue over most of it.
+    for name in ["a-part1", "b-part2"] {
+        let base = f.dir.path().join(format!("{name}.mp4"));
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-t",
+                "8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "48",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+            ])
+            .arg(&base)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let sup = f.dir.path().join(format!("{name}.sup"));
+        std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 0, 7000)).unwrap();
+        f.media(
+            &format!("{name}.mkv"),
+            &[
+                "-i",
+                base.to_str().unwrap(),
+                "-i",
+                sup.to_str().unwrap(),
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-c",
+                "copy",
+                "-metadata:s:s:0",
+                "language=eng",
+            ],
+        );
+    }
+    f.scan().await;
+    let file = |name: &'static str| {
+        let db = f.server.app.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, f64)>(
+                "SELECT id,revision,duration_seconds FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _, first_seconds) = file("a-part1.mkv").await;
+    let (second, second_revision, _) = file("b-part2.mkv").await;
+    let db = &f.server.app.db;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) WHERE id=?")
+        .bind(&first)
+        .bind(&second)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+    )
+    .bind(&version)
+    .bind(&second)
+    .bind(&second_revision)
+    .execute(db)
+    .await
+    .unwrap();
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let component = playscale::components::timeline_components(db, &timeline)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.kind == playscale_core::components::Kind::Subtitle)
+        .unwrap()
+        .id;
+    let plan = |modes: Value| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        let component = component.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_component_id"] = json!(component);
+            input["tracks"]["subtitle_policy"] = json!("require");
+            input["client"]["subtitle_modes"] = modes;
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    // A client that presents only text cannot be given a bitmap.
+    assert_eq!(plan(json!(["text"])).await.body["status"], "blocked");
+    let burned = plan(json!(["burned"])).await;
+    assert_eq!(
+        burned.body["operation"], "video_transcode",
+        "{}",
+        burned.body
+    );
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let offset = (first_seconds * 1000.0) as u64;
+    for (n, start) in [(1, 0), (2, offset + 2000)] {
+        let planned = plan(json!(["burned"])).await;
+        let admitted = f
+            .post(
+                "/api/v2/playback/delivery-sessions",
+                &auth,
+                Some(&format!("burned-parts-session-{n}")),
+                json!({"plan_token": planned.body["plan_token"], "start_ms": start}),
+            )
+            .await;
+        assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+        let id = admitted.body["id"].as_str().unwrap().to_owned();
+        let ready = f
+            .until(&id, &auth, |d| {
+                d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start
+                    || d["active"]["status"] == "failed"
+            })
+            .await;
+        assert_ne!(ready["active"]["status"], "failed", "{ready}");
+        let base_url = format!("/api/v2/streams/{id}/1");
+        let fragment = f.dir.path().join(format!("parts-{n}.mp4"));
+        std::fs::write(
+            &fragment,
+            [
+                get(format!("{base_url}/variants/main/init.mp4")).await,
+                get(format!("{base_url}/segments/0.m4s")).await,
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let frame = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&fragment)
+            .args([
+                "-ss",
+                "0.5",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(frame.len(), 320 * 240);
+        let mean = |x0: usize, y0: usize| {
+            let mut sum = 0usize;
+            for y in y0..y0 + 40 {
+                sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                    .iter()
+                    .map(|&p| p as usize)
+                    .sum::<usize>();
+            }
+            sum / (220 * 40)
+        };
+        let (inside, below) = (mean(50, 50), mean(50, 150));
+        assert!(
+            inside > 225 && below < 200,
+            "start {start}: box {inside}, picture {below}"
+        );
+        let closed = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/playback/delivery-sessions/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    }
+}

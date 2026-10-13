@@ -656,11 +656,49 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `aa963d5` is clean: no actionable findings.
 
-### Remaining item 3 slices (not started)
+### 3C (part 4). Burned bitmap subtitles across parts
+
+- **Source SHA:** branch `plan-completion/multipart-burn`, stacked on
+  `plan-completion/bitmap-lookback`.
+- **Implemented:**
+  - **Planning:** a subtitle component that occurs in every part as a
+    bitmap (core `parts::burnable_across`) is burned for a client that
+    accepts burned subtitles. This applies whether it is chosen explicitly
+    or automatically: automatic candidates across parts are text, joined,
+    for a client presenting text, otherwise burned bitmaps. Each part's own
+    stream is pinned as `PartPin.burn`, which is additive and omitted when
+    absent. Burned text (libass) across parts stays refused.
+  - **Admission:** the plan's burn and every part's burn must agree.
+    Each part's pinned stream must be a bitmap subtitle of that exact
+    revision; otherwise 422 `subtitle_unsupported`.
+  - **Conversion:** each part's subpicture is overlaid on its own pictures
+    (its canvas scaled to theirs) before they are normalized into the
+    concat canvas. The part playback starts in is probed like a single
+    file (3C part 3): it is read from the display set still showing at
+    its seek, and the extra time is trimmed in the graph (video and audio).
+    Later parts play from their beginning.
+- **Found while testing:** the single-file read-earlier output trim was
+  also applied to a multipart conversion. It cut more than the remaining
+  part, so the encoder exited before its first segment. That trim now
+  applies to one file only.
+- **Core/adapter boundary:** what may be burned across parts is core
+  `burnable_across`; where to read from is core `burn_read_from`. The
+  adapter maps components to each part's tracks, verifies pins at
+  admission and builds the graph. The route model is unchanged (burning
+  and multipart already require a conversion).
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core | 164 passed. New: `a_bitmap_subtitle_burns_across_parts_only_as_a_bitmap_in_every_part` |
+  | `tests/v2_playback.rs` `bitmap_subtitles_are_burned_across_parts` | passed. Two parts, each with its own PGS cue: a text-only client is refused; for a burned client the conversion from 0 s draws part 1's box, and from 2 s into part 2 draws part 2's box (its display set precedes that seek) |
+  | `v2_playback` 35, `route_selection_model` | passed; clippy clean |
+
+### Remaining item 3 slices
 
 | Slice | Next step |
 |---|---|
-| 3C burned subtitles across parts | Per-part burn inputs in the concat graph (bitmap overlay per part; text needs per-part libass extraction) |
+| 3C burned text subtitles across parts | Per-part libass extraction (`burn-text` per part, with fonts) and a per-part `subtitles` filter in the concat graph |
 
 ## 4. Library-management UI workflows
 
