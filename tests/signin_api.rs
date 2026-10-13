@@ -1273,14 +1273,15 @@ async fn oidc_reservation_case(cancel_exchange: bool) {
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let observed: Value = client
+            let observed = client
                 .get(format!("{origin}/fixture/status"))
                 .send()
                 .await
                 .unwrap()
-                .json()
+                .bytes()
                 .await
                 .unwrap();
+            let observed: Value = serde_json::from_slice(&observed).unwrap();
             if observed["exchanges"] == 1 {
                 break;
             }
@@ -1356,14 +1357,15 @@ async fn oidc_reservation_case(cancel_exchange: bool) {
         let replay = f.call("GET", &path, None, &[("cookie", &cookie)]).await;
         assert_eq!(replay.status, StatusCode::CONFLICT);
     }
-    let observed: Value = client
+    let observed = client
         .get(format!("{origin}/fixture/status"))
         .send()
         .await
         .unwrap()
-        .json()
+        .bytes()
         .await
         .unwrap();
+    let observed: Value = serde_json::from_slice(&observed).unwrap();
     assert_eq!(
         observed["exchanges"], 1,
         "duplicates and restart never retry the provider code"
