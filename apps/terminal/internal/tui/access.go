@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -200,6 +201,9 @@ func textField(label, id, value string) accessField {
 	in := textinput.New()
 	in.Prompt = ""
 	in.CharLimit = 400
+	if id == "labels" || id == "ratings" {
+		in.CharLimit = 0
+	}
 	in.SetValue(value)
 	return accessField{label: label, kind: "text", id: id, input: in}
 }
@@ -235,7 +239,7 @@ func (m *Model) grantFields(d *accessDialog, u api.User) {
 	if d.kind == "invite" {
 		d.fields = append(d.fields, textField("Expires in seconds (60–86400)", "ttl", "600"))
 	}
-	d.fields = append(d.fields, toggle("Allow unrated content", "unrated", "", u.Policy.AllowUnrated), toggle("Deny all rated content", "deny_rated", "", u.Policy.DenyRated), textField("Allowed ratings (comma separated; empty = any unless denied)", "ratings", strings.Join(u.Policy.AllowedRatings, ",")), textField("Blocked labels (comma separated)", "labels", strings.Join(u.Policy.BlockedLabels, ",")))
+	d.fields = append(d.fields, toggle("Allow unrated content", "unrated", "", u.Policy.AllowUnrated), toggle("Deny all rated content", "deny_rated", "", u.Policy.DenyRated), textField("Allowed ratings (JSON list; [] = any unless denied)", "ratings", accessList(u.Policy.AllowedRatings)), textField("Blocked labels (JSON list)", "labels", accessList(u.Policy.BlockedLabels)))
 	profiles, _ := data[[]api.Profile](*m, keyProfiles)
 	for _, p := range profiles {
 		d.fields = append(d.fields, toggle("Profile: "+clean(p.Name), "profile", p.ID, has(u.ProfileIDs, p.ID)))
@@ -440,14 +444,19 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 	f.input, cmd = f.input.Update(msg)
 	return cmd
 }
-func splitAccess(value string) []string {
-	out := []string{}
-	for _, v := range strings.Split(value, ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			out = append(out, v)
-		}
+func accessList(values []string) string {
+	if values == nil {
+		values = []string{}
 	}
-	return out
+	encoded, _ := json.Marshal(values)
+	return string(encoded)
+}
+func parseAccessList(value string) ([]string, error) {
+	var values []string
+	if err := json.Unmarshal([]byte(value), &values); err != nil || values == nil {
+		return nil, fmt.Errorf("enter a JSON list of strings, for example [\"PG\",\"PG-13\"]")
+	}
+	return values, nil
 }
 func (d *accessDialog) input() (api.UserInput, int64, error) {
 	in := api.UserInput{ProfileIDs: []string{}, Permissions: []string{}, Policy: api.GrantPolicy{LibraryIDs: []string{}, AllowedRatings: []string{}, BlockedLabels: []string{}}}
@@ -480,9 +489,17 @@ func (d *accessDialog) input() (api.UserInput, int64, error) {
 			case "name":
 				in.Name = f.input.Value()
 			case "ratings":
-				in.Policy.AllowedRatings = splitAccess(f.input.Value())
+				values, err := parseAccessList(f.input.Value())
+				if err != nil {
+					return in, 0, err
+				}
+				in.Policy.AllowedRatings = values
 			case "labels":
-				in.Policy.BlockedLabels = splitAccess(f.input.Value())
+				values, err := parseAccessList(f.input.Value())
+				if err != nil {
+					return in, 0, err
+				}
+				in.Policy.BlockedLabels = values
 			case "ttl":
 				var err error
 				ttl, err = strconv.ParseInt(f.input.Value(), 10, 64)

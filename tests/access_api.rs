@@ -4717,3 +4717,65 @@ async fn explicit_operator_source_keeps_administrative_event_disclosure() {
     assert_eq!(events[0].0, "changed");
     assert_eq!(events[0].1["resource_id"], "auth-test");
 }
+
+#[tokio::test]
+async fn administrator_user_edit_ignores_revoked_device_label_overflow() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, _, user_id) = f.pair_owned(&["default"], &["catalog:read"]).await;
+    let auth = bearer(OPERATOR);
+    let labels: Vec<_> = (0..200).map(|i| format!("old-{i}")).collect();
+    let path = format!("/api/v2/devices/{device}/policy");
+    let changed = f.call("PUT", &path, Some(json!({"library_ids":[],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":labels,"permissions":["catalog:read"]})), &[("authorization", &auth),("if-match", "\"r-1\"")]).await;
+    assert_eq!(changed.status, StatusCode::OK);
+    let revoked = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[
+                ("authorization", &auth),
+                ("if-match", changed.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT);
+    let device_before = f
+        .call(
+            "GET",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    let upath = format!("/api/v2/users/{user_id}");
+    let user = f
+        .call("GET", &upath, None, &[("authorization", &auth)])
+        .await;
+    let mut edit = user_edit(user.body.clone());
+    edit["policy"]["blocked_labels"] = json!(["new-label"]);
+    let changed = f
+        .call(
+            "PUT",
+            &upath,
+            Some(edit),
+            &[
+                ("authorization", &auth),
+                ("if-match", user.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.body);
+    assert_eq!(
+        changed.body["policy"]["blocked_labels"],
+        json!(["new-label"])
+    );
+    let device_after = f
+        .call(
+            "GET",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(device_before.body, device_after.body);
+}

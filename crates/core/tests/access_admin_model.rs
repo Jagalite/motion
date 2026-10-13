@@ -407,6 +407,12 @@ impl Model for Access {
             ),
             check("exact_effect_count", t.outputs.len() == 1),
             check(
+                "user_edit_preserves_permanent_device_revocation",
+                !matches!(input, Input::EditUser(_))
+                    || !s.device.as_ref().is_some_and(|d| d.revoked)
+                    || n.device == s.device,
+            ),
+            check(
                 "unavailable_invite_never_issues",
                 !(s.now >= 60
                     || !s.issuer

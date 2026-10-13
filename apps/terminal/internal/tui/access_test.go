@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -90,7 +92,7 @@ func TestAccessFormsPreserveExplicitRatedDenial(t *testing.T) {
 		}
 		for i := range d.fields {
 			if d.fields[i].id == "ratings" {
-				d.fields[i].input.SetValue("G")
+				d.fields[i].input.SetValue(`["G"]`)
 			}
 		}
 		if _, _, err := d.input(); err == nil {
@@ -241,5 +243,38 @@ func TestAuthorizationWithdrawalClearsAccessAndFencesLateSecrets(t *testing.T) {
 	m.accessFinished(accessDone{epoch: epoch, invitation: &api.Invitation{Code: "late-secret"}})
 	if m.access != nil {
 		t.Fatal("sign-out retained or restored dialog")
+	}
+}
+
+func TestAccessPolicyListsRoundTripWithoutWeakening(t *testing.T) {
+	m := New(context.Background(), &fake{}, "", nil)
+	labels := []string{"comma,label", " quote\"and space "}
+	for i := 0; i < 198; i++ {
+		labels = append(labels, strings.Repeat("x", 96)+fmt.Sprintf("%03d", i))
+	}
+	for _, kind := range []string{"user", "invite", "approve"} {
+		d := &accessDialog{kind: kind}
+		m.grantFields(d, api.User{Name: "Before", Policy: api.GrantPolicy{BlockedLabels: labels, AllowedRatings: []string{"PG,custom"}}})
+		for i := range d.fields {
+			if d.fields[i].id == "name" {
+				d.fields[i].input.SetValue("After")
+			}
+		}
+		in, _, err := d.input()
+		if err != nil || !reflect.DeepEqual(in.Policy.BlockedLabels, labels) || !reflect.DeepEqual(in.Policy.AllowedRatings, []string{"PG,custom"}) {
+			t.Fatalf("%s changed a policy list: %v", kind, err)
+		}
+	}
+}
+func TestAccessPagesUseOwnCacheAndEmptyMessage(t *testing.T) {
+	m := New(context.Background(), &fake{}, "", nil)
+	for _, c := range []struct {
+		page       page
+		key, empty string
+	}{{pageUsers, keyUsers, "No access users."}, {pagePairings, keyPairings, "No pending pairing requests."}, {pageInvitations, keyInvitations, "No invitations."}} {
+		m.route = route{page: c.page}
+		if m.tableKey() != c.key || m.tableEmpty() != c.empty {
+			t.Fatalf("wrong cache or empty message for %v", c.page)
+		}
 	}
 }

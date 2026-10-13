@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"github.com/charmbracelet/x/term"
 	"io"
@@ -23,9 +22,9 @@ func redeemCmd(env *Env) *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "Terminal", "device name shown to administrators")
 	cmd.Flags().StringVar(&accepted, "credential-store", "", "credential storage consent (file)")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
-		ctx, cancel := context.WithTimeout(cmd.Context(), env.Timeout)
-		defer cancel()
-		c, err := env.Connect(ctx)
+		connectCtx, connectCancel := env.context(cmd.Context())
+		c, err := env.Connect(connectCtx)
+		connectCancel()
 		if err != nil {
 			return err
 		}
@@ -48,7 +47,14 @@ func redeemCmd(env *Env) *cobra.Command {
 		if err != nil && err != io.EOF {
 			return err
 		}
-		input := api.RedemptionInput{Code: strings.TrimSpace(code), ClaimID: api.NewIdempotencyKey(), DeviceName: name, ClientName: "motion-terminal"}
+		code = strings.TrimSpace(code)
+		claim, err := c.Store.BeginRedemption(c.Health.ServerID, code, accepted, store.RedemptionClaim{ClaimID: api.NewIdempotencyKey(), DeviceName: name})
+		if err != nil {
+			return err
+		}
+		ctx, cancel := env.context(cmd.Context())
+		defer cancel()
+		input := api.RedemptionInput{Code: code, ClaimID: claim.ClaimID, DeviceName: claim.DeviceName, ClientName: "motion-terminal"}
 		var credential api.Credential
 		for attempt := 0; attempt < 3; attempt++ {
 			credential, err = c.RedeemInvitation(ctx, input)

@@ -190,6 +190,12 @@ func project(width int, specs []column, rows []table.Row, ids []string) ([]table
 
 func (m Model) tableKey() string {
 	switch m.route.page {
+	case pageUsers:
+		return keyUsers
+	case pagePairings:
+		return keyPairings
+	case pageInvitations:
+		return keyInvitations
 	case pageProcessing:
 		return keyJobs
 	case pageScans:
@@ -208,6 +214,12 @@ func (m Model) tableKey() string {
 
 func (m Model) tableEmpty() string {
 	switch m.route.page {
+	case pageUsers:
+		return "No access users."
+	case pagePairings:
+		return "No pending pairing requests."
+	case pageInvitations:
+		return "No invitations."
 	case pageProcessing:
 		return "No jobs. Scans, matching and conversions appear here while they run."
 	case pageScans:

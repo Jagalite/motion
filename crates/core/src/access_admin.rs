@@ -74,6 +74,10 @@ pub fn authorize_grant(
 /// silently widens an existing device's approval. Every user edit fences old
 /// policy-bound sessions/deliveries, even if the effective grant stays equal.
 pub fn constrain(device: &Device, user: &User) -> Result<Device, AccessError> {
+    // Revocation is permanent. Obsolete restrictions cannot block edits to active siblings.
+    if device.revoked {
+        return Ok(device.clone());
+    }
     let mut next = device.clone();
     next.revision = match access::revise(device.revision, device.revision, true)? {
         access::Revised::Next(n) => n,

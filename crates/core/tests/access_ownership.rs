@@ -216,3 +216,17 @@ fn linked_and_reenabled_methods_preserve_the_initiating_device_ceiling() {
         Err(AccessError::UserDisabled)
     );
 }
+
+#[test]
+fn revoked_device_is_not_reconstrained_by_later_user_edits() {
+    let mut device = device();
+    device.revoked = true;
+    device.revision = u64::MAX;
+    device.policy.blocked_labels = (0..200).map(|i| format!("old-{i}")).collect();
+    for disabled in [false, true] {
+        let mut owner = user();
+        owner.disabled = disabled;
+        owner.policy.blocked_labels.insert("new-restriction".into());
+        assert_eq!(admin::constrain(&device, &owner).unwrap(), device);
+    }
+}
