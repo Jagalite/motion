@@ -718,18 +718,31 @@ pub(crate) async fn download_form(
     device_id: String,
     profile_id: String,
     timeline_id: String,
+    #[default] prepared: Vec<crate::facade::PreparedDownload>,
 ) -> Result<impl View> {
     let tracks = r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"auto","audio_track_id":null,"subtitle_track_id":null}"#;
     Ok(view! {
         <div class="download-action" data-desktop-only="true" hidden=(true)>
             command_form(command: "POST /api/v2/downloads".to_string(), label: "Save for offline", idempotent: true, class: Some("command inline"),
-                <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id)>
-                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id)>
-                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id)>
+                <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
                 <input type="hidden" name="version_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
             )
+            // A prepared version is saved with exactly the selection it kept.
+            for version in prepared.iter() {
+                command_form(command: "POST /api/v2/downloads".to_string(), label: "Save this version for offline", idempotent: true, class: Some("command inline"),
+                    <span class="small">(version.label.as_str())</span>
+                    <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                    <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                    <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
+                    <input type="hidden" name="version_id" data-type=(kind(Field::Json)) value="null">
+                    <input type="hidden" name="recipe_id" data-type=(kind(Field::Text)) value=(version.recipe_id.as_str())>
+                    <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(version.tracks_json.as_str())>
+                )
+            }
         </div>
     })
 }

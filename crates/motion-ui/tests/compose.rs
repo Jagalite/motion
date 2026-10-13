@@ -878,4 +878,16 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
     ] {
         assert!(action.contains(field), "{field}");
     }
+    // A ready prepared version is offered too, with exactly its recipe and
+    // the selection it kept (5E).
+    let prepared = &item[item
+        .find("H.264 720p · audio 2 · subtitle 1")
+        .expect("prepared version")..];
+    let prepared = &prepared[..prepared.find("</form>").unwrap()];
+    assert!(prepared.contains(r#"name="recipe_id" data-type="text" value="h264720p""#));
+    assert!(
+        prepared.contains(r#"&quot;audio_track_id&quot;:&quot;a1&quot;"#),
+        "{prepared}"
+    );
+    assert!(prepared.contains("Save this version for offline"));
 }

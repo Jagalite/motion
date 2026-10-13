@@ -230,6 +230,11 @@ impl UiQueryFacade for MockUiQueryFacade {
                             availability: Availability::Available,
                             summary: "H.264 1920×1080 · audio: English 2ch, Français 2ch · subtitles: English SDH".into(),
                         }],
+                        prepared_downloads: vec![crate::facade::PreparedDownload {
+                            label: "H.264 720p · audio 2 · subtitle 1".into(),
+                            recipe_id: "h264720p".into(),
+                            tracks_json: r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"require","audio_track_id":"a1","subtitle_track_id":"s0"}"#.into(),
+                        }],
                     }]
                 })
                 .unwrap_or_default();

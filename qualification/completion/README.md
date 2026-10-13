@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice and transfer-state PRs | Merge by user; then 5E |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented (review pending); 5E part 2 and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state and prepared-downloads PRs | Merge by user; then 5E part 2 |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1009,11 +1009,64 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `f7cd792`: clean.
 
+### 5E (part 1). Downloading a prepared version with its kept selection
+
+- **Source SHA:** branch `plan-completion/prepared-downloads`, stacked on
+  5D (`plan-completion/transfer-state`).
+- **Implemented:** a device can save a ready prepared version (3D) instead
+  of the original. Previously a recipe was always refused.
+  - **API:** `createDownload` with a `recipe_id` resolves the requested
+    tracks on the source revision each rendition was prepared from (the
+    same resolver as `createPreparation`). It chooses the ready rendition
+    of that recipe that is current for its source and carries exactly that
+    selection, decided by core `processing::carries`. Otherwise it answers
+    `download_preparation_unavailable`. Nothing is prepared on request and
+    another selection is never substituted. An original download keeps
+    refusing track pins, since it is copied whole.
+  - **Expiry:** a prepared download expires when its rendition is no
+    longer current for its source (`renditions::available`), not only
+    when its own binding changes.
+  - **`Rendition`:** gains `recipe_id` and the `tracks` it kept (optional,
+    additive). The title page offers each ready prepared version, in
+    words ("H.264 720p · audio 2 · subtitle 1"), as "Save this version for
+    offline". The form sends exactly that recipe and selection.
+  - The device agent is unchanged: a prepared version is one MP4 file. A
+    kept text subtitle travels inside it as `mov_text`.
+- **Core/adapter boundary:**
+  - **Core:** the choice among originals and prepared renditions
+    (`downloads::choose` with `Candidate::prepared`); whether a rendition
+    carries the selection (`processing::carries`); whether it is current
+    (`renditions::available`).
+  - **Adapter:** reads the rendition facts and resolves the selection on
+    the exact source revision.
+- **Evidence:**
+  - Core lib: 157 passed. New: the exact rendition is chosen among other
+    recipes and other selections; refusal without one; a stale rendition
+    is no candidate; an original request never answers with a rendition.
+  - `v2_playback`: 30 passed. The 3D test now also downloads the real
+    prepared rendition:
+    - its manifest pins the rendition's digest;
+    - other audio, or no subtitle, is refused with
+      `download_preparation_unavailable`;
+    - after the source changes, the download is `expired`.
+  - compose: 22 passed (prepared version offered with its recipe and kept
+    selection).
+  - `v2_downloads` 8, `v2_metadata_processing` 18, `m3_workflows` 2,
+    contract 5 and JS 96 passed.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:**
+  - A device without `processing:request` sees only the original option,
+    because `listRenditions` requires it; the API accepts the request
+    either way.
+  - Subtitles as separate offline files, and artwork and metadata files in
+    the manifest, remain (5E part 2).
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5E prepared and track-selected downloads | Manifest files for renditions, subtitles and artwork with pins | Item 3D (preparation by component) |
+| 5E part 2 subtitles, artwork and metadata as offline files | Manifest files for subtitle sidecars, artwork and metadata with pins; the offline host presents them | 5E part 1 |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work

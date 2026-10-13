@@ -18432,6 +18432,21 @@
               "failed",
               "expired"
             ]
+          },
+          "recipe_id": {
+            "description": "The recipe it was prepared with.",
+            "$ref": "#/components/schemas/Id"
+          },
+          "tracks": {
+            "description": "The selection it kept, as recorded on its source revision (track pins resolved to that revision's streams). createDownload with this recipe_id and selection downloads exactly it.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TrackSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -19039,6 +19054,7 @@
             ]
           },
           "recipe_id": {
+            "description": "Null downloads the original file whole (tracks must then select nothing). A recipe downloads the ready prepared version of that recipe that is current for its source and carries exactly the selected tracks (resolved like createPreparation on the source revision it was prepared from); otherwise download_preparation_unavailable. Nothing is prepared on request and another selection is never substituted.",
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Id"

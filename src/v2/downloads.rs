@@ -53,11 +53,11 @@ impl From<Refusal> for Problem {
             Refusal::NotFound => Problem::not_found(),
             Refusal::PreparationUnavailable => unsupported(
                 "download_preparation_unavailable",
-                "Downloading a prepared rendition is not available; request the original (recipe_id null)",
+                "No ready prepared version of that recipe carries exactly this selection; prepare one first, or request the original (recipe_id null)",
             ),
             Refusal::TrackSelectionUnavailable => unsupported(
                 "download_tracks_unavailable",
-                "Downloads copy the complete original file; component/track pins and required subtitles are not available",
+                "An original is downloaded whole; to keep only chosen tracks, download a prepared version (recipe_id)",
             ),
             Refusal::MultipartUnavailable => unsupported(
                 "download_multipart_unavailable",
@@ -185,6 +185,29 @@ async fn observe(
     .bind(&row.file_revision)
     .fetch_optional(&mut *conn)
     .await?;
+    // A prepared rendition is bound only while it is current for its source
+    // (`renditions::available`); an original has no rendition record.
+    let rendition: Option<(bool, String, String, String, String)> = sqlx::query_as(
+        "SELECT (f.available=1),f.revision,r.file_revision,s.revision,r.source_revision FROM renditions r \
+         JOIN media_files f ON f.id=r.file_id JOIN media_files s ON s.id=r.source_file_id \
+         WHERE r.file_id=? AND f.generated=1",
+    )
+    .bind(&row.file_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let bound = bound.filter(|_| {
+        rendition.as_ref().is_none_or(
+            |(available, revision, registered, source, registered_source)| {
+                playscale_core::renditions::available(
+                    *available,
+                    revision,
+                    registered,
+                    source,
+                    registered_source,
+                )
+            },
+        )
+    });
     let facts = file_facts(conn, &row.file_id).await?;
     let readable = match readable_timeline(conn, principal, &row.timeline_id).await {
         Ok(_) => access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
@@ -391,6 +414,173 @@ async fn candidates(
             content_type: content_type(&path),
             size_bytes: u64::try_from(bytes).unwrap_or(0),
             duration_ms,
+            prepared: None,
+        });
+    }
+    Ok(found)
+}
+
+/// A prepared rendition bound to the timeline (a generated version) as a
+/// download candidate: its recipe, whether it is still current for its
+/// source (`renditions::available`), and whether it carries exactly the
+/// requested selection, resolved on its source's exact revision
+/// (`processing::selection`, then `processing::carries`).
+#[allow(clippy::too_many_arguments)]
+async fn prepared_candidates(
+    app: &App,
+    conn: &mut SqliteConnection,
+    principal: &Principal,
+    timeline: &str,
+    version: Option<&str>,
+    timeline_duration: Option<i64>,
+    tracks: &TrackInput,
+) -> Result<Vec<Candidate>, Problem> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<f64>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT v.id,f.id,f.revision,b.file_revision,(f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1)),\
+         r.file_revision,s.id,s.revision,r.source_revision,j.recipe,p.tracks_json,f.relative_path,f.bytes,f.duration_seconds \
+         FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+         JOIN media_files f ON f.id=b.file_id JOIN renditions r ON r.file_id=f.id AND r.source='playscale' \
+         JOIN processing_jobs j ON j.id=r.external_id JOIN preparations p ON p.job_id=j.id \
+         JOIN media_files s ON s.id=r.source_file_id \
+         WHERE v.timeline_id=? AND v.origin='generated' AND f.generated=1 AND (? IS NULL OR v.id=?) \
+         AND b.start_ms IS NULL AND b.end_ms IS NULL \
+         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+         ORDER BY r.updated_at DESC,v.id LIMIT 200",
+    )
+    .bind(timeline)
+    .bind(version)
+    .bind(version)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut found = Vec::with_capacity(rows.len());
+    for (
+        version,
+        file,
+        revision,
+        bound,
+        available,
+        registered,
+        source,
+        source_revision,
+        registered_source,
+        recipe,
+        recorded,
+        path,
+        bytes,
+        seconds,
+    ) in rows
+    {
+        let current = playscale_core::renditions::available(
+            available,
+            &revision,
+            &registered,
+            &source_revision,
+            &registered_source,
+        );
+        // The selection on the source revision the rendition was prepared
+        // from; a selection it cannot express there is carried by nothing.
+        let streams: Vec<crate::db::Track> =
+            sqlx::query_scalar::<_, String>("SELECT tracks_json FROM media_files WHERE id=?")
+                .bind(&source)
+                .fetch_one(&mut *conn)
+                .await
+                .map(|json| serde_json::from_str(&json).unwrap_or_default())?;
+        let requested = super::processing::Tracks {
+            audio_component_id: tracks.audio_component_id.clone(),
+            subtitle_component_id: tracks.subtitle_component_id.clone(),
+            subtitle_policy: match tracks.subtitle_policy {
+                SubtitlePolicy::Off => "off",
+                SubtitlePolicy::Auto => "auto",
+                SubtitlePolicy::Require => "require",
+            }
+            .into(),
+            audio_track_id: tracks.audio_track_id.clone(),
+            subtitle_track_id: tracks.subtitle_track_id.clone(),
+        };
+        let resolved = super::processing::selection(
+            app,
+            conn,
+            timeline,
+            &super::processing::FileRef {
+                file_id: source.clone(),
+                file_revision: source_revision.clone(),
+            },
+            &streams,
+            requested,
+        )
+        .await;
+        let carries = match resolved {
+            Ok(selection) => {
+                let ordinal = |id: Option<&String>, prefix: char| {
+                    id.and_then(|i| i.strip_prefix(prefix)?.parse::<u32>().ok())
+                };
+                let record: Option<super::processing::Tracks> =
+                    serde_json::from_str(&recorded).ok();
+                let default_audio = streams.iter().any(|t| t.kind == "audio").then_some(0);
+                let audio = ordinal(selection.audio_track_id.as_ref(), 'a').or(default_audio);
+                let wanted = playscale_core::processing::Wanted {
+                    audio,
+                    audio_chosen: selection.audio_track_id.is_some(),
+                    default_audio,
+                    subtitle: match ordinal(selection.subtitle_track_id.as_ref(), 's') {
+                        Some(n) => playscale_core::processing::WantedSubtitle::Text(n),
+                        None => playscale_core::processing::WantedSubtitle::None,
+                    },
+                };
+                let carried = match record {
+                    Some(r) => playscale_core::processing::Carried::Encoded(
+                        playscale_core::processing::Encoded {
+                            audio: ordinal(r.audio_track_id.as_ref(), 'a'),
+                            subtitle: ordinal(r.subtitle_track_id.as_ref(), 's'),
+                        },
+                    ),
+                    None => playscale_core::processing::Carried::Unreadable,
+                };
+                playscale_core::processing::carries(carried, wanted)
+            }
+            Err(_) => false,
+        };
+        let facts = file_facts(conn, &file).await?;
+        found.push(Candidate {
+            version_id: version,
+            file_id: file,
+            bound_current: current && bound == revision && is_sha256(&revision),
+            file_revision: revision,
+            original: false,
+            parts: 1,
+            interval: false,
+            available,
+            readable: access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
+            content_type: content_type(&path),
+            size_bytes: u64::try_from(bytes).unwrap_or(0),
+            duration_ms: timeline_duration
+                .filter(|d| *d > 0)
+                .map(|d| d as u64)
+                .or_else(|| {
+                    seconds
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .map(|s| (s * 1000.0).round() as u64)
+                }),
+            prepared: Some(playscale_core::downloads::Prepared {
+                recipe_id: recipe,
+                carries_selection: carries,
+            }),
         });
     }
     Ok(found)
@@ -442,14 +632,30 @@ pub async fn create(
             .bind(&input.timeline_id)
             .fetch_one(&mut *tx)
             .await?;
-    let found = candidates(
-        &mut tx,
-        &principal,
-        &input.timeline_id,
-        input.version_id.as_deref(),
-        timeline_duration,
-    )
-    .await?;
+    let found = match input.recipe_id {
+        None => {
+            candidates(
+                &mut tx,
+                &principal,
+                &input.timeline_id,
+                input.version_id.as_deref(),
+                timeline_duration,
+            )
+            .await?
+        }
+        Some(_) => {
+            prepared_candidates(
+                &app,
+                &mut tx,
+                &principal,
+                &input.timeline_id,
+                input.version_id.as_deref(),
+                timeline_duration,
+                &input.tracks,
+            )
+            .await?
+        }
+    };
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM downloads WHERE device_id=? AND principal_id=? AND state='ready'",
     )

@@ -38,9 +38,11 @@ pub enum SubtitlePolicy {
     Require,
 }
 
-/// The requested track selection. The supported slice downloads the complete
-/// original file, so pins and required subtitles are refused explicitly
-/// rather than silently delivering another selection.
+/// The requested track selection. An original is downloaded whole, so its
+/// pins and required subtitles are refused explicitly rather than silently
+/// delivering another selection; a prepared download (`Request::recipe_id`)
+/// is the rendition carrying exactly this selection
+/// (`Candidate::prepared`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Tracks {
     pub audio_component_id: Option<String>,
@@ -77,6 +79,19 @@ pub struct Candidate {
     pub size_bytes: u64,
     /// Timeline duration, or the file's probed duration when the timeline has none.
     pub duration_ms: Option<u64>,
+    /// A prepared rendition (a generated version), with what it carries.
+    #[serde(default)]
+    pub prepared: Option<Prepared>,
+}
+
+/// What a prepared rendition is, observed by the adapter.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Prepared {
+    /// The recipe it was prepared with.
+    pub recipe_id: String,
+    /// It carries exactly the requested selection
+    /// (`processing::carries` against its recorded tracks).
+    pub carries_selection: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,7 +110,9 @@ pub struct Choice {
 pub enum Refusal {
     /// No readable, available original binds the timeline (or the version).
     NotFound,
-    /// Preparing a rendition for download is not implemented.
+    /// No ready prepared rendition of the requested recipe, current for its
+    /// source, carries exactly the requested selection. Nothing is prepared
+    /// on request; another selection is never substituted.
     PreparationUnavailable,
     /// Track pins or required subtitles cannot be honoured by a whole-file copy.
     TrackSelectionUnavailable,
@@ -119,23 +136,30 @@ pub fn choose(
     candidates: &[Candidate],
     active: usize,
 ) -> Result<Choice, Refusal> {
-    if request.recipe_id.is_some() {
-        return Err(Refusal::PreparationUnavailable);
-    }
     let t = &request.tracks;
-    if t.audio_component_id.is_some()
-        || t.subtitle_component_id.is_some()
-        || t.audio_track_id.is_some()
-        || t.subtitle_track_id.is_some()
-        || t.subtitle_policy == SubtitlePolicy::Require
+    if request.recipe_id.is_none()
+        && (t.audio_component_id.is_some()
+            || t.subtitle_component_id.is_some()
+            || t.audio_track_id.is_some()
+            || t.subtitle_track_id.is_some()
+            || t.subtitle_policy == SubtitlePolicy::Require)
     {
         return Err(Refusal::TrackSelectionUnavailable);
     }
-    let mut refusal = Refusal::NotFound;
-    let readable = candidates.iter().filter(|c| {
+    // An original, or exactly the prepared rendition the request names.
+    let wanted = |c: &&Candidate| match (&request.recipe_id, &c.prepared) {
+        (None, None) => c.original,
+        (Some(recipe), Some(p)) => !c.original && &p.recipe_id == recipe && p.carries_selection,
+        _ => false,
+    };
+    let mut refusal = if request.recipe_id.is_some() {
+        Refusal::PreparationUnavailable
+    } else {
+        Refusal::NotFound
+    };
+    let readable = candidates.iter().filter(wanted).filter(|c| {
         c.readable
             && c.available
-            && c.original
             && c.bound_current
             && request
                 .version_id
@@ -186,7 +210,7 @@ impl Refusal {
     /// The more specific of two refusals: the one later in the admission order.
     fn max_specific(self, other: Refusal) -> Refusal {
         let rank = |r: Refusal| match r {
-            Refusal::NotFound => 0,
+            Refusal::NotFound | Refusal::PreparationUnavailable => 0,
             Refusal::MultipartUnavailable => 1,
             Refusal::ContainerUnavailable => 2,
             Refusal::DurationUnknown => 3,
@@ -710,6 +734,7 @@ mod tests {
             content_type: Some("video/mp4".into()),
             size_bytes: 10,
             duration_ms: Some(100_000),
+            prepared: None,
         }
     }
     fn request() -> Request {
@@ -727,6 +752,49 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_download_is_exactly_the_rendition_carrying_the_selection() {
+        let prepared = |version: &str, recipe: &str, carries: bool| Candidate {
+            version_id: version.into(),
+            file_id: format!("file-{version}"),
+            original: false,
+            prepared: Some(Prepared {
+                recipe_id: recipe.into(),
+                carries_selection: carries,
+            }),
+            ..candidate()
+        };
+        let mut r = request();
+        r.recipe_id = Some("h264720p".into());
+        r.tracks.audio_track_id = Some("a1".into());
+        r.tracks.subtitle_policy = SubtitlePolicy::Require;
+        r.tracks.subtitle_track_id = Some("s0".into());
+        let all = [
+            candidate(),
+            prepared("other-recipe", "remux_mp4", true),
+            prepared("other-tracks", "h264720p", false),
+            prepared("exact", "h264720p", true),
+        ];
+        assert_eq!(choose(&r, &all, 0).unwrap().version_id, "exact");
+        // Without a rendition that carries it: refused, never substituted.
+        assert_eq!(
+            choose(&r, &all[..3], 0),
+            Err(Refusal::PreparationUnavailable)
+        );
+        // A stale rendition (its source changed) or an unreadable one is not one.
+        let mut stale = prepared("exact", "h264720p", true);
+        stale.bound_current = false;
+        assert_eq!(
+            choose(&r, &[stale], 0),
+            Err(Refusal::PreparationUnavailable)
+        );
+        // An original request never answers with a rendition.
+        assert_eq!(
+            choose(&request(), &[prepared("exact", "h264720p", true)], 0),
+            Err(Refusal::NotFound)
+        );
+    }
+
+    #[test]
     fn choice_is_exact_and_refusals_are_specific() {
         let c = candidate();
         assert_eq!(
@@ -739,7 +807,8 @@ mod tests {
         r.recipe_id = Some("x".into());
         assert_eq!(
             choose(&r, std::slice::from_ref(&c), 0),
-            Err(Refusal::PreparationUnavailable)
+            Err(Refusal::PreparationUnavailable),
+            "an original never answers a prepared request"
         );
         let mut r = request();
         r.tracks.subtitle_policy = SubtitlePolicy::Require;

@@ -137,6 +137,26 @@ fn version_label(edition: &str, v: &Value, item_files: &[Value]) -> String {
     parts.join(" · ")
 }
 
+/// A prepared version in words: its recipe and the tracks it kept.
+fn prepared_label(r: &Value) -> String {
+    let recipe = match r["recipe_id"].as_str().unwrap_or("") {
+        "remux_mp4" => "MP4 copy",
+        "audio_aac" => "AAC audio",
+        "h264720p" => "H.264 720p",
+        "video_profile" => "Custom profile",
+        other => other,
+    };
+    let ordinal = |key: &str, prefix: char| {
+        r["tracks"][key]
+            .as_str()
+            .and_then(|id| id.strip_prefix(prefix)?.parse::<u32>().ok())
+    };
+    let mut parts = vec![recipe.to_owned()];
+    parts.extend(ordinal("audio_track_id", 'a').map(|n| format!("audio {}", n + 1)));
+    parts.extend(ordinal("subtitle_track_id", 's').map(|n| format!("subtitle {}", n + 1)));
+    parts.join(" · ")
+}
+
 fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
     let audio_tracks = v["tracks"]
         .as_array()
@@ -659,12 +679,37 @@ impl UiQueryFacade for Queries {
                     position_ms: v["position_ms"].as_u64().unwrap_or(0),
                     watched: v["watched"].as_bool().unwrap_or(false),
                 });
+                // Ready prepared versions, when this caller may save and read
+                // them; each is offered with exactly the selection it kept.
+                let prepared_downloads =
+                    if who.can("downloads:manage") && who.can("processing:request") {
+                        let query = url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("timeline_id", &timeline)
+                            .append_pair("limit", "50")
+                            .finish();
+                        self.read(&format!("/processing/renditions?{query}"))
+                            .await
+                            .ok()
+                            .and_then(|page| page["items"].as_array().cloned())
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|r| r["status"] == "ready" && r["tracks"].is_object())
+                            .map(|r| PreparedDownload {
+                                label: prepared_label(r),
+                                recipe_id: text(r, "recipe_id"),
+                                tracks_json: r["tracks"].to_string(),
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
                 timelines.push(TimelineView {
                     id: timeline,
                     edition: text(edition, "label"),
                     duration_ms: row["duration_ms"].as_u64(),
                     viewing,
                     versions,
+                    prepared_downloads,
                 });
             }
             // The planner decides per request; this only offers the action

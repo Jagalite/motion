@@ -123,6 +123,19 @@ pub struct TimelineView {
     /// None means the viewing service is unavailable, not an unstarted title.
     pub viewing: Option<TimelineViewing>,
     pub versions: Vec<VersionView>,
+    /// Ready prepared versions a device may save instead of the original,
+    /// each with exactly the selection it kept.
+    pub prepared_downloads: Vec<PreparedDownload>,
+}
+
+/// A ready prepared version offered for download.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedDownload {
+    /// Recipe and kept tracks, in words.
+    pub label: String,
+    pub recipe_id: String,
+    /// The selection it kept (TrackSelection JSON), sent unchanged.
+    pub tracks_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

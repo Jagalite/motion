@@ -224,9 +224,9 @@ pub(crate) struct Tracks {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FileRef {
-    file_id: String,
-    file_revision: String,
+pub(crate) struct FileRef {
+    pub file_id: String,
+    pub file_revision: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,7 +313,7 @@ pub(crate) async fn publication_facts(
 /// two agreeing when both are given. Returns the record the worker encodes
 /// and playback matches (`processing::carries`): `a{n}` and `s{n}` ordinals
 /// of the revision, with the requested components.
-async fn selection(
+pub(crate) async fn selection(
     app: &App,
     conn: &mut sqlx::SqliteConnection,
     timeline: &str,
@@ -698,8 +698,10 @@ async fn renditions(
         Option<String>,
         bool,
         bool,
+        String,
+        String,
     );
-    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {timeline} AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(&query.timeline_id).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1),j.recipe,p.tracks_json FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {timeline} AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(&query.timeline_id).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
     for (
         id,
@@ -715,6 +717,8 @@ async fn renditions(
         current,
         available,
         source_available,
+        recipe,
+        tracks,
     ) in rows
     {
         let binding = exact_binding(&mut tx, &timeline, &file, &revision).await?;
@@ -730,7 +734,10 @@ async fn renditions(
         let output = output.zip(output_revision).map(
             |(file_id, file_revision)| json!({"file_id":file_id,"file_revision":file_revision}),
         );
-        values.push((id.clone(),json!({"id":id,"revision":resource_revision.to_string(),"timeline_id":timeline,"source":{"file_id":file,"file_revision":revision},"output":output,"recipe_digest":digest,"job_id":id,"status":status})));
+        // The selection it kept, as recorded on its source revision; a
+        // download names exactly this (`createDownload` with `recipe_id`).
+        let tracks = serde_json::from_str::<Value>(&tracks).unwrap_or(Value::Null);
+        values.push((id.clone(),json!({"id":id,"revision":resource_revision.to_string(),"timeline_id":timeline,"source":{"file_id":file,"file_revision":revision},"output":output,"recipe_digest":digest,"job_id":id,"status":status,"recipe_id":recipe,"tracks":tracks})));
     }
     let result = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;

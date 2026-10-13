@@ -4419,6 +4419,61 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         vtt.contains("00:01.000 --> 00:03.000") && vtt.contains("Kept caption"),
         "{vtt}"
     );
+    // A device downloads exactly this prepared version (5E): the same recipe
+    // and selection; any other selection is refused, never substituted.
+    let (saver, saver_auth) = f
+        .device(
+            &["default"],
+            &["catalog:read", "downloads:manage", "viewing:write"],
+        )
+        .await;
+    let download = |key: &'static str, audio: &str, subtitle: Option<&str>| {
+        let f = &f;
+        let saver_auth = saver_auth.clone();
+        let body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+            "version_id": null, "recipe_id": "remux_mp4",
+            "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                "subtitle_policy": if subtitle.is_some() { "require" } else { "off" },
+                "audio_track_id": audio, "subtitle_track_id": subtitle}});
+        async move {
+            f.post("/api/v2/downloads", &saver_auth, Some(key), body)
+                .await
+        }
+    };
+    let saved = download("prepared-download-0001", "a1", Some("s0")).await;
+    assert_eq!(saved.status, StatusCode::ACCEPTED, "{}", saved.body);
+    let pinned = f
+        .get(
+            &format!(
+                "/api/v2/downloads/{}/manifest",
+                saved.body["id"].as_str().unwrap()
+            ),
+            &saver_auth,
+        )
+        .await;
+    let rendition_revision: String =
+        sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        pinned.body["files"][0]["digest"],
+        format!("sha256:{rendition_revision}"),
+        "{}",
+        pinned.body
+    );
+    for (key, audio, subtitle) in [
+        ("prepared-download-0002", "a0", Some("s0")),
+        ("prepared-download-0003", "a1", None),
+    ] {
+        let refused = download(key, audio, subtitle).await;
+        assert_eq!(
+            refused.body["code"], "download_preparation_unavailable",
+            "{}",
+            refused.body
+        );
+    }
     // A replan of the prepared delivery for the same selection keeps it.
     let id = admitted.body["id"].as_str().unwrap().to_owned();
     let again = plan("a1", Some("s0")).await;
@@ -4438,6 +4493,20 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         "{}",
         staged.body
     );
+    // The rendition's source changes: the prepared download is no longer
+    // current for it and expires (never served from a stale preparation).
+    sqlx::query("UPDATE media_files SET revision='changed-source' WHERE id=?")
+        .bind(source["file_id"].as_str().unwrap())
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let expired = f
+        .get(
+            &format!("/api/v2/downloads/{}", saved.body["id"].as_str().unwrap()),
+            &saver_auth,
+        )
+        .await;
+    assert_eq!(expired.body["state"], "expired", "{}", expired.body);
 }
 
 /// One gray frame of `path` at `at` seconds (320x240 sources).
