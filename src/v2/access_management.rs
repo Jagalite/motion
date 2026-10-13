@@ -334,6 +334,17 @@ pub struct PairingSummary {
     expires_at: String,
     status: &'static str,
 }
+#[derive(sqlx::FromRow)]
+struct PairingListRow {
+    id: String,
+    device_name: String,
+    client_name: String,
+    user_code: String,
+    created_at: i64,
+    expires_at: i64,
+    phase: String,
+    denied: bool,
+}
 pub async fn list_pairings(
     State(app): State<App>,
     caller: Caller,
@@ -344,11 +355,20 @@ pub async fn list_pairings(
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
         .await?;
-    let rows:Vec<(String,String,String,String,i64,i64,String,bool)>=sqlx::query_as("SELECT id,device_name,client_name,user_code,created_at,expires_at,phase,denied FROM pairings WHERE id>? ORDER BY id LIMIT ?").bind(q.after()?).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows: Vec<PairingListRow> =sqlx::query_as("SELECT id,device_name,client_name,user_code,created_at,expires_at,phase,denied FROM pairings WHERE id>? ORDER BY id LIMIT ?").bind(q.after()?).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let rows = rows
         .into_iter()
         .map(
-            |(id, device_name, client_name, user_code, created, expires, phase, denied)| {
+            |PairingListRow {
+                 id,
+                 device_name,
+                 client_name,
+                 user_code,
+                 created_at: created,
+                 expires_at: expires,
+                 phase,
+                 denied,
+             }| {
                 let status = if denied {
                     "denied"
                 } else if phase == "claimed" {
@@ -504,11 +524,13 @@ fn invite_body(
     })
 }
 async fn issuer_current(
+    app: &App,
     conn: &mut sqlx::SqliteConnection,
     row: &InviteRow,
 ) -> Result<bool, Problem> {
     if row.issuer_id == "operator" {
-        return Ok(row.issuer_credential_hash.is_none());
+        return Ok(row.issuer_credential_hash.as_deref()
+            == Some(auth::token_hash(&app.admin_token).as_str()));
     }
     let Some(hash) = &row.issuer_credential_hash else {
         return Ok(false);
@@ -525,6 +547,7 @@ async fn issuer_current(
     }
 }
 async fn invitation_available(
+    app: &App,
     conn: &mut sqlx::SqliteConnection,
     row: &InviteRow,
 ) -> Result<bool, Problem> {
@@ -532,7 +555,7 @@ async fn invitation_available(
         return Ok(false);
     };
     let inv = row.invitation()?;
-    Ok(issuer_current(conn, row).await?
+    Ok(issuer_current(app, conn, row).await?
         && admin::authorize_grant(&user, inv.user_revision, &inv.grant, &inv.policy).is_ok())
 }
 pub async fn list_invitations(
@@ -553,7 +576,7 @@ pub async fn list_invitations(
             .await?;
     let mut output = vec![];
     for row in rows {
-        let available = invitation_available(&mut tx, &row).await?;
+        let available = invitation_available(&app, &mut tx, &row).await?;
         output.push((row.id.clone(), invite_body(&row, None, available)?));
     }
     let body = page(&mut tx, &principal, output, limit).await?;
@@ -604,7 +627,7 @@ pub async fn create_invitation(
         if row.revoked
             || row.device_id.is_some()
             || now() >= row.expires_at
-            || !invitation_available(&mut tx, &row).await?
+            || !invitation_available(&app, &mut tx, &row).await?
         {
             return Err(AccessError::ReplayUnavailable.into());
         }
@@ -646,7 +669,12 @@ pub async fn create_invitation(
     let id = new_id();
     let nonce = auth::nonce();
     let code = auth::derive_secret(&app.access.key, Purpose::Invitation, &nonce);
-    sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(auth::token_hash(&code)).bind(&user.id).bind(expected as i64).bind(&principal.id).bind(principal.policy_revision as i64).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(json(&grant.profile_ids)).bind(json(&grant.permissions)).bind(json(&input.policy)).bind(now()).bind(now()+input.ttl_seconds).execute(&mut *tx).await?;
+    let issuer_hash = if principal.id == "operator" {
+        Some(auth::token_hash(&app.admin_token))
+    } else {
+        caller.credential.as_ref().map(|(hash, _)| hash.clone())
+    };
+    sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(auth::token_hash(&code)).bind(&user.id).bind(expected as i64).bind(&principal.id).bind(principal.policy_revision as i64).bind(issuer_hash).bind(json(&grant.profile_ids)).bind(json(&grant.permissions)).bind(json(&input.policy)).bind(now()).bind(now()+input.ttl_seconds).execute(&mut *tx).await?;
     let row: InviteRow = sqlx::query_as("SELECT * FROM access_invitations WHERE id=?")
         .bind(&id)
         .fetch_one(&mut *tx)
@@ -743,7 +771,7 @@ pub async fn redeem_invitation(
     let user = load_user(&mut tx, &row.user_id)
         .await?
         .ok_or(AccessError::InvitationUnavailable)?;
-    let issuer = issuer_current(&mut tx, &row).await?;
+    let issuer = issuer_current(&app, &mut tx, &row).await?;
     let invitation = row.invitation()?;
     // Bind the full request so a retry cannot rename or reassign the device.
     let claim_hash = super::sha256(

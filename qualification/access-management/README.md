@@ -54,6 +54,17 @@ security restrictions. Boundary and transaction rollback tests are added;
 focused Sol review at `057c55a` confirmed the fix and found no new issue.
 There are no unresolved source findings. Execution of the new regression remains
 pending with the Rust queue.
+Self-review additionally pinned operator-created invitations to the current
+operator token hash. Sol confirmed the adapter observation and existing core
+issuer rule align; token rotation invalidates unused invitations and claim
+retries while leaving already issued device credentials independent. Regression
+execution remains pending.
+
+CI at `057c55a` exposed a Topcoat boolean-attribute syntax error and a model lint;
+`9ba2e03` fixed both. That head compiled past the UI and exposed a pairing-row
+Clippy type-complexity warning; the row is now a named adapter struct. Earlier
+failed lanes stopped at compilation and are not runtime evidence.
+
 PR: https://github.com/Jagalite/motion/pull/36 (draft, not merged).
 
 ## Verification status

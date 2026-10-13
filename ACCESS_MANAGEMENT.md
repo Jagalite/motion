@@ -54,7 +54,8 @@ can return the same credential only for the same retained claim identity and exa
 request. A second claimant never receives a new credential. Expiry, target-user
 revision changes, or loss/change of the issuing administrator credential or policy
 invalidate outstanding invitations and claim retries. Creation through the
-server-local operator is tied to that installation's key. Redemption has a durable
+server-local operator is pinned to its current token; rotating that token also
+invalidates its invitations. Redemption has a durable
 server-wide limit of 30 attempts per minute, including unknown codes; restart does
 not reset it. This limit can temporarily delay legitimate recipients during abuse.
 Codes never belong in URLs, command arguments, logs, screenshots, or issue reports.

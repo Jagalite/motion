@@ -4325,3 +4325,44 @@ async fn administrator_user_label_overflow_rolls_back_every_revision_and_restric
         );
     }
 }
+
+#[tokio::test]
+async fn administrator_operator_token_rotation_invalidates_unused_invitation_and_claim_replay() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Operator rotation").await;
+    let unused = access_invite(&f, &user, "operator-unused").await;
+    let used = access_invite(&f, &user, "operator-used").await;
+    let claim = redemption(&used["code"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(claim.clone()),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let mut rotated = f.app.clone();
+    rotated.admin_token = Arc::new("new-operator-secret-0123456789abcdef".into());
+    for input in [
+        claim,
+        redemption(&unused["code"], "0123456789abcdef0123456789abcdef"),
+    ] {
+        let response = api::router(rotated.clone(), None)
+            .oneshot(f.request("POST", "/api/v2/auth/invitations/redeem", Some(&input), &[]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "invitation_unavailable");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
