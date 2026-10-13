@@ -25,6 +25,8 @@ pub struct Track {
     #[serde(default)]
     pub height: Option<u32>,
     #[serde(default)]
+    pub rotation_degrees: i32,
+    #[serde(default)]
     pub average_frame_rate: Option<crate::encoding::FrameRate>,
     #[serde(default)]
     pub bitrate: Option<u64>,
@@ -74,13 +76,22 @@ pub struct Track {
 }
 
 /// The scanner's current stream probe version (`Track::probe_version`).
-pub const PROBE_VERSION: u32 = 1;
+pub const PROBE_VERSION: u32 = 2;
 
 fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
 impl Track {
+    pub fn display_dimensions(&self) -> (u32, u32) {
+        let size = (self.width.unwrap_or(0), self.height.unwrap_or(0));
+        if matches!(self.rotation_degrees.rem_euclid(360), 90 | 270) {
+            (size.1, size.0)
+        } else {
+            size
+        }
+    }
+
     /// The probed colour facts the core HDR policy decides from.
     pub fn color_facts(&self) -> playscale_core::color::ColorFacts<'_> {
         playscale_core::color::ColorFacts {
@@ -98,12 +109,7 @@ impl Track {
     /// an HDR video stream's colour facts, or an attachment's MIME type and
     /// size (which bound burned-subtitle fonts). The next scan probes it again.
     pub fn lacks_probe_facts(&self) -> bool {
-        self.probe_version < PROBE_VERSION
-            && match self.kind.as_str() {
-                "video" => playscale_core::color::hdr(self.color_transfer.as_deref()).is_some(),
-                "attachment" => true,
-                _ => false,
-            }
+        self.probe_version < PROBE_VERSION && matches!(self.kind.as_str(), "video" | "attachment")
     }
 }
 #[derive(Debug, Serialize, ToSchema)]
@@ -767,4 +773,22 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         .await?;
     restored.close().await;
     Ok(receipt)
+}
+
+#[cfg(test)]
+#[test]
+fn preview_geometry_uses_display_rotation() {
+    for rotation in [0, 90, -90, 180, 270] {
+        let track: Track = serde_json::from_value(serde_json::json!({"index":0,"kind":"video","codec":"h264","language":null,"width":1920,"height":1080,"rotation_degrees":rotation})).unwrap();
+        let expected = if matches!(rotation, 90 | -90 | 270) {
+            (1080, 1920)
+        } else {
+            (1920, 1080)
+        };
+        assert_eq!(track.display_dimensions(), expected);
+        assert!(
+            track.lacks_probe_facts(),
+            "old video probe must refresh orientation"
+        );
+    }
 }

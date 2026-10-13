@@ -563,3 +563,14 @@ test('a superseded thumbnail lookup settles at once and a retired player release
   releaseSheets(element);
   assert.deepEqual(revoked, ['blob:1', 'blob:2'], 'released once');
 });
+
+test('authored previews require the exact playing file and revision', () => {
+  const {matchingPreviewSource} = runInNewContext(source.replace('export {close, maintainLease};', '({matchingPreviewSource});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const manifest = {file_id: 'cut-a', file_revision: 'r1'};
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r1'}), true);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-b', file_revision: 'r1'}), false);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r2'}), false);
+  assert.equal(matchingPreviewSource(manifest, null), false);
+});

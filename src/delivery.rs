@@ -5514,15 +5514,20 @@ pub(crate) async fn open_source(
     app: &App,
     file_id: &str,
     revision: &str,
+    lease: std::sync::Arc<crate::execution::Lease>,
+    stop: &CancellationToken,
 ) -> Result<(std::fs::File, String), ApiError> {
     let source = source_of(app, file_id, revision).await?;
     let fingerprint = source.fingerprint.clone();
-    let opened = tokio::time::timeout(
+    let opened = crate::execution::prepare(
+        lease,
+        stop,
         PROBE_DEADLINE,
-        tokio::task::spawn_blocking(move || source_valid(&source)),
+        move || source_valid(&source),
+        || {},
     )
     .await
-    .map_err(|_| ApiError::conflict("source_unavailable", "The file could not be opened"))?
+    .ok_or_else(|| ApiError::conflict("source_unavailable", "The file could not be opened"))?
     .map_err(ApiError::internal)?
     .map_err(|_| ApiError::conflict("source_revision_changed", "The file changed"))?;
     Ok((opened, fingerprint))

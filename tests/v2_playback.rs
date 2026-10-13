@@ -8329,6 +8329,35 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         (StatusCode::OK, &queued.body["job_id"])
     );
     assert_eq!(done.body["status"], "ready");
+    // Technical metadata changes invalidate previews and retries even when bytes do not.
+    let ready_file = ready["file_id"].as_str().unwrap();
+    sqlx::query("UPDATE media_files SET duration_seconds=30 WHERE id=?")
+        .bind(ready_file)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "none");
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    let stale_retry = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/retry"),
+            &operator,
+            Some("preview-stale-retry-01"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(stale_retry.status, StatusCode::NOT_FOUND);
+    sqlx::query("UPDATE media_files SET duration_seconds=25 WHERE id=?")
+        .bind(ready_file)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "ready");
     // Sheets missing on disk (a database restored without them): retention
     // withdraws the previews, and a request renders them again.
     let file_id = ready["file_id"].as_str().unwrap().to_owned();
@@ -8340,6 +8369,19 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         .join("previews")
         .join(&file_id)
         .join(&revision);
+    // A corrupted sparse sheet is refused without loading its full length.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(published.join("sheet-1.jpg"))
+        .unwrap()
+        .set_len(playscale_core::previews::MAX_SHEET_BYTES + 1)
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &url, None, &[("authorization", &auth)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
     std::fs::remove_file(published.join("sheet-1.jpg")).unwrap();
     playscale::v2::previews::retain(&f.server.app)
         .await

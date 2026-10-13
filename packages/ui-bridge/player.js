@@ -515,12 +515,15 @@ function unlessAborted(promise, signal) {
  * with the player). Optional: without them, or on any failure, the player
  * keeps its own previews.
  */
-async function attachPreviews(element, base, timeline) {
+function matchingPreviewSource(manifest, source) {
+  return !!source && manifest?.file_id === source.file_id && manifest?.file_revision === source.file_revision;
+}
+async function attachPreviews(element, base, timeline, source) {
   try {
     const {AuthoredPreviewProvider} = await import(`${base}web/generated/index.js`);
     if (typeof AuthoredPreviewProvider !== 'function' || typeof element.player?.preview?.addProvider !== 'function') return;
     const manifest = await api('GET', `/api/v2/catalog/timelines/${encodeURIComponent(timeline)}/previews`, undefined, undefined, AbortSignal.timeout(10000));
-    if (manifest?.status !== 'ready' || !element.isConnected) return;
+    if (manifest?.status !== 'ready' || !element.isConnected || !matchingPreviewSource(manifest, source)) return;
     const held = {sheets: new Map(), made: new Set(), controller: new AbortController()};
     sheetUrls.set(element, held);
     const {sheets, made, controller} = held;
@@ -554,7 +557,7 @@ async function attachPreviews(element, base, timeline) {
   }
 }
 
-async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false} = {}) {
+async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false, source = state.delivery?.source} = {}) {
   const data = host.dataset;
   const previous = state.element?.player.state;
   const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate} : null);
@@ -574,7 +577,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await openGeneration(element, generation, position, location.origin);
-    void attachPreviews(element, data.demuxeBase, data.timelineId);
+    if (element.controls) void attachPreviews(element, data.demuxeBase, data.timelineId, source);
     if (generation.subtitles_url && generation.transport === 'hls') {
       // A live generation's selected subtitle is its manifest's subtitle
       // rendition: select that (the only in-manifest subtitle) and show it.
@@ -745,7 +748,7 @@ async function switchDelivery(plan) {
         return renewed;
       },
       failed: error => { leaseFailure = error; }});
-    element = await preparePlayer(generation, position, current, preferences, {inert: true});
+    element = await preparePlayer(generation, position, current, preferences, {inert: true, source: ready.source});
     if (!current()) throw new Error('Playback ownership changed.');
     if (leaseFailure) throw leaseFailure;
     if (state.viewing) {

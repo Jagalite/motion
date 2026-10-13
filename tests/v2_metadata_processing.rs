@@ -2195,6 +2195,16 @@ async fn preview_schedules_queue_each_revision_once_within_the_queue() {
         .execute(&f.app.db)
         .await
         .unwrap();
+    let identity = playscale::v2::sha256(
+        serde_json::to_string(&(Some(60.0), video))
+            .unwrap()
+            .as_bytes(),
+    );
+    sqlx::query("UPDATE previews SET layout_identity=? WHERE file_id='file-pv-c'")
+        .bind(identity)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     let op = format!("Bearer {OPERATOR}");
     let created = f
         .call(

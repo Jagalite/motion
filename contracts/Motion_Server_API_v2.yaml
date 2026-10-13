@@ -4038,6 +4038,12 @@ paths:
       required: true
       schema:
         $ref: '#/components/schemas/Id'
+    - name: layout
+      in: query
+      required: true
+      description: Opaque layout identity from the manifest sheet URL; changes with technical metadata.
+      schema:
+        type: string
     get:
       operationId: getPreviewSheet
       summary: Read one trick-play preview sheet

@@ -1518,7 +1518,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | `tests/contract.rs` (served-operation ledger) | 5 passed with `listMarkers` and `createMarker` served |
   | `crates/motion-ui/tests/compose.rs` | 22 passed. New: manage-page marker list and form; player chapter and skip buttons with the detected label |
   | `tests/access_api.rs`, `tests/m3_workflows.rs` | 39 and 2 passed (pages that changed) |
-  | `node --test packages/ui-bridge` | 43 passed. New: skip buttons only inside their interval; seconds sent as milliseconds |
+  | `node --test packages/ui-bridge/*.test.mjs` | 43 passed. New: skip buttons only inside their interval; seconds sent as milliseconds |
 - **Review (GPT-6.1 Sol):** round 1 at `43b0827` against item 4 raised four
   P2 findings, all fixed in the follow-up commit:
 
@@ -1767,7 +1767,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   | Check | Result |
   |---|---|
-  | `node --test packages/ui-bridge` | 46 passed. New: crops at and between positions and on a second sheet; nothing beyond the end, for a pending or malformed manifest, or for a foreign sheet URL |
+  | `node --test packages/ui-bridge/*.test.mjs` | 46 passed. New: crops at and between positions and on a second sheet; nothing beyond the end, for a pending or malformed manifest, or for a foreign sheet URL |
   | Electron 44.7.0 with the deployed Demuxe (manual harness: local server, `demuxe-player` on a sample MP4, `AuthoredPreviewProvider` returning a `blob:` sheet with a crop, then `preview.request` at 12 s) | Demuxe validated and returned the frame unchanged: path `motion-previews`, time 10 s, 160×90, `blob:` URI, crop at x=160. That is the result shape `attachPreviews` produces |
 - **Not covered:** an automated end-to-end run of the online player
   showing thumbnails while scrubbing (needs the full server and player in
@@ -1813,13 +1813,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - **Focus after a command:** a successful command reloaded the
     server-rendered page, losing a keyboard or screen-reader user's place
     and announcing nothing. The bridge now remembers the form (command and
-    position) for that page. After the reload it focuses the same form's
+    stable action identity) for that page. After the reload it focuses the same form's
     button and sets its live status to "Done."; if the form is gone (what
     it changed was removed) it focuses the main content. Sign-in and
     profile switching, which change the whole page, are unchanged.
 - **Result:** no violations remain except `region` on the mock facade's
-  own banner, which exists only with the mock. Every page's first Tab stop
-  is "Skip to content"; the chrome's is its address field.
+  own banner, which exists only with the mock. The recorded library-page first Tab result is inconclusive (BODY rather
+  than the skip link); it requires a fresh browser audit. The receipt also
+  recorded the parent revision rather than the tested contrast patch, so
+  this historical audit does not qualify a reproducible committed artifact.
 - **Not covered:** a screen reader pass (VoiceOver or NVDA) needs a person,
   and stays an item 8 release check. Interactive states beyond the first
   Tab stop are covered by the focus unit test, not the audit. The offline
@@ -1829,7 +1831,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | Check | Result |
   |---|---|
   | `a11y-audit.json` | 15 presentation pages, desktop chrome, 2 offline pages; only the mock banner's `region` remains |
-  | `node --test packages/ui-bridge` | 48 passed. New: after a reload the same form's button is focused with "Done." (same command, second form); when the form is gone the main content is focused; another page moves nothing; the remembered place is used once |
+  | `node --test packages/ui-bridge/*.test.mjs` | 48 passed. New: after a reload the same form's button is focused with "Done." (same command, second form); when the form is gone the main content is focused; another page moves nothing; the remembered place is used once |
   | compose | 22 passed; clippy clean |
 - **Review (GPT-6.1 Sol):** round 1 at `e0a394d` raised two P2 findings,
   both fixed:

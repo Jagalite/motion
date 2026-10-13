@@ -192,6 +192,7 @@ function restoreAfterReload() {
     sessionStorage.removeItem(AFTER_COMMAND);
   } catch { return; }
   if (!saved || saved.page !== location.pathname + location.search) return;
+  if (document.activeElement?.matches?.('main [role="alert"]')) return;
   const matches = [...document.querySelectorAll('form[data-command]')].filter(f => formIdentity(f) === saved.form);
   const form = matches.length === 1 ? matches[0] : null;
   // A form inside closed disclosures is shown again before it takes focus.
