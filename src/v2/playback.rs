@@ -1691,8 +1691,8 @@ pub async fn plan(
         } else {
             subtitle
         };
-        if let Some(index) = candidate {
-            if let Ok((_, _, Some(selected_burn))) = resolve_subtitle(
+        if let Some(index) = candidate
+            && let Ok((_, _, Some(selected_burn))) = resolve_subtitle(
                 &mut conn,
                 &bound.file,
                 &streams,
@@ -1703,13 +1703,12 @@ pub async fn plan(
                 None,
             )
             .await?
-            {
-                subtitle = None;
-                burn = Some(selected_burn);
-                request.burn_in = true;
-                decided = core::plan(&bound.file.id, &source, &request);
-                automatic_burn_resolved = automatic && !require;
-            }
+        {
+            subtitle = None;
+            burn = Some(selected_burn);
+            request.burn_in = true;
+            decided = core::plan(&bound.file.id, &source, &request);
+            automatic_burn_resolved = automatic && !require;
         }
     }
     // A prepared plan pins the chosen rendition and plays its default streams:

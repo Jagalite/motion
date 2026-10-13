@@ -1990,13 +1990,13 @@ pub async fn sync(
             )
         })?),
     };
-    if let Some((_, through)) = &reanchor {
-        if !core::reanchor_batch(*through, acknowledged, events.first().map(|e| e.sequence)) {
-            return Err(Problem::invalid(
-                "invalid_reanchor",
-                "The re-anchor must match the acknowledgement and the first retained sequence",
-            ));
-        }
+    if let Some((_, through)) = &reanchor
+        && !core::reanchor_batch(*through, acknowledged, events.first().map(|e| e.sequence))
+    {
+        return Err(Problem::invalid(
+            "invalid_reanchor",
+            "The re-anchor must match the acknowledgement and the first retained sequence",
+        ));
     }
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
