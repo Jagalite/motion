@@ -701,7 +701,7 @@ async fn search(cx: &Cx) -> Result<impl View> {
             <label class="visually-hidden" for="page-search">"Search the catalog"</label>
             icon(name: "search")
             <input id="page-search" type="search" name="q" placeholder="Search titles" autocomplete="off"
-                enterkeyhint="search">
+                enterkeyhint="search" value=(view_model.query.as_str())>
         </form>
         <header class="page-header">
             <h1 class="page-title">(heading.as_str())</h1>

@@ -40,6 +40,14 @@ function observe(state, force = false) {
   latest = {position_ms: Math.min(context.duration_ms, Math.max(0, Math.round(state.currentTime * 1000))), status: state.status};
   void flush().catch(fail);
 }
+function snapshotClosePath() {
+  const ticket = /^\/cache\/media\/([a-f0-9]{32})$/.exec(context?.media_url ?? '')?.[1];
+  return ticket ? `/cache/close/${ticket}` : null;
+}
+async function releaseSnapshot() {
+  const path = snapshotClosePath();
+  if (path) await request(path, {});
+}
 async function close() {
   if (closing) return closing;
   closing = (async () => {
@@ -49,6 +57,7 @@ async function close() {
     await flush(); // Failure keeps native close/navigation retryable.
     await element?.destroy();
     element?.remove();
+    await releaseSnapshot();
   })().catch(error => { closing = null; fail(error); throw error; });
   return closing;
 }
@@ -58,13 +67,13 @@ async function start() {
   if (retired) return;
   definePlayerElement();
   context = await request(`/cache/open/${encodeURIComponent(host.dataset.downloadId)}`, {});
-  if (retired) return;
+  if (retired) { await releaseSnapshot(); return; }
   element = document.createElement('demuxe-player');
   element.setAttribute('asset-base', base);
   element.controls = true; element.showSourceControls = false; element.allowFileDrop = false;
   host.append(element);
   await element.open(context.media_url, {startTime: context.position_ms / 1000});
-  if (retired) { await element.destroy(); return; }
+  if (retired) { await element.destroy(); await releaseSnapshot(); return; }
   host.querySelector('.status-panel')?.remove();
   host.dataset.state = 'ready';
   unsubscribe = element.player.subscribe(state => observe(state));
@@ -80,6 +89,15 @@ document.addEventListener('click', event => {
   event.preventDefault();
   void close().then(() => location.assign(link.href)).catch(() => {});
 });
-addEventListener('pagehide', () => { retired = true; unsubscribe?.(); void element?.destroy(); });
+addEventListener('pagehide', () => {
+  retired = true; unsubscribe?.(); void element?.destroy();
+  const path = snapshotClosePath();
+  if (path) void fetch(path, {method: 'POST', credentials: 'same-origin', redirect: 'error', keepalive: true,
+    headers: {'Content-Type': 'application/json', 'X-Motion-Cache': '1'}, body: '{}'}).catch(() => {});
+});
 addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
-if (host) void start().catch(error => { host.dataset.state = 'failed'; fail(error); });
+if (host) void start().catch(async error => {
+  host.dataset.state = 'failed'; fail(error);
+  await element?.destroy(); element?.remove();
+  await releaseSnapshot().catch(() => {});
+});

@@ -45,6 +45,9 @@ func sourcesCmd(env *Env) *cobra.Command {
 				rows = append(rows, []string{s.ID, s.Name, s.RootPath, s.Availability})
 			}
 			table(w, "ID\tNAME\tROOT\tAVAILABILITY", rows)
+			if result.NextCursor != nil {
+				fmt.Fprintf(w, "More: --cursor %s\n", sanitize(*result.NextCursor))
+			}
 		})
 	})}
 	pageFlags(list, &cursor, &limit)
@@ -91,6 +94,9 @@ func catalogCmd(env *Env) *cobra.Command {
 				rows = append(rows, []string{item.ID, item.Title, item.Kind, item.Availability})
 			}
 			table(w, "ID\tTITLE\tKIND\tAVAILABILITY", rows)
+			if result.NextCursor != nil {
+				fmt.Fprintf(w, "More: --cursor %s\n", sanitize(*result.NextCursor))
+			}
 		})
 	}
 	list := &cobra.Command{Use: "list", Args: cobra.NoArgs, RunE: run(env, func(ctx context.Context, c *Conn) error {

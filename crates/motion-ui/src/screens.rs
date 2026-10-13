@@ -225,6 +225,8 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
     let kinds = [
         ("movies", "Movies"),
         ("television", "Television"),
+        ("music", "Music"),
+        ("photos", "Photos"),
         ("personal_video", "Personal video"),
         ("mixed", "Mixed"),
     ];

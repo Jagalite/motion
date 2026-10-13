@@ -419,3 +419,52 @@ async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
     drop(app);
     assert!(Cache::open(&moved).is_ok());
 }
+
+#[tokio::test]
+async fn snapshot_retirement_is_exact_and_reopening_invalidates_the_old_ticket() {
+    let (dir, _) = fixture();
+    let (app, cookie) = authenticated(Arc::new(Cache::open(dir.path()).unwrap())).await;
+    let mut urls = Vec::new();
+    for _ in 0..2 {
+        let (status, _, bytes) = request(
+            &app,
+            "POST",
+            "/cache/open/download",
+            &cookie,
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let opened: Value = serde_json::from_slice(&bytes).unwrap();
+        urls.push(opened["media_url"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(urls[0], urls[1]);
+    assert_eq!(
+        request(&app, "GET", &urls[0], &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let old_close = urls[0].replace("/cache/media/", "/cache/close/");
+    assert_eq!(
+        request(&app, "POST", &old_close, &cookie, Some(json!({})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "GET", &urls[1], &cookie, None).await.0,
+        StatusCode::OK
+    );
+    let close = urls[1].replace("/cache/media/", "/cache/close/");
+    for _ in 0..2 {
+        assert_eq!(
+            request(&app, "POST", &close, &cookie, Some(json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        request(&app, "GET", &urls[1], &cookie, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}

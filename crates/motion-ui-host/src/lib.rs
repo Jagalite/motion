@@ -446,6 +446,7 @@ impl Host {
         Router::new()
             .route("/cache/bootstrap", post(bootstrap))
             .route("/cache/open/{id}", post(open_media))
+            .route("/cache/close/{ticket}", post(close_media))
             .route("/cache/media/{ticket}", get(media))
             .route("/cache/events", post(record))
             .route("/ui/{file}", get(motion_ui::ui_asset))
@@ -543,16 +544,20 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     let Ok(_single) = host.opening.clone().try_lock_owned() else {
         return StatusCode::CONFLICT.into_response();
     };
+    // Retire the previous ticket before allocating its replacement. Bodies
+    // already admitted retain Arc<File> until their actual read completes;
+    // the new snapshot must fit alongside only those outstanding readers.
+    host.media.lock().unwrap().take();
     let cache = host.cache.clone();
     let download = id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         // Cancellation of the HTTP handler cannot admit another copy while this
         // blocking worker still consumes the snapshot disk budget.
-        let _single = _single;
-        cache.snapshot(&download)
+        let result = cache.snapshot(&download);
+        (result, _single)
     })
     .await;
-    let Ok(Ok((item, file))) = snapshot else {
+    let Ok((Ok((item, file)), _single)) = snapshot else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
     let history = host.cache.history.lock().unwrap();
@@ -580,6 +585,15 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     });
     Json(result).into_response()
 }
+async fn close_media(State(host): State<Host>, AxumPath(ticket): AxumPath<String>) -> Response {
+    let mut active = host.media.lock().unwrap();
+    if active.as_ref().is_some_and(|media| media.ticket == ticket) {
+        active.take();
+    }
+    // Exact-ticket retirement is idempotent and cannot close a newer open.
+    Json(json!({"closed":true})).into_response()
+}
+
 async fn record(State(host): State<Host>, Json(event): Json<OfflineEvent>) -> Response {
     match tokio::task::spawn_blocking(move || host.cache.record(event)).await {
         Ok(Ok(ack)) => Json(ack).into_response(),
