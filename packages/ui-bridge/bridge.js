@@ -95,6 +95,9 @@ async function call(method, path, body, headers = {}) {
 }
 
 function message(error) {
+  if (error.code === 'pairing_denied') return 'An administrator denied this pairing request. Ask them before starting a new request.';
+  if (error.code === 'pairing_expired') return 'The pairing code expired before it was approved. Start a new pairing request.';
+  if (error.code === 'invitation_unavailable') return 'This invitation is no longer available. Ask an administrator for a new code.';
   if (error.status === 409 || error.status === 412) return 'This changed somewhere else. Reload the page to see the latest version, then try again.';
   if (error.status === 401) return 'Your session has ended. Sign in again.';
   if (error.status === 403) return 'You are not allowed to do that.';

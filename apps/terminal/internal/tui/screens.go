@@ -397,6 +397,12 @@ func (m Model) listTitle() string {
 		return "Storage sources"
 	case pageDevices:
 		return "Paired devices"
+	case pagePairings:
+		return "Pairing requests"
+	case pageUsers:
+		return "Users and access"
+	case pageInvitations:
+		return "Access invitations"
 	case pageNowPlaying:
 		return "Sessions"
 	case pageHistory:
