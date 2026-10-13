@@ -72,4 +72,7 @@ embedding its whole text in `ModelMetadata.build` exceeded Stateless's default
 65,536-byte per-string trace bound. Access and caller models now record a
 `sha256:` fingerprint of the complete compile-time source (71 bytes). All model
 versions, state/transition limits, inputs, checks and exact-replay expectations
-are retained. No trace read/record limits are relaxed. Focused validation pending.
+are retained. No trace read/record limits are relaxed. Pinned Rust 1.98 Kyoto
+compile `e9091d92e3c8417f8465323c616e94c3` passed. The exact failing trace
+replay test passed (0.01 s). Caller model passed: 192 states, 2,304 transitions
+(0.03 s). The unchanged full access graph was not rerun for this metadata fix.
