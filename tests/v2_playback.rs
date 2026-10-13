@@ -8164,12 +8164,16 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         .post(&path, &operator, Some("preview-request-0002"), json!(null))
         .await;
     assert_eq!(first.status, StatusCode::ACCEPTED, "{}", first.body);
-    let cancelled_id = first.body["id"].as_str().unwrap().to_owned();
+    let cancelled_id = first.body["job_id"].as_str().unwrap().to_owned();
     let again = f
         .post(&path, &operator, Some("preview-request-0003"), json!(null))
         .await;
     assert_eq!(again.status, StatusCode::OK);
-    assert_eq!(again.body["id"], cancelled_id.as_str(), "never duplicated");
+    assert_eq!(
+        again.body["job_id"],
+        cancelled_id.as_str(),
+        "never duplicated"
+    );
     let cancel = f
         .post(
             &format!("/api/v2/jobs/{cancelled_id}/cancel"),
@@ -8184,7 +8188,19 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         .post(&path, &operator, Some("preview-request-0004"), json!(null))
         .await;
     assert_eq!(queued.status, StatusCode::ACCEPTED, "{}", queued.body);
-    assert_ne!(queued.body["id"], cancelled_id.as_str());
+    assert_ne!(queued.body["job_id"], cancelled_id.as_str());
+    assert_eq!(queued.body["status"], "pending");
+    // Retrying the cancelled job alongside the active one is refused.
+    let retried = f
+        .post(
+            &format!("/api/v2/jobs/{cancelled_id}/retry"),
+            &operator,
+            Some("preview-retry-00001"),
+            json!(null),
+        )
+        .await;
+    assert_eq!(retried.status, StatusCode::CONFLICT, "{}", retried.body);
+    assert_eq!(retried.body["code"], "preview_duplicate");
     assert_eq!(f.get(&path, &auth).await.body["status"], "pending");
     let stop = tokio_util::sync::CancellationToken::new();
     let worker = tokio::spawn(playscale::v2::previews::worker(
@@ -8200,7 +8216,7 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(ready["status"], "ready", "{ready}");
-    assert_eq!(ready["job_id"], queued.body["id"]);
+    assert_eq!(ready["job_id"], queued.body["job_id"]);
     // 25 s at one thumbnail per 10 s: 3 tiles of 160x120 on one sheet.
     assert_eq!(
         (
@@ -8268,9 +8284,37 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         .post(&path, &operator, Some("preview-request-0005"), json!(null))
         .await;
     assert_eq!(
-        (done.status, &done.body["id"]),
-        (StatusCode::OK, &queued.body["id"])
+        (done.status, &done.body["job_id"]),
+        (StatusCode::OK, &queued.body["job_id"])
     );
+    assert_eq!(done.body["status"], "ready");
+    // Sheets missing on disk (a database restored without them): retention
+    // withdraws the previews, and a request renders them again.
+    let file_id = ready["file_id"].as_str().unwrap().to_owned();
+    let revision = ready["file_revision"].as_str().unwrap().to_owned();
+    let root = &f.server.app.processing.root;
+    let published = root
+        .parent()
+        .unwrap_or(root)
+        .join("previews")
+        .join(&file_id)
+        .join(&revision);
+    std::fs::remove_file(published.join("sheet-1.jpg")).unwrap();
+    playscale::v2::previews::retain(&f.server.app)
+        .await
+        .unwrap();
+    assert_eq!(f.get(&path, &auth).await.body["status"], "none");
+    let rebuilt = f
+        .post(&path, &operator, Some("preview-request-0006"), json!(null))
+        .await;
+    assert_eq!(rebuilt.status, StatusCode::ACCEPTED, "{}", rebuilt.body);
+    for _ in 0..600 {
+        if f.get(&path, &auth).await.body["status"] == "ready" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(f.get(&path, &auth).await.body["status"], "ready");
     // The file changes: its previews retire with the old revision.
     sqlx::query("UPDATE media_files SET revision='0000000000000000000000000000000000000000000000000000000000000001'")
         .execute(&f.server.app.db)

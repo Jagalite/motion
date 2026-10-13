@@ -1662,6 +1662,22 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | core | 167 passed. New: layouts bound tiles and follow the picture shape; only the promised sheets validate and publish; a position finds its thumbnail |
   | `tests/v2_playback.rs` `previews_are_rendered_once_served_by_revision_and_retired` | passed. A reader cannot request rendering. A repeated request answers with the same job. A cancelled queued job never renders, and a new request queues again. The worker publishes one 1600×1200 sheet of three 160×120 thumbnails (25 s, one every 10 s). Another sheet number, no session, or a device scoped away from the library is refused. After a revision change, retention retires the previews |
   | `v2_playback` 36, `jobs_model` 3, contract 5, `v2_downloads` 11, `access_api` 39, `m3_workflows` 2, `catalog_workflows` 27, `catalog_persistence` 15, `scans` 8, `v2_catalog` 20 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `38d016e` raised one P1 and five P2
+  findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | V1 (P1) | The renderer was spawned directly: killing the server left it running unaccounted, and recovery could start a replacement beyond capacity | Fixed: the renderer runs under the FFmpeg supervisor, which ends it when the owner's pipe closes, with an ownership witness (`lease.started`, `confirm_exit`). Recovery re-registers held witnesses (`execution.recovered`) before requeuing, and retention leaves a held attempt's staging alone |
+  | V2 | The `fps` rounding rendered fewer thumbnails than the layout promises (0 for 3 s, 1 for 11 s), so sheets either failed or showed blank tiles | Fixed: `fps=…:start_time=0:round=down:eof_action=pass`, verified exact for 3 s, 11 s, 20 s, 25 s, 1,001 s (101 thumbnails) and sparse key frames. FFmpeg writes one thumbnail per tile, core `valid_thumbnails` checks the exact count and size, and the sheets are assembled from them in Rust, never padded |
+  | V3 | Retrying a cancelled job could requeue it beside a newer active job, or after publication, and bypassed the queue bound | Fixed: a preview retry is refused (409 `preview_duplicate`) beside an active job or published previews of the revision, and 503 when the queue is full. The active-job index is now unique per revision |
+  | V4 | A database restored without its preview files kept rows reporting `ready` while the sheets were gone | Fixed: retention withdraws rows whose sheets are not all on disk, so a request renders them again |
+  | V5 | Publication synced the sheets but not their directory entries or a new file-level directory before the commit | Fixed: the witness is removed, then the sheets, the staging directory, a newly created ancestor and the published directory and its parent are synced before the row commits |
+  | V6 | Deduplicated requests by another requester returned a partial `Job` | Fixed: `createTimelinePreviews` now answers with the `TimelinePreviews` manifest, which names the job only by ID (its details stay its requester's) |
+
+  Test additions: the retry duplicate is refused; a missing sheet is
+  withdrawn and rendered again on request; responses are manifests. Core
+  168, `v2_playback` 36, `access_api` 39, contract 5, `jobs_model` 3
+  passed; clippy clean.
 
 ### Remaining item 6 work (not started)
 

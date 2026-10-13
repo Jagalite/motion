@@ -74,6 +74,22 @@ pub fn valid_sheets(layout: &Layout, sheets: &[Sheet]) -> bool {
         })
 }
 
+/// A rendered thumbnail larger than this is refused.
+pub const MAX_THUMBNAIL_BYTES: u64 = 256 * 1024;
+
+/// Whether rendered thumbnails are exactly the layout's: one per tile (the
+/// picture at each `n * interval_ms`, so a sheet never shows a blank tile
+/// the manifest promises), each the tile size and not oversized.
+pub fn valid_thumbnails(layout: &Layout, thumbnails: &[Sheet]) -> bool {
+    thumbnails.len() == layout.tiles as usize
+        && thumbnails.iter().all(|t| {
+            t.width == layout.tile_width
+                && t.height == layout.tile_height
+                && t.bytes > 0
+                && t.bytes <= MAX_THUMBNAIL_BYTES
+        })
+}
+
 /// What a finished preview attempt must hold to publish its sheets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicationFacts {
@@ -187,6 +203,33 @@ mod tests {
         ] {
             assert!(!broken.publishable());
         }
+    }
+
+    #[test]
+    fn exactly_one_thumbnail_per_tile_validates() {
+        let l = layout(25_000, 320, 240).unwrap();
+        let thumb = Sheet {
+            width: 160,
+            height: 120,
+            bytes: 4_000,
+        };
+        assert!(valid_thumbnails(&l, &[thumb; 3]));
+        assert!(!valid_thumbnails(&l, &[thumb; 2]));
+        assert!(!valid_thumbnails(&l, &[thumb; 4]));
+        assert!(!valid_thumbnails(
+            &l,
+            &[Sheet {
+                height: 90,
+                ..thumb
+            }; 3]
+        ));
+        assert!(!valid_thumbnails(
+            &l,
+            &[Sheet {
+                bytes: MAX_THUMBNAIL_BYTES + 1,
+                ..thumb
+            }; 3]
+        ));
     }
 
     #[test]

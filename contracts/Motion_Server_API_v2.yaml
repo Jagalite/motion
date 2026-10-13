@@ -3975,9 +3975,10 @@ paths:
     post:
       operationId: createTimelinePreviews
       summary: Render trick-play previews of a timeline's original
-      description: Queues a preview job for the original's current revision (202), or answers with the
-        job already rendering or that rendered it (200); never duplicated. preview_unavailable when the
-        timeline has no whole single-file original with a known duration and picture.
+      description: Queues a preview job for the original's current revision and answers with the pending
+        manifest (202), or answers with the manifest as it already is, pending or ready (200); never
+        duplicated. The job is named by job_id; its details are its requester's (getJob). preview_unavailable
+        when the timeline has no whole single-file original with a known duration and picture.
       tags:
       - media
       x-owner: A06
@@ -3985,17 +3986,17 @@ paths:
       x-status: implementation_target
       responses:
         '200':
-          description: The job already rendering or that rendered this revision's previews.
+          description: This revision's previews are already rendering or ready.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Job'
+                $ref: '#/components/schemas/TimelinePreviews'
         '202':
           description: A preview job was queued.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Job'
+                $ref: '#/components/schemas/TimelinePreviews'
         '400':
           $ref: '#/components/responses/E400'
         '401':

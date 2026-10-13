@@ -165,6 +165,37 @@ async fn control(
             )
         })?;
     }
+    // A preview retry is admitted like a new request: never alongside
+    // another active job or published previews of the same revision, and
+    // within the queue bound.
+    if retry && old.kind == "preview" {
+        let (duplicate, active): (i64, i64) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM preview_jobs o JOIN preview_jobs j ON j.id=? \
+             WHERE o.file_id=j.file_id AND o.file_revision=j.file_revision AND o.id<>j.id \
+             AND o.phase IN ('queued','running','cancelling')) \
+             OR EXISTS(SELECT 1 FROM previews p JOIN preview_jobs j ON j.id=? \
+             WHERE p.file_id=j.file_id AND p.file_revision=j.file_revision), \
+             (SELECT count(*) FROM preview_jobs WHERE phase IN ('queued','running','cancelling'))",
+        )
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if duplicate != 0 {
+            return Err(Problem::new(
+                StatusCode::CONFLICT,
+                "preview_duplicate",
+                "This revision's previews are already rendering or ready",
+            ));
+        }
+        if active >= super::previews::MAX_ACTIVE_JOBS {
+            return Err(Problem::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "processing_limit",
+                "The preview queue is full",
+            ));
+        }
+    }
     let (next, _) = transition(&state, if retry { Input::Retry } else { Input::Cancel });
     if next != state {
         if old.kind == "scan" {

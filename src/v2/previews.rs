@@ -34,7 +34,7 @@ pub fn routes() -> Router<App> {
 /// How long one rendering may run before it is stopped.
 const RENDER_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// At most this many preview jobs wait or run at once.
-const MAX_ACTIVE_JOBS: i64 = 100;
+pub(crate) const MAX_ACTIVE_JOBS: i64 = 100;
 
 /// The timeline's whole, single-file, available original the caller may
 /// read, with its duration and picture size: (file, revision, duration ms,
@@ -114,6 +114,43 @@ fn sheet_url(file: &str, revision: &str, n: u32) -> String {
 
 type PreviewRow = (String, i64, i64, i64, i64, i64, i64, i64);
 
+/// The manifest of a revision's previews: ready (layout and sheets),
+/// pending (a job is rendering them) or none.
+async fn manifest_body(
+    tx: &mut sqlx::SqliteConnection,
+    timeline: &str,
+    file: &str,
+    revision: &str,
+) -> Result<Value, Problem> {
+    let ready: Option<PreviewRow> = sqlx::query_as(
+        "SELECT job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets FROM previews WHERE file_id=? AND file_revision=?",
+    )
+    .bind(file)
+    .bind(revision)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM preview_jobs WHERE file_id=? AND file_revision=? AND phase IN ('queued','running','cancelling') LIMIT 1",
+    )
+    .bind(file)
+    .bind(revision)
+    .fetch_optional(&mut *tx)
+    .await?;
+    Ok(match ready {
+        Some((job, interval, width, height, columns, rows, tiles, sheets)) => json!({
+            "timeline_id": timeline, "status": "ready", "file_id": file, "file_revision": revision,
+            "job_id": job, "interval_ms": interval, "tile_width": width, "tile_height": height,
+            "columns": columns, "rows": rows, "tiles": tiles,
+            "sheets": (1..=u32::try_from(sheets).unwrap_or(0)).map(|n| sheet_url(file, revision, n)).collect::<Vec<_>>(),
+        }),
+        None => json!({
+            "timeline_id": timeline,
+            "status": if pending.is_some() { "pending" } else { "none" },
+            "file_id": file, "file_revision": revision, "job_id": pending,
+        }),
+    })
+}
+
 /// The timeline's previews: ready (with their layout and sheets), pending
 /// (a job is rendering them) or none.
 async fn manifest(
@@ -127,40 +164,15 @@ async fn manifest(
     let Some((file, revision, ..)) = original(&mut tx, &caller.principal, &timeline).await? else {
         return Ok(Json(json!({"timeline_id": timeline, "status": "none"})));
     };
-    let ready: Option<PreviewRow> = sqlx::query_as(
-        "SELECT job_id,interval_ms,tile_width,tile_height,columns,rows,tiles,sheets FROM previews WHERE file_id=? AND file_revision=?",
-    )
-    .bind(&file)
-    .bind(&revision)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let pending: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM preview_jobs WHERE file_id=? AND file_revision=? AND phase IN ('queued','running','cancelling') LIMIT 1",
-    )
-    .bind(&file)
-    .bind(&revision)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let body = manifest_body(&mut tx, &timeline, &file, &revision).await?;
     tx.commit().await?;
-    let body = match ready {
-        Some((job, interval, width, height, columns, rows, tiles, sheets)) => json!({
-            "timeline_id": timeline, "status": "ready", "file_id": file, "file_revision": revision,
-            "job_id": job, "interval_ms": interval, "tile_width": width, "tile_height": height,
-            "columns": columns, "rows": rows, "tiles": tiles,
-            "sheets": (1..=u32::try_from(sheets).unwrap_or(0)).map(|n| sheet_url(&file, &revision, n)).collect::<Vec<_>>(),
-        }),
-        None => json!({
-            "timeline_id": timeline,
-            "status": if pending.is_some() { "pending" } else { "none" },
-            "file_id": file, "file_revision": revision, "job_id": pending,
-        }),
-    };
     Ok(Json(body))
 }
 
-/// Request previews of the timeline's original at its current revision.
-/// Never duplicated: an active job for that revision, or its published
-/// previews, answer instead of a new job.
+/// Request previews of the timeline's original at its current revision:
+/// the manifest, pending (202 when this request queued the job) or as it
+/// already is (200). Never duplicated: an active job for that revision, or
+/// its published previews, answer instead of a new job.
 async fn create(
     State(app): State<App>,
     caller: Caller,
@@ -220,8 +232,8 @@ async fn create(
     .bind(&revision)
     .fetch_optional(&mut *tx)
     .await?;
-    let (status, id) = match existing {
-        Some(id) => (StatusCode::OK, id),
+    let status = match existing {
+        Some(_) => StatusCode::OK,
         None => {
             let active: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM preview_jobs WHERE phase IN ('queued','running','cancelling')",
@@ -240,15 +252,12 @@ async fn create(
                 .bind(&id).bind(&file).bind(&revision).bind(&principal.id)
                 .bind(caller.credential.as_ref().map(|(hash, _)| hash)).bind(&caller.ingress).bind(crate::now())
                 .execute(&mut *tx).await?;
-            (StatusCode::ACCEPTED, id)
+            StatusCode::ACCEPTED
         }
     };
-    // The answering job, as its requester sees it; another requester's job
-    // is named, not shown.
-    let value = match super::jobs::row(&mut tx, &id, &principal).await {
-        Ok(row) => row.wire(),
-        Err(_) => json!({"id": id, "kind": "preview"}),
-    };
+    // The manifest, as any reader sees it (the job by its ID only: its
+    // details are its requester's).
+    let value = manifest_body(&mut tx, &timeline, &file, &revision).await?;
     record
         .save(&mut tx, &digest, status, Some(&value), None)
         .await?;
@@ -363,6 +372,21 @@ struct Started {
 /// Attempts a stopped server left running or cancelling are recovered
 /// (core `jobs::transition` with `Recover`): requeued or cancelled.
 async fn recover(app: &App) -> anyhow::Result<()> {
+    // Renderers of a previous process still alive (their witness held) keep
+    // their capacity until they are gone, before any attempt is requeued;
+    // their staging is left alone until then (`retain`).
+    let staging = previews_root(app).join(".staging");
+    for (path, witness) in
+        tokio::task::spawn_blocking(move || crate::processing::held_witnesses(&staging)).await??
+    {
+        app.processing.execution.recovered(
+            format!("recovered:{}", path.display()),
+            playscale_core::work::Class::Maintenance,
+            1,
+            witness,
+            || {},
+        );
+    }
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
@@ -473,15 +497,21 @@ async fn render(
     let _ = tokio::fs::remove_dir_all(&staging).await;
     tokio::fs::create_dir_all(&staging).await?;
     let (w, h) = (layout.tile_width, layout.tile_height);
+    // One thumbnail per tile, at exactly 0, interval, 2·interval, …: the
+    // last frame at or before each (key frames only), and one at the end of
+    // a part-interval (`eof_action=pass`). Sheets are assembled here, so
+    // their tiles are counted, never padded with blanks.
     let filter = format!(
-        "fps=1000/{interval},scale={w}:{h}:force_original_aspect_ratio=decrease,\
-         pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,tile={c}x{r}",
+        "fps=fps=1000/{interval}:start_time=0:round=down:eof_action=pass,\
+         scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1",
         interval = layout.interval_ms,
-        c = layout.columns,
-        r = layout.rows,
     );
-    let mut command = tokio::process::Command::new(&app.processing.settings.ffmpeg);
-    command
+    let tiles = layout.tiles.to_string();
+    let output = staging.join("thumb-%d.jpg");
+    let mut supervisor = tokio::process::Command::new(&app.processing.supervisor);
+    supervisor
+        .arg("--internal-ffmpeg-supervisor")
+        .arg(&app.processing.settings.ffmpeg)
         .args([
             "-v",
             "error",
@@ -491,23 +521,36 @@ async fn render(
             "-i",
             "/dev/fd/3",
         ])
-        .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vf", &filter])
         .args([
-            "-frames:v",
-            &layout.sheets.to_string(),
-            "-q:v",
-            "5",
-            "-f",
-            "image2",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &filter,
+            "-fps_mode",
+            "passthrough",
         ])
-        .arg(staging.join("sheet-%d.jpg"))
-        .stdin(std::process::Stdio::null())
+        .args(["-frames:v", &tiles, "-q:v", "5", "-f", "image2"])
+        .arg(&output)
+        // The supervisor ends the renderer when this pipe closes, even if
+        // the server is killed: no renderer outlives its owner.
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(false);
+    // fd 3: the validated source; fd 4: the ownership witness. Capacity
+    // returns only once the witness is free (recovered after a restart).
+    let owner = staging.join(".owner");
+    let (witness, held) = crate::execution::Witness::create(&owner)?;
     #[cfg(unix)]
-    crate::execution::inherit(&mut command, &[&input]);
-    let mut child = command.spawn()?;
+    crate::execution::inherit(&mut supervisor, &[&input, &held.0]);
+    lease.started(&owner)?;
+    let child = supervisor.spawn();
+    drop(held);
+    let mut child = child?;
+    let heartbeat = child.stdin.take();
     let deadline = tokio::time::Instant::now() + RENDER_DEADLINE;
     let status = loop {
         tokio::select! {
@@ -523,18 +566,17 @@ async fn render(
             }
         }
     };
-    let Some(status) = status else {
-        let _ = child.start_kill();
-        if tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .is_err()
-        {
-            lease.stuck(async move {
-                let _ = child.wait().await;
-            });
-        }
-        anyhow::bail!("rendering stopped");
-    };
+    drop(heartbeat);
+    let confirmed = crate::execution::confirm_exit(
+        lease,
+        status.is_none().then_some(child),
+        Some(witness),
+        crate::execution::TERMINATION_DEADLINE,
+        || {},
+    )
+    .await;
+    anyhow::ensure!(confirmed, "renderer outlived its supervisor");
+    let status = status.ok_or_else(|| anyhow::anyhow!("rendering stopped"))?;
     anyhow::ensure!(status.success(), "renderer failed");
     // The renderer read the descriptor after it was validated: observe it
     // again before trusting what it rendered.
@@ -544,24 +586,63 @@ async fn render(
             .is_ok_and(|m| crate::scan::fingerprint(&m) == fingerprint)
     })
     .await?;
-    let observed = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Sheet>> {
-        let mut sheets = Vec::new();
+    let observed = tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, Vec<Sheet>)> {
+        let mut thumbnails = Vec::new();
         for n in 1.. {
-            let path = staging.join(format!("sheet-{n}.jpg"));
+            let path = staging.join(format!("thumb-{n}.jpg"));
             let Ok(meta) = std::fs::metadata(&path) else {
                 break;
             };
             let (width, height) = image::image_dimensions(&path)?;
-            sheets.push(Sheet {
+            thumbnails.push(Sheet {
                 width,
                 height,
                 bytes: meta.len(),
             });
         }
-        Ok(sheets)
+        if !core::valid_thumbnails(&layout, &thumbnails) {
+            return Ok((false, vec![]));
+        }
+        // Assemble each sheet row by row from its thumbnails.
+        let per_sheet = layout.columns * layout.rows;
+        let mut sheets = Vec::new();
+        for sheet in 0..layout.sheets {
+            let mut canvas = image::RgbImage::new(
+                layout.tile_width * layout.columns,
+                layout.tile_height * layout.rows,
+            );
+            for within in 0..per_sheet {
+                let n = sheet * per_sheet + within;
+                if n >= layout.tiles {
+                    break;
+                }
+                let tile = image::open(staging.join(format!("thumb-{}.jpg", n + 1)))?.to_rgb8();
+                image::imageops::replace(
+                    &mut canvas,
+                    &tile,
+                    i64::from(within % layout.columns * layout.tile_width),
+                    i64::from(within / layout.columns * layout.tile_height),
+                );
+            }
+            let path = staging.join(format!("sheet-{}.jpg", sheet + 1));
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut file, 80)
+                .encode_image(&canvas)?;
+            std::io::Write::flush(&mut file)?;
+            drop(file);
+            sheets.push(Sheet {
+                width: canvas.width(),
+                height: canvas.height(),
+                bytes: std::fs::metadata(&path)?.len(),
+            });
+        }
+        for n in 1..=layout.tiles {
+            std::fs::remove_file(staging.join(format!("thumb-{n}.jpg")))?;
+        }
+        Ok((true, sheets))
     })
     .await??;
-    Ok((layout, observed, unchanged))
+    Ok((layout, observed.1, unchanged && observed.0))
 }
 
 /// Publish a valid attempt's sheets, or discard them (core
@@ -653,19 +734,33 @@ async fn finish(
         .await?
         .is_some();
         if !published {
-            // Durable sheets, then the immutable directory, then the row.
-            let (from, to) = (staging.clone(), target.clone());
+            // Durable sheets and their directory entries, then the immutable
+            // directory under durable ancestors, then the row: a committed
+            // row never names sheets a power loss could take away.
+            let (from, to, root) = (staging.clone(), target.clone(), previews_root(app));
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let sync = |dir: &std::path::Path| -> anyhow::Result<()> {
+                    #[cfg(unix)]
+                    std::fs::File::open(dir)?.sync_all()?;
+                    Ok(())
+                };
+                let _ = std::fs::remove_file(from.join(".owner"));
                 for entry in std::fs::read_dir(&from)? {
                     std::fs::File::open(entry?.path())?.sync_all()?;
                 }
+                sync(&from)?;
                 if to.exists() {
                     std::fs::remove_dir_all(&to)?;
                 }
-                std::fs::create_dir_all(to.parent().unwrap_or(&to))?;
+                let parent = to.parent().unwrap_or(&to).to_path_buf();
+                let created = !parent.exists();
+                std::fs::create_dir_all(&parent)?;
+                if created {
+                    sync(&root)?;
+                }
                 std::fs::rename(&from, &to)?;
-                #[cfg(unix)]
-                std::fs::File::open(to.parent().unwrap_or(&to))?.sync_all()?;
+                sync(&to)?;
+                sync(&parent)?;
                 Ok(())
             })
             .await??;
@@ -696,11 +791,23 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
     let stale: Vec<(String, String)> = {
         let _guard = app.jobs.lock().await;
         let mut tx = begin_write(&app.db).await?;
-        let stale: Vec<(String, String)> = sqlx::query_as(
+        let mut stale: Vec<(String, String)> = sqlx::query_as(
             "SELECT file_id,file_revision FROM previews p WHERE NOT EXISTS(SELECT 1 FROM media_files f WHERE f.id=p.file_id AND f.revision=p.file_revision) LIMIT 500",
         )
         .fetch_all(&mut *tx)
         .await?;
+        // Published rows whose sheets are not all on disk (a database
+        // restored without them): withdrawn, so a request renders again.
+        let published: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT file_id,file_revision,sheets FROM previews")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (file, revision, sheets) in published {
+            let dir = published_dir(app, &file, &revision);
+            if (1..=sheets).any(|n| !dir.join(format!("sheet-{n}.jpg")).is_file()) {
+                stale.push((file, revision));
+            }
+        }
         for (file, revision) in &stale {
             sqlx::query("DELETE FROM previews WHERE file_id=? AND file_revision=?")
                 .bind(file)
@@ -761,7 +868,14 @@ pub async fn retain(app: &App) -> anyhow::Result<()> {
             .bind(attempt.parse::<i64>().unwrap_or(-1))
             .fetch_optional(&app.db)
             .await?;
-            if live.is_none() {
+            // A renderer still holding its witness (of this or a previous
+            // process) keeps its staging until it is gone.
+            let owner = entry.path().join(".owner");
+            let held = tokio::task::spawn_blocking(move || {
+                crate::execution::Witness::open(&owner).is_ok_and(|w| !w.released())
+            })
+            .await?;
+            if live.is_none() && !held {
                 let _ = tokio::fs::remove_dir_all(entry.path()).await;
             }
         }
