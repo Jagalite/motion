@@ -257,7 +257,7 @@ pub(crate) async fn request_in(
 
 /// Bound a library's scan history in the admitting transaction: the policy
 /// (`core::prunable_requests`) keeps the admitted request, every pending one
-/// and the newest settled ones by admission order (rowid, not the clock).
+/// and the newest settled ones by admission sequence (not the clock).
 /// Demands cascade with their request; jobs are not touched.
 async fn prune_history(
     tx: &mut SqliteConnection,
@@ -265,7 +265,7 @@ async fn prune_history(
     admitting: &str,
 ) -> Result<(), ScanError> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT r.id,(SELECT json_group_array(d.status) FROM scan_demands d WHERE d.request_id=r.id) FROM scan_requests r WHERE r.library_id=? ORDER BY r.rowid DESC",
+        "SELECT r.id,(SELECT json_group_array(d.status) FROM scan_demands d WHERE d.request_id=r.id) FROM scan_requests r WHERE r.library_id=? ORDER BY r.admission DESC",
     )
     .bind(library)
     .fetch_all(&mut *tx)

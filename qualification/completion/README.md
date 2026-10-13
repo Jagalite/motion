@@ -24,7 +24,7 @@ item below is the single completion agent unless stated otherwise.
 |---|---|---|---|
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
-| 2 Library query scaling | Implemented, tested | library-queries PR | Sol review |
+| 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
 | 4 Library-management UI | Not started | — | After item 2 |
 | 5 Offline breadth | Not started | — | After item 1 |
@@ -127,16 +127,19 @@ item below is the single completion agent unless stated otherwise.
   (migration order 0045 → 0046, shared ledger).
 - **Implemented:**
   - **Scan history.** `listScans` gains `order=recent`, which pages newest
-    first in admission order (SQLite rowid, with an opaque keyset cursor;
-    not the whole-second, clock-dependent capture time), and `library_id`.
+    first by a durable admission sequence (opaque keyset cursor), and
+    `library_id`. The sequence (migration 0046: a growing counter assigned
+    by an insert trigger, existing rows backfilled in insertion order) is
+    neither the whole-second, clock-dependent capture time nor the rowid,
+    which SQLite reuses after the newest rows are deleted.
     Authorization and the filter apply before ordering and the limit. A scan
     admitted mid-read sorts before every cursor, so it never shifts or
     repeats a later page. Retention: admitting a scan prunes the library's
     settled history beyond the newest 200 in the same transaction. The policy
     is core `demands::prunable_requests`, which never prunes the request
     being admitted or a pending one, and does not count them. Demands
-    cascade; jobs are untouched. Index `scan_requests(library_id)` in
-    migration 0046 (rowid is implicit).
+    cascade; jobs are untouched. Indexes on the admission sequence, overall
+    and per library.
   - **Renditions.** `listRenditions` gains `timeline_id`, applied before the
     page limit; an unknown or unreadable timeline is an empty page. Index
     `preparations(timeline_id, job_id)`.
@@ -154,8 +157,8 @@ item below is the single completion agent unless stated otherwise.
   the cursor) are emitted as direct predicates only when present.
   `EXPLAIN QUERY PLAN` on the migrated schema shows primary-key lookups for
   `ids`, `preparations_timeline` for renditions, and
-  `scan_requests_library (library_id=? AND rowid<?)` or the rowid key for
-  scan pages.
+  `scan_requests_library_admission (library_id=? AND admission<?)` or
+  `scan_requests_admission (admission<?)` for scan pages.
 - **Unsupported / limits:** a collection with more than 100 merged-alias or
   hidden members leaves the excess unresolved. Playlists with more than 500
   distinct timelines show the rest untitled. An idempotent replay of a pruned
@@ -190,9 +193,18 @@ item below is the single completion agent unless stated otherwise.
   | L4 | Rendition `timeline_id` used an optional `OR`, so the timeline index was unused | Fixed: direct predicate; plan uses `preparations_timeline` |
   | L5 | Recent scan pages could not seek by cursor or library | Fixed: direct `library_id=?` and `rowid<?` when given; plan seeks `scan_requests_library` |
 
-  After the fixes: core lib 142, `playscale` lib 64, `v2_catalog` 19 (the
+  Round 2 at `a696a0d` (focused on the fixes) raised one P2:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | L6 | Rowids are reused after a library's newest requests are deleted, so a later page could contain a new admission | Fixed: durable admission sequence (counter and trigger, migration 0046) for recent order, cursors and pruning. The test deletes the newest history between page reads, admits through the API and checks the later page |
+
+  After the round-1 fixes: core lib 142, `playscale` lib 64, `v2_catalog` 19 (the
   scan test ran three times), `v2_metadata_processing` 18, `access_api` 39,
   `m3_workflows` 1 passed; clippy clean (Kyoto `415cb9b5`, `e59a0b6c`).
+  After the round-2 fix: `v2_catalog` 19, `v2_metadata_processing` 18,
+  `access_api` 39, `m3_workflows` 1 passed (Kyoto `06928103`); clippy
+  clean (Kyoto `83dcb092`).
 - **Release checks:** frozen 10,000-item / 100,000-file browse and organize
   timings (handoff section 8).
 

@@ -2486,6 +2486,53 @@ async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
         "invalid_cursor",
     );
 
+    // The newest history is deleted between page reads (as deleting its
+    // library does), then a scan is admitted: SQLite would reuse the deleted
+    // rowids, the admission sequence never is, so the new scan stays off the
+    // later page.
+    for (id, library) in [("seq-old", &f.b), ("seq-mid", &f.b), ("seq-new", &f.b)] {
+        sqlx::query(
+            "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,0,1)",
+        )
+        .bind(id)
+        .bind(library)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    }
+    let top = get("/api/v2/scans?order=recent&limit=1".into(), auth.clone()).await;
+    assert_eq!(ids(&top), ["seq-new"]);
+    sqlx::query("DELETE FROM scan_requests WHERE id IN ('seq-mid','seq-new')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let readmitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.b),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-after-delete-01"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        readmitted.status,
+        StatusCode::ACCEPTED,
+        "{}",
+        readmitted.body
+    );
+    let after = get(
+        format!(
+            "/api/v2/scans?order=recent&limit=1&cursor={}",
+            top.body["next_cursor"].as_str().unwrap()
+        ),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(ids(&after), ["seq-old"]);
+
     // Admitting a scan bounds the library's settled history; the running
     // request and the other library's history are kept.
     let admitted = f

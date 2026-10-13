@@ -271,9 +271,10 @@ struct ListQuery {
     order: Order,
     library_id: Option<String>,
 }
-/// Keyset cursor for newest-first pages: the admission sequence (SQLite
-/// rowid) of the last row. Rowids grow with every admission, unlike capture
-/// times (whole seconds, possibly stepping back with the clock).
+/// Keyset cursor for newest-first pages: the durable admission sequence of
+/// the last row (migration 0046). It only grows, unlike capture times (whole
+/// seconds, possibly stepping back with the clock) or rowids (reused after
+/// the newest rows are deleted).
 fn recent_cursor(sequence: i64) -> String {
     super::catalog::b64_encode(sequence.to_string().as_bytes())
 }
@@ -348,9 +349,13 @@ async fn list(
                 "" => None,
                 cursor => Some(decode_recent(cursor)?),
             };
-            let before = if after.is_some() { " AND rowid<?" } else { "" };
+            let before = if after.is_some() {
+                " AND admission<?"
+            } else {
+                ""
+            };
             let sql = format!(
-                "SELECT rowid,id FROM scan_requests WHERE {scoped}{library}{before} ORDER BY rowid DESC LIMIT ?"
+                "SELECT admission,id FROM scan_requests WHERE {scoped}{library}{before} ORDER BY admission DESC LIMIT ?"
             );
             let mut rows = sqlx::query_as::<_, (i64, String)>(&sql)
                 .bind(all)
