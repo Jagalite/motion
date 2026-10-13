@@ -291,6 +291,9 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             }
         };
         let mut more = false;
+        // The preview queue was full: the cursor is kept and the schedule
+        // backs off instead of holding a dispatch slot.
+        let mut blocked = false;
         match row.task.as_str() {
             "scan" => {
                 match crate::scans::request_in(&mut tx, &row.library_id, None, false, false).await {
@@ -383,6 +386,7 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                     if active >= super::previews::MAX_ACTIVE_JOBS {
                         // The queue is full: continue from here next time.
                         more = true;
+                        blocked = true;
                         last = n.checked_sub(1).map(|p| files[p].0.clone());
                         break;
                     }
@@ -456,7 +460,16 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
             }
         }
         sqlx::query("UPDATE api_schedules SET next_run=? WHERE id=?")
-            .bind(if more { row.next_run } else { next.next_run })
+            .bind(playscale_core::maintenance::next_run(
+                row.next_run,
+                &next,
+                crate::now(),
+                match (blocked, more) {
+                    (true, _) => playscale_core::maintenance::RunOutcome::Blocked,
+                    (false, true) => playscale_core::maintenance::RunOutcome::More,
+                    (false, false) => playscale_core::maintenance::RunOutcome::Done,
+                },
+            ))
             .bind(row.id)
             .execute(&mut *tx)
             .await?;

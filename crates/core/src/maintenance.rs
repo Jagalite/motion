@@ -63,6 +63,35 @@ impl Schedule {
     }
 }
 
+/// How a schedule's run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Everything due was dispatched.
+    Done,
+    /// More remains; the next tick continues from the cursor.
+    More,
+    /// The work queue was full; dispatch stopped at the cursor.
+    Blocked,
+}
+
+/// How long a schedule blocked by a full work queue waits before trying
+/// again, so blocked schedules never keep the oldest dispatch slots from
+/// the others.
+pub const BLOCKED_BACKOFF_SECONDS: i64 = 300;
+
+/// When a claimed schedule (`claim`, which yields `claimed`) runs next:
+/// after its interval when done, at once when more remains (it keeps its
+/// due time, continuing from its cursor), and after a backoff when blocked.
+pub fn next_run(previous_due: i64, claimed: &Schedule, now: i64, outcome: RunOutcome) -> i64 {
+    match outcome {
+        RunOutcome::Done => claimed.next_run,
+        RunOutcome::More => previous_due,
+        RunOutcome::Blocked => now
+            .saturating_add(BLOCKED_BACKOFF_SECONDS)
+            .min(claimed.next_run),
+    }
+}
+
 /// Query adapters may use these bounds to preselect candidates before applying
 /// CacheEntry::removable; the same observation time must be used for both.
 pub fn retention_cutoff(now: i64, retention: u64) -> i64 {
@@ -86,5 +115,30 @@ impl BackupReceiptFacts {
             && self.database_verified
             && self.inventory_complete
             && self.destination_durable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_blocked_schedule_backs_off_and_keeps_no_dispatch_slot() {
+        let claimed = Schedule {
+            next_run: 10_000 + 3_600,
+            interval: 3_600,
+        };
+        assert_eq!(next_run(9_000, &claimed, 10_000, RunOutcome::Done), 13_600);
+        assert_eq!(next_run(9_000, &claimed, 10_000, RunOutcome::More), 9_000);
+        assert_eq!(
+            next_run(9_000, &claimed, 10_000, RunOutcome::Blocked),
+            10_000 + BLOCKED_BACKOFF_SECONDS
+        );
+        // Never later than its next regular run.
+        let short = Schedule {
+            next_run: 10_060,
+            interval: 60,
+        };
+        assert_eq!(next_run(9_000, &short, 10_000, RunOutcome::Blocked), 10_060);
     }
 }

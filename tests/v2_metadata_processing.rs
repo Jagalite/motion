@@ -2247,10 +2247,18 @@ async fn preview_schedules_queue_each_revision_once_within_the_queue() {
         .await
         .unwrap();
     assert_eq!(progress, 1);
+    // Blocked, it backed off rather than staying due.
+    let next: i64 = sqlx::query_scalar("SELECT next_run FROM api_schedules WHERE id=?")
+        .bind(&id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(next > playscale::now() + 200, "{next}");
     sqlx::query("UPDATE preview_jobs SET phase='cancelled' WHERE id LIKE 'busy-%'")
         .execute(&f.app.db)
         .await
         .unwrap();
+    due().await.unwrap();
     playscale::maintenance::tick(&f.app).await.unwrap();
     assert_eq!(queued().await, ["file-pv-a", "file-pv-b"]);
     let progress: i64 = sqlx::query_scalar("SELECT count(*) FROM schedule_dispatch_progress")
@@ -2258,4 +2266,40 @@ async fn preview_schedules_queue_each_revision_once_within_the_queue() {
         .await
         .unwrap();
     assert_eq!(progress, 0);
+    // Many blocked preview schedules never starve the others: blocked, they
+    // back off, and a later-due scan schedule is dispatched.
+    for n in 0..100 {
+        sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,requester_id,created_at) VALUES (?,?,'r2','operator',1)")
+            .bind(format!("full-{n}"))
+            .bind(format!("full-{n}"))
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id) VALUES (?,?,'preview',3600,1,0,'operator')")
+            .bind(format!("blocked-{n}"))
+            .bind(&f.library)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE api_schedules SET next_run=1 WHERE id=?")
+        .bind(&id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id) VALUES ('later-scan',?,'scan',3600,1,1,'operator')")
+        .bind(&f.library)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let scans =
+        || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scan_requests").fetch_one(&f.app.db);
+    let before = scans().await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    playscale::maintenance::tick(&f.app).await.unwrap();
+    assert_eq!(
+        scans().await.unwrap(),
+        before + 1,
+        "the scan schedule was starved"
+    );
 }

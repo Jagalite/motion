@@ -1724,6 +1724,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   |---|---|
   | `tests/v2_metadata_processing.rs` `preview_schedules_queue_each_revision_once_within_the_queue` | passed. Accepted through the API. A run queues exactly the two eligible originals, skipping one with published previews and one without pictures. A second run adds nothing. With 99 other active jobs a run queues one and keeps its cursor; the next run, with room, queues the other and clears the cursor |
   | `v2_metadata_processing` 19, compose 22 (the form offers `preview` but not `optimize`), `m3_workflows` 2 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `98e1fc3` raised one P2 finding,
+  fixed:
+  - **Starvation:** a preview schedule stopped by the full queue kept its
+    old due time, so 100 such schedules took every tick's 100 dispatch
+    slots and starved scan and metadata schedules. Core
+    `maintenance::next_run` now decides a claimed schedule's next due time
+    from its outcome: done means its interval, more work means at once, and
+    blocked means a 5-minute backoff, never later than its interval, with
+    its cursor kept. Core unit test. The integration test checks that a
+    blocked schedule backs off and resumes. With 100 queue-blocked preview
+    schedules due first, a later-due scan schedule is still dispatched
+    within two ticks. Core 169, `v2_metadata_processing` 19,
+    `m3_workflows` 2 passed; clippy clean.
 
 ### Remaining item 6 work (not started)
 
