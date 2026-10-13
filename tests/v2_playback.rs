@@ -7514,3 +7514,121 @@ async fn embedded_chapters_come_only_from_readable_originals() {
         .collect();
     assert_eq!(labels, ["Hidden"], "{}", page.body);
 }
+
+/// A burned bitmap cue whose display set began long before a start (beyond
+/// what reading the video earlier would cover) is still drawn: the subtitle
+/// is read from its own descriptor of the source, BURN_LOOKBACK_MS earlier.
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cues_established_long_before_a_start_are_drawn() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "50");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("box.sup");
+    // One cue from 1 s to 45 s on a 640x480 canvas over 320x240 video.
+    std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 1000, 45000)).unwrap();
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+    input["source"] = f.source().await;
+    input["tracks"]["subtitle_track_id"] = json!("s0");
+    input["tracks"]["subtitle_policy"] = json!("require");
+    input["client"]["subtitle_modes"] = json!(["burned"]);
+    let planned = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    // Starting at 40 s: the cue's display set is 39 s earlier.
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-lookback-001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 40000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 40000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    assert_eq!(ready["active"]["media_time_origin_ms"], 40000, "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base_url = format!("/api/v2/streams/{id}/1");
+    let fragment = f.dir.path().join("lookback.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mean = |x0: usize, y0: usize| {
+        let mut sum = 0usize;
+        for y in y0..y0 + 40 {
+            sum += frame[y * 320 + x0..y * 320 + x0 + 220]
+                .iter()
+                .map(|&p| p as usize)
+                .sum::<usize>();
+        }
+        sum / (220 * 40)
+    };
+    let (inside, below) = (mean(50, 50), mean(50, 150));
+    assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+}

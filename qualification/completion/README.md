@@ -583,11 +583,40 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Review (GPT-6.1 Sol):** round 1 at `34dd3bc` is clean: no actionable
   findings.
 
+### 3C (part 3). Bitmap cues established before a start
+
+- **Source SHA:** branch `plan-completion/bitmap-lookback`, stacked on
+  `plan-completion/multipart-subtitles`.
+- **Implemented:**
+  - A single-file conversion that burns a bitmap subtitle (PGS, DVD, DVB)
+    reads the subtitle from its own descriptor of the source. The
+    descriptor is validated like the source (root identity, fingerprint),
+    opened in the same preparation and inherited as fd 5.
+  - That input seeks `BURN_LOOKBACK_MS` (now 5 minutes) before the start,
+    without accurate seeking: FFmpeg 8's accurate-seek trim would drop
+    exactly the earlier cues. `-itsoffset` places the subtitle's time on
+    the video's.
+  - The video input now seeks to the start itself, so a start no longer
+    decodes 20 s of video that is thrown away.
+- **Limits:** a cue established more than 5 minutes before a start or seek
+  is not restored. The window bounds the extra reading a start costs.
+  Burned subtitles across parts remain refused.
+- **Core/adapter boundary:** an adapter (FFmpeg arguments and descriptor)
+  change. Which subtitle is burned, and on which routes, is unchanged in
+  core.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `tests/v2_playback.rs` `bitmap_cues_established_long_before_a_start_are_drawn` | passed. A cue from 1 s to 45 s, delivered from 40 s (39 s after its display set): the box is drawn in the first segment. It failed (box not drawn) with the old 20 s lookback and with accurate seeking on the subtitle input |
+  | `bitmap_subtitles_are_burned_into_conversions_only` | passed. From 0 s and from 8 s inside a cue |
+  | `v2_playback` | 33 passed; clippy clean |
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
-| 3C bitmap cues before the 20 s lookback; burned subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph |
+| 3C burned subtitles across parts | Per-part burn inputs in the concat graph (bitmap overlay per part; text needs per-part libass extraction) |
 
 ## 4. Library-management UI workflows
 

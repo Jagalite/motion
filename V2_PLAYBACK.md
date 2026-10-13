@@ -131,8 +131,10 @@ What remains:
   versions a text subtitle component that occurs in every part is delivered
   (chosen explicitly or automatically by the profile), each part's own
   stream joined in timeline time; sidecars and burned subtitles across
-  parts are refused. Burned bitmap cues displayed more than 20 s before a
-  start or seek are not restored.
+  parts are refused. A burned bitmap subtitle is read from its own
+  descriptor of the source up to 5 minutes before a start or seek, so a cue
+  still showing there is drawn; cues established earlier than that are not
+  restored.
 - Client bitrate caps are API-only: the server keeps `max_bitrate_bps`, but
   the production bridge sends `null` and nothing in the product supplies a
   value yet.

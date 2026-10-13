@@ -57,10 +57,11 @@ pub const RECIPE: &str = "hls-fmp4-h264-720p-aac-stereo-v1";
 pub const REMUX_RECIPE: &str = "hls-fmp4-copy-h264-copy-aac-v1";
 /// Stream copy of H.264 with audio converted to stereo AAC.
 pub const AUDIO_RECIPE: &str = "hls-fmp4-copy-h264-aac-stereo-v1";
-/// How far before a generation's start a burned-subtitle conversion begins
-/// reading, so a bitmap cue that started earlier and is still showing is
-/// drawn. Cues established longer before the start are not restored.
-pub const BURN_LOOKBACK_MS: u64 = 20_000;
+/// How far before a generation's start a burned bitmap subtitle is read (from
+/// its own descriptor of the source), so a cue that started earlier and is
+/// still showing is drawn. Cues established longer before the start are not
+/// restored; the window bounds the extra reading a start costs.
+pub const BURN_LOOKBACK_MS: u64 = 300_000;
 /// Hardware (VideoToolbox) transcode; never falls back to software encoding.
 pub const VIDEOTOOLBOX_RECIPE: &str = "hls-fmp4-h264-720p-videotoolbox-aac-stereo-v1";
 /// Output height bound of the transcoding recipes (`scale=...min(720,ih)`).
@@ -618,17 +619,7 @@ fn arguments(
     ]
     .map(str::to_owned)
     .to_vec();
-    // A burned bitmap cue is established by a display set that may precede
-    // the start: read BURN_LOOKBACK_MS earlier and trim the output to the
-    // start, so cues still showing there are drawn. Output time zero is the
-    // start either way.
     let burn = burn.filter(|_| !copy);
-    // libass reads every event of an extracted subtitle: no lookback.
-    let input_ms = if matches!(burn, Some(Burn::Bitmap(_))) {
-        start_ms.saturating_sub(BURN_LOOKBACK_MS)
-    } else {
-        start_ms
-    };
     let at = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
     match parts {
         // A multipart timeline from the part the start falls in: that part
@@ -643,7 +634,7 @@ fn arguments(
             }
         }
         None => {
-            args.extend(["-ss".to_owned(), at(input_ms)]);
+            args.extend(["-ss".to_owned(), at(start_ms)]);
             if copy {
                 // Keep source timestamps: copied video starts at the preceding
                 // keyframe, and its media time is timeline time (the route
@@ -652,12 +643,24 @@ fn arguments(
             }
             // The validated source descriptor inherited as fd 3.
             args.extend(["-i", "/dev/fd/3"].map(str::to_owned));
+            // A burned bitmap cue is established by a display set that may
+            // precede the start: the subtitle is read from its own validated
+            // descriptor of the source (fd 5, input 1), BURN_LOOKBACK_MS
+            // earlier, and offset so its time is the video's (output time
+            // zero is the start). libass reads every event of an extracted
+            // text subtitle: no lookback there.
+            if matches!(burn, Some(Burn::Bitmap(_))) {
+                let from = start_ms.saturating_sub(BURN_LOOKBACK_MS);
+                // Without accurate seeking: its trim would drop the decoded
+                // cues the offset places before the start, the very ones
+                // this input is for.
+                args.extend(["-ss".to_owned(), at(from), "-noaccurate_seek".to_owned()]);
+                if start_ms > from {
+                    args.extend(["-itsoffset".to_owned(), format!("-{}", at(start_ms - from))]);
+                }
+                args.extend(["-i", "/dev/fd/5"].map(str::to_owned));
+            }
         }
-    }
-    if start_ms > input_ms {
-        let trim = start_ms - input_ms;
-        args.push("-ss".into());
-        args.push(format!("{}.{:03}", trim / 1000, trim % 1000));
     }
     // An interval ends inside the file: the output stops at its end.
     if let Some(end_ms) = end_ms {
@@ -757,7 +760,7 @@ fn arguments(
             args.push("-filter_complex".into());
             // Subpictures are SDR: they are drawn on the already tone-mapped picture.
             args.push(format!(
-                "{video}[0:s:{index}]{source}scale2ref=w=iw:h=ih[sub][base];\
+                "{video}[1:s:{index}]{source}scale2ref=w=iw:h=ih[sub][base];\
                  [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
@@ -1693,6 +1696,7 @@ async fn run_generation(
                 .collect(),
         )
     };
+    let bitmap = durations.is_empty() && matches!(pinned_burn(&pin), Some(Burn::Bitmap(_)));
     let prepared = {
         let directory = directory.clone();
         let source = session.source.clone();
@@ -1720,8 +1724,15 @@ async fn run_generation(
                     .iter()
                     .map(source_valid)
                     .collect::<anyhow::Result<Vec<_>>>()?;
+                // A burned bitmap subtitle of one file is read through its own
+                // descriptor (fd 5), validated like the source.
+                let subtitles = if bitmap {
+                    Some(source_valid(&source)?)
+                } else {
+                    None
+                };
                 let (witness, held) = execution::Witness::create(&directory.join(".owner"))?;
-                anyhow::Ok((input, later, witness, held))
+                anyhow::Ok((input, later, subtitles, witness, held))
             },
             move || {
                 stopped(&late_app, &late_session);
@@ -1735,7 +1746,7 @@ async fn run_generation(
         };
         prepared
     };
-    let (input, later, witness, held) = match prepared {
+    let (input, later, subtitles, witness, held) = match prepared {
         Ok(Ok(prepared)) => prepared,
         Ok(Err(error)) => {
             tracing::warn!(delivery=%session.id, generation, %error, "delivery generation not started");
@@ -1804,11 +1815,13 @@ async fn run_generation(
         .stderr(Stdio::piped())
         .kill_on_drop(false);
     // fd 3: the validated source; fd 4: the execution witness; fd 5 onward:
-    // the validated later parts of a multipart timeline.
+    // the validated later parts of a multipart timeline, or (one file) the
+    // burned bitmap subtitle's own descriptor.
     #[cfg(unix)]
     {
         let mut inherited = vec![&input, &held.0];
         inherited.extend(later.iter());
+        inherited.extend(subtitles.iter());
         execution::inherit(&mut supervisor, &inherited);
     }
     if stop.is_cancelled() {
@@ -1823,7 +1836,7 @@ async fn run_generation(
         return fail(&app, &session);
     }
     let child = supervisor.spawn();
-    drop((input, held));
+    drop((input, held, subtitles));
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
