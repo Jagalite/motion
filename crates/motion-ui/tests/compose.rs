@@ -250,11 +250,27 @@ async fn series_navigation_and_generated_links() {
 #[tokio::test]
 async fn user_text_is_escaped_and_bounded() {
     let app = app(Some(principal("everyone", VIEWER)), None);
-    let (status, _, html) = get_page(&app, "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!html.contains("<script>alert(1)"));
-    assert!(html.contains("&lt;script&gt;"));
-    assert_strict_markup(&html);
+    for (query, attribute) in [
+        ("<script>alert(1)</script>", "<script>alert(1)</script>"),
+        (
+            "\"><script>alert(1)</script>& 雪",
+            "&quot;><script>alert(1)</script>&amp; 雪",
+        ),
+    ] {
+        let encoded: String = query.bytes().map(|b| format!("%{b:02X}")).collect();
+        let (status, _, html) = get_page(&app, &format!("/search?q={encoded}")).await;
+        assert_eq!(status, StatusCode::OK);
+        // Topcoat escapes quotes and ampersands in double-quoted attributes;
+        // angle brackets there are literal input text, not HTML elements.
+        // Verify the complete quoted value before checking executable markup
+        // outside it, including a query that attempts to end the attribute.
+        let value = format!("value=\"{attribute}\"");
+        assert!(html.contains(&value), "search value must round-trip safely");
+        let markup = html.replacen(&value, "value=\"\"", 1);
+        assert!(!markup.contains("<script>alert(1)"));
+        assert!(markup.contains("&lt;script&gt;"));
+        assert_strict_markup(&markup);
+    }
     let long = "a".repeat(201);
     let (status, _, _) = get_page(&app, &format!("/search?q={long}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

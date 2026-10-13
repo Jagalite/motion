@@ -5993,6 +5993,9 @@
         "tags": [
           "metadata"
         ],
+        "x-owner": "A04",
+        "x-milestone": "M3",
+        "x-status": "implementation_target",
         "x-required-permission": "catalog:read",
         "responses": {
           "200": {

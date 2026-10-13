@@ -166,9 +166,19 @@ integration/upgrade/restore, and macOS packaging. Three checks failed:
   core dependency addition. Regeneration changes only that digest; the 318
   dependency packages are unchanged. The notice check and six unit tests pass.
 
+GitHub full-workspace Clippy passed at `adbbb17`. Its fast tests then exposed
+two additional failures: the new artwork GET lacked `x-owner`, `x-milestone`,
+and `x-status`, and the search test treated angle brackets in a quoted input
+value as executable tags. The contract now includes the metadata; the UI test
+checks the complete escaped attribute (including a quote-breakout attempt and
+Unicode) before checking the surrounding markup. Topcoat already escapes the
+attribute correctly; no production escaping behavior is changed.
+
 These repairs do not change state-dependent production decisions. Validation:
-Kyoto test rebuild `5b2ca112d654406699be1c0f9c517941` and full-workspace Clippy
-`da7755504eab480eaa9c5c32eab48470` are pending. The first local Clippy attempt
+Kyoto test rebuild `c2af4d6279114aa4b6d08bd47f4f4609` includes the UI composition
+target and remains pending. It replaces the pressure-deferred
+`5b2ca112d654406699be1c0f9c517941`. The redundant local Clippy job
+`da7755504eab480eaa9c5c32eab48470` was cancelled after GitHub Clippy passed. The first local Clippy attempt
 `b008213b43694b5cbc8101f34a419097` failed from selecting the Homebrew 1.99 driver
 with 1.98 dependencies; the replacement also pins the toolchain binary directory.
 Runtime checks will execute compiled test binaries under Kyoto's compile-only
