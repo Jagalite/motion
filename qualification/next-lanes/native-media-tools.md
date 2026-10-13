@@ -10,6 +10,13 @@ on real pixels. No production playback route uses either yet. Production
 policy, execution and client wiring belong to the M4 owner (A06/A07, PR #22),
 as described under "Handoff" below. Nothing here implies HDR or subtitle parity.
 
+> **Status note (2026-10-12, main `28f4b32`).** This lane merged (PR #33).
+> Section 6's handoff is now owned by completion item 3 (plan section 12,
+> [the completion ledger](../completion/README.md)). Since this ledger was
+> written, PR #22 added live HLS WebVTT text renditions for `hls_text` clients,
+> so the "future HLS rendition" in section 5 exists for plain text; styled and
+> burned text are still refused.
+
 ## 1. Starting inventory (main `c6d6e26`, PR #22 head)
 
 | Area | Fact | Where |
