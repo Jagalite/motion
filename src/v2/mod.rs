@@ -343,7 +343,7 @@ impl From<AccessError> for Problem {
             ),
             InvitationUnavailable => (StatusCode::CONFLICT, "The invitation is unavailable"),
             PairingPending => (StatusCode::CONFLICT, "The pairing is awaiting approval"),
-            PairingDecided => (StatusCode::CONFLICT, "The pairing was already approved"),
+            PairingDecided => (StatusCode::CONFLICT, "The pairing already has a decision"),
             UserCodeMismatch => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "The user code does not match the pairing",

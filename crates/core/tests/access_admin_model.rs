@@ -160,12 +160,12 @@ impl Model for Access {
                 output = "issuer_lost"
             }
             Input::RevokeDevice => {
-                if let Some(d) = &s.device {
-                    if let Some(next) = revoke(d, d.revision).unwrap() {
-                        n.device = Some(next);
-                        n.credential = None;
-                        output = "device_revoked"
-                    }
+                if let Some(d) = &s.device
+                    && let Some(next) = revoke(d, d.revision).unwrap()
+                {
+                    n.device = Some(next);
+                    n.credential = None;
+                    output = "device_revoked"
                 }
             }
             Input::RevokeAdmin(index, stale) => {

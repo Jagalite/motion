@@ -51,7 +51,9 @@ are added. It also caught an incorrect test expectation (download creation is
 could accumulate more than 200 device blocked labels. Core now rejects that
 proposal before any user/device update, with a clear API error. It never truncates
 security restrictions. Boundary and transaction rollback tests are added;
-execution and focused follow-up review are pending.
+focused Sol review at `057c55a` confirmed the fix and found no new issue.
+There are no unresolved source findings. Execution of the new regression remains
+pending with the Rust queue.
 PR: https://github.com/Jagalite/motion/pull/36 (draft, not merged).
 
 ## Verification status

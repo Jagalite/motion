@@ -115,7 +115,7 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
         )
         <p class="muted small">"An administrator can approve the displayed code in Motion terminal → Pairing requests."</p>
         command_form(command: "POST /api/v2/auth/invitations/redeem".to_string(), label: "Redeem invitation", class: Some("command invitation"),
-            <label>"Invitation code" <input type="password" name="code" data-type=(kind(Field::Text)) autocomplete="off" required maxlength="128"></label>
+            <label>"Invitation code" <input type="password" name="code" data-type=(kind(Field::Text)) autocomplete="off" required=(true) maxlength="128"></label>
             <input type="hidden" name="device_name" data-type=(kind(Field::Text)) value="Web browser">
             <input type="hidden" name="client_name" data-type=(kind(Field::Text)) value="Motion web">
         )
