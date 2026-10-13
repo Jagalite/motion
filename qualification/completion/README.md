@@ -1773,6 +1773,22 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   showing thumbnails while scrubbing (needs the full server and player in
   a browser). The online player's other paths have the same gap; it
   remains an item 8 release check.
+- **Review (GPT-6.1 Sol):** round 1 at `2a7b705` raised three P2 findings,
+  all fixed:
+  - **Replacement delay:** disposal awaited pending sheet downloads (up to
+    10 s) before a version switch could resume playback. Release is now
+    synchronous: downloads share an abort controller that is cancelled,
+    and only object URLs already made are revoked.
+  - **Superseded lookups:** a slow sheet blocked Demuxe's newer previews
+    because the lookup ignored the request's abort signal. The lookup now
+    settles as soon as Demuxe aborts it (`unlessAborted`), while the shared
+    download continues for later lookups.
+  - **Normal close:** `close()` never revoked the sheets. It now releases
+    them like `disposePlayer`.
+
+  Unit test: an aborted wait settles while its download continues;
+  release cancels, revokes each made URL once, and returns without
+  awaiting. ui-bridge 47 passed.
 
 ### Remaining item 6 work (not started)
 

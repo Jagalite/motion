@@ -533,3 +533,33 @@ test('server thumbnails are cropped from their sheet at or before a position', (
   assert.equal(previewFrame({...manifest, interval_ms: 0}, 0, origin), null);
   assert.equal(previewFrame(manifest, -1, origin), null);
 });
+
+test('a superseded thumbnail lookup settles at once and a retired player releases its sheets synchronously', async () => {
+  const revoked = [];
+  const FakeURL = class extends URL {};
+  FakeURL.revokeObjectURL = url => revoked.push(url);
+  const {unlessAborted, releaseSheets, sheetUrls} = runInNewContext(
+    source.replace('export {close, maintainLease};', '({unlessAborted, releaseSheets, sheetUrls});'), {
+      document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {}, URL: FakeURL,
+    });
+  // Aborting settles the wait with nothing while the download goes on.
+  let finish;
+  const download = new Promise(resolve => { finish = resolve; });
+  const controller = new AbortController();
+  const waiting = unlessAborted(download, controller.signal);
+  controller.abort();
+  assert.equal(await waiting, null);
+  finish('blob:late');
+  assert.equal(await unlessAborted(Promise.resolve('blob:ok'), new AbortController().signal), 'blob:ok');
+  assert.equal(await unlessAborted(Promise.resolve('blob:x'), AbortSignal.abort()), null);
+  // Release: downloads cancelled, made URLs revoked, nothing awaited.
+  const element = {};
+  const held = {sheets: new Map([['/a', new Promise(() => {})]]), made: new Set(['blob:1', 'blob:2']), controller: new AbortController()};
+  sheetUrls.set(element, held);
+  assert.equal(releaseSheets(element), undefined);
+  assert.equal(held.controller.signal.aborted, true);
+  assert.deepEqual(revoked, ['blob:1', 'blob:2']);
+  assert.equal(sheetUrls.has(element), false);
+  releaseSheets(element);
+  assert.deepEqual(revoked, ['blob:1', 'blob:2'], 'released once');
+});

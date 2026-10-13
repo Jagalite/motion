@@ -449,9 +449,7 @@ async function disposePlayer(element) {
   if (!element) return;
   await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
   element.remove();
-  // The thumbnail sheets this player held.
-  for (const url of await Promise.all(sheetUrls.get(element)?.values() ?? [])) if (url) URL.revokeObjectURL(url);
-  sheetUrls.delete(element);
+  releaseSheets(element);
 }
 
 /**
@@ -478,8 +476,36 @@ function previewFrame(manifest, seconds, origin) {
   };
 }
 
-/** Each player's fetched thumbnail sheets, as local object URLs by sheet. */
+/**
+ * Each player's thumbnail sheets: downloads by sheet URL (resolving to a
+ * local object URL, or null), the object URLs made, and the downloads'
+ * shared cancellation.
+ */
 const sheetUrls = new WeakMap();
+
+/**
+ * Release a retired player's sheets without waiting for anything: pending
+ * downloads are cancelled and every object URL made is revoked.
+ */
+function releaseSheets(element) {
+  const held = sheetUrls.get(element);
+  if (!held) return;
+  sheetUrls.delete(element);
+  held.controller.abort();
+  for (const url of held.made) URL.revokeObjectURL(url);
+  held.made.clear();
+}
+
+/** A value, or null as soon as `signal` aborts (the value may still settle later). */
+function unlessAborted(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const abort = () => resolve(null);
+    signal.addEventListener('abort', abort, {once: true});
+    promise.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, () => resolve(null));
+  });
+}
 
 /**
  * Offer the timeline's server-rendered thumbnails to the player's preview
@@ -495,23 +521,33 @@ async function attachPreviews(element, base, timeline) {
     if (typeof AuthoredPreviewProvider !== 'function' || typeof element.player?.preview?.addProvider !== 'function') return;
     const manifest = await api('GET', `/api/v2/catalog/timelines/${encodeURIComponent(timeline)}/previews`, undefined, undefined, AbortSignal.timeout(10000));
     if (manifest?.status !== 'ready' || !element.isConnected) return;
-    const sheets = new Map();
-    sheetUrls.set(element, sheets);
+    const held = {sheets: new Map(), made: new Set(), controller: new AbortController()};
+    sheetUrls.set(element, held);
+    const {sheets, made, controller} = held;
     const local = url => {
       if (!sheets.has(url)) {
-        sheets.set(url, fetch(url, {credentials: 'same-origin', redirect: 'error', signal: AbortSignal.timeout(10000)})
+        sheets.set(url, fetch(url, {credentials: 'same-origin', redirect: 'error',
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)])})
           .then(response => response.ok ? response.blob() : null)
-          .then(blob => blob && blob.size <= 4 * 1024 * 1024 && element.isConnected ? URL.createObjectURL(blob) : null)
+          .then(blob => {
+            // Released meanwhile: nothing is made that could outlive it.
+            if (!blob || blob.size > 4 * 1024 * 1024 || controller.signal.aborted) return null;
+            const local = URL.createObjectURL(blob);
+            made.add(local);
+            return local;
+          })
           .catch(() => null)
           // A sheet that could not be read is tried again on a later lookup.
           .then(local => { if (!local) sheets.delete(url); return local; }));
       }
       return sheets.get(url);
     };
-    element.player.preview.addProvider(new AuthoredPreviewProvider(async ({time}) => {
+    // A superseded lookup settles at once (Demuxe aborts its signal), even
+    // while the shared download continues for later lookups.
+    element.player.preview.addProvider(new AuthoredPreviewProvider(async ({time, signal}) => {
       const frame = previewFrame(manifest, time, location.origin);
-      const url = frame && await local(frame.image.uris[0]);
-      return url ? {...frame, image: {...frame.image, uris: [url]}} : null;
+      const url = frame && await unlessAborted(local(frame.image.uris[0]), signal);
+      return url && !signal?.aborted ? {...frame, image: {...frame.image, uris: [url]}} : null;
     }));
   } catch {
     // Previews are an enhancement; playback never depends on them.
@@ -923,6 +959,7 @@ function close({unloading = false} = {}) {
     state.element = null;
     if (element) await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
     element?.remove();
+    if (element) releaseSheets(element);
     await retiring;
   })();
   return state.closing;
