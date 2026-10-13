@@ -1290,8 +1290,9 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
         "invalid_reanchor",
     );
     assert_eq!(
-        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
-        0
+        f.count("SELECT COUNT(*) FROM offline_sequences").await,
+        0,
+        "an invalid reanchor must not create sequence state"
     );
     let reanchor = json!({"from_viewing_epoch": before, "through": "2"});
     let continued = sync(after.clone(), third.clone(), json!("2"), reanchor.clone()).await;
@@ -1330,17 +1331,27 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
         4
     );
     // A backup that already held later sequences: the sequence stays and the
-    // floor still moves to `through`, without an acknowledged_through.
+    // floor still moves to the acknowledged compacted prefix. Re-anchor an
+    // empty batch before submitting the next event already expected by it.
     sqlx::query("UPDATE offline_sequences SET next_sequence=10,pruned_through=0 WHERE device_id=?")
         .bind(&device)
         .execute(&f.app.db)
         .await
         .unwrap();
+    let anchored = sync(
+        after.clone(),
+        vec![],
+        json!("8"),
+        json!({"from_viewing_epoch": before, "through": "8"}),
+    )
+    .await;
+    assert_eq!(anchored.status, StatusCode::OK, "{:?}", anchored.body);
+    assert_eq!(anchored.body["next_device_sequence"], "10");
     let later = sync(
         after.clone(),
         vec![event(10, &timeline, base, 50_000, "paused")],
+        json!("8"),
         Value::Null,
-        json!({"from_viewing_epoch": before, "through": "8"}),
     )
     .await;
     assert_eq!(later.body["next_device_sequence"], "11", "{:?}", later.body);
