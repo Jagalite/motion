@@ -1390,7 +1390,13 @@ pub async fn plan(
                                         )
                                         .is_some()
                                     })
-                                && core::presents_subtitle(r, true, live_text, false))
+                                && matches!(
+                                    r,
+                                    Route::Remux
+                                        | Route::AudioConvert
+                                        | Route::Transcode
+                                        | Route::HardwareTranscode
+                                ))
                     }),
             })
             .collect();
@@ -1526,7 +1532,8 @@ pub async fn plan(
         || audio != default_audio;
     use playscale_core::processing::{Wanted, WantedSubtitle};
     let prepared_subtitle = if automatic && !require {
-        match choose(Some(Route::Prepared)) {
+        // Choose the source text first; carries() below proves the rendition contains it.
+        match choose(Some(Route::Original)) {
             AutomaticSubtitle::Selected(i)
                 if !candidates[i].burned && candidates[i].choice.1.is_none() =>
             {
