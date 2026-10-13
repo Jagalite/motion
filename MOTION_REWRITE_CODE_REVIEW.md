@@ -371,3 +371,11 @@ Coordinate these findings with the existing completion owner; the handoff remain
 4. Address P02/P03/P05's component/candidate/source rules, K09's manifest metadata, C08–C10's scanner/watcher bounds and coverage, and U03's snapshot ownership. Correct D02's stale client-source reference.
 
 These are proposed additional follow-ups only. Reconciliation changed documentation, not application behavior, and performed no builds or tests. Work removed from this document remains with the handoff's implementation owner; it is not claimed complete.
+
+## Implementation status
+
+Repairs started in branch `fix/rewrite-review`, from baseline `28f4b32`.
+The review and Catabolic integration proposal were committed in `779be9d`.
+The historical findings above remain the static review baseline. Current patch
+status, verification, review disposition and outstanding work are recorded in the
+[single completion ledger](qualification/completion/README.md#additional-rewrite-review-findings).
