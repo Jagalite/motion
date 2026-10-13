@@ -566,7 +566,7 @@ async fn pending_email_challenges_reject_user_identity_method_and_epoch_changes(
         "UPDATE signin_identities SET enabled=0,revision=revision+1",
         "UPDATE signin_identities SET revision=revision+1",
         "UPDATE signin_settings SET email_revision=email_revision+1",
-        "UPDATE signin_settings SET email_json=json_set(email_json,'$.enabled',0)",
+        "UPDATE signin_settings SET email_json=json_set(email_json,'$.enabled',json('false'))",
         "UPDATE server_identity SET restore_epoch='restored-signin-test'",
     ] {
         let f = Fixture::new().await;
@@ -1112,4 +1112,86 @@ async fn disabling_email_ends_an_admitted_event_stream_and_preserves_pairing() {
         .await
         .unwrap();
     assert_eq!(revoked, 1);
+}
+
+#[tokio::test]
+async fn fresh_login_ignores_existing_session_but_identity_changes_do_not() {
+    for state in ["valid", "expired", "revoked"] {
+        let f = Fixture::new().await;
+        f.enrolled().await;
+        let (id, binding, code) = f.challenge().await;
+        let first = f.email_finish(&id, &binding, &code).await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+        let session = first.cookie("motion_session").unwrap();
+        match state {
+            "expired" => {
+                sqlx::query("UPDATE signin_families SET expires_at=0")
+                    .execute(&f.app.db)
+                    .await
+                    .unwrap();
+            }
+            "revoked" => {
+                sqlx::query("UPDATE signin_families SET revoked=1")
+                    .execute(&f.app.db)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        // No CSRF header: public login relies on exact Origin and its own
+        // browser-bound proof, regardless of an old session's validity.
+        let previous = f.mail.messages.lock().await.len();
+        let start = f
+            .email_start(ADDRESS, "login", &[("cookie", &session)])
+            .await;
+        assert_eq!(start.status, StatusCode::OK, "{state}: {}", start.body);
+        let transaction = start.body["transaction_id"].as_str().unwrap();
+        let actor: Option<String> =
+            sqlx::query_scalar("SELECT actor_id FROM signin_transactions WHERE id=?")
+                .bind(transaction)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap();
+        assert!(
+            actor.is_none(),
+            "ordinary login never adopts a session actor"
+        );
+        let code = f.delivered_code(previous).await;
+        let combined = format!("{}; {}", session, start.cookie("motion_signin").unwrap());
+        let second = f.email_finish(transaction, &combined, &code).await;
+        assert_eq!(second.status, StatusCode::OK, "{state}: {}", second.body);
+        assert_ne!(second.cookie("motion_session").unwrap(), session);
+        assert_eq!(f.families().await, 2);
+        for purpose in ["enroll", "reauth"] {
+            let denied = f
+                .email_start(ADDRESS, purpose, &[("cookie", &session)])
+                .await;
+            assert!(
+                matches!(
+                    denied.status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ),
+                "{state}/{purpose}: {}",
+                denied.body
+            );
+        }
+        for purpose in ["link", "test", "reauth"] {
+            let denied = f
+                .call(
+                    "POST",
+                    "/api/v2/auth/oidc/missing/start",
+                    Some(json!({"purpose":purpose,"return_to":"/"})),
+                    &[("cookie", &session)],
+                )
+                .await;
+            assert!(
+                matches!(
+                    denied.status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ),
+                "{state}/{purpose}: {}",
+                denied.body
+            );
+        }
+    }
 }

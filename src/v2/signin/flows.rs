@@ -52,7 +52,17 @@ fn origin(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
     }
     Ok(())
 }
-async fn optional_caller(app: &App, headers: &HeaderMap) -> Result<Option<Caller>, Problem> {
+async fn initiating_caller(
+    app: &App,
+    headers: &HeaderMap,
+    purpose: core::Purpose,
+) -> Result<Option<Caller>, Problem> {
+    // Login proves a new identity. A lingering expired/revoked session must not
+    // block it or turn it into linking. Origin and transaction-browser binding
+    // still apply; every identity-changing purpose authenticates the caller.
+    if purpose == core::Purpose::Login {
+        return Ok(None);
+    }
     if auth::bearer(headers)?.is_some() || auth::session_cookie(headers).is_some() {
         Ok(Some(
             auth::resolve(app, &axum::http::Method::POST, headers).await?,
@@ -236,7 +246,7 @@ pub async fn oidc_start(
         .map(str::to_owned)
         .unwrap_or_else(|| keyed(&app, "browser-random", &auth::nonce()));
     limit(&app, &format!("oidc:browser:{browser}"), 12, 60).await?;
-    let caller = optional_caller(&app, &headers).await?;
+    let caller = initiating_caller(&app, &headers, body.value.purpose).await?;
     let mut tx = begin_write(&app.db).await?;
     trim(&mut tx).await?;
     if hold(&mut tx).await? {
@@ -712,7 +722,7 @@ pub async fn email_start(
     // response path, including unknown, disabled and ineligible recipients.
     let address = core::canonical_email(&body.value.address).unwrap_or_default();
     limit(&app, &format!("email:address:{address}"), 5, 600).await?;
-    let caller = optional_caller(&app, &headers).await?;
+    let caller = initiating_caller(&app, &headers, body.value.purpose).await?;
     let mut tx = begin_write(&app.db).await?;
     trim(&mut tx).await?;
     let (cfg, revision, _) = mail(&mut tx, &app).await?;

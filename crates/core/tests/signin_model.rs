@@ -540,7 +540,10 @@ fn current_user_binding_distinguishes_absent_and_same_revision_other_user() {
     let mut anonymous = tx.clone();
     anonymous.user_id = None;
     anonymous.user_revision = None;
+    anonymous.identity_revision = None;
     current.user_revision = None;
+    current.identity_revision = None;
+    current.identity_owner = None;
     assert_eq!(
         core::reserve(&anonymous, &current).unwrap().phase,
         Phase::Exchanging

@@ -3877,7 +3877,28 @@ async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
     // Two admins permit revoking the issuer while keeping a usable administrator.
     let (issuer, token) = f.pair(&[], &["system:admin"]).await;
     let _backup = f.pair(&[], &["system:admin"]).await;
-    let issued=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":"1","profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&bearer(&token)),("idempotency-key","issuer-invitation-fixture-01")]).await;
+    let proof = f
+        .call(
+            "POST",
+            "/api/v2/auth/proofs",
+            Some(json!({"action":"invitation.create","target":user["id"]})),
+            &[("authorization", &bearer(&token))],
+        )
+        .await;
+    assert_eq!(proof.status, StatusCode::OK, "{:?}", proof.body);
+    let approved = f
+        .call(
+            "POST",
+            &format!(
+                "/api/v2/auth/proofs/{}/approve",
+                proof.body["id"].as_str().unwrap()
+            ),
+            Some(json!({"code":proof.body["code"]})),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(approved.status, StatusCode::OK, "{:?}", approved.body);
+    let issued=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":"1","profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&bearer(&token)),("idempotency-key","issuer-invitation-fixture-01"),("x-motion-action-proof",proof.body["id"].as_str().unwrap())]).await;
     assert_eq!(issued.status, StatusCode::CREATED, "{:?}", issued.body);
     assert_eq!(
         f.call(
