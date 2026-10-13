@@ -418,6 +418,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - The main process validates the name before starting the offline host.
   - The chrome page shows the chooser only when there is more than one
     library. Labels are set with `textContent`.
+  - The chooser re-reads the roots before every open, after every attempt
+    and on focus. A selection is kept only while its root still exists.
 - **Unsupported (still open):** removing titles from the offline host;
   prepared or track-selected downloads; the device transfer-state contract;
   the restore recovery flow. Each is listed below with its next step.
@@ -426,11 +428,18 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   and the cache scope, lock and verified manifest still govern what the host
   serves.
 - **Focused evidence:** `node --test apps/desktop/test/*.test.mjs
-  packages/ui-bridge/*.test.mjs`: 84 passed. New: two servers, one with an
-  empty root, are listed with labels and the current one; a chosen root
-  opens; an empty or unknown root is refused. The chrome test's harness
-  without the new IPC still passes.
-- **Review:** pending (GPT-6.1 Sol).
+  packages/ui-bridge/*.test.mjs`: 86 passed. New tests:
+  - Two servers, one with an empty root, are listed with labels and the
+    current one marked.
+  - A chosen root opens; an empty or unknown root is refused.
+  - Driving the production chrome script: a selected root removed after
+    startup is not resubmitted; a root saved later appears; a valid
+    selection survives refreshes; with one library the choice is hidden.
+  - The chrome test's harness without the new IPC still passes.
+- **Review (GPT-6.1 Sol), round 1:** two P2 findings, both fixed.
+  - The chooser kept its startup options, so it resubmitted removed roots
+    and never showed new ones.
+  - The `label` display rule overrode `[hidden]`.
 - **Release checks:** the Electron run of the chooser with two real servers.
 
 ### Remaining item 5 work (not started)
