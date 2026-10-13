@@ -1545,3 +1545,156 @@ async fn manifests_carry_the_titles_bounded_metadata() {
         })
     );
 }
+
+/// An original's selected text subtitle travels beside it as WebVTT: pinned
+/// by digest in the manifest, served at exactly that digest, and released
+/// with the download. Only text subtitles of the exact revision qualify.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
+    if std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIPPED: ffmpeg not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let srt = f.dir.path().join("film.srt");
+    std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:01,500\nHello offline\n").unwrap();
+    let media = f.dir.path().join("subtitled.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=10",
+            "-i",
+        ])
+        .arg(&srt)
+        .args([
+            "-t",
+            "2",
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:s",
+            "mov_text",
+        ])
+        .arg(&media)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (timeline, _, _) = f.scanned("film.mp4", &std::fs::read(&media).unwrap()).await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let with_subtitle = |track: &str, policy: &str| {
+        let mut body = input(&device, &timeline);
+        body["tracks"]["subtitle_track_id"] = json!(track);
+        body["tracks"]["subtitle_policy"] = json!(policy);
+        body
+    };
+    // Named without `require`: a whole file cannot honour it.
+    problem(
+        &f.post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0001",
+            with_subtitle("s0", "off"),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "download_tracks_unavailable",
+    );
+    // No such text subtitle in this revision.
+    problem(
+        &f.post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0002",
+            with_subtitle("s1", "require"),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "download_subtitle_unavailable",
+    );
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0003",
+            with_subtitle("s0", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    assert_eq!(created.body["subtitle_track_id"], "s0");
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let manifest = f
+        .get(&format!("/api/v2/downloads/{id}/manifest"), &auth)
+        .await;
+    assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
+    let file = manifest.body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["role"] == "subtitle")
+        .unwrap()
+        .clone();
+    assert_eq!(file["relative_name"], "subtitles.vtt");
+    let url = file["media_url"].as_str().unwrap();
+    let (status, bytes) = f.bytes(url, &[("authorization", &auth)]).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(
+        text.starts_with("WEBVTT") && text.contains("Hello offline"),
+        "{text}"
+    );
+    use sha2::Digest;
+    assert_eq!(
+        file["digest"],
+        format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
+    );
+    assert_eq!(file["size_bytes"], bytes.len().to_string());
+    // The same bytes on every manifest read; another digest is refused.
+    let again = f
+        .get(&format!("/api/v2/downloads/{id}/manifest"), &auth)
+        .await;
+    assert_eq!(again.body["files"], manifest.body["files"]);
+    let (status, _) = f
+        .bytes(
+            &format!(
+                "/api/v2/downloads/{id}/subtitles?digest=sha256:{}",
+                "0".repeat(64)
+            ),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Cancelling the download releases its subtitle file.
+    let root = &f.app.processing.root;
+    let kept = root
+        .parent()
+        .unwrap_or(root)
+        .join("download-subtitles")
+        .join(format!("{id}.vtt"));
+    assert!(kept.exists());
+    let cancelled = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/downloads/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    assert!(!kept.exists());
+    let (status, _) = f.bytes(url, &[("authorization", &auth)]).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}

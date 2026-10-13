@@ -6813,6 +6813,57 @@ paths:
         '503':
           $ref: '#/components/responses/E503'
       x-required-permission: downloads:manage
+  /api/v2/downloads/{download_id}/subtitles:
+    parameters:
+    - name: download_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+    - name: digest
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/Digest'
+    get:
+      operationId: getDownloadSubtitles
+      summary: Read a download's subtitle file at the digest its manifest names
+      description: The selected text subtitle of the pinned file as WebVTT, converted once for the download.
+        Served only while the download is ready and only at exactly the digest its manifest names; otherwise
+        409 download_subtitles_changed (read the manifest again) or download_expired.
+      tags:
+      - offline
+      x-owner: A13
+      x-milestone: M5
+      x-status: implementation_target
+      responses:
+        '200':
+          description: The WebVTT bytes the manifest pins.
+          content:
+            text/vtt:
+              schema:
+                type: string
+          headers:
+            X-Request-ID:
+              schema:
+                $ref: '#/components/schemas/Id'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      x-required-permission: downloads:manage
   /api/v2/downloads/{download_id}/transfer:
     parameters:
     - name: download_id
@@ -12530,7 +12581,10 @@ components:
           - $ref: '#/components/schemas/Id'
           - type: 'null'
         recipe_id:
-          description: Null downloads the original file whole (tracks must then select nothing). A recipe
+          description: Null downloads the original file whole; tracks may then only name one text subtitle
+            track of its exact revision with subtitle_policy require, which travels beside it as WebVTT
+            (download_subtitle_unavailable when it is not a text subtitle). Audio pins and components are
+            refused for an original. A recipe
             downloads the ready prepared version of that recipe that is current for its source and carries
             exactly the selected tracks (resolved like createPreparation on the source revision it was prepared
             from); otherwise download_preparation_unavailable. Nothing is prepared on request and another
@@ -12580,6 +12634,12 @@ components:
           - $ref: '#/components/schemas/UInt64'
           - type: 'null'
         job_id:
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
+        subtitle_track_id:
+          description: The text subtitle track of the pinned file saved beside it as WebVTT (a subtitle
+            file in the manifest); null for none.
           anyOf:
           - $ref: '#/components/schemas/Id'
           - type: 'null'

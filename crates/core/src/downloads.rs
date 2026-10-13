@@ -39,10 +39,11 @@ pub enum SubtitlePolicy {
 }
 
 /// The requested track selection. An original is downloaded whole, so its
-/// pins and required subtitles are refused explicitly rather than silently
-/// delivering another selection; a prepared download (`Request::recipe_id`)
-/// is the rendition carrying exactly this selection
-/// (`Candidate::prepared`).
+/// audio pins and components are refused explicitly rather than silently
+/// delivering another selection; it may name one text subtitle track of its
+/// exact revision, required, which travels as a WebVTT file beside it. A
+/// prepared download (`Request::recipe_id`) is the rendition carrying
+/// exactly this selection (`Candidate::prepared`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Tracks {
     pub audio_component_id: Option<String>,
@@ -82,6 +83,10 @@ pub struct Candidate {
     /// A prepared rendition (a generated version), with what it carries.
     #[serde(default)]
     pub prepared: Option<Prepared>,
+    /// The subtitle tracks of its revision that convert to WebVTT without
+    /// losing meaning (`delivery::sidecar_subtitle`), by track ID.
+    #[serde(default)]
+    pub text_subtitles: Vec<String>,
 }
 
 /// What a prepared rendition is, observed by the adapter.
@@ -102,6 +107,10 @@ pub struct Choice {
     pub content_type: String,
     pub size_bytes: u64,
     pub duration_ms: u64,
+    /// The text subtitle track of the pinned file saved beside it as
+    /// WebVTT: the one an original names, or a prepared rendition's kept
+    /// subtitle (its first subtitle track).
+    pub subtitle_track_id: Option<String>,
 }
 
 /// Why a download cannot be authorized. Every refusal is explicit; none
@@ -114,8 +123,12 @@ pub enum Refusal {
     /// source, carries exactly the requested selection. Nothing is prepared
     /// on request; another selection is never substituted.
     PreparationUnavailable,
-    /// Track pins or required subtitles cannot be honoured by a whole-file copy.
+    /// Audio pins, components or an implicit required subtitle cannot be
+    /// honoured by a whole-file copy.
     TrackSelectionUnavailable,
+    /// The selected subtitle is not a text subtitle the device can be given
+    /// as WebVTT (bitmap or styled subtitles, or no such track).
+    SubtitleUnavailable,
     /// Only multipart or interval bindings exist.
     MultipartUnavailable,
     /// Only containers the offline player cannot present exist.
@@ -137,15 +150,24 @@ pub fn choose(
     active: usize,
 ) -> Result<Choice, Refusal> {
     let t = &request.tracks;
+    // An original keeps every stream; it may only name the one text
+    // subtitle saved beside it, explicitly and required.
     if request.recipe_id.is_none()
         && (t.audio_component_id.is_some()
             || t.subtitle_component_id.is_some()
             || t.audio_track_id.is_some()
-            || t.subtitle_track_id.is_some()
-            || t.subtitle_policy == SubtitlePolicy::Require)
+            || (t.subtitle_track_id.is_some() != (t.subtitle_policy == SubtitlePolicy::Require)))
     {
         return Err(Refusal::TrackSelectionUnavailable);
     }
+    // The subtitle saved beside the file: the original's named track, or
+    // the kept subtitle a rendition carries as its first subtitle track.
+    let subtitle = match &request.recipe_id {
+        None => t.subtitle_track_id.clone(),
+        Some(_) => (t.subtitle_policy == SubtitlePolicy::Require
+            && (t.subtitle_track_id.is_some() || t.subtitle_component_id.is_some()))
+        .then(|| "s0".to_owned()),
+    };
     // An original, or exactly the prepared rendition the request names.
     let wanted = |c: &&Candidate| match (&request.recipe_id, &c.prepared) {
         (None, None) => c.original,
@@ -191,6 +213,13 @@ pub fn choose(
             refusal = refusal.max_specific(Refusal::TooLarge);
             continue;
         }
+        if subtitle
+            .as_ref()
+            .is_some_and(|s| !c.text_subtitles.contains(s))
+        {
+            refusal = refusal.max_specific(Refusal::SubtitleUnavailable);
+            continue;
+        }
         if active >= MAX_ACTIVE_PER_DEVICE {
             return Err(Refusal::Quota);
         }
@@ -201,6 +230,7 @@ pub fn choose(
             content_type: content_type.into(),
             size_bytes: c.size_bytes,
             duration_ms,
+            subtitle_track_id: subtitle,
         });
     }
     Err(refusal)
@@ -215,7 +245,8 @@ impl Refusal {
             Refusal::ContainerUnavailable => 2,
             Refusal::DurationUnknown => 3,
             Refusal::TooLarge => 4,
-            _ => 5,
+            Refusal::SubtitleUnavailable => 5,
+            _ => 6,
         };
         if rank(other) > rank(self) {
             other
@@ -735,7 +766,84 @@ mod tests {
             size_bytes: 10,
             duration_ms: Some(100_000),
             prepared: None,
+            text_subtitles: vec![],
         }
+    }
+
+    #[test]
+    fn a_text_subtitle_travels_beside_an_original_or_a_rendition() {
+        let mut r = request();
+        r.tracks.subtitle_track_id = Some("s1".into());
+        r.tracks.subtitle_policy = SubtitlePolicy::Require;
+        let bitmap_first = Candidate {
+            version_id: "v0".into(),
+            text_subtitles: vec!["s0".into()],
+            ..candidate()
+        };
+        let text = Candidate {
+            text_subtitles: vec!["s0".into(), "s1".into()],
+            ..candidate()
+        };
+        // The first original carrying the named text subtitle is pinned with it.
+        let choice = choose(&r, &[bitmap_first.clone(), text.clone()], 0).unwrap();
+        assert_eq!(
+            (
+                choice.version_id.as_str(),
+                choice.subtitle_track_id.as_deref()
+            ),
+            ("v1", Some("s1"))
+        );
+        // No original carries it as text: refused, never another subtitle.
+        assert_eq!(
+            choose(&r, &[bitmap_first], 0),
+            Err(Refusal::SubtitleUnavailable)
+        );
+        // Named without `require`, `require` without a name, or with audio
+        // pins or components: a whole file cannot honour it.
+        for change in [
+            |r: &mut Request| r.tracks.subtitle_policy = SubtitlePolicy::Off,
+            |r: &mut Request| r.tracks.subtitle_track_id = None,
+            |r: &mut Request| r.tracks.audio_track_id = Some("a0".into()),
+            |r: &mut Request| r.tracks.subtitle_component_id = Some("c".into()),
+        ] {
+            let mut r = r.clone();
+            change(&mut r);
+            assert_eq!(
+                choose(&r, std::slice::from_ref(&text), 0),
+                Err(Refusal::TrackSelectionUnavailable)
+            );
+        }
+        // Nothing selected: no subtitle.
+        assert_eq!(
+            choose(&request(), &[text], 0).unwrap().subtitle_track_id,
+            None
+        );
+        // A rendition keeping an explicit subtitle carries it as its first
+        // subtitle track; it must be text to travel.
+        let mut r = request();
+        r.recipe_id = Some("h264720p".into());
+        r.tracks.subtitle_track_id = Some("s3".into());
+        r.tracks.subtitle_policy = SubtitlePolicy::Require;
+        let rendition = |subtitles: Vec<String>| Candidate {
+            original: false,
+            prepared: Some(Prepared {
+                recipe_id: "h264720p".into(),
+                carries_selection: true,
+            }),
+            text_subtitles: subtitles,
+            ..candidate()
+        };
+        assert_eq!(
+            choose(&r, &[rendition(vec!["s0".into()])], 0)
+                .unwrap()
+                .subtitle_track_id
+                .as_deref(),
+            Some("s0")
+        );
+        assert_eq!(
+            choose(&r, &[rendition(vec![])], 0),
+            Err(Refusal::SubtitleUnavailable)
+        );
     }
     fn request() -> Request {
         Request {
@@ -761,6 +869,7 @@ mod tests {
                 recipe_id: recipe.into(),
                 carries_selection: carries,
             }),
+            text_subtitles: vec!["s0".into()],
             ..candidate()
         };
         let mut r = request();

@@ -59,6 +59,7 @@ getDevicePolicy
 getDiagnostics
 getDownload
 getDownloadManifest
+getDownloadSubtitles
 getHealth
 getHlsInit
 getHlsMaster

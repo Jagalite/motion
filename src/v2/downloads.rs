@@ -33,12 +33,14 @@ use playscale_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqliteConnection;
+use std::time::Duration;
 
 pub fn routes() -> Router<App> {
     Router::new()
         .route("/downloads", post(create).get(list))
         .route("/downloads/{download_id}", get(read).delete(cancel))
         .route("/downloads/{download_id}/manifest", get(manifest))
+        .route("/downloads/{download_id}/subtitles", get(subtitles))
         .route(
             "/downloads/{download_id}/transfer",
             axum::routing::put(report_transfer),
@@ -58,6 +60,10 @@ impl From<Refusal> for Problem {
             Refusal::TrackSelectionUnavailable => unsupported(
                 "download_tracks_unavailable",
                 "An original is downloaded whole; to keep only chosen tracks, download a prepared version (recipe_id)",
+            ),
+            Refusal::SubtitleUnavailable => unsupported(
+                "download_subtitle_unavailable",
+                "The selected subtitle cannot be saved for offline playback (only text subtitles can); choose another or none",
             ),
             Refusal::MultipartUnavailable => unsupported(
                 "download_multipart_unavailable",
@@ -118,6 +124,7 @@ struct Row {
     size_bytes: i64,
     duration_ms: i64,
     state: String,
+    subtitle_track_id: Option<String>,
 }
 
 impl Row {
@@ -138,7 +145,7 @@ impl Row {
     }
 }
 
-const COLUMNS: &str = "id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state";
+const COLUMNS: &str = "id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,subtitle_track_id";
 
 /// A download of the caller's principal and device. Everything else is not found.
 async fn owned(
@@ -267,6 +274,7 @@ fn download_json(row: &Row, state: core::State) -> Value {
         "manifest_asset_id": null,
         "size_bytes": row.size_bytes.to_string(),
         "job_id": null,
+        "subtitle_track_id": row.subtitle_track_id,
         // Filled from the device's reports (`current_json`); none yet.
         "device_transfer": null,
     })
@@ -349,6 +357,27 @@ type CandidateRow = (
     Option<f64>,
 );
 
+/// The subtitle tracks of a file's revision that convert to WebVTT without
+/// losing meaning (core `delivery::sidecar_subtitle`), by track ID (`sN` is
+/// the file's N-th subtitle stream).
+async fn text_subtitles(conn: &mut SqliteConnection, file: &str) -> Result<Vec<String>, Problem> {
+    let tracks: Option<String> =
+        sqlx::query_scalar("SELECT tracks_json FROM media_files WHERE id=?")
+            .bind(file)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let tracks: Vec<crate::db::Track> = tracks
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    Ok(tracks
+        .iter()
+        .filter(|t| t.kind == "subtitle")
+        .enumerate()
+        .filter(|(_, t)| playscale_core::delivery::sidecar_subtitle(&t.codec))
+        .map(|(n, _)| format!("s{n}"))
+        .collect())
+}
+
 async fn candidates(
     conn: &mut SqliteConnection,
     principal: &Principal,
@@ -392,6 +421,7 @@ async fn candidates(
     ) in rows
     {
         let facts = file_facts(conn, &file).await?;
+        let subtitles = text_subtitles(conn, &file).await?;
         let duration_ms = timeline_duration
             .filter(|d| *d > 0)
             .map(|d| d as u64)
@@ -416,6 +446,7 @@ async fn candidates(
             size_bytes: u64::try_from(bytes).unwrap_or(0),
             duration_ms,
             prepared: None,
+            text_subtitles: subtitles,
         });
     }
     Ok(found)
@@ -575,6 +606,7 @@ async fn prepared_candidates(
             Err(_) => false,
         };
         let facts = file_facts(conn, &file).await?;
+        let subtitles = text_subtitles(conn, &file).await?;
         found.push(Candidate {
             version_id: version,
             file_id: file,
@@ -599,6 +631,7 @@ async fn prepared_candidates(
                 recipe_id: recipe,
                 carries_selection: carries,
             }),
+            text_subtitles: subtitles,
         });
     }
     Ok(found)
@@ -725,9 +758,10 @@ pub async fn create(
         size_bytes: i64::try_from(choice.size_bytes).map_err(Problem::internal)?,
         duration_ms: i64::try_from(choice.duration_ms).map_err(Problem::internal)?,
         state: "ready".into(),
+        subtitle_track_id: choice.subtitle_track_id,
     };
     sqlx::query(&format!(
-        "INSERT INTO downloads({COLUMNS},created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        "INSERT INTO downloads({COLUMNS},created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
     ))
     .bind(&row.id)
     .bind(row.revision)
@@ -743,6 +777,7 @@ pub async fn create(
     .bind(row.size_bytes)
     .bind(row.duration_ms)
     .bind(&row.state)
+    .bind(&row.subtitle_track_id)
     .bind(at)
     .bind(at)
     .execute(&mut *tx)
@@ -838,7 +873,140 @@ pub async fn cancel(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    // Its subtitle file is no longer served; keep only those of active demands.
+    release_subtitles(&app).await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Where a download's subtitle file is kept: beside the processing and
+/// delivery directories, never inside them (their cleanup owns those).
+fn subtitles_path(app: &App, download_id: &str) -> std::path::PathBuf {
+    let root = &app.processing.root;
+    root.parent()
+        .unwrap_or(root)
+        .join("download-subtitles")
+        .join(format!("{download_id}.vtt"))
+}
+
+/// Remove subtitle files whose download is no longer an active demand
+/// (cancelled or gone). Best effort: a leftover is removed by a later call.
+async fn release_subtitles(app: &App) {
+    let directory = subtitles_path(app, "x");
+    let Some(directory) = directory.parent() else {
+        return;
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let id = name
+            .strip_suffix(".vtt")
+            .or_else(|| name.split_once(".vtt.").map(|(id, _)| id))
+            .unwrap_or(&name);
+        let active: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM downloads WHERE id=? AND state='ready'")
+                .bind(id)
+                .fetch_optional(&app.db)
+                .await
+                .unwrap_or(Some(1));
+        if active.is_none() {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+/// The download's subtitle file: converted once from the pinned file
+/// revision's track (`delivery::download_subtitles`), then kept, so its
+/// digest is stable for the download. Conversion runs in its own task: a
+/// request that stops waiting never leaves a partial file in place.
+async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, Problem> {
+    let path = subtitles_path(app, &row.id);
+    if let Ok(bytes) = tokio::fs::read(&path).await {
+        return Ok(bytes);
+    }
+    let index = track
+        .strip_prefix('s')
+        .and_then(|n| n.parse::<u32>().ok())
+        .ok_or_else(|| Problem::internal("invalid pinned subtitle track"))?;
+    let (app, id, file, revision) = (
+        app.clone(),
+        row.id.clone(),
+        row.file_id.clone(),
+        row.file_revision.clone(),
+    );
+    let converted = tokio::spawn(async move {
+        let text = crate::delivery::download_subtitles(&app, &id, &file, &revision, index).await?;
+        let path = subtitles_path(&app, &id);
+        let partial = path.with_extension(format!("vtt.{}", new_id()));
+        let written = async {
+            tokio::fs::create_dir_all(path.parent().unwrap_or(&path)).await?;
+            tokio::fs::write(&partial, &text).await?;
+            tokio::fs::File::open(&partial).await?.sync_all().await?;
+            tokio::fs::rename(&partial, &path).await
+        }
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&partial).await;
+        }
+        written.map_err(crate::api::ApiError::internal)?;
+        Ok::<_, crate::api::ApiError>(text)
+    });
+    match tokio::time::timeout(Duration::from_secs(30), converted).await {
+        Ok(Ok(Ok(text))) => Ok(text),
+        Ok(Ok(Err(error))) if error.parts().1 == "source_revision_changed" => Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_expired",
+            "The source changed or is no longer readable; request a new download",
+        )),
+        // Still converting, or the conversion failed: try again later.
+        _ => Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "download_subtitles_unavailable",
+            "The download's subtitles are not ready yet; try again shortly",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct SubtitlesQuery {
+    digest: String,
+}
+
+/// The download's subtitle file, only at the digest its manifest names:
+/// the exact bytes the device verifies.
+async fn subtitles(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Query(query): Query<SubtitlesQuery>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::DownloadsManage)?;
+    let mut tx = app.db.begin().await?;
+    let row = owned(&mut tx, &caller.principal, &id).await?;
+    let current = observe(&mut tx, &caller.principal, &row).await?;
+    tx.commit().await?;
+    if !core::transferable(core::state(row.stored(), &row.pin(), &current)) {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_expired",
+            "The source changed or is no longer readable; request a new download",
+        ));
+    }
+    let bytes = match row.subtitle_track_id {
+        Some(_) => tokio::fs::read(subtitles_path(&app, &row.id)).await.ok(),
+        None => None,
+    }
+    .ok_or_else(Problem::not_found)?;
+    use sha2::Digest;
+    if query.digest != format!("sha256:{:x}", sha2::Sha256::digest(&bytes)) {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_subtitles_changed",
+            "The subtitles changed; read the manifest again",
+        ));
+    }
+    Ok(([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], bytes).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1066,6 +1234,11 @@ pub async fn manifest(
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
+    // The selected text subtitle travels as WebVTT, pinned by digest.
+    let subtitles = match &row.subtitle_track_id {
+        Some(track) => Some(ensure_subtitles(&app, &row, track).await?),
+        None => None,
+    };
     let mut files = vec![json!({
         "asset_id": row.file_id,
         "relative_name": format!("media.{}", extension(&row.content_type)),
@@ -1111,6 +1284,22 @@ pub async fn manifest(
     });
     if let Some(metadata) = metadata {
         body["metadata"] = json!(metadata);
+    }
+    if let Some(bytes) = subtitles {
+        use sha2::Digest;
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let files = body["files"].as_array_mut().expect("files");
+        files.push(json!({
+            "asset_id": format!("{}-subtitles", row.id),
+            "relative_name": "subtitles.vtt",
+            "digest": format!("sha256:{digest}"),
+            "size_bytes": bytes.len().to_string(),
+            "media_url": format!(
+                "/api/v2/downloads/{}/subtitles?digest=sha256:{digest}",
+                row.id
+            ),
+            "role": "subtitle",
+        }));
     }
     Ok(tagged(StatusCode::OK, body, row.revision))
 }

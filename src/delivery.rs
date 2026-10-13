@@ -5100,7 +5100,7 @@ async fn ensure_subtitles(
     // and only while its fingerprint is still the pinned one.
     let text = match &selected {
         SubtitleSource::Embedded(index) => {
-            convert_subtitle(&app, &session, session.source.clone(), None, *index).await?
+            convert_subtitle(&app, &session.id, session.source.clone(), None, *index).await?
         }
         SubtitleSource::Sidecar(sidecar) => {
             let format = match sidecar
@@ -5122,7 +5122,7 @@ async fn ensure_subtitles(
                 fingerprint: sidecar.fingerprint.clone(),
                 ..session.source.clone()
             };
-            convert_subtitle(&app, &session, source, Some(format), 0).await?
+            convert_subtitle(&app, &session.id, source, Some(format), 0).await?
         }
         SubtitleSource::Parts(parts) => {
             if parts.len() != session.parts.len() + 1 {
@@ -5131,7 +5131,8 @@ async fn ensure_subtitles(
             let sources = std::iter::once(&session.source).chain(&session.parts);
             let mut converted = Vec::with_capacity(parts.len());
             for (source, (index, duration)) in sources.zip(parts) {
-                let text = convert_subtitle(&app, &session, source.clone(), None, *index).await?;
+                let text =
+                    convert_subtitle(&app, &session.id, source.clone(), None, *index).await?;
                 let cues = std::str::from_utf8(&text)
                     .ok()
                     .and_then(playscale_core::subtitles::parse_webvtt)
@@ -5168,12 +5169,57 @@ async fn ensure_subtitles(
     Ok(())
 }
 
+/// Convert subtitle stream `index` of an available file at exactly
+/// `revision` to WebVTT in its file time, for a download (`owner`). The file
+/// is opened beneath its library root only while its fingerprint is the
+/// recorded one, as for a delivery, and one of the subtitle conversion slots
+/// is held. The result is bounded and parses as WebVTT.
+pub(crate) async fn download_subtitles(
+    app: &App,
+    owner: &str,
+    file_id: &str,
+    revision: &str,
+    index: u32,
+) -> Result<Vec<u8>, ApiError> {
+    let file: Option<(String, String, String, String)> = sqlx::query_as(
+        "SELECT f.relative_path,f.fingerprint,l.root,l.root_identity FROM media_files f JOIN libraries l ON l.id=f.library_id \
+         WHERE f.id=? AND f.revision=? AND f.available=1 AND l.enabled=1",
+    )
+    .bind(file_id)
+    .bind(revision)
+    .fetch_optional(&app.db)
+    .await?;
+    let (relative, fingerprint, root, root_identity) = file
+        .ok_or_else(|| ApiError::conflict("source_revision_changed", "Request a new download"))?;
+    let _slot = app
+        .processing
+        .deliveries
+        .subtitle_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| subtitles_unavailable())?;
+    let source = Source {
+        root: root.into(),
+        relative: relative.into(),
+        root_identity,
+        fingerprint,
+    };
+    let text = convert_subtitle(app, owner, source, None, index).await?;
+    if !std::str::from_utf8(&text)
+        .ok()
+        .is_some_and(|t| playscale_core::subtitles::parse_webvtt(t).is_some())
+    {
+        return Err(subtitles_unavailable());
+    }
+    Ok(text)
+}
+
 /// Convert subtitle stream `index` of `source` (opened beneath its validated
 /// root, only while its fingerprint is the pinned one) to WebVTT in its file
 /// time, observing the descriptor again before the result is used.
 async fn convert_subtitle(
     app: &App,
-    session: &Arc<Session>,
+    owner: &str,
     source: Source,
     format: Option<&'static str>,
     index: u32,
@@ -5216,7 +5262,7 @@ async fn convert_subtitle(
         Ok(text) if text.starts_with(b"WEBVTT") => text,
         Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
         Err(ProbeFailure::Stalled(mut child)) => {
-            tracing::error!(delivery=%session.id, "subtitle conversion did not exit when killed");
+            tracing::error!(%owner, "subtitle conversion did not exit when killed");
             // Keep the lock and slot until the converter is actually gone.
             let _ = child.wait().await;
             return Err(subtitles_unavailable());

@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork and offline-metadata PRs | Merge by user; then 5F |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented (review pending); offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1213,11 +1213,64 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `333b824` is clean: no actionable findings.
 
+### 5E (part 4, server). A selected text subtitle pinned as WebVTT
+
+- **Source SHA:** branch `plan-completion/offline-subtitles`, stacked on
+  `plan-completion/embedded-chapters` (migration 0050 follows its 0049).
+- **Implemented (server side; the device side is the next slice):**
+  - **Core `downloads::choose`:** an original may name one text subtitle
+    track of its exact revision with `subtitle_policy: require`. Audio pins,
+    components, a named track without `require`, or `require` without a
+    track are still refused (`download_tracks_unavailable`). A prepared
+    rendition keeping an explicit subtitle carries it as its first subtitle
+    track. Either way the pinned track must be a text subtitle that converts
+    to WebVTT without losing meaning (`delivery::sidecar_subtitle`: SubRip,
+    mov_text, WebVTT, text). Otherwise the request is refused with the new
+    `download_subtitle_unavailable`, never substituted. The choice records
+    `subtitle_track_id`.
+  - **Pin:** `downloads.subtitle_track_id` (migration 0050, additive).
+    `Download.subtitle_track_id` reports it.
+  - **Artifact:** the manifest converts the track once per download from
+    the pinned file revision. It uses the delivery converter
+    (`delivery::download_subtitles`: opened beneath its root only while its
+    fingerprint is the recorded one, a conversion slot held, bounded,
+    parsed as WebVTT). The file is kept at
+    `download-subtitles/<download>.vtt` beside the processing and delivery
+    directories, so its digest is stable for the download. Conversion runs
+    in its own task; a manifest read waits up to 30 s and otherwise answers
+    503 `download_subtitles_unavailable` (retry). Cancelling a download
+    releases the file.
+  - **Manifest:** a `subtitle` file (`subtitles.vtt`) with its digest,
+    size and the URL of the new `getDownloadSubtitles`. The operation
+    serves the bytes only while the download is ready and only at exactly
+    that digest (409 `download_subtitles_changed` otherwise).
+- **Unsupported / limits:**
+  - Sidecar subtitle files beside an original are not yet selectable.
+  - Styled (ASS/SSA) and bitmap subtitles are refused, not burned in.
+  - Files of expired downloads stay until the download is cancelled.
+  - The device does not save the file yet: until the next slice the
+    current agent refuses a manifest naming a `subtitle` file and says so.
+    A subtitle is only named when the person explicitly selected one.
+- **Core/adapter boundary:** which subtitle may travel with which download
+  is decided in `downloads::choose` from observed track facts. Conversion,
+  storage and serving are adapter effects bound to the pin (exact file
+  revision and track). The digest in the manifest is the device's integrity
+  rule. The Stateless downloads model is unchanged: the subtitle is fixed
+  at creation by a pure decision covered by unit tests, and adds no state
+  transition.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core `downloads` | 10 passed. New: an original's named text subtitle is pinned on the first candidate carrying it; no carrier refuses; malformed selections refuse; a rendition's kept subtitle travels as `s0` only when it is text |
+  | `tests/v2_downloads.rs` `an_originals_text_subtitle_travels_as_pinned_webvtt` | passed with a real ffmpeg MP4 (mov_text). Policy and missing-track refusals; the manifest names `subtitles.vtt` with digest and size; the served bytes are that digest and contain the cue; repeated manifests are identical; another digest is refused; cancelling releases the file and serving stops |
+  | `v2_downloads` 11, `downloads_model` 6 (unchanged model, exhausted), contract 5, `v2_playback` 32 (delivery converter shared), compose 22, `access_api` 39, `m3_workflows` 2 | passed; clippy clean |
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5E remaining: subtitle files offline | Text subtitle WebVTT renditions pinned by digest, served at exactly that digest for the download; the offline player presents them | 5E parts 1–3 |
+| 5E remaining: subtitle files on the device | The agent saves the pinned `subtitle` file (verified like the poster, required when selected); the cache store publishes it; the offline host serves it and the offline player adds it as a text track; the title page offers the selection for originals | 5E part 4 (server) |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work
