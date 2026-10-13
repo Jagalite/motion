@@ -234,7 +234,10 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const type = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(poster.relative_name ?? '')?.[1]];
     const size = Number(poster.size_bytes);
     if (!sha256 || !type || !(size > 0) || size > MAX_ARTWORK_BYTES) return null;
-    const response = await fetchMedia(poster.media_url, {range: null, signal: signal ?? AbortSignal.timeout(60000)});
+    // Bounded whatever the connection does: an unavailable optional poster
+    // never holds up the title or the downloads after it.
+    const deadline = AbortSignal.timeout(60000);
+    const response = await fetchMedia(poster.media_url, {range: null, signal: signal ? AbortSignal.any([signal, deadline]) : deadline});
     if (response.status !== 200) return null;
     const chunks = [];
     let received = 0;
@@ -268,20 +271,18 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
     }
-    // The poster: small, fetched whole and verified against its digest
-    // before publication; a poster that cannot be saved never blocks the title.
-    const artwork = posters.length ? await savePoster(download.id, posters[0], target).catch(() => null) : null;
-    const entry = JSON.stringify({
+    const entryFor = artwork => JSON.stringify({
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
       title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
       ...(artwork ? {artwork} : {})});
+    const posterBytes = posters.length ? Math.max(0, Number(posters[0].size_bytes) || 0) : 0;
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     // A publication that crashed after verifying its blob needs no new
     // transfer or space: the cache tool re-verifies and publishes it.
-    if (have === 0 && (await cache(target.path, target.scope, ['recover'], entry)).recovered) {
+    if (have === 0 && (await cache(target.path, target.scope, ['recover'], entryFor(null))).recovered) {
       writeAtomically(join(base, 'current.json'), {root: target.name});
       await report(download, 'verified_local', size);
       return true;
@@ -298,7 +299,11 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const largest = Math.max(size, ...(await Promise.all(managedRoots().map(async other =>
       Math.max(0, ...(await cache(other.path, other.scope, ['status'])).manifest.downloads.map(d => d.size ?? 0))))));
     const reserve = Math.max(headroom, largest + SNAPSHOT_RESERVE);
-    const admitted = await cache(target.path, target.scope, ['admit', '--incoming', String(size - have), '--quota', String(remaining), '--headroom', String(reserve)]);
+    // The poster counts against the same admission; without room for it the
+    // title is saved without one.
+    const admit = incoming => cache(target.path, target.scope, ['admit', '--incoming', String(incoming), '--quota', String(remaining), '--headroom', String(reserve)]);
+    const withPoster = posterBytes > 0 && (await admit(size - have + posterBytes)).admitted;
+    const admitted = withPoster ? {admitted: true} : await admit(size - have);
     if (!admitted.admitted) {
       status(`Not enough space to save "${manifest.title}". Free space or remove downloads, then reconnect.`);
       return false;
@@ -349,9 +354,12 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         clearTimeout(timer);
       }
     }
+    // The poster last, once the media is staged and its space admitted;
+    // fetched whole and verified, it never blocks the title.
+    const artwork = withPoster ? await savePoster(download.id, posters[0], target).catch(() => null) : null;
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.
-    await cache(target.path, target.scope, ['publish'], entry);
+    await cache(target.path, target.scope, ['publish'], entryFor(artwork));
     // Openable offline as soon as one verified copy exists, even if a later
     // transfer in this pass fails.
     writeAtomically(join(base, 'current.json'), {root: target.name});

@@ -1129,7 +1129,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Not covered:** subtitle sidecar files and a metadata document offline;
   for now, a prepared version's kept text subtitle travels inside its MP4.
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** one P1 and two P2 findings, all
+  fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | A1 (P1) | The poster fetch had no deadline whenever a connection signal existed, so a stalled poster could block every download | Fixed: the poster fetch always has a 60 s deadline, combined with the connection signal |
+  | A2 | The poster was written before space admission, so a title that fitted without it could be refused forever | Fixed: the poster counts against the same admission. Without room for it the title is saved alone, and the poster is fetched only after the media is staged. JS test |
+  | A3 | A poster staged alone escaped lifecycle cleanup | Fixed: `Store::staged()` reports downloads with a staged poster too (deduplicated). Store test |
+
+  After the fixes: store 19, cache 10 and JS 99 passed.
 
 ### Remaining item 5 work (not started)
 

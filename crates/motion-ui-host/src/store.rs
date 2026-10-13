@@ -322,13 +322,19 @@ impl Store {
         let mut ids = Vec::new();
         for entry in self.staging.entries()? {
             let name = entry?.file_name();
-            if let Some(id) = name.to_string_lossy().strip_suffix(".part")
+            let name = name.to_string_lossy();
+            // A staged transfer or a staged poster: either belongs to the
+            // download's lifecycle (cancellation, expiry, withdrawal).
+            if let Some(id) = name
+                .strip_suffix(".part")
+                .or_else(|| name.strip_suffix(".artwork"))
                 && offline::identifier(id)
             {
                 ids.push(id.to_owned());
             }
         }
         ids.sort();
+        ids.dedup();
         Ok(ids)
     }
 

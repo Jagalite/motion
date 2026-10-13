@@ -749,3 +749,28 @@ fn a_poster_is_published_and_released_with_its_download() {
     assert!(store.remove("d1").unwrap());
     assert!(blobs(&root).is_empty());
 }
+
+/// A staged poster alone still belongs to its download's lifecycle.
+#[test]
+fn a_staged_poster_alone_is_a_staged_download() {
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    std::fs::write(
+        root.join("staging")
+            .join(artwork_staging_name("d1").unwrap()),
+        b"poster",
+    )
+    .unwrap();
+    stage(&root, "d2", b"partial");
+    std::fs::write(
+        root.join("staging")
+            .join(artwork_staging_name("d2").unwrap()),
+        b"poster",
+    )
+    .unwrap();
+    assert_eq!(store.staged().unwrap(), ["d1", "d2"]);
+    assert!(!store.remove("d1").unwrap(), "nothing published");
+    assert_eq!(store.staged().unwrap(), ["d2"]);
+}

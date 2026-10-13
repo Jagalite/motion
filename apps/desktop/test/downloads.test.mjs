@@ -816,3 +816,22 @@ test('a verified poster is saved with the title; a bad one never blocks it', asy
   assert.equal(await agent.transfer({id: 'd2'}, target), true);
   assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
 });
+
+test('a poster is saved only within the admitted space; without room the title is saved alone', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const poster = Buffer.alloc(2000, 7);
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async path => path.endsWith('/manifest') ? {...manifest('d1'), files: [...manifest('d1').files,
+      {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+        media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]} : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => url.includes('/assets/') ? assert.fail('no poster beyond the admitted space') : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const admits = calls.filter(c => c[1] === 'admit').map(c => c[2][1]);
+  assert.deepEqual(admits, [String(media.length + poster.length), String(media.length)]);
+  assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
+  assert.ok(!existsSync(join(target.path, 'staging', 'd1.artwork')));
+});
