@@ -693,6 +693,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | core | 164 passed. New: `a_bitmap_subtitle_burns_across_parts_only_as_a_bitmap_in_every_part` |
   | `tests/v2_playback.rs` `bitmap_subtitles_are_burned_across_parts` | passed. Two parts, each with its own PGS cue: a text-only client is refused; for a burned client the conversion from 0 s draws part 1's box, and from 2 s into part 2 draws part 2's box (its display set precedes that seek) |
   | `v2_playback` 35, `route_selection_model` | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `4fb3a61` raised one P2 finding,
+  fixed:
+  - **A/V offset:** after reading early, video and audio were each reset to
+    start at zero (`setpts=PTS-STARTPTS`). An audio stream starting later
+    than the pictures then lost its delay. Both streams now shift by the
+    same lookback (`setpts=PTS-<lookback>/TB`), so their offsets are kept.
+    Confirmed with FFmpeg first (the first 0.2 s: −17.6 dB before, −91 dB
+    after). The test's part 2 now has audio starting 0.5 s after its
+    pictures. A start 0.25 s into it gives a silent first 0.2 s and sound
+    from 0.4 s, with the cue drawn. `v2_playback` 35 passed; clippy clean.
 
 ### Remaining item 3 slices
 

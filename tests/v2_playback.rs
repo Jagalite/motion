@@ -7933,19 +7933,29 @@ async fn bitmap_subtitles_are_burned_across_parts() {
         assert!(status.success());
         let sup = f.dir.path().join(format!("{name}.sup"));
         std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 0, 7000)).unwrap();
+        // Part 2's audio starts 0.5 s after its pictures.
+        let delay = if name == "b-part2" { "0.5" } else { "0" };
         f.media(
             &format!("{name}.mkv"),
             &[
                 "-i",
                 base.to_str().unwrap(),
+                "-itsoffset",
+                delay,
+                "-i",
+                base.to_str().unwrap(),
                 "-i",
                 sup.to_str().unwrap(),
                 "-map",
-                "0",
+                "0:v",
                 "-map",
-                "1",
+                "1:a",
+                "-map",
+                "2",
                 "-c",
                 "copy",
+                "-metadata:s:a:0",
+                "language=eng",
                 "-metadata:s:s:0",
                 "language=eng",
             ],
@@ -8030,7 +8040,7 @@ async fn bitmap_subtitles_are_burned_across_parts() {
         }
     };
     let offset = (first_seconds * 1000.0) as u64;
-    for (n, start) in [(1, 0), (2, offset + 2000)] {
+    for (n, start) in [(1, 0), (2, offset + 2000), (3, offset + 250)] {
         let planned = plan(json!(["burned"])).await;
         let admitted = f
             .post(
@@ -8093,6 +8103,25 @@ async fn bitmap_subtitles_are_burned_across_parts() {
             inside > 225 && below < 200,
             "start {start}: box {inside}, picture {below}"
         );
+        // Read early for the cue, part 2's delayed audio keeps its offset:
+        // from 0.25 s into the part, sound begins 0.25 s into the output.
+        if n == 3 {
+            let detect = |range: &str| {
+                let out = Command::new("ffmpeg")
+                    .args(["-v", "info", "-i"])
+                    .arg(&fragment)
+                    .args(["-af", &format!("{range},volumedetect"), "-f", "null", "-"])
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stderr).into_owned();
+                text.lines()
+                    .find_map(|l| l.split("max_volume: ").nth(1))
+                    .and_then(|v| v.trim_end_matches(" dB").parse::<f64>().ok())
+                    .unwrap()
+            };
+            assert!(detect("atrim=end=0.2") < -60.0, "audio not delayed");
+            assert!(detect("atrim=start=0.4:end=1") > -40.0, "audio missing");
+        }
         let closed = f
             .call(
                 "DELETE",

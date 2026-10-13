@@ -719,7 +719,9 @@ fn arguments(
             };
             let lookback = part.lookback.min(part.seek);
             if lookback > 0 {
-                picture.push_str(&format!("trim=start={},setpts=PTS-STARTPTS,", at(lookback)));
+                // Both streams shift by the same lookback, so a stream that
+                // starts later in the part (delayed audio) keeps its offset.
+                picture.push_str(&format!("trim=start={0},setpts=PTS-{0}/TB,", at(lookback)));
             }
             graph.push_str(&format!(
                 "{picture}scale=w='trunc(iw*sar/2)*2':h=ih,setsar=1,\
@@ -730,7 +732,7 @@ fn arguments(
             inputs.push_str(&format!("[v{i}]"));
             if let Some(audio) = audio.and(part.audio) {
                 let trim = if lookback > 0 {
-                    format!("atrim=start={},asetpts=PTS-STARTPTS,", at(lookback))
+                    format!("atrim=start={0},asetpts=PTS-{0}/TB,", at(lookback))
                 } else {
                     String::new()
                 };
