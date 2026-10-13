@@ -532,8 +532,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Delete one blob a write just stopped referencing, unless another
-    /// entry still shares it.
     /// Whether a published entry names this blob (its media or its poster).
     fn referenced(&self, sha256: &str) -> bool {
         self.manifest
@@ -542,6 +540,8 @@ impl Store {
             .any(|d| d.sha256 == sha256 || d.artwork.as_ref().is_some_and(|a| a.sha256 == sha256))
     }
 
+    /// Delete one blob a write just stopped referencing, unless another
+    /// entry still shares it.
     fn release(&self, sha256: &str) -> anyhow::Result<()> {
         if self.referenced(sha256) {
             return Ok(());
@@ -792,6 +792,29 @@ impl Store {
                 self.blobs_sync.sync_all()?;
             }
             return Ok(false);
+        }
+        // The optional poster is verified here as well: a corrupt one is
+        // discarded and recovery declines, so the caller recovers the
+        // verified media without it rather than failing every pass.
+        if let Some(art) = &entry.artwork {
+            let staged_artwork = artwork_staging_name(&entry.identity.download_id)?;
+            let (mut file, from_staging) = match self.staging.open(&staged_artwork) {
+                Ok(file) => (file, true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    (self.blobs.open(&art.sha256)?, false)
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if Self::verify(&mut file, art.size, &art.sha256).is_err() {
+                drop(file);
+                if from_staging {
+                    self.staging.remove_file(&staged_artwork)?;
+                } else if !self.referenced(&art.sha256) {
+                    self.blobs.remove_file(&art.sha256)?;
+                    self.blobs_sync.sync_all()?;
+                }
+                return Ok(false);
+            }
         }
         self.publish(entry)?;
         Ok(true)

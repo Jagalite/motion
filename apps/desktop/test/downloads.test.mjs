@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {cacheTitle, createDownloadAgent, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
 
@@ -864,3 +865,43 @@ test('a disconnect during the poster stops before publication; recovery keeps a 
   const recovered = JSON.parse(recovering.calls.find(c => c[1] === 'recover')[3]);
   assert.equal(recovered.artwork.sha256, posterDigest);
 });
+
+/** The real `motion-ui-host cache` writer, when a built binary is named. */
+function realCache(binary) {
+  return (root, scope, args, input) => new Promise((resolve, reject) => {
+    const child = spawn(binary, ['cache', '--cache-dir', root, '--scope', JSON.stringify(scope), ...args], {stdio: ['pipe', 'pipe', 'ignore']});
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { output += chunk; });
+    child.once('error', reject);
+    child.stdin.on('error', reject);
+    child.once('exit', code => {
+      let value;
+      try { value = JSON.parse(output); } catch { return reject(new Error('The offline cache tool failed')); }
+      if (code === 0) resolve(value); else reject(new Error(value.error ?? 'The offline cache tool failed'));
+    });
+    child.stdin.end(input ?? '');
+  });
+}
+
+test('with the real cache, a corrupt poster never blocks recovering verified media',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const poster = Buffer.from('poster image bytes');
+    const posterDigest = createHash('sha256').update(poster).digest('hex');
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => path.endsWith('/manifest') ? {...manifest('d1'), files: [...manifest('d1').files,
+        {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+          media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]} : {},
+      fetchMedia: async () => assert.fail('no transfer')});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    // A crash left the verified media blob, and a corrupt poster blob.
+    writeFileSync(join(target.path, 'blobs', digest), media);
+    writeFileSync(join(target.path, 'blobs', posterDigest), 'corrupt poster');
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(saved.downloads.map(d => [d.identity.download_id, d.artwork ?? null]), [['d1', null]]);
+    assert.ok(!existsSync(join(target.path, 'blobs', posterDigest)), 'the corrupt poster is discarded');
+  });

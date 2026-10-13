@@ -1150,6 +1150,17 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   JS test covers both. JS 100 passed.
 
+  Round 3 at `2b762ab` raised one P2 finding, fixed:
+  - **Corrupt poster:** a corrupt poster blob made recovery with the
+    poster fail, so the media-only fallback never ran and every pass
+    failed. `Store::recover` now verifies the poster too. A corrupt one
+    is discarded (unless another entry names it) and recovery declines,
+    so the media is recovered without it.
+
+  Covered by a store test and an agent test against the real cache tool
+  (it runs when `MOTION_UI_HOST_BINARY` names a built binary). Store 20
+  and desktop JS 56 passed, with the real-cache test run.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

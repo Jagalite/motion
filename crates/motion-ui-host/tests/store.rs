@@ -750,6 +750,44 @@ fn a_poster_is_published_and_released_with_its_download() {
     assert!(blobs(&root).is_empty());
 }
 
+/// A corrupt optional poster never blocks recovering verified media: the
+/// recovery with it declines and discards it, the one without it succeeds.
+#[test]
+fn a_corrupt_poster_does_not_block_recovering_its_media() {
+    use motion_ui::offline::CachedArtwork;
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"verified before the crash";
+    let poster = b"poster bytes";
+    let poster_sha = format!("{:x}", Sha256::digest(poster));
+    let with_poster = CachedDownload {
+        artwork: Some(CachedArtwork {
+            sha256: poster_sha.clone(),
+            size: poster.len() as u64,
+            content_type: "image/png".into(),
+        }),
+        ..entry("d1", media)
+    };
+    std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
+    // A corrupt poster blob left in place.
+    std::fs::write(root.join("blobs").join(&poster_sha), b"corrupt poster").unwrap();
+    assert!(!store.recover(with_poster.clone()).unwrap());
+    assert!(!blobs(&root).contains(&poster_sha), "discarded");
+    // A corrupt staged poster likewise.
+    let staged = root
+        .join("staging")
+        .join(artwork_staging_name("d1").unwrap());
+    std::fs::write(&staged, b"also corrupt").unwrap();
+    assert!(!store.recover(with_poster.clone()).unwrap());
+    assert!(!staged.exists());
+    assert!(store.manifest().downloads.is_empty());
+    // The media alone is still recovered.
+    assert!(store.recover(entry("d1", media)).unwrap());
+    assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
+}
+
 /// A staged poster alone still belongs to its download's lifecycle.
 #[test]
 fn a_staged_poster_alone_is_a_staged_download() {
