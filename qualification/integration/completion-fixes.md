@@ -83,8 +83,9 @@ Core boundaries: HDR classification, offline history supersession, and cache eli
 ## Validation
 
 - Desktop Node tests: 59 passed, 3 skipped (62 total), latest source rerun passed.
-- Rust core compile and server/test typecheck submitted through Kyoto; queued, not passed.
-- Independent Sol review pending.
+- Rust core compile and server/test typecheck were submitted through Kyoto, stayed queued under memory pressure, then cancelled as redundant when the integration owner moved validation to exact combined CI. No local Rust pass claimed.
+- GPT-6.1 Sol reviewed exact checkpoint `a4cd66a` with no outstanding actionable findings after bounded-cache and test-status repairs. Follow-up `505ee18` corrects prepared automatic text selection and includes its router regression; combined source review and runtime CI remain authoritative.
+- Focused desktop download tests after the byte-proof regression: 35 passed, 3 skipped.
 
 ## Follow-up checkpoint
 
