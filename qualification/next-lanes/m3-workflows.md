@@ -9,6 +9,11 @@ checks, review findings and deferred release checks separate. "Usable" means an
 ordinary user with the right grant can reach the operation from the Motion web
 UI and see its result. It does not mean it has passed release qualification.
 
+> **Status note (2026-10-12, main `28f4b32`).** PR #30 has merged. The gaps in
+> section 2 are completion items 2 (bounded lists), 3 (subtitle preparation,
+> audio components, video profiles) and 4 (remaining UI workflows) of plan
+> section 12 ([the completion ledger](../completion/README.md)).
+
 ## 1. Workflow matrix
 
 The API column was taken from `contracts/served_operations.txt` and the handlers

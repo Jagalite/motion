@@ -10,6 +10,15 @@ dependency changes. The only dependency change this lane uses is Statelessness
 This ledger records the **completed declared backend slice** of M4 and its
 evidence. It is not release qualification and not M4 closure.
 
+> **Status note (2026-10-12, main `28f4b32`).** PR #22 has merged. Statements
+> below that no available FFmpeg has the tone-mapping or libass filters
+> describe the state before N2 (PR #33): the bundled tool build now includes
+> zimg and libass, pixel-verified as a tool-enablement slice. HDR tone mapping,
+> text/styled burn-in, multipart subtitles, early bitmap cues, preparation by
+> audio component and the client bitrate preference are **still not
+> implemented** in production; they are completion item 3 in plan section 12
+> and [the completion ledger](../completion/README.md).
+
 **Declared slices:**
 - **M4-00:** the inventory.
 - **M4-01:** stream copy and VideoToolbox conversions in v2.

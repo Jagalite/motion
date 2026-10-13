@@ -9,6 +9,11 @@ focused checks, review findings and deferred release checks. "Works" means the
 real code path was exercised as stated in section 4. It is not release
 qualification.
 
+> **Status note (2026-10-12, main `28f4b32`).** PR #31 has merged. Open
+> findings S30 and S31 and the unbounded server event retention are completion
+> item 1; the deferred rows in section 8 are items 5 and 8 of plan section 12
+> ([the completion ledger](../completion/README.md)).
+
 ## 1. Starting inventory
 
 | Piece | At the starting SHA |

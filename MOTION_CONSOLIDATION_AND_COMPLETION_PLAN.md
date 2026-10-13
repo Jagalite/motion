@@ -561,3 +561,279 @@ consolidation ledger. This path is a deliverable to create, not existing evidenc
 - **Full M4 closure:** reconcile the complete milestone against these receipts and
   the parity inventory. A narrow format slice, explicit refusal, merged PR or
   deferred ABR increment must not be presented as complete broad playback parity.
+
+## 11. Next parallel worklanes after the M4 backend slice
+
+> **Status (2026-10-12, main `28f4b32`): historical assignment, superseded.**
+> Lanes N1 (PR #30), N2 (PR #33) and N3 (PR #31) have merged, together with
+> PR #22 (M4 backend slice), #28 (TUI), #29 (admin metrics) and #32 (playback
+> monitoring). The text below is the 2026-10-11 assignment, kept unchanged
+> except that machine paths were replaced with neutral names. Its
+> "may start", "PR #22 owns" and "PR #29 proposes migration 0042" sentences
+> describe that checkpoint, not current work. Current status per lane:
+>
+> - **N1 merged** as a UI workflow slice. Remaining M3 UI gaps (smart filters,
+>   order groups, merge/split, deletion, non-poster artwork, readable matches,
+>   bounded list queries) are completion items 2 and 4 in section 12.
+> - **N2 merged** as a *tool-enablement slice*: the bundled FFmpeg build now
+>   contains zimg (`zscale`) and libass (`subtitles`/`ass`) with pixel-verified
+>   transforms. **No production route tone-maps HDR or burns text/styled
+>   subtitles yet**; that is completion item 3.
+> - **N3 merged** with two open Sol findings (S30, S31) and unbounded server
+>   event retention; these are completion item 1.
+> - M4 (PR #22) delivered live HLS WebVTT text renditions and a bounded
+>   two-rung software ABR ladder (off by default) after this checkpoint.
+>
+> Section 12 and [the completion ledger](qualification/completion/README.md)
+> are the current backlog.
+
+**Assignment checkpoint: 2026-10-11.** These are implementation assignments,
+not completion claims. Refresh `origin/main` and record the actual starting SHA.
+At this checkpoint PR #22 owns M4 fixes and playback wiring, PR #28 owns the TUI,
+and PR #29 owns admin metrics and its CI repair. Do not duplicate those changes
+or assume an open PR has merged. Older missing-operation lists in this document
+are historical inventories: inspect merged routes and clients before adding work.
+
+The next three lanes may start in parallel. None requires a Catabolic backend
+replacement, Tauri migration, or a new online metadata provider.
+
+### 11.1 Common execution and ownership rules
+
+- Use an individual Git worktree under the build host's shared worktree root, with a dedicated
+  branch and build/artifact directory. Suggested worktree names appear below;
+  they are assignments, not directories already created. Never build or edit in
+  another agent's worktree, and do not check out branches in the shared checkout.
+- Use **`python3 "$KYOTO_SCRIPT"`**, set to the host's shared Kyoto installation,
+  for builds under section 7.1. Queue only
+  the smallest affected target. No full application/package build unless the
+  integration change actually requires one. Read the queue's current policy and
+  record completed job results; test compilation alone is not a passing test.
+- Inventory existing behavior first. Keep a per-lane ledger under
+  `qualification/next-lanes/` with implementation, missing wiring, unsupported
+  cases, focused checks, review findings and deferred release checks separated.
+  Those ledger files are deliverables to create when the lane starts.
+- Get GPT-6.1 Sol review of implementation commits and the final PR diff; resolve
+  findings and record dispositions. Follow AGENTS.md for production-core policy,
+  deterministic verification and real adapter tests. Do not manufacture a model
+  for ordinary rendering or read-only measurements.
+- Integration coordinates contract YAML/JSON, generated clients, schema-number
+  allocation, root dependencies, native-tool manifests and shared player files.
+  PR #29 proposes migration 0042: recheck the merged registry before allocating
+  any migration. Never edit an applied migration or reuse an occupied number.
+- Keep the exhaustive browser/native, physical A/V, performance and final
+  installed-package matrix for release as agreed. Each lane still runs focused
+  correctness tests and a representative real workflow. Missing implementation,
+  wrong authorization or data-loss defects are not qualification deferrals.
+- Use disposable state for tests. The user's migrated preview and original
+  library databases are not fixtures. Coordinate preview restarts with its owner.
+
+### 11.2 Lane N1 — Complete M3 library workflows
+
+**Worktree:** `motion-m3-workflows` (shared worktree root).
+**Owners:** A01–A04/A09 with A11 presentation; coordinate with A02 for persistence.
+**Ledger:** `qualification/next-lanes/m3-workflows.md`.
+
+**Objective:** complete ordinary library management through the real Motion UI
+and public API, reusing the already implemented catalog/preparation services.
+This is functional workflow completion, not another visual redesign.
+
+1. Map each workflow to its current API route, UI entry, authorization and known
+   evidence: source registration/relocation, scan start/progress/cancel, browse
+   and search, manual identify/match correction, NFO/local metadata, artwork
+   upload/selection, collections/playlists/order, preparation and schedules.
+2. Implement missing calls/screens/actions and useful pending/error/conflict
+   states. A route existing is not proof that the ordinary user can reach it.
+   Conversely, do not rebuild an already completed endpoint based on stale prose.
+3. Demonstrate an isolated library's complete path: add source, scan, browse,
+   correct metadata/match/artwork, rescan without losing corrections, organize,
+   prepare a supported rendition and inspect its result and schedule. Test
+   restricted access and stale-revision rejection at changed boundaries.
+4. Preserve source/timeline identity and preparation component selection. If a
+   requested component cannot be prepared yet, make that explicit and coordinate
+   the implementation with M4 rather than silently selecting another track.
+
+**Likely paths:** `crates/motion-ui`, relevant `src/v2` catalog/metadata/organization/
+scan/schedule adapters and focused tests. Negotiate edits to shared UI layout and
+bridge files before starting. Leave `apps/terminal` to PR #28 and playback route
+selection/delivery to PR #22. Online provider matching and provider artwork remain
+explicitly deferred; local/manual workflows must remain useful without them.
+
+**Done for this lane:** a workflow matrix identifies every required M3 operation
+as usable or explicitly still missing, implemented gaps have focused tests and
+real UI/API evidence, and the remaining full-M3 release gate is accurately named.
+An inventory alone does not complete the lane.
+
+### 11.3 Lane N2 — Native-tool support and remaining playback transforms
+
+**Worktree:** `motion-native-media-tools` (shared worktree root).
+**Owners:** A14 integration/release for native tools; A06/A07 for playback policy
+and execution, handed off after PR #22's shared files settle.
+**Ledger:** `qualification/next-lanes/native-media-tools.md`.
+
+**Objective:** unblock a supported HDR-to-SDR route and text/styled subtitle
+fallbacks without misreporting what the current FFmpeg/player can do.
+
+1. Inspect exact host and bundled tool/provider capabilities. Select one explicit
+   supported tone-mapping pipeline and a libass-backed subtitle pipeline, pin
+   required sources/dependencies and record license/notices changes. Do not assume
+   the presence of `zscale` alone performs tone mapping, or that retagging color
+   metadata converts HDR pixels to SDR.
+2. Build the smallest native-tool artifact needed and verify real filter output,
+   relocation and dependency closure. This lane may require a native-tool rebuild;
+   it does not justify repeatedly rebuilding the complete Motion application.
+3. Coordinate with M4 to add capability-gated production policies and execution
+   for the selected transforms. Report unknown/unavailable tools explicitly.
+   Test bounded processes, cancellation, source/component fencing, output color
+   metadata and a fixture with meaningful pixel/color expectations. Keep physical
+   display fidelity as a separate release gate.
+4. Inspect Demuxe's actual supported subtitle paths before requiring burn-in.
+   Distinguish external text-track addition on a live Shaka presentation from
+   supported HLS subtitle renditions. Carry offsets, exact subtitle identity,
+   forced/SDH roles and attachment/font ownership through the chosen route.
+5. Coordinate missing client capability/quality wiring with the PR #22 owner.
+   Existing text-only capability advertisement cannot exercise bitmap burn-in;
+   adding tools cannot itself fix that. Preserve original playback and keep
+   unqualified experimental defaults explicit.
+
+**Likely paths:** `scripts/build_media_tools.py`, native-tool/package lock and
+notices, packaging checks; later coordinated changes in core, delivery and the
+player bridge. Do not independently modify M4's active files or replace Demuxe.
+
+**Done for this lane:** exact tool artifacts support the chosen transforms,
+production routes and client wiring exist, focused media/negative tests and
+review pass, and the delivered supported/refused matrix is truthful. If only
+the tool artifact is ready, call it a tool-enablement slice and name the pending
+playback implementation owner. Full HDR/subtitle parity is not implied.
+
+### 11.4 Lane N3 — Managed downloads and offline reconciliation (M5)
+
+**Worktree:** `motion-m5-downloads` (shared worktree root).
+**Owners:** A13 with A11/A12; A00 reviews contract additions.
+**Ledger:** `qualification/next-lanes/downloads-offline.md`.
+
+**Objective:** turn the existing cache-only `motion-ui-host` and offline core
+into an end-to-end download feature. Reuse their verified manifest, scoped
+media access, durable event log and desktop lifecycle; do not create a second
+catalog server or count manually seeded cache playback as download completion.
+
+1. Freeze the download identity/state contract and ownership split: the server
+   authorizes exact timeline/source revisions and optional preparation; the
+   device owns transfer staging, verified publication, resume, quotas and removal.
+   Coordinate any new schema/API allocation after PR #29 and other active work.
+2. Implement request/status/cancel and resumable transfer into the managed cache.
+   Publish manifests and blobs atomically only after size/checksum verification.
+   Cover interrupted transfer, stale source, disk full, duplicate completion and
+   competing cancellation/deletion. Keep active playback pins safe from eviction.
+3. Wire the Downloads UI and explicit offline launch to the actual completed
+   cache. Start with a named supported media/component slice; surface unsupported
+   subtitles/artwork/multipart cases instead of silently dropping requested data.
+4. Reconcile offline viewing through existing canonical authority and causal
+   revision/manual-epoch rules. Preserve device sequence identity and duplicate
+   handling. Define acknowledged-event compaction before removing local events;
+   the current bounded log is not an unlimited sync queue.
+5. Demonstrate download online, stop the remote server, cold-start offline,
+   play/seek/save progress, restart offline, reconnect and reconcile without
+   overwriting newer manual state or creating duplicate history. Test account/
+   profile/server isolation; disconnected cache cannot promise remote erasure.
+
+**Likely paths:** `crates/core/src/offline.rs`, `crates/motion-ui-host`, new/reused
+download services and contract entries, coordinated desktop lifecycle and
+Downloads views. N1 owns general library views; N2/M4 own codecs and transforms.
+Do not add cast, music, browser-offline storage or a second native host here.
+
+**Done for this lane:** the real download-to-offline-to-reconciliation workflow
+works without manual cache seeding, focused state/SQLite/filesystem/client tests
+and independent review pass, and final installed/long-duration checks remain
+listed with exact required fixtures and owners.
+
+### 11.5 Parallel schedule, integration and later backlog
+
+| Work | Can start now | Must coordinate or wait |
+|---|---|---|
+| N1 library workflow inventory and focused UI/API fixes | Yes | Shared UI files, preparation selection with M4, schema/API edits with integration |
+| N2 native-tool inventory, dependency pins and isolated filter proof | Yes | Production playback changes after agreement with PR #22; shared manifests with integration |
+| N3 download contract, cache/transfer and offline policy work | Yes | Contract/schema allocation; coordinated Downloads UI and desktop changes |
+| Existing M4, TUI and metrics fixes | Continue with current owners | Reconcile current main and shared contracts before merge |
+| Final release qualification | Prepare fixtures/ledger now | Run acceptance against the integrated server/player/tools/package bytes |
+
+Merge independently reviewed foundations first; dependent PRs name their exact
+base and handoff. There is no requirement to merge an unfinished N1 before N2 or
+N3. One integration owner reconciles shared contracts, migrations and packages.
+
+After these assignments, explicitly scope M5 chapters/previews/markers against
+existing server and Demuxe functionality. Physical TV/cast receiver support,
+dedicated music/photos, broader OS support and M6 interchange remain separate
+future assignments. ABR remains M4's declared later increment. Tauri or Catabolic
+engine replacement requires a separate architecture decision, not silent scope
+expansion in these lanes.
+
+The one-time old-library transfer is operational migration work with its own
+backup and validation receipt; it does not prove all historical schema upgrade
+paths or complete M1/M3 qualification. Final release also reconciles the full
+parity ledger, supported upgrade/restore paths, package provenance, performance,
+and the exact combined browser/Electron/client acceptance matrix.
+
+## 12. Single-agent completion backlog
+
+**Status (2026-10-12):** current execution backlog after the plan audit of main
+`28f4b32`. One implementation owner works the items below in order, in small
+reviewable PRs; GPT-6.1 Sol is the independent reviewer. This is a backlog,
+not a claim that M3–M6 are complete. Progress, evidence and review dispositions
+are recorded per item in [the completion ledger](qualification/completion/README.md).
+The full assignment text is
+[MOTION_SINGLE_AGENT_COMPLETION_HANDOFF.md](MOTION_SINGLE_AGENT_COMPLETION_HANDOFF.md).
+
+### 12.1 Corrected current-status claims
+
+These replace stale current-status prose elsewhere; historical receipts stay.
+
+- **Native tools:** the bundled FFmpeg build recipe now includes zimg and libass
+  (N2, PR #33), pixel-verified in `scripts/test_media_transforms.py`. Statements
+  that "no available FFmpeg has the filters" (M4 ledger) describe the pre-N2
+  state. Production HDR-to-SDR conversion and text/styled burn-in are **still
+  not implemented**: they remain refused by core policy.
+- **Live subtitles:** text subtitles on live HLS routes are implemented as an
+  in-manifest WebVTT rendition for clients listing `hls_text` (PR #22).
+  External text tracks on live presentations remain unsupported by the player.
+- **ABR:** a bounded two-rung software ladder exists behind
+  `processing.experimental_adaptive_bitrate` (off by default). Wider ladders are
+  a later increment, not an implied promise.
+- **Served operations:** 152 of 156 contract operations are served. Unserved:
+  `listMarkers`, `createMarker` (M5) and `previewImport`, `commitImport` (M6).
+- **Schema:** migrations run through 0044. The next allocation is 0045,
+  rechecked against `migrations/` and [MIGRATIONS.md](MIGRATIONS.md) at use.
+
+### 12.2 Milestone and parity matrix
+
+"Requirement" cites the architecture plan
+([Motion_Final_Architecture_and_Implementation_Plan.md](Motion_Final_Architecture_and_Implementation_Plan.md))
+section or the ledger row it closes. Location is where the work is expected to
+land; the ledger records the actual commits.
+
+| Item | Work | Requirement | Expected location | Acceptance check |
+|---|---|---|---|---|
+| 1.1 | Offline sync independent of `downloads:manage` (S30) | §16.1 reconciliation; N3 S30 | `apps/desktop/src/downloads.mjs` | Agent test: losing `downloads:manage` still syncs with `viewing:write`; revoked `viewing:write` denies; events retained, exact acknowledgement |
+| 1.2 | Collect crash-orphaned blobs after withdrawal (S31) | §16.1 quotas; N3 S31 | desktop agent, `motion-ui-host` store | Store/agent test: orphan collected after withdraw, published/pinned and foreign blobs kept |
+| 1.3 | Bounded server `offline_events` retention | §16.1; N3 deferred row | `crates/core/src/downloads.rs`, `src/v2/downloads.rs`, migration ≥ 0045 | Core + model + SQLite tests: retry identity, duplicates, lineage and stale-device refusal survive pruning; bound enforced |
+| 2.1 | Recent-ordered, paginated scan history; retention | §20 M1/M3; N1 §2 bounds | `src/v2/scans.rs`, scan persistence | > 1,000 scans usable; active scans retained; stable pages under inserts |
+| 2.2 | `timeline_id` filter on `listRenditions` | §20 M3; N1 §2 | `src/v2/processing.rs`, contract | Scoped filter, pagination, no inaccessible rows |
+| 2.3 | Batched organization title reads | §20 M3; N1 §2 | `src/presentation.rs`, `crates/motion-ui` | > 300 titles usable; no leak via counts/errors |
+| 3.1 | Filter and color-fact observation | §10.5–10.6; N2 handoff 1–2 | `src/processing.rs`, scan probe, migration | Unknown → refused; facts persisted per revision |
+| 3.2 | Production HDR→SDR tone mapping | §20 M4; M4-04 | `crates/core/src/delivery.rs`, `playback_session`, `src/delivery.rs` | Pixel and tag checks on output; DV profile 5 refused; capability truthful |
+| 3.3 | Text/styled burn-in with fonts and offsets | M4-02 | core subtitle policy, `src/delivery.rs` | Exact stream identity (`si`), offset, far seek, attachments |
+| 3.4 | Per-part subtitles; bitmap cues before 20 s lookback | M4-02/M4-03 deferrals | core `parts`, `src/delivery.rs` | Boundary seeks, early-cue restore |
+| 3.5 | Subtitle-inclusive preparation, audio-component selection | §20 M3 "selected tracks retained"; N1 §2 | `src/v2/processing.rs`, core `processing` | Exact mapping, stale-source fencing, no first-track substitution |
+| 3.6 | User bitrate/quality preference and control | M4-04 caps "API-only" | contract, bridge, `crates/motion-ui` | Invalid limits refused; interaction with routes and ABR |
+| 3.7 | Custom video-profile preparation UI | N1 §2 `video_profile` | `crates/motion-ui` | Validated controls, server refusal shown |
+| 4.x | Smart filters, order groups, merge/split, deletion, artwork roles, readable matches | §20 M3; N1 §2 | `crates/motion-ui`, scoped reads | Per-workflow representative check, stale-edit protection |
+| 5.x | Prepared/track downloads, transfer-state contract, multi-root picker, offline removal, restore recovery | §16.1; N3 §3/§8 | contract, server, agent, host | Real agent download → offline cold start → reconnect, Electron/Demuxe path |
+| 6.x | Markers v2, previews, schedules, receiver proof | §16.2, §16.5, §20 M5 | `src/markers.rs`, core `markers` | Per-slice supported matrix; physical receiver evidence or named block |
+| 7.x | Music, photos, interchange, platforms, parity reconciliation | §16.3–16.5, §20 M6 | new services | Media-specific fidelity/privacy gates |
+| 8 | Release qualification | §21 | release ledger | Frozen identities, matrices, performance with recorded workload |
+
+### 12.3 Rules carried forward
+
+Sections 7.1, 10.4 and 11.1 still apply: Kyoto builds of the smallest target,
+production-core decisions with Stateless coverage, disposable fixtures,
+contract/served-operation consistency, no edits to applied migrations, no
+merges/releases or experimental-default changes without user instruction.
