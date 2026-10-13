@@ -26,7 +26,10 @@ Sol rechecked the repair. These reviews are source evidence, not Rust test or
 browser qualification. Sol reviewed a4cd66a and 505ee18, then converter admission repair c618fe8 and
 populated restore regression3717d0d. Bounded cache, transfer-status expectation
 and subtitle directory durability observations were repaired before acceptance.
-No source blocker remained in those reviewed commits; CI still gates merging.
+Sol subsequently reviewed the cleanup starvation repair57924b4, compile/error
+mapping repairs56a79f3/c131187, first-use subtitle reserve repair21bc76a,
+reanchor fixture904608d, and bounded access trace provenance5707739. All reported
+source findings were repaired and rechecked; runtime CI still gates merging.
 
 ## Integration correctness boundaries
 
@@ -63,8 +66,17 @@ access/auth's Caller methods while retaining the exact layout identity pin.
   unknown/dirty refusal, source preservation and authority invalidation. Lineage
   fixtures are empty-schema replay; populated ownership/auth migration runtime
   coverage must not be inferred from them.
-- Rust integration compilation/test execution and final CI remain pending. Local
-  Rust builds are submitted only through Kyoto; the host is pressure-deferred.
+- At c131187, full-workspace/all-target Clippy and real-process integration,
+  released-baseline upgrade, rollback and restore passed. Fast CI found a stale
+  quality-label expectation, first-use subtitle reserve path failure and stale
+  reanchor fixture;21bc76a/904608d repaired them. The cancelled heavy run passed
+  12 playback and39 delivery tests, but exposed access trace metadata overflow;
+  5707739 replaces full-source metadata with a SHA-256 fingerprint, retaining
+  limits/invariants. Focused exact replay passed (see access ledger).
+- Final combined fast/heavy/package CI remains the merge gate. Current receipts
+  and exact final SHA are tracked in [PR66](https://github.com/Jagalite/motion/pull/66).
+  Local build work uses Kyoto; pressure-deferred obsolete jobs were cancelled.
+  The focused access compile subsequently succeeded when the queue admitted it.
 - Historical browser/a11y receipts remain historical. No fresh integrated
   browser/Electron/TUI walkthrough or installed-package qualification is claimed.
 
