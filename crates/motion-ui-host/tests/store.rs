@@ -799,6 +799,41 @@ fn metadata_is_kept_within_bounds_and_never_refuses_a_title() {
     }
 }
 
+/// Metadata never fills the manifest: once it would exceed its budget,
+/// later titles are saved without it, and every title is still saved.
+#[test]
+fn metadata_never_stops_a_title_from_being_saved() {
+    use playscale_core::offline::{MAX_DESCRIPTION_CHARS, OfflineMetadata};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    // The largest description: 4,000 four-byte characters.
+    let metadata = OfflineMetadata {
+        description: Some("\u{1F3AC}".repeat(MAX_DESCRIPTION_CHARS)),
+        ..Default::default()
+    };
+    for n in 0..140 {
+        let id = format!("d{n}");
+        let bytes = format!("media {n}");
+        stage(&root, &id, bytes.as_bytes());
+        let entry = CachedDownload {
+            metadata: Some(metadata.clone()),
+            ..entry(&id, bytes.as_bytes())
+        };
+        assert_eq!(
+            store.publish(entry).unwrap(),
+            Publication::Published,
+            "{id}"
+        );
+    }
+    let downloads = &store.manifest().downloads;
+    assert_eq!(downloads.len(), 140);
+    let described = downloads.iter().filter(|d| d.metadata.is_some()).count();
+    assert!((100..140).contains(&described), "{described}");
+    assert!(downloads[..described].iter().all(|d| d.metadata.is_some()));
+    assert!(std::fs::metadata(root.join("manifest.json")).unwrap().len() <= 2 * 1024 * 1024);
+}
+
 /// A corrupt optional poster never blocks recovering verified media: the
 /// recovery with it declines and discards it, the one without it succeeds.
 #[test]

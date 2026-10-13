@@ -1201,6 +1201,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | Cache | 11 passed. New: the list shows the year and the title page shows year, genres and the escaped description |
   | Desktop JS (with `MOTION_UI_HOST_BINARY`) | 58 passed. New: field filtering; with the real cache tool, a title is saved with its metadata minus an unknown field, and out-of-bounds metadata never blocks a title |
   | `v2_downloads` 10, contract 5, compose 22 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `9f3a6e7` raised one P2 finding,
+  fixed:
+  - **Manifest budget:** valid metadata on many entries could exceed the
+    cache's 2 MiB manifest bound before its 500-download limit, so
+    publication failed on every retry. A new entry now keeps its metadata
+    only while the manifest stays within the bound less 256 KiB (room for
+    other entries' later growth); otherwise the title is saved without it.
+    Store test: 140 titles with the largest description are all saved, and
+    the later ones have none. Store 22 passed; clippy clean.
 
 ### Remaining item 5 work (not started)
 

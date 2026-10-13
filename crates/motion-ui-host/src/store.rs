@@ -110,6 +110,11 @@ pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
     Ok(format!("{download_id}.part"))
 }
 
+/// The manifest size up to which a new entry keeps its optional metadata:
+/// the manifest bound less room for other entries' later growth (resume
+/// positions, rebases).
+const METADATA_BUDGET: u64 = crate::MAX_MANIFEST - 256 * 1024;
+
 impl Store {
     /// Open (creating when absent) the cache root for exactly `scope`.
     pub fn open(path: &Path, scope: &CacheScope) -> anyhow::Result<Self> {
@@ -491,6 +496,14 @@ impl Store {
             "the cache holds the maximum number of downloads"
         );
         next.downloads.push(entry);
+        // Optional metadata is kept only while the manifest stays within
+        // its budget (leaving room for the entries' later growth), so it can
+        // never stop a title from being saved.
+        if serde_json::to_vec(&next)?.len() as u64 > METADATA_BUDGET
+            && let Some(last) = next.downloads.last_mut()
+        {
+            last.metadata = None;
+        }
         self.write_manifest(next)?;
         // Only bytes this publication superseded; other unreferenced blobs
         // may still be recovered by their own ready demand (see `collect`).
