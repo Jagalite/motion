@@ -893,3 +893,48 @@ async fn the_first_start_after_a_restore_captures_its_viewing_baseline() {
     assert_eq!(revision, 5);
     db.close().await;
 }
+
+#[tokio::test]
+async fn restore_withdraws_saved_authority_without_changing_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("backup.sqlite");
+    let source = db::connect(&path).await.unwrap();
+    for sql in [
+        "INSERT INTO devices(id,name,client_name,revision,profile_ids,permissions,policy,created_at) VALUES ('d','Device','test',1,'[]','[]','{}',0)",
+        "INSERT INTO credentials(token_hash,device_id,kind,generation,expires_at) VALUES ('secret','d','device',0,9223372036854775807)",
+        "INSERT INTO credentials(token_hash,device_id,kind,generation,expires_at,parent_hash,csrf_token) VALUES ('cookie','d','session',0,9223372036854775807,'secret','csrf')",
+        "INSERT INTO content_tickets(id,token_hash,principal_id,credential_hash,file_id,file_revision,purpose,expires_at) VALUES ('t','ticket','d','secret','f','r','playback',9223372036854775807)",
+        "INSERT INTO content_tickets(id,token_hash,principal_id,file_id,file_revision,purpose,expires_at) VALUES ('o','operator-ticket','operator','f','r','playback',9223372036854775807)",
+        "INSERT INTO pairings(id,device_code_hash,user_code,device_name,client_name,expires_at,phase,device_id) VALUES ('p','code','CODE','Device','test',9223372036854775807,'approved','d')",
+        "INSERT INTO idempotency_records(principal_id,operation,target,key,digest,status,issued_nonce,expires_at) VALUES ('d','pair','d','key','digest',200,'secret-replay',9223372036854775807)",
+    ] {
+        sqlx::query(sql).execute(&source).await.unwrap();
+    }
+    source.close().await;
+    let destination = dir.path().join("restored.sqlite");
+    db::restore_into(&path, &destination).await.unwrap();
+    let restored = db::connect(&destination).await.unwrap();
+    for table in [
+        "credentials",
+        "content_tickets",
+        "pairings",
+        "idempotency_records",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    let revoked: bool = sqlx::query_scalar("SELECT revoked FROM devices WHERE id='d'")
+        .fetch_one(&restored)
+        .await
+        .unwrap();
+    assert!(revoked);
+    let source = db::connect(&path).await.unwrap();
+    let still_saved: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&source)
+        .await
+        .unwrap();
+    assert_eq!(still_saved, 2);
+}

@@ -935,3 +935,23 @@ test('with the real cache, a title is saved with its metadata, and bad metadata 
     assert.deepEqual(Object.fromEntries(saved.downloads.map(d => [d.identity.download_id, d.metadata ?? null])),
       {d1: {release_year: 1999, description: 'Plot', genres: ['Drama']}, d2: null});
   });
+test('a repeating inventory cursor fails before removing any saved copies', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  let pages = 0;
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => { throw new Error('must not transfer a partial inventory'); },
+    api: async path => {
+      assert.ok(path.includes('active_only=true'));
+      pages++;
+      return {items: [], next_cursor: 'repeated'};
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'saved', timeline_id: 't'}});
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  await assert.rejects(agent.pass(), /inventory did not complete/);
+  assert.equal(pages, 2);
+  assert.ok(!fake.calls.some(c => c[1] === 'remove'));
+  assert.equal(fake.state(target.path).downloads[0].identity.download_id, 'saved');
+});

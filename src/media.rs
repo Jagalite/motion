@@ -20,7 +20,7 @@ use tokio::sync::OwnedSemaphorePermit;
 
 // A cancelled waiter must not release admission while its OS operation is still running.
 async fn admitted_io<T: Send + 'static>(
-    permit: Arc<OwnedSemaphorePermit>,
+    permit: Arc<(OwnedSemaphorePermit, Arc<crate::artifact_leases::Lease>)>,
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
     tokio::task::spawn_blocking(move || {
@@ -54,6 +54,14 @@ pub async fn serve(
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    // Acquire before the available-row observation, so GC cannot retire a file
+    // between that observation and the real open/read. The body and blocking
+    // closures share ownership even when their async waiter is cancelled.
+    let artifact = app
+        .processing
+        .artifacts
+        .pin([id.clone()])
+        .ok_or_else(ApiError::not_found)?;
     let row =
         sqlx::query_as::<_, ItemRow>("SELECT * FROM catalog_files WHERE id=? AND available=1")
             .bind(&id)
@@ -71,13 +79,16 @@ pub async fn serve(
             .bind(&row.library_id)
             .fetch_one(&app.db)
             .await?;
-    let permit = Arc::new(app.streams.clone().try_acquire_owned().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "stream_limit",
-            "Too many open streams",
-        )
-    })?);
+    let permit = Arc::new((
+        app.streams.clone().try_acquire_owned().map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "stream_limit",
+                "Too many open streams",
+            )
+        })?,
+        artifact,
+    ));
     let relative = row.relative_path.clone();
     let (file, meta) = admitted_io(permit.clone(), move || {
         let root_meta = std::fs::metadata(&root).map_err(|_| ApiError::not_found())?;
@@ -221,7 +232,9 @@ mod tests {
     #[tokio::test]
     async fn cancelled_io_keeps_admission_until_blocking_operation_finishes() {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let artifacts = Arc::new(crate::artifact_leases::Registry::default());
+        let pin = artifacts.pin(["file".into()]).unwrap();
+        let permit = Arc::new((slots.clone().try_acquire_owned().unwrap(), pin));
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         let task = tokio::spawn(admitted_io(permit, move || {
@@ -233,6 +246,7 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(slots.available_permits(), 0);
         assert!(slots.clone().try_acquire_owned().is_err());
+        assert!(artifacts.claim_cleanup("file".into()).is_none());
         release.send(()).unwrap();
         let permit = tokio::time::timeout(std::time::Duration::from_secs(2), slots.acquire())
             .await
@@ -240,5 +254,18 @@ mod tests {
             .unwrap();
         drop(permit);
         assert_eq!(slots.available_permits(), 1);
+        // Tuple fields drop in order: the semaphore can wake this task before
+        // the blocking thread finishes releasing the artifact pin. Observe
+        // both releases instead of assuming they form one atomic operation.
+        let _cleanup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(cleanup) = artifacts.claim_cleanup("file".into()) {
+                    break cleanup;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed blocking operation retained its artifact pin");
     }
 }

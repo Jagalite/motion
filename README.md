@@ -71,7 +71,8 @@ checksums, preserves upstream licensing materials, and adds Motion's provider
 manifest and paced-HLS adaptations. Build and asset hashes are recorded in
 `playscale-package.json`. The Shaka build requires Node, Python, and Java.
 
-`web/demuxe.js` supports the published per-player API. If a future package provides
+`packages/ui-bridge/player.js` is the production playback bridge. The legacy
+`fixtures/legacy-web/demuxe.js` remains as a compatibility fixture. If a package provides
 both `DemuxeRuntime` and `demuxe-player.runtime`, it uses one document-owned runtime
 and retries failed initialization. Motion packaging retains per-player ownership
 and applies its paced-HLS adaptations to the integrity-pinned npm release. No cross-player Wasm

@@ -691,6 +691,10 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    // The final path must not become bootable until authority withdrawal commits.
+    // VACUUM creates this unique staging file exclusively; publication below also
+    // refuses an existing destination even if it appeared during the restore.
+    let staging = destination.with_file_name(format!(".motion-restore-{}.sqlite", new_id()));
     // Copy through SQLite so committed WAL content is included and the
     // destination is a single clean file, never a torn file-level copy.
     {
@@ -700,15 +704,15 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         )
         .await?;
         sqlx::query("VACUUM INTO ?")
-            .bind(destination.to_str().context("destination must be UTF-8")?)
+            .bind(staging.to_str().context("destination must be UTF-8")?)
             .execute(&mut source)
             .await?;
         source.close().await?;
     }
-    let restored = match connect(destination).await {
+    let restored = match connect(&staging).await {
         Ok(db) => db,
         Err(error) => {
-            let _ = tokio::fs::remove_file(destination).await;
+            let _ = tokio::fs::remove_file(&staging).await;
             return Err(error.context("restored database could not be upgraded"));
         }
     };
@@ -742,6 +746,17 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
             .bind(&epoch)
             .execute(&mut *tx)
             .await?;
+        // A snapshot cannot prove post-snapshot revocations. Withdraw saved
+        // authority atomically with the new restore history and baseline.
+        for statement in [
+            "DELETE FROM content_tickets",
+            "DELETE FROM pairings",
+            "DELETE FROM idempotency_records",
+            "DELETE FROM credentials",
+            "UPDATE devices SET revoked=1",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         capture_restore_baseline(&restored).await?;
         Some(epoch)
@@ -765,6 +780,18 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         .bind(serde_json::to_string(&receipt)?)
         .execute(&restored)
         .await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&restored)
+        .await?;
     restored.close().await;
+    tokio::fs::File::open(&staging).await?.sync_all().await?;
+    // A hard link publishes atomically without replacing a concurrent destination.
+    tokio::fs::hard_link(&staging, destination).await?;
+    tokio::fs::remove_file(&staging).await?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tokio::fs::File::open(parent).await?.sync_all().await?;
     Ok(receipt)
 }

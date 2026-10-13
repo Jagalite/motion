@@ -1111,6 +1111,120 @@ async fn page_event_cursor_resumes_without_reset() {
     assert_eq!(events[0].1["resource_id"], "default");
 }
 
+#[tokio::test]
+async fn organization_and_schedule_events_survive_deletion_without_disclosing_hidden_owners() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    sqlx::query("INSERT INTO profiles(id,name) VALUES ('hidden-profile','Hidden')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let hidden_root = f._dir.path().join("hidden");
+    std::fs::create_dir(&hidden_root).unwrap();
+    let hidden_library = db::add_library(&f.app.db, "Hidden", &hidden_root)
+        .await
+        .unwrap()
+        .id;
+    let (device, token) = f
+        .pair(
+            &["default"],
+            &[
+                "events:read",
+                "catalog:read",
+                "collections:write",
+                "sources:manage",
+            ],
+        )
+        .await;
+    let auth = bearer(&token);
+    sqlx::query("UPDATE devices SET policy=? WHERE id=?").bind(json!({"library_ids":[f.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}).to_string()).bind(&device).execute(&f.app.db).await.unwrap();
+    let mut stream = f
+        .raw(f.request("GET", "/api/v2/events", None, &[("authorization", &auth)]))
+        .await
+        .into_body();
+    assert_eq!(sse(&mut stream, 1).await.0[0].0, "reset");
+    for (table, extra_columns, extra_values) in [
+        ("collections", ",kind", ",'manual'"),
+        ("saved_filters", ",terms_json", ",'{}'"),
+        ("playlists", "", ""),
+    ] {
+        let id = format!("owned-{table}");
+        sqlx::query(&format!("INSERT INTO {table}(id,revision,profile_id,name{extra_columns}) VALUES (?,1,'default','Own'{extra_values})"))
+            .bind(&id).execute(&f.app.db).await.unwrap();
+        let hint = sse(&mut stream, 1).await.0.remove(0).1;
+        assert_eq!(hint["resource_id"], id);
+        let cursor = hint["cursor"].as_str().unwrap().to_owned();
+        sqlx::query(&format!("DELETE FROM {table} WHERE id=?"))
+            .bind(&id)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        let hint = sse(&mut stream, 1).await.0.remove(0).1;
+        assert_eq!(hint["kind"], "reset");
+        assert!(hint["resource_id"].is_null());
+        let mut resumed = f
+            .raw(f.request(
+                "GET",
+                "/api/v2/events",
+                None,
+                &[("authorization", &auth), ("last-event-id", &cursor)],
+            ))
+            .await
+            .into_body();
+        assert_eq!(sse(&mut resumed, 1).await.0[0].0, "reset");
+    }
+    sqlx::query("INSERT INTO api_schedules(id,library_id,task,interval_seconds,enabled,next_run,requester_id) VALUES ('own-schedule',?,'scan',60,1,0,?)")
+        .bind(&f.library).bind(&device).execute(&f.app.db).await.unwrap();
+    assert_eq!(
+        sse(&mut stream, 1).await.0[0].1["resource_id"],
+        "own-schedule"
+    );
+    sqlx::query(
+        "UPDATE api_schedules SET library_id=?,revision=revision+1 WHERE id='own-schedule'",
+    )
+    .bind(&hidden_library)
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(sse(&mut stream, 1).await.0[0].0, "reset");
+    sqlx::query("DELETE FROM api_schedules WHERE id='own-schedule'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO playlists(id,revision,profile_id,name) VALUES ('hidden-list',1,'hidden-profile','Hidden')").execute(&f.app.db).await.unwrap();
+    sqlx::query("DELETE FROM playlists WHERE id='hidden-list'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    // An authorized sentinel proves hidden events were consumed without names
+    // or unnecessary resets, rather than merely waiting for a quiet interval.
+    sqlx::query("UPDATE profiles SET name='Sentinel' WHERE id='default'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let hints = sse(&mut stream, 1).await.0;
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0].1["resource_id"], "default");
+
+    let (_, bare_token) = f.pair(&["default"], &["events:read"]).await;
+    let bare_auth = bearer(&bare_token);
+    let mut bare = f
+        .raw(f.request(
+            "GET",
+            "/api/v2/events",
+            None,
+            &[("authorization", &bare_auth)],
+        ))
+        .await
+        .into_body();
+    let _ = sse(&mut bare, 1).await;
+    sqlx::query("INSERT INTO playlists(id,revision,profile_id,name) VALUES ('private-list',1,'default','Private')").execute(&f.app.db).await.unwrap();
+    sqlx::query("UPDATE profiles SET name='Second sentinel' WHERE id='default'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(sse(&mut bare, 1).await.0[0].1["resource_id"], "default");
+}
+
 // Snapshot every application table, including both historical and canonical
 // viewing state. Retired requests must not perform even a hidden side write.
 async fn retirement_snapshot(app: &App) -> Vec<(String, Vec<String>)> {

@@ -1876,3 +1876,7 @@ Not started. Optional external/commercial/social services are out of scope.
 ## 8. Release qualification
 
 Not started. Runs after feature implementation, against frozen identities.
+
+## Rewrite repair evidence
+
+See [rewrite repair ledger](../integration/rewrite-fixes.md) for the separate repair batch and its remaining qualification gaps.

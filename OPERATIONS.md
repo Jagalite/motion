@@ -139,7 +139,11 @@ python3 scripts/backup.py restore \
 ```
 
 It refuses every existing destination, even an empty one. Restored servers generate
-a fresh admin token. Media roots/identities remain as recorded; restoring the DB does
+a fresh admin token. Restore withdraws all saved device grants and deletes file
+tickets, login/access credentials, pending pairings and idempotency receipts.
+Devices must pair again, including trusted-ingress identities that were previously
+approved. This prevents a snapshot from reviving grants revoked after the backup.
+Device audit records, profiles and viewing state remain. Media roots/identities remain as recorded; restoring the DB does
 not relocate media. To switch a service to restored data: stop/unload it, change
 `data_dir` in its configuration, then bootstrap it again. Keep the original data
 and configuration until the replacement has passed readiness and content checks.
@@ -224,7 +228,8 @@ and foreign keys, record schema versions and SHA-256, then atomically publish a
 manifest directory under `data_dir/backups`. Restore with the existing
 `scripts/backup.py restore` command. These are local database snapshots: copy them
 to another device for protection against loss of the server disk. Source media,
-generated files, configuration, credentials, and player assets are not included.
+generated files, configuration, credential-derivation keys, and player assets are not included.
+Saved credential hashes are part of the database; both restore paths invalidate them before use.
 
 Retention removes only marked `auto-*` snapshot directories belonging to this
 scheduler. Unfinished directories are not published as backups; partials older than

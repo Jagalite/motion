@@ -1,5 +1,6 @@
 pub mod administration;
 pub mod api;
+pub mod artifact_leases;
 pub mod artwork;
 pub mod catalog;
 pub mod components;

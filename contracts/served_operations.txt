@@ -160,3 +160,4 @@ uploadArtwork
 createTimelinePreviews
 getTimelinePreviews
 getPreviewSheet
+getArtworkSelection

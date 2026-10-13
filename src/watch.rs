@@ -17,6 +17,10 @@ use playscale_core::watch::{self as core, Debounce, Hint};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -25,6 +29,27 @@ use tokio_util::sync::CancellationToken;
 /// How often the watched set is reconciled with registered sources.
 const RESYNC: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_millis(500);
+const EVENT_CAPACITY: usize = 256;
+const EVENT_PATHS: usize = 256;
+const EVENT_PATH_BYTES: usize = 64 * 1024;
+
+fn queue_observation(tx: &mpsc::Sender<Observed>, overflow: &AtomicBool, observed: Observed) {
+    let oversized = match &observed {
+        Observed::Paths(paths, _) => {
+            paths.len() > EVENT_PATHS
+                || paths
+                    .iter()
+                    .map(|path| path.as_os_str().len())
+                    .sum::<usize>()
+                    > EVENT_PATH_BYTES
+        }
+        Observed::Lost(Some(path)) => path.as_os_str().len() > EVENT_PATH_BYTES,
+        Observed::Lost(None) => false,
+    };
+    if oversized || tx.try_send(observed).is_err() {
+        overflow.store(true, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Watched {
@@ -67,7 +92,9 @@ fn identity(root: &Path) -> Option<String> {
 
 /// Run until `shutdown`. `policy` is injectable for tests.
 pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Observed>();
+    let (tx, mut rx) = mpsc::channel::<Observed>(EVENT_CAPACITY);
+    let overflow = Arc::new(AtomicBool::new(false));
+    let callback_overflow = overflow.clone();
     let mut watcher = match notify::recommended_watcher(
         move |result: notify::Result<notify::Event>| {
             let observed = match result {
@@ -79,7 +106,7 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
                 }
                 Err(error) => Observed::Lost(error.paths.into_iter().next()),
             };
-            let _ = tx.send(observed);
+            queue_observation(&tx, &callback_overflow, observed);
         },
     ) {
         Ok(watcher) => watcher,
@@ -97,6 +124,13 @@ pub async fn worker(app: App, shutdown: CancellationToken, policy: Debounce) -> 
     let mut resync = tokio::time::interval(RESYNC);
     let mut tick = tokio::time::interval(TICK);
     loop {
+        if overflow.swap(false, Ordering::AcqRel) {
+            // A bounded callback cannot retain every native notification.
+            // Losing any of them requires a fresh traversal for every root.
+            for source in watched.keys() {
+                core::record(&mut pending, source, now_ms());
+            }
+        }
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             _ = resync.tick() => {
@@ -254,4 +288,32 @@ async fn demand(app: &App, source: &str) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bounded_callback_tests {
+    use super::*;
+
+    #[test]
+    fn full_or_oversized_notifications_require_a_catchup_without_blocking() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let overflow = AtomicBool::new(false);
+        queue_observation(&tx, &overflow, Observed::Lost(None));
+        assert!(!overflow.load(Ordering::Acquire));
+        queue_observation(
+            &tx,
+            &overflow,
+            Observed::Paths(vec!["changed.mkv".into()], false),
+        );
+        assert!(overflow.swap(false, Ordering::AcqRel));
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        queue_observation(
+            &tx,
+            &overflow,
+            Observed::Paths(vec![PathBuf::new(); EVENT_PATHS + 1], false),
+        );
+        assert!(overflow.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_err());
+    }
 }

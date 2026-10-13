@@ -105,6 +105,7 @@ pub struct Runtime {
     pub io: Arc<Semaphore>,
     pub inspection: Arc<Semaphore>,
     pub maintenance: tokio::sync::Mutex<()>,
+    pub artifacts: Arc<crate::artifact_leases::Registry>,
     /// Shared encoder capacity; released only after confirmed worker termination.
     pub execution: Arc<crate::execution::Coordinator>,
     /// Hardware encoder sessions, accounted like CPU capacity.
@@ -125,6 +126,7 @@ impl Runtime {
             io: Arc::new(Semaphore::new(1)),
             inspection: Arc::new(Semaphore::new(1)),
             maintenance: tokio::sync::Mutex::new(()),
+            artifacts: Arc::default(),
             execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
             hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
             videotoolbox: tokio::sync::OnceCell::new(),

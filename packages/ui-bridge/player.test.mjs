@@ -563,3 +563,18 @@ test('a superseded thumbnail lookup settles at once and a retired player release
   releaseSheets(element);
   assert.deepEqual(revoked, ['blob:1', 'blob:2'], 'released once');
 });
+
+test('next-title navigation retains the selected profile after teardown', async () => {
+  const navigated = [];
+  const requests = [];
+  const host = {dataset: {profileId: 'guest-profile', timelineId: 'episode-1'}, querySelector: () => ({setAttribute() {}})};
+  const playNext = runInNewContext(source.replace('if (host) void start();', '').replace('export {close, maintainLease};', 'playNext;'), {
+    document: {getElementById: id => id === 'motion-player' ? host : null, querySelector: () => null, addEventListener() {}},
+    addEventListener() {}, AbortSignal,
+    fetch: async path => { requests.push(path); return {ok: true, status: 200, json: async () => ({items: [{id: 'episode-2'}]})}; },
+    location: {assign: path => navigated.push(path)},
+  });
+  await playNext();
+  assert.deepEqual(requests, ['/api/v2/profiles/guest-profile/timelines/episode-1/next']);
+  assert.deepEqual(navigated, ['/play/episode-2?play=1&profile=guest-profile']);
+});

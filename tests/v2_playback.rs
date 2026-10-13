@@ -8373,3 +8373,32 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
     stop.cancel();
     worker.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn planning_uses_one_pool_slot_for_components_and_preferences() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "2");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let auth = bearer(OPERATOR);
+    let mut occupied = Vec::new();
+    for _ in 0..3 {
+        occupied.push(f.server.app.db.acquire().await.unwrap());
+    }
+    for policy in ["off", "auto"] {
+        let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            f.post("/api/v2/playback/plans", &auth, None, input),
+        )
+        .await
+        .expect("planning must not acquire a second pool connection");
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+        assert_eq!(response.body["status"], "ready");
+    }
+}

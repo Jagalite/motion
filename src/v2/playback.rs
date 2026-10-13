@@ -1071,7 +1071,8 @@ pub async fn plan(
     }
     let require_sdr = input.quality.hdr_policy == "require_sdr";
     let principal = &caller.principal;
-    let mut conn = app.db.acquire().await?;
+    // All planning observations share one read snapshot and one pool slot.
+    let mut conn = app.db.begin().await?;
     usable_profile(&mut conn, principal, &input.profile_id).await?;
     readable_timeline(&mut conn, principal, &input.timeline_id).await?;
     // A pinned generated version names the original it renders; only that
@@ -1170,7 +1171,7 @@ pub async fn plan(
     let audios = streams.iter().filter(|t| t.kind == "audio").count();
     let subtitles = streams.iter().filter(|t| t.kind == "subtitle").count();
     let default_audio = (audios > 0).then_some(0);
-    let components = crate::components::timeline_components(&app.db, &input.timeline_id)
+    let components = crate::components::timeline_components_in(&mut conn, &input.timeline_id)
         .await
         .map_err(Problem::internal)?;
     let component_index = |id: &Option<String>, kind, name: &str| -> Option<u32> {
@@ -1331,7 +1332,7 @@ pub async fn plan(
     };
     let preferences = if automatic {
         Some(
-            legacy::prefs(&app, &input.profile_id)
+            legacy::prefs_in(&mut conn, &input.profile_id)
                 .await
                 .map_err(problem)?
                 .preferences,
@@ -1608,7 +1609,7 @@ pub async fn plan(
             }
             _ => core::StreamCopy::Ineligible,
         };
-        conn = app.db.acquire().await?;
+        conn = app.db.begin().await?;
         decided = core::plan(&bound.file.id, &source, &request);
         if decided == core::Plan::Observe {
             return Err(Problem::internal(
@@ -2772,21 +2773,12 @@ pub async fn master_playlist(
         .flatten()
         .find(|g| g.generation == generation && g.transport == "hls" && g.manifest_url.is_some())
         .ok_or_else(Problem::not_found)?;
-    // A stream copy keeps the source's H.264 profile/level and AAC object
-    // type: describe its own output. A transcode keeps its recipe's existing
-    // description (H.264 High, AAC-LC stereo).
-    // An adaptive ladder describes each variant from its own init segment.
-    let (codecs, size) =
-        if matches!(serving.operation.as_str(), "remux" | "audio_convert") || serving.adaptive {
-            delivery::init_codecs(&app, &id, &generation, None)
-                .await
-                .map_err(stream_problem)?
-                .ok_or_else(|| Problem::internal("copied stream codecs could not be described"))?
-        } else if serving.audio_track.is_some() {
-            ("avc1.64001f,mp4a.40.2".into(), None)
-        } else {
-            ("avc1.64001f".into(), None)
-        };
+    // Encoder choice and output resolution can change profile/level. Advertise
+    // the actual initialization segment for every route, including transcodes.
+    let (codecs, size) = delivery::init_codecs(&app, &id, &generation, None)
+        .await
+        .map_err(stream_problem)?
+        .ok_or_else(|| Problem::internal("stream codecs could not be described"))?;
     // Ladder rungs carry their sizes so a client can tell them apart.
     let resolution = |size: Option<(u32, u32)>| {
         size.filter(|_| serving.adaptive)

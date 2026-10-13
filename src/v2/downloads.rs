@@ -798,23 +798,44 @@ pub async fn create(
 
 // -------------------------------------------------------------------- reads
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadQuery {
+    // URL query values must reach serde_urlencoded's typed deserializer.
+    // Flattening PageQuery buffers `limit` as a string and rejects valid u32s.
+    cursor: Option<String>,
+    limit: Option<u32>,
+    /// Keep cancelled demand history available to explicit history clients.
+    #[serde(default)]
+    active_only: bool,
+}
+
 pub async fn list(
     State(app): State<App>,
     caller: Caller,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<DownloadQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
     let device = device(&caller.principal, None)?;
-    let limit = q.limit()?;
+    let pagination = PageQuery {
+        cursor: q.cursor,
+        limit: q.limit,
+    };
+    let limit = pagination.limit()?;
+    let active = if q.active_only {
+        " AND state='ready'"
+    } else {
+        ""
+    };
     let mut tx = app.db.begin().await?;
     let profiles: Vec<&String> = caller.principal.grant.profile_ids.iter().collect();
     let rows: Vec<Row> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM downloads WHERE device_id=? AND principal_id=? AND id>? \
+        "SELECT {COLUMNS} FROM downloads WHERE device_id=? AND principal_id=? AND id>?{active} \
          AND (? OR profile_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?"
     ))
     .bind(&device)
     .bind(&caller.principal.id)
-    .bind(q.after()?)
+    .bind(pagination.after()?)
     .bind(caller.principal.is_admin())
     .bind(serde_json::to_string(&profiles).map_err(Problem::internal)?)
     .bind(i64::from(limit) + 1)

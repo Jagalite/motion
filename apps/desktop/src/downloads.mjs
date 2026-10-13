@@ -189,9 +189,16 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
   async function listDownloads() {
     const items = [];
     let cursor = null;
+    const seen = new Set();
     do {
-      const page = await api(`/api/v2/downloads?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      // MAX_ACTIVE_PER_DEVICE=500 includes expired, uncancelled demands.
+      // Return only a complete inventory: callers remove copies absent from it.
+      if (seen.size >= 3 || seen.has(cursor)) throw new Error('Download inventory did not complete within its bound');
+      seen.add(cursor);
+      const page = await api(`/api/v2/downloads?active_only=true&limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+      if (!Array.isArray(page.items) || page.items.length > 200) throw new Error('Invalid download inventory page');
       items.push(...page.items);
+      if (items.length > 500) throw new Error('Download inventory exceeds device limit');
       cursor = page.next_cursor;
     } while (cursor);
     return items;

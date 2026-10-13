@@ -446,12 +446,23 @@ pub struct PreferenceUpdate {
     pub preferences: Preferences,
 }
 pub(crate) async fn prefs(app: &App, p: &str) -> Result<PreferenceState, ApiError> {
-    profile(app, p).await?;
+    let mut conn = app.db.acquire().await?;
+    prefs_in(&mut conn, p).await
+}
+
+pub(crate) async fn prefs_in(
+    conn: &mut sqlx::SqliteConnection,
+    p: &str,
+) -> Result<PreferenceState, ApiError> {
+    let _: String = sqlx::query_scalar("SELECT id FROM profiles WHERE id=?")
+        .bind(p)
+        .fetch_one(&mut *conn)
+        .await?;
     let row: Option<(i64, String)> = sqlx::query_as(
         "SELECT revision,document_json FROM playback_preferences WHERE profile_id=?",
     )
     .bind(p)
-    .fetch_optional(&app.db)
+    .fetch_optional(&mut *conn)
     .await?;
     match row {
         Some((revision, doc)) => Ok(PreferenceState {

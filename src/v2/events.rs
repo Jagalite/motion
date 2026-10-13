@@ -129,7 +129,7 @@ async fn classify(
     principal: &Principal,
     row: &Row,
 ) -> Result<Resource, sqlx::Error> {
-    let (_, topic, id, _, scope) = row;
+    let (_, topic, id, _, scope, prior_profile) = row;
     let prior = scope.iter().cloned().collect();
     Ok(match topic.as_str() {
         "libraries" => Resource::Library(id.clone()),
@@ -158,8 +158,13 @@ async fn classify(
             .bind(id)
             .fetch_optional(conn)
             .await?;
-            owner.map_or(Resource::Administrative, Resource::Profile)
+            Resource::Organization { current_profile: owner, prior_profile: prior_profile.clone() }
         }
+        "schedules" => Resource::Schedule {
+            current_library: sqlx::query_scalar("SELECT library_id FROM api_schedules WHERE id=?")
+                .bind(id).fetch_optional(conn).await?,
+            prior_library: scope.clone(),
+        },
         "devices" => Resource::Device(id.clone()),
         "scan" | "processing" | "job" => {
             let requester:Option<String>=sqlx::query_scalar("SELECT requester_id FROM api_jobs WHERE id=?")
@@ -224,8 +229,8 @@ fn reset(epoch: &str, principal: &Principal, position: i64, reason: ResetReason)
         .data(serde_json::to_string(&hint).unwrap())
 }
 
-/// id, topic, resource_id, kind, scope_library
-type Row = (i64, String, String, String, Option<String>);
+/// id, topic, resource_id, kind, prior library and profile (survive deletion).
+type Row = (i64, String, String, String, Option<String>, Option<String>);
 type Batch = (i64, i64, String, Vec<Row>);
 
 async fn batch(app: &App, after: i64) -> Result<Batch, sqlx::Error> {
@@ -239,7 +244,7 @@ async fn batch(app: &App, after: i64) -> Result<Batch, sqlx::Error> {
             .fetch_one(&mut *tx)
             .await?;
     let rows = sqlx::query_as(
-        "SELECT id,topic,resource_id,kind,scope_library FROM change_events WHERE id>? ORDER BY id LIMIT ?",
+        "SELECT id,topic,resource_id,kind,scope_library,scope_profile FROM change_events WHERE id>? ORDER BY id LIMIT ?",
     )
     .bind(after)
     .bind(BATCH)
@@ -340,7 +345,7 @@ pub async fn subscribe(
                     let Ok(resource) = classify(&mut conn, &principal, &row).await else { break 'stream };
                     disclose(&principal, &resource)
                 };
-                let (id, topic, resource_id, kind, _) = row;
+                let (id, topic, resource_id, kind, _, _) = row;
                 position = id;
                 match disclosure {
                     Disclosure::Withhold => continue,

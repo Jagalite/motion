@@ -165,7 +165,7 @@ async function playNext(current = () => true) {
     const finishing = close();
     const closedEpoch = state.epoch;
     await finishing;
-    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}?play=1`);
+    if (state.epoch === closedEpoch) location.assign(`/play/${encodeURIComponent(id)}?play=1&profile=${encodeURIComponent(host.dataset.profileId)}`);
   } catch (error) { if (current()) status(`Next title could not start: ${error.message}`, 'alert'); }
   finally { advancing = false; }
 }

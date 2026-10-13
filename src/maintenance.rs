@@ -147,6 +147,7 @@ async fn clean_with(
     let permit = std::sync::Arc::new(permit);
     let paths = {
         let _lock = app.jobs.lock().await;
+        let mut tx = crate::db::begin_write(&app.db).await?;
         #[derive(sqlx::FromRow)]
         struct Observation {
             id: String,
@@ -162,7 +163,7 @@ async fn clean_with(
         let clock = now();
         loop {
             let page: Vec<Observation> = sqlx::query_as("SELECT p.id,p.output_file_id,p.attempt,p.phase,p.updated_at,(SELECT max(s.updated_at) FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused')) AS last_active_playback FROM processing_jobs p WHERE p.cache_cleaned=0 AND (p.phase IN ('failed','cancelled') OR (p.phase='completed' AND p.updated_at<?)) AND NOT EXISTS(SELECT 1 FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused') AND s.updated_at>?) ORDER BY p.updated_at,p.id LIMIT 200 OFFSET ?")
-                .bind(playscale_core::maintenance::retention_cutoff(clock, app.processing.settings.retention_seconds)).bind(playscale_core::maintenance::playback_cutoff(clock)).bind(offset).fetch_all(&app.db).await?;
+                .bind(playscale_core::maintenance::retention_cutoff(clock, app.processing.settings.retention_seconds)).bind(playscale_core::maintenance::playback_cutoff(clock)).bind(offset).fetch_all(&mut *tx).await?;
             let count = page.len();
             for Observation {
                 id,
@@ -183,7 +184,16 @@ async fn clean_with(
                     last_active_playback,
                 };
                 if state.removable(clock, app.processing.settings.retention_seconds) {
-                    rows.push((id, file, attempt));
+                    let cleanup = if let Some(file) = &file {
+                        let Some(claim) = app.processing.artifacts.claim_cleanup(file.clone())
+                        else {
+                            continue;
+                        };
+                        Some(claim)
+                    } else {
+                        None
+                    };
+                    rows.push((id, file, attempt, cleanup));
                     if rows.len() == 200 {
                         break;
                     }
@@ -194,9 +204,8 @@ async fn clean_with(
             }
             offset += count as i64;
         }
-        let mut tx = crate::db::begin_write(&app.db).await?;
         let mut paths = Vec::new();
-        for (id, file, attempt) in rows {
+        for (id, file, attempt, cleanup) in rows {
             if let Some(file) = file {
                 sqlx::query(
                     "UPDATE media_files SET available=0 WHERE id=? AND generated=1 AND available=1",
@@ -206,7 +215,7 @@ async fn clean_with(
                 .await?;
             }
             sqlx::query("UPDATE processing_jobs SET expired=1 WHERE id=? AND phase='completed' AND expired=0").bind(&id).execute(&mut *tx).await?;
-            paths.push((app.processing.root.join(&id), Some((id, attempt))));
+            paths.push((app.processing.root.join(&id), Some((id, attempt)), cleanup));
         }
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id,attempt FROM processing_jobs WHERE phase='queued' AND attempt>0 LIMIT 100",
@@ -224,18 +233,24 @@ async fn clean_with(
                 last_active_playback: None,
             };
             if let Some(attempt) = state.abandoned_attempt() {
-                paths.push((app.processing.root.join(id).join(attempt.to_string()), None));
+                paths.push((
+                    app.processing.root.join(id).join(attempt.to_string()),
+                    None,
+                    None,
+                ));
             }
         }
         tx.commit().await?;
         paths
     }; // No writer lock or transaction is held during filesystem operations.
     let mut removed = 0;
-    for (path, job) in paths {
+    for (path, job, cleanup) in paths {
         let hold = permit.clone();
         let remove = remove.clone();
+        let cleanup_hold = cleanup.clone();
         let deleted = tokio::task::spawn_blocking(move || {
             let _hold = hold;
+            let _cleanup = cleanup_hold;
             // A held (or unreadable) witness marks a possibly running encoder: keep
             // its directory so recovery can find it, and do not acknowledge the
             // cleanup. Witness creation happens under the same I/O permit, so this
@@ -361,7 +376,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available) VALUES ('file','edition',?,'fixture.mp4','hash','stamp',1,'[]',1)").bind(library.id).execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) VALUES ('job','file','hash','h264720p','software','key','failed',0,0)").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available,generated) SELECT 'output',edition_id,library_id,'generated.mp4','output-revision','output-stamp',1,'[]',1,1 FROM media_files WHERE id='file'").execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,output_file_id) VALUES ('job','file','hash','h264720p','software','key','completed',0,0,'output')").execute(&db).await.unwrap();
         let app = App {
             health: Arc::new(crate::operations::Health::new(false)),
             db,
@@ -386,6 +402,21 @@ mod tests {
             )),
         };
         let (entered, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let active = app.processing.artifacts.pin(["output".into()]).unwrap();
+        assert_eq!(
+            clean_with(&app, |_| panic!("pinned output must not be removed"))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT available FROM media_files WHERE id='output'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap(),
+            1
+        );
+        drop(active);
         let (release, blocked) = std::sync::mpsc::channel();
         let blocked = std::sync::Mutex::new(blocked);
         let worker = app.clone();
@@ -413,10 +444,19 @@ mod tests {
             .unwrap();
         drop(writer);
         assert!(app.processing.io.clone().try_acquire_owned().is_err());
+        assert!(app.processing.artifacts.pin(["output".into()]).is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT available FROM media_files WHERE id='output'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap(),
+            0
+        );
         // Dropping an async request must not free the uncancellable filesystem slot.
         task.abort();
         let _ = task.await;
         assert!(app.processing.io.clone().try_acquire_owned().is_err());
+        assert!(app.processing.artifacts.pin(["output".into()]).is_none());
         release.send(()).unwrap();
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -426,5 +466,22 @@ mod tests {
         .unwrap()
         .unwrap();
         drop(permit);
+        // The failed waiter did not acknowledge removal. A future cleanup can
+        // retry the durable unavailable/expired intent after the real I/O exits.
+        assert!(
+            app.processing
+                .artifacts
+                .claim_cleanup("output".into())
+                .is_some()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT cache_cleaned FROM processing_jobs WHERE id='job'"
+            )
+            .fetch_one(&app.db)
+            .await
+            .unwrap(),
+            0
+        );
     }
 }

@@ -1,6 +1,38 @@
 //! Maintenance eligibility uses observed time and durable state, never a clock.
 use crate::jobs::{Job, Phase};
 use serde::{Deserialize, Serialize};
+
+/// Per-artifact ownership. The adapter supplies releases only from unique RAII
+/// guards; clones retain a guard rather than manufacturing independent releases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArtifactUse {
+    Readers(u32),
+    Cleaning,
+}
+impl Default for ArtifactUse {
+    fn default() -> Self {
+        Self::Readers(0)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactUseInput {
+    Pin,
+    ReleasePin,
+    ClaimCleanup,
+    ReleaseCleanup,
+}
+impl ArtifactUse {
+    pub fn transition(self, input: ArtifactUseInput) -> Option<Self> {
+        use ArtifactUseInput::*;
+        match (self, input) {
+            (Self::Readers(n), Pin) => n.checked_add(1).map(Self::Readers),
+            (Self::Readers(n), ReleasePin) => n.checked_sub(1).map(Self::Readers),
+            (Self::Readers(0), ClaimCleanup) => Some(Self::Cleaning),
+            (Self::Cleaning, ReleaseCleanup) => Some(Self::Readers(0)),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheEntry {
     pub job: Job,

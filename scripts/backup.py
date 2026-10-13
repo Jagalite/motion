@@ -89,17 +89,24 @@ RESTORE_BASELINE_EPOCH = """CREATE TABLE IF NOT EXISTS restore_baseline_epoch (
 
 
 def rotate_restore_epoch(database):
-    """A restored database has a different history: event cursors issued
-    against the original must reset rather than resume overlapping positions.
-    The new epoch is recorded as a pending viewing baseline in the same
-    transaction; the server's first start captures it after migrations and
-    before serving anything (db::connect)."""
+    """Start a new history, capture its pending viewing baseline, and withdraw
+    saved authority atomically. Post-snapshot revocations cannot be recovered;
+    restored devices must pair again. The server captures the baseline before
+    serving requests after migration. Older schemas may lack authority tables.
+    """
     with sqlite3.connect(database) as db:
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_identity'").fetchone():
+        db.execute('PRAGMA foreign_keys=ON')
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'server_identity' in tables:
             db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
             db.execute(RESTORE_BASELINE_EPOCH)
             db.execute("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) "
                        "SELECT 1,restore_epoch,0 FROM server_identity WHERE singleton=1")
+        for table in ('content_tickets', 'pairings', 'idempotency_records', 'credentials'):
+            if table in tables:
+                db.execute(f'DELETE FROM {table}')
+        if 'devices' in tables:
+            db.execute('UPDATE devices SET revoked=1')
     db.close()
 
 

@@ -57,6 +57,9 @@ func jobsCmd(env *Env) *cobra.Command {
 				rows = append(rows, []string{j.ID, j.Kind, j.Phase, j.AttemptGeneration})
 			}
 			table(w, "ID\tKIND\tPHASE\tATTEMPT", rows)
+			if result.NextCursor != nil {
+				fmt.Fprintf(w, "More: --cursor %s\n", sanitize(*result.NextCursor))
+			}
 		})
 	})}
 	pageFlags(list, &cursor, &limit)

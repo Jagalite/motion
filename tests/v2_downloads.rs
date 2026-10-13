@@ -1074,6 +1074,77 @@ async fn reconciliation_uses_the_downloads_effective_duration() {
 }
 
 #[tokio::test]
+async fn download_query_accepts_limits_and_pages_active_and_historical_demands() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"pagination").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "download-query-0001",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap();
+    for (id, state) in [("zz-cancelled", "cancelled"), ("zz-ready", "ready")] {
+        sqlx::query("INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) SELECT ?,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,?,created_at,updated_at FROM downloads WHERE id=?")
+            .bind(id).bind(state).bind(created.body["id"].as_str().unwrap())
+            .execute(&f.app.db).await.unwrap();
+    }
+    for active in [None, Some(false), Some(true)] {
+        let filter = active
+            .map(|value| format!("&active_only={value}"))
+            .unwrap_or_default();
+        let first = f
+            .get(&format!("/api/v2/downloads?limit=1{filter}"), &auth)
+            .await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+        assert_eq!(first.body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first.body["items"][0]["id"], id);
+        let cursor = first.body["next_cursor"].as_str().unwrap();
+        let next = f
+            .get(
+                &format!("/api/v2/downloads?limit=2&cursor={cursor}{filter}"),
+                &auth,
+            )
+            .await;
+        assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+        let ids: Vec<&str> = next.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            if active == Some(true) {
+                vec!["zz-ready"]
+            } else {
+                vec!["zz-cancelled", "zz-ready"]
+            }
+        );
+        assert!(next.body["next_cursor"].is_null());
+    }
+    for query in [
+        "limit=0",
+        "limit=201",
+        "limit=oops",
+        "active_only=oops",
+        "unexpected=true",
+    ] {
+        let result = f.get(&format!("/api/v2/downloads?{query}"), &auth).await;
+        assert_eq!(
+            result.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            result.body
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_downloads_page_lists_every_actionable_record() {
     let f = Fixture::new().await;
     let (timeline, file, revision) = f.scanned("film.mp4", b"paged").await;
@@ -1087,6 +1158,10 @@ async fn the_downloads_page_lists_every_actionable_record() {
         )
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    // A long cancelled history sorts before the actionable records. Filtering
+    // after a fixed number of history pages would make this UI unavailable.
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5001) INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) SELECT printf('history-%05d',n.x),1,d.principal_id,d.device_id,d.profile_id,d.timeline_id,d.timeline_revision,d.version_id,d.file_id,d.file_revision,d.content_type,d.size_bytes,d.duration_ms,'cancelled',0,0 FROM downloads d CROSS JOIN n WHERE d.id=?")
+        .bind(created.body["id"].as_str().unwrap()).execute(&f.app.db).await.unwrap();
     // More records than one API page: 205 ready and one cancelled.
     for n in 0..206 {
         sqlx::query(

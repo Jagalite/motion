@@ -52,13 +52,23 @@ pub async fn timeline_components(
     timeline: &str,
 ) -> anyhow::Result<Vec<Component>> {
     let mut tx = db.begin().await?;
+    let result = timeline_components_in(&mut tx, timeline).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+/// Use the caller's read snapshot without acquiring another pool slot.
+pub(crate) async fn timeline_components_in(
+    conn: &mut SqliteConnection,
+    timeline: &str,
+) -> anyhow::Result<Vec<Component>> {
     let bound: Vec<(String, String, String, String)> = sqlx::query_as(
         // Evidence only from an occurrence holding the pinned (reviewed)
         // revision: the bound file if unchanged, else a copy with that content.
         "SELECT v.id,o.id,b.file_revision,o.tracks_json FROM media_versions v JOIN version_files b ON b.version_id=v.id JOIN media_files o ON o.id=coalesce((SELECT f.id FROM media_files f WHERE f.id=b.file_id AND f.revision=b.file_revision),(SELECT f.id FROM media_files f WHERE f.revision=b.file_revision ORDER BY f.available DESC,f.id LIMIT 1)) WHERE v.timeline_id=? ORDER BY v.id,b.part",
     )
     .bind(timeline)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     let mut versions: BTreeMap<String, Vec<Observed>> = BTreeMap::new();
     for (version, file, revision, tracks_json) in bound {
@@ -90,7 +100,7 @@ pub async fn timeline_components(
             "SELECT name,language,forced,hearing_impaired FROM sidecar_subtitles WHERE file_id=? ORDER BY name",
         )
         .bind(&file)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
         for (name, language, forced, hearing_impaired) in sidecars {
             entry.push(Observed {
@@ -110,7 +120,6 @@ pub async fn timeline_components(
             });
         }
     }
-    tx.commit().await?;
     let versions: Vec<(String, Vec<Observed>)> = versions.into_iter().collect();
     Ok(core::derive(timeline, &versions))
 }
