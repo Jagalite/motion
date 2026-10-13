@@ -1,7 +1,19 @@
 # Motion SSO, email sign-in and administrator access screen
 
-Status: implementation plan, not shipped functionality. Source review baseline:
-local main `28f4b32`, 2026-10-12. Recheck current main before implementation.
+Status (2026-10-13): A1–A4 implemented and qualified with isolated local OIDC/mail
+services in [PR #38](https://github.com/Jagalite/motion/pull/38), stacked on
+[PR #36](https://github.com/Jagalite/motion/pull/36). A5 recovery/model/API work,
+review and documentation are implemented; presentation qualification and a CI
+integration rerun remain open. This is not a shipped or fully qualified release.
+
+See [the qualification ledger](qualification/auth-signin/README.md) for exact
+source/artifact receipts: 346 native tests plus two added OIDC adapter fault tests,
+61 bridge tests, genuine-provider/mail browser flows and final rebuilt UI checks.
+T3 screenshot/resize failures block visual/narrow-screen sign-off; an alternative
+browser choice is pending. Final-head CI smoke/operations timed out on first
+capabilities reads, while both exact scripts passed locally through Kyoto.
+The ledger also retains an isolated-server SQLite-busy exit and its recovery.
+Original source-review baseline: local main `28f4b32`, 2026-10-12.
 
 ## Outcome and scope
 

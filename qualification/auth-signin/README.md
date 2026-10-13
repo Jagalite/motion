@@ -1,180 +1,245 @@
-# Authentication sign-in implementation ledger
+# Authentication sign-in qualification
 
-Implementation now covers ownership, browser OIDC/email authentication,
-Authentication & Access administration, self-service methods, freshness proofs,
-and restore fencing. **Runtime qualification is in progress; this is not a
-completed feature or release qualification.** Methods default to disabled.
+The A1–A5 implementation is delivered in PR [#38](https://github.com/Jagalite/motion/pull/38),
+stacked on shared access/TUI PR [#36](https://github.com/Jagalite/motion/pull/36).
+OIDC and direct email are opt-in and remain disabled by default. No live database,
+external provider, real mailbox, production migration, PR merge or deployment was used.
+The user approved isolated local services for final provider/mail qualification.
 
-## Current implementation and qualification
+## Source and correctness boundary
 
-The branch integrates the committed shared access API/TUI primitives at `e804b87`
-through merge `a70be30`. Migration 0045 remains unchanged; forward migrations
-0046 and 0047 reconcile legacy ownership and add sign-in persistence. Existing
-viewing and playback ownership remains device-scoped.
+Native qualification used `6868a4c0258f56d2ec1526228dfc6bded8c4300c`.
+Final application source review accepted `ad0b481`; its application changes after
+that native-tested commit are authentication JavaScript and tests: recovery safeguard explanations,
+no stale-revision retry advice for those safeguards, and immediate email-test
+status refresh. Follow-up `c85b07f` adds only the reviewed callback fault fixture
+and two adapter tests. Final presentation build/result is recorded below.
 
-Production core policy owns grant intersection, linking ceilings, transaction
-purpose/revision/browser/epoch checks, one-time consumption and freshness.
-Adapters own verified OIDC observations, encrypted secret storage, bounded mail
-transport and SQLite atomic issuance. Reserving an OIDC exchange commits before
-network I/O; final identity/session issuance consumes that reservation atomically.
-An interrupted exchange fails closed and requires a new login.
+The branch integrates access/TUI head `1a10cd4` through merge `5d0c088`.
+Migration 0045 is unchanged. Forward migrations 0046/0047 reconcile legacy
+ownership and add authentication persistence. Existing paired-device credentials
+and device-scoped playback/viewing ownership remain intact.
 
-Completed checks on the implementation draft:
+Production core owns caller provenance, effective-grant intersection, linking
+ceilings, transaction purpose/browser/epoch/revision fences, freshness and session
+deadlines, one-time consumption and recovery safeguards. Adapters verify OIDC
+observations, constrain network destinations, encrypt secrets and deliver mail.
+SQLite commits exchange reservation before network I/O and atomically consumes
+proof/challenge state with identity or family issuance. An interrupted exchange
+fails closed. Executed email adapter tests separately check durable attempt
+budgets, one-time issuance and family revocation. The additional OIDC callback
+reservation/cancellation tests passed. Model exploration does not prove SQLite
+or network conformance.
 
-- Browser bridge tests: 16 passed, including secret handling, stale revisions,
-  self-service pagination and explicit proof resubmission.
-- API contract validation: 142 paths, 201 operations, 213 schemas.
-- Isolated SQLite ownership-upgrade probe: fresh and managed legacy cases passed,
-  preserving credentials, invitations and effective grants with no foreign-key errors.
-- Kyoto dependency resolution and isolated local OIDC fixture installation passed.
-- First native compile (`a6e6a8cf968a4071826749cf03a6d3dd`, source snapshot 01)
-  failed on a UI route macro parameter name; corrected in source snapshot 02.
-- Kyoto snapshot-02 compile `da715b6363544f1ba6aff33c5e374173` was deferred
-  four times under memory/swap/disk pressure, then cancelled before completion.
-  Snapshot-03 compile `daed411bbc5443e1ba34b2bcba217e72` targets core models,
-  server/UI libraries, access/sign-in/protocol APIs, contracts and playback.
-  TUI/API Go regression job `9ad5620dc3f54d89b235171c7bf435d7` passed both
-  `internal/api` and `internal/tui` packages on snapshot 03. Those Go sources
-  are unchanged in implementation commit `04b1a8f`.
-  Compilation and test execution remain distinct gates; no native runtime pass
-  is claimed. Snapshot 03 was deferred under pressure and superseded after review
-  fixes; a new final snapshot is required.
-- Dependency notices regenerated and verified; six notice-generator tests passed.
-  The defmt-parser archive omits licenses, so exact upstream-revision texts and
-  their provenance are preserved under `third_party/licenses`.
-- Local OIDC discovery was reached in the collaborative browser; the loopback
-  SMTP sink started. This is fixture readiness, not Motion login qualification.
-  Controlled HTTP/JWT claim/key-rotation tests and API mail-outage, network-limit
-  and secret-retention tests are added but have not executed.
+## Completed native and contract checks
 
-GPT-6.1 Sol source review found four issues, all corrected and accepted in focused
-follow-up review: restricted-device linking could inherit the owner's broader
-rights; device-policy admin elevation lacked fresh proof; pending enrollment
-could outlive its initiating fresh proof; and re-enrollment of a disabled owned
-email identity was rejected. Linking now intersects initiating-device, user and
-existing-method ceilings; admin elevation requires action-bound freshness;
-transactions capture actor revisions and the original proof deadline; same-owner
-email re-enrollment is an explicit core exception. Adapter regressions cover
-these boundaries. GPT-6.1 Sol reviewed implementation commit `04b1a8f` and
-`origin/main...HEAD`. Three additional findings were resolved and accepted in
-focused review: the returned approval code's contract annotation, exact encryption
-key/AAD documentation, and session expiry measured from verified authentication
-rather than later local issuance. The latter now uses production core policy and
-one deadline for device, parent, session, family and cookie. Final qualification
-evidence review remains pending.
+Kyoto compiled the affected suites with `--no-run` in job
+`f0ded6c31aba4eeb921eea0d29721e9a`, then separately executed the emitted binaries.
+**346 tests passed, zero failures**, across 14 executables:
 
-The local fixtures use a genuine `oidc-provider` service and a loopback SMTP sink.
-No external provider, real mailbox or live database is used. Remaining gates are
-native execution, protocol failure/key-rotation tests, browser administration and
-sign-in/playback walkthroughs, mail retry/outage, cross-client checks and final
-review. The sections below retain the earlier caller-only checkpoint evidence;
-their limitations describe that historical checkpoint, not the current source.
+| Target | Passed |
+| --- | ---: |
+| Core library | 138 |
+| Sign-in model | 11 |
+| Caller model | 1 |
+| Core ownership | 6 |
+| Access administrator model | 4 |
+| Sign-in API | 15 |
+| Playback API / real FFmpeg delivery | 28 |
+| Contract | 5 |
+| Downloads API | 5 |
+| Server ownership | 2 |
+| Server library | 73 |
+| Real HTTP/JWKS/JWT protocol | 1 |
+| Access API | 55 |
+| UI library | 2 |
 
-## Historical A1 checkpoint: explicit caller authority
+Execution job `f281a2148daa423bae8d0d8cafe3b977` passed the first six targets,
+then was cancelled when macOS stalled the server executable at `_dyld_start`
+during the FFmpeg supervisor warmup. No application code had run in that stalled
+process. An identical SHA-256 artifact copy launched normally. The target path
+was temporarily pointed at that copy; resumed Kyoto job
+`8c1380692d114d389ffa7734b682a741` verified all test-binary hashes, skipped only
+already-passed identical executables, and passed the remaining targets. The
+original target was restored afterward. The receipt records this host workaround;
+it is not presented as an uninterrupted first-attempt pass.
 
-Base: `origin/main` at `28f4b32c0df0c31d636488fdb524c23549c89bdc`.
-Worktree: `motion-auth-signin` under the seed1 volume's `Projects` directory.
+The suites cover populated legacy ownership migration, grant ceilings, explicit
+operator/credential/ingress authority, stale transactional and SSE callers,
+active conversion shutdown after user disable/narrowing, independent method
+families, enrollment/linking ceilings and freshness, last-administrator/method
+protection, restore hold and old-family invalidation. Email cases include generic
+responses, browser binding, POST-only redemption, one-time issuance, attempt and
+network limits, revision/epoch changes, outage retry and encrypted-payload erasure.
+Protocol cases exercise wrong issuer/audience/nonce, expired/old authentication,
+wrong authorized party/signature/key/PKCE and key rotation using real HTTP and JWTs.
 
-Request callers now carry one private, explicit source: proven local operator,
-stored credential, or verified ingress device. Missing credential/ingress fields
-can no longer select operator authority. Transactional writes and SSE disclosures
-use the same reauthentication method. It reloads the current device/parent rows
-and rejects replacement of a credential's immutable admitted identity.
+Stateless runs the production decisions with graph exhaustion asserted:
 
-The production core receives explicit `Authentication` observations and decides
-credential/parent validity, ingress-device identity, grants and revocation.
-Protocol/header proof, secret lookup and SQLite reads stay in the adapter. The
-source type is neither client-deserializable nor constructible outside the auth
-module. No global state model or new identity store is introduced.
+- For each of five purposes (login, link, test, reauthentication, enrollment),
+  OIDC explores 5,760 states / 59,328 transitions and email 30,720 states /
+  377,856 transitions. Bounds: one transaction, two browsers, explicit epoch and
+  provider/user/identity/actor revisions, availability failures, time 0/599/600,
+  attempts 0–5; limits 50,000 states, 1,000,000 transitions, depth 20. Exact
+  acceptance and effect identities/counts are asserted; no checks were skipped.
+- Access administration explores 2,808 states / 50,544 transitions with two
+  administrators, one pairing and one invitation/two claims, issuer loss,
+  user revisions, replay, revocation and expiry.
+- Caller exploration asserts 192 states and graph exhaustion for one
+  device/parent/session chain, explicit caller sources and time 0/99/100.
+  Limits are 1,000 states, 20,000 transitions and depth 20.
 
-The HTTP contract and database schema are unchanged. Existing credentials, cookie
-flags, CSRF and origin rules remain compatible. No migration is required for this
-checkpoint. Durable jobs/tickets keep their existing encoding: their explicit
-requester/principal ID is still required to identify operator work when no
-credential/ingress reference exists. Existing content-ticket issuance now also
-uses the explicit caller source for its operator exemption.
+Follow-up Kyoto compile `c323f9a563c74b2d9081085163dcc157` and execution
+`daaa8259a6a4409ab3745e1b1b0f09f4` passed all **17 sign-in API tests** on
+`c85b07fb2ec3bd91dfb0e339edb4fe2504f3f403`, including two new tests. Together
+with the unchanged suites above, this is 348 distinct native tests across the
+recorded source checkpoints, not 363 distinct tests. The new real HTTP fixture
+holds token exchange while an independent SQLite reader observes the committed
+reservation. A wrong-browser callback leaves it pending; a concurrent duplicate
+cannot start another exchange; successful provider-test completion publishes one
+audit effect and no login family. Aborting the first request, reopening the actual
+database and reconstructing runtime preserves the reservation and fences replay
+through combined reservation/epoch checks. This is cancellation/restart fault
+injection, not OS process-kill or concurrent ordinary-login-family qualification.
+The first added-test compile failed because Reqwest's optional JSON helper is
+not enabled; the fixture now parses response bytes with the existing JSON library.
 
-## Verification
+All 61 browser-bridge tests passed on `ad0b481` (18 authentication-specific).
+Contract validation covers 142 paths, 201 operations and 213 schemas. Current-head
+CI contract, client controllers/desktop host/Go terminal, and notices checks pass.
+Kyoto Go job `9ad5620dc3f54d89b235171c7bf435d7` also passed the API/TUI packages on
+the earlier implementation snapshot. CI run `38427205893` passed formatting,
+Clippy and fast tests on `6868a4c`; run `38427205825` passed real-process integration,
+upgrade and restore. Its heavy/package jobs were superseded by the next push,
+not counted as passes. Final-head CI results are recorded separately below.
 
-Builds use Kyoto with `RUSTC` pinned to the 1.98.0 toolchain and isolated target
-`motion-auth-signin-target` under the same seed1 `Projects` directory. Receipts and raw logs belong in
-`motion-auth-signin-artifacts` alongside that target; all database fixtures are
-temporary and isolated from live state.
+## Isolated browser walkthrough
 
-- Formatting and `git diff --check`: passed.
-- Initial CI on `3660792` failed publication privacy because this ledger used
-  absolute machine paths; portable locations fixed that in `a838d25` and the
-  local publication check passed.
-- The same initial CI failed to compile `caller_model`: its `Transition` struct
-  initializer omitted `disposition`. Commit `558bdee` uses the existing
-  `Transition::accepted` constructor. It compiled in the CI run recorded below;
-  local compilation remains pending. Source review did not establish compilation.
-- Sol focused review of `558bdee`: no code findings. Its requested ledger
-  correction (record the initial CI failures and pending rerun) is included here.
-- Kyoto compilation job `c74625e7ab664a35bb00bce08399415b`: submitted; not yet a
-  compilation or execution pass. Last observation: still queued; shared Kyoto
-  admission reported OS memory pressure. Do not bypass the queue.
-- Requested targets: `playscale-core --test caller_model` and
-  `playscale --test access_api`, `cargo test --locked --no-run --jobs 2`.
-- Local test binaries have not yet executed. Queue policy requires `--no-run`.
-- CI run `38341814710` on `558bdee` passed formatting, Clippy, the new caller
-  Stateless model (asserted 192 states and graph exhaustion), and 40/41 access
-  API tests. The remaining new operator SSE test used invalid fixture event kind
-  `updated`; SQLite requires `changed` or `deleted`. This checkpoint corrects the
-  fixture to `changed` in `3a7452a`; the complete access API rerun remains pending.
-- CI contract, client-controller and publication checks passed on `558bdee`.
-  These results are separate from the still-queued local Kyoto build.
-- The new Stateless model checks exact principals/grants, rejection outcomes and
-  effect counts after deletion, revocation, generation rotation, policy downgrade
-  and expiry, with explicit operator, device, session, ingress and wrong-device
-  ingress observations. Declared bounds: one device/parent/session chain, time
-  0/99/100, at most 1,000 states, 20,000 transitions and depth 20. Actual explored
-  transition count was not printed by CI; the passing test asserts 192 states,
-  graph exhaustion and no skipped checks. It does not model unimplemented SSO
-  transactions.
-- New SQLite/API tests cover missing/malformed proof, stale cached principal,
-  changed/deleted credential rows, operator continuity, session parent loss,
-  ingress revocation and permission changes across transactional writes and SSE.
-- GPT-6.1 Sol reviewed implementation commit `36607923ff3aeb235872694ad84c248e89032637`
-  and the full `origin/main...HEAD` diff: no actionable findings. Review covered
-  caller provenance, core dispatch, write/SSE reauthentication, credential
-  replacement/revocation, issuance, durable compatibility and regression tests.
-  This was source review, separate from the partial CI execution recorded above.
-- Sol final implementation/PR diff review at `3a7452a`: no code findings. Its
-  requested status wording correction is included here; no builds were run by
-  the reviewer.
-- Draft PR: https://github.com/Jagalite/motion/pull/38 (linked to this thread).
+The collaborative browser exercised Motion at loopback port 8950 against genuine
+`oidc-provider` 9.12.2 at 8951 and an SMTP sink at 8952. The tested server artifact
+was built by Kyoto job `955a33510e5449d58669d43f9e47a004` from `6868a4c`, SHA-256
+`3ac02d7cd41a7e54b3db0eac33ea6a73ad918d527c3592e091c3357dcd91dded`.
+Operator credentials stayed outside the browser; the local operator only bootstrapped
+pairing and independently approved displayed action codes. Configuration changes
+used ordinary administrator screens and real APIs.
 
-No live browser, native/TUI walkthrough, provider, mail delivery, restore flow,
-active playback qualification or production migration has been performed here.
-The existing access API suite includes pairing/cookies/tickets and ingress checks;
-those must not be described as complete SSO or playback qualification.
+Completed interactions:
 
-## Shared TUI seam and next checkpoint
+1. Pair a browser, configure public origin, create a disabled provider draft,
+   run configuration and genuine browser tests, then explicitly enable it.
+   Each sensitive step required fresh action approval and explicit resubmission.
+   Saved secrets stayed blank with retain selected; reads expose presence metadata.
+2. Unknown Alice OIDC login produced a pending request and no application access
+   (`GET /me` 401). An administrator created a bounded user and approved the exact
+   issuer/subject. A fresh Alice login issued an owned non-administrator family.
+   Direct administrator API and screen access failed.
+3. Alice selected the permitted Everyone profile/library/title and played the
+   20-second H264/AAC fixture in Demuxe: advancing time, readyState 4 and decoded
+   frames were observed; playback reached the end with 484 decoded frames.
+4. Self-service blocked removal of the last usable identity. Revoking the current
+   family produced the session-ended screen and `/me` 401. A fresh OIDC login
+   succeeded despite the lingering revoked cookie and issued a different device.
+5. Administrator UI configured disabled SMTP, explicitly sent a test to the sink,
+   then enabled email. Existing administrator authority plus a fresh provider
+   proof explicitly linked the OIDC identity; email equality never linked it.
+6. Fresh administrator OIDC login allowed explicit email enrollment. An incorrect
+   code failed; the delivered code linked the method without issuing another
+   family. Public email login then issued its own administrator family.
+7. Two administrator tabs held the same user revision. The first approved save
+   committed revision 2; the second stale save remained rejected after fresh
+   approval, with revision 2 unchanged. No automatic replay occurred.
+8. Administrator UI last-admin removal was blocked. Administrator revocation of
+   Alice's credentials revoked both owned browser devices and advanced user revision.
+9. With both IdP and SMTP stopped, OIDC failed closed, email start remained generic,
+   and pairing request/approval plus local operator recovery remained usable.
+   After SMTP restart, the original challenge was delivered on attempt 2 with
+   the same code hash and erased encrypted payload, without editing retry times.
+   Browser-context redemption succeeded once; replay returned `signin_already_used`.
+10. Keyboard Enter expanded an edit disclosure; Tab reached its labelled field.
+    A DOM audit found no unlabelled administrator inputs, selects or buttons.
+    Expired freshness prompted a new action-specific approval; refresh alone
+    did not renew authentication. The five-proof-per-device limit was observed.
 
-Read-only inventory of `motion-tui-access` at
-`6980c6007a58f0654e7bbd0518c212500c56ad14` found an existing `access_admin::User`,
-`access_users`, `devices.user_id`, invitation lifecycle, user/pairing/invitation
-APIs and migration `0045_access_management.sql`. Reuse and reconcile those
-primitives; do not independently allocate migration 0045 or create another users
-or invitations system. Recheck the branch/main state before integration.
+Browser media evidence uses the existing Demuxe 1.1.0 fixture bundle (266 verified
+files, archive SHA-256 `ddb82eb5dfaa94ca2c806c974bab4e45785e835b0264cd3abab160969f60f66f`).
+Direct MP4 playback passed. The bundle lacks the Shaka adaptive provider: its
+bundle probe has one pass, one failure and two explicit shared-runtime skips.
+This is not browser adaptive-HLS or full player-package qualification. Native
+paired playback and active FFmpeg delivery are covered by the 28 passing API tests.
 
-Two differences require deliberate reconciliation against the sign-in plan:
+## Independent review and evidence
 
-1. TUI migration 0045 assigns a synthetic user to every legacy device; its loaders
-   expect ownership. This plan requires legacy devices to remain visibly
-   unassigned. Keep legacy authority intact and use a forward migration if 0045
-   has landed/applied; never rewrite an applied migration.
-2. TUI `constrain` represents disjoint rating allowlists by clearing libraries and
-   replaces an admin device's policy with a restricted user's policy. The sign-in
-   plan needs explicit unrestricted/empty rated eligibility and independent
-   restrictions on both sides of the effective grant.
+GPT-6.1 Sol reviewed implementation commits, focused corrections, the shared TUI
+integration and final `origin/main...ad0b481` diff. No actionable source findings
+remain. The final evidence ledger and plan status were also reviewed and accepted.
+Findings resolved include linking grant widening, freshness on device
+admin elevation, enrollment evidence deadlines, disabled owned-email re-enrollment,
+proof response schema, key/AAD documentation, authentication-time session deadlines,
+stale-cookie fresh login, and misleading safeguard retry UI. Review is separate
+from executed qualification.
 
-Its invitation adapter also needs the new `Caller::credential()` accessor when
-integrated. Existing durable worker readers already guard absent authority with
-an explicit operator requester ID. Do not infer users from viewing profiles.
+Raw logs and private fixture state remain in the sibling
+`motion-auth-signin-artifacts` directory. Relevant receipts include
+`native-6868a4c-receipt.json`, per-target native logs, `browser-progress.json`,
+`supervisor-launch-workaround.json`, the warmup process sample, and before/after
+outage challenge receipts. Fixture secrets, mailbox contents and database files
+are not committed. Source snapshots and artifact hashes bind the evidence.
 
-Next A1 work: reconcile shared ownership/effective grants, add method/session
-lineage and restore fencing, then update contracts/migrations and verify API,
-SSE and delivery user revocation. A2's dedicated administrator screen remains a
-required feature phase. This checkpoint must not be represented as completed A1.
+Earlier compile/CI failures were corrected, not counted as passes: UI macro
+parameter, caller-model transition initializer, SSE fixture event kind, OIDC
+closure ownership, Clippy findings, and three fixture assumptions (fresh invitation
+proof, JSON boolean, and anonymous identity state). Earlier Kyoto builds were
+cancelled or deferred under host pressure; their partial logs do not qualify runtime.
+
+## Outstanding A5 presentation gates and release boundaries
+
+T3 snapshot capture repeatedly failed and both preset/freeform resize operations
+timed out; navigation, DOM reads, clicks, typing and keyboard interaction worked.
+Screenshot-based visual review, actual narrow-viewport presentation review and
+screen-reader walkthrough remain outstanding A5 qualification gates. The
+implementation is delivered, but these walkthroughs are not qualified. No installed
+desktop/native OIDC walkthrough is claimed.
+The scope explicitly preserves native pairing rather than adding native OIDC.
+Production provider interoperability, real mailbox delivery and deployment remain
+outside the user-approved isolated qualification. These limitations do not change
+the default-disabled behavior or authorize a release.
+
+## Final rebuilt presentation
+
+The successful `c323f9a563c74b2d9081085163dcc157` compile also emitted the
+non-test server executable. Its preserved artifact from `c85b07f` has SHA-256
+`c0c38b055a9833e3960d241ec2ff441ba7bfef6984b08ae6b6289fd42a14e98e`.
+The isolated server was restarted with that artifact and the same database/key.
+The browser loaded `auth.9299b72a98df.js`. Last-administrator disable displayed
+specific recovery guidance without a stale-state panel. Explicit test delivery
+to the sink immediately refreshed the shown timestamp and named the destination,
+without a document reload; the SMTP sink independently received the message.
+Receipts: `server-c85b07f-receipt.json` and `browser-final-ui.json`.
+
+The earlier rebuild `dda1425e1b8b459495e26db71e1dd1cc` was deferred four times
+and superseded by this successful compile. A test-run submission with an incorrect
+expected commit was rejected by the receipt guard before any executable ran;
+the corrected execution above passed. These are not counted as runtime passes.
+
+During the later denied-account walkthrough, the old isolated server exited with
+SQLite code 5 (`database is locked`) from its worker group under host storage
+contention. The precise worker was not identified; no causal attribution to
+sign-in is claimed. After restart the database passed integrity and foreign-key
+checks, the committed pending request still granted no access, fresh email login
+worked, and administrator UI denial persisted. The interruption remains a
+stability observation, not a clean uninterrupted walkthrough pass.
+
+Final source/test review accepted `c85b07f`. Current-head contract, clients/Go
+and notices CI pass. Final-head integration run `38435524333` failed its smoke
+and operations checks on ten-second first-call capabilities timeouts; its other
+integration checks passed. The failing receipt/logs are preserved. Kyoto job
+`94c55be85dbb43e09f5fa1e0d0b36b79` reran those exact scripts on the recorded
+`c85b07f` artifact: smoke passed in 6.539 seconds and operations in 12.189 seconds.
+A separate first capabilities call took 6.099 seconds versus 0.228 seconds warm;
+executable hashing is a plausible cold-start cause, not a demonstrated CI root
+cause. No assertions or timeouts were weakened. GitHub disallows rerunning the
+failed job while sibling jobs are running; that CI rerun remains outstanding.
+Final fast Rust CI `38435524612` passed formatting, Clippy and fast tests in
+13m32s. Heavy/package jobs remain pending. The
+application's preceding `ad0b481` fast Rust CI and real-process upgrade/restore
+CI passed. No application Rust changed after that checkpoint.
