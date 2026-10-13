@@ -155,6 +155,42 @@ fn inventory_with(
     file_limit: usize,
     device_of: &dyn Fn(&Path, &std::fs::Metadata) -> u64,
 ) -> anyhow::Result<Inventory> {
+    inventory_bounded(
+        root,
+        exclusions,
+        stop,
+        file_limit,
+        InventoryLimits::default(),
+        device_of,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct InventoryLimits {
+    entries: usize,
+    per_directory: usize,
+    directories: usize,
+    depth: usize,
+}
+impl Default for InventoryLimits {
+    fn default() -> Self {
+        Self {
+            entries: 200_000,
+            per_directory: 10_000,
+            directories: 20_000,
+            depth: 64,
+        }
+    }
+}
+
+fn inventory_bounded(
+    root: &Path,
+    exclusions: &[String],
+    stop: &CancellationToken,
+    file_limit: usize,
+    limits: InventoryLimits,
+    device_of: &dyn Fn(&Path, &std::fs::Metadata) -> u64,
+) -> anyhow::Result<Inventory> {
     let out_of_scope =
         |path: &Path| key(path).is_some_and(|k| playscale_core::sources::excluded(&k, exclusions));
     let root_device = device_of(Path::new(""), &std::fs::symlink_metadata(root)?);
@@ -162,28 +198,56 @@ fn inventory_with(
     let mut pending = vec![PathBuf::new()];
     let mut first = true;
     let mut subtitle_count = 0usize;
+    let mut entry_count = 0usize;
+    let mut directory_count = 1usize;
     while let Some(relative) = pending.pop() {
         anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
-        let Some(name) = key(&relative) else {
-            continue; // Non-UTF-8 directories hold no catalogable paths.
-        };
-        let listing = std::fs::read_dir(root.join(&relative))
-            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>());
-        let mut entries = match listing {
+        let name = key(&relative).expect("only representable paths are queued");
+        let listing = match std::fs::read_dir(root.join(&relative)) {
             Ok(entries) => entries,
-            Err(error) if first => {
-                return Err(error).context("source root could not be listed");
-            }
+            Err(error) if first => return Err(error).context("source root could not be listed"),
             Err(_) => {
                 out.incomplete.insert(name, "unreadable");
                 continue;
             }
         };
         first = false;
-        entries.sort_by_key(|e| e.file_name());
+        // ReadDir itself is lazy. Bound and check cancellation before retaining
+        // entries, including ignored files, and sort only this bounded batch.
+        let mut entries = Vec::new();
         let mut reason = None;
+        for entry in listing {
+            anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
+            if entry_count >= limits.entries {
+                // Unvisited scopes are all unknown. A single root boundary
+                // bounds coverage too and cannot prove any old path absent.
+                out.complete.clear();
+                out.incomplete.clear();
+                out.incomplete.insert(String::new(), "entry_limit");
+                out.files.sort();
+                return Ok(out);
+            }
+            entry_count += 1;
+            if entries.len() >= limits.per_directory {
+                reason = Some("directory_entry_limit");
+                break;
+            }
+            match entry {
+                Ok(entry) => entries.push(entry),
+                Err(_) => {
+                    reason = Some("unreadable_entry");
+                    break;
+                }
+            }
+        }
+        entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            anyhow::ensure!(!stop.is_cancelled(), "scan cancelled");
             let child = relative.join(entry.file_name());
+            if key(&child).is_none() {
+                reason = Some("non_utf8_path");
+                continue;
+            }
             // Excluded paths are outside the source's scope: neither listed,
             // inspected, nor counted as unproven.
             if out_of_scope(&child) {
@@ -195,7 +259,16 @@ fn inventory_with(
             };
             if kind.is_dir() {
                 match entry.metadata() {
-                    Ok(meta) if device_of(&child, &meta) == root_device => pending.push(child),
+                    Ok(meta) if device_of(&child, &meta) == root_device => {
+                        if directory_count >= limits.directories {
+                            reason = Some("directory_limit");
+                        } else if child.components().count() > limits.depth {
+                            reason = Some("depth_limit");
+                        } else {
+                            directory_count += 1;
+                            pending.push(child);
+                        }
+                    }
                     Ok(_) => {
                         if let Some(dir) = key(&child) {
                             out.incomplete.insert(dir, "mount_boundary");
@@ -837,6 +910,50 @@ mod inventory_tests {
     }
     fn real_device(_: &Path, meta: &std::fs::Metadata) -> u64 {
         device(meta)
+    }
+
+    #[test]
+    fn inventory_bounds_ignored_entries_directories_and_depth() {
+        let dir = tree(&["a.txt", "b.txt", "c.txt", "d.txt", "nested/deeper/file.mkv"]);
+        let stop = CancellationToken::new();
+        let limits = InventoryLimits {
+            entries: 2,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert!(found.complete.is_empty());
+        assert_eq!(found.incomplete.get(""), Some(&"entry_limit"));
+        let limits = InventoryLimits {
+            per_directory: 2,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert!(!found.complete.contains(""));
+        assert!(found.incomplete.contains_key(""));
+        let limits = InventoryLimits {
+            directories: 1,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert_eq!(found.incomplete.get(""), Some(&"directory_limit"));
+        let limits = InventoryLimits {
+            depth: 1,
+            ..InventoryLimits::default()
+        };
+        let found = inventory_bounded(dir.path(), &[], &stop, 100, limits, &real_device).unwrap();
+        assert_eq!(found.incomplete.get("nested"), Some(&"depth_limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_directory_names_leave_parent_coverage_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tree(&["valid.mkv"]);
+        std::fs::create_dir(dir.path().join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
+        let found = inventory(dir.path(), &[], &CancellationToken::new()).unwrap();
+        assert_eq!(found.files, vec![PathBuf::from("valid.mkv")]);
+        assert_eq!(found.incomplete.get(""), Some(&"non_utf8_path"));
+        assert!(!found.complete.contains(""));
     }
 
     #[test]
