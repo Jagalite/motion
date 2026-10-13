@@ -917,11 +917,36 @@ pub fn subtitle_conversions() -> u64 {
     CONVERSIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// When a download's last conversion failed, by its file path: reads that
-/// were already waiting share that failure instead of each converting
-/// again. Kept only for failing downloads, and briefly.
-fn failures() -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, std::time::Instant>> {
-    type Failures = HashMap<std::path::PathBuf, std::time::Instant>;
+/// The conversion error a remembered failure replays.
+fn failure(expired: bool) -> crate::api::ApiError {
+    if expired {
+        crate::api::ApiError::conflict("source_revision_changed", "Request a new download")
+    } else {
+        crate::api::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subtitles_unavailable",
+            "The subtitle track could not be converted; try again",
+        )
+    }
+}
+
+/// Record a failed conversion as one would (tests order waiting reads
+/// against a failure with it).
+#[doc(hidden)]
+pub fn remember_subtitle_failure(app: &App, download_id: &str, expired: bool) {
+    failures().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        subtitles_path(app, download_id),
+        (std::time::Instant::now(), expired),
+    );
+}
+
+/// How a download's last conversion failed, and when, by its file path:
+/// reads that were already waiting share that outcome (an expired source
+/// stays expired) instead of each converting again. Kept only for failing
+/// downloads, and briefly.
+fn failures() -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, (std::time::Instant, bool)>>
+{
+    type Failures = HashMap<std::path::PathBuf, (std::time::Instant, bool)>;
     static FAILURES: std::sync::LazyLock<std::sync::Mutex<Failures>> =
         std::sync::LazyLock::new(Default::default);
     &FAILURES
@@ -999,24 +1024,22 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
         if let Ok(bytes) = tokio::fs::read(&path).await {
             return Ok(bytes);
         }
-        // Or tried and failed: share that outcome rather than converting
-        // again for a read that may already have stopped waiting.
-        if failures()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&path)
-            .is_some_and(|failed| *failed >= asked)
-        {
-            return Err(crate::api::ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "subtitles_unavailable",
-                "The subtitle track could not be converted; try again",
-            ));
-        }
         let cancelled =
             || crate::api::ApiError::conflict("download_cancelled", "The download was cancelled");
         if !active(&app, &id).await {
             return Err(cancelled());
+        }
+        // Or tried and failed while this read waited: share that outcome
+        // rather than converting again for a read that may already have
+        // stopped waiting.
+        let failed = failures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&path)
+            .copied()
+            .filter(|(at, _)| *at >= asked);
+        if let Some((_, expired)) = failed {
+            return Err(failure(expired));
         }
         CONVERSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let text =
@@ -1029,9 +1052,10 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
                     text
                 }
                 Err(error) => {
+                    let expired = error.parts().1 == "source_revision_changed";
                     let mut failed = failures().lock().unwrap_or_else(|e| e.into_inner());
-                    failed.retain(|_, at| at.elapsed() < Duration::from_secs(600));
-                    failed.insert(path.clone(), std::time::Instant::now());
+                    failed.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+                    failed.insert(path.clone(), (std::time::Instant::now(), expired));
                     return Err(error);
                 }
             };

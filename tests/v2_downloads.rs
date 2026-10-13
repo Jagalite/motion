@@ -1814,4 +1814,37 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
         "download_subtitles_unavailable",
     );
     assert_eq!(conversions() - before, 2);
+
+    // A waiting read replays the failure it waited for as it was: an
+    // expired source stays expired (not a retry)...
+    let downloads = &playscale::v2::downloads::remember_subtitle_failure;
+    let before = conversions();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let fail = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        downloads(&f.app, &id, true);
+        drop(held);
+    };
+    let (read, ()) = tokio::join!(f.get(&path, &auth), fail);
+    problem(&read, StatusCode::CONFLICT, "download_expired");
+    // ...and a cancellation after the failure still answers as cancelled.
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let fail_then_cancel = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        downloads(&f.app, &id, false);
+        let cancelled = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/downloads/{id}"),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        drop(held);
+        cancelled
+    };
+    let (read, cancelled) = tokio::join!(f.get(&path, &auth), fail_then_cancel);
+    assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
+    problem(&read, StatusCode::CONFLICT, "download_cancelled");
+    assert_eq!(conversions() - before, 0);
 }

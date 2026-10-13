@@ -1288,6 +1288,21 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   After the fixes: `v2_downloads` 11 passed (three runs); clippy clean.
 
+  Round 3 at `085d2cf` raised two P2 findings, both fixed:
+  - **S5:** a remembered failure lost its kind. Readers waiting on an
+    expired source got a retryable 503 instead of 409 `download_expired`.
+    The failure now records whether the source expired, and waiting reads
+    replay exactly that.
+  - **S6:** a remembered failure was replayed before the cancellation
+    check, so a reader waiting through a failure and then a cancellation
+    got 503 instead of 409 `download_cancelled`. Cancellation is checked
+    first.
+
+  Integration test (a remembered failure ordered against a waiting read
+  with the lock): an expired failure replays as `download_expired`; a
+  failure followed by a cancellation answers `download_cancelled`; neither
+  converts. `v2_downloads` 11 passed (three runs); clippy clean.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
