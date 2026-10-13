@@ -388,7 +388,17 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | `tests/access_api.rs` | 39 passed |
   | `node --test` bridge and desktop suites | 81 passed. New: typed filter terms, only chosen criteria sent, an empty conjunction kept |
   | Contract checks (`check_contract.py`, `contract_json.rb --check`) | pass |
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol):** round 1 at `6763cee` against item 3 raised two
+  P2 findings, both fixed in the follow-up commit:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | U1 | A smart collection made on the page could not be browsed: its evaluated members were never shown | Fixed: `/organize` lists the first 24 members the server evaluated (read-only links) and "and N more"; the end-to-end test asserts the scanned film appears |
+  | U2 | Unlabeled versions all read "Original · " in the split picker | Fixed: `version_label` uses the label or origin, the first file's size and length, and a short ID, which is always distinct. Unit-tested |
+
+  After the fixes: `playscale` lib 68, compose 22, `access_api` 39 and
+  `m3_workflows` 2 passed. Pinned clippy 1.98 is clean after two test-only
+  lints.
 
 ## 5. Offline experience breadth
 

@@ -103,6 +103,40 @@ fn size(bytes: u64) -> String {
     }
 }
 /// A file of an item, labelled without its server path.
+/// A version as a person can tell it apart: its label (or origin when it
+/// has none), the size and length of its first file, and a short ID, which
+/// is always distinct.
+fn version_label(edition: &str, v: &Value, item_files: &[Value]) -> String {
+    let name = match text(v, "label") {
+        label if !label.is_empty() => label,
+        _ => format!("{} version", text(v, "origin")),
+    };
+    let mut parts = vec![edition.to_owned(), name];
+    let first = v["files"][0]["file"]["file_id"].as_str();
+    if let Some(file) = item_files
+        .iter()
+        .find(|f| first.is_some_and(|id| f["id"] == id))
+    {
+        if let Some(bytes) = text(file, "size_bytes").parse::<f64>().ok() {
+            parts.push(format!("{:.1} GB", bytes / 1e9));
+        }
+        if let Some(ms) = file["duration_ms"]
+            .as_u64()
+            .or_else(|| text(file, "duration_ms").parse().ok())
+        {
+            parts.push(format!(
+                "{}:{:02}:{:02}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1000 % 60
+            ));
+        }
+    }
+    let id = text(v, "id");
+    parts.push(format!("#{}", &id[..id.len().min(8)]));
+    parts.join(" · ")
+}
+
 fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
     let audio_tracks = v["tracks"]
         .as_array()
@@ -134,6 +168,9 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
         audio_tracks,
     }
 }
+/// Members of a smart collection shown on the organize page.
+const SMART_PREVIEW: usize = 24;
+
 /// Bounds on the per-title reads of the organize page: distinct playlist
 /// timelines, and titles a batched read did not return.
 const ORGANIZE_TIMELINE_READS: usize = 500;
@@ -938,6 +975,11 @@ impl UiQueryFacade for Queries {
                     let mut originals = std::collections::HashSet::new();
                     let mut out = Vec::new();
                     let mut version_rows = Vec::new();
+                    // File facts to tell unlabeled versions apart (size, length).
+                    let item_files = self
+                        .complete_list(&format!("{path}/files?limit=200"))
+                        .await
+                        .unwrap_or_default();
                     for row in rows {
                         let timeline = text(&row, "id");
                         let edition = editions
@@ -954,7 +996,7 @@ impl UiQueryFacade for Queries {
                         for v in &versions {
                             version_rows.push(VersionRow {
                                 id: text(v, "id"),
-                                label: format!("{edition} · {}", text(v, "label")),
+                                label: version_label(&edition, v, &item_files),
                             });
                         }
                         let mut whole = Vec::new();
@@ -1376,24 +1418,34 @@ impl UiQueryFacade for Queries {
                 }
             }
             // Every title the page shows, read in batches. A smart collection's
-            // members follow its filter and are not listed or edited here.
+            // members follow its filter (the server evaluates it): the first
+            // few are shown, read-only.
+            let shown = |c: &Value| {
+                let ids = strings(&c["item_ids"]);
+                if c["kind"] == "smart" {
+                    ids.into_iter().take(SMART_PREVIEW).collect()
+                } else {
+                    ids
+                }
+            };
             let mut wanted: Vec<String> = Vec::new();
-            for c in collection_rows.iter().filter(|c| c["kind"] != "smart") {
-                wanted.extend(strings(&c["item_ids"]));
+            for c in &collection_rows {
+                wanted.extend(shown(c));
             }
             wanted.extend(timeline_items.values().flatten().cloned());
             let titles = self.cards(&wanted).await?;
             let mut collections = Vec::new();
             for c in &collection_rows {
-                let ids = if c["kind"] == "smart" {
-                    Vec::new()
-                } else {
-                    strings(&c["item_ids"])
-                };
+                let smart = c["kind"] == "smart";
+                let ids = shown(c);
                 let mut items = Vec::new();
                 let mut remove_bodies = Vec::new();
                 for item_id in &ids {
                     if let Some(Some(card)) = titles.get(item_id).cloned() {
+                        if smart {
+                            items.push(card);
+                            continue;
+                        }
                         let rest: Vec<&String> = ids.iter().filter(|i| *i != item_id).collect();
                         remove_bodies.push(
                             serde_json::json!({
@@ -1411,6 +1463,7 @@ impl UiQueryFacade for Queries {
                     kind: text(c, "kind"),
                     filter_id: c["filter_id"].as_str().map(str::to_owned),
                     etag: tag(c)?,
+                    member_count: c["item_ids"].as_array().map_or(0, Vec::len),
                     items,
                     remove_bodies,
                 });
@@ -1500,5 +1553,28 @@ impl UiQueryFacade for Queries {
                 filters,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod version_label_tests {
+    use serde_json::json;
+
+    #[test]
+    fn unlabeled_versions_are_told_apart() {
+        let files = [json!({"id":"f1","size_bytes":"4200000000","duration_ms":6130000})];
+        let unlabeled = |id: &str| json!({"id":id,"label":"","origin":"original","files":[{"file":{"file_id":"f1"}}]});
+        let a = super::version_label("Original", &unlabeled("aaaaaaaa-1"), &files);
+        let b = super::version_label("Original", &unlabeled("bbbbbbbb-2"), &files);
+        assert_eq!(
+            a,
+            "Original · original version · 4.2 GB · 1:42:10 · #aaaaaaaa"
+        );
+        assert_ne!(a, b);
+        let labeled = json!({"id":"c1","label":"Director's cut","origin":"original","files":[]});
+        assert_eq!(
+            super::version_label("Original", &labeled, &[]),
+            "Original · Director's cut · #c1"
+        );
     }
 }

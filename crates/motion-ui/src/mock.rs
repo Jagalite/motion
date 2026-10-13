@@ -527,7 +527,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     vec![
                         VersionRow {
                             id: "v1".into(),
-                            label: "Original · 1080p".into(),
+                            label: "Original · original version · 4.2 GB · 1:42:10 · #v1".into(),
                         },
                         VersionRow {
                             id: "v2".into(),
@@ -616,6 +616,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     kind: "manual".into(),
                     filter_id: None,
                     etag: "\"r-1\"".into(),
+                    member_count: 1,
                     items: vec![card(&TITLES[0])],
                     remove_bodies: vec![format!(
                         r#"{{"name":"Weekend","profile_id":"{}","kind":"manual","item_ids":[],"filter_id":null}}"#,

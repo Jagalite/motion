@@ -1101,7 +1101,7 @@ async fn library_management_workflows_run_through_the_pages() {
     let op = format!("Bearer {OPERATOR}");
     let films = f.dir.path().join("films");
     // One scanned film; its duplicate is a cataloged title created below.
-    for path in ["Night Train.mp4"] {
+    {
         ffmpeg(
             &[
                 "-f",
@@ -1115,7 +1115,7 @@ async fn library_management_workflows_run_through_the_pages() {
                 "-preset",
                 "ultrafast",
             ],
-            &films.join(path),
+            &films.join("Night Train.mp4"),
         );
     }
     let source = f
@@ -1182,8 +1182,7 @@ async fn library_management_workflows_run_through_the_pages() {
             &op,
             "POST",
             "/api/v2/catalog/filters",
-            Some(json!({"name":"Late 90s","profile_id":"default","all":[
-                {"field":"year","operator":"gte","value":1995},
+            Some(json!({"name":"Trains","profile_id":"default","all":[
                 {"field":"title","operator":"contains","value":"Train"}]})),
             &[("idempotency-key", "c4-filter-00001-key-padding")],
         )
@@ -1191,10 +1190,7 @@ async fn library_management_workflows_run_through_the_pages() {
     assert_eq!(filter.status, StatusCode::CREATED, "{:?}", filter.body);
     let filter_id = filter.body["id"].as_str().unwrap().to_owned();
     let organize = f.ok_page(&op, "/organize").await;
-    assert!(
-        organize.contains("From 1995 · Title contains “Train”"),
-        "{organize}"
-    );
+    assert!(organize.contains("Title contains “Train”"), "{organize}");
     let smart = form(
         &organize,
         "POST /api/v2/collections",
@@ -1213,7 +1209,12 @@ async fn library_management_workflows_run_through_the_pages() {
     assert_eq!(created.body["filter_id"], filter_id.as_str());
     let organize = f.ok_page(&op, "/organize").await;
     assert!(
-        organize.contains("Titles that match “Late 90s”"),
+        organize.contains("Titles that match “Trains”"),
+        "{organize}"
+    );
+    // The smart collection lists its matching titles (read-only).
+    assert!(
+        organize.contains(&format!("href=\"/item/{target}\">Night Train</a>")),
         "{organize}"
     );
     // The filter is in use: the page no longer offers deleting it.
@@ -1230,7 +1231,7 @@ async fn library_management_workflows_run_through_the_pages() {
             &op,
             "PUT",
             &format!("/api/v2/catalog/filters/{filter_id}"),
-            Some(json!({"name":"Late 90s","profile_id":"default","all":[{"field":"year","operator":"gte","value":1990}]})),
+            Some(json!({"name":"Trains","profile_id":"default","all":[{"field":"title","operator":"contains","value":"Night"}]})),
             &[("if-match", &stale)],
         )
         .await;
@@ -1240,7 +1241,7 @@ async fn library_management_workflows_run_through_the_pages() {
             &op,
             "PUT",
             &format!("/api/v2/catalog/filters/{filter_id}"),
-            Some(json!({"name":"Late 90s","profile_id":"default","all":[]})),
+            Some(json!({"name":"Trains","profile_id":"default","all":[]})),
             &[("if-match", &stale)],
         )
         .await;
@@ -1339,7 +1340,7 @@ async fn library_management_workflows_run_through_the_pages() {
         )
         .await;
     assert_eq!(plan.status, StatusCode::OK, "{:?}", plan.body);
-    assert!(plan.body["affected_ids"].as_array().unwrap().len() >= 1);
+    assert!(!plan.body["affected_ids"].as_array().unwrap().is_empty());
     let committed = f
         .call(
             &op,

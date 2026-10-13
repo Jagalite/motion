@@ -1163,6 +1163,18 @@ pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
                                     None => "Its titles follow a saved filter of another profile or one you cannot read.".to_string(),
                                 })
                             </p>
+                            if collection.items.is_empty() {
+                                <p class="muted">"No titles match yet."</p>
+                            } else {
+                                <ul class="rows">
+                                    for item in collection.items.iter() {
+                                        <li><a href=(format!("/item/{}", item.id))>(item.title.as_str())</a></li>
+                                    }
+                                </ul>
+                                if collection.member_count > collection.items.len() {
+                                    <p class="muted small">(format!("and {} more", collection.member_count - collection.items.len()))</p>
+                                }
+                            }
                         } else if collection.items.is_empty() {
                             <p class="muted">"Empty."</p>
                         } else {

@@ -431,6 +431,8 @@ pub struct CollectionView {
     pub kind: String,
     /// The saved filter a smart collection follows.
     pub filter_id: Option<String>,
+    /// Readable members in all (a smart collection shows only its first few).
+    pub member_count: usize,
     pub etag: String,
     pub items: Vec<ItemCard>,
     /// Exact replacement bodies removing each listed item, in `items` order.
