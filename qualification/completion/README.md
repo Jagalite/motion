@@ -704,6 +704,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     pictures. A start 0.25 s into it gives a silent first 0.2 s and sound
     from 0.4 s, with the cue drawn. `v2_playback` 35 passed; clippy clean.
 
+  Round 2 at `ae29f6d` is clean: no actionable findings.
+
 ### Remaining item 3 slices
 
 | Slice | Next step |
