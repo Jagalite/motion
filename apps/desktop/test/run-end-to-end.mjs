@@ -93,6 +93,17 @@ async function session(origin, credential) {
   return {principal: body.principal, api, cookie};
 }
 
+// Source provenance, captured before anything runs: the commit, whether
+// the tested files differ from it, and their hashes.
+const tested = () => [...readdirSync(join(root, 'apps/desktop/src')).map(name => `apps/desktop/src/${name}`),
+  'apps/desktop/test/offline-smoke.mjs', 'apps/desktop/test/run-end-to-end.mjs', 'packages/ui-bridge/offline-player.js'];
+function sourceHashes() {
+  return Object.fromEntries(tested().map(relative => [relative, sha(readFileSync(join(root, relative)))]));
+}
+const sources = sourceHashes();
+const commit = execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim();
+const sourcesCommitted = execFileSync('git', ['status', '--porcelain', '--', ...tested()], {cwd: root}).toString().trim() === '';
+
 const options = {executable: server.path, dataDir: join(work, 'server'), demuxeDir, contractDigest};
 let owned = createOwnedServer(options);
 let failure;
@@ -183,15 +194,15 @@ function existsCache() {
   try { currentRoot(cacheBase); return true; } catch { return false; }
 }
 
-const sources = {};
-for (const relative of [...readdirSync(join(root, 'apps/desktop/src')).map(name => `apps/desktop/src/${name}`),
-  'apps/desktop/test/offline-smoke.mjs', 'apps/desktop/test/run-end-to-end.mjs', 'packages/ui-bridge/offline-player.js']) {
-  sources[relative] = sha(readFileSync(join(root, relative)));
+// The tested bytes must be the recorded ones: unchanged since the start.
+const after = sourceHashes();
+if (JSON.stringify(after) !== JSON.stringify(sources) && !failure) {
+  failure = 'Desktop sources changed during the run; the receipt cannot name what was tested';
 }
 const receipt = {passed: !failure, failure: failure ?? null, checks, electron: offline,
   server_sha256: server.sha256, host_sha256: host.sha256, runtime_binary_sha256: sha(readFileSync(runtime)),
   demuxe_package_sha256: sha(readFileSync(join(demuxeDir, 'playscale-package.json'))), media_sha256: sha(mediaBytes), source_sha256: sources,
-  commit: execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim(), recorded_at: new Date().toISOString(),
+  commit, sources_committed: sourcesCommitted, recorded_at: new Date().toISOString(),
   artifacts: `$TMPDIR/${basename(work)}`,
   limitations: ['The download is driven by the production agent module from Node, not from the Electron main process (sign-in UI not exercised).',
     'One device, one profile, one complete MP4 original with one text subtitle; macOS arm64 debug binaries; unpackaged Electron; audio muted.',
