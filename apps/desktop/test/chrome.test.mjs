@@ -62,9 +62,14 @@ test('the offline library choice follows roots saved or removed after startup', 
   assert.equal(choice.value, 'c');
   await button.listeners.click({currentTarget: button});
   assert.deepEqual(opened, ['b', 'c']);
-  // One library left: the choice is hidden and no root is named.
-  roots = [root('c', true)];
+  // One library left (the current one was emptied): the choice is hidden
+  // but the surviving root is still named, never the emptied current one.
+  roots = [root('a')];
   await button.listeners.click({currentTarget: button});
   assert.equal(label.hidden, true);
-  assert.deepEqual(opened, ['b', 'c', undefined]);
+  assert.deepEqual(opened, ['b', 'c', 'a']);
+  // No saved library: nothing is named and the host decides.
+  roots = [];
+  await button.listeners.click({currentTarget: button});
+  assert.deepEqual(opened, ['b', 'c', 'a', undefined]);
 });

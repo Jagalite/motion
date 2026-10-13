@@ -54,7 +54,9 @@ for (const [id, operation, message] of [
   button.disabled = true;
   try {
     if (id === 'downloads') await listOfflineRoots();
-    await window.motionHost[operation](id === 'downloads' && !rootLabel.hidden ? rootChoice.value : undefined);
+    // A listed root is named even when it is the only one (the chooser is
+    // hidden): the most recently synchronized root may since have been emptied.
+    await window.motionHost[operation](id === 'downloads' && rootChoice.value ? rootChoice.value : undefined);
     show(message);
   } catch (error) { show(error.message, true); }
   finally {

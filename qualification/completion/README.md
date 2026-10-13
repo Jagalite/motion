@@ -434,12 +434,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - A chosen root opens; an empty or unknown root is refused.
   - Driving the production chrome script: a selected root removed after
     startup is not resubmitted; a root saved later appears; a valid
-    selection survives refreshes; with one library the choice is hidden.
+    selection survives refreshes; with one library left the choice is hidden
+    but that library is still the one opened.
   - The chrome test's harness without the new IPC still passes.
 - **Review (GPT-6.1 Sol), round 1:** two P2 findings, both fixed.
   - The chooser kept its startup options, so it resubmitted removed roots
     and never showed new ones.
   - The `label` display rule overrode `[hidden]`.
+- **Review, round 2:** one P2, fixed. When only one library remained, the
+  hidden chooser named no root, so the emptied most recent root opened. The
+  surviving root is now always named.
 - **Release checks:** the Electron run of the chooser with two real servers.
 
 ### Remaining item 5 work (not started)
