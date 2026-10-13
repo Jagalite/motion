@@ -40,6 +40,12 @@ def notice_files(package):
             if path.is_file() and path.name.upper().startswith(NOTICE_PREFIXES)
         }
         base, prefix = repository, 'repository/'
+    if not selected and (package['name'], package['version']) == ('defmt-parser', '1.0.0'):
+        # This registry archive omits its workspace licenses. Preserve the exact
+        # upstream revision's texts in-tree; provenance accompanies the files.
+        base = ROOT / 'third_party/licenses/defmt-parser-1.0.0'
+        selected = {base / 'LICENSE-MIT', base / 'LICENSE-APACHE'}
+        prefix = 'vendored-upstream/'
     if not selected:
         raise ValueError(f"No license/notice files found: {package['name']} {package['version']}")
     notices = []

@@ -249,7 +249,7 @@ func authCmd(env *Env) *cobra.Command {
 			})
 		}),
 	}
-	cmd.AddCommand(pair, approve, status, logout)
+	cmd.AddCommand(pair, approve, status, logout, redeemCmd(env))
 	return cmd
 }
 
@@ -275,7 +275,7 @@ func pairDevice(ctx context.Context, env *Env, c *Conn, name, accepted string) e
 		return err
 	}
 	env.notice(map[string]string{"pairing_id": p.ID, "user_code": p.UserCode, "expires_at": p.ExpiresAt},
-		fmt.Sprintf("Pairing requested. On an administrator's terminal run:\n  motion auth approve %s --code %s --permission catalog:read --permission events:read\nWaiting for approval (expires %s)...", p.ID, p.UserCode, p.ExpiresAt))
+		fmt.Sprintf("Pairing requested. In an administrator’s Motion TUI, open Pairing requests and compare code %s.\nWaiting for approval (expires %s)...", p.UserCode, p.ExpiresAt))
 	interval := time.Duration(max(p.PollIntervalSeconds, 1)) * time.Second
 	for attempt := 0; ; attempt++ {
 		if err := c.Sleep(ctx, interval); err != nil {

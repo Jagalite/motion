@@ -115,6 +115,9 @@ async function call(method, path, body, headers = {}) {
 }
 
 function message(error) {
+  if (error.code === 'pairing_denied') return 'An administrator denied this pairing request. Ask them before starting a new request.';
+  if (error.code === 'pairing_expired') return 'The pairing code expired before it was approved. Start a new pairing request.';
+  if (error.code === 'invitation_unavailable') return 'This invitation is no longer available. Ask an administrator for a new code.';
   if (error.status === 409 || error.status === 412) return 'This changed somewhere else. Reload the page to see the latest version, then try again.';
   if (error.status === 401) return 'Your session has ended. Sign in again.';
   if (error.status === 403) return 'You are not allowed to do that.';
@@ -207,6 +210,7 @@ restoreAfterReload();
 const submitting = new WeakSet();
 async function submitCommand(form) {
   if (submitting.has(form)) return;
+  if (form.classList.contains('invitation')) return redeemBrowserInvitation(form);
   submitting.add(form);
   const [method, path] = form.dataset.command.split(' ');
   const status = form.querySelector('.command-status');
@@ -326,7 +330,7 @@ async function pair(form, pairing) {
       return;
     } catch (error) {
       // Not approved yet, polling too fast, or no response: keep trying until expiry.
-      const transient = !error.status || error.status === 409 || error.status === 429 || error.status >= 500;
+      const transient = !error.status || error.code === 'pairing_pending' || error.status === 429 || error.status >= 500;
       if (!transient) {
         status.textContent = message(error);
         status.setAttribute('role', 'alert');
@@ -382,3 +386,34 @@ document.addEventListener('click', event => {
   event.preventDefault();
   history.back();
 });
+
+// Invitation secrets and retry identities stay only in memory, never in URL,
+// logs or the ordinary command idempotency storage (whose key includes a body).
+const invitationClaims = new WeakMap();
+async function redeemBrowserInvitation(form) {
+  if (submitting.has(form)) return;
+  submitting.add(form);
+  const status = form.querySelector('.command-status');
+  const button = form.querySelector('button[type="submit"]');
+  const input = bodyOf(form);
+  let claim = invitationClaims.get(form);
+  if (!claim || claim.body.code !== input.code) {
+    claim = {body: {...input, claim_id: newKey()}, credential: null};
+    invitationClaims.set(form, claim);
+  }
+  try {
+    button?.setAttribute('disabled', '');
+    status.textContent = 'Redeeming invitation…';
+    claim.credential ??= await call('POST', '/api/v2/auth/invitations/redeem', claim.body);
+    await call('POST', '/api/v2/auth/session', {kind: 'credential', credential: claim.credential.access_token});
+    invitationClaims.delete(form);
+    form.reset?.();
+    location.reload();
+  } catch (error) {
+    status.textContent = message(error);
+    status.setAttribute('role', 'alert');
+  } finally {
+    submitting.delete(form);
+    button?.removeAttribute('disabled');
+  }
+}

@@ -1,5 +1,6 @@
 //! Deterministic decisions. No clocks, database connections, tasks, or file handles.
 pub mod access;
+pub mod access_admin;
 pub mod artwork;
 pub mod catalog;
 pub mod color;
@@ -37,3 +38,5 @@ pub mod timeline_viewing;
 pub mod viewing;
 pub mod watch;
 pub mod work;
+
+pub mod signin;

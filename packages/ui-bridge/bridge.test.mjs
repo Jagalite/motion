@@ -388,3 +388,48 @@ test('after a command reloads the page, focus returns to the same action, never 
   runInNewContext(source, context('/elsewhere'));
   assert.equal(focused.length, count);
 });
+
+test('invitation redemption retains claim after lost response without storing the code', async () => {
+  const storage = new Map(), bodies = [], paths = [];
+  let first = true;
+  const bridge = harness(storage, async (path, options) => {
+    paths.push(path); bodies.push(JSON.parse(options.body));
+    if (first) {first = false; throw new Error('connection lost');}
+    return {ok: true, status: 200, json: async () => ({access_token: 'credential'})};
+  });
+  const f = form([input('code','text','private-invitation'),input('device_name','text','Browser'),input('client_name','text','Motion web')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f); await bridge.submitCommand(f);
+  assert.equal(paths.length, 3);
+  assert.equal(paths[2], '/api/v2/auth/session');
+  assert.deepEqual(bodies[0], bodies[1]);
+  assert.match(bodies[0].claim_id, /^[a-f0-9]{32}$/);
+  assert.equal(storage.size, 0);
+});
+
+test('denied and expired pairing stop polling and explain the actual outcome', async () => {
+  for (const [code, expected] of [
+    ['pairing_denied', 'An administrator denied this pairing request. Ask them before starting a new request.'],
+    ['pairing_expired', 'The pairing code expired before it was approved. Start a new pairing request.'],
+  ]) {
+    let calls = 0;
+    const bridge = harness(new Map(), async () => {
+      calls++;
+      return {ok:false, status:409, json:async()=>({code,detail:'Server detail'})};
+    });
+    const f = form();
+    await bridge.pair(f, {id:'pair',user_code:'CODE',device_code:'secret',poll_interval_seconds:0,expires_at:new Date(Date.now()+1000).toISOString()});
+    assert.equal(calls,1);
+    assert.equal(f.querySelector('.command-status').textContent, expected);
+  }
+});
+
+test('an unavailable invitation asks for a new code without saving the secret', async () => {
+  const storage = new Map();
+  const bridge = harness(storage, async () => ({ok:false, status:409, json:async()=>({code:'invitation_unavailable'})}));
+  const f = form([input('code', 'text', 'private-invitation')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f);
+  assert.equal(f.querySelector('.command-status').textContent, 'This invitation is no longer available. Ask an administrator for a new code.');
+  assert.equal(storage.size, 0);
+});

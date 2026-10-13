@@ -189,3 +189,25 @@ test('a rebind adopts the same session on another delivery only when idle', asyn
   assert.equal(await fresh.flush(), true, 'acks for the new delivery are accepted after rebind');
   assert.equal(fresh.session.sequence, '1');
 });
+
+for (const status of [401, 403]) test(`user access withdrawal ${status} archives exact pending identity before clearing`, async () => {
+  let archived;
+  const h = harness(async () => { throw Object.assign(new Error('access withdrawn'), {status}); }, {
+    archive(value) { archived = JSON.parse(JSON.stringify(value)); assert.notEqual(h.stored, null); }
+  });
+  h.writer.record(snapshot(12345));
+  await assert.rejects(h.writer.flush(), /access withdrawn/);
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(archived.pending, h.calls[0].event);
+  assert.equal(archived.session.id, session.id);
+  assert.equal(archived.pending.event_id, 'e1');
+  assert.equal(archived.pending.sequence, '1');
+  assert.equal(archived.pending.position_ms, 12345);
+  assert.equal(archived.latest, null);
+  assert.equal(archived.status, status);
+  assert.equal(h.stored, null);
+  h.writer.record(snapshot(20000));
+  await h.writer.flush();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.writer.rejected, true);
+});

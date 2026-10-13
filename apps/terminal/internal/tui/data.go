@@ -312,6 +312,20 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 		return list(b.ListProfiles)
 	case keyDevices:
 		return list(b.ListDevices)
+	case keyUsers, keyPairings, keyInvitations:
+		if a, ok := b.(accessBackend); ok {
+			switch kind {
+			case keyUsers:
+				return list(a.ListUsers)
+			case keyPairings:
+				return list(a.ListPairings)
+			case keyInvitations:
+				return list(a.ListInvitations)
+			}
+		}
+		return func(context.Context) (any, bool, error) {
+			return nil, false, fmt.Errorf("access management unavailable")
+		}
 	case keyLibraries:
 		return list(b.ListLibraries)
 	case keyScans:

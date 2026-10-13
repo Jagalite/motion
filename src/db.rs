@@ -753,6 +753,12 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         // A snapshot cannot prove post-snapshot revocations. Withdraw saved
         // authority atomically with the new restore history and baseline.
         for statement in [
+            "DELETE FROM access_invitations",
+            "DELETE FROM signin_outbox",
+            "DELETE FROM signin_transactions",
+            "DELETE FROM signin_requests",
+            "DELETE FROM signin_proofs",
+            "UPDATE signin_families SET revoked=1,revision=revision+1",
             "DELETE FROM content_tickets",
             "DELETE FROM pairings",
             "DELETE FROM idempotency_records",

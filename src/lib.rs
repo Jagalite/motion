@@ -30,6 +30,7 @@ pub mod renditions;
 pub mod scan;
 pub mod scans;
 pub mod search;
+pub mod signin_protocol;
 pub mod storage;
 pub mod upgrade;
 pub mod v2;

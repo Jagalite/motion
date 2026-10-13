@@ -202,6 +202,35 @@ impl Fixture {
         )
     }
 
+    async fn assign_user(&self, device: &str) -> String {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, &format!("download-owner-{}", uuid::Uuid::new_v4()),
+            json!({"name":"Download owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+        user.body["id"].as_str().unwrap().into()
+    }
+
     /// Scan `name` into the library; returns (timeline_id, file_id, revision).
     async fn scanned(&self, name: &str, bytes: &[u8]) -> (String, String, String) {
         std::fs::write(self.dir.path().join("media").join(name), bytes).unwrap();
@@ -1923,4 +1952,82 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
     problem(&read, StatusCode::CONFLICT, "download_cancelled");
     assert_eq!(conversions() - before, 0);
+}
+
+#[tokio::test]
+async fn administrator_user_changes_fence_download_tickets_and_keep_history() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("user-download.mp4", b"0123456789").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let user_id = f.assign_user(&device).await;
+    let create = input(&device, &timeline);
+    let download = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "user-download-create",
+            create.clone(),
+        )
+        .await;
+    assert_eq!(download.status, StatusCode::ACCEPTED, "{}", download.body);
+    let id = download.body["id"].as_str().unwrap();
+    let ticket = f
+        .post(
+            "/api/v2/content-access",
+            &auth,
+            "user-download-ticket",
+            download_ticket(id),
+        )
+        .await;
+    assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
+    let url = ticket.body["url"].as_str().unwrap();
+    let operator = bearer(OPERATOR);
+    let path = format!("/api/v2/users/{user_id}");
+    let user = f.get(&path, &operator).await;
+    let mut edit = user.body;
+    edit.as_object_mut().unwrap().remove("id");
+    edit.as_object_mut().unwrap().remove("revision");
+    edit["permissions"] = json!(["catalog:read", "viewing:write"]);
+    let narrowed = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit.clone()),
+            &[
+                ("authorization", &operator),
+                ("if-match", user.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+    for method in ["GET", "HEAD"] {
+        assert_eq!(
+            f.raw(f.request(method, url, None, &[])).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        f.post("/api/v2/downloads", &auth, "user-download-create", create)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    edit["disabled"] = json!(true);
+    let disabled = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit),
+            &[
+                ("authorization", &operator),
+                ("if-match", narrowed.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(disabled.status, StatusCode::OK, "{}", disabled.body);
+    assert_eq!(f.bytes(url, &[]).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(f.count("SELECT count(*) FROM downloads").await, 1);
+    assert_eq!(f.count("SELECT count(*) FROM devices").await, 1);
+    assert_eq!(f.count("SELECT count(*) FROM credentials").await, 0);
+    assert_eq!(f.count("SELECT count(*) FROM content_tickets").await, 0);
 }

@@ -250,7 +250,7 @@ async fn create(
             let id = crate::new_id();
             sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,requester_id,credential_hash,ingress_id,created_at) VALUES (?,?,?,?,?,?,?)")
                 .bind(&id).bind(&file).bind(&revision).bind(&principal.id)
-                .bind(caller.credential.as_ref().map(|(hash, _)| hash)).bind(&caller.ingress).bind(crate::now())
+                .bind(caller.credential().map(|(hash, _)| hash)).bind(caller.ingress_device_id()).bind(crate::now())
                 .execute(&mut *tx).await?;
             StatusCode::ACCEPTED
         }

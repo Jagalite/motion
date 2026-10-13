@@ -105,9 +105,13 @@ def rotate_restore_epoch(database):
             db.execute(RESTORE_BASELINE_EPOCH)
             db.execute("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) "
                        "SELECT 1,restore_epoch,0 FROM server_identity WHERE singleton=1")
-        for table in ('content_tickets', 'pairings', 'idempotency_records', 'credentials'):
+        for table in ('access_invitations', 'signin_outbox', 'signin_transactions',
+                      'signin_requests', 'signin_proofs', 'content_tickets', 'pairings',
+                      'idempotency_records', 'credentials'):
             if table in tables:
                 db.execute(f'DELETE FROM {table}')
+        if 'signin_families' in tables:
+            db.execute('UPDATE signin_families SET revoked=1,revision=revision+1')
         if 'devices' in tables:
             db.execute('UPDATE devices SET revoked=1')
     db.close()

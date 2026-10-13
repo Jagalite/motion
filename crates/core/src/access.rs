@@ -65,12 +65,16 @@ pub struct Grant {
 }
 
 /// Resource restrictions beyond permissions. Rating and label restrictions are
-/// active when `allow_unrated` is false or either list is non-empty.
+/// active when rated or unrated eligibility is limited or a list is non-empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Policy {
     pub library_ids: BTreeSet<String>,
     pub allow_unrated: bool,
     pub allowed_ratings: BTreeSet<String>,
+    /// Explicit bottom for rated eligibility. An empty legacy allowlist alone
+    /// continues to mean every rating; disjoint ceilings must not become any.
+    #[serde(default)]
+    pub deny_rated: bool,
     pub blocked_labels: BTreeSet<String>,
 }
 
@@ -81,6 +85,7 @@ impl Default for Policy {
             library_ids: BTreeSet::new(),
             allow_unrated: true,
             allowed_ratings: BTreeSet::new(),
+            deny_rated: false,
             blocked_labels: BTreeSet::new(),
         }
     }
@@ -88,7 +93,64 @@ impl Default for Policy {
 
 impl Policy {
     pub fn rating_restricted(&self) -> bool {
-        !self.allow_unrated || !self.allowed_ratings.is_empty() || !self.blocked_labels.is_empty()
+        self.deny_rated
+            || !self.allow_unrated
+            || !self.allowed_ratings.is_empty()
+            || !self.blocked_labels.is_empty()
+    }
+
+    pub fn rating_eligibility(&self) -> RatingEligibility {
+        if self.deny_rated {
+            RatingEligibility::None
+        } else if self.allowed_ratings.is_empty() {
+            RatingEligibility::Any
+        } else {
+            RatingEligibility::Only(self.allowed_ratings.clone())
+        }
+    }
+
+    pub fn set_rating_eligibility(&mut self, eligibility: RatingEligibility) {
+        self.deny_rated = matches!(&eligibility, RatingEligibility::None)
+            || matches!(&eligibility, RatingEligibility::Only(ratings) if ratings.is_empty());
+        self.allowed_ratings = match eligibility {
+            RatingEligibility::Only(ratings) => ratings,
+            _ => BTreeSet::new(),
+        };
+    }
+}
+
+/// Semantic eligibility used by production grant composition. `None` applies
+/// only to rated content; the policy's `allow_unrated` remains independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RatingEligibility {
+    Any,
+    Only(BTreeSet<String>),
+    None,
+}
+
+impl RatingEligibility {
+    pub fn within(&self, ceiling: &Self) -> bool {
+        match (self, ceiling) {
+            (Self::None, _) | (_, Self::Any) => true,
+            (Self::Only(values), Self::Only(allowed)) => values.is_subset(allowed),
+            (Self::Only(values), Self::None) => values.is_empty(),
+            _ => false,
+        }
+    }
+
+    pub fn intersection(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::None, _) | (_, Self::None) => Self::None,
+            (Self::Any, value) | (value, Self::Any) => value.clone(),
+            (Self::Only(left), Self::Only(right)) => {
+                let values: BTreeSet<_> = left.intersection(right).cloned().collect();
+                if values.is_empty() {
+                    Self::None
+                } else {
+                    Self::Only(values)
+                }
+            }
+        }
     }
 }
 
@@ -157,6 +219,12 @@ pub enum AccessError {
     PairingExpired,
     PairingPending,
     PairingDecided,
+    PairingDenied,
+    UserDisabled,
+    GrantExceeded,
+    PolicyLimitExceeded,
+    LastAdministrator,
+    InvitationUnavailable,
     UserCodeMismatch,
     UnknownProfile,
     UnknownLibrary,
@@ -181,6 +249,12 @@ impl AccessError {
             Self::PairingExpired => "pairing_expired",
             Self::PairingPending => "pairing_pending",
             Self::PairingDecided => "pairing_already_decided",
+            Self::PairingDenied => "pairing_denied",
+            Self::UserDisabled => "user_disabled",
+            Self::GrantExceeded => "grant_exceeded",
+            Self::PolicyLimitExceeded => "policy_limit_exceeded",
+            Self::LastAdministrator => "last_administrator",
+            Self::InvitationUnavailable => "invitation_unavailable",
             Self::UserCodeMismatch => "user_code_mismatch",
             Self::UnknownProfile => "unknown_profile",
             Self::UnknownLibrary => "unknown_library",
@@ -197,6 +271,7 @@ impl AccessError {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PairingPhase {
     Pending,
+    Denied,
     Approved {
         device_id: String,
     },
@@ -341,6 +416,7 @@ pub fn claim(
     }
     let (device_id, claimed) = match &pairing.phase {
         PairingPhase::Pending => return Err(AccessError::PairingPending),
+        PairingPhase::Denied => return Err(AccessError::PairingDenied),
         PairingPhase::Approved { device_id } => (device_id, None),
         PairingPhase::Claimed {
             device_id,
@@ -405,6 +481,41 @@ pub struct Credential {
     pub kind: CredentialKind,
     pub generation: u64,
     pub expires_at: i64,
+}
+
+/// Authentication facts supplied by a trusted adapter, never deserialized from
+/// client input. Missing device/credential observations cannot select the local
+/// operator path: that source requires explicit proof from the adapter.
+pub enum Authentication<'a> {
+    VerifiedLocalOperator,
+    Credential {
+        credential: Option<&'a Credential>,
+        parent: Option<&'a Credential>,
+        device: Option<&'a Device>,
+    },
+    TrustedIngress {
+        device_id: &'a str,
+        device: Option<&'a Device>,
+    },
+}
+
+pub fn authenticate_caller(source: Authentication<'_>, now: i64) -> Result<Principal, AccessError> {
+    match source {
+        Authentication::VerifiedLocalOperator => Ok(Principal::operator()),
+        Authentication::Credential {
+            credential,
+            parent,
+            device,
+        } => authenticate(
+            credential.ok_or(AccessError::CredentialRevoked)?,
+            parent,
+            device,
+            now,
+        ),
+        Authentication::TrustedIngress { device_id, device } => {
+            authenticate_ingress(device.filter(|d| d.id == device_id))
+        }
+    }
 }
 
 /// Every request re-derives the principal from the current device row, so a

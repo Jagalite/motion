@@ -140,10 +140,15 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	health := data(t, status.stdout)["health"].(map[string]any)
 	serverID := health["server_id"].(string)
 
-	// Restricted mode: the legacy v1 surface is closed to anonymous callers.
+	// Retired v1 routes are absent; the current v2 surface requires authentication.
 	resp, err := http.Get(srv.url + "/api/v1/libraries")
+	if err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("retired legacy route: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	resp, err = http.Get(srv.url + "/api/v2/catalog/items")
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("legacy surface open: %v %v", resp, err)
+		t.Fatalf("anonymous v2 catalog access: %v %v", resp, err)
 	}
 	resp.Body.Close()
 

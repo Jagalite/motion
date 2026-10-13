@@ -282,6 +282,34 @@ impl Fixture {
         (device, token)
     }
 
+    async fn assign_user(&self, device: &str) {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, Some(&format!("playback-owner-{}", uuid::Uuid::new_v4())),
+            json!({"name":"Playback owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+    }
+
     async fn policy(&self, device: &str, libraries: &[&str], permissions: &[&str], tag: &str) {
         let replaced = self
             .call(
@@ -2027,6 +2055,17 @@ async fn planning_skips_originals_outside_the_callers_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn playback_only_observations_advance_live_conversion_and_revocation_stops_worker() {
+    live_conversion_access_withdrawal("device").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn administrator_user_narrowing_stops_live_conversion() {
+    live_conversion_access_withdrawal("narrow").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn administrator_user_disable_stops_live_conversion() {
+    live_conversion_access_withdrawal("disable").await;
+}
+async fn live_conversion_access_withdrawal(action: &str) {
     assert!(
         tools_available(),
         "this qualification requires ffmpeg and ffprobe"
@@ -2038,6 +2077,9 @@ async fn playback_only_observations_advance_live_conversion_and_revocation_stops
     let (device, auth) = f
         .device(&["default"], &["catalog:read", "playback:request"])
         .await;
+    if action != "device" {
+        f.assign_user(&device).await;
+    }
     let caps = f.get("/api/v2/system/capabilities", &auth).await;
     assert_eq!(caps.status, StatusCode::OK);
     for id in ["catalog.v2", "playback.v2"] {
@@ -2154,21 +2196,50 @@ async fn playback_only_observations_advance_live_conversion_and_revocation_stops
     let operator = bearer(OPERATOR);
     let row = f.get(&format!("/api/v2/devices/{device}"), &operator).await;
     let start = std::time::Instant::now();
-    let revoked = f
-        .call(
-            "DELETE",
-            &format!("/api/v2/devices/{device}"),
-            None,
-            &[
-                ("authorization", &operator),
-                ("if-match", row.headers["etag"].to_str().unwrap()),
-            ],
-        )
-        .await;
-    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    if action == "device" {
+        let revoked = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/devices/{device}"),
+                None,
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    } else {
+        let path = format!("/api/v2/users/{}", row.body["user_id"].as_str().unwrap());
+        let user = f.get(&path, &operator).await;
+        let mut edit = user.body.clone();
+        edit.as_object_mut().unwrap().remove("id");
+        edit.as_object_mut().unwrap().remove("revision");
+        if action == "disable" {
+            edit["disabled"] = json!(true);
+        } else {
+            edit["permissions"] = json!(["catalog:read"]);
+        }
+        let result = f
+            .call(
+                "PUT",
+                &path,
+                Some(edit),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", user.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(result.status, StatusCode::OK, "{}", result.body);
+    }
     assert_eq!(
         f.get(manifest, &auth).await.status,
-        StatusCode::UNAUTHORIZED
+        if action == "narrow" {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        }
     );
     tokio::time::timeout(Duration::from_secs(10), async {
         while f.server.app.processing.deliveries.is_live(id) {

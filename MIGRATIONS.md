@@ -55,6 +55,8 @@ applying any pending migration to an existing database.
 | 0054 | `0054_preparation_dependencies.sql` | Rewrite review A05 | invalidate preparation revisions only for source, binding and output dependencies |
 | 0055 | `0055_artwork_selection_revisions.sql` | Rewrite review C11 | advance role selection readback ETags when contribution facts change |
 | 0056 | `0056_event_ownership.sql` | Rewrite review A07 | retain organization and logical schedule scope for authorized invalidation after deletion/moves |
+| 0057 | `0057_access_management.sql` | TUI access | explicit user ownership, pairing denial, revision-bound invitations and durable redemption limits |
+| 0058 | `0058_legacy_access_ownership.sql` | SSO/email A1 | unassign untouched generated legacy placeholders; preserve device grants/credentials and deliberate user associations |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 

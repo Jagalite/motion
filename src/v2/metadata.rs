@@ -1204,7 +1204,7 @@ async fn refresh_metadata(
         return Ok(replayed(stored.unwrap()));
     }
     let job = crate::new_id();
-    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) VALUES (?,?,?,?,?,'queued',?)").bind(&job).bind(&id).bind(&principal.id).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).bind(crate::now()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO metadata_jobs(id,item_id,requester_id,credential_hash,ingress_id,phase,created_at) VALUES (?,?,?,?,?,'queued',?)").bind(&job).bind(&id).bind(&principal.id).bind(caller.credential().map(|(hash,_)|hash)).bind(caller.ingress_device_id()).bind(crate::now()).execute(&mut *tx).await?;
     let value = serde_json::json!({"id":job,"revision":"1","kind":"metadata","phase":"queued","attempt_generation":"0","progress":Value::Null,"error_code":Value::Null,"result_ids":[],"requester_id":principal.id});
     record
         .save(&mut tx, &digest, StatusCode::ACCEPTED, Some(&value), None)

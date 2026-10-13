@@ -63,6 +63,12 @@ pub static BRIDGE: Asset = Asset::new(
     "text/javascript; charset=utf-8",
     include_bytes!("../../../packages/ui-bridge/bridge.js"),
 );
+pub static AUTH: Asset = Asset::new(
+    "auth",
+    "js",
+    "text/javascript; charset=utf-8",
+    include_bytes!("../../../packages/ui-bridge/auth.js"),
+);
 pub static PLAYER: Asset = Asset::new(
     "player",
     "js",
@@ -108,10 +114,11 @@ pub static ICON_512: Asset = Asset::new(
 );
 
 /// Every embedded asset, for routing and the release inventory.
-pub fn all() -> [&'static Asset; 7] {
+pub fn all() -> [&'static Asset; 8] {
     [
         &STYLESHEET,
         &BRIDGE,
+        &AUTH,
         &PLAYER,
         &OFFLINE_PLAYER,
         &TOUCH_ICON,

@@ -61,8 +61,10 @@ The provider builder requires new output and source-build directories. Existing
 development deployments are preserved. Source builds retain their original local `data/` default.
 
 Open **http://127.0.0.1:8787**. Registration and an initial scan run for each
-`--library`; repeat the option for more roots. The webpage includes folder/scan
-administration using the token in `data/admin-token` (created with mode 0600 on Unix).
+`--library`; repeat the option for more roots. Pair the browser from a paired
+administrator terminal under **Pairing requests**, or redeem an invitation.
+See [Administrator access](ACCESS_MANAGEMENT.md) for users, grants, invitations,
+device revocation and explicit server-local recovery.
 Use the exact configured hostname. Local data defaults to `data/`; put it on a local
 disk outside media roots. One process may own a data directory.
 
@@ -213,7 +215,8 @@ Demuxe, FFmpeg and FFprobe defaults.
 
 Real configuration, `.env` files and generated admin-token files are ignored by
 Git. Motion reads JSON configuration; it does not load `.env` automatically.
-Keep your admin token in Motion's data directory and enter it in the local UI.
+Keep the protected admin token in Motion's data directory for server-local recovery;
+ordinary browser pairing and invitations never require copying it.
 Commit only example configuration with placeholders. `--check-config` output
 contains your local paths; keep that output private.
 
