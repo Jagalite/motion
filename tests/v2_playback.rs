@@ -4494,6 +4494,24 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
             .await;
         assert_eq!(refused.body["code"], code, "{}", refused.body);
     }
+    // Another generated version binding only an interval of the same output
+    // (sorting first) is never the listed pin: it cannot be downloaded.
+    let output_revision: String = sqlx::query_scalar("SELECT revision FROM media_files WHERE id=?")
+        .bind(&rendition)
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO media_versions(id,timeline_id,origin,equivalence) VALUES ('0-interval',?,'generated','declared')")
+        .bind(&timeline)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision,start_ms,end_ms) VALUES ('0-interval',1,?,?,0,1000)")
+        .bind(&rendition)
+        .bind(&output_revision)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
     // The rendition's generated version (as listed) pins exactly it.
     let listed = f
         .get(
@@ -4505,6 +4523,7 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         .as_str()
         .unwrap()
         .to_owned();
+    assert_ne!(version, "0-interval");
     let pinned_body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
         "version_id": version, "recipe_id": "remux_mp4",
         "tracks": listed.body["items"][0]["tracks"].clone()});

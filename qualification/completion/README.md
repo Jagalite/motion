@@ -1074,6 +1074,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   22, `v2_metadata_processing` 18, `m3_workflows` 2 and contract 5 passed;
   pinned clippy is clean.
 
+  Round 2 at `e40bfdc` raised two P2 findings, both fixed:
+  - **Pin:** the listed `version_id` could name another generated
+    version that binds only an interval or several parts of the same
+    output. It is now restricted to the downloadable binding: whole
+    output, single part, at its revision. The integration test adds such
+    a version, sorting first, and checks that it is never listed.
+  - **Cap:** past the read cap the title page discarded every rendition
+    it had read. Read rows are kept (`list_up_to`), and the form says when
+    only some prepared versions are offered.
+
+  `v2_playback` 30, compose 22 and `m3_workflows` 2 passed; pinned clippy
+  is clean.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

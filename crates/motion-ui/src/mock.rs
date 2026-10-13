@@ -236,6 +236,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                             version_id: "ver-prepared-720p".into(),
                             tracks_json: r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"require","audio_track_id":"a1","subtitle_track_id":"s0"}"#.into(),
                         }],
+                        prepared_incomplete: false,
                     }]
                 })
                 .unwrap_or_default();

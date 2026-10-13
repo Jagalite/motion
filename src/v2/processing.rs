@@ -779,9 +779,12 @@ async fn renditions(
         // and its generated version pins exactly this rendition.
         let tracks = serde_json::from_str::<Value>(&tracks).unwrap_or(Value::Null);
         let version: Option<String> = match &output {
-            Some(o) => sqlx::query_scalar("SELECT v.id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE v.timeline_id=? AND v.origin='generated' AND b.file_id=? ORDER BY v.id LIMIT 1")
+            // Only a downloadable binding: the whole output at its revision,
+            // as the only part (what `createDownload` admits).
+            Some(o) => sqlx::query_scalar("SELECT v.id FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 WHERE v.timeline_id=? AND v.origin='generated' AND b.file_id=? AND b.file_revision=? AND b.start_ms IS NULL AND b.end_ms IS NULL AND NOT EXISTS(SELECT 1 FROM version_files x WHERE x.version_id=v.id AND x.part<>1) ORDER BY v.id LIMIT 1")
                 .bind(&timeline)
                 .bind(o["file_id"].as_str().unwrap_or_default())
+                .bind(o["file_revision"].as_str().unwrap_or_default())
                 .fetch_optional(&mut *tx)
                 .await?,
             None => None,

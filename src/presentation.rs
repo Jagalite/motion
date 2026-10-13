@@ -365,6 +365,37 @@ impl Queries {
         vec![]
     }
 
+    /// Up to `pages` pages of a listing: the rows read, and whether that
+    /// was all of them (the rows are kept either way).
+    async fn list_up_to(&self, path: &str, pages: usize) -> UiResult<(Vec<Value>, bool)> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..pages {
+            let url = match &cursor {
+                Some(c) => {
+                    let q = url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("cursor", c)
+                        .finish();
+                    format!("{path}{separator}limit=200&{q}")
+                }
+                None => format!("{path}{separator}limit=200"),
+            };
+            let page = self.read(&url).await?;
+            rows.extend(
+                page["items"]
+                    .as_array()
+                    .ok_or(UiError::Unavailable)?
+                    .clone(),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => return Ok((rows, true)),
+            }
+        }
+        Ok((rows, false))
+    }
+
     async fn list_all(&self, path: &str, pages: usize) -> UiResult<Vec<Value>> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let mut rows = Vec::new();
@@ -681,16 +712,21 @@ impl UiQueryFacade for Queries {
                 });
                 // Ready prepared versions, when this caller may save and read
                 // them; each is offered with exactly the selection it kept.
+                let mut prepared_incomplete = false;
                 let prepared_downloads =
                     if who.can("downloads:manage") && who.can("processing:request") {
                         // Every page: ready versions may follow pending ones.
                         let query = url::form_urlencoded::Serializer::new(String::new())
                             .append_pair("timeline_id", &timeline)
                             .finish();
-                        self.list_all(&format!("/processing/renditions?{query}"), 5)
+                        // The ready ones among those read are kept even when
+                        // more remain (`prepared_incomplete` says so).
+                        let (rows, complete) = self
+                            .list_up_to(&format!("/processing/renditions?{query}"), 5)
                             .await
-                            .unwrap_or_default()
-                            .iter()
+                            .unwrap_or((vec![], true));
+                        prepared_incomplete = !complete;
+                        rows.iter()
                             .filter(|r| {
                                 r["status"] == "ready"
                                     && r["tracks"].is_object()
@@ -713,6 +749,7 @@ impl UiQueryFacade for Queries {
                     viewing,
                     versions,
                     prepared_downloads,
+                    prepared_incomplete,
                 });
             }
             // The planner decides per request; this only offers the action

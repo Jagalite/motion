@@ -719,6 +719,7 @@ pub(crate) async fn download_form(
     profile_id: String,
     timeline_id: String,
     #[default] prepared: Vec<crate::facade::PreparedDownload>,
+    #[default] incomplete: bool,
 ) -> Result<impl View> {
     let tracks = r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"auto","audio_track_id":null,"subtitle_track_id":null}"#;
     Ok(view! {
@@ -731,6 +732,9 @@ pub(crate) async fn download_form(
                 <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
             )
+            if incomplete {
+                <p class="muted small">"Only some prepared versions are offered here; the title's manage page lists them all."</p>
+            }
             // A prepared version is saved with exactly the selection it kept.
             for version in prepared.iter() {
                 command_form(command: "POST /api/v2/downloads".to_string(), label: "Save this version for offline", idempotent: true, class: Some("command inline"),

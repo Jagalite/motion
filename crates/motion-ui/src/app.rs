@@ -638,7 +638,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                     </a>
                                 }
                                 if who.can("downloads:manage") {
-                                    download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone(), prepared: timeline.prepared_downloads.clone())
+                                    download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone(), prepared: timeline.prepared_downloads.clone(), incomplete: timeline.prepared_incomplete)
                                 }
                                 if let Some(viewing) = &timeline.viewing {
                                     if viewing.watched {

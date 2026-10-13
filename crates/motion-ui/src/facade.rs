@@ -126,6 +126,8 @@ pub struct TimelineView {
     /// Ready prepared versions a device may save instead of the original,
     /// each with exactly the selection it kept.
     pub prepared_downloads: Vec<PreparedDownload>,
+    /// More prepared versions exist than were read for the offer.
+    pub prepared_incomplete: bool,
 }
 
 /// A ready prepared version offered for download.
