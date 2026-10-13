@@ -255,12 +255,55 @@ async fn read(
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, value))
 }
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum Order {
+    #[default]
+    Id,
+    Recent,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    order: Order,
+    library_id: Option<String>,
+}
+/// Keyset cursor for newest-first pages: `(created_at, id)` of the last row.
+fn recent_cursor(created: i64, id: &str) -> String {
+    super::catalog::b64_encode(
+        serde_json::to_string(&(created, id))
+            .expect("serializes")
+            .as_bytes(),
+    )
+}
+fn decode_recent(cursor: &str) -> Result<(i64, String), Problem> {
+    super::catalog::b64_decode(cursor)
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| Problem::bad("invalid_cursor", "The page cursor is invalid"))
+}
 async fn list(
     State(app): State<App>,
     caller: Caller,
-    Query(q): Query<PageQuery>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::SourcesManage)?;
+    if query
+        .library_id
+        .as_deref()
+        .is_some_and(|id| !super::catalog::valid_id(id))
+    {
+        return Err(Problem::bad(
+            "invalid_query",
+            "library_id must be a valid ID",
+        ));
+    }
+    let q = PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    };
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
     let scope = access::catalog_scope(&caller.principal);
@@ -271,10 +314,55 @@ async fn list(
         }
         _ => "[]".into(),
     };
-    let ids:Vec<String>=sqlx::query_scalar("SELECT id FROM scan_requests WHERE id>? AND (? OR library_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?").bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    // Authorization and the optional library filter apply before ordering
+    // and the page limit, so hidden scans never shape a page.
+    let filter =
+        "(? OR library_id IN (SELECT value FROM json_each(?))) AND (? IS NULL OR library_id=?)";
+    let keyed: Vec<(String, String)> = match query.order {
+        Order::Id => {
+            let rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT id FROM scan_requests WHERE id>? AND {filter} ORDER BY id LIMIT ?"
+            ))
+            .bind(q.after()?)
+            .bind(all)
+            .bind(&ids)
+            .bind(&query.library_id)
+            .bind(&query.library_id)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.into_iter().map(|id| (id.clone(), id)).collect()
+        }
+        Order::Recent => {
+            // Newest first by capture time, then ID. A new scan sorts before
+            // every existing cursor, so it never shifts a later page.
+            let after = match q.after()? {
+                "" => None,
+                cursor => Some(decode_recent(cursor)?),
+            };
+            let (created, after_id) = after.clone().unwrap_or((i64::MAX, String::new()));
+            let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+                "SELECT id,created_at FROM scan_requests WHERE (? OR created_at<? OR (created_at=? AND id<?)) AND {filter} ORDER BY created_at DESC,id DESC LIMIT ?"
+            ))
+            .bind(after.is_none())
+            .bind(created)
+            .bind(created)
+            .bind(&after_id)
+            .bind(all)
+            .bind(&ids)
+            .bind(&query.library_id)
+            .bind(&query.library_id)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&mut *tx)
+            .await?;
+            rows.into_iter()
+                .map(|(id, created)| (recent_cursor(created, &id), id))
+                .collect()
+        }
+    };
     let mut rows = Vec::new();
-    for id in ids {
-        rows.push((id.clone(), wire(&mut tx, &id, &caller.principal).await?));
+    for (cursor, id) in keyed {
+        rows.push((cursor, wire(&mut tx, &id, &caller.principal).await?));
     }
     let value = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;

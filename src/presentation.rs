@@ -134,6 +134,11 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
         audio_tracks,
     }
 }
+/// Bounds on the per-title reads of the organize page: distinct playlist
+/// timelines, and titles a batched read did not return.
+const ORGANIZE_TIMELINE_READS: usize = 500;
+const ORGANIZE_FALLBACK_READS: usize = 100;
+
 fn segment(s: &str) -> String {
     let mut url = url::Url::parse("http://local/").unwrap();
     url.path_segments_mut().unwrap().push(s);
@@ -260,9 +265,9 @@ impl Queries {
         (Some((version, file, revision)), options)
     }
 
-    /// Every row of a paged list, bounded to `pages` pages of 200. Lists are
-    /// ordered by random ID, so callers needing recency must read them whole;
-    /// beyond the bound this reports unavailable rather than a partial view.
+    /// Every row of a paged list, bounded to `pages` pages of 200. Callers
+    /// use server filters and orderings to keep the read narrow; beyond the
+    /// bound this reports unavailable rather than a partial view.
     async fn list_all(&self, path: &str, pages: usize) -> UiResult<Vec<Value>> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let mut rows = Vec::new();
@@ -290,6 +295,51 @@ impl Queries {
             }
         }
         Err(UiError::Unavailable)
+    }
+
+    /// Title cards for `ids`, read 100 at a time through the catalog's
+    /// batched `ids` filter. An ID a batch does not return (a merged alias,
+    /// or a hidden or removed title) gets one individual read, which resolves
+    /// aliases and maps hidden titles to `None`, up to a bound; past it the
+    /// ID is left out (not loaded).
+    async fn cards(
+        &self,
+        ids: &[String],
+    ) -> UiResult<std::collections::HashMap<String, Option<ItemCard>>> {
+        let mut unique: Vec<&String> = Vec::new();
+        for id in ids {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        let mut cards = std::collections::HashMap::new();
+        for chunk in unique.chunks(100) {
+            let list = chunk
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let q = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("ids", &list)
+                .finish();
+            for v in self.list(&format!("/catalog/items?limit=100&{q}")).await? {
+                cards.insert(text(&v, "id"), Some(item(&v)));
+            }
+        }
+        let mut fallback = ORGANIZE_FALLBACK_READS;
+        for id in unique {
+            if cards.contains_key(id) || fallback == 0 {
+                continue;
+            }
+            fallback -= 1;
+            let card = match self.read(&format!("/catalog/items/{}", segment(id))).await {
+                Ok(v) => Some(item(&v)),
+                Err(UiError::NotFound) => None,
+                Err(e) => return Err(e),
+            };
+            cards.insert(id.clone(), card);
+        }
+        Ok(cards)
     }
 
     async fn list(&self, path: &str) -> UiResult<Vec<Value>> {
@@ -654,36 +704,30 @@ impl UiQueryFacade for Queries {
             };
             // Recent scans, newest first. A scan read failure is shown as
             // unavailable, never as an empty history.
-            let scans = match self.list_all("/scans", 5).await {
-                Ok(mut rows) => {
-                    rows.sort_by_key(|a| std::cmp::Reverse(text(a, "captured_after")));
-                    Some(
-                        rows.iter()
-                            .take(20)
-                            .map(|v| ScanRow {
-                                id: text(v, "id"),
-                                library_name: library_name(v["library_id"].as_str().unwrap_or("")),
-                                status: text(v, "status"),
-                                started: text(v, "captured_after"),
-                                sources: v["sources"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .map(|r| ScanSourceRow {
-                                        source_name: source_name(
-                                            r["source_id"].as_str().unwrap_or(""),
-                                        ),
-                                        status: text(r, "status"),
-                                        observed_files: count(&r["observed_files"]),
-                                        complete_directories: count(&r["complete_directories"]),
-                                        incomplete_directories: count(&r["incomplete_directories"]),
-                                        error_codes: strings(&r["error_codes"]),
-                                    })
-                                    .collect(),
-                            })
-                            .collect(),
-                    )
-                }
+            let scans = match self.list("/scans?order=recent&limit=20").await {
+                Ok(rows) => Some(
+                    rows.iter()
+                        .map(|v| ScanRow {
+                            id: text(v, "id"),
+                            library_name: library_name(v["library_id"].as_str().unwrap_or("")),
+                            status: text(v, "status"),
+                            started: text(v, "captured_after"),
+                            sources: v["sources"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|r| ScanSourceRow {
+                                    source_name: source_name(r["source_id"].as_str().unwrap_or("")),
+                                    status: text(r, "status"),
+                                    observed_files: count(&r["observed_files"]),
+                                    complete_directories: count(&r["complete_directories"]),
+                                    incomplete_directories: count(&r["incomplete_directories"]),
+                                    error_codes: strings(&r["error_codes"]),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
                 Err(_) => None,
             };
             let schedules = match self.list_all("/schedules", 5).await {
@@ -1052,15 +1096,25 @@ impl UiQueryFacade for Queries {
                             })
                             .collect()
                     });
-                // Renditions have no timeline filter; past the read bound they
-                // are reported unknown while preparing stays available.
-                let renditions = self.list_all("/processing/renditions", 5).await.ok();
+                // Each timeline's renditions are read through the server's
+                // timeline filter. Past the read bound (or on a failed read)
+                // they are reported unknown while preparing stays available.
+                let mut renditions = std::collections::HashMap::new();
+                for (timeline, _, _) in structure.iter().flat_map(|(rows, _)| rows) {
+                    let rows = self
+                        .list_all(
+                            &format!("/processing/renditions?timeline_id={}", segment(timeline)),
+                            5,
+                        )
+                        .await
+                        .ok();
+                    renditions.insert(timeline.clone(), rows);
+                }
                 let timelines = structure.as_ref().map(|(rows, _)| {
                     rows.iter()
                         .map(|(timeline, edition, whole)| PrepareTimeline {
-                            renditions: renditions.as_ref().map(|all| {
+                            renditions: renditions.get(timeline).cloned().flatten().map(|all| {
                                 all.iter()
-                                    .filter(|r| r["timeline_id"] == timeline.as_str())
                                     .map(|r| RenditionRow {
                                         id: text(r, "id"),
                                         status: text(r, "status"),
@@ -1180,14 +1234,55 @@ impl UiQueryFacade for Queries {
                 return Err(UiError::Denied);
             }
             let mine = |v: &&Value| v["profile_id"] == who.profile_id.as_str();
-            // Titles are read one by one; bound the page rather than drain it.
-            let mut budget = 300usize;
-            let mut titles: std::collections::HashMap<String, Option<ItemCard>> =
+            let collection_rows: Vec<Value> = self
+                .list_all("/collections", 5)
+                .await?
+                .into_iter()
+                .filter(|v| mine(&v))
+                .collect();
+            let playlist_rows: Vec<Value> = self
+                .list_all("/playlists", 5)
+                .await?
+                .into_iter()
+                .filter(|v| mine(&v))
+                .collect();
+            // Playlist entries name timelines: one read per distinct timeline,
+            // bounded. Past the bound an entry stays listed and removable
+            // with its title not loaded, rather than failing the page.
+            let mut timeline_items: std::collections::HashMap<String, Option<String>> =
                 Default::default();
+            let mut timeline_reads = ORGANIZE_TIMELINE_READS;
+            for p in &playlist_rows {
+                for e in p["entries"].as_array().ok_or(UiError::Unavailable)? {
+                    let timeline = text(e, "timeline_id");
+                    if timeline_items.contains_key(&timeline) || timeline_reads == 0 {
+                        continue;
+                    }
+                    timeline_reads -= 1;
+                    // Playlists hide entries by title visibility; the timeline
+                    // read also requires its edition. An entry readable only in
+                    // part stays listed (removable) without disclosing a title.
+                    let owner = match self
+                        .read(&format!("/catalog/timelines/{}", segment(&timeline)))
+                        .await
+                    {
+                        Ok(t) => Some(text(&t, "item_id")),
+                        Err(UiError::NotFound) => None,
+                        Err(e) => return Err(e),
+                    };
+                    timeline_items.insert(timeline, owner);
+                }
+            }
+            // Every title the page shows, read in batches. A smart collection's
+            // members follow its filter and are not listed or edited here.
+            let mut wanted: Vec<String> = Vec::new();
+            for c in collection_rows.iter().filter(|c| c["kind"] != "smart") {
+                wanted.extend(strings(&c["item_ids"]));
+            }
+            wanted.extend(timeline_items.values().flatten().cloned());
+            let titles = self.cards(&wanted).await?;
             let mut collections = Vec::new();
-            for c in self.list_all("/collections", 5).await?.iter().filter(mine) {
-                // A smart collection's members follow its filter and are not
-                // listed or edited here, so they spend none of the read budget.
+            for c in &collection_rows {
                 let ids = if c["kind"] == "smart" {
                     Vec::new()
                 } else {
@@ -1196,19 +1291,7 @@ impl UiQueryFacade for Queries {
                 let mut items = Vec::new();
                 let mut remove_bodies = Vec::new();
                 for item_id in &ids {
-                    if !titles.contains_key(item_id) {
-                        budget = budget.checked_sub(1).ok_or(UiError::Unavailable)?;
-                        let card = match self
-                            .read(&format!("/catalog/items/{}", segment(item_id)))
-                            .await
-                        {
-                            Ok(v) => Some(item(&v)),
-                            Err(UiError::NotFound) => None,
-                            Err(e) => return Err(e),
-                        };
-                        titles.insert(item_id.clone(), card);
-                    }
-                    if let Some(card) = titles[item_id].clone() {
+                    if let Some(Some(card)) = titles.get(item_id).cloned() {
                         let rest: Vec<&String> = ids.iter().filter(|i| *i != item_id).collect();
                         remove_bodies.push(
                             serde_json::json!({
@@ -1229,36 +1312,22 @@ impl UiQueryFacade for Queries {
                     remove_bodies,
                 });
             }
-            let mut timeline_titles: std::collections::HashMap<String, String> = Default::default();
             let mut playlists = Vec::new();
-            for p in self.list_all("/playlists", 5).await?.iter().filter(mine) {
+            for p in &playlist_rows {
                 let entries = p["entries"].as_array().ok_or(UiError::Unavailable)?.clone();
                 let mut views = Vec::new();
                 let mut bodies = Vec::new();
                 for (n, e) in entries.iter().enumerate() {
                     let timeline = text(e, "timeline_id");
-                    if !timeline_titles.contains_key(&timeline) {
-                        budget = budget.checked_sub(2).ok_or(UiError::Unavailable)?;
-                        // Playlists hide entries by title visibility; the timeline
-                        // read also requires its edition. An entry readable only in
-                        // part stays listed (removable) without disclosing a title.
-                        let title = match self
-                            .read(&format!("/catalog/timelines/{}", segment(&timeline)))
-                            .await
-                        {
-                            Ok(t) => match self
-                                .read(&format!("/catalog/items/{}", segment(&text(&t, "item_id"))))
-                                .await
-                            {
-                                Ok(w) => text(&w, "title"),
-                                Err(UiError::NotFound) => "Unavailable title".into(),
-                                Err(e) => return Err(e),
-                            },
-                            Err(UiError::NotFound) => "Unavailable title".into(),
-                            Err(e) => return Err(e),
-                        };
-                        timeline_titles.insert(timeline.clone(), title);
-                    }
+                    let title = match timeline_items.get(&timeline) {
+                        None => "Title not loaded".into(),
+                        Some(None) => "Unavailable title".into(),
+                        Some(Some(item)) => match titles.get(item) {
+                            Some(Some(card)) => card.title.clone(),
+                            Some(None) => "Unavailable title".into(),
+                            None => "Title not loaded".into(),
+                        },
+                    };
                     let body = |entries: Vec<&Value>| {
                         serde_json::json!({"name": p["name"], "profile_id": p["profile_id"], "entries": entries})
                             .to_string()
@@ -1277,7 +1346,7 @@ impl UiQueryFacade for Queries {
                     bodies.push((remove, up));
                     views.push(PlaylistEntryView {
                         entry_id: text(e, "entry_id"),
-                        title: timeline_titles[&timeline].clone(),
+                        title,
                         timeline_id: timeline,
                     });
                 }

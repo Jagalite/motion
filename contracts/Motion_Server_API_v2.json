@@ -2862,6 +2862,28 @@
           },
           {
             "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "description": "`id` (default) pages by scan ID. `recent` pages newest first by capture time, then ID; its cursors stay stable while new scans are admitted, which appear only on a fresh first page.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "id",
+                "recent"
+              ]
+            }
+          },
+          {
+            "name": "library_id",
+            "in": "query",
+            "required": false,
+            "description": "Only scans of this library. Narrows the authorized rows; an unknown or unreadable library yields an empty page.",
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
           }
         ]
       }
@@ -3137,6 +3159,16 @@
             "schema": {
               "type": "string",
               "maxLength": 200
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "required": false,
+            "description": "A batched read of 1-100 distinct comma-separated live item IDs. Authorization applies as for any page; merged aliases and unknown or unreadable IDs match nothing.",
+            "schema": {
+              "type": "string",
+              "maxLength": 12900
             }
           },
           {
@@ -7886,6 +7918,15 @@
           },
           {
             "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "timeline_id",
+            "in": "query",
+            "required": false,
+            "description": "Only renditions prepared for this timeline. Narrows the authorized rows; an unknown or unreadable timeline yields an empty page.",
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            }
           }
         ]
       }

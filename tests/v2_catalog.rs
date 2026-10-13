@@ -2338,3 +2338,225 @@ async fn file_inventory_filters_scope_before_pagination() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Settled scan history beyond the old 1,000-row page bound, plus one still
+/// pending request, inserted directly; `minute` orders them.
+async fn scan_history(f: &Fixture, library: &str, prefix: &str, settled: usize) {
+    for n in 0..settled {
+        let id = format!("{prefix}-{n:04}");
+        sqlx::query(
+            "INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES (?,?,0,?)",
+        )
+        .bind(&id)
+        .bind(library)
+        .bind(1_000 + n as i64)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO scan_demands(id,request_id,source_id,barrier,verify,status) VALUES (?,?,?,0,0,'complete')")
+            .bind(format!("{id}-d"))
+            .bind(&id)
+            .bind(library)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn scan_history_pages_newest_first_stably_and_stays_bounded() {
+    let f = Fixture::new().await;
+    let auth = bearer(OPERATOR);
+    scan_history(&f, &f.a, "a", 1_100).await;
+    scan_history(&f, &f.b, "b", 3).await;
+    // The oldest request is still running: it is never pruned.
+    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-running',?,0,1)")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO scan_demands(id,request_id,source_id,barrier,verify,status) VALUES ('a-running-d','a-running',?,0,0,'pending')")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let get = |path: String, auth: String| {
+        let f = &f;
+        async move {
+            f.call("GET", &path, None, &[("authorization", &auth)])
+                .await
+        }
+    };
+
+    // Newest first across pages; a scan admitted mid-read appears only on a
+    // fresh first page and never shifts or repeats a later one.
+    let first = get(
+        format!("/api/v2/scans?order=recent&limit=200&library_id={}", f.a),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(ids(&first)[..2], ["a-1099".to_owned(), "a-1098".to_owned()]);
+    sqlx::query("INSERT INTO scan_requests(id,library_id,require_complete,created_at) VALUES ('a-late',?,0,99999)")
+        .bind(&f.a)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut seen = ids(&first);
+    let mut cursor = first.body["next_cursor"].as_str().map(str::to_owned);
+    while let Some(c) = cursor {
+        let page = get(
+            format!(
+                "/api/v2/scans?order=recent&limit=200&library_id={}&cursor={c}",
+                f.a
+            ),
+            auth.clone(),
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        seen.extend(ids(&page));
+        cursor = page.body["next_cursor"].as_str().map(str::to_owned);
+    }
+    let mut expected: Vec<String> = (0..1_100).rev().map(|n| format!("a-{n:04}")).collect();
+    expected.push("a-running".into());
+    assert_eq!(seen, expected, "every existing scan once, newest first");
+    let fresh = get(
+        format!("/api/v2/scans?order=recent&limit=1&library_id={}", f.a),
+        auth.clone(),
+    )
+    .await;
+    assert_eq!(ids(&fresh), ["a-late"]);
+    sqlx::query("DELETE FROM scan_requests WHERE id='a-late'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    // The library filter and the caller's scope both narrow the rows; a
+    // filter naming a hidden library is an empty page, not an error.
+    let limited = f.device(&["catalog:read", "sources:manage"], &[&f.b]).await;
+    let mine = get("/api/v2/scans?order=recent".into(), limited.clone()).await;
+    assert_eq!(ids(&mine), ["b-0002", "b-0001", "b-0000"]);
+    let hidden = get(
+        format!("/api/v2/scans?order=recent&library_id={}", f.a),
+        limited,
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::OK);
+    assert!(ids(&hidden).is_empty());
+    problem(
+        &get(
+            "/api/v2/scans?order=recent&cursor=not-a-cursor".into(),
+            auth.clone(),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_cursor",
+    );
+
+    // Admitting a scan bounds the library's settled history; the running
+    // request and the other library's history are kept.
+    let admitted = f
+        .call(
+            "POST",
+            &format!("/api/v2/libraries/{}/scans", f.a),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "scan-retention-00001"),
+            ],
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::ACCEPTED, "{}", admitted.body);
+    let count = |sql: &'static str| {
+        let f = &f;
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(&f.a)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE library_id=? AND (id LIKE 'a-0%' OR id LIKE 'a-1%')").await,
+        playscale_core::demands::RETAINED_SCANS_PER_LIBRARY as i64
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE library_id=? AND id='a-running'").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_demands WHERE request_id='a-0000' AND ?<>''").await,
+        0,
+        "demands cascade"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id LIKE 'b-%' AND ?<>''").await,
+        3
+    );
+    // The newest settled requests are the ones kept.
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id='a-1099' AND ?<>''").await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM scan_requests WHERE id='a-0899' AND ?<>''").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn batched_item_reads_apply_the_catalog_scope_and_skip_aliases() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    sqlx::query("INSERT INTO catalog_receipts VALUES ('rc','catalog:merge',0,'{}')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO item_aliases VALUES ('manual','film-a','rc')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let get = |path: &'static str, auth: String| {
+        let f = &f;
+        async move { f.call("GET", path, None, &[("authorization", &auth)]).await }
+    };
+    let operator = bearer(OPERATOR);
+    let all = get(
+        "/api/v2/catalog/items?ids=both,film-b,film-a,manual,missing",
+        operator.clone(),
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    // Title order, live items only: the alias and the unknown ID match nothing.
+    assert_eq!(ids(&all), ["film-a", "film-b", "both"]);
+    // A restricted reader sees only what it could browse; a hidden title is
+    // indistinguishable from an unknown one.
+    let limited = f.device(&["catalog:read"], &[&f.a]).await;
+    let mine = get(
+        "/api/v2/catalog/items?ids=both,film-b,film-a",
+        limited.clone(),
+    )
+    .await;
+    assert_eq!(ids(&mine), ["film-a", "both"]);
+    let hidden = get("/api/v2/catalog/items?ids=film-b", limited).await;
+    assert_eq!(hidden.status, StatusCode::OK);
+    assert!(ids(&hidden).is_empty());
+    for bad in [
+        "/api/v2/catalog/items?ids=film-a,film-a",
+        "/api/v2/catalog/items?ids=",
+        "/api/v2/catalog/items?ids=no%20spaces",
+    ] {
+        problem(
+            &get(bad, operator.clone()).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        );
+    }
+    let many: Vec<String> = (0..101).map(|n| format!("i{n}")).collect();
+    let path = format!("/api/v2/catalog/items?ids={}", many.join(","));
+    let reply = f
+        .call("GET", &path, None, &[("authorization", &operator)])
+        .await;
+    problem(&reply, StatusCode::BAD_REQUEST, "invalid_query");
+}

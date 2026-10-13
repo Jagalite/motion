@@ -198,3 +198,44 @@ pub fn request_status(statuses: &[DemandStatus]) -> DemandStatus {
         Complete
     }
 }
+
+/// Settled scan requests kept per library. History beyond this is pruned
+/// when a new request is admitted; pending requests are always kept.
+pub const RETAINED_SCANS_PER_LIBRARY: usize = 200;
+
+/// Which of a library's scan requests to prune. `newest_first` lists every
+/// request of one library, newest first, with its per-source demand
+/// statuses. A request still pending (by [`request_status`]) is never pruned
+/// and does not count toward `keep`; of the settled ones, the newest `keep`
+/// stay.
+pub fn prunable_requests<I: Clone>(newest_first: &[(I, Vec<DemandStatus>)], keep: usize) -> Vec<I> {
+    newest_first
+        .iter()
+        .filter(|(_, statuses)| request_status(statuses) != DemandStatus::Pending)
+        .skip(keep)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{DemandStatus::*, prunable_requests};
+
+    #[test]
+    fn pending_requests_are_kept_and_settled_history_is_bounded() {
+        let requests = vec![
+            ("new", vec![Complete]),
+            ("running", vec![Pending, Complete]),
+            ("older", vec![Failed]),
+            ("empty", vec![]),
+            ("oldest", vec![Cancelled]),
+            ("ancient", vec![Partial]),
+        ];
+        assert_eq!(prunable_requests(&requests, 2), vec!["oldest", "ancient"]);
+        assert_eq!(
+            prunable_requests(&requests, 0),
+            vec!["new", "older", "oldest", "ancient"]
+        );
+        assert!(prunable_requests(&requests, 10).is_empty());
+    }
+}

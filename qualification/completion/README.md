@@ -24,7 +24,7 @@ item below is the single completion agent unless stated otherwise.
 |---|---|---|---|
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
-| 2 Library query scaling | Not started | — | Scan history ordering |
+| 2 Library query scaling | Implemented, tested | library-queries PR | Sol review |
 | 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
 | 4 Library-management UI | Not started | — | After item 2 |
 | 5 Offline breadth | Not started | — | After item 1 |
@@ -123,9 +123,57 @@ item below is the single completion agent unless stated otherwise.
 
 ## 2. Library scalability and query support
 
-Not started. Inputs: N1 ledger section 2 "Lists are bounded"
-([m3-workflows.md](../next-lanes/m3-workflows.md)). The broader 10,000-item /
-100,000-file performance qualification is a release item (section 8).
+- **Source SHA:** branch `plan-completion/library-queries`, stacked on item 1
+  (migration order 0045 → 0046, shared ledger).
+- **Implemented:**
+  - **Scan history.** `listScans` gains `order=recent` (newest first by
+    capture time, then ID, with an opaque keyset cursor) and `library_id`.
+    Authorization and the filter apply before ordering and the limit. A scan
+    admitted mid-read sorts before every cursor, so it never shifts or
+    repeats a later page. Retention: admitting a scan prunes the library's
+    settled history beyond the newest 200 in the same transaction. The policy
+    is core `demands::prunable_requests`, which never prunes a pending request
+    (by `request_status`) or counts it. Demands cascade; jobs are untouched.
+    Indexes in migration 0046.
+  - **Renditions.** `listRenditions` gains `timeline_id`, applied before the
+    page limit; an unknown or unreadable timeline is an empty page. Index
+    `preparations(timeline_id, job_id)`.
+  - **Organization.** `listCatalogItems` gains `ids` (1-100 distinct live IDs),
+    a batched read under the normal scope; aliases and hidden or unknown IDs
+    match nothing, so a hidden title looks like an unknown one.
+  - **Facade.** `/sources` reads one page of 20 newest scans, and the manage
+    page reads each timeline's renditions through the filter. `/organize`
+    reads titles 100 at a time. Up to 100 unresolved IDs (aliases, hidden)
+    get individual reads, and up to 500 distinct playlist timelines are read.
+    Past those bounds, entries stay listed and removable as "Title not
+    loaded" (collection members are left out) instead of the whole page
+    becoming unavailable.
+- **Unsupported / limits:** a collection with more than 100 merged-alias or
+  hidden members leaves the excess unresolved. Playlists with more than 500
+  distinct timelines show the rest untitled. An idempotent replay of a pruned
+  scan's `createScan` returns its stored body, whose ID now reads as 404.
+  The 10,000-item / 100,000-file performance qualification is a release item.
+- **Core/adapter boundary:** which scans survive is a core policy
+  (`prunable_requests`); the adapter reads statuses, deletes in the admission
+  transaction and orders and filters in SQL. The query filters are reads, not
+  state transitions, so no Stateless model was added; real SQLite tests cover
+  them.
+- **Focused evidence (2026-10-12, Kyoto compile `68473507`, `2cb3937a`,
+  `d3feca78`; direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `playscale-core` lib (adds `prunable_requests`) | 142 passed |
+  | `playscale` lib | 64 passed |
+  | `tests/v2_catalog.rs` | 19 passed. New: 1,100 settled scans plus a running one paged newest first across six pages with an insert mid-read (every row exactly once); fresh first page shows the new scan; restricted and hidden-library filters; bad cursor; admission prunes to 200 settled, keeps the running request and other libraries, cascades demands. Batched `ids`: scope, aliases, hidden, validation, 101 IDs refused |
+  | `tests/v2_metadata_processing.rs` | 18 passed. New: 250 renditions of another timeline; the filtered page holds exactly this timeline's rendition with no next cursor; unknown timeline empty; invalid ID 400 |
+  | `tests/access_api.rs` | 39 passed. New: `/organize` with a 450-title collection and a 520-timeline playlist renders every member and 20 "Title not loaded" entries (the old page failed past about 300) |
+  | `tests/m3_workflows.rs` (real scan, ffmpeg, processing worker) | 1 passed |
+  | Pinned clippy 1.98, CI flags, `-p playscale-core -p playscale --all-targets` | clean (Kyoto `a3a08b28`) |
+  | `fmt`, contract checks | pass |
+- **Review:** pending (GPT-6.1 Sol).
+- **Release checks:** frozen 10,000-item / 100,000-file browse and organize
+  timings (handoff section 8).
 
 ## 3. Production playback and preparation
 

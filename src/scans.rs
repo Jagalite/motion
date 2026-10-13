@@ -251,7 +251,37 @@ pub(crate) async fn request_in(
         sqlx::query("INSERT INTO scan_demands (id,request_id,source_id,barrier,verify,status) VALUES (?,?,?,?,?,'pending')")
             .bind(&demand_id).bind(&id).bind(&source).bind(barrier).bind(verify).execute(&mut *tx).await?;
     }
+    prune_history(tx, library).await?;
     get_in(tx, &id).await
+}
+
+/// Bound a library's scan history in the admitting transaction: the policy
+/// (`core::prunable_requests`) keeps every pending request and the newest
+/// settled ones. Demands cascade with their request; jobs are not touched.
+async fn prune_history(tx: &mut SqliteConnection, library: &str) -> Result<(), ScanError> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT r.id,(SELECT json_group_array(d.status) FROM scan_demands d WHERE d.request_id=r.id) FROM scan_requests r WHERE r.library_id=? ORDER BY r.created_at DESC,r.id DESC",
+    )
+    .bind(library)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut requests = Vec::with_capacity(rows.len());
+    for (id, statuses) in rows {
+        let names: Vec<String> = serde_json::from_str(statuses.as_deref().unwrap_or("[]"))
+            .map_err(anyhow::Error::from)?;
+        let statuses = names
+            .iter()
+            .map(|n| status_value(n))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        requests.push((id, statuses));
+    }
+    for id in core::prunable_requests(&requests, core::RETAINED_SCANS_PER_LIBRARY) {
+        sqlx::query("DELETE FROM scan_requests WHERE id=?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// A filesystem change hint: later demands require a newer traversal.

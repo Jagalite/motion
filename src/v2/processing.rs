@@ -468,12 +468,36 @@ async fn prepare(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenditionQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+    /// Only this timeline's renditions. A filter narrows the authorized rows;
+    /// an unreadable or unknown timeline yields an empty page, never an error.
+    timeline_id: Option<String>,
+}
+
 async fn renditions(
     State(app): State<App>,
     caller: Caller,
-    Query(q): Query<PageQuery>,
+    Query(query): Query<RenditionQuery>,
 ) -> Result<Json<super::Page<Value>>, Problem> {
     caller.require(Permission::ProcessingRequest)?;
+    if query
+        .timeline_id
+        .as_deref()
+        .is_some_and(|id| !super::catalog::valid_id(id))
+    {
+        return Err(Problem::bad(
+            "invalid_query",
+            "timeline_id must be a valid ID",
+        ));
+    }
+    let q = PageQuery {
+        cursor: query.cursor,
+        limit: query.limit,
+    };
     let mut tx = app.db.begin().await?;
     let limit = q.limit()?;
     let (clause, all, ids) =
@@ -493,7 +517,7 @@ async fn renditions(
         bool,
         bool,
     );
-    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
+    let rows:Vec<Row>=sqlx::query_as(&format!("SELECT j.id,p.timeline_id,j.source_file_id,j.source_revision,p.recipe_digest,j.phase,p.revision,j.expired,j.output_file_id,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.id>? AND (? IS NULL OR p.timeline_id=?) AND {clause} ORDER BY j.id LIMIT ?")).bind(q.after()?).bind(&query.timeline_id).bind(&query.timeline_id).bind(all).bind(ids).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
     let mut values = Vec::new();
     for (
         id,

@@ -1547,6 +1547,54 @@ async fn preparation_admission_pins_identity_and_replays_once() {
         .await;
     assert_eq!(list.status, StatusCode::OK, "{}", list.body);
     assert_eq!(list.body["items"][0]["status"], "pending");
+    // Many renditions of another timeline: the timeline filter applies
+    // before the page limit, so one timeline's rows stay one short read.
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<250) INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id) SELECT printf('0bulk-%04d',i),source_file_id,source_revision,recipe,backend,printf('v2-bulk-%04d',i),'completed',created_at,updated_at,requester_id FROM processing_jobs, n WHERE processing_jobs.id=?")
+        .bind(first.body["id"].as_str().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json) SELECT j.id,'ed-film-b',p.recipe_digest,p.tracks_json FROM processing_jobs j, preparations p WHERE j.id LIKE '0bulk-%'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let get = |path: &'static str| {
+        let f = &f;
+        let op = op.clone();
+        async move { f.call("GET", path, None, &[("authorization", &op)]).await }
+    };
+    let mine = get("/api/v2/processing/renditions?timeline_id=ed-film-a&limit=1").await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+    assert_eq!(mine.body["items"][0]["id"], first.body["id"]);
+    assert!(mine.body["next_cursor"].is_null());
+    let other = get("/api/v2/processing/renditions?timeline_id=ed-film-b&limit=200").await;
+    assert_eq!(other.body["items"].as_array().unwrap().len(), 200);
+    assert!(
+        other.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["timeline_id"] == "ed-film-b")
+    );
+    assert!(other.body["next_cursor"].is_string());
+    assert!(
+        get("/api/v2/processing/renditions?timeline_id=unknown")
+            .await
+            .body["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        get("/api/v2/processing/renditions?timeline_id=no%20spaces")
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+    sqlx::query("DELETE FROM preparations WHERE job_id LIKE '0bulk-%'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     let mut wrong = input.clone();
     wrong["timeline_id"] = json!("ed-film-b");
     assert_eq!(

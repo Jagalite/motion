@@ -3349,3 +3349,86 @@ async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn topcoat_organize_reads_titles_in_batches_beyond_the_old_bound() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let app = api::router_with(
+        f.app.clone(),
+        None,
+        Some(playscale::presentation::router(f.app.clone())),
+    );
+    // 520 titles, each with one timeline; the old page read titles one by
+    // one and became unavailable past about 300.
+    for n in 0..520 {
+        let id = format!("org-{n:03}");
+        for sql in [
+            "INSERT INTO items(id,title,kind) VALUES (?1,'Title '||?1,'video')",
+            "INSERT INTO item_origins(item_id,title) VALUES (?1,'Title '||?1)",
+            "INSERT INTO editions(id,item_id,label) VALUES (?1||'-ed',?1,'Original')",
+            "INSERT INTO timelines(id,edition_id) VALUES (?1||'-ed',?1||'-ed')",
+        ] {
+            sqlx::query(sql).bind(&id).execute(&f.app.db).await.unwrap();
+        }
+    }
+    let operator = bearer(OPERATOR);
+    let ids: Vec<String> = (0..450).map(|n| format!("org-{n:03}")).collect();
+    let entries: Vec<Value> = (0..520)
+        .map(|n| json!({"entry_id":format!("e{n:03}"),"timeline_id":format!("org-{n:03}-ed")}))
+        .collect();
+    for (path, body, key) in [
+        (
+            "/api/v2/collections",
+            json!({"name":"Everything","profile_id":"default","kind":"manual","item_ids":ids,"filter_id":null}),
+            "organize-collection-0001",
+        ),
+        (
+            "/api/v2/playlists",
+            json!({"name":"Marathon","profile_id":"default","entries":entries}),
+            "organize-playlist-000001",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(f.request(
+                "POST",
+                path,
+                Some(&body),
+                &[("authorization", &operator), ("idempotency-key", key)],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{path}: {}",
+            response.status()
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(f.request("GET", "/organize", None, &[("authorization", &operator)]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    // Every collection member is shown.
+    for n in [0, 299, 300, 449] {
+        assert!(
+            html.contains(&format!("href=\"/item/org-{n:03}\"")),
+            "member {n}"
+        );
+    }
+    // Playlist entries within the timeline-read bound have titles; the rest
+    // stay listed and removable with their titles not loaded.
+    assert!(html.contains("Title org-499"));
+    assert_eq!(html.matches("Title not loaded").count(), 20);
+}

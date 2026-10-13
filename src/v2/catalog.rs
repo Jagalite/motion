@@ -98,7 +98,7 @@ fn replayed(stored: Stored) -> Response {
     response
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -254,7 +254,7 @@ fn curation_problem(e: crate::curation::CurationError) -> Problem {
 // URL-safe base64 without padding, for opaque cursors and plan tokens.
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64_encode(bytes: &[u8]) -> String {
+pub(super) fn b64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 4 / 3 + 3);
     for chunk in bytes.chunks(3) {
         let b = [
@@ -270,7 +270,7 @@ fn b64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn b64_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn b64_decode(text: &str) -> Option<Vec<u8>> {
     let values = text
         .bytes()
         .map(|c| B64.iter().position(|&b| b == c).map(|p| p as u32))
@@ -572,6 +572,9 @@ pub struct ItemQuery {
     parent_id: Option<String>,
     q: Option<String>,
     sort: Option<Sort>,
+    /// Comma-separated live item IDs (at most 100): a batched read. Merged
+    /// aliases and unreadable or unknown IDs match nothing.
+    ids: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -589,6 +592,26 @@ struct Filter {
     kind: Option<MediaKind>,
     parent_id: Option<String>,
     q: Option<String>,
+    /// A JSON array of item IDs, when filtering by identity.
+    ids: Option<String>,
+}
+
+/// The `ids` query: 1-100 distinct valid IDs, as a JSON array for `json_each`.
+fn id_list(ids: &Option<String>) -> Result<Option<String>, Problem> {
+    let Some(ids) = ids else { return Ok(None) };
+    let list: Vec<String> = ids.split(',').map(str::to_owned).collect();
+    if list.len() > 100
+        || list.iter().any(|id| !valid_id(id))
+        || list.iter().collect::<std::collections::BTreeSet<_>>().len() != list.len()
+    {
+        return Err(Problem::bad(
+            "invalid_query",
+            "ids must list 1-100 distinct valid IDs",
+        ));
+    }
+    Ok(Some(
+        serde_json::to_string(&list).map_err(Problem::internal)?,
+    ))
 }
 
 fn query_id(field: &str, id: &Option<String>) -> Result<(), Problem> {
@@ -662,6 +685,7 @@ async fn browse(
          AND ? AND (? IS NULL OR coalesce(s.media_type,'unclassified')=?) AND (? IS NULL OR i.kind=?)
          AND (? IS NULL OR s.parent_id=?)
          AND (? IS NULL OR instr(lower(i.title),lower(?))>0)
+         AND (? IS NULL OR i.id IN (SELECT value FROM json_each(?)))
          AND (? OR i.title>? OR (i.title=? AND i.id>?))
          ORDER BY i.title,i.id LIMIT ?"
     );
@@ -684,6 +708,8 @@ async fn browse(
         .bind(&filter.parent_id)
         .bind(&filter.q)
         .bind(&filter.q)
+        .bind(&filter.ids)
+        .bind(&filter.ids)
         .bind(after.is_none())
         .bind(&after_title)
         .bind(&after_title)
@@ -718,6 +744,7 @@ pub async fn list_items(
         kind: q.kind,
         parent_id: q.parent_id,
         q: q.q,
+        ids: id_list(&q.ids)?,
     };
     let page = PageQuery {
         cursor: q.cursor,
