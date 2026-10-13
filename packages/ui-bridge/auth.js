@@ -207,7 +207,7 @@ async function mutation(parent, method, path, body, options = {}) {
   catch (error) {
     if (error.code === 'recent_auth_required' && options.action) {
       await proofFlow(parent, options.action, options.target ?? 'new', perform);
-    } else if ([409, 412, 428].includes(error.status)) {
+    } else if ([409, 412, 428].includes(error.status) && !['last_administrator', 'last_signin_method'].includes(error.code)) {
       const stale = panel(parent, 'Review the latest state', 'This change was not applied. Refresh to see current authority and revisions before submitting again.');
       button('Refresh and review', () => location.reload(), stale);
     }

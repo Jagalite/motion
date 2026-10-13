@@ -45,6 +45,19 @@ test('last administrator protection explains recovery rather than suggesting sta
   assert.match(client.errorMessage({status: 412, code: 'revision_conflict'}), /Refresh this section/);
 });
 
+test('recovery safeguards do not offer stale-state retries', async () => {
+  for (const code of ['last_administrator', 'last_signin_method']) {
+    let calls = 0;
+    const client = harness(async () => { calls++; return response(409, {code}); });
+    const parent = new Element('div');
+    await assert.rejects(client.mutation(parent, 'DELETE', '/auth/identities/i1', undefined, {revision: '1'}));
+    assert.equal(calls, 1);
+    assert.equal(parent.byText('Review the latest state'), undefined);
+    assert.equal(parent.byText('Refresh and review'), undefined);
+    assert.equal(client.pending.size, 0);
+  }
+});
+
 test('writes use same-origin credentials, CSRF, explicit revision/proof and reject redirects', async () => {
   const calls = [];
   const client = harness(async (path, options) => { calls.push({path, options}); return response(200, {ok: true}); });
@@ -142,6 +155,7 @@ test('revision conflicts never silently replay and invalidate the old retry key'
   assert.equal(calls.length, 2);
   assert.notEqual(calls[0].headers['Idempotency-Key'], calls[1].headers['Idempotency-Key']);
   assert.equal(client.pending.size, 0);
+  assert.ok(parent.byText('Refresh and review'));
 });
 
 test('fresh approval requires explicit request, check, and reviewed resubmission', async () => {
