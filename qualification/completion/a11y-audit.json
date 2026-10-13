@@ -271,5 +271,7 @@
     "A screen reader pass (VoiceOver/NVDA)",
     "Interactive states beyond the first Tab stop are covered by unit tests (focus after a command), not by this audit",
     "Offline subtitles attribute (device stack, not in this branch)"
-  ]
+  ],
+  "qualification_status": "historical_inconclusive",
+  "provenance_correction": "Recorded commit is parent of tested contrast changes; exact tested tree was not captured. Library first Tab result is inconclusive. Fresh committed-artifact audit required."
 }

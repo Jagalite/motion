@@ -52,6 +52,37 @@ pub fn layout(duration_ms: u64, width: u32, height: u32) -> Option<Layout> {
     })
 }
 
+/// Facts observed atomically by every preview admission adapter.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionFacts {
+    pub source_current: bool,
+    pub requester_authorized: bool,
+    pub layout_valid: bool,
+    pub equivalent_work: bool,
+    pub active_jobs: u64,
+    pub capacity: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Enqueue,
+    Existing,
+    Invalid,
+    Full,
+}
+impl AdmissionFacts {
+    pub fn decide(self) -> Admission {
+        if !self.source_current || !self.requester_authorized || !self.layout_valid {
+            Admission::Invalid
+        } else if self.equivalent_work {
+            Admission::Existing
+        } else if self.active_jobs >= self.capacity {
+            Admission::Full
+        } else {
+            Admission::Enqueue
+        }
+    }
+}
+
 /// A rendered sheet as observed: its decoded size and its bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sheet {
@@ -132,6 +163,38 @@ pub fn tile_at(layout: &Layout, position_ms: u64) -> Option<(u32, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_checks_authority_and_identity_before_deduplication_and_capacity() {
+        for current in [false, true] {
+            for authorized in [false, true] {
+                for valid in [false, true] {
+                    for existing in [false, true] {
+                        for active in [0, 99, 100, 101] {
+                            let facts = AdmissionFacts {
+                                source_current: current,
+                                requester_authorized: authorized,
+                                layout_valid: valid,
+                                equivalent_work: existing,
+                                active_jobs: active,
+                                capacity: 100,
+                            };
+                            let expected = if !current || !authorized || !valid {
+                                Admission::Invalid
+                            } else if existing {
+                                Admission::Existing
+                            } else if active >= 100 {
+                                Admission::Full
+                            } else {
+                                Admission::Enqueue
+                            };
+                            assert_eq!(facts.decide(), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn layouts_bound_tiles_and_follow_the_picture_shape() {

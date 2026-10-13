@@ -578,3 +578,14 @@ test('next-title navigation retains the selected profile after teardown', async 
   assert.deepEqual(requests, ['/api/v2/profiles/guest-profile/timelines/episode-1/next']);
   assert.deepEqual(navigated, ['/play/episode-2?play=1&profile=guest-profile']);
 });
+
+test('authored previews require the exact playing file and revision', () => {
+  const {matchingPreviewSource} = runInNewContext(source.replace('export {close, maintainLease};', '({matchingPreviewSource});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  const manifest = {file_id: 'cut-a', file_revision: 'r1'};
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r1'}), true);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-b', file_revision: 'r1'}), false);
+  assert.equal(matchingPreviewSource(manifest, {file_id: 'cut-a', file_revision: 'r2'}), false);
+  assert.equal(matchingPreviewSource(manifest, null), false);
+});

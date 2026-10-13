@@ -378,18 +378,6 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                 files.truncate(200);
                 let mut last = files.last().map(|f| f.0.clone());
                 for (n, (file, revision, seconds, tracks)) in files.iter().enumerate() {
-                    let active: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM preview_jobs WHERE phase IN ('queued','running','cancelling')",
-                    )
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if active >= super::previews::MAX_ACTIVE_JOBS {
-                        // The queue is full: continue from here next time.
-                        more = true;
-                        blocked = true;
-                        last = n.checked_sub(1).map(|p| files[p].0.clone());
-                        break;
-                    }
                     if !playscale_core::playback_session::readable(
                         &p,
                         super::content::file_facts(&mut tx, file)
@@ -411,33 +399,36 @@ pub(crate) async fn tick(app: &App) -> anyhow::Result<()> {
                         .and_then(|d| {
                             playscale_core::previews::layout(
                                 d,
-                                video.width.unwrap_or(0),
-                                video.height.unwrap_or(0),
+                                video.display_dimensions().0,
+                                video.display_dimensions().1,
                             )
                         })
                         .is_none()
                     {
                         continue;
                     }
-                    sqlx::query(
-                        "INSERT INTO preview_jobs(id,file_id,file_revision,requester_id,credential_hash,ingress_id,created_at) \
-                         SELECT ?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM preview_jobs WHERE file_id=? AND file_revision=? \
-                         AND phase IN ('queued','running','cancelling')) \
-                         AND NOT EXISTS(SELECT 1 FROM previews WHERE file_id=? AND file_revision=?)",
-                    )
-                    .bind(crate::new_id())
-                    .bind(file)
-                    .bind(revision)
-                    .bind(&p.id)
-                    .bind(&row.credential_hash)
-                    .bind(&row.ingress_id)
-                    .bind(crate::now())
-                    .bind(file)
-                    .bind(revision)
-                    .bind(file)
-                    .bind(revision)
-                    .execute(&mut *tx)
-                    .await?;
+                    let Some(identity) =
+                        super::previews::layout_identity(&mut tx, file, revision).await?
+                    else {
+                        continue;
+                    };
+                    match super::previews::admission(&mut tx, &p, file, revision, &identity, "")
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                    {
+                        playscale_core::previews::Admission::Enqueue => {}
+                        playscale_core::previews::Admission::Existing
+                        | playscale_core::previews::Admission::Invalid => continue,
+                        playscale_core::previews::Admission::Full => {
+                            more = true;
+                            blocked = true;
+                            last = n.checked_sub(1).map(|p| files[p].0.clone());
+                            break;
+                        }
+                    }
+                    sqlx::query("INSERT INTO preview_jobs(id,file_id,file_revision,layout_identity,requester_id,credential_hash,ingress_id,created_at) VALUES (?,?,?,?,?,?,?,?)")
+                        .bind(crate::new_id()).bind(file).bind(revision).bind(identity).bind(&p.id)
+                        .bind(&row.credential_hash).bind(&row.ingress_id).bind(crate::now()).execute(&mut *tx).await?;
                 }
                 match (more, last) {
                     (true, Some(last)) => {

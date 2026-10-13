@@ -382,6 +382,13 @@ test('after a command reloads the page, focus returns to the same action, never 
   runInNewContext(source, context());
   assert.deepEqual(focused.at(-1), 'POST /api/v2/catalog/order-groups/g1/placements g1');
   assert.equal(forms[0].status.textContent, 'Done.');
+  // A failed facade render already focused its error panel: retain it.
+  before.reloadAfter(forms[0]);
+  const errorContext = context();
+  errorContext.document.activeElement = {matches: selector => selector === 'main [role="alert"]'};
+  const errorFocusCount = focused.length;
+  runInNewContext(source, errorContext);
+  assert.equal(focused.length, errorFocusCount);
   // Another page: nothing is moved.
   const count = focused.length;
   before.reloadAfter(forms[0]);

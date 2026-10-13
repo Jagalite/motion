@@ -509,6 +509,17 @@ pub(crate) async fn inspect(
         .into_iter()
         .flatten()
         .map(|s| Track {
+            rotation_degrees: s["side_data_list"]
+                .as_array()
+                .and_then(|items| items.iter().find_map(|item| item["rotation"].as_f64()))
+                .or_else(|| {
+                    s["tags"]["rotate"]
+                        .as_str()
+                        .and_then(|r| r.parse::<f64>().ok())
+                })
+                .filter(|r| r.is_finite())
+                .map(|r| r.round() as i32)
+                .unwrap_or(0),
             index: s["index"].as_i64().unwrap_or(0),
             kind: s["codec_type"].as_str().unwrap_or("unknown").into(),
             codec: s["codec_name"].as_str().unwrap_or("unknown").into(),
