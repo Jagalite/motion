@@ -68,8 +68,13 @@ async fn downloads(cx: &Cx) -> Result<impl View> {
         <p>"Server: " (scope.server_id.as_str()) " · Profile: " (scope.profile_id.as_str())</p>
         if downloads.is_empty() { <p class="status-panel">"No verified downloads are available for this profile."</p> }
         <ul class="grid" aria-label="Downloads">
-        for item in downloads { <li class="card"><a href=(format!("/download/{}",item.identity.download_id))><span class="card-title">(item.title)</span><span class="card-meta">"Saved on this device"</span></a></li> }
+        for item in downloads {
+            <li class="card"><a href=(format!("/download/{}",item.identity.download_id))><span class="card-title">(item.title.as_str())</span><span class="card-meta">"Saved on this device"</span></a>
+                <button type="button" class="card-action" data-remove-download=(item.identity.download_id.as_str())>"Remove from this device"</button></li>
+        }
         </ul>
+        <p id="offline-removal" role="status"></p>
+        <p class="muted small">"Removing a title frees its space on this device only. Progress saved here is kept and sent to your server later, and the download is removed from your server's list when this device next connects."</p>
     })
 }
 

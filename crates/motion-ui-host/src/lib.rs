@@ -198,8 +198,12 @@ pub struct Cache {
     /// Where playback snapshots are created: the cache's own volume, whose
     /// free space the download admission reserved for them.
     path: std::path::PathBuf,
-    _lock: std::fs::File,
-    manifest: CacheManifest,
+    /// The root's exclusive lock, held for the host's lifetime; removals run
+    /// as the writer under it (`Store::open_held`).
+    lock: std::fs::File,
+    scope: CacheScope,
+    /// Replaced only after a removal's durable manifest write.
+    manifest: std::sync::RwLock<CacheManifest>,
     history: Mutex<EventLog>,
 }
 pub(crate) fn bounded(mut file: cap_std::fs::File, limit: u64) -> anyhow::Result<Vec<u8>> {
@@ -258,16 +262,34 @@ impl Cache {
             directory,
             durable,
             path: path.to_owned(),
-            _lock: lock,
-            manifest,
+            lock,
+            scope: manifest.scope.clone(),
+            manifest: std::sync::RwLock::new(manifest),
             history: Mutex::new(history),
         })
     }
-    fn item(&self, id: &str) -> Option<&CachedDownload> {
+    fn item(&self, id: &str) -> Option<CachedDownload> {
         self.manifest
+            .read()
+            .ok()?
             .downloads
             .iter()
             .find(|d| d.identity.download_id == id)
+            .cloned()
+    }
+    /// The person removes a saved title from this device while it is open
+    /// for offline viewing (`Store::remove_by_person` under the lock this
+    /// host holds). Its offline progress is kept; the download agent asks
+    /// the server to delete the download when it next connects.
+    pub fn remove(&self, download_id: &str) -> anyhow::Result<bool> {
+        let mut store =
+            crate::store::Store::open_held(&self.path, &self.scope, self.lock.try_clone()?)?;
+        let removed = store.remove_by_person(download_id)?;
+        *self
+            .manifest
+            .write()
+            .map_err(|_| anyhow::anyhow!("cache manifest failed"))? = store.manifest().clone();
+        Ok(removed)
     }
     fn record(&self, event: OfflineEvent) -> anyhow::Result<serde_json::Value> {
         let item = self
@@ -281,7 +303,7 @@ impl Cache {
             history.base_sequence,
             &history.events,
             &event,
-            &self.manifest.scope,
+            &self.scope,
             &item.identity,
             item.duration_ms,
             MAX_EVENTS,
@@ -302,7 +324,7 @@ impl Cache {
         )
     }
     fn snapshot(&self, id: &str) -> anyhow::Result<(CachedDownload, std::fs::File)> {
-        let item = self.item(id).context("download is unavailable")?.clone();
+        let item = self.item(id).context("download is unavailable")?;
         let mut source = self.directory.open(format!("blobs/{}", item.sha256))?;
         ensure!(
             source.metadata()?.is_file() && source.metadata()?.len() == item.size,
@@ -367,10 +389,15 @@ pub(crate) fn replace_durably(
 
 impl OfflinePresentationReader for Cache {
     fn scope(&self) -> &CacheScope {
-        &self.manifest.scope
+        &self.scope
     }
     fn downloads(&self) -> BoxFuture<'_, UiResult<Vec<CachedDownload>>> {
-        Box::pin(async { Ok(self.manifest.downloads.clone()) })
+        Box::pin(async {
+            self.manifest
+                .read()
+                .map(|m| m.downloads.clone())
+                .map_err(|_| motion_ui::facade::UiError::Unavailable)
+        })
     }
 }
 
@@ -448,6 +475,7 @@ impl Host {
             .route("/cache/open/{id}", post(open_media))
             .route("/cache/media/{ticket}", get(media))
             .route("/cache/events", post(record))
+            .route("/cache/remove/{id}", post(remove))
             .route("/ui/{file}", get(motion_ui::ui_asset))
             .route("/assets/demuxe/{*file}", get(player_asset))
             .fallback_service(
@@ -535,7 +563,7 @@ async fn bootstrap(State(host): State<Host>, Json(input): Json<Bootstrap>) -> Re
                 host.cookie
             ),
         )],
-        Json(json!({"protocol":1,"scope":host.cache.manifest.scope})),
+        Json(json!({"protocol":1,"scope":host.cache.scope})),
     )
         .into_response()
 }
@@ -571,7 +599,7 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
             }
         });
     let ticket = Uuid::new_v4().simple().to_string();
-    let result = json!({"scope":host.cache.manifest.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
+    let result = json!({"scope":host.cache.scope,"media":item.identity,"duration_ms":item.duration_ms,"position_ms":position,
         "next_sequence":history.next_sequence().map(|n|n.to_string()),"media_url":format!("/cache/media/{ticket}")});
     *host.media.lock().unwrap() = Some(Media {
         ticket,
@@ -579,6 +607,30 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
         file: Arc::new(Mutex::new(file)),
     });
     Json(result).into_response()
+}
+/// Remove a saved title from this device. Serialized with opening media,
+/// whose snapshot reads the blob being removed.
+async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let Ok(_single) = host.opening.clone().try_lock_owned() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let cache = host.cache.clone();
+    let download = id.clone();
+    match tokio::task::spawn_blocking(move || cache.remove(&download)).await {
+        Ok(Ok(true)) => {
+            // An open player's ticket no longer names a saved title.
+            let mut media = host.media.lock().unwrap();
+            if media
+                .as_ref()
+                .is_some_and(|m| m.item.identity.download_id == id)
+            {
+                *media = None;
+            }
+            Json(json!({"removed": true})).into_response()
+        }
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::CONFLICT.into_response(),
+    }
 }
 async fn record(State(host): State<Host>, Json(event): Json<OfflineEvent>) -> Response {
     match tokio::task::spawn_blocking(move || host.cache.record(event)).await {

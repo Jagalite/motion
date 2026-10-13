@@ -56,6 +56,14 @@ enum CacheCommand {
         #[arg(long)]
         download_id: String,
     },
+    /// Settle a removal the person made on this device with the server's
+    /// answer to deleting the download: deleted, absent or failed.
+    SettleRemoval {
+        #[arg(long)]
+        download_id: String,
+        #[arg(long)]
+        outcome: String,
+    },
     /// Delete blobs no manifest entry references (crash leftovers whose
     /// demand ended).
     Collect,
@@ -86,7 +94,8 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
         CacheCommand::Status => {
             let events = store.events()?;
             json!({"manifest":store.manifest(),"staged":store.staged()?,"usage":store.usage()?.to_string(),
-                "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string())})
+                "pending_events":events.events.len(),"next_sequence":events.next_sequence().map(|n|n.to_string()),
+                "removals":store.removals()})
         }
         CacheCommand::Admit {
             incoming,
@@ -108,6 +117,13 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             json!({"recovered": store.recover(serde_json::from_str(&input)?)?})
         }
         CacheCommand::Remove { download_id } => json!({"removed": store.remove(&download_id)?}),
+        CacheCommand::SettleRemoval {
+            download_id,
+            outcome,
+        } => {
+            let outcome = serde_json::from_value(serde_json::Value::String(outcome))?;
+            json!({"settled": store.settle_removal(&download_id, outcome)?})
+        }
         CacheCommand::Collect => {
             store.collect()?;
             json!({"collected": true})

@@ -220,9 +220,46 @@ pub fn admit(
     Admission::Append
 }
 
+/// What the server answered when a download the person removed on this
+/// device was deleted there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Deletion {
+    /// The server deleted the download.
+    Deleted,
+    /// The server no longer has it (deleted before, expired, or not visible).
+    Absent,
+    /// No answer, or a refusal: the server may still list it.
+    Failed,
+}
+
+/// A download the person removed from this device stays removed. It is never
+/// published (transferred or recovered) again while its removal is pending,
+/// whatever the server still lists.
+pub fn may_publish(download_id: &str, pending_removals: &[String]) -> bool {
+    !pending_removals.iter().any(|id| id == download_id)
+}
+
+/// A pending removal is settled only once the server confirms the download
+/// itself is gone; until then the device keeps refusing to save it again.
+pub fn settles(outcome: Deletion) -> bool {
+    matches!(outcome, Deletion::Deleted | Deletion::Absent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removed_download_is_never_saved_again_until_the_server_confirms() {
+        let pending = vec!["d1".to_owned()];
+        assert!(!may_publish("d1", &pending));
+        assert!(may_publish("d2", &pending));
+        assert!(may_publish("d1", &[]));
+        assert!(settles(Deletion::Deleted));
+        assert!(settles(Deletion::Absent));
+        assert!(!settles(Deletion::Failed));
+    }
     fn event() -> OfflineEvent {
         OfflineEvent {
             scope: CacheScope {

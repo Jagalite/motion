@@ -80,6 +80,22 @@ document.addEventListener('click', event => {
   event.preventDefault();
   void close().then(() => location.assign(link.href)).catch(() => {});
 });
+// Removing a saved title asks first; the host keeps its offline progress.
+document.addEventListener('click', event => {
+  const button = event.target?.closest?.('[data-remove-download]');
+  if (!button || button.disabled) return;
+  const id = button.dataset.removeDownload;
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return;
+  const title = button.closest('.card')?.querySelector('.card-title')?.textContent ?? 'this title';
+  if (!confirm(`Remove "${title}" from this device? Its saved progress is kept.`)) return;
+  const status = document.getElementById('offline-removal');
+  button.disabled = true;
+  void request(`/cache/remove/${encodeURIComponent(id)}`, {}).then(() => location.reload(), error => {
+    button.disabled = false;
+    if (status) { status.textContent = 'This title could not be removed now. Close any title that is playing and try again.'; status.setAttribute('role', 'alert'); }
+    else fail(error);
+  });
+});
 addEventListener('pagehide', () => { retired = true; unsubscribe?.(); void element?.destroy(); });
 addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 if (host) void start().catch(error => { host.dataset.state = 'failed'; fail(error); });

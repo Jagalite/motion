@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented (review pending); 5C–5F not started | offline-roots and offline-removal PRs | Merge by user; then 5C |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -645,11 +645,61 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Review, round 3:** clean.
 - **Release checks:** the Electron run of the chooser with two real servers.
 
+### 5B. Removing a saved title on the device
+
+- **Source SHA:** branch `plan-completion/offline-removal`, stacked on 3F
+  (`plan-completion/video-profile-ui`).
+- **Implemented:** a person can now remove a saved title from the offline
+  downloads page with "Remove from this device" (it asks first).
+  Previously the offline host could not remove anything.
+  - **Host:** the running host removes the title as the cache writer, under
+    the exclusive lock it already holds (`Store::open_held`, which checks
+    that the handle is this root's `events.lock`). It serializes removal
+    with opening media and invalidates an open player's ticket for that
+    title.
+  - **Progress:** offline progress recorded for the title is kept and
+    synchronized later.
+- **Correctness rule:** a removed title is never saved again behind the
+  person's back. Its removal is a durable intent (`removals.json`), written
+  before the copy goes.
+  - Core `offline::may_publish` refuses publication and crash recovery of
+    that download while the intent is pending.
+  - When online, the download agent deletes the download on the server
+    and settles the intent with the answer. Core `offline::settles`
+    settles on deleted or absent and keeps the intent on failure.
+  - Until settled, the agent skips that download even if the server still
+    lists it.
+- **Core/adapter boundary:**
+  - **Core:** the two decisions above, with the server's answer as an
+    explicit `Deletion` input (deleted, absent, failed).
+  - **Store:** enforces them in the writer's locked, durable transitions,
+    in order: intent, then manifest, then blob release.
+  - **JS agent and host:** perform the HTTP and filesystem effects.
+- **Evidence:**
+  - Core lib: 151 passed. New: `may_publish` and `settles`.
+  - `motion-ui-host` store: 13 passed. New:
+    - a removed title's copy and blob go;
+    - publication and recovery are refused, durably across reopen;
+    - a failed answer keeps the intent and an absent one settles it, after
+      which publication works again;
+    - a staged transfer can be removed;
+    - only this root's held lock admits `open_held`.
+  - `motion-ui-host` cache: 7 passed. New: the offline page offers removal;
+    an unauthenticated removal is refused; removal is idempotent (404 the
+    second time); the page and blob are gone; and an open player's media
+    ticket stops serving.
+  - JS: 88 passed. New: an unreachable server keeps the removal pending
+    and nothing is transferred; a later absent answer settles it.
+  - compose 22 passed.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:** the Electron run of removal in the packaged offline
+  window (5F).
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5B offline removal | A removal action in the offline host that takes the cache lock and calls `Store::remove` | Host lifecycle (lock held by the running host) |
 | 5C restore recovery | When sync answers `viewing_epoch_changed`, offer "re-base on the restored server" or "discard", as an explicit choice applied by the cache tool | Core rule for re-basing retained events onto a new history |
 | 5D transfer state | Contract operation for device-reported progress, owned by the device; never inferred by the server | Contract review |
 | 5E prepared and track-selected downloads | Manifest files for renditions, subtitles and artwork with pins | Item 3D (preparation by component) |

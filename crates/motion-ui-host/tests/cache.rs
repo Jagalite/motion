@@ -419,3 +419,67 @@ async fn publication_stays_with_open_cache_when_its_path_is_replaced() {
     drop(app);
     assert!(Cache::open(&moved).is_ok());
 }
+
+/// The offline page removes a saved title through the host: authenticated
+/// like every cache write, the title leaves the page and the cache, an open
+/// player's ticket stops serving it, and recorded progress is kept.
+#[tokio::test]
+async fn a_saved_title_is_removed_from_the_offline_host() {
+    let (dir, _) = fixture();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(body).unwrap();
+    assert!(
+        page.contains(r#"data-remove-download="download""#),
+        "{page}"
+    );
+    // Without the cache cookie nothing is removed.
+    let (status, _, _) = request(&app, "POST", "/cache/remove/download", "", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!dir.path().join("blobs").read_dir().unwrap().any(|_| true));
+}

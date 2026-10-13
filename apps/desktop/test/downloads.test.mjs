@@ -27,10 +27,12 @@ function fakeCache() {
     const s = state(root);
     switch (args[0]) {
       case 'status': return {manifest: {protocol: 1, scope, downloads: s.downloads}, usage: String(s.downloads.reduce((n, d) => n + (d.size ?? 0), 0)),
-        staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5))};
+        staged: readdirSync(join(root, 'staging')).filter(n => n.endsWith('.part')).map(n => n.slice(0, -5)), removals: s.removals ?? []};
       case 'admit': return {admitted: Number(args[2]) <= 1000};
       case 'publish': {
         const entry = JSON.parse(input);
+        // Mirrors offline::may_publish: a pending removal is never saved again.
+        if ((s.removals ?? []).includes(entry.identity.download_id)) throw new Error('this download was removed on this device');
         const staged = join(root, 'staging', `${entry.identity.download_id}.part`);
         const bytes = readFileSync(staged);
         if (createHash('sha256').update(bytes).digest('hex') !== entry.sha256) throw new Error('transfer checksum mismatch');
@@ -56,6 +58,13 @@ function fakeCache() {
         s.events = s.events.filter(e => Number(e.device_sequence) > through);
         s.base = through;
         return {base_sequence: String(s.base), events: s.events};
+      }
+      case 'settle-removal': {
+        // Mirrors offline::settles: only the server's confirmation settles.
+        const [, id, , outcome] = args.slice(1);
+        if (!['deleted', 'absent'].includes(outcome)) return {settled: false};
+        s.removals = (s.removals ?? []).filter(r => r !== id);
+        return {settled: true};
       }
       case 'rebase': return {rebased: true};
       case 'collect': return {collected: true};
@@ -493,4 +502,42 @@ test('several offline libraries are listed with labels and only saved roots can 
   // A root with nothing saved, or any other name, is not openable.
   assert.throws(() => currentRoot(base, empty.name), /not on this device/);
   assert.throws(() => currentRoot(base, '0'.repeat(32)), /not on this device/);
+});
+
+test('a title removed on this device is deleted on the server and never saved again until settled', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const deletes = [];
+  let answer = 'fail';
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('a removed title is never transferred'),
+    api: async (path, init = {}) => {
+      // Listed until the server no longer has it.
+      if (path.startsWith('/api/v2/downloads?')) return {items: answer === 'fail' ? [{id: 'gone', profile_id: 'default', state: 'ready'}] : [], next_cursor: null};
+      if (path === '/api/v2/downloads/gone' && init.method === 'DELETE') {
+        deletes.push(answer);
+        if (answer === 'fail') throw Object.assign(new Error('offline'), {status: 503, code: 'unavailable'});
+        if (answer === 'absent') throw Object.assign(new Error('not found'), {status: 404, code: 'not_found'});
+        return null;
+      }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).removals = ['gone'];
+  // The server cannot be reached: the removal stays pending and the still
+  // listed download is not saved again.
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, ['gone']);
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  assert.match(statuses.join('\n'), /still listed by the server/);
+  // The server confirms it is gone (here: already absent): settled.
+  answer = 'absent';
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, []);
+  assert.deepEqual(deletes, ['fail', 'absent']);
+  assert.ok(!statuses.some(m => /could not be saved/.test(m)), 'nothing was transferred');
+  assert.deepEqual(fake.calls.filter(c => c[1] === 'settle-removal').map(c => c[2]),
+    [['--download-id', 'gone', '--outcome', 'failed'], ['--download-id', 'gone', '--outcome', 'absent']]);
 });

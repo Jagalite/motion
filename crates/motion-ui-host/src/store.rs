@@ -30,7 +30,15 @@ pub struct Store {
     staging: Dir,
     _lock: std::fs::File,
     manifest: CacheManifest,
+    /// Downloads the person removed on this device whose deletion the server
+    /// has not confirmed yet (`removals.json`): never published again
+    /// (`offline::may_publish`) until settled (`offline::settles`).
+    removals: Vec<String>,
 }
+
+/// At most this many unsettled removals are kept.
+const MAX_REMOVALS: usize = 500;
+const MAX_REMOVALS_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +89,21 @@ pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
 impl Store {
     /// Open (creating when absent) the cache root for exactly `scope`.
     pub fn open(path: &Path, scope: &CacheScope) -> anyhow::Result<Self> {
+        Self::open_with(path, scope, None)
+    }
+
+    /// Open the root as the writer that already holds its exclusive lock:
+    /// `lock` is a handle on this root's `events.lock` whose lock the caller
+    /// (the running offline host) holds, so no other writer can run.
+    pub fn open_held(path: &Path, scope: &CacheScope, lock: std::fs::File) -> anyhow::Result<Self> {
+        Self::open_with(path, scope, Some(lock))
+    }
+
+    fn open_with(
+        path: &Path,
+        scope: &CacheScope,
+        held: Option<std::fs::File>,
+    ) -> anyhow::Result<Self> {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -88,17 +111,36 @@ impl Store {
         builder.create(path)?;
         let root = Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
         let root_sync = sync_handle(path, &root)?;
-        let lock = root
-            .open_with(
-                "events.lock",
-                cap_std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true),
-            )?
-            .into_std();
-        lock.try_lock_exclusive()
-            .context("the offline cache is in use")?;
+        let lock = match held {
+            Some(lock) => {
+                // The handle must be this root's lock file, not any file.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let (a, b) = (root.metadata("events.lock")?, lock.metadata()?);
+                    ensure!(
+                        cap_std::fs::MetadataExt::dev(&a) == b.dev()
+                            && cap_std::fs::MetadataExt::ino(&a) == b.ino(),
+                        "the held lock is not this cache's"
+                    );
+                }
+                lock
+            }
+            None => {
+                let lock = root
+                    .open_with(
+                        "events.lock",
+                        cap_std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true),
+                    )?
+                    .into_std();
+                lock.try_lock_exclusive()
+                    .context("the offline cache is in use")?;
+                lock
+            }
+        };
         let (blobs, blobs_sync) = subdirectory(&root, path, "blobs")?;
         let (staging, _) = subdirectory(&root, path, "staging")?;
         let manifest = match root.open("manifest.json") {
@@ -129,6 +171,15 @@ impl Store {
             }
             Err(e) => return Err(e.into()),
         };
+        let removals: Vec<String> = match root.open("removals.json") {
+            Ok(file) => serde_json::from_slice(&bounded(file, MAX_REMOVALS_BYTES)?)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(e.into()),
+        };
+        ensure!(
+            removals.len() <= MAX_REMOVALS && removals.iter().all(|id| offline::identifier(id)),
+            "invalid removal record"
+        );
         Ok(Self {
             path: path.to_owned(),
             root,
@@ -138,11 +189,82 @@ impl Store {
             staging,
             _lock: lock,
             manifest,
+            removals,
         })
     }
 
     pub fn manifest(&self) -> &CacheManifest {
         &self.manifest
+    }
+
+    /// Removals the server has not confirmed yet.
+    pub fn removals(&self) -> &[String] {
+        &self.removals
+    }
+
+    fn write_removals(&mut self, removals: Vec<String>) -> anyhow::Result<()> {
+        ensure!(
+            removals.len() <= MAX_REMOVALS,
+            "too many removals await the server"
+        );
+        replace_durably(
+            &self.root,
+            &self.root_sync,
+            "removals.json",
+            &serde_json::to_vec(&removals)?,
+        )?;
+        self.removals = removals; // Only after the durable rename.
+        Ok(())
+    }
+
+    /// The person removes a saved download from this device. The intent is
+    /// durable before the copy goes, so a crash in between leaves a removal
+    /// the next pass completes, never a copy the agent saves again.
+    /// Offline progress already recorded for it is kept.
+    pub fn remove_by_person(&mut self, download_id: &str) -> anyhow::Result<bool> {
+        ensure!(
+            offline::identifier(download_id),
+            "invalid download identity"
+        );
+        let saved = self
+            .manifest
+            .downloads
+            .iter()
+            .any(|d| d.identity.download_id == download_id)
+            || self.staged()?.iter().any(|id| id == download_id);
+        if !saved {
+            return Ok(false);
+        }
+        if offline::may_publish(download_id, &self.removals) {
+            let mut next = self.removals.clone();
+            next.push(download_id.to_owned());
+            self.write_removals(next)?;
+        }
+        self.remove(download_id)?;
+        Ok(true)
+    }
+
+    /// Settle a pending removal with the server's answer to deleting the
+    /// download (`offline::settles`). Returns whether it is now settled.
+    pub fn settle_removal(
+        &mut self,
+        download_id: &str,
+        outcome: offline::Deletion,
+    ) -> anyhow::Result<bool> {
+        if offline::may_publish(download_id, &self.removals) {
+            return Ok(true);
+        }
+        if !offline::settles(outcome) {
+            return Ok(false);
+        }
+        let next = self
+            .removals
+            .iter()
+            .filter(|id| *id != download_id)
+            .cloned()
+            .collect();
+        self.write_removals(next)?;
+        Ok(true)
     }
 
     /// Downloads with a staged (unpublished) transfer. These are lifecycle
@@ -233,6 +355,10 @@ impl Store {
     pub fn publish(&mut self, entry: CachedDownload) -> anyhow::Result<Publication> {
         validate_download(&entry)?;
         let id = entry.identity.download_id.clone();
+        ensure!(
+            offline::may_publish(&id, &self.removals),
+            "this download was removed on this device"
+        );
         let staged = staging_name(&id)?;
         if self.manifest.downloads.iter().any(|d| {
             d.identity.download_id == id && d.sha256 == entry.sha256 && d.size == entry.size
@@ -420,6 +546,10 @@ impl Store {
     /// or transferring again. Returns whether the download is now published.
     pub fn recover(&mut self, entry: CachedDownload) -> anyhow::Result<bool> {
         validate_download(&entry)?;
+        ensure!(
+            offline::may_publish(&entry.identity.download_id, &self.removals),
+            "this download was removed on this device"
+        );
         let staged = staging_name(&entry.identity.download_id)?;
         let staged_exists = match self.staging.metadata(&staged) {
             Ok(_) => true,

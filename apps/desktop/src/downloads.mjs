@@ -353,9 +353,27 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         if (signal?.aborted) throw error;
         status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
       }
-      const before = await cache(target.path, target.scope, ['status']);
+      let before = await cache(target.path, target.scope, ['status']);
+      // Titles the person removed on this device: delete each download on
+      // the server, then settle the removal with its answer. Until it is
+      // settled the cache refuses to save that download again.
+      if ((before.removals ?? []).length > 0) {
+        for (const id of before.removals) {
+          if (signal?.aborted) return;
+          let outcome = 'deleted';
+          try { await api(`/api/v2/downloads/${encodeURIComponent(id)}`, {method: 'DELETE'}); }
+          catch (error) {
+            if (signal?.aborted) throw error;
+            outcome = error.status === 404 ? 'absent' : 'failed';
+            if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
+          }
+          await cache(target.path, target.scope, ['settle-removal', '--download-id', id, '--outcome', outcome]);
+        }
+        before = await cache(target.path, target.scope, ['status']);
+      }
+      const removed = new Set(before.removals ?? []);
       let local = before.manifest;
-      const wanted = downloads.filter(d => d.profile_id === profile);
+      const wanted = downloads.filter(d => d.profile_id === profile && !removed.has(d.id));
       // Cancelled, expired and no-longer-visible downloads leave this device,
       // published copies and unpublished staged transfers alike.
       const present = new Set([...local.downloads.map(entry => entry.identity.download_id), ...before.staged]);

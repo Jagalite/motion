@@ -428,3 +428,74 @@ fn recoverable_leftovers_count_against_the_quota() {
     assert_eq!(store.usage().unwrap(), 10);
     assert!(!store.admits_transfer(1, 10, 0).unwrap());
 }
+
+/// A title the person removes stays removed: the intent is durable, the
+/// copy and its blob go, and neither publication nor recovery saves it
+/// again until the server's answer settles the removal.
+#[test]
+fn a_removed_title_is_never_saved_again_until_the_server_confirms() {
+    use playscale_core::offline::Deletion;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"removed media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    assert!(
+        !store.remove_by_person("unknown").unwrap(),
+        "only a saved title"
+    );
+    assert!(store.remove_by_person("d1").unwrap());
+    assert!(store.manifest().downloads.is_empty());
+    assert!(blobs(&root).is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+    // Neither a new transfer nor a crash leftover is saved again.
+    stage(&root, "d1", media);
+    assert!(store.publish(entry("d1", media)).is_err());
+    assert!(store.recover(entry("d1", media)).is_err());
+    drop(store);
+    // Durable: a reopened writer still refuses it.
+    let mut store = Store::open(&root, &scope()).unwrap();
+    assert_eq!(store.removals(), ["d1"]);
+    assert!(!store.settle_removal("d1", Deletion::Failed).unwrap());
+    assert_eq!(store.removals(), ["d1"]);
+    assert!(store.settle_removal("d1", Deletion::Absent).unwrap());
+    assert!(store.removals().is_empty());
+    // Settled: a new demand may save it again.
+    stage(&root, "d1", media);
+    assert_eq!(
+        store.publish(entry("d1", media)).unwrap(),
+        Publication::Published
+    );
+    // A staged (unpublished) transfer can be removed too.
+    stage(&root, "d2", b"partial");
+    assert!(store.remove_by_person("d2").unwrap());
+    assert!(store.staged().unwrap().is_empty());
+    assert_eq!(store.removals(), ["d2"]);
+}
+
+/// The running host removes titles as the writer under the lock it holds;
+/// another handle that merely names a file is refused.
+#[test]
+fn only_the_held_lock_of_this_root_admits_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"held media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    drop(store);
+    let host = Cache::open(&root).unwrap();
+    let elsewhere = dir.path().join("other.lock");
+    std::fs::write(&elsewhere, b"").unwrap();
+    assert!(
+        Store::open_held(&root, &scope(), std::fs::File::open(&elsewhere).unwrap()).is_err(),
+        "a handle on another file is not this root's lock"
+    );
+    assert!(host.remove("d1").unwrap());
+    assert!(!host.remove("d1").unwrap());
+    drop(host);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert!(store.manifest().downloads.is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+}
