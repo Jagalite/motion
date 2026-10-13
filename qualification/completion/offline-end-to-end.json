@@ -1,0 +1,57 @@
+{
+  "passed": true,
+  "failure": null,
+  "checks": {
+    "agent_downloaded_media_subtitles_and_metadata": true,
+    "electron_offline_playback_seek_progress_and_restart": true,
+    "reconnect_reconciles_once_and_compacts": true,
+    "device_reports_its_verified_copy": true
+  },
+  "electron": {
+    "passed": true,
+    "checks": {
+      "cold_start_without_authoritative_server": true,
+      "sandboxed": true,
+      "saved_metadata_shown": true,
+      "saved_subtitles_presented": true,
+      "real_offline_playback": true,
+      "offline_seek": true,
+      "owned_helper_stopped": true,
+      "durable_ordered_progress": true,
+      "restart_resumes_from_cache": true,
+      "no_authoritative_database_created": true
+    },
+    "scope": "Real offline helper and production desktop over a cache the download agent filled from a disposable server",
+    "electron": "44.7.0",
+    "chromium": "152.0.7977.130"
+  },
+  "server_sha256": "8a63c5b790005ee4a084d318be4c6088ddbc4d170930d9469d90357774af6be5",
+  "host_sha256": "a19f24a6bf4fffd17aee47911371e2170da83f29e410ed2241e55342936e734c",
+  "runtime_binary_sha256": "6c7bfa625e72ad31e564b262c916aa6a9d5b88f570dea195dec52255e9c6305d",
+  "demuxe_package_sha256": "93550c13b8b9d6070a47fec68fc2c990394bd0b45e7b8201c0a855c0dceae672",
+  "media_sha256": "195dec0c319591a54289310f2fe62798d0031a181248db094e9c6831adac6c41",
+  "source_sha256": {
+    "apps/desktop/src/chrome.css": "c1824055bfc200fedb7b6f5dcbcbc0a0e02c5a99231e125b05c6cf7e27368d9d",
+    "apps/desktop/src/chrome.html": "d11bba376ab7a9a0aa37c8f657d380af6bddb38a6b3c157b6c72e0d3deb87d8c",
+    "apps/desktop/src/chrome.js": "fc1ca0744d2eabb81f3195916124a410288dc33735a6710e765a4756f57a92d4",
+    "apps/desktop/src/downloads.mjs": "7fb6b03b652696722477b39c376d4d8ca9c243fec896473a95f37775b4b9a44a",
+    "apps/desktop/src/lifecycle.mjs": "a5b4b0078d23a7d5de9ace65a14ea645f519b99ea17cd41a5e5f840bd8259e9a",
+    "apps/desktop/src/main.mjs": "ed5f5e769c28f9c244090729df6f5d2c1d2c6372b55c7b38c9a4feadc4901143",
+    "apps/desktop/src/outbox.mjs": "6e3744ea714577c6aad5a992127551ec9ed9a8d8d899bc7df6d370c6b4efd9dd",
+    "apps/desktop/src/owned.mjs": "c54251c1449fc4b8bdbbda50b576c570bbc8615b729850f7f180039c2f8b4297",
+    "apps/desktop/src/policy.mjs": "fd1ff924b397eeca4ebf5f712d2707d05d2c6f0352e00aec140348da5f5d0af3",
+    "apps/desktop/src/preload.cjs": "6a49ff6575e8b623133343c0a99e087e2920c6aed853f5f59147d42f6fa34c27",
+    "apps/desktop/src/recovery.mjs": "a06fe121e7413e095c23723fd045313476fd7cb43b0caf6b654bf474adce301f",
+    "apps/desktop/test/offline-smoke.mjs": "66b67e357e1c368adc597350bd1c96829d5c754313b9ebb7a750d7a52e0c0b9e",
+    "apps/desktop/test/run-end-to-end.mjs": "fcdc00822ad9d6bf2e74f8d528a7a5c24b910d1febe0576e93443ec9c944bda9",
+    "packages/ui-bridge/offline-player.js": "74f5f8ea2c9cebb35f46e6726a286b3c09fe0a7120dc85bb665d2fab89cc4285"
+  },
+  "commit": "fc4b5e9fb5279873b5a1342df93574b514f3a70a",
+  "recorded_at": "2026-10-13T11:31:39.845Z",
+  "artifacts": "$TMPDIR/motion-end-to-end-vK5ZNJ",
+  "limitations": [
+    "The download is driven by the production agent module from Node, not from the Electron main process (sign-in UI not exercised).",
+    "One device, one profile, one complete MP4 original with one text subtitle; macOS arm64 debug binaries; unpackaged Electron; audio muted.",
+    "No screen-reader, physical A/V or packaged-app observations."
+  ]
+}

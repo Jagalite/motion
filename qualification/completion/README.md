@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; 5E part 5 device side implemented and reviewed; 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata, offline-subtitles and offline-subtitles-device PRs | Merge by user; then 5F |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; 5E part 5 device side implemented and reviewed; 5F run passed (review pending) | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata, offline-subtitles, offline-subtitles-device and offline-end-to-end PRs | Merge by user |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1361,11 +1361,51 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `c07bed7` is clean: no actionable findings.
 
-### Remaining item 5 work (not started)
+### 5F. End-to-end: download, offline in Electron with Demuxe, reconnect
 
-| Slice | Next step | Dependency |
-|---|---|---|
-| 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
+- **Source SHA:** branch `plan-completion/offline-end-to-end`, stacked on
+  `plan-completion/offline-subtitles-device`. The receipt names `fc4b5e9`.
+  The binaries were built from its parent, whose non-test sources are
+  identical.
+- **Run (`apps/desktop/test/run-end-to-end.mjs`):**
+  1. A disposable owned server scans a disposable library: one 12 s MP4
+     with a `mov_text` subtitle and an NFO.
+  2. A download is created with the subtitle selected (`require`, `s0`).
+  3. The production download agent module fills a real cache through the
+     real `motion-ui-host cache` writer: media, subtitles and metadata,
+     verified and published. This uses the device's session, as the
+     desktop's session fetcher does.
+  4. The server is stopped. The real desktop app runs in Electron 44.7.0
+     (`offline-smoke.mjs`, now parameterized) over that cache:
+     - it cold-starts the offline host with no authoritative server and
+       stays sandboxed;
+     - it shows the saved description;
+     - Demuxe plays, attaches the saved subtitles as the selected external
+       track, and seeks;
+     - progress is saved durably and in order; after a restart playback
+       resumes from the cache, and no database is created.
+  5. The server restarts, and the agent reconciles the progress once (the
+     server position equals the last offline event; events are compacted;
+     a repeat pass adds no history). The device reports its verified copy.
+- **Evidence (2026-10-13):** [offline-end-to-end.json](offline-end-to-end.json)
+  passed. Its 4 harness checks and 10 Electron checks hold the hashes of
+  the server, host, Electron runtime, Demuxe package, media and harness
+  sources.
+- **Found by the run:** nothing in the product. The harness's first
+  version fetched without the device's session, which the subtitle file
+  requires (the desktop's fetcher has it).
+- **Limitations (as recorded in the receipt):**
+  - The download is driven by the agent module from Node, not by the
+    Electron main process, so sign-in is not exercised.
+  - One device, profile, title and text subtitle.
+  - macOS arm64 debug binaries, unpackaged Electron, audio muted.
+  - No screen reader, physical audio/video or packaged-app observations;
+    those remain item 8 release checks.
+
+### Remaining item 5 work
+
+None in this plan. Packaged-app, long and interrupted transfers, full-disk
+and device-matrix runs are item 8 release qualification.
 
 ## 6. M5 convenience and receiver work
 
