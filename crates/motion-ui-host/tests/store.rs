@@ -37,6 +37,7 @@ fn entry(id: &str, bytes: &[u8]) -> CachedDownload {
         content_type: "video/mp4".into(),
         resume_position_ms: None,
         artwork: None,
+        subtitles: None,
         metadata: None,
     }
 }
@@ -870,6 +871,57 @@ fn a_corrupt_poster_does_not_block_recovering_its_media() {
     // The media alone is still recovered.
     assert!(store.recover(entry("d1", media)).unwrap());
     assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
+}
+
+/// Saved subtitles are verified into their own blob before the entry names
+/// them, and released with it; a staged file alone is a staged download.
+#[test]
+fn subtitles_are_published_verified_and_released_with_their_download() {
+    use motion_ui::offline::CachedSubtitles;
+    use motion_ui_host::store::subtitles_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"subtitled media";
+    let vtt = b"WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n";
+    let with_subtitles = CachedDownload {
+        subtitles: Some(CachedSubtitles {
+            sha256: format!("{:x}", Sha256::digest(vtt)),
+            size: vtt.len() as u64,
+        }),
+        ..entry("d1", media)
+    };
+    let staged = root
+        .join("staging")
+        .join(subtitles_staging_name("d1").unwrap());
+    stage(&root, "d1", media);
+    // Bytes that do not match: nothing is published, the staged file is gone.
+    std::fs::write(&staged, b"WEBVTT\n\nother").unwrap();
+    assert_eq!(store.staged().unwrap(), ["d1"]);
+    assert!(store.publish(with_subtitles.clone()).is_err());
+    assert!(store.manifest().downloads.is_empty());
+    assert!(!staged.exists());
+    // Missing entirely: refused as well (they are part of the entry).
+    assert!(store.publish(with_subtitles.clone()).is_err());
+    std::fs::write(&staged, vtt).unwrap();
+    assert_eq!(
+        store.publish(with_subtitles.clone()).unwrap(),
+        Publication::Published
+    );
+    let blob = format!("{:x}", Sha256::digest(vtt));
+    assert!(blobs(&root).contains(&blob));
+    store.collect().unwrap();
+    assert!(blobs(&root).contains(&blob));
+    assert!(store.remove("d1").unwrap());
+    assert!(blobs(&root).is_empty());
+    // Recovery needs them in place and verified; a corrupt blob is discarded.
+    std::fs::write(root.join("blobs").join(&with_subtitles.sha256), media).unwrap();
+    std::fs::write(root.join("blobs").join(&blob), b"corrupt").unwrap();
+    assert!(!store.recover(with_subtitles.clone()).unwrap());
+    assert!(!blobs(&root).contains(&blob));
+    std::fs::write(&staged, vtt).unwrap();
+    assert!(store.recover(with_subtitles.clone()).unwrap());
+    assert_eq!(store.manifest().downloads, vec![with_subtitles]);
 }
 
 /// A staged poster alone still belongs to its download's lifecycle.

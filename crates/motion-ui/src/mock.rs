@@ -237,6 +237,11 @@ impl UiQueryFacade for MockUiQueryFacade {
                             tracks_json: r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"require","audio_track_id":"a1","subtitle_track_id":"s0"}"#.into(),
                         }],
                         prepared_incomplete: false,
+                        subtitle_downloads: vec![crate::facade::SubtitleDownload {
+                            version_id: "version-1".into(),
+                            label: "Original".into(),
+                            tracks: vec![("s1".into(), "Subtitle 2 · eng".into())],
+                        }],
                     }]
                 })
                 .unwrap_or_default();

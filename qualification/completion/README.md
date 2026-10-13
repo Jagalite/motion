@@ -29,6 +29,9 @@ item below is the single completion agent unless stated otherwise.
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented and reviewed; 6D implemented and reviewed; 6E not started | markers, embedded-chapters, previews, preview-schedules, player-previews and accessibility PRs | Re-review; merge by user |
+
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; 5E part 5 device side implemented and reviewed; 5F run passed and reviewed | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata, offline-subtitles, offline-subtitles-device and offline-end-to-end PRs | Merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1462,12 +1465,124 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `3d66651` is clean: no actionable findings.
 
-### Remaining item 5 work (not started)
+### 5E (part 5, device). Selected subtitles saved and shown offline
 
-| Slice | Next step | Dependency |
-|---|---|---|
-| 5E remaining: subtitle files on the device | The agent saves the pinned `subtitle` file (verified like the poster, required when selected); the cache store publishes it; the offline host serves it and the offline player adds it as a text track; the title page offers the selection for originals | 5E part 4 (server) |
-| 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
+- **Source SHA:** branch `plan-completion/offline-subtitles-device`, stacked
+  on `plan-completion/offline-subtitles`.
+- **Implemented:**
+  - **Title page:** each whole, single-file original with text subtitles
+    offers "Save with subtitles" with a choice of its tracks. The request
+    pins that exact version and the chosen track with `require`, so the
+    track ID always means that file's track.
+  - **Agent:** a manifest may name one `subtitle` file, which is required.
+    It counts against the same space admission as the media. It is fetched
+    whole after the media, size- and digest-verified, and staged as
+    `<id>.subtitles`; if it cannot be saved nothing is published and the
+    next pass retries. The cache entry records `subtitles` (digest, size).
+  - **Cache store:** the poster and subtitles are now "side files" handled
+    by one rule. Each is verified into its own blob before the entry names
+    it. It is staged, collected and released with its download, and
+    verified again on crash recovery (a corrupt one is discarded and
+    recovery declines).
+  - **Offline host and player:** `/cache/subtitles/{id}` serves the
+    verified WebVTT (checked against its digest on every read). The player
+    page names it, and the offline player adds it as the default text
+    track.
+- **Unsupported / limits:**
+  - One subtitle per download.
+  - Prepared versions' kept subtitles travel too (server side), but their
+    title-page offer is unchanged.
+  - The offline player's track addition has no automated test; it uses
+    the same Demuxe `addTextTrack` call as online playback. A real
+    Electron run belongs to 5F.
+- **Core/adapter boundary:** what may be saved is decided by the server's
+  pin (5E part 4) and verified by digest. The agent and cache store only
+  carry and verify it. No new state transition.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | Store | 23 passed. New: mismatched or missing subtitles publish nothing; verified subtitles are kept by collection and released by removal; recovery discards corrupt subtitles and succeeds once they are in place |
+  | Cache | 12 passed. New: the player page names the subtitles; the route serves the verified bytes, refuses without a session, and refuses bytes that no longer match |
+  | Compose | 22 passed. New: the "Save with subtitles" form pins the version and offers `require` with the track |
+  | Desktop JS (with `MOTION_UI_HOST_BINARY`) | 60 passed. New: subtitles are required (nothing published until saved) and admitted with the media; with the real cache tool, a title is saved with its subtitles |
+  | `access_api` 39, `v2_downloads` 11, ui-bridge 45 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `aba9882` raised one P1 and two P2
+  findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | D1 (P1) | The desktop app's fetcher allowed only `/api/v2/media/` URLs, so every subtitle download failed | Fixed: `transferLocation` admits media content and exactly `/api/v2/downloads/<id>/subtitles?digest=sha256:<hex>`; `main.mjs` uses it. JS test of accepted and refused URLs |
+  | D2 | Subtitles staged before an interruption were admitted again on retry, so a near-quota title could be refused forever | Fixed: staged subtitles that verify are reused and not admitted again; anything else staged beside the media (stale subtitles, a poster) is discarded before admission. JS test: a retry with everything staged admits 0 bytes; stale subtitles are fetched again |
+  | D3 | If adding the subtitles failed, the opened player kept playing without them and without progress recording | Fixed: the player is destroyed and the failure shown. Not covered by an automated test (the offline player's start needs the Demuxe bundle) |
+
+  After the fixes: desktop JS 62 (with the real cache tool) and ui-bridge
+  45 passed.
+
+  Round 2 at `c07bed7` is clean: no actionable findings.
+
+### 5F. End-to-end: download, offline in Electron with Demuxe, reconnect
+
+- **Source SHA:** branch `plan-completion/offline-end-to-end`, stacked on
+  `plan-completion/offline-subtitles-device`. The receipt names `00b7c9b`.
+  The binaries were built from its parent, whose non-test sources are
+  identical.
+- **Run (`apps/desktop/test/run-end-to-end.mjs`):**
+  1. A disposable owned server scans a disposable library: one 12 s MP4
+     with a `mov_text` subtitle and an NFO.
+  2. A download is created with the subtitle selected (`require`, `s0`).
+  3. The production download agent module fills a real cache through the
+     real `motion-ui-host cache` writer: media, subtitles and metadata,
+     verified and published. This uses the device's session, as the
+     desktop's session fetcher does.
+  4. The server is stopped. The real desktop app runs in Electron 44.7.0
+     (`offline-smoke.mjs`, now parameterized) over that cache:
+     - it cold-starts the offline host with no authoritative server and
+       stays sandboxed;
+     - it shows the saved description;
+     - Demuxe plays, attaches the saved subtitles as the selected external
+       track, and seeks;
+     - progress is saved durably and in order; after a restart playback
+       resumes from the cache, and no database is created.
+  5. The server restarts, and the agent reconciles the progress once (the
+     server position equals the last offline event; events are compacted;
+     a repeat pass adds no history). The device reports its verified copy.
+- **Evidence (2026-10-13):** [offline-end-to-end.json](offline-end-to-end.json)
+  passed. Its 4 harness checks and 10 Electron checks hold the hashes of
+  the server, host, Electron runtime, Demuxe package, media and harness
+  sources.
+- **Found by the run:** nothing in the product. The harness's first
+  version fetched without the device's session, which the subtitle file
+  requires (the desktop's fetcher has it).
+- **Limitations (as recorded in the receipt):**
+  - The download is driven by the agent module from Node, not by the
+    Electron main process, so sign-in is not exercised.
+  - One device, profile, title and text subtitle.
+  - macOS arm64 debug binaries, unpackaged Electron, audio muted.
+  - No screen reader, physical audio/video or packaged-app observations;
+    those remain item 8 release checks.
+- **Review (GPT-6.1 Sol):** round 1 at `7ba37ae` (same content as
+  `fc4b5e9`) raised one P2 finding, fixed:
+  - **Provenance:** the receipt hashed the desktop sources after the
+    multi-minute run, so a change during it could name bytes that were
+    never tested. The commit, source hashes and whether the tested files
+    are committed (`sources_committed`) are now captured before anything
+    runs. The files are hashed again at the end, and a change fails the
+    receipt. The run was repeated: it passed at `6453f0c` with
+    `sources_committed: true`.
+
+  Round 2 at `6453f0c` raised one P2 finding, fixed:
+  - **Deleted sources:** the committed-state check listed only existing
+    files, so a deleted tracked desktop source still counted as committed.
+    It now covers the whole `apps/desktop/src` directory. The run passed
+    again at `00b7c9b`.
+
+  Round 3 at `00b7c9b` is clean: no actionable findings.
+
+### Remaining item 5 work
+
+None in this plan. Packaged-app, long and interrupted transfers, full-disk
+and device-matrix runs are item 8 release qualification.
 
 ## 6. M5 convenience and receiver work
 

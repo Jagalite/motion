@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {cacheMetadata, cacheTitle, createDownloadAgent, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
+import {cacheMetadata, cacheTitle, createDownloadAgent, transferLocation, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
 
 const identity = {server_id: 'server', principal_id: 'device1', device_id: 'device1'};
 const media = Buffer.from('0123456789abcdefghij');
@@ -141,7 +141,9 @@ test('unsupported manifests are reported instead of silently dropping files', as
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   const statuses = [];
   const withSubtitle = manifest('d1');
-  withSubtitle.files.push({...withSubtitle.files[0], role: 'subtitle', relative_name: 'subtitle.vtt'});
+  // Two subtitle files: at most one is saved with a title.
+  withSubtitle.files.push({...withSubtitle.files[0], role: 'subtitle', relative_name: 'subtitle.vtt'},
+    {...withSubtitle.files[0], role: 'subtitle', relative_name: 'other.vtt'});
   const agent = createDownloadAgent({base, identity, cache: fakeCache().cache, quota: 1000, status: m => statuses.push(m),
     api: async () => withSubtitle, fetchMedia: async () => assert.fail('no transfer')});
   assert.equal(await agent.transfer({id: 'd1'}, agent.root('default')), false);
@@ -935,3 +937,90 @@ test('with the real cache, a title is saved with its metadata, and bad metadata 
     assert.deepEqual(Object.fromEntries(saved.downloads.map(d => [d.identity.download_id, d.metadata ?? null])),
       {d1: {release_year: 1999, description: 'Plot', genres: ['Drama']}, d2: null});
   });
+
+const vtt = Buffer.from('WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n');
+const vttDigest = createHash('sha256').update(vtt).digest('hex');
+const withSubtitles = id => ({...manifest(id), files: [...manifest(id).files,
+  {asset_id: `${id}-subtitles`, relative_name: 'subtitles.vtt', digest: `sha256:${vttDigest}`, size_bytes: String(vtt.length),
+    media_url: `/api/v2/downloads/${id}/subtitles?digest=sha256:${vttDigest}`, role: 'subtitle'}]});
+
+test('selected subtitles are required: saved and verified with the title, or nothing is published', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  let serveSubtitles = false;
+  const admits = [];
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    if (args[0] === 'admit') admits.push(args[2]);
+    return cache(root, scope, args, input);
+  }, quota: 100000,
+    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => url.includes('/subtitles') ? (serveSubtitles ? response(200, vtt) : response(503, '')) : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  await assert.rejects(agent.transfer({id: 'd1'}, target), /subtitles/);
+  assert.ok(!calls.some(c => c[1] === 'publish'), 'nothing published without them');
+  // Admitted with the media: they count against the same space.
+  assert.equal(admits[0], String(media.length + vtt.length));
+  serveSubtitles = true;
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const published = JSON.parse(calls.find(c => c[1] === 'publish')[3]);
+  assert.deepEqual(published.subtitles, {sha256: vttDigest, size: vtt.length});
+  assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.subtitles')), vtt);
+});
+
+test('with the real cache, a title is saved with its subtitles',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : path.endsWith('/transfer') ? {} : {url: '/api/v2/media/files/f1/content?ticket=t'},
+      fetchMedia: async url => response(200, url.includes('/subtitles') ? vtt : media)});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(saved.downloads[0].subtitles, {sha256: vttDigest, size: vtt.length});
+    assert.deepEqual(readFileSync(join(target.path, 'blobs', vttDigest)), vtt);
+  });
+
+test('the agent fetches only media, artwork and a download\'s subtitles at a digest', () => {
+  assert.ok(transferLocation('/api/v2/media/files/f1/content?ticket=t'));
+  assert.ok(transferLocation(`/api/v2/downloads/d-1/subtitles?digest=sha256:${vttDigest}`));
+  for (const url of ['/api/v2/downloads/d-1/manifest', '/api/v2/downloads/d-1/subtitles', `/api/v2/downloads/../subtitles?digest=sha256:${vttDigest}`,
+    `https://elsewhere.example/api/v2/media/x`, `/api/v2/downloads/d-1/subtitles?digest=sha256:${vttDigest}&x=1`, null]) {
+    assert.equal(transferLocation(url), false, String(url));
+  }
+});
+
+test('subtitles staged by an interrupted pass are reused, never admitted twice', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const admits = [];
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    if (args[0] === 'admit') admits.push(args[2]);
+    return cache(root, scope, args, input);
+  }, quota: 100000,
+    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async () => assert.fail('nothing left to fetch')});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  // The whole media and verified subtitles were staged before the stop.
+  writeFileSync(join(target.path, 'staging', 'd1.part'), media);
+  writeFileSync(join(target.path, 'staging', 'd1.subtitles'), vtt);
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  assert.deepEqual(admits, ['0']);
+  assert.deepEqual(JSON.parse(calls.find(c => c[1] === 'publish')[3]).subtitles, {sha256: vttDigest, size: vtt.length});
+  // Staged bytes that do not verify are discarded and fetched again.
+  const second = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fetched = [];
+  const again = createDownloadAgent({base: second, identity, cache: fakeCache().cache, quota: 100000,
+    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => { fetched.push(url); return response(200, vtt); }});
+  const other = again.root('default');
+  mkdirSync(join(other.path, 'staging'), {recursive: true});
+  writeFileSync(join(other.path, 'staging', 'd1.part'), media);
+  writeFileSync(join(other.path, 'staging', 'd1.subtitles'), 'WEBVTT\n\nstale');
+  assert.equal(await again.transfer({id: 'd1'}, other), true);
+  assert.equal(fetched.length, 1);
+  assert.match(fetched[0], /\/subtitles\?digest=/);
+});

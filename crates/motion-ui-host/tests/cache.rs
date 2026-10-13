@@ -41,6 +41,7 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
             content_type: "video/mp4".into(),
             resume_position_ms: None,
             artwork: None,
+            subtitles: None,
             metadata: None,
         }],
     };
@@ -683,4 +684,41 @@ async fn saved_metadata_is_shown_offline() {
     let page = String::from_utf8(page).unwrap();
     assert!(page.contains("1999 · Drama, Mystery"), "{page}");
     assert!(page.contains("A &lt;described&gt; title."), "{page}");
+}
+
+/// Saved subtitles are served offline from their verified blob, and the
+/// player page names them; a blob that no longer matches is not served.
+#[tokio::test]
+async fn saved_subtitles_are_served_offline() {
+    let (dir, mut manifest) = fixture();
+    let vtt = b"WEBVTT\n\n00:00.500 --> 00:01.500\nHello\n";
+    let digest = format!("{:x}", Sha256::digest(vtt));
+    std::fs::write(dir.path().join("blobs").join(&digest), vtt).unwrap();
+    manifest.downloads[0].subtitles = Some(motion_ui::offline::CachedSubtitles {
+        sha256: digest.clone(),
+        size: vtt.len() as u64,
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/download/download", &cookie, None).await;
+    assert!(
+        String::from_utf8(page)
+            .unwrap()
+            .contains(r#"data-subtitles-url="/cache/subtitles/download""#)
+    );
+    let (status, headers, bytes) =
+        request(&app, "GET", "/cache/subtitles/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/vtt; charset=utf-8");
+    assert_eq!(bytes, vtt);
+    let (status, _, _) = request(&app, "GET", "/cache/subtitles/download", "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    std::fs::write(dir.path().join("blobs").join(&digest), b"WEBVTT\n\nchanged").unwrap();
+    let (status, _, _) = request(&app, "GET", "/cache/subtitles/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
