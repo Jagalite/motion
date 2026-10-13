@@ -1347,6 +1347,17 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | Compose | 22 passed. New: the "Save with subtitles" form pins the version and offers `require` with the track |
   | Desktop JS (with `MOTION_UI_HOST_BINARY`) | 60 passed. New: subtitles are required (nothing published until saved) and admitted with the media; with the real cache tool, a title is saved with its subtitles |
   | `access_api` 39, `v2_downloads` 11, ui-bridge 45 | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `aba9882` raised one P1 and two P2
+  findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | D1 (P1) | The desktop app's fetcher allowed only `/api/v2/media/` URLs, so every subtitle download failed | Fixed: `transferLocation` admits media content and exactly `/api/v2/downloads/<id>/subtitles?digest=sha256:<hex>`; `main.mjs` uses it. JS test of accepted and refused URLs |
+  | D2 | Subtitles staged before an interruption were admitted again on retry, so a near-quota title could be refused forever | Fixed: staged subtitles that verify are reused and not admitted again; anything else staged beside the media (stale subtitles, a poster) is discarded before admission. JS test: a retry with everything staged admits 0 bytes; stale subtitles are fetched again |
+  | D3 | If adding the subtitles failed, the opened player kept playing without them and without progress recording | Fixed: the player is destroyed and the failure shown. Not covered by an automated test (the offline player's start needs the Demuxe bundle) |
+
+  After the fixes: desktop JS 62 (with the real cache tool) and ui-bridge
+  45 passed.
 
 ### Remaining item 5 work (not started)
 

@@ -9,7 +9,7 @@ import {createOutboxStore} from './outbox.mjs';
 import {restoreViewing} from './recovery.mjs';
 import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities, boundedJson} from './policy.mjs';
-import {createDownloadAgent, currentRoot, offlineRoots} from './downloads.mjs';
+import {createDownloadAgent, currentRoot, offlineRoots, transferLocation} from './downloads.mjs';
 
 if (app.isPackaged) app.setName('Motion');
 const explicitUserData = app.commandLine.getSwitchValue('user-data-dir');
@@ -236,7 +236,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
         serverLabel: new URL(selected.origin).host,
         identity: {server_id: selected.serverId, principal_id: principal.id, device_id: principal.device_id},
         fetchMedia: (url, {range, signal}) => {
-          if (!url.startsWith('/api/v2/media/')) throw new Error('Unexpected transfer location');
+          if (!transferLocation(url)) throw new Error('Unexpected transfer location');
           return ses.fetch(`${selected.origin}${url}`, {redirect: 'error', cache: 'no-store', signal, headers: range ? {Range: range} : {}});
         },
         status: message => { if (current()) window.webContents.send('motion:status', message); }});

@@ -6,7 +6,7 @@
 // events (motion-ui-host cache, playscale_core::offline). This adapter only
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
-import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
+import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -55,6 +55,15 @@ export function cacheMetadata(metadata) {
   if (typeof metadata.description === 'string') kept.description = metadata.description;
   if (Array.isArray(metadata.genres) && metadata.genres.every(g => typeof g === 'string')) kept.genres = metadata.genres;
   return Object.keys(kept).length ? kept : null;
+}
+
+/**
+ * Whether a manifest URL is one the agent may fetch from its server: media
+ * and artwork content, or exactly a download's subtitle file at a digest.
+ */
+export function transferLocation(url) {
+  return typeof url === 'string' && (url.startsWith('/api/v2/media/')
+    || /^\/api\/v2\/downloads\/[A-Za-z0-9_-]{1,128}\/subtitles\?digest=sha256:[0-9a-f]{64}$/.test(url));
 }
 
 export function cacheTitle(title) {
@@ -341,10 +350,20 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const largest = Math.max(size, ...(await Promise.all(managedRoots().map(async other =>
       Math.max(0, ...(await cache(other.path, other.scope, ['status'])).manifest.downloads.map(d => d.size ?? 0))))));
     const reserve = Math.max(headroom, largest + SNAPSHOT_RESERVE);
+    // Subtitles an interrupted pass already staged are reused when they
+    // verify (the cache counts them as used already); anything else staged
+    // beside the media is discarded before admission, never counted twice.
+    const stagedSubtitles = join(target.path, 'staging', `${download.id}.subtitles`);
+    const subtitlesStaged = Boolean(subtitles) && existsSync(stagedSubtitles) && (() => {
+      const bytes = readFileSync(stagedSubtitles);
+      return bytes.length === subtitles.size && createHash('sha256').update(bytes).digest('hex') === subtitles.sha256;
+    })();
+    if (!subtitlesStaged) rmSync(stagedSubtitles, {force: true});
+    rmSync(join(target.path, 'staging', `${download.id}.artwork`), {force: true});
     // The poster and subtitles count against the same admission; without
     // room for the optional poster the title is saved without one.
     const admit = incoming => cache(target.path, target.scope, ['admit', '--incoming', String(incoming), '--quota', String(remaining), '--headroom', String(reserve)]);
-    const required = size - have + (subtitles?.size ?? 0);
+    const required = size - have + (subtitles && !subtitlesStaged ? subtitles.size : 0);
     const withPoster = posterBytes > 0 && (await admit(required + posterBytes)).admitted;
     const admitted = withPoster ? {admitted: true} : await admit(required);
     if (!admitted.admitted) {
@@ -408,7 +427,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (signal?.aborted) throw signal.reason ?? new Error('Downloads stopped');
     // The selected subtitles, whole and verified; without them nothing is
     // published and the next pass tries again.
-    if (subtitles && !await saveWhole(download.id, subtitleFiles[0].media_url, subtitles.sha256, subtitles.size, 'subtitles', target)) {
+    if (subtitles && !subtitlesStaged && !await saveWhole(download.id, subtitleFiles[0].media_url, subtitles.sha256, subtitles.size, 'subtitles', target)) {
       throw new Error(`The subtitles of "${manifest.title}" could not be saved`);
     }
     // Verification and publication belong to the cache tool; a mismatch
