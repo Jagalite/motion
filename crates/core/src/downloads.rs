@@ -578,6 +578,8 @@ pub enum ReanchorRefusal {
     OtherServer,
     /// The current history itself: its sequence is never skipped.
     SameHistory,
+    /// The claimed predecessor was never recorded as an issued server history.
+    UnknownHistory,
 }
 
 /// Continue a device's sequence on a restored server. The device compacted
@@ -591,6 +593,7 @@ pub enum ReanchorRefusal {
 pub fn reanchor(
     current: (&str, &str),
     from: &str,
+    issued_history: bool,
     through: u64,
     next_sequence: u64,
     retention: Retention,
@@ -604,6 +607,9 @@ pub fn reanchor(
     }
     if restore == current.1 {
         return Err(ReanchorRefusal::SameHistory);
+    }
+    if !issued_history {
+        return Err(ReanchorRefusal::UnknownHistory);
     }
     // The device never resends a sequence at or below `through`, so nothing
     // there is retained, whether or not the sequence moves.
@@ -1179,35 +1185,39 @@ mod tests {
         let current = ("server", "r2");
         // The device compacted through 7 under r1; the restored server is at 3.
         assert_eq!(
-            reanchor(current, "server:r1", 7, 3, retention),
+            reanchor(current, "server:r1", true, 7, 3, retention),
             Ok((8, Retention::server(7)))
+        );
+        assert_eq!(
+            reanchor(current, "server:invented", false, 7, 3, retention),
+            Err(ReanchorRefusal::UnknownHistory)
         );
         // A retried request after the move changes nothing.
         assert_eq!(
-            reanchor(current, "server:r1", 7, 8, Retention::server(7)),
+            reanchor(current, "server:r1", true, 7, 8, Retention::server(7)),
             Ok((8, Retention::server(7)))
         );
         // A backup already past `through`: the sequence stays, the floor moves.
         assert_eq!(
-            reanchor(current, "server:r1", 10_000, 10_001, retention),
+            reanchor(current, "server:r1", true, 10_000, 10_001, retention),
             Ok((10_001, Retention::server(10_000)))
         );
         assert_eq!(
-            reanchor(current, "server:r2", 7, 3, retention),
+            reanchor(current, "server:r2", true, 7, 3, retention),
             Err(ReanchorRefusal::SameHistory)
         );
         assert_eq!(
-            reanchor(current, "other:r1", 7, 3, retention),
+            reanchor(current, "other:r1", true, 7, 3, retention),
             Err(ReanchorRefusal::OtherServer)
         );
         for bad in ["server", ":r1", "server:"] {
             assert_eq!(
-                reanchor(current, bad, 7, 3, retention),
+                reanchor(current, bad, true, 7, 3, retention),
                 Err(ReanchorRefusal::Invalid)
             );
         }
         assert_eq!(
-            reanchor(current, "server:r1", 1 << 53, 3, retention),
+            reanchor(current, "server:r1", true, 1 << 53, 3, retention),
             Err(ReanchorRefusal::Invalid)
         );
     }

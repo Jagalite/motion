@@ -1792,9 +1792,16 @@ pub async fn sync(
             sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
                 .fetch_one(&mut *tx)
                 .await?;
+        let issued: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM server_viewing_histories WHERE viewing_epoch=?)",
+        )
+        .bind(from)
+        .fetch_one(&mut *tx)
+        .await?;
         let (moved, retention) = core::reanchor(
             (&current.0, &current.1),
             from,
+            issued,
             *through,
             next as u64,
             core::Retention::server(pruned as u64),
@@ -1807,6 +1814,7 @@ pub async fn sync(
                     core::ReanchorRefusal::OtherServer => {
                         "A re-anchor continues only this server's own earlier history"
                     }
+                    core::ReanchorRefusal::UnknownHistory => "The earlier history was not issued by this server",
                     core::ReanchorRefusal::SameHistory => {
                         "The current history's sequence is never skipped"
                     }

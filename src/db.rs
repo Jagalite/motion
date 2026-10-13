@@ -738,6 +738,8 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         // The new history and its pending baseline in one transaction; the
         // database is migrated already, so the baseline is captured now.
         let mut tx = restored.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO server_viewing_histories(viewing_epoch) SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .execute(&mut *tx).await?;
         sqlx::query("UPDATE server_identity SET restore_epoch=?")
             .bind(&epoch)
             .execute(&mut *tx)
@@ -746,6 +748,8 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
             .bind(&epoch)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("INSERT OR IGNORE INTO server_viewing_histories(viewing_epoch) SELECT server_id || ':' || restore_epoch FROM server_identity")
+            .execute(&mut *tx).await?;
         // A snapshot cannot prove post-snapshot revocations. Withdraw saved
         // authority atomically with the new restore history and baseline.
         for statement in [

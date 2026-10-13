@@ -46,6 +46,9 @@ class RestoreEpoch(unittest.TestCase):
                 self.assertEqual(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0, table)
             self.assertEqual(db.execute('SELECT revoked FROM devices').fetchone()[0], 1)
             db.close()
+            with sqlite3.connect(root / 'restored' / 'playscale.sqlite3') as restored:
+                histories = {row[0] for row in restored.execute('SELECT viewing_epoch FROM server_viewing_histories')}
+                self.assertEqual(histories, {'server:original', f'server:{epoch}'})
             original = sqlite3.connect(root / 'data' / 'playscale.sqlite3')
             self.assertEqual(original.execute('SELECT revoked FROM devices').fetchone()[0], 0)
             original.close()

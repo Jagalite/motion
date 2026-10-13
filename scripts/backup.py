@@ -98,7 +98,10 @@ def rotate_restore_epoch(database):
         db.execute('PRAGMA foreign_keys=ON')
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'server_identity' in tables:
+            db.execute("CREATE TABLE IF NOT EXISTS server_viewing_histories (viewing_epoch TEXT PRIMARY KEY)")
+            db.execute("INSERT OR IGNORE INTO server_viewing_histories SELECT server_id || ':' || restore_epoch FROM server_identity")
             db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
+            db.execute("INSERT OR IGNORE INTO server_viewing_histories SELECT server_id || ':' || restore_epoch FROM server_identity")
             db.execute(RESTORE_BASELINE_EPOCH)
             db.execute("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) "
                        "SELECT 1,restore_epoch,0 FROM server_identity WHERE singleton=1")

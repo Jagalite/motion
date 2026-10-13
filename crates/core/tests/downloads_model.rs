@@ -210,6 +210,7 @@ fn sync(
         let Ok((next, moved)) = downloads::reanchor(
             current.split_once(':').unwrap(),
             &r.from_viewing_epoch,
+            (0..=w.epoch).any(|epoch| epoch_name(epoch) == r.from_viewing_epoch),
             r.through,
             w.next_sequence,
             retention,
