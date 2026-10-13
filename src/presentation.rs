@@ -157,26 +157,11 @@ fn prepared_label(r: &Value) -> String {
     parts.join(" · ")
 }
 
-fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
-    let audio_tracks = v["tracks"]
-        .as_array()
-        .map(|tracks| {
-            tracks
-                .iter()
-                .filter(|t| t["kind"] == "audio")
-                .enumerate()
-                .map(|(n, t)| {
-                    let mut label = vec![format!("Track {}", n + 1)];
-                    label.extend(t["language"].as_str().map(str::to_owned));
-                    label.extend(t["codec"].as_str().map(str::to_owned));
-                    label.extend(t["channels"].as_u64().map(|c| format!("{c}ch")));
-                    (format!("a{n}"), label.join(" · "))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // Only text subtitles can be kept by a preparation (as mov_text).
-    let subtitle_tracks = v["tracks"]
+/// A file's text subtitle streams, as (track ID `s{n}`, label): what a
+/// preparation can keep, and what a download can carry as WebVTT. `n`
+/// counts every subtitle stream of the revision.
+fn text_subtitle_tracks(v: &Value) -> Vec<(String, String)> {
+    v["tracks"]
         .as_array()
         .map(|tracks| {
             tracks
@@ -196,7 +181,29 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
                 })
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
+    let audio_tracks = v["tracks"]
+        .as_array()
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter(|t| t["kind"] == "audio")
+                .enumerate()
+                .map(|(n, t)| {
+                    let mut label = vec![format!("Track {}", n + 1)];
+                    label.extend(t["language"].as_str().map(str::to_owned));
+                    label.extend(t["codec"].as_str().map(str::to_owned));
+                    label.extend(t["channels"].as_u64().map(|c| format!("{c}ch")));
+                    (format!("a{n}"), label.join(" · "))
+                })
+                .collect()
+        })
         .unwrap_or_default();
+    // Only text subtitles can be kept by a preparation (as mov_text).
+    let subtitle_tracks = text_subtitle_tracks(v);
     let mut label = format!("File {} · {}", n + 1, size(count(&v["size_bytes"])));
     if let Some(ms) = v["duration_ms"].as_u64() {
         label.push_str(&format!(" · {} min", ms.div_ceil(60_000)));
@@ -678,6 +685,14 @@ impl UiQueryFacade for Queries {
             let rows = self
                 .complete_list(&format!("{path}/timelines?limit=20"))
                 .await?;
+            // The item's files, for the subtitles a download may carry.
+            let item_files = if who.can("downloads:manage") {
+                self.complete_list(&format!("{path}/files?limit=200"))
+                    .await
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
             let mut timelines = Vec::new();
             for row in rows {
                 let timeline = text(&row, "id");
@@ -685,12 +700,45 @@ impl UiQueryFacade for Queries {
                     .iter()
                     .find(|e| e["id"] == row["edition_id"])
                     .ok_or(UiError::Unavailable)?;
-                let versions = self
+                let version_rows = self
                     .complete_list(&format!(
                         "/catalog/timelines/{}/versions?limit=200",
                         segment(&timeline)
                     ))
-                    .await?
+                    .await?;
+                // Whole single-file originals with text subtitles: a download
+                // may carry one of them, pinned to that exact version.
+                let subtitle_downloads = version_rows
+                    .iter()
+                    .filter(|v| v["origin"] == "original")
+                    .filter_map(|v| {
+                        let [binding] = v["files"].as_array()?.as_slice() else {
+                            return None;
+                        };
+                        if binding["part"] != 1
+                            || !binding["start_ms"].is_null()
+                            || !binding["end_ms"].is_null()
+                        {
+                            return None;
+                        }
+                        let file = item_files.iter().find(|f| {
+                            f["id"] == binding["file"]["file_id"]
+                                && f["revision"] == binding["file"]["file_revision"]
+                        })?;
+                        let tracks = text_subtitle_tracks(file);
+                        let label = text(v, "label");
+                        (!tracks.is_empty()).then(|| SubtitleDownload {
+                            version_id: text(v, "id"),
+                            label: if label.trim().is_empty() {
+                                "Unnamed version".into()
+                            } else {
+                                label
+                            },
+                            tracks,
+                        })
+                    })
+                    .collect();
+                let versions = version_rows
                     .iter()
                     .map(|v| {
                         let label = text(v, "label");
@@ -750,6 +798,7 @@ impl UiQueryFacade for Queries {
                     versions,
                     prepared_downloads,
                     prepared_incomplete,
+                    subtitle_downloads,
                 });
             }
             // The planner decides per request; this only offers the action

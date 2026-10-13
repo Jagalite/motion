@@ -891,4 +891,22 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
         "{prepared}"
     );
     assert!(prepared.contains("Save this version for offline"));
+    // An original with text subtitles may be saved with one of them, pinned
+    // to exactly that version and required.
+    let subtitled = &item[item
+        .find("Save with subtitles")
+        .map(|end| item[..end].rfind("<form").unwrap())
+        .expect("subtitled original")..];
+    let subtitled = &subtitled[..subtitled.find("</form>").unwrap()];
+    assert!(subtitled.contains(r#"name="version_id" data-type="text" value="version-1""#));
+    assert!(
+        subtitled.contains(r#"<select name="tracks" data-type="json">"#),
+        "{subtitled}"
+    );
+    assert!(
+        subtitled.contains(r#"&quot;subtitle_policy&quot;:&quot;require&quot;"#)
+            && subtitled.contains(r#"&quot;subtitle_track_id&quot;:&quot;s1&quot;"#),
+        "{subtitled}"
+    );
+    assert!(subtitled.contains("Subtitle 2 · eng"));
 }

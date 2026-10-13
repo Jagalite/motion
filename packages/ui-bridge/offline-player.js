@@ -65,6 +65,11 @@ async function start() {
   host.append(element);
   await element.open(context.media_url, {startTime: context.position_ms / 1000});
   if (retired) { await element.destroy(); return; }
+  // The subtitles saved with the download (verified WebVTT in file time).
+  if (host.dataset.subtitlesUrl) {
+    if (typeof element.player.addTextTrack !== 'function') throw new Error('This player cannot present the saved subtitles.');
+    await element.player.addTextTrack({src: new URL(host.dataset.subtitlesUrl, location.origin).href, label: 'Subtitles', default: true});
+  }
   host.querySelector('.status-panel')?.remove();
   host.dataset.state = 'ready';
   unsubscribe = element.player.subscribe(state => observe(state));

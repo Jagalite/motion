@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented (review pending); 5E part 5 device side implemented (review pending); 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata, offline-subtitles and offline-subtitles-device PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1305,11 +1305,53 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `3d66651` is clean: no actionable findings.
 
+### 5E (part 5, device). Selected subtitles saved and shown offline
+
+- **Source SHA:** branch `plan-completion/offline-subtitles-device`, stacked
+  on `plan-completion/offline-subtitles`.
+- **Implemented:**
+  - **Title page:** each whole, single-file original with text subtitles
+    offers "Save with subtitles" with a choice of its tracks. The request
+    pins that exact version and the chosen track with `require`, so the
+    track ID always means that file's track.
+  - **Agent:** a manifest may name one `subtitle` file, which is required.
+    It counts against the same space admission as the media. It is fetched
+    whole after the media, size- and digest-verified, and staged as
+    `<id>.subtitles`; if it cannot be saved nothing is published and the
+    next pass retries. The cache entry records `subtitles` (digest, size).
+  - **Cache store:** the poster and subtitles are now "side files" handled
+    by one rule. Each is verified into its own blob before the entry names
+    it. It is staged, collected and released with its download, and
+    verified again on crash recovery (a corrupt one is discarded and
+    recovery declines).
+  - **Offline host and player:** `/cache/subtitles/{id}` serves the
+    verified WebVTT (checked against its digest on every read). The player
+    page names it, and the offline player adds it as the default text
+    track.
+- **Unsupported / limits:**
+  - One subtitle per download.
+  - Prepared versions' kept subtitles travel too (server side), but their
+    title-page offer is unchanged.
+  - The offline player's track addition has no automated test; it uses
+    the same Demuxe `addTextTrack` call as online playback. A real
+    Electron run belongs to 5F.
+- **Core/adapter boundary:** what may be saved is decided by the server's
+  pin (5E part 4) and verified by digest. The agent and cache store only
+  carry and verify it. No new state transition.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | Store | 23 passed. New: mismatched or missing subtitles publish nothing; verified subtitles are kept by collection and released by removal; recovery discards corrupt subtitles and succeeds once they are in place |
+  | Cache | 12 passed. New: the player page names the subtitles; the route serves the verified bytes, refuses without a session, and refuses bytes that no longer match |
+  | Compose | 22 passed. New: the "Save with subtitles" form pins the version and offers `require` with the track |
+  | Desktop JS (with `MOTION_UI_HOST_BINARY`) | 60 passed. New: subtitles are required (nothing published until saved) and admitted with the media; with the real cache tool, a title is saved with its subtitles |
+  | `access_api` 39, `v2_downloads` 11, ui-bridge 45 | passed; clippy clean |
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5E remaining: subtitle files on the device | The agent saves the pinned `subtitle` file (verified like the poster, required when selected); the cache store publishes it; the offline host serves it and the offline player adds it as a text track; the title page offers the selection for originals | 5E part 4 (server) |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work
