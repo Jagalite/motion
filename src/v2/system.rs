@@ -192,11 +192,17 @@ pub async fn capabilities(
         .server_hash
         .get_or_init(|| async {
             let exe = std::env::current_exe().ok()?;
-            tokio::task::spawn_blocking(move || std::fs::read(exe).ok())
-                .await
-                .ok()
-                .flatten()
-                .map(|bytes| format!("sha256:{}", super::sha256(&bytes)))
+            // Reading and hashing a large executable must both stay off the
+            // async worker. The once-cell retains the same process-lifetime
+            // artifact identity for subsequent capabilities requests.
+            tokio::task::spawn_blocking(move || {
+                std::fs::read(exe)
+                    .ok()
+                    .map(|bytes| format!("sha256:{}", super::sha256(&bytes)))
+            })
+            .await
+            .ok()
+            .flatten()
         })
         .await
     {
