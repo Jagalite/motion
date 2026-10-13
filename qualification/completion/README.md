@@ -332,6 +332,13 @@ findings, all fixed in the follow-up commit:
 | P2-3 | Dolby Vision profile 7 with compatibility ID 6 (UHD Blu-ray HDR10 base layer) was refused | Fixed: `(7, 6)` maps to a PQ base layer; `(8, 6)` stays refused. Unit-tested |
 | P3-3 | Font attachments were dumped without a byte bound | Fixed: the scanner records attachment MIME type and size. Core `burn_fonts` admits attachments only when every one is a font of known size (≤ 16 MiB each, ≤ 64 MiB total, ≤ 64); otherwise none are extracted and libass uses system fonts. Extraction also requires free space for the largest admissible set |
 
+Round 2 at `a3879fb` (focused on those fixes) raised one P2, fixed in the
+follow-up commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| P4-3 | Attachment rows probed before this change never gain MIME type and size, so burn-in would ignore their fonts until a full rescan | Fixed: `Track::lacks_probe_facts` re-probes legacy attachment streams, like legacy HDR video, in ordinary scans. The styled test strips the facts, scans incrementally and checks they return. Core lib 147, `playscale` lib 67, `delivery` 12 and `access_api` 39 passed; HDR and styled tests passed again |
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |

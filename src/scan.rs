@@ -486,10 +486,11 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                     if stamp != row.fingerprint {
                         return Ok(None);
                     }
-                    // HDR streams probed before colour facts were recorded
-                    // are inspected again, so conversion policy has them.
+                    // Streams probed before the facts later policies need
+                    // were recorded are inspected again (HDR colour facts,
+                    // attachment MIME types and sizes).
                     let tracks: Vec<Track> = serde_json::from_str(&row.tracks_json)?;
-                    if tracks.iter().any(Track::lacks_color_facts) {
+                    if tracks.iter().any(Track::lacks_probe_facts) {
                         return Ok(None);
                     }
                     Ok(Some(Found {

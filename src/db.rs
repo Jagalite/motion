@@ -45,9 +45,10 @@ pub struct Track {
     pub commentary: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Colour facts beyond the transfer, probed since completion item 3.
-    /// Rows probed earlier lack them (`color_probed` false) and are re-probed
-    /// by the next scan when their transfer is HDR.
+    /// Colour facts beyond the transfer and attachment facts, probed since
+    /// completion item 3. Rows probed earlier lack them (`color_probed`
+    /// false) and HDR video or attachment streams are re-probed by the next
+    /// scan (`lacks_probe_facts`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub color_probed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -85,11 +86,16 @@ impl Track {
         }
     }
 
-    /// An HDR video stream probed before colour facts were recorded.
-    pub fn lacks_color_facts(&self) -> bool {
-        self.kind == "video"
-            && !self.color_probed
-            && playscale_core::color::hdr(self.color_transfer.as_deref()).is_some()
+    /// A stream probed before the facts later policies need were recorded:
+    /// an HDR video stream's colour facts, or an attachment's MIME type and
+    /// size (which bound burned-subtitle fonts). The next scan probes it again.
+    pub fn lacks_probe_facts(&self) -> bool {
+        !self.color_probed
+            && match self.kind.as_str() {
+                "video" => playscale_core::color::hdr(self.color_transfer.as_deref()).is_some(),
+                "attachment" => true,
+                _ => false,
+            }
     }
 }
 #[derive(Debug, Serialize, ToSchema)]

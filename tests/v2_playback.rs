@@ -6246,6 +6246,43 @@ async fn styled_subtitles_are_burned_by_libass_from_the_exact_stream() {
     .await;
     build(&plain);
     plain.scan().await;
+    // An attachment recorded before its MIME type and size were probed is
+    // probed again by the next ordinary scan (fonts are bounded by them).
+    let attachment = |f: &Fixture| {
+        let db = f.server.app.db.clone();
+        async move {
+            let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+            let tracks: Value = serde_json::from_str(&tracks).unwrap();
+            tracks
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["kind"] == "attachment")
+                .cloned()
+                .unwrap()
+        }
+    };
+    let probed = attachment(&plain).await;
+    assert_eq!(
+        (
+            probed["mimetype"].as_str(),
+            probed["attachment_bytes"].as_u64()
+        ),
+        (Some("font/ttf"), Some(17))
+    );
+    sqlx::query("UPDATE media_files SET tracks_json=(SELECT json_group_array(json_remove(value,'$.color_probed','$.mimetype','$.attachment_bytes')) FROM json_each(tracks_json))")
+        .execute(&plain.server.app.db)
+        .await
+        .unwrap();
+    assert!(attachment(&plain).await["mimetype"].is_null());
+    plain.scan().await;
+    assert_eq!(
+        attachment(&plain).await["attachment_bytes"].as_u64(),
+        Some(17)
+    );
     let (timeline, _) = plain.timeline().await;
     let (_, auth) = plain.device(&["default"], PLAYER).await;
     let source = plain.source().await;
