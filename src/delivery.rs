@@ -108,6 +108,7 @@ pub struct Runtime {
     admission_slots: Arc<tokio::sync::Semaphore>,
     /// Concurrent subtitle conversions (each reads the whole source once).
     subtitle_slots: Arc<tokio::sync::Semaphore>,
+    copy_probe_slots: Arc<tokio::sync::Semaphore>,
     stopping: std::sync::atomic::AtomicBool,
     /// Bytes sent to clients for all deliveries since this process started.
     pub bytes_sent: Arc<std::sync::atomic::AtomicU64>,
@@ -160,6 +161,8 @@ struct WorkerControl {
 
 struct Session {
     id: String,
+    /// Retained by session workers and responses even after runtime retirement.
+    _artifacts: Arc<crate::artifact_leases::Lease>,
     file_id: String,
     revision: String,
     /// The v2 principal and context this delivery was admitted for; None for
@@ -180,7 +183,7 @@ struct Session {
     stream_rates: (Option<u64>, Vec<Option<u64>>),
     inner: Mutex<Inner>,
     /// Serializes subtitle sidecar extraction for this delivery.
-    subtitles: tokio::sync::Mutex<()>,
+    subtitles: Arc<tokio::sync::Mutex<()>>,
     /// Observed transfer and playback, for administrator monitoring only.
     telemetry: Arc<crate::playback_monitor::Telemetry>,
 }
@@ -194,6 +197,7 @@ impl Runtime {
             admission: tokio::sync::Mutex::new(()),
             admission_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMISSIONS)),
             subtitle_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            copy_probe_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             stopping: std::sync::atomic::AtomicBool::new(false),
             bytes_sent: Arc::default(),
             finishing: Mutex::default(),
@@ -968,6 +972,42 @@ async fn run_descriptor(
 /// Observe the details stream copy eligibility needs, before any admission
 /// transaction (a probe must not hold the database writer).
 async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, ApiError> {
+    let artifact = app
+        .processing
+        .artifacts
+        .pin([file_id.to_owned()])
+        .ok_or_else(ApiError::not_found)?;
+    let slot = app
+        .processing
+        .deliveries
+        .copy_probe_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "probe_unavailable",
+                "Source probes are busy; try again",
+            )
+        })?;
+    let admission = Arc::new((slot, artifact));
+    let app = app.clone();
+    let file_id = file_id.to_owned();
+    // The owner survives a cancelled planning/admission waiter, including
+    // uncancellable source opens and a child that has not acknowledged kill.
+    tokio::spawn(async move { probe_copy_details_owned(&app, &file_id, admission).await })
+        .await
+        .map_err(ApiError::internal)?
+}
+
+async fn probe_copy_details_owned(
+    app: &App,
+    file_id: &str,
+    admission: Arc<(
+        tokio::sync::OwnedSemaphorePermit,
+        Arc<crate::artifact_leases::Lease>,
+    )>,
+) -> Result<CopyDetails, ApiError> {
     let file: db::ItemRow = sqlx::query_as("SELECT * FROM catalog_files WHERE id=? AND available=1 AND library_id IN (SELECT id FROM libraries WHERE enabled=1)")
         .bind(file_id)
         .fetch_optional(&app.db)
@@ -984,7 +1024,7 @@ async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, Api
         root_identity,
         fingerprint: file.fingerprint.clone(),
     };
-    let input = tokio::task::spawn_blocking(move || source_valid(&source))
+    let input = admitted_blocking(admission.clone(), move || source_valid(&source))
         .await
         .map_err(ApiError::internal)?
         .map_err(|error| {
@@ -1018,6 +1058,7 @@ async fn probe_copy_details(app: &App, file_id: &str) -> Result<CopyDetails, Api
                 // Not tied to execution capacity: admission has not reserved any.
                 tracing::error!(file_id, "source probe did not exit when killed");
                 tokio::spawn(async move {
+                    let _admission = admission;
                     let _ = child.wait().await;
                 });
             }
@@ -1068,6 +1109,7 @@ async fn copy_keyframe(
     start_ms: u64,
     duration_ms: Option<u64>,
     lease: &execution::Lease,
+    artifacts: Arc<crate::artifact_leases::Lease>,
 ) -> Option<(u64, u64)> {
     let from = start_ms.saturating_sub(COPY_TARGET_SECONDS * 1000);
     let mut until = start_ms + 60_000 + COPY_TARGET_SECONDS * 1000;
@@ -1102,6 +1144,7 @@ async fn copy_keyframe(
         Ok(stdout) => stdout,
         Err(ProbeFailure::Stalled(mut child)) => {
             lease.stuck(async move {
+                let _artifacts = artifacts;
                 let _ = child.wait().await;
             });
             return None;
@@ -1649,7 +1692,15 @@ async fn run_generation(
     let (copy_start, seek_ms) = if copies_video(operation) {
         // Bounded by its own deadline; not abandoned on stop, which would leave
         // the probe unowned.
-        let probed = copy_keyframe(&app, &input, start_ms, duration_ms, &lease).await;
+        let probed = copy_keyframe(
+            &app,
+            &input,
+            start_ms,
+            duration_ms,
+            &lease,
+            session._artifacts.clone(),
+        )
+        .await;
         if stop.is_cancelled() {
             return stopped(&app, &session);
         }
@@ -3769,6 +3820,17 @@ async fn admit_owned(
         }
     }
     authority.fresh()?;
+    let artifacts = app
+        .processing
+        .artifacts
+        .pin(
+            std::iter::once(r.file_id.clone()).chain(
+                planned
+                    .iter()
+                    .flat_map(|p| p.parts.iter().map(|p| p.file.clone())),
+            ),
+        )
+        .ok_or_else(ApiError::not_found)?;
     if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3944,6 +4006,7 @@ async fn admit_owned(
     .map_err(error)?;
     let session = Arc::new(Session {
         id: new_id(),
+        _artifacts: artifacts,
         file_id: file.id.clone(),
         revision: file.revision.clone(),
         owner: planned.as_ref().map(|p| p.owner.clone()),
@@ -3994,7 +4057,7 @@ async fn admit_owned(
             changes: Default::default(),
             copy_peaks: HashMap::new(),
         }),
-        subtitles: tokio::sync::Mutex::new(()),
+        subtitles: Arc::new(tokio::sync::Mutex::new(())),
         telemetry: Arc::new({
             let telemetry = crate::playback_monitor::Telemetry::new(
                 planned.as_ref().map_or("unknown", |p| p.network),
@@ -4702,7 +4765,8 @@ pub(crate) async fn subtitle_segment(
         })
     };
     let (from, duration, offset) = window.ok_or_else(ApiError::not_found)?;
-    let text = tokio::task::spawn_blocking(move || {
+    let permit = Arc::new(permit);
+    let text = admitted_blocking(permit.clone(), move || {
         let text = std::fs::read_to_string(path).ok()?;
         let cues = playscale_core::subtitles::parse_webvtt(&text)?;
         Some(playscale_core::subtitles::webvtt_segment(
@@ -4721,6 +4785,18 @@ pub(crate) async fn subtitle_segment(
         yield Ok::<_, std::io::Error>(axum::body::Bytes::from(text));
     });
     Ok((stream_headers("text/vtt; charset=utf-8"), body).into_response())
+}
+
+// Cancellation of an async waiter cannot cancel running blocking I/O. Its
+// admission remains owned by that work until the operation actually returns.
+fn admitted_blocking<A: Send + Sync + 'static, T: Send + 'static>(
+    admission: Arc<A>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        work()
+    })
 }
 
 /// Largest sidecar accepted from the converter.
@@ -4751,17 +4827,18 @@ async fn ensure_subtitles(
     selected: SubtitleSource,
     path: PathBuf,
 ) -> Result<(), ApiError> {
-    let _extraction = session.subtitles.lock().await;
+    let extraction = session.subtitles.clone().lock_owned().await;
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Ok(());
     }
-    let _slot = app
+    let slot = app
         .processing
         .deliveries
         .subtitle_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
+    let admission = Arc::new((extraction, slot, session._artifacts.clone()));
     // A sidecar is opened like the media file: under the same validated root,
     // and only while its fingerprint is still the pinned one.
     let (source, format, map) = match &selected {
@@ -4792,7 +4869,7 @@ async fn ensure_subtitles(
     let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
-        tokio::task::spawn_blocking(move || source_valid(&source)),
+        admitted_blocking(admission.clone(), move || source_valid(&source)),
     )
     .await
     .map_err(|_| subtitles_unavailable())?
@@ -4837,7 +4914,7 @@ async fn ensure_subtitles(
     // Observe the descriptor again before publishing.
     let unchanged = tokio::time::timeout(
         PROBE_DEADLINE,
-        tokio::task::spawn_blocking(move || {
+        admitted_blocking(admission.clone(), move || {
             input
                 .metadata()
                 .is_ok_and(|m| scan::fingerprint(&m) == expected)
@@ -4895,6 +4972,35 @@ pub async fn segment(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn subtitle_admission_survives_cancelled_blocking_waiter() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let extraction = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let admission = std::sync::Arc::new((
+            extraction.clone().lock_owned().await,
+            slots.clone().try_acquire_owned().unwrap(),
+        ));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = super::admitted_blocking(admission.clone(), move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        ready.await.unwrap();
+        task.abort();
+        drop(task);
+        drop(admission);
+        assert_eq!(slots.available_permits(), 0);
+        assert!(extraction.try_lock().is_err());
+        release.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extraction.try_lock().is_ok());
+        drop(permit);
+    }
+
     use super::{CopyDetails, Operation, db, parse_copy_details, validate_route};
 
     #[test]

@@ -1017,7 +1017,7 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         .await;
     assert_eq!(m.status, StatusCode::OK);
     let text = String::from_utf8(m.bytes).unwrap();
-    assert!(text.contains("CODECS=\"avc1.64001f,mp4a.40.2\""), "{text}");
+    assert!(text.contains("CODECS=\"avc1."), "{text}");
     assert!(text.contains("variants/main/index.m3u8"), "{text}");
     let (_, other) = f.device(&["default"], PLAYER).await;
     problem(
@@ -1048,6 +1048,21 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         )
         .await;
     assert_eq!(init.status, StatusCode::OK);
+    let avcc = init
+        .bytes
+        .windows(4)
+        .position(|w| w == b"avcC")
+        .expect("H.264 initialization");
+    let actual = format!(
+        "avc1.{:02x}{:02x}{:02x}",
+        init.bytes[avcc + 5],
+        init.bytes[avcc + 6],
+        init.bytes[avcc + 7]
+    );
+    assert!(
+        text.contains(&format!("CODECS=\"{actual},mp4a.40.2\"")),
+        "{text}"
+    );
     let first = f
         .call(
             "GET",
@@ -4140,6 +4155,48 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
+
+    // A live v2 byte delivery pins this generated artifact without creating a
+    // legacy playback_sessions row. Retention must honor that real ownership.
+    sqlx::query("UPDATE processing_jobs SET updated_at=0 WHERE id=?")
+        .bind(&job)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let delivery = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("prepared-gc-pin"),
+            json!({"plan_token":pinned.body["plan_token"],"start_ms":0}),
+        )
+        .await;
+    assert_eq!(delivery.status, StatusCode::CREATED, "{}", delivery.body);
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT available FROM media_files WHERE id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap(),
+        1
+    );
+    let removed = f
+        .call(
+            "DELETE",
+            &format!(
+                "/api/v2/playback/delivery-sessions/{}",
+                delivery.body["id"].as_str().unwrap()
+            ),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
 }
 
 /// One gray frame of `path` at `at` seconds (320x240 sources).
@@ -5930,4 +5987,33 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     assert_eq!(entry["end_reason"], "interrupted");
     assert_eq!(entry["bytes_sent"], (10_000 + rest).to_string());
     assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
+}
+
+#[tokio::test]
+async fn planning_uses_one_pool_slot_for_components_and_preferences() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "2");
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let auth = bearer(OPERATOR);
+    let mut occupied = Vec::new();
+    for _ in 0..3 {
+        occupied.push(f.server.app.db.acquire().await.unwrap());
+    }
+    for policy in ["off", "auto"] {
+        let mut input = plan_input("default", &timeline, "original", None, &["http_range"]);
+        input["tracks"]["subtitle_policy"] = json!(policy);
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            f.post("/api/v2/playback/plans", &auth, None, input),
+        )
+        .await
+        .expect("planning must not acquire a second pool connection");
+        assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+        assert_eq!(response.body["status"], "ready");
+    }
 }
