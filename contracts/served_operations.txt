@@ -3,6 +3,9 @@
 # x-status is a planning field and does not record this.
 activateGeneration
 approvePairing
+approveSigninProof
+approveSigninRequest
+assignDeviceUser
 cancelJob
 cancelScan
 changeDelivery
@@ -31,6 +34,8 @@ createRelationship
 createSavedFilter
 createScan
 createSchedule
+createSigninProof
+createSigninProvider
 createSource
 createTimeline
 createVersion
@@ -48,6 +53,9 @@ deleteSavedFilter
 deleteSchedule
 deleteSource
 denyPairing
+denySigninRequest
+finishEmailSignin
+finishOidcSignin
 getAccessUser
 getAssetBytes
 getBrowserSession
@@ -73,6 +81,7 @@ getMatch
 getMediaFileBytes
 getMetadata
 getMetrics
+getMySignin
 getNextTimeline
 getOpenApi
 getPlaylist
@@ -85,6 +94,13 @@ getRelationship
 getSavedFilter
 getScan
 getSchedule
+getSigninEmailSettings
+getSigninMethods
+getSigninOverview
+getSigninProof
+getSigninRestoreReview
+getSigninTransaction
+getSigninUserDetails
 getSource
 getStorage
 getTimeline
@@ -104,6 +120,8 @@ issueContentAccess
 listAccessInvitations
 listAccessUsers
 listAdminFiles
+listAdminSigninIdentitys
+listAdminSigninSessions
 listArtwork
 listBackups
 listCatalogItems
@@ -119,6 +137,8 @@ listItemTimelines
 listJobs
 listLibrarys
 listMatches
+listMySigninIdentitys
+listMySigninSessions
 listPairings
 listPlaybackHistory
 listPlaybackSessions
@@ -130,6 +150,10 @@ listRenditions
 listSavedFilters
 listScans
 listSchedules
+listSigninAudit
+listSigninProofs
+listSigninProviders
+listSigninRequests
 listSources
 listVersions
 placeTimelineInOrder
@@ -152,14 +176,25 @@ replaceProfile
 replaceQueue
 replaceSavedFilter
 replaceSchedule
+replaceSigninEmailSettings
+replaceSigninProvider
+replaceSigninSettings
 replaceViewingDelivery
 retryJob
+reviewRestoredSignin
 revokeAccessInvitation
 revokeContentAccess
 revokeDevice
+revokeSigninSession
+revokeSigninUser
 searchCatalog
 selectArtwork
 setWatchedState
+startEmailSignin
+startOidcSignin
 subscribeEvents
 syncOffline
+testSigninEmail
+testSigninProvider
+unlinkSigninIdentity
 uploadArtwork

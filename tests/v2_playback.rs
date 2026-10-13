@@ -282,6 +282,34 @@ impl Fixture {
         (device, token)
     }
 
+    async fn assign_user(&self, device: &str) {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, Some(&format!("playback-owner-{}", uuid::Uuid::new_v4())),
+            json!({"name":"Playback owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+    }
+
     async fn policy(&self, device: &str, libraries: &[&str], permissions: &[&str], tag: &str) {
         let replaced = self
             .call(
@@ -2019,6 +2047,9 @@ async fn live_conversion_access_withdrawal(action: &str) {
     let (device, auth) = f
         .device(&["default"], &["catalog:read", "playback:request"])
         .await;
+    if action != "device" {
+        f.assign_user(&device).await;
+    }
     let caps = f.get("/api/v2/system/capabilities", &auth).await;
     assert_eq!(caps.status, StatusCode::OK);
     for id in ["catalog.v2", "playback.v2"] {

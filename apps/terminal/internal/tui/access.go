@@ -155,6 +155,9 @@ func (m Model) accessDetail(width int) []string {
 		for _, u := range values {
 			if u.ID == id {
 				lines = []string{"e edit name, grants and enabled state · n new user", "Ratings: " + clean(strings.Join(u.Policy.AllowedRatings, ", ")) + " · Blocked labels: " + clean(strings.Join(u.Policy.BlockedLabels, ", ")), "User edits narrow existing devices; widening requires a new device approval."}
+				if u.Policy.DenyRated {
+					lines = append(lines, "All rated content denied; unrated access is configured separately.")
+				}
 				lines = append(lines, m.grantSummary(u.ProfileIDs, u.Policy.LibraryIDs)...)
 				lines = append(lines, "Permissions: "+clean(strings.Join(u.Permissions, ", ")))
 				if has(u.Permissions, api.PermSystemAdmin) {
@@ -232,7 +235,7 @@ func (m *Model) grantFields(d *accessDialog, u api.User) {
 	if d.kind == "invite" {
 		d.fields = append(d.fields, textField("Expires in seconds (60–86400)", "ttl", "600"))
 	}
-	d.fields = append(d.fields, toggle("Allow unrated content", "unrated", "", u.Policy.AllowUnrated), textField("Allowed ratings (comma separated; empty = any)", "ratings", strings.Join(u.Policy.AllowedRatings, ",")), textField("Blocked labels (comma separated)", "labels", strings.Join(u.Policy.BlockedLabels, ",")))
+	d.fields = append(d.fields, toggle("Allow unrated content", "unrated", "", u.Policy.AllowUnrated), toggle("Deny all rated content", "deny_rated", "", u.Policy.DenyRated), textField("Allowed ratings (comma separated; empty = any unless denied)", "ratings", strings.Join(u.Policy.AllowedRatings, ",")), textField("Blocked labels (comma separated)", "labels", strings.Join(u.Policy.BlockedLabels, ",")))
 	profiles, _ := data[[]api.Profile](*m, keyProfiles)
 	for _, p := range profiles {
 		d.fields = append(d.fields, toggle("Profile: "+clean(p.Name), "profile", p.ID, has(u.ProfileIDs, p.ID)))
@@ -470,6 +473,8 @@ func (d *accessDialog) input() (api.UserInput, int64, error) {
 			in.Disabled = !f.checked
 		case "unrated":
 			in.Policy.AllowUnrated = f.checked
+		case "deny_rated":
+			in.Policy.DenyRated = f.checked
 		case "text":
 			switch f.id {
 			case "name":
@@ -486,6 +491,9 @@ func (d *accessDialog) input() (api.UserInput, int64, error) {
 				}
 			}
 		}
+	}
+	if in.Policy.DenyRated && len(in.Policy.AllowedRatings) != 0 {
+		return in, 0, fmt.Errorf("clear the rating allowlist when denying all rated content")
 	}
 	return in, ttl, nil
 }

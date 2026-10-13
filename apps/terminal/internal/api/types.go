@@ -128,6 +128,7 @@ type AccessPolicy struct {
 	LibraryIDs     []string `json:"library_ids"`
 	AllowUnrated   bool     `json:"allow_unrated"`
 	AllowedRatings []string `json:"allowed_ratings"`
+	DenyRated      bool     `json:"deny_rated"`
 	BlockedLabels  []string `json:"blocked_labels"`
 	Permissions    []string `json:"permissions"`
 }

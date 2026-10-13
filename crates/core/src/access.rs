@@ -65,12 +65,16 @@ pub struct Grant {
 }
 
 /// Resource restrictions beyond permissions. Rating and label restrictions are
-/// active when `allow_unrated` is false or either list is non-empty.
+/// active when rated or unrated eligibility is limited or a list is non-empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Policy {
     pub library_ids: BTreeSet<String>,
     pub allow_unrated: bool,
     pub allowed_ratings: BTreeSet<String>,
+    /// Explicit bottom for rated eligibility. An empty legacy allowlist alone
+    /// continues to mean every rating; disjoint ceilings must not become any.
+    #[serde(default)]
+    pub deny_rated: bool,
     pub blocked_labels: BTreeSet<String>,
 }
 
@@ -81,6 +85,7 @@ impl Default for Policy {
             library_ids: BTreeSet::new(),
             allow_unrated: true,
             allowed_ratings: BTreeSet::new(),
+            deny_rated: false,
             blocked_labels: BTreeSet::new(),
         }
     }
@@ -88,7 +93,64 @@ impl Default for Policy {
 
 impl Policy {
     pub fn rating_restricted(&self) -> bool {
-        !self.allow_unrated || !self.allowed_ratings.is_empty() || !self.blocked_labels.is_empty()
+        self.deny_rated
+            || !self.allow_unrated
+            || !self.allowed_ratings.is_empty()
+            || !self.blocked_labels.is_empty()
+    }
+
+    pub fn rating_eligibility(&self) -> RatingEligibility {
+        if self.deny_rated {
+            RatingEligibility::None
+        } else if self.allowed_ratings.is_empty() {
+            RatingEligibility::Any
+        } else {
+            RatingEligibility::Only(self.allowed_ratings.clone())
+        }
+    }
+
+    pub fn set_rating_eligibility(&mut self, eligibility: RatingEligibility) {
+        self.deny_rated = matches!(&eligibility, RatingEligibility::None)
+            || matches!(&eligibility, RatingEligibility::Only(ratings) if ratings.is_empty());
+        self.allowed_ratings = match eligibility {
+            RatingEligibility::Only(ratings) => ratings,
+            _ => BTreeSet::new(),
+        };
+    }
+}
+
+/// Semantic eligibility used by production grant composition. `None` applies
+/// only to rated content; the policy's `allow_unrated` remains independent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RatingEligibility {
+    Any,
+    Only(BTreeSet<String>),
+    None,
+}
+
+impl RatingEligibility {
+    pub fn within(&self, ceiling: &Self) -> bool {
+        match (self, ceiling) {
+            (Self::None, _) | (_, Self::Any) => true,
+            (Self::Only(values), Self::Only(allowed)) => values.is_subset(allowed),
+            (Self::Only(values), Self::None) => values.is_empty(),
+            _ => false,
+        }
+    }
+
+    pub fn intersection(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::None, _) | (_, Self::None) => Self::None,
+            (Self::Any, value) | (value, Self::Any) => value.clone(),
+            (Self::Only(left), Self::Only(right)) => {
+                let values: BTreeSet<_> = left.intersection(right).cloned().collect();
+                if values.is_empty() {
+                    Self::None
+                } else {
+                    Self::Only(values)
+                }
+            }
+        }
     }
 }
 

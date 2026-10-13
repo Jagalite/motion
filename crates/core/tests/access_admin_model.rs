@@ -499,7 +499,9 @@ fn grant_rating_intersection_and_attempt_boundaries() {
     d.policy.library_ids = ["lib".into()].into();
     d.policy.allowed_ratings = ["R".into()].into();
     let n = admin::constrain(&d, &user).unwrap();
-    assert!(n.policy.library_ids.is_empty());
+    assert_eq!(n.policy.library_ids, ["lib".into()].into());
+    assert!(n.policy.deny_rated);
+    assert!(n.policy.allowed_ratings.is_empty());
     assert_eq!(admin::redemption_attempt(0, 30, 59), Err(1));
     assert_eq!(admin::redemption_attempt(0, 30, 60), Ok((60, 1)));
     assert!(!admin::usable_admin(&d, true, 0));

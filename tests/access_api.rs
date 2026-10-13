@@ -126,6 +126,34 @@ impl Fixture {
 
     /// Pair a device with the given grant; returns (device_id, token).
     async fn pair(&self, profiles: &[&str], permissions: &[&str]) -> (String, String) {
+        self.pair_with_user(profiles, permissions, None).await
+    }
+
+    /// User-lifecycle tests explicitly select a local identity; legacy pairing
+    /// tests keep using `pair` and exercise unassigned-device compatibility.
+    async fn pair_owned(
+        &self,
+        profiles: &[&str],
+        permissions: &[&str],
+    ) -> (String, String, String) {
+        let user = self.call(
+            "POST", "/api/v2/users",
+            Some(json!({"name":"Explicit fixture owner","disabled":false,"profile_ids":profiles,"permissions":permissions,"policy":{"library_ids":[self.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),
+            &[("authorization", &bearer(OPERATOR)), ("idempotency-key", &format!("owned-user-{}", uuid::Uuid::new_v4()))],
+        ).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let (device, token) = self
+            .pair_with_user(profiles, permissions, Some(&user.body))
+            .await;
+        (device, token, user.body["id"].as_str().unwrap().into())
+    }
+
+    async fn pair_with_user(
+        &self,
+        profiles: &[&str],
+        permissions: &[&str],
+        user: Option<&Value>,
+    ) -> (String, String) {
         let pairing = self
             .call(
                 "POST",
@@ -137,15 +165,20 @@ impl Fixture {
         assert_eq!(pairing.status, StatusCode::CREATED, "{:?}", pairing.body);
         let id = pairing.body["id"].as_str().unwrap().to_owned();
         let key = format!("approve-{id}");
+        let mut approval = json!({"user_code":pairing.body["user_code"],"profile_ids":profiles,"permissions":permissions});
+        if let Some(user) = user {
+            approval["user_id"] = user["id"].clone();
+            approval["user_revision"] = user["revision"].clone();
+        }
         let approved = self
             .call(
                 "POST",
                 &format!("/api/v2/auth/pairings/{id}/approve"),
-                Some(json!({"user_code":pairing.body["user_code"],"profile_ids":profiles,"permissions":permissions})),
-                &[(
-                    "authorization",
-                    &format!("Bearer {OPERATOR}"),
-                ), ("idempotency-key", &key)],
+                Some(approval),
+                &[
+                    ("authorization", &format!("Bearer {OPERATOR}")),
+                    ("idempotency-key", &key),
+                ],
             )
             .await;
         assert_eq!(approved.status, StatusCode::OK, "{:?}", approved.body);
@@ -3357,6 +3390,77 @@ async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
 }
 
 // Administrator access management runs through real HTTP and SQLite.
+#[tokio::test]
+async fn explicit_device_assignment_is_revision_bound_and_preserves_principal() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, token) = f.pair(&["default"], &["catalog:read"]).await;
+    let user = access_user(&f, "Explicit assignee").await;
+    let path = format!("/api/v2/devices/{device}/user");
+    let operator = bearer(OPERATOR);
+    let input = json!({"user_id":user["id"],"user_revision":user["revision"]});
+    let denied = f
+        .call(
+            "PUT",
+            &path,
+            Some(input.clone()),
+            &[("authorization", &bearer(&token)), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    let stale = f
+        .call(
+            "PUT",
+            &path,
+            Some(json!({"user_id":user["id"],"user_revision":"0"})),
+            &[("authorization", &operator), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+    let before = f
+        .call(
+            "GET",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
+    assert!(before.body["user_id"].is_null());
+    assert_eq!(before.body["revision"], "1");
+    let assigned = f
+        .call(
+            "PUT",
+            &path,
+            Some(input.clone()),
+            &[("authorization", &operator), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+    assert_eq!(assigned.body["id"], device);
+    assert_eq!(assigned.body["user_id"], user["id"]);
+    assert_eq!(assigned.body["permissions"], json!(["catalog:read"]));
+    assert_eq!(assigned.body["revision"], "2");
+    let replay = f
+        .call(
+            "PUT",
+            &path,
+            Some(input),
+            &[("authorization", &operator), ("if-match", "\"r-2\"")],
+        )
+        .await;
+    assert_eq!(replay.status, StatusCode::PRECONDITION_FAILED);
+    let me = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("authorization", &bearer(&token))],
+        )
+        .await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert_eq!(me.body["id"], device);
+    assert_eq!(me.body["permissions"], json!(["catalog:read"]));
+}
+
 async fn access_user(f: &Fixture, name: &str) -> Value {
     let response=f.call("POST","/api/v2/users",Some(json!({"name":name,"disabled":false,"profile_ids":["default"],"permissions":["catalog:read","playback:request","events:read"],"policy":{"library_ids":[f.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",&format!("access-user-{}",uuid::Uuid::new_v4()))]).await;
     assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
@@ -3628,15 +3732,12 @@ async fn administrator_last_usable_admin_and_invitation_rate_limit() {
 }
 
 #[tokio::test]
-async fn administrator_legacy_siblings_become_managed_and_last_admin_downgrade_rolls_back() {
+async fn administrator_owned_siblings_keep_user_ceiling_and_last_admin_downgrade_rolls_back() {
     let f = Fixture::new(AccessMode::Restricted).await;
-    let (original, _) = f.pair(&["default"], &["catalog:read", "events:read"]).await;
+    let (original, _, user_id) = f
+        .pair_owned(&["default"], &["catalog:read", "events:read"])
+        .await;
     let auth = bearer(OPERATOR);
-    let user_id: String = sqlx::query_scalar("SELECT user_id FROM devices WHERE id=?")
-        .bind(&original)
-        .fetch_one(&f.app.db)
-        .await
-        .unwrap();
     let user = f
         .call(
             "GET",
@@ -3812,7 +3913,7 @@ fn user_edit(mut body: Value) -> Value {
 }
 
 #[tokio::test]
-async fn administrator_pairing_decision_race_and_generated_name_bounds() {
+async fn administrator_pairing_decision_race_and_unassigned_name_preservation() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let auth = bearer(OPERATOR);
     for (index, name) in [
@@ -3860,29 +3961,14 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
             .await;
         assert_eq!(current.status, StatusCode::OK);
         assert_eq!(current.body, approved.body);
-        let upath = format!(
-            "/api/v2/users/{}",
-            approved.body["user_id"].as_str().unwrap()
-        );
-        let u = f
-            .call("GET", &upath, None, &[("authorization", &auth)])
-            .await;
-        assert_eq!(u.body["name"].as_str().unwrap().chars().count(), 100);
-        let mut edit = user_edit(u.body);
-        edit["disabled"] = json!(true);
-        assert_eq!(
-            f.call(
-                "PUT",
-                &upath,
-                Some(edit),
-                &[
-                    ("authorization", &auth),
-                    ("if-match", u.headers["etag"].to_str().unwrap())
-                ]
-            )
+        assert!(approved.body["user_id"].is_null());
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM access_users")
+            .fetch_one(&f.app.db)
             .await
-            .status,
-            StatusCode::OK
+            .unwrap();
+        assert_eq!(
+            users, 0,
+            "legacy pairing must not invent a person from a device name"
         );
     }
     let p = f
@@ -3932,8 +4018,8 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
 async fn administrator_user_last_admin_race_and_stale_credential_do_not_lock_out() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let auth = bearer(OPERATOR);
-    let (first, _) = f.pair(&[], &["system:admin"]).await;
-    let first_path = format!("/api/v2/users/user-{first}");
+    let (first, _, first_user) = f.pair_owned(&[], &["system:admin"]).await;
+    let first_path = format!("/api/v2/users/{first_user}");
     let one = f
         .call("GET", &first_path, None, &[("authorization", &auth)])
         .await;
@@ -3954,7 +4040,7 @@ async fn administrator_user_last_admin_race_and_stale_credential_do_not_lock_out
             .await;
         assert_eq!(refused.body["code"], "last_administrator");
     }
-    let (second, _) = f.pair(&[], &["system:admin"]).await;
+    let (second, _, second_user) = f.pair_owned(&[], &["system:admin"]).await;
     // An expired or superseded parent is not a usable backup.
     for sql in [
         "UPDATE credentials SET generation=0 WHERE device_id=?",
@@ -3981,7 +4067,7 @@ async fn administrator_user_last_admin_race_and_stale_credential_do_not_lock_out
         .execute(&f.app.db)
         .await
         .unwrap();
-    let second_path = format!("/api/v2/users/user-{second}");
+    let second_path = format!("/api/v2/users/{second_user}");
     let two = f
         .call("GET", &second_path, None, &[("authorization", &auth)])
         .await;
@@ -4049,8 +4135,8 @@ async fn administrator_invitation_credential_failure_rolls_back_consumption() {
 async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
     let f = Fixture::new(AccessMode::Restricted).await;
     let (file, revision) = f.scanned_file("user-film.mp4", b"0123456789").await;
-    let (device, token) = f
-        .pair(
+    let (device, token, user_id) = f
+        .pair_owned(
             &["default"],
             &["catalog:read", "events:read", "playback:request"],
         )
@@ -4111,7 +4197,7 @@ async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
         .await;
     assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
     let url = ticket.body["url"].as_str().unwrap();
-    let path = format!("/api/v2/users/user-{device}");
+    let path = format!("/api/v2/users/{user_id}");
     let user = f
         .call("GET", &path, None, &[("authorization", &operator)])
         .await;
@@ -4266,7 +4352,7 @@ async fn administrator_invitation_replay_observes_current_user_and_limiter_survi
 #[tokio::test]
 async fn administrator_user_label_overflow_rolls_back_every_revision_and_restriction() {
     let f = Fixture::new(AccessMode::Restricted).await;
-    let (device, token) = f.pair(&["default"], &["catalog:read"]).await;
+    let (device, token, user_id) = f.pair_owned(&["default"], &["catalog:read"]).await;
     let auth = bearer(OPERATOR);
     let path = format!("/api/v2/devices/{device}/policy");
     let labels: Vec<_> = (0..200).map(|i| format!("old-{i}")).collect();
@@ -4280,7 +4366,7 @@ async fn administrator_user_label_overflow_rolls_back_every_revision_and_restric
         )
         .await;
     assert_eq!(changed.status, StatusCode::OK);
-    let upath = format!("/api/v2/users/user-{device}");
+    let upath = format!("/api/v2/users/{user_id}");
     let user = f
         .call("GET", &upath, None, &[("authorization", &auth)])
         .await;

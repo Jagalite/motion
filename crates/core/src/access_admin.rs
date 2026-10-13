@@ -46,11 +46,9 @@ pub fn within(grant: &Grant, policy: &Policy, user: &User) -> bool {
         && grant.profile_ids.is_subset(&user.grant.profile_ids)
         && policy.library_ids.is_subset(&user.policy.library_ids)
         && (!policy.allow_unrated || user.policy.allow_unrated)
-        && (user.policy.allowed_ratings.is_empty()
-            || (!policy.allowed_ratings.is_empty()
-                && policy
-                    .allowed_ratings
-                    .is_subset(&user.policy.allowed_ratings)))
+        && policy
+            .rating_eligibility()
+            .within(&user.policy.rating_eligibility())
         && user.policy.blocked_labels.is_subset(&policy.blocked_labels)
 }
 
@@ -111,24 +109,12 @@ pub fn constrain(device: &Device, user: &User) -> Result<Device, AccessError> {
             next.policy
                 .blocked_labels
                 .extend(user.policy.blocked_labels.iter().cloned());
-            if !user.policy.allowed_ratings.is_empty() {
-                if device.policy.allowed_ratings.is_empty() {
-                    next.policy.allowed_ratings = user.policy.allowed_ratings.clone();
-                } else {
-                    next.policy.allowed_ratings = device
-                        .policy
-                        .allowed_ratings
-                        .intersection(&user.policy.allowed_ratings)
-                        .cloned()
-                        .collect();
-                    // Empty means any rating. A disjoint intersection must deny
-                    // rated content; an empty library set is the safe bottom.
-                    if next.policy.allowed_ratings.is_empty() {
-                        next.policy.library_ids.clear();
-                        next.policy.allowed_ratings = user.policy.allowed_ratings.clone();
-                    }
-                }
-            }
+            next.policy.set_rating_eligibility(
+                device
+                    .policy
+                    .rating_eligibility()
+                    .intersection(&user.policy.rating_eligibility()),
+            );
         }
     }
     // Repeated ceilings accumulate restrictions. Reject overflow atomically;
@@ -137,6 +123,72 @@ pub fn constrain(device: &Device, user: &User) -> Result<Device, AccessError> {
         return Err(AccessError::PolicyLimitExceeded);
     }
     Ok(next)
+}
+
+/// Linking is an authority-preserving enrollment, including re-enrollment of
+/// a disabled identity. The observed initiating device and any existing method
+/// are both ceilings; possession of a user's identity is never a wider grant.
+pub fn link_ceiling(
+    user: &User,
+    initiating: &Device,
+    existing: Option<&Device>,
+) -> Result<Device, AccessError> {
+    let bounded = constrain(initiating, user)?;
+    if bounded.revoked {
+        return Err(AccessError::UserDisabled);
+    }
+    match existing {
+        None => Ok(bounded),
+        Some(existing) => constrain(
+            existing,
+            &User {
+                grant: bounded.grant,
+                policy: bounded.policy,
+                ..user.clone()
+            },
+        ),
+    }
+}
+
+pub fn adds_administrator(previous: &Device, next: &Device) -> bool {
+    !previous
+        .grant
+        .permissions
+        .contains(&Permission::SystemAdmin)
+        && next.grant.permissions.contains(&Permission::SystemAdmin)
+}
+
+/// Unassigned legacy devices retain their exact device authority. An assigned
+/// device requires the named current owner; a missing owner never means legacy.
+pub fn owner_allows(device: &Device, owner_id: Option<&str>, owner: Option<&User>) -> bool {
+    match (owner_id, owner) {
+        (None, None) => true,
+        (Some(id), Some(user)) if id == user.id => within(&device.grant, &device.policy, user),
+        _ => false,
+    }
+}
+
+/// Assign an unassigned device explicitly. Its current approval is intersected
+/// with the selected user's ceiling; assignment never widens or revives it.
+/// Already assigned devices require a separate recovery/transfer operation.
+pub fn assign_owner(
+    device: &Device,
+    current_owner: Option<&str>,
+    expected_device_revision: u64,
+    user: &User,
+    expected_user_revision: u64,
+) -> Result<Device, AccessError> {
+    access::revise(device.revision, expected_device_revision, false)?;
+    if current_owner.is_some() || user.revision != expected_user_revision {
+        return Err(AccessError::StaleRevision);
+    }
+    if device.revoked {
+        return Err(AccessError::DeviceRevoked);
+    }
+    if user.disabled {
+        return Err(AccessError::UserDisabled);
+    }
+    constrain(device, user)
 }
 
 pub fn usable_admin(device: &Device, credential_present: bool, now: i64) -> bool {

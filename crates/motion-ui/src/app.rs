@@ -52,6 +52,9 @@ pub fn router(facade: Facade) -> Router {
         .page(crate::screens::manage_item)
         .page(crate::screens::organize)
         .page(crate::screens::downloads)
+        .page(crate::access_screens::access)
+        .page(crate::access_screens::my_signin)
+        .page(crate::access_screens::signin)
         .build()
 }
 
@@ -250,6 +253,12 @@ fn manage_links(who: &UiPrincipal) -> Vec<ManageLink> {
         ),
         ("downloads:manage", "/downloads", "Downloads", "download"),
         ("system:admin", "/diagnostics", "Diagnostics", "diagnostics"),
+        (
+            "system:admin",
+            "/settings/access",
+            "Authentication & Access",
+            "manage",
+        ),
     ]
     .into_iter()
     .filter(|(permission, ..)| who.can(permission))
@@ -347,6 +356,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     </ul>
                                 }
                                 <ul class="nav-list nav-foot">
+                                    nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
                                     nav_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profiles".to_string(), icon_name: "profiles", current: path.starts_with("/profiles"))
                                 </ul>
                             </nav>
@@ -409,6 +419,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                             <h1>(title)</h1>
                                             <p>(message)</p>
                                             if sign_in {
+                                                <p><a class="button primary" href="/signin">"Sign in with SSO or email"</a></p>
                                                 crate::screens::pairing_form()
                                             }
                                         </section>
@@ -428,7 +439,7 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             tab_link(href: href!(search).resolve(cx), label: "Search", icon_name: "search", current: path.starts_with("/search"))
                             if can_manage {
                                 tab_link(href: href!(manage).resolve(cx), label: "Manage", icon_name: "manage",
-                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/organize", "/diagnostics"].iter().any(|p| path.starts_with(p)))
+                                    current: path.starts_with("/manage") || ["/matches", "/processing", "/sources", "/organize", "/diagnostics", "/settings/access"].iter().any(|p| path.starts_with(p)))
                             }
                             tab_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profile", icon_name: "profiles", current: path.starts_with("/profiles"))
                         </nav>

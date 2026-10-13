@@ -162,12 +162,16 @@ pub async fn capabilities(
         ("interval_seconds", "10".into()),
         ("retention_seconds", "86400".into()),
     ]);
+    let (oidc_enabled,email_enabled):(bool,bool)=sqlx::query_as("SELECT EXISTS(SELECT 1 FROM signin_providers WHERE enabled=1) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL,coalesce(json_extract(s.email_json,'$.enabled'),0) AND s.reviewed_epoch=x.restore_epoch AND s.public_origin IS NOT NULL FROM signin_settings s CROSS JOIN server_identity x").fetch_one(&app.db).await?;
     let features = vec![
         api,
         feature("identity.pairing", true, true),
         feature("identity.access_management", true, true),
         feature("identity.invitations", true, true),
         feature("identity.browser_sessions", true, true),
+        feature("identity.oidc", true, oidc_enabled),
+        feature("identity.email_codes", true, email_enabled),
+        feature("identity.action_proofs", true, true),
         feature(
             "identity.trusted_private_ingress",
             true,

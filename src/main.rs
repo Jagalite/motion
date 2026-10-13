@@ -202,6 +202,7 @@ async fn run() -> anyhow::Result<()> {
             playscale::maintenance::worker(worker_app.clone(), worker_stop.clone()),
             playscale::storage::worker(worker_app.clone(), worker_stop.clone()),
             playscale::watch::worker(worker_app.clone(), worker_stop.clone(), Default::default()),
+            playscale::v2::signin::mail_worker(worker_app.clone(), worker_stop.clone()),
             playscale::scan::configure(worker_app.clone(), args.libraries, worker_stop)
         )
         .map(|_| ());

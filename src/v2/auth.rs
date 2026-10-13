@@ -164,9 +164,14 @@ pub async fn load_device(
             Some(id) => super::access_management::load_user(conn, id).await?,
             None => None,
         };
-        if user.as_ref().is_none_or(|user| {
-            !playscale_core::access_admin::within(&row.device.grant, &row.device.policy, user)
-        }) {
+        if !playscale_core::access_admin::owner_allows(
+            &row.device,
+            row.user_id.as_deref(),
+            user.as_ref(),
+        ) {
+            row.device.revoked = true;
+        }
+        if !super::signin::device_lineage_valid(conn, id).await? {
             row.device.revoked = true;
         }
     }
@@ -197,30 +202,16 @@ pub async fn insert_device(
     row: &DeviceRow,
 ) -> Result<(), Problem> {
     let d = &row.device;
-    let user_id = match &row.user_id {
-        Some(id) => {
-            // Explicit association makes this a managed user. Its ceiling must
-            // no longer mirror one legacy device's policy endpoint.
-            sqlx::query("UPDATE access_users SET legacy=0 WHERE id=?")
-                .bind(id)
-                .execute(&mut *conn)
-                .await?;
-            id.clone()
-        }
-        None => {
-            let id = format!("user-{}", d.id);
-            let owner_name = format!("Device identity: {}", row.name);
-            let owner_name = if owner_name.chars().count() > 100 {
-                owner_name.chars().take(99).chain(['…']).collect::<String>()
-            } else {
-                owner_name
-            };
-            sqlx::query("INSERT INTO access_users(id,name,revision,profile_ids,permissions,policy,legacy,created_at) VALUES (?,?,1,?,?,?,1,?)")
-                .bind(&id).bind(owner_name).bind(json(&d.grant.profile_ids))
-                .bind(json(&d.grant.permissions)).bind(json(&d.policy)).bind(crate::now()).execute(&mut *conn).await?;
-            id
-        }
-    };
+    if let Some(id) = &row.user_id {
+        let user = super::access_management::load_user(conn, id)
+            .await?
+            .ok_or(AccessError::UserDisabled)?;
+        playscale_core::access_admin::authorize_grant(&user, user.revision, &d.grant, &d.policy)?;
+        sqlx::query("UPDATE access_users SET legacy=0 WHERE id=?")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
     sqlx::query("INSERT INTO devices(id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at,created_at,user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&d.id)
         .bind(&row.name)
@@ -233,7 +224,7 @@ pub async fn insert_device(
         .bind(d.generation as i64)
         .bind(d.credential_expires_at)
         .bind(crate::now())
-        .bind(user_id)
+        .bind(&row.user_id)
         .execute(conn)
         .await?;
     Ok(())

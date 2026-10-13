@@ -7,6 +7,7 @@
 //! media/API responses are untouched by presentation headers, and Topcoat
 //! receives the full original URI and the genuine peer address.
 
+mod access_screens;
 mod app;
 pub mod assets;
 pub mod facade;

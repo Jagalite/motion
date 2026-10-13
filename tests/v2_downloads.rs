@@ -202,6 +202,35 @@ impl Fixture {
         )
     }
 
+    async fn assign_user(&self, device: &str) -> String {
+        let operator = bearer(OPERATOR);
+        let row = self
+            .get(&format!("/api/v2/devices/{device}"), &operator)
+            .await;
+        let policy = self
+            .get(&format!("/api/v2/devices/{device}/policy"), &operator)
+            .await;
+        let mut ceiling = policy.body;
+        ceiling.as_object_mut().unwrap().remove("revision");
+        ceiling.as_object_mut().unwrap().remove("permissions");
+        let user = self.post("/api/v2/users", &operator, &format!("download-owner-{}", uuid::Uuid::new_v4()),
+            json!({"name":"Download owner","disabled":false,"profile_ids":row.body["profile_ids"],"permissions":row.body["permissions"],"policy":ceiling})).await;
+        assert_eq!(user.status, StatusCode::CREATED, "{}", user.body);
+        let assigned = self
+            .call(
+                "PUT",
+                &format!("/api/v2/devices/{device}/user"),
+                Some(json!({"user_id":user.body["id"],"user_revision":user.body["revision"]})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", row.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(assigned.status, StatusCode::OK, "{}", assigned.body);
+        user.body["id"].as_str().unwrap().into()
+    }
+
     /// Scan `name` into the library; returns (timeline_id, file_id, revision).
     async fn scanned(&self, name: &str, bytes: &[u8]) -> (String, String, String) {
         std::fs::write(self.dir.path().join("media").join(name), bytes).unwrap();
@@ -984,6 +1013,7 @@ async fn administrator_user_changes_fence_download_tickets_and_keep_history() {
     let f = Fixture::new().await;
     let (timeline, _, _) = f.scanned("user-download.mp4", b"0123456789").await;
     let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let user_id = f.assign_user(&device).await;
     let create = input(&device, &timeline);
     let download = f
         .post(
@@ -1006,7 +1036,7 @@ async fn administrator_user_changes_fence_download_tickets_and_keep_history() {
     assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
     let url = ticket.body["url"].as_str().unwrap();
     let operator = bearer(OPERATOR);
-    let path = format!("/api/v2/users/user-{device}");
+    let path = format!("/api/v2/users/{user_id}");
     let user = f.get(&path, &operator).await;
     let mut edit = user.body;
     edit.as_object_mut().unwrap().remove("id");

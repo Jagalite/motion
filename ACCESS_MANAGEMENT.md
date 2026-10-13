@@ -35,19 +35,30 @@ These screens use the public server API; they never read the database.
 Grants are bounded by the selected user's access and revision. User edits narrow
 existing devices immediately; widening a user does not silently widen an earlier
 device approval. Pair a new device for a wider grant. Ratings are comma separated;
-an empty allowed-rating list means any rating, and **Allow unrated content** is
-separate. Library and profile selections are explicit. Device-specific blocked labels stay
+an empty allowed-rating list means any rating unless **Deny all rated content**
+is selected. That explicit denial requires an empty list and is also the result
+of combining disjoint user/device rating lists. **Allow unrated content** remains
+separate. Rating and label evidence is not yet available to catalog authorization,
+so restricted rating/label policies currently deny catalog access conservatively.
+Library and profile selections are explicit. Device-specific blocked labels stay
 in effect when a user changes. If combining them would exceed 200 labels, the
 whole user edit is refused without changing any device. Adjust the device policy
 explicitly or approve a new device before retrying. Administration permits all
 operations and overrides ordinary resource restrictions; grant it deliberately.
 
 Existing devices retain their IDs, credentials, profiles and grants after upgrade.
-Each gets a separate **Legacy device: …** user, even when names match. Older
-single-device approval clients similarly create a **Device identity: …** user.
-Rename/edit that identity to manage it explicitly. Associating another device
-turns it into a shared user ceiling. There is no ownership inference from names,
-password provider, or automatic device transfer between users.
+Unassigned devices remain visibly **Unassigned**; older pairing clients can still
+approve a device without creating a person. Select a local user explicitly when
+approving new enrollment. Administrators can assign an existing unassigned device
+through `PUT /api/v2/devices/{device_id}/user`, with the device's current `If-Match`
+and `{ "user_id": "…", "user_revision": "…" }`. This narrows its grant to the
+user ceiling and does not transfer an already owned device or revive a revoked
+one. There is no ownership inference from names or email.
+
+Migration 0046 reconciles automatic placeholders created by migration 0045: only
+untouched, singly owned users without invitations are detached and removed.
+Edited users, shared users and invitation references retain their ownership.
+Device grants, credentials and viewing data are preserved.
 
 Invitations are single-use bearer secrets, stored as hashes. A lost claim response
 can return the same credential only for the same retained claim identity and exact

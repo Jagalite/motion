@@ -74,6 +74,31 @@ func TestInvitationAdminRequiresExplicitSelection(t *testing.T) {
 	}
 }
 
+func TestAccessFormsPreserveExplicitRatedDenial(t *testing.T) {
+	m := New(context.Background(), &fake{}, "", nil)
+	for _, kind := range []string{"user", "invite", "approve"} {
+		d := &accessDialog{kind: kind}
+		m.grantFields(d, api.User{Name: "Before", Policy: api.GrantPolicy{DenyRated: true, AllowUnrated: true}})
+		for i := range d.fields {
+			if d.fields[i].id == "name" {
+				d.fields[i].input.SetValue("After")
+			}
+		}
+		in, _, err := d.input()
+		if err != nil || !in.Policy.DenyRated || !in.Policy.AllowUnrated || len(in.Policy.AllowedRatings) != 0 {
+			t.Fatalf("%s lost explicit rated denial during unrelated edit: %#v %v", kind, in.Policy, err)
+		}
+		for i := range d.fields {
+			if d.fields[i].id == "ratings" {
+				d.fields[i].input.SetValue("G")
+			}
+		}
+		if _, _, err := d.input(); err == nil {
+			t.Fatalf("%s accepted contradictory rated eligibility", kind)
+		}
+	}
+}
+
 func TestAccessFormsNavigateTextToggleAndUserFields(t *testing.T) {
 	for _, kind := range []string{"user", "approve", "invite"} {
 		t.Run(kind, func(t *testing.T) {

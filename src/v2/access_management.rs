@@ -110,6 +110,12 @@ pub(super) async fn validate_grant(
     grant: &Grant,
     policy: &Policy,
 ) -> Result<(), Problem> {
+    if policy.deny_rated && !policy.allowed_ratings.is_empty() {
+        return Err(Problem::invalid(
+            "invalid_field",
+            "Denying rated content requires an empty rating allowlist",
+        ));
+    }
     identity::valid_ids(
         "profile_ids",
         &grant.profile_ids.iter().cloned().collect::<Vec<_>>(),
@@ -210,6 +216,7 @@ pub async fn create_user(
         let value = s.body.clone().unwrap_or_default();
         return Ok(identity::replayed(s, value));
     }
+    super::signin::require_fresh(&mut tx, &caller, &headers, "user.admin", "new").await?;
     let user = body.value.user(new_id(), 1)?;
     validate_grant(&mut tx, &user.grant, &user.policy).await?;
     sqlx::query("INSERT INTO access_users(id,name,revision,disabled,profile_ids,permissions,policy,created_at) VALUES (?,?,1,?,?,?,?,?)").bind(&user.id).bind(&user.name).bind(user.disabled).bind(json(&user.grant.profile_ids)).bind(json(&user.grant.permissions)).bind(json(&user.policy)).bind(now()).execute(&mut *tx).await?;
@@ -223,6 +230,7 @@ pub async fn create_user(
             None,
         )
         .await?;
+    super::signin::audit(&mut tx, &caller.principal.id, &user.id, "user.create", "ok").await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::CREATED, &response, 1))
 }
@@ -238,6 +246,7 @@ pub async fn replace_user(
     caller
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
         .await?;
+    super::signin::require_fresh(&mut tx, &caller, &headers, "user.admin", &id).await?;
     let previous = load_user(&mut tx, &id)
         .await?
         .ok_or_else(Problem::not_found)?;
@@ -269,45 +278,36 @@ pub async fn replace_user(
         }
         sqlx::query("UPDATE access_users SET name=?,revision=?,disabled=?,profile_ids=?,permissions=?,policy=?,legacy=0 WHERE id=? AND revision=?").bind(&next.name).bind(next.revision as i64).bind(next.disabled).bind(json(&next.grant.profile_ids)).bind(json(&next.grant.permissions)).bind(json(&next.policy)).bind(&id).bind(expected as i64).execute(&mut *tx).await?;
     }
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "user.replace", "ok").await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, &user_body(&next), next.revision))
 }
 
-/// Existing single-device identities preserve the pre-users policy API. Named
-/// users are ceilings; legacy identities track their sole device until edited.
+/// Unassigned devices retain the existing device policy API. Explicit owners
+/// always bound a device; changing a device never changes its owner's ceiling.
 pub(super) async fn check_device_ceiling(
     conn: &mut sqlx::SqliteConnection,
     row: &DeviceRow,
     next: &Device,
 ) -> Result<(), Problem> {
-    let id = row.user_id.as_deref().ok_or(AccessError::UserDisabled)?;
+    let Some(id) = row.user_id.as_deref() else {
+        return Ok(());
+    };
     let user = load_user(conn, id)
         .await?
         .ok_or(AccessError::UserDisabled)?;
-    let legacy: bool = sqlx::query_scalar("SELECT legacy FROM access_users WHERE id=?")
-        .bind(id)
-        .fetch_one(&mut *conn)
-        .await?;
-    if legacy {
-        if user.disabled {
-            return Err(AccessError::UserDisabled.into());
-        }
-        sqlx::query("UPDATE access_users SET revision=revision+1,profile_ids=?,permissions=?,policy=? WHERE id=?").bind(json(&next.grant.profile_ids)).bind(json(&next.grant.permissions)).bind(json(&next.policy)).bind(id).execute(conn).await?;
-        Ok(())
-    } else {
-        Ok(admin::authorize_grant(
-            &user,
-            user.revision,
-            &next.grant,
-            &next.policy,
-        )?)
-    }
+    Ok(admin::authorize_grant(
+        &user,
+        user.revision,
+        &next.grant,
+        &next.policy,
+    )?)
 }
 pub(super) async fn guard_admin_change(
     conn: &mut sqlx::SqliteConnection,
     changes: &[(Device, Device)],
 ) -> Result<(), Problem> {
-    let ids:Vec<String>=sqlx::query_scalar("SELECT DISTINCT d.id FROM devices d JOIN credentials c ON c.device_id=d.id AND c.kind='device' AND c.generation=d.generation JOIN access_users u ON u.id=d.user_id WHERE c.expires_at>? AND u.disabled=0 AND d.revoked=0").bind(now()).fetch_all(&mut *conn).await?;
+    let ids:Vec<String>=sqlx::query_scalar("SELECT DISTINCT d.id FROM devices d JOIN credentials c ON c.device_id=d.id AND c.kind='device' AND c.generation=d.generation LEFT JOIN access_users u ON u.id=d.user_id WHERE c.expires_at>? AND (d.user_id IS NULL OR u.disabled=0) AND d.revoked=0").bind(now()).fetch_all(&mut *conn).await?;
     let (mut before, mut after) = (0, 0);
     for id in ids {
         let row = auth::load_device(conn, &id)
@@ -322,6 +322,72 @@ pub(super) async fn guard_admin_change(
         after += usize::from(admin::usable_admin(next, true, now()));
     }
     Ok(admin::preserve_admin(before, after)?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceUserInput {
+    user_id: String,
+    user_revision: String,
+}
+
+/// Attach an unassigned paired device to an explicitly selected user. Both
+/// revision checks and the narrower device grant commit in one writer snapshot.
+pub async fn assign_device_user(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body<DeviceUserInput>,
+) -> Result<Response, Problem> {
+    let expected = if_match(&headers)?;
+    let expected_user = body.value.user_revision.parse::<u64>().map_err(|_| {
+        Problem::invalid("user_revision_required", "Select a current user revision")
+    })?;
+    let mut tx = begin_write(&app.db).await?;
+    caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let row = auth::load_device(&mut tx, &id)
+        .await?
+        .ok_or_else(Problem::not_found)?;
+    let user = load_user(&mut tx, &body.value.user_id)
+        .await?
+        .ok_or_else(Problem::not_found)?;
+    let next = admin::assign_owner(
+        &row.device,
+        row.user_id.as_deref(),
+        expected,
+        &user,
+        expected_user,
+    )?;
+    super::signin::require_fresh(&mut tx, &caller, &headers, "device.assign", &id).await?;
+    guard_admin_change(&mut tx, &[(row.device.clone(), next.clone())]).await?;
+    auth::update_device(&mut tx, &row.device, &next).await?;
+    let changed = sqlx::query("UPDATE devices SET user_id=? WHERE id=? AND user_id IS NULL")
+        .bind(&user.id)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    if changed.rows_affected() != 1 {
+        return Err(AccessError::StaleRevision.into());
+    }
+    sqlx::query("UPDATE access_users SET legacy=0 WHERE id=?")
+        .bind(&user.id)
+        .execute(&mut *tx)
+        .await?;
+    let row = DeviceRow {
+        device: next,
+        user_id: Some(user.id),
+        ..row
+    };
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "device.assign", "ok").await?;
+    tx.commit().await?;
+    Ok(tagged(
+        StatusCode::OK,
+        &identity::device_body(&row),
+        row.device.revision,
+    ))
 }
 
 #[derive(Serialize)]
@@ -431,6 +497,7 @@ pub async fn deny_pairing(
     scope
         .save(&mut tx, "deny", StatusCode::NO_CONTENT, None, None)
         .await?;
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "pairing.deny", "ok").await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -646,6 +713,14 @@ pub async fn create_invitation(
         )?;
         return Ok(tagged(StatusCode::CREATED, &response, row.revision as u64));
     }
+    super::signin::require_fresh(
+        &mut tx,
+        &caller,
+        &headers,
+        "invitation.create",
+        &body.value.user_id,
+    )
+    .await?;
     let input = body.value;
     if !(60..=admin::INVITATION_TTL_MAX).contains(&input.ttl_seconds) {
         return Err(Problem::invalid(
@@ -672,7 +747,7 @@ pub async fn create_invitation(
     let issuer_hash = if principal.id == "operator" {
         Some(auth::token_hash(&app.admin_token))
     } else {
-        caller.credential().map(|(hash, _)| hash.clone())
+        caller.credential().map(|(hash, _)| hash.to_owned())
     };
     sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(auth::token_hash(&code)).bind(&user.id).bind(expected as i64).bind(&principal.id).bind(principal.policy_revision as i64).bind(issuer_hash).bind(json(&grant.profile_ids)).bind(json(&grant.permissions)).bind(json(&input.policy)).bind(now()).bind(now()+input.ttl_seconds).execute(&mut *tx).await?;
     let row: InviteRow = sqlx::query_as("SELECT * FROM access_invitations WHERE id=?")
@@ -690,6 +765,14 @@ pub async fn create_invitation(
         )
         .await?;
     let response = invite_body(&row, Some(code), true)?;
+    super::signin::audit(
+        &mut tx,
+        &caller.principal.id,
+        &id,
+        "invitation.create",
+        "ok",
+    )
+    .await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::CREATED, &response, 1))
 }
@@ -716,6 +799,14 @@ pub async fn revoke_invitation(
             .execute(&mut *tx)
             .await?;
     }
+    super::signin::audit(
+        &mut tx,
+        &caller.principal.id,
+        &id,
+        "invitation.revoke",
+        "ok",
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -1,10 +1,67 @@
 # Authentication sign-in implementation ledger
 
-This branch starts `MOTION_SSO_AND_EMAIL_AUTH_PLAN.md`. A1 is **in progress**;
-A2–A5 are not implemented here. OIDC/email login and the Authentication & Access
-screen are not advertised or enabled by this change.
+Implementation now covers ownership, browser OIDC/email authentication,
+Authentication & Access administration, self-service methods, freshness proofs,
+and restore fencing. **Runtime qualification is in progress; this is not a
+completed feature or release qualification.** Methods default to disabled.
 
-## A1 checkpoint: explicit caller authority
+## Current implementation and qualification
+
+The branch integrates the committed shared access API/TUI primitives at `e804b87`
+through merge `a70be30`. Migration 0045 remains unchanged; forward migrations
+0046 and 0047 reconcile legacy ownership and add sign-in persistence. Existing
+viewing and playback ownership remains device-scoped.
+
+Production core policy owns grant intersection, linking ceilings, transaction
+purpose/revision/browser/epoch checks, one-time consumption and freshness.
+Adapters own verified OIDC observations, encrypted secret storage, bounded mail
+transport and SQLite atomic issuance. Reserving an OIDC exchange commits before
+network I/O; final identity/session issuance consumes that reservation atomically.
+An interrupted exchange fails closed and requires a new login.
+
+Completed checks on the implementation draft:
+
+- Browser bridge tests: 16 passed, including secret handling, stale revisions,
+  self-service pagination and explicit proof resubmission.
+- API contract validation: 142 paths, 201 operations, 213 schemas.
+- Isolated SQLite ownership-upgrade probe: fresh and managed legacy cases passed,
+  preserving credentials, invitations and effective grants with no foreign-key errors.
+- Kyoto dependency resolution and isolated local OIDC fixture installation passed.
+- First native compile (`a6e6a8cf968a4071826749cf03a6d3dd`, source snapshot 01)
+  failed on a UI route macro parameter name; corrected in source snapshot 02.
+- Kyoto snapshot-02 compile `da715b6363544f1ba6aff33c5e374173` was deferred
+  four times under memory/swap/disk pressure, then cancelled before completion.
+  Snapshot-03 compile `daed411bbc5443e1ba34b2bcba217e72` targets core models,
+  server/UI libraries, access/sign-in/protocol APIs, contracts and playback.
+  TUI/API Go regression job `9ad5620dc3f54d89b235171c7bf435d7` is also queued.
+  Compilation and test execution remain distinct gates; no native runtime pass
+  is claimed. Further source edits require a new final snapshot.
+- Dependency notices regenerated and verified; six notice-generator tests passed.
+  The defmt-parser archive omits licenses, so exact upstream-revision texts and
+  their provenance are preserved under `third_party/licenses`.
+- Local OIDC discovery was reached in the collaborative browser; the loopback
+  SMTP sink started. This is fixture readiness, not Motion login qualification.
+  Controlled HTTP/JWT claim/key-rotation tests and API mail-outage, network-limit
+  and secret-retention tests are added but have not executed.
+
+GPT-6.1 Sol source review found four issues, all corrected and accepted in focused
+follow-up review: restricted-device linking could inherit the owner's broader
+rights; device-policy admin elevation lacked fresh proof; pending enrollment
+could outlive its initiating fresh proof; and re-enrollment of a disabled owned
+email identity was rejected. Linking now intersects initiating-device, user and
+existing-method ceilings; admin elevation requires action-bound freshness;
+transactions capture actor revisions and the original proof deadline; same-owner
+email re-enrollment is an explicit core exception. Adapter regressions cover
+these boundaries. Final implementation-commit and PR-diff review remains pending.
+
+The local fixtures use a genuine `oidc-provider` service and a loopback SMTP sink.
+No external provider, real mailbox or live database is used. Remaining gates are
+native execution, protocol failure/key-rotation tests, browser administration and
+sign-in/playback walkthroughs, mail retry/outage, cross-client checks and final
+review. The sections below retain the earlier caller-only checkpoint evidence;
+their limitations describe that historical checkpoint, not the current source.
+
+## Historical A1 checkpoint: explicit caller authority
 
 Base: `origin/main` at `28f4b32c0df0c31d636488fdb524c23549c89bdc`.
 Worktree: `motion-auth-signin` under the seed1 volume's `Projects` directory.

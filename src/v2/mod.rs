@@ -20,6 +20,7 @@ pub mod playback;
 pub mod processing;
 pub mod scans;
 pub mod schedules;
+pub mod signin;
 pub mod system;
 pub mod viewing;
 
@@ -773,6 +774,70 @@ pub fn router() -> Router<App> {
         .route("/admin/metrics", get(system::metrics))
         .route("/system/capabilities", get(system::capabilities))
         .route("/me", get(identity::me))
+        .route("/auth/methods", get(signin::methods))
+        .route("/auth/oidc/{provider_id}/start", post(signin::oidc_start))
+        .route("/auth/oidc/callback", get(signin::oidc_callback))
+        .route("/auth/email/start", post(signin::email_start))
+        .route(
+            "/auth/email/{transaction_id}/finish",
+            post(signin::email_finish),
+        )
+        .route(
+            "/auth/transactions/{transaction_id}",
+            get(signin::transaction),
+        )
+        .route("/auth/me", get(signin::me))
+        .route("/auth/identities", get(signin::my_identities))
+        .route("/auth/sessions", get(signin::my_sessions))
+        .route(
+            "/auth/sessions/{id}",
+            axum::routing::delete(signin::revoke_session),
+        )
+        .route(
+            "/auth/identities/{id}",
+            axum::routing::delete(signin::unlink_identity),
+        )
+        .route("/auth/proofs", post(signin::create_proof))
+        .route("/auth/proofs/{id}", get(signin::get_proof))
+        .route("/auth/proofs/{id}/approve", post(signin::approve_proof))
+        .route("/admin/auth/overview", get(signin::overview))
+        .route(
+            "/admin/auth/settings",
+            axum::routing::put(signin::replace_settings),
+        )
+        .route(
+            "/admin/auth/restore-review",
+            get(signin::overview).post(signin::review_restore),
+        )
+        .route(
+            "/admin/auth/providers",
+            get(signin::list_providers).post(signin::create_provider),
+        )
+        .route(
+            "/admin/auth/providers/{id}",
+            axum::routing::put(signin::replace_provider),
+        )
+        .route(
+            "/admin/auth/providers/{id}/test",
+            post(signin::test_provider),
+        )
+        .route(
+            "/admin/auth/email",
+            get(signin::get_email).put(signin::replace_email),
+        )
+        .route("/admin/auth/email/test", post(signin::test_email))
+        .route("/admin/auth/requests", get(signin::list_requests))
+        .route(
+            "/admin/auth/requests/{id}/approve",
+            post(signin::approve_request),
+        )
+        .route("/admin/auth/requests/{id}/deny", post(signin::deny_request))
+        .route("/admin/auth/fresh-approvals", get(signin::list_proofs))
+        .route("/admin/auth/identities", get(signin::list_identities))
+        .route("/admin/auth/sessions", get(signin::list_sessions))
+        .route("/admin/auth/users/{id}", get(signin::user_details))
+        .route("/admin/auth/users/{id}/revoke", post(signin::revoke_user))
+        .route("/admin/auth/audit", get(signin::list_audit))
         .route(
             "/auth/pairings",
             post(identity::create_pairing).get(access_management::list_pairings),
@@ -817,6 +882,10 @@ pub fn router() -> Router<App> {
         )
         .route("/auth/access-tokens", post(identity::issue_access_token))
         .route("/devices", get(identity::list_devices))
+        .route(
+            "/devices/{device_id}/user",
+            axum::routing::put(access_management::assign_device_user),
+        )
         .route(
             "/devices/{device_id}",
             get(identity::get_device).delete(identity::revoke_device),

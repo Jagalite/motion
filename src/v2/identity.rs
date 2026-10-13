@@ -92,6 +92,7 @@ pub(super) async fn existing_profiles(
 pub struct PrincipalBody {
     id: String,
     device_id: Option<String>,
+    user_id: Option<String>,
     profile_ids: Vec<String>,
     permissions: Vec<Permission>,
     policy_revision: String,
@@ -120,6 +121,11 @@ async fn principal_body(
     Ok(PrincipalBody {
         id: p.id.clone(),
         device_id: p.device_id.clone(),
+        user_id: sqlx::query_scalar("SELECT user_id FROM devices WHERE id=?")
+            .bind(&p.id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten(),
         profile_ids,
         permissions,
         policy_revision: p.policy_revision.to_string(),
@@ -342,6 +348,7 @@ pub async fn approve_pairing(
         }
         return Ok(replayed(stored, body));
     }
+    super::signin::require_fresh(&mut tx, &caller, &headers, "pairing.approve", &id).await?;
     let row = load_pairing(&mut tx, &id)
         .await?
         .ok_or_else(Problem::not_found)?;
@@ -398,6 +405,7 @@ pub async fn approve_pairing(
     scope
         .save(&mut tx, &digest, StatusCode::OK, Some(&body), None)
         .await?;
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "pairing.approve", "ok").await?;
     tx.commit().await?;
     Ok(tagged(StatusCode::OK, &body, device.device.revision))
 }
@@ -719,10 +727,36 @@ pub async fn get_session(State(app): State<App>, caller: Caller) -> Result<Respo
 
 pub async fn delete_session(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
     let (hash, _, _) = cookie_session(&caller)?;
-    sqlx::query("DELETE FROM credentials WHERE token_hash=?")
-        .bind(hash)
-        .execute(&app.db)
-        .await?;
+    let mut tx = begin_write(&app.db).await?;
+    caller.reauthenticate(&mut tx).await?;
+    let family: Option<String> =
+        sqlx::query_scalar("SELECT id FROM signin_families WHERE session_hash=?")
+            .bind(hash)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(id) = family {
+        // Logout is always allowed, including the last administrator session.
+        // Independent pairing/operator recovery remains available.
+        sqlx::query("UPDATE signin_families SET revoked=1,revision=revision+1 WHERE id=?")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE devices SET revoked=1,revision=revision+1 WHERE id=?")
+            .bind(&caller.principal.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM credentials WHERE device_id=?")
+            .bind(&caller.principal.id)
+            .execute(&mut *tx)
+            .await?;
+        super::signin::audit(&mut tx, &caller.principal.id, &id, "session.logout", "ok").await?;
+    } else {
+        sqlx::query("DELETE FROM credentials WHERE token_hash=?")
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     response
         .headers_mut()
@@ -882,6 +916,7 @@ pub async fn revoke_device(
             .execute(&mut *tx)
             .await?;
     }
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "device.revoke", "ok").await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -892,6 +927,7 @@ pub struct PolicyBody {
     library_ids: Vec<String>,
     allow_unrated: bool,
     allowed_ratings: Vec<String>,
+    deny_rated: bool,
     blocked_labels: Vec<String>,
     permissions: Vec<Permission>,
 }
@@ -902,6 +938,7 @@ fn policy_body(d: &Device) -> PolicyBody {
         library_ids: d.policy.library_ids.iter().cloned().collect(),
         allow_unrated: d.policy.allow_unrated,
         allowed_ratings: d.policy.allowed_ratings.iter().cloned().collect(),
+        deny_rated: d.policy.deny_rated,
         blocked_labels: d.policy.blocked_labels.iter().cloned().collect(),
         permissions: d.grant.permissions.iter().copied().collect(),
     }
@@ -926,6 +963,8 @@ pub struct AccessPolicyInput {
     library_ids: Vec<String>,
     allow_unrated: bool,
     allowed_ratings: Vec<String>,
+    #[serde(default)]
+    deny_rated: bool,
     blocked_labels: Vec<String>,
     permissions: Vec<Permission>,
 }
@@ -940,6 +979,12 @@ pub async fn replace_policy(
     caller.require(Permission::SystemAdmin)?;
     let expected = if_match(&headers)?;
     let input = body.value;
+    if input.deny_rated && !input.allowed_ratings.is_empty() {
+        return Err(Problem::invalid(
+            "invalid_field",
+            "Denying rated content requires an empty rating allowlist",
+        ));
+    }
     valid_ids("library_ids", &input.library_ids)?;
     let text_ok = |v: &String, max: usize| {
         (1..=max).contains(&v.chars().count()) && !v.chars().any(char::is_control)
@@ -959,6 +1004,7 @@ pub async fn replace_policy(
         library_ids: input.library_ids.into_iter().collect(),
         allow_unrated: input.allow_unrated,
         allowed_ratings: input.allowed_ratings.into_iter().collect(),
+        deny_rated: input.deny_rated,
         blocked_labels: input.blocked_labels.into_iter().collect(),
     };
     let mut tx = begin_write(&app.db).await?;
@@ -980,6 +1026,10 @@ pub async fn replace_policy(
     let permissions = input.permissions.into_iter().collect();
     let device = match core::replace_policy(&row.device, expected, permissions, policy, &known)? {
         Some(next) => {
+            if playscale_core::access_admin::adds_administrator(&row.device, &next) {
+                super::signin::require_fresh(&mut tx, &caller, &headers, "device.policy", &id)
+                    .await?;
+            }
             super::access_management::guard_admin_change(
                 &mut tx,
                 &[(row.device.clone(), next.clone())],
@@ -991,6 +1041,7 @@ pub async fn replace_policy(
         }
         None => row.device,
     };
+    super::signin::audit(&mut tx, &caller.principal.id, &id, "device.policy", "ok").await?;
     tx.commit().await?;
     Ok(tagged(
         StatusCode::OK,
