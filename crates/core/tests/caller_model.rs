@@ -183,10 +183,7 @@ impl Model for Callers {
                 Effect::Changed
             }
         };
-        Ok(Transition {
-            state: next,
-            outputs: vec![output],
-        })
+        Ok(Transition::accepted(next, vec![output]))
     }
 
     fn check_state(&self, state: &State) -> Result<Vec<Check>, ModelError> {
