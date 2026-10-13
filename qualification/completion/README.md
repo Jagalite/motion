@@ -580,6 +580,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | `tests/v2_playback.rs` `multipart_text_subtitles_are_joined_in_timeline_time` | passed. New: with the profile's English subtitles `always`, a part without the component gives `auto` without subtitles and `require` refused; with it in every part, `auto` selects `s0` and the delivery publishes both parts' cues joined |
   | `multipart_versions_play_their_parts_in_order` | passed. `require` without subtitles in any part now answers `subtitle_unavailable`, as a single file does |
   | `v2_playback` 32, `route_selection_model` | passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `34dd3bc` is clean: no actionable
+  findings.
 
 ### Remaining item 3 slices (not started)
 
