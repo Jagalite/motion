@@ -907,6 +907,14 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         "INSERT INTO content_tickets(id,token_hash,principal_id,file_id,file_revision,purpose,expires_at) VALUES ('o','operator-ticket','operator','f','r','playback',9223372036854775807)",
         "INSERT INTO pairings(id,device_code_hash,user_code,device_name,client_name,expires_at,phase,device_id) VALUES ('p','code','CODE','Device','test',9223372036854775807,'approved','d')",
         "INSERT INTO idempotency_records(principal_id,operation,target,key,digest,status,issued_nonce,expires_at) VALUES ('d','pair','d','key','digest',200,'secret-replay',9223372036854775807)",
+        "INSERT INTO access_users(id,name,revision,profile_ids,permissions,policy,created_at) VALUES ('u','Owner',1,'[]','[]','{}',0)",
+        "INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,profile_ids,permissions,policy,created_at,expires_at) VALUES ('invite','code','u',1,'d',1,'[]','[]','{}',0,9223372036854775807)",
+        "INSERT INTO signin_identities(id,user_id,kind,address,profile_ids,permissions,policy,created_at) VALUES ('identity','u','email','person@example.test','[]','[]','{}',0)",
+        "INSERT INTO signin_families(id,device_id,user_id,identity_id,identity_revision,method_revision,epoch,issued_at,authenticated_at,expires_at,parent_hash,session_hash) SELECT 'family','d','u','identity',1,1,restore_epoch,0,0,9223372036854775807,'secret','cookie' FROM server_identity",
+        "INSERT INTO signin_transactions(id,state_json,return_to,created_at,expires_at) VALUES ('transaction','{}','/',0,9223372036854775807)",
+        "INSERT INTO signin_outbox(id,transaction_id,payload,next_attempt,expires_at,config_revision,destination_hash,created_at) VALUES ('mail','transaction','secret-email',0,9223372036854775807,1,'destination',0)",
+        "INSERT INTO signin_proofs(id,actor_id,action,target,epoch,code_hash,expires_at,created_at) VALUES ('proof','d','grant','u','old','code',9223372036854775807,0)",
+        "INSERT INTO signin_audit(actor,target,action,outcome,at) VALUES ('d','u','grant','ok',0)",
     ] {
         sqlx::query(sql).execute(&source).await.unwrap();
     }
@@ -919,6 +927,10 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         "content_tickets",
         "pairings",
         "idempotency_records",
+        "access_invitations",
+        "signin_transactions",
+        "signin_outbox",
+        "signin_proofs",
     ] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&restored)
@@ -931,6 +943,26 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         .await
         .unwrap();
     assert!(revoked);
+    let family: (bool, i64) =
+        sqlx::query_as("SELECT revoked,revision FROM signin_families WHERE id='family'")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+    assert_eq!(family, (true, 2));
+    let needs_review: bool = sqlx::query_scalar(
+        "SELECT reviewed_epoch != restore_epoch FROM signin_settings CROSS JOIN server_identity",
+    )
+    .fetch_one(&restored)
+    .await
+    .unwrap();
+    assert!(needs_review);
+    for table in ["access_users", "signin_identities", "signin_audit"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "retained {table}");
+    }
     let source = db::connect(&path).await.unwrap();
     let still_saved: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
         .fetch_one(&source)
