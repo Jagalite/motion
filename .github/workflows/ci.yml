@@ -101,6 +101,8 @@ jobs:
       - name: Terminal regressions
         working-directory: apps/terminal
         run: go test ./...
+      - name: Development migration copy and restore authority regressions
+        run: python3 -m unittest scripts/test_reconcile_development_migrations.py scripts/test_backup.py
       - name: Package source inventory regressions
         run: python3 scripts/test_packaging.py
       - name: Published npm player assembly (fixture Shaka assets)

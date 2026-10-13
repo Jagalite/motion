@@ -51,12 +51,23 @@ applying any pending migration to an existing database.
 | 0044 | `0044_offline_downloads.sql` | A13 (N3 downloads, PR #31) | device downloads, download ticket link, offline sequences/events/lineage |
 | 0045 | `0045_offline_event_retention.sql` | Completion item 1 (downloads) | offline event retention floor acknowledged by the device |
 | 0046 | `0046_bounded_library_queries.sql` | Completion item 2 (library queries) | durable scan admission sequence (counter and trigger) and rendition-by-timeline index; finalized before merge (earlier branch states are development-only) |
+| 0047 | `0047_restore_baselines.sql` | Offline restore | viewing baseline captured before restored service starts |
+| 0048 | `0048_download_transfers.sql` | Downloads | ordered device transfer reports |
+| 0049 | `0049_file_chapters.sql` | Chapters | revision-bound probed chapters |
+| 0050 | `0050_download_subtitles.sql` | Downloads | selected subtitle identity |
+| 0051 | `0051_previews.sql` | Previews | durable preview jobs and published sheets |
+| 0052 | `0052_preview_jobs_unique.sql` | Previews | unique active revision admission |
 | 0053 | `0053_review_download_inventory.sql` | Rewrite review U06 | bounded active download inventory independent of cancelled history |
 | 0054 | `0054_preparation_dependencies.sql` | Rewrite review A05 | invalidate preparation revisions only for source, binding and output dependencies |
 | 0055 | `0055_artwork_selection_revisions.sql` | Rewrite review C11 | advance role selection readback ETags when contribution facts change |
 | 0056 | `0056_event_ownership.sql` | Rewrite review A07 | retain organization and logical schedule scope for authorized invalidation after deletion/moves |
 | 0057 | `0057_access_management.sql` | TUI access | explicit user ownership, pairing denial, revision-bound invitations and durable redemption limits |
 | 0058 | `0058_legacy_access_ownership.sql` | SSO/email A1 | unassign untouched generated legacy placeholders; preserve device grants/credentials and deliberate user associations |
+
+| 0059 | `0059_signin.sql` | Authentication | identity, session family, sign-in transaction and audit facts |
+| 0060 | `0060_preview_layout_identity.sql` | Review repairs | layout identity and bounded retention cursor |
+| 0061 | `0061_issued_viewing_histories.sql` | Restore reconciliation | only known issued epochs may re-anchor offline sequences |
+| 0062 | `0062_marker_creation_order.sql` | Marker corrections | persisted creation order for manual corrections |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
@@ -91,3 +102,8 @@ an automatic startup rewrite or a restore: restoring a backup separately
 rotates viewing history and withdraws saved authority, including sign-in grants.
 Unknown earlier development snapshots need explicit investigation; they are
 not accepted by weakening SQLx checksum validation.
+
+Repeated restores from the same old backup cannot prove epochs created only
+after that snapshot. Offline logs claiming such unknown epochs are retained
+and refused; they are never silently discarded or re-anchored. Recovery across
+those absent histories requires a separately designed retained/signed proof.

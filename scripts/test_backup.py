@@ -27,6 +27,22 @@ def database(path):
         INSERT INTO pairings VALUES ('approved-pairing');
         CREATE TABLE idempotency_records (id TEXT PRIMARY KEY);
         INSERT INTO idempotency_records VALUES ('secret-replay');
+        CREATE TABLE access_invitations (id TEXT PRIMARY KEY);
+        INSERT INTO access_invitations VALUES ('invitation');
+        CREATE TABLE signin_transactions (id TEXT PRIMARY KEY);
+        INSERT INTO signin_transactions VALUES ('transaction');
+        CREATE TABLE signin_outbox (id TEXT PRIMARY KEY, transaction_id TEXT REFERENCES signin_transactions(id));
+        INSERT INTO signin_outbox VALUES ('email', 'transaction');
+        CREATE TABLE signin_requests (id TEXT PRIMARY KEY);
+        INSERT INTO signin_requests VALUES ('request');
+        CREATE TABLE signin_proofs (id TEXT PRIMARY KEY);
+        INSERT INTO signin_proofs VALUES ('proof');
+        CREATE TABLE signin_families (id TEXT PRIMARY KEY, revoked INTEGER, revision INTEGER);
+        INSERT INTO signin_families VALUES ('family', 0, 7);
+        CREATE TABLE signin_settings (reviewed_epoch TEXT);
+        INSERT INTO signin_settings VALUES ('original');
+        CREATE TABLE signin_audit (id TEXT);
+        INSERT INTO signin_audit VALUES ('audit');
     """)
     db.commit()
     db.close()
@@ -42,9 +58,14 @@ class RestoreEpoch(unittest.TestCase):
             backup.restore(root / 'backup', root / 'restored')
             db = sqlite3.connect(root / 'restored' / 'playscale.sqlite3')
             server, epoch = db.execute('SELECT server_id, restore_epoch FROM server_identity').fetchone()
-            for table in ('credentials', 'content_tickets', 'pairings', 'idempotency_records'):
+            for table in ('credentials', 'content_tickets', 'pairings', 'idempotency_records',
+                          'access_invitations', 'signin_transactions', 'signin_outbox',
+                          'signin_requests', 'signin_proofs'):
                 self.assertEqual(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0, table)
             self.assertEqual(db.execute('SELECT revoked FROM devices').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT revoked,revision FROM signin_families').fetchone(), (1, 8))
+            self.assertEqual(db.execute('SELECT reviewed_epoch FROM signin_settings').fetchone(), ('original',))
+            self.assertEqual(db.execute('SELECT id FROM signin_audit').fetchone(), ('audit',))
             db.close()
             with sqlite3.connect(root / 'restored' / 'playscale.sqlite3') as restored:
                 histories = {row[0] for row in restored.execute('SELECT viewing_epoch FROM server_viewing_histories')}
