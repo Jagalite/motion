@@ -1,0 +1,44 @@
+[
+  {
+    "old": 50,
+    "new": 53,
+    "sha384": "a1b8e4bbb2bf3a7146facc61e4fe4557e1a331b5e9ff1ab3fa4083c619141cb807244689a681cbd03658ac588a8de154",
+    "name": "review_download_inventory"
+  },
+  {
+    "old": 51,
+    "new": 54,
+    "sha384": "ded82e74a7af5887cc64d4cb0e0d751bb474bed8f4c6910ae9ef817c3e783a960e0983567d530fd2c6dd61ff365825c2",
+    "name": "preparation_dependencies"
+  },
+  {
+    "old": 52,
+    "new": 55,
+    "sha384": "7cd29ca930971a802ec91d439d5eae6f0d9590f39b282e4c1ea61723167537e00f4a5af402279dddbbb5e3a02b7b6100",
+    "name": "artwork_selection_revisions"
+  },
+  {
+    "old": 53,
+    "new": 56,
+    "sha384": "00f4595f57bfe1b3b2b9307d404baf371b62356439ce72f2037d50f2642d7deb20e6fb19e83535a44073a249f25723ca",
+    "name": "event_ownership"
+  },
+  {
+    "old": 45,
+    "new": 57,
+    "sha384": "466923b9df8ea5dc02280cc335274a688a455be1da1c51c30cfebe0bafdb2e247d11ca13e3864f131d02088c3b469fad",
+    "name": "access_management"
+  },
+  {
+    "old": 46,
+    "new": 58,
+    "sha384": "d1814ebaea38b68c42a0925d3c44588b80fabdc8c1e1ace3f5cafff47a231c065d29a5c274e7433ec9d373e1911779cc",
+    "name": "legacy_access_ownership"
+  },
+  {
+    "old": 47,
+    "new": 59,
+    "sha384": "7ab7d9a47c2a5eef27633e0da6fb30478b970a9028b309f1022478d097cd6e40d43cd71356047ccc6170925842484315",
+    "name": "signin"
+  }
+]
