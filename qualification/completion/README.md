@@ -1082,7 +1082,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     a version, sorting first, and checks that it is never listed.
   - **Cap:** past the read cap the title page discarded every rendition
     it had read. Read rows are kept (`list_up_to`), and the form says when
-    only some prepared versions are offered.
+    only some prepared versions are offered (round 3: the note no longer
+    points to the manage page, which has the same cap).
 
   `v2_playback` 30, compose 22 and `m3_workflows` 2 passed; pinned clippy
   is clean.

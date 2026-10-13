@@ -733,7 +733,7 @@ pub(crate) async fn download_form(
                 <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
             )
             if incomplete {
-                <p class="muted small">"Only some prepared versions are offered here; the title's manage page lists them all."</p>
+                <p class="muted small">"Only the first prepared versions found are offered here."</p>
             }
             // A prepared version is saved with exactly the selection it kept.
             for version in prepared.iter() {
