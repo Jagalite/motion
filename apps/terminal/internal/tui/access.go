@@ -54,6 +54,59 @@ func (m Model) userName(id string) string {
 	}
 	return "Unassigned"
 }
+func (m Model) grantSummary(profiles, libraries []string) []string {
+	ps, _ := data[[]api.Profile](m, keyProfiles)
+	ls, _ := data[[]api.Library](m, keyLibraries)
+	pnames, lnames := []string{}, []string{}
+	for _, id := range profiles {
+		name := id
+		for _, p := range ps {
+			if p.ID == id {
+				name = p.Name
+				break
+			}
+		}
+		pnames = append(pnames, clean(name))
+	}
+	for _, id := range libraries {
+		name := id
+		for _, l := range ls {
+			if l.ID == id {
+				name = l.Name
+				break
+			}
+		}
+		lnames = append(lnames, clean(name))
+	}
+	if len(pnames) == 0 {
+		pnames = []string{"none"}
+	}
+	if len(lnames) == 0 {
+		lnames = []string{"none"}
+	}
+	return []string{"Profiles: " + strings.Join(pnames, ", "), "Libraries: " + strings.Join(lnames, ", ")}
+}
+func (m Model) ownedDevices(id string) []string {
+	devices, ok := data[[]api.Device](m, keyDevices)
+	if !ok {
+		return []string{"Owned devices: loading; refresh before applying a user-wide change."}
+	}
+	lines := []string{}
+	for _, d := range devices {
+		if d.UserID == nil || *d.UserID != id {
+			continue
+		}
+		status := "enabled"
+		if d.Revoked {
+			status = "revoked"
+		}
+		lines = append(lines, "Device: "+clean(d.Name)+" · "+clean(d.ClientName)+" · "+status)
+	}
+	if len(lines) == 0 {
+		lines = []string{"Owned devices: none"}
+	}
+	return lines
+}
 func (m Model) accessRows(width int) ([]table.Column, []table.Row, []string) {
 	var rows []table.Row
 	var ids []string
@@ -102,6 +155,12 @@ func (m Model) accessDetail(width int) []string {
 		for _, u := range values {
 			if u.ID == id {
 				lines = []string{"e edit name, grants and enabled state · n new user", "Ratings: " + clean(strings.Join(u.Policy.AllowedRatings, ", ")) + " · Blocked labels: " + clean(strings.Join(u.Policy.BlockedLabels, ", ")), "User edits narrow existing devices; widening requires a new device approval."}
+				lines = append(lines, m.grantSummary(u.ProfileIDs, u.Policy.LibraryIDs)...)
+				lines = append(lines, "Permissions: "+clean(strings.Join(u.Permissions, ", ")))
+				if has(u.Permissions, api.PermSystemAdmin) {
+					lines = append(lines, "Administrator: unrestricted access.")
+				}
+				lines = append(lines, m.ownedDevices(u.ID)...)
 			}
 		}
 	case pageInvitations:
@@ -482,12 +541,30 @@ func (m *Model) submitAccess() tea.Cmd {
 		return result
 	}
 }
+
+// Withdraw both cached administrator data and in-flight modal results. This
+// deliberately leaves the local viewing outbox untouched.
+func (m *Model) forgetAccess() {
+	m.access = nil
+	m.accessEpoch++
+	for _, key := range []string{keyUsers, keyPairings, keyInvitations, keyDevices} {
+		m.drop(key)
+	}
+}
 func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	if m.access == nil || result.epoch != m.access.epoch || result.epoch != m.accessEpoch {
 		return nil
 	}
 	d := m.access
 	d.busy = false
+	if unauthenticated(result.err) {
+		m.signedOut(result.err)
+		return nil
+	}
+	if revoked(result.err) {
+		m.forgetAccess()
+		return m.load(keySession)
+	}
 	if result.err != nil {
 		d.message = clean(result.err.Error())
 		return nil
@@ -519,7 +596,12 @@ func (m Model) accessView() string {
 			if in.Disabled {
 				state = "DISABLED across ALL owned devices"
 			}
-			lines = append(lines, "User: "+clean(in.Name)+" · "+state, "Permissions: "+strings.Join(in.Permissions, ", "), fmt.Sprintf("%d profiles · %d libraries", len(in.ProfileIDs), len(in.Policy.LibraryIDs)), "Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.")
+			lines = append(lines, "User: "+clean(in.Name)+" · "+state, "Permissions: "+strings.Join(in.Permissions, ", "))
+			lines = append(lines, m.grantSummary(in.ProfileIDs, in.Policy.LibraryIDs)...)
+			if d.kind == "user" && d.target != "" {
+				lines = append(lines, m.ownedDevices(d.target)...)
+			}
+			lines = append(lines, "Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.")
 		}
 	} else {
 		lines = append(lines, "", "↑/↓ or Tab choose · Space toggle · Ctrl+S review · Esc cancel", "")

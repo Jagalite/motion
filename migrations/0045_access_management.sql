@@ -11,7 +11,7 @@ CREATE TABLE access_users (
  legacy INTEGER NOT NULL DEFAULT 0 CHECK(legacy IN (0,1)),
  created_at INTEGER NOT NULL
 );
-INSERT INTO access_users SELECT 'user-'||id,'Legacy device: '||name,1,revoked,profile_ids,permissions,policy,1,created_at FROM devices;
+INSERT INTO access_users SELECT 'user-'||id,substr('Legacy device: '||name,1,100),1,revoked,profile_ids,permissions,policy,1,created_at FROM devices;
 ALTER TABLE devices ADD COLUMN user_id TEXT REFERENCES access_users(id);
 UPDATE devices SET user_id='user-'||id;
 CREATE INDEX devices_user ON devices(user_id);

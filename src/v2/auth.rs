@@ -209,7 +209,7 @@ pub async fn insert_device(
         None => {
             let id = format!("user-{}", d.id);
             sqlx::query("INSERT INTO access_users(id,name,revision,profile_ids,permissions,policy,legacy,created_at) VALUES (?,?,1,?,?,?,1,?)")
-                .bind(&id).bind(format!("Device identity: {}", row.name)).bind(json(&d.grant.profile_ids))
+                .bind(&id).bind(format!("Device identity: {}", row.name).chars().take(100).collect::<String>()).bind(json(&d.grant.profile_ids))
                 .bind(json(&d.grant.permissions)).bind(json(&d.policy)).bind(crate::now()).execute(&mut *conn).await?;
             id
         }

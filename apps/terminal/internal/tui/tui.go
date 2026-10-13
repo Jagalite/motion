@@ -372,6 +372,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.signedOut(msg.err)
 			return nil
 		}
+		if (msg.key == keyUsers || msg.key == keyPairings || msg.key == keyInvitations || msg.key == keyDevices) && revoked(msg.err) {
+			m.forgetAccess()
+			return m.load(keySession)
+		}
 		if (msg.key == keyPlayback || msg.key == keyHistory) && (!m.watchesPlayback() || revoked(msg.err)) {
 			// A late answer after access ended, or the server withdrawing it.
 			m.forgetPlayback()
@@ -400,6 +404,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			}
 			if !m.admin() {
 				m.forgetMetrics()
+				m.forgetAccess()
 			}
 			var leave tea.Cmd
 			if !m.watchesPlayback() {
@@ -806,6 +811,7 @@ func unauthenticated(err error) bool {
 // device's credential: nothing it showed may stay on screen, not even the
 // sidebar's libraries, until the user refreshes after pairing again.
 func (m *Model) signedOut(err error) {
+	m.forgetAccess()
 	for key := range m.cache.slots {
 		m.drop(key)
 	}

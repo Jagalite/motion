@@ -1903,6 +1903,8 @@ async fn trusted_ingress_identity_is_listener_bound_mapped_and_never_admin() {
         "ingress callers are never administrators"
     );
     let _ = csrf;
+    // Keep a second usable administrator while testing mapped-device revocation.
+    let _backup = f.pair(&[], &["system:admin"]).await;
     // Revoking the mapped device fails the identity closed.
     let etag = f.device_etag(&device_id).await;
     let revoked = f
@@ -3795,4 +3797,389 @@ async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
         .body["code"],
         "invitation_unavailable"
     );
+}
+
+fn user_edit(mut body: Value) -> Value {
+    body.as_object_mut().unwrap().remove("id");
+    body.as_object_mut().unwrap().remove("revision");
+    body
+}
+
+#[tokio::test]
+async fn administrator_pairing_decision_race_and_generated_name_bounds() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let auth = bearer(OPERATOR);
+    for (index, name) in ["a".repeat(100), "界".repeat(100)].iter().enumerate() {
+        let p = f
+            .call(
+                "POST",
+                "/api/v2/auth/pairings",
+                Some(json!({"device_name":name,"client_name":"test"})),
+                &[],
+            )
+            .await;
+        assert_eq!(p.status, StatusCode::CREATED);
+        let path = format!(
+            "/api/v2/auth/pairings/{}/approve",
+            p.body["id"].as_str().unwrap()
+        );
+        let approved = f
+            .call(
+                "POST",
+                &path,
+                Some(json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]})),
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", &format!("long-{index}")),
+                ],
+            )
+            .await;
+        assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+        assert_eq!(approved.body["name"], *name);
+        let upath = format!(
+            "/api/v2/users/{}",
+            approved.body["user_id"].as_str().unwrap()
+        );
+        let u = f
+            .call("GET", &upath, None, &[("authorization", &auth)])
+            .await;
+        assert_eq!(u.body["name"].as_str().unwrap().chars().count(), 100);
+        let mut edit = user_edit(u.body);
+        edit["disabled"] = json!(true);
+        assert_eq!(
+            f.call(
+                "PUT",
+                &upath,
+                Some(edit),
+                &[
+                    ("authorization", &auth),
+                    ("if-match", u.headers["etag"].to_str().unwrap())
+                ]
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+    }
+    let p = f
+        .call(
+            "POST",
+            "/api/v2/auth/pairings",
+            Some(json!({"device_name":"Racing","client_name":"test"})),
+            &[],
+        )
+        .await;
+    let root = format!("/api/v2/auth/pairings/{}", p.body["id"].as_str().unwrap());
+    let apath = format!("{root}/approve");
+    let dpath = format!("{root}/deny");
+    let (a, d) = tokio::join!(
+        f.call(
+            "POST",
+            &apath,
+            Some(json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "race-approve")
+            ]
+        ),
+        f.call(
+            "POST",
+            &dpath,
+            None,
+            &[("authorization", &auth), ("idempotency-key", "race-deny")]
+        )
+    );
+    assert_ne!(
+        a.status.is_success(),
+        d.status.is_success(),
+        "{} {}",
+        a.body,
+        d.body
+    );
+    assert!(a.status.is_success() || d.status.is_success());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices WHERE name='Racing'")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, i64::from(a.status.is_success()));
+}
+
+#[tokio::test]
+async fn administrator_user_last_admin_race_and_stale_credential_do_not_lock_out() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let auth = bearer(OPERATOR);
+    let (first, _) = f.pair(&[], &["system:admin"]).await;
+    let first_path = format!("/api/v2/users/user-{first}");
+    let one = f
+        .call("GET", &first_path, None, &[("authorization", &auth)])
+        .await;
+    for disabled in [true, false] {
+        let mut edit = user_edit(one.body.clone());
+        if disabled {
+            edit["disabled"] = json!(true);
+        } else {
+            edit["permissions"] = json!([]);
+        }
+        let refused = f
+            .call(
+                "PUT",
+                &first_path,
+                Some(edit),
+                &[("authorization", &auth), ("if-match", "\"r-1\"")],
+            )
+            .await;
+        assert_eq!(refused.body["code"], "last_administrator");
+    }
+    let (second, _) = f.pair(&[], &["system:admin"]).await;
+    // An expired or superseded parent is not a usable backup.
+    for sql in [
+        "UPDATE credentials SET generation=0 WHERE device_id=?",
+        "UPDATE credentials SET generation=1,expires_at=0 WHERE device_id=?",
+    ] {
+        sqlx::query(sql)
+            .bind(&second)
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+        let refused = f
+            .call(
+                "DELETE",
+                &format!("/api/v2/devices/{first}"),
+                None,
+                &[("authorization", &auth), ("if-match", "\"r-1\"")],
+            )
+            .await;
+        assert_eq!(refused.body["code"], "last_administrator");
+    }
+    sqlx::query("UPDATE credentials SET expires_at=? WHERE device_id=?")
+        .bind(playscale::now() + 600)
+        .bind(&second)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let second_path = format!("/api/v2/users/user-{second}");
+    let two = f
+        .call("GET", &second_path, None, &[("authorization", &auth)])
+        .await;
+    let mut a = user_edit(one.body);
+    a["disabled"] = json!(true);
+    let mut b = user_edit(two.body);
+    b["permissions"] = json!([]);
+    let (a, b) = tokio::join!(
+        f.call(
+            "PUT",
+            &first_path,
+            Some(a),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        ),
+        f.call(
+            "PUT",
+            &second_path,
+            Some(b),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+    );
+    assert_ne!(a.status.is_success(), b.status.is_success());
+    assert_eq!(
+        if a.status.is_success() {
+            b.body["code"].clone()
+        } else {
+            a.body["code"].clone()
+        },
+        "last_administrator"
+    );
+}
+
+#[tokio::test]
+async fn administrator_invitation_credential_failure_rolls_back_consumption() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Rollback").await;
+    let invite = access_invite(&f, &user, "rollback-invite").await;
+    sqlx::query("CREATE TRIGGER refuse_credential BEFORE INSERT ON credentials BEGIN SELECT RAISE(ABORT,'injected issue failure'); END").execute(&f.app.db).await.unwrap();
+    let input = redemption(&invite["code"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(input.clone()),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let phase: Option<String> = sqlx::query_scalar("SELECT claim_hash FROM access_invitations")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(phase, None);
+    sqlx::query("DROP TRIGGER refuse_credential")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("POST", "/api/v2/auth/invitations/redeem", Some(input), &[])
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (file, revision) = f.scanned_file("user-film.mp4", b"0123456789").await;
+    let (device, token) = f
+        .pair(
+            &["default"],
+            &["catalog:read", "events:read", "playback:request"],
+        )
+        .await;
+    f.grant_library(
+        &device,
+        &["catalog:read", "events:read", "playback:request"],
+    )
+    .await;
+    let auth = bearer(&token);
+    let operator = bearer(OPERATOR);
+    let session = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":token})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(session.status, StatusCode::OK);
+    let cookie = session.headers["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let child = f
+        .call(
+            "POST",
+            "/api/v2/auth/access-tokens",
+            Some(json!({"ttl_seconds":600})),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "user-child-token"),
+            ],
+        )
+        .await;
+    assert_eq!(child.status, StatusCode::CREATED, "{}", child.body);
+    let child_auth = bearer(child.body["access_token"].as_str().unwrap());
+    let response = f
+        .raw(f.request("GET", "/api/v2/events", None, &[("authorization", &auth)]))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body();
+    let _ = sse(&mut stream, 1).await;
+    let ticket_input = json!({"purpose":"playback","delivery_id":null,"generation":null,"file":{"file_id":file,"file_revision":revision},"download_id":null,"ttl_seconds":600});
+    let ticket = f
+        .call(
+            "POST",
+            "/api/v2/content-access",
+            Some(ticket_input.clone()),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "user-ticket-key"),
+            ],
+        )
+        .await;
+    assert_eq!(ticket.status, StatusCode::CREATED, "{}", ticket.body);
+    let url = ticket.body["url"].as_str().unwrap();
+    let path = format!("/api/v2/users/user-{device}");
+    let user = f
+        .call("GET", &path, None, &[("authorization", &operator)])
+        .await;
+    let mut edit = user_edit(user.body);
+    edit["permissions"] = json!(["catalog:read", "events:read"]);
+    let narrowed = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit.clone()),
+            &[
+                ("authorization", &operator),
+                ("if-match", user.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(narrowed.status, StatusCode::OK, "{}", narrowed.body);
+    for headers in [
+        vec![("authorization", auth.as_str())],
+        vec![("authorization", child_auth.as_str())],
+        vec![("cookie", cookie.as_str())],
+    ] {
+        let me = f.call("GET", "/api/v2/me", None, &headers).await;
+        assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+        assert_eq!(
+            me.body["permissions"],
+            json!(["catalog:read", "events:read"])
+        );
+        assert_eq!(me.body["policy_revision"], "3");
+    }
+    for method in ["GET", "HEAD"] {
+        assert_eq!(
+            f.raw(f.request(method, url, None, &[])).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/content-access",
+            Some(ticket_input),
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "user-ticket-key")
+            ]
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    let (events, _) = sse(&mut stream, 1).await;
+    assert_eq!(events[0].1["reason"], "policy_changed");
+    assert_eq!(events[0].1["policy_revision"], "3");
+    edit["disabled"] = json!(true);
+    let disabled = f
+        .call(
+            "PUT",
+            &path,
+            Some(edit),
+            &[
+                ("authorization", &operator),
+                ("if-match", narrowed.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(disabled.status, StatusCode::OK, "{}", disabled.body);
+    for headers in [
+        vec![("authorization", auth.as_str())],
+        vec![("authorization", child_auth.as_str())],
+        vec![("cookie", cookie.as_str())],
+    ] {
+        assert_eq!(
+            f.call("GET", "/api/v2/me", None, &headers).await.status,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(f.bytes(url, &[]).await.0, StatusCode::UNAUTHORIZED);
+    assert!(sse(&mut stream, 1).await.1);
+    for table in ["credentials", "content_tickets"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
 }

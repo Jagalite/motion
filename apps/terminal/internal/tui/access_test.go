@@ -119,3 +119,36 @@ func TestInvitationRevokeUsesStrongRevision(t *testing.T) {
 		t.Fatalf("wrong ETag: %q", f.revokedETag)
 	}
 }
+
+func TestAuthorizationWithdrawalClearsAccessAndFencesLateSecrets(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		m := New(context.Background(), &accessFake{fake: &fake{}}, "", nil)
+		m.accessEpoch = 7
+		m.access = &accessDialog{epoch: 7, secret: "private", busy: true}
+		m.cache.slots[keyUsers] = &slot{data: []api.User{{Name: "private"}}}
+		m.accessFinished(accessDone{epoch: 7, err: &api.Problem{Status: status}})
+		if m.access != nil || m.cache.slots[keyUsers] != nil || m.accessEpoch == 7 {
+			t.Fatalf("%d retained administrator content", status)
+		}
+		m.accessFinished(accessDone{epoch: 7, invitation: &api.Invitation{Code: "late-secret"}})
+		if m.access != nil {
+			t.Fatal("late response restored secret")
+		}
+	}
+	f := &fake{permissions: []string{api.PermSystemAdmin}}
+	m := start(t, f, 100, 40)
+	m.accessEpoch = 9
+	m.access = &accessDialog{epoch: 9, secret: "private"}
+	f.permissions = []string{api.PermCatalogRead}
+	m = drain(t, m, m.load(keySession))
+	if m.access != nil || m.accessEpoch == 9 {
+		t.Fatal("verified admin loss retained dialog")
+	}
+	m.access = &accessDialog{epoch: m.accessEpoch, secret: "private"}
+	epoch := m.accessEpoch
+	m.signedOut(&api.Problem{Status: 401})
+	m.accessFinished(accessDone{epoch: epoch, invitation: &api.Invitation{Code: "late-secret"}})
+	if m.access != nil {
+		t.Fatal("sign-out retained or restored dialog")
+	}
+}
