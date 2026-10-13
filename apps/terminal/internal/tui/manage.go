@@ -22,7 +22,7 @@ const (
 
 func (m Model) kind() pageKind {
 	switch m.route.page {
-	case pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
+	case pagePairings, pageUsers, pageInvitations, pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
 		return kindTable
 	case pageOverview, pageActivity, pageServer:
 		return kindText
@@ -89,6 +89,8 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 	var rows []table.Row
 	var ids []string
 	switch m.route.page {
+	case pagePairings, pageUsers, pageInvitations:
+		return m.accessRows(width)
 	case pageNowPlaying, pageHistory:
 		return m.playbackRows(width)
 	case pageProcessing:
@@ -291,6 +293,9 @@ func (m Model) detail() string {
 }
 
 func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
+	if handled, cmd := m.accessAction(msg); handled {
+		return cmd
+	}
 	page := max(m.tvisible, 1) // as many rows as are on screen
 	m.tselID = ""              // moving by keys: the index leads
 	switch {

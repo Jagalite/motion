@@ -20,7 +20,7 @@ use playscale_core::access::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-fn bounded(field: &str, value: &str, min: usize, max: usize) -> Result<(), Problem> {
+pub(super) fn bounded(field: &str, value: &str, min: usize, max: usize) -> Result<(), Problem> {
     let n = value.chars().count();
     if n < min || n > max || value.trim() != value || value.chars().any(char::is_control) {
         return Err(Problem::invalid(
@@ -31,7 +31,7 @@ fn bounded(field: &str, value: &str, min: usize, max: usize) -> Result<(), Probl
     Ok(())
 }
 
-fn valid_ids(field: &str, ids: &[String]) -> Result<(), Problem> {
+pub(super) fn valid_ids(field: &str, ids: &[String]) -> Result<(), Problem> {
     let ok = ids.len() <= 200
         && ids.iter().all(|id| {
             !id.is_empty()
@@ -51,14 +51,14 @@ fn valid_ids(field: &str, ids: &[String]) -> Result<(), Problem> {
 }
 
 /// A JSON response with a strong ETag for the returned revision.
-fn tagged<T: Serialize>(status: StatusCode, body: &T, revision: u64) -> Response {
+pub(super) fn tagged<T: Serialize>(status: StatusCode, body: &T, revision: u64) -> Response {
     let mut response = (status, Json(body)).into_response();
     response.headers_mut().insert(header::ETAG, etag(revision));
     response
 }
 
 /// Replays a stored acknowledgement without re-executing the operation.
-fn replayed(stored: Stored, body: serde_json::Value) -> Response {
+pub(super) fn replayed(stored: Stored, body: serde_json::Value) -> Response {
     let revision = body
         .get("revision")
         .and_then(|r| r.as_str())
@@ -73,7 +73,7 @@ fn replayed(stored: Stored, body: serde_json::Value) -> Response {
     response
 }
 
-async fn existing_profiles(
+pub(super) async fn existing_profiles(
     conn: &mut sqlx::SqliteConnection,
     ids: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, Problem> {
@@ -174,13 +174,15 @@ pub async fn create_pairing(
     app.access.admit_pairing_request()?;
     let now = now();
     let mut tx = begin_write(&app.db).await?;
-    sqlx::query("DELETE FROM pairings WHERE expires_at<=?")
+    sqlx::query("DELETE FROM pairings WHERE expires_at<=?-86400")
         .bind(now)
         .execute(&mut *tx)
         .await?;
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM pairings WHERE phase='pending'")
-        .fetch_one(&mut *tx)
-        .await?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pairings WHERE phase='pending' AND denied=0 AND expires_at>?",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
     if !core::admit_pairing(pending as usize) {
         return Err(Problem::rate_limited(60));
     }
@@ -188,13 +190,14 @@ pub async fn create_pairing(
     let device_code = auth::derive_secret(&app.access.key, Purpose::PairingCode, &auth::nonce());
     let user_code = user_code();
     let expires_at = now + PAIRING_TTL_SECONDS;
-    sqlx::query("INSERT INTO pairings(id,device_code_hash,user_code,device_name,client_name,expires_at,phase) VALUES (?,?,?,?,?,?,'pending')")
+    sqlx::query("INSERT INTO pairings(id,device_code_hash,user_code,device_name,client_name,expires_at,phase,created_at) VALUES (?,?,?,?,?,?,'pending',?)")
         .bind(&id)
         .bind(auth::token_hash(&device_code))
         .bind(&user_code)
         .bind(&request.device_name)
         .bind(&request.client_name)
         .bind(expires_at)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -211,7 +214,7 @@ pub async fn create_pairing(
         .into_response())
 }
 
-type PairingRow = (
+pub(super) type PairingRow = (
     String,
     String,
     i64,
@@ -222,33 +225,39 @@ type PairingRow = (
     String,
     String,
     Option<i64>,
+    bool,
 );
 
-async fn load_pairing(
+pub(super) async fn load_pairing(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
 ) -> Result<Option<PairingRow>, Problem> {
     Ok(sqlx::query_as(
-        "SELECT device_code_hash,user_code,expires_at,phase,device_id,last_claim_at,credential_nonce,device_name,client_name,claimed_generation FROM pairings WHERE id=?",
+        "SELECT device_code_hash,user_code,expires_at,phase,device_id,last_claim_at,credential_nonce,device_name,client_name,claimed_generation,denied FROM pairings WHERE id=?",
     )
     .bind(id)
     .fetch_optional(conn)
     .await?)
 }
 
-fn pairing(id: &str, row: &PairingRow) -> Pairing {
+pub(super) fn pairing(id: &str, row: &PairingRow) -> Pairing {
     let device_id = row.4.clone().unwrap_or_default();
     Pairing {
         id: id.into(),
         user_code: row.1.clone(),
         expires_at: row.2,
-        phase: match row.3.as_str() {
-            "pending" => PairingPhase::Pending,
-            "approved" => PairingPhase::Approved { device_id },
-            _ => PairingPhase::Claimed {
-                device_id,
-                generation: row.9.unwrap_or_default() as u64,
-            },
+        phase: if row.10 {
+            PairingPhase::Denied
+        } else {
+            match row.3.as_str() {
+                "pending" => PairingPhase::Pending,
+                "approved" => PairingPhase::Approved { device_id },
+                "claimed" => PairingPhase::Claimed {
+                    device_id,
+                    generation: row.9.unwrap_or_default() as u64,
+                },
+                _ => PairingPhase::Denied,
+            }
         },
     }
 }
@@ -259,6 +268,12 @@ pub struct PairingApproval {
     user_code: String,
     profile_ids: Vec<String>,
     permissions: Vec<Permission>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    user_revision: Option<String>,
+    #[serde(default)]
+    policy: Policy,
 }
 
 #[derive(Serialize)]
@@ -269,9 +284,11 @@ pub struct DeviceBody {
     profile_ids: Vec<String>,
     permissions: Vec<Permission>,
     revoked: bool,
+    user_id: Option<String>,
+    client_name: String,
 }
 
-fn device_body(row: &DeviceRow) -> DeviceBody {
+pub(super) fn device_body(row: &DeviceRow) -> DeviceBody {
     let d = &row.device;
     DeviceBody {
         id: d.id.clone(),
@@ -280,6 +297,8 @@ fn device_body(row: &DeviceRow) -> DeviceBody {
         profile_ids: d.grant.profile_ids.iter().cloned().collect(),
         permissions: d.grant.permissions.iter().copied().collect(),
         revoked: d.revoked,
+        user_id: row.user_id.clone(),
+        client_name: row.client_name.clone(),
     }
 }
 
@@ -312,6 +331,15 @@ pub async fn approve_pairing(
     if core::idempotency(stored.as_ref().map(|s| &s.record), &digest, now)? == Idempotent::Replay {
         let stored = stored.unwrap();
         let body = stored.body.clone().unwrap_or_default();
+        let device_id = body["id"].as_str().ok_or(AccessError::ReplayUnavailable)?;
+        let current = auth::load_device(&mut tx, device_id)
+            .await?
+            .ok_or(AccessError::ReplayUnavailable)?;
+        if current.device.revoked
+            || body["revision"].as_str() != Some(&current.device.revision.to_string())
+        {
+            return Err(AccessError::ReplayUnavailable.into());
+        }
         return Ok(replayed(stored, body));
     }
     let row = load_pairing(&mut tx, &id)
@@ -330,14 +358,29 @@ pub async fn approve_pairing(
         &grant,
         &known,
     )?;
+    super::access_management::validate_grant(&mut tx, &grant, &approval.policy).await?;
+    if let Some(user_id) = &approval.user_id {
+        let user = super::access_management::load_user(&mut tx, user_id)
+            .await?
+            .ok_or_else(Problem::not_found)?;
+        let expected = approval
+            .user_revision
+            .as_deref()
+            .and_then(|r| r.parse().ok())
+            .ok_or_else(|| Problem::invalid("user_revision_required", "Select a current user"))?;
+        playscale_core::access_admin::authorize_grant(&user, expected, &grant, &approval.policy)?;
+    }
+    let mut approved = Device::approved(new_id(), grant);
+    approved.policy = approval.policy;
     let device = DeviceRow {
-        device: Device::approved(new_id(), grant),
+        device: approved,
+        user_id: approval.user_id,
         name: row.7.clone(),
         client_name: row.8.clone(),
     };
     auth::insert_device(&mut tx, &device).await?;
     let updated = sqlx::query(
-        "UPDATE pairings SET phase='approved',device_id=? WHERE id=? AND phase='pending'",
+        "UPDATE pairings SET phase='approved',device_id=? WHERE id=? AND phase='pending' AND denied=0",
     )
     .bind(&device.device.id)
     .bind(&id)
@@ -612,6 +655,7 @@ async fn bootstrap_device(
                         permissions: Permission::ALL.into_iter().collect(),
                     },
                 ),
+                user_id: None,
                 name: "Desktop".into(),
                 client_name: "motion-desktop".into(),
             };
@@ -823,6 +867,11 @@ pub async fn revoke_device(
         .await?
         .ok_or_else(Problem::not_found)?;
     if let Some(next) = core::revoke(&row.device, expected)? {
+        super::access_management::guard_admin_change(
+            &mut tx,
+            &[(row.device.clone(), next.clone())],
+        )
+        .await?;
         auth::update_device(&mut tx, &row.device, &next).await?;
         sqlx::query("DELETE FROM credentials WHERE device_id=?")
             .bind(&id)
@@ -927,6 +976,12 @@ pub async fn replace_policy(
     let permissions = input.permissions.into_iter().collect();
     let device = match core::replace_policy(&row.device, expected, permissions, policy, &known)? {
         Some(next) => {
+            super::access_management::guard_admin_change(
+                &mut tx,
+                &[(row.device.clone(), next.clone())],
+            )
+            .await?;
+            super::access_management::check_device_ceiling(&mut tx, &row, &next).await?;
             auth::update_device(&mut tx, &row.device, &next).await?;
             next
         }

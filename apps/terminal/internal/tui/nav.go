@@ -20,6 +20,9 @@ const (
 	pageServer
 	pageNowPlaying
 	pageHistory
+	pagePairings
+	pageUsers
+	pageInvitations
 )
 
 // route names a page; library and item pages carry the resource ID.
@@ -48,7 +51,13 @@ func (r route) keys() []string {
 	case pageOverview:
 		return []string{keyJobs}
 	case pageDevices:
-		return []string{keyDevices}
+		return []string{keyDevices, keyUsers}
+	case pagePairings:
+		return []string{keyPairings, keyUsers, keyProfiles, keyLibraries}
+	case pageUsers:
+		return []string{keyUsers, keyProfiles, keyLibraries, keyDevices}
+	case pageInvitations:
+		return []string{keyInvitations, keyUsers, keyProfiles, keyLibraries}
 	case pageSources:
 		return []string{keySources}
 	case pageNowPlaying:
@@ -115,6 +124,9 @@ func (m Model) navEntries() []navEntry {
 	if allows(api.PermSourcesManage) {
 		entries = append(entries, navEntry{group: "Admin", label: "Sources", icon: "▥", route: route{page: pageSources}})
 	}
+	if allows(api.PermSystemAdmin) && m.accessFeature() {
+		entries = append(entries, navEntry{group: "Admin", label: "Pairing requests", icon: "⇄", route: route{page: pagePairings}}, navEntry{group: "Admin", label: "Users and access", icon: "♙", route: route{page: pageUsers}}, navEntry{group: "Admin", label: "Invitations", icon: "✉", route: route{page: pageInvitations}})
+	}
 	if allows(api.PermSystemAdmin) {
 		entries = append(entries, navEntry{group: "Admin", label: "Devices", icon: "▢", route: route{page: pageDevices}})
 	}
@@ -161,6 +173,12 @@ func (m Model) title(r route) string {
 		return "Scans"
 	case pageDevices:
 		return "Devices"
+	case pagePairings:
+		return "Pairing requests"
+	case pageUsers:
+		return "Users and access"
+	case pageInvitations:
+		return "Access invitations"
 	case pageSources:
 		return "Sources"
 	case pageActivity:

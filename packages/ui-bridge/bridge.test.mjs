@@ -265,3 +265,31 @@ test('desktop-only download actions are revealed only inside the desktop host', 
     assert.equal(action.hidden, !revealed);
   }
 });
+
+test('invitation redemption retains claim after lost response without storing the code', async () => {
+  const storage = new Map(), bodies = [], paths = [];
+  let first = true;
+  const bridge = harness(storage, async (path, options) => {
+    paths.push(path); bodies.push(JSON.parse(options.body));
+    if (first) {first = false; throw new Error('connection lost');}
+    return {ok: true, status: 200, json: async () => ({access_token: 'credential'})};
+  });
+  const f = form([input('code','text','private-invitation'),input('device_name','text','Browser'),input('client_name','text','Motion web')]);
+  f.classList.contains = cls => cls === 'invitation';
+  await bridge.submitCommand(f); await bridge.submitCommand(f);
+  assert.equal(paths.length, 3);
+  assert.equal(paths[2], '/api/v2/auth/session');
+  assert.deepEqual(bodies[0], bodies[1]);
+  assert.match(bodies[0].claim_id, /^[a-f0-9]{32}$/);
+  assert.equal(storage.size, 0);
+});
+
+test('denied pairing ends polling with an actionable outcome', async () => {
+  let calls = 0;
+  const bridge = harness(new Map(), async () => {
+    calls++;
+    return {ok:false, status:409, json:async()=>({code:'pairing_denied',detail:'Pairing denied'})};
+  });
+  await bridge.pair(form(), {id:'pair',user_code:'CODE',device_code:'secret',poll_interval_seconds:0,expires_at:new Date(Date.now()+1000).toISOString()});
+  assert.equal(calls,1);
+});

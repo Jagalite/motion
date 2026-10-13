@@ -69,6 +69,8 @@ type notice struct {
 
 // Model is the interface state.
 type Model struct {
+	access      *accessDialog
+	accessEpoch int
 	ctx         context.Context
 	backend     Backend
 	server      string
@@ -311,6 +313,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case accessDone:
+		return m.accessFinished(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case spinner.TickMsg:
@@ -580,6 +584,9 @@ func (m Model) navIndex() int {
 func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	if msg.String() == "ctrl+c" {
 		return tea.Quit
+	}
+	if m.access != nil {
+		return m.accessKey(msg)
 	}
 	if m.confirm != "" {
 		switch {

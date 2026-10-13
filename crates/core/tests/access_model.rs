@@ -617,6 +617,7 @@ fn expected(s: &State, input: &Input) -> Expect {
             match (&p.phase, device) {
                 _ if s.now >= p.expires_at => Expect::Reject(AccessError::PairingExpired),
                 (PairingPhase::Pending, _) => Expect::Reject(AccessError::PairingPending),
+                (PairingPhase::Denied, _) => Expect::Reject(AccessError::PairingDenied),
                 (_, Some(d)) if d.revoked => Expect::Reject(AccessError::DeviceRevoked),
                 (PairingPhase::Approved { .. }, Some(d)) => Expect::Issued(d.generation + 1),
                 (PairingPhase::Claimed { generation, .. }, Some(d)) => {

@@ -84,6 +84,16 @@ func (m *Model) poll() tea.Cmd {
 		return s == nil || (!s.loading && time.Since(s.at) >= every-pollEvery/4)
 	}
 	var cmds []tea.Cmd
+	if m.admin() && m.accessFeature() {
+		switch m.route.page {
+		case pagePairings, pageUsers, pageInvitations, pageDevices:
+			for _, key := range m.route.keys() {
+				if due(key, 5*time.Second) {
+					cmds = append(cmds, m.load(key))
+				}
+			}
+		}
+	}
 	watching := m.route.page == pageOverview || m.route.page == pageServer
 	if watching && m.admin() {
 		if due(keyDiagnostics, pollEvery) {

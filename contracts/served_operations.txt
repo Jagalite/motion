@@ -10,6 +10,8 @@ claimPairing
 closeDelivery
 commitReconciliation
 commitSourceRelocation
+createAccessInvitation
+createAccessUser
 createBackup
 createBrowserSession
 createCatalogItem
@@ -45,6 +47,8 @@ deleteRelationship
 deleteSavedFilter
 deleteSchedule
 deleteSource
+denyPairing
+getAccessUser
 getAssetBytes
 getBrowserSession
 getCapabilities
@@ -97,6 +101,8 @@ headMediaFileBytes
 heartbeatDelivery
 issueApiAccessToken
 issueContentAccess
+listAccessInvitations
+listAccessUsers
 listAdminFiles
 listArtwork
 listBackups
@@ -113,6 +119,7 @@ listItemTimelines
 listJobs
 listLibrarys
 listMatches
+listPairings
 listPlaybackHistory
 listPlaybackSessions
 listPlaylists
@@ -131,7 +138,9 @@ previewMerge
 previewSourceRelocation
 previewSplit
 recordViewingEvent
+redeemAccessInvitation
 refreshMetadata
+replaceAccessUser
 replaceCatalogItem
 replaceCollection
 replaceDevicePolicy
@@ -145,6 +154,7 @@ replaceSavedFilter
 replaceSchedule
 replaceViewingDelivery
 retryJob
+revokeAccessInvitation
 revokeContentAccess
 revokeDevice
 searchCatalog

@@ -234,6 +234,8 @@ func (m Model) header(width int) []string {
 		lines = m.titled("Processing", count(keyJobs, "job", "jobs"))
 	case pageScans:
 		lines = m.titled("Scans", count(keyScans, "scan", "scans"))
+	case pagePairings, pageUsers, pageInvitations:
+		lines = m.titled(m.title(m.route), "n new · a approve · e edit · d deny/revoke")
 	case pageDevices:
 		lines = m.titled("Devices", count(keyDevices, "device", "devices"))
 	case pageProfiles:
@@ -290,7 +292,11 @@ func (m Model) sessionProblem() error {
 // View declares the frame and the terminal state the console wants: the
 // alternate screen and a window title that summarises the server.
 func (m Model) View() tea.View {
-	v := tea.NewView(m.render())
+	body := m.render()
+	if m.access != nil {
+		body = m.accessView()
+	}
+	v := tea.NewView(body)
 	v.AltScreen = true
 	v.ReportFocus = true
 	v.MouseMode = tea.MouseModeCellMotion

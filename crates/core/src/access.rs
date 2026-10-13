@@ -157,6 +157,11 @@ pub enum AccessError {
     PairingExpired,
     PairingPending,
     PairingDecided,
+    PairingDenied,
+    UserDisabled,
+    GrantExceeded,
+    LastAdministrator,
+    InvitationUnavailable,
     UserCodeMismatch,
     UnknownProfile,
     UnknownLibrary,
@@ -181,6 +186,11 @@ impl AccessError {
             Self::PairingExpired => "pairing_expired",
             Self::PairingPending => "pairing_pending",
             Self::PairingDecided => "pairing_already_decided",
+            Self::PairingDenied => "pairing_denied",
+            Self::UserDisabled => "user_disabled",
+            Self::GrantExceeded => "grant_exceeded",
+            Self::LastAdministrator => "last_administrator",
+            Self::InvitationUnavailable => "invitation_unavailable",
             Self::UserCodeMismatch => "user_code_mismatch",
             Self::UnknownProfile => "unknown_profile",
             Self::UnknownLibrary => "unknown_library",
@@ -197,6 +207,7 @@ impl AccessError {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PairingPhase {
     Pending,
+    Denied,
     Approved {
         device_id: String,
     },
@@ -341,6 +352,7 @@ pub fn claim(
     }
     let (device_id, claimed) = match &pairing.phase {
         PairingPhase::Pending => return Err(AccessError::PairingPending),
+        PairingPhase::Denied => return Err(AccessError::PairingDenied),
         PairingPhase::Approved { device_id } => (device_id, None),
         PairingPhase::Claimed {
             device_id,

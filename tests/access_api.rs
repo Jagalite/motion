@@ -52,10 +52,7 @@ impl Fixture {
                 dir.path().join("cache"),
                 Default::default(),
             )),
-            access: Arc::new(playscale::v2::Runtime::new(
-                mode,
-                playscale::v2::auth::random_key(),
-            )),
+            access: Arc::new(playscale::v2::Runtime::new(mode, [0; 32])),
         };
         Self {
             _dir: dir,
@@ -3348,4 +3345,454 @@ async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// Administrator access management runs through real HTTP and SQLite.
+async fn access_user(f: &Fixture, name: &str) -> Value {
+    let response=f.call("POST","/api/v2/users",Some(json!({"name":name,"disabled":false,"profile_ids":["default"],"permissions":["catalog:read","playback:request","events:read"],"policy":{"library_ids":[f.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",name)]).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
+    response.body
+}
+async fn access_invite(f: &Fixture, user: &Value, key: &str) -> Value {
+    let response=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":user["revision"],"profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",key)]).await;
+    assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
+    response.body
+}
+fn redemption(code: &Value, claim: &str) -> Value {
+    json!({"code":code,"claim_id":claim,"device_name":"Browser","client_name":"test"})
+}
+#[tokio::test]
+async fn administrator_invitation_atomic_claim_retry_restart_and_revocation() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Alice").await;
+    let inv = access_invite(&f, &user, "invitation-one").await;
+    let code = inv["code"].as_str().unwrap();
+    let stored: String = sqlx::query_scalar("SELECT code_hash FROM access_invitations WHERE id=?")
+        .bind(inv["id"].as_str().unwrap())
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_ne!(stored, code);
+    let input = redemption(&inv["code"], "0123456789abcdef0123456789abcdef");
+    let (a, b) = tokio::join!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(input.clone()),
+            &[]
+        ),
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(input.clone()),
+            &[]
+        )
+    );
+    assert_eq!(a.status, StatusCode::OK, "{:?}", a.body);
+    assert_eq!(a.body, b.body);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices WHERE user_id=?")
+        .bind(user["id"].as_str().unwrap())
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    // Rebuild all process-local access state, retaining the installation key/DB.
+    let mut restarted = f.app.clone();
+    restarted.access = Arc::new(playscale::v2::Runtime::new(AccessMode::Restricted, [0; 32]));
+    let response = api::router(restarted, None)
+        .oneshot(f.request("POST", "/api/v2/auth/invitations/redeem", Some(&input), &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(replay, a.body);
+    let other = f
+        .call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(redemption(&inv["code"], "fedcba9876543210fedcba9876543210")),
+            &[],
+        )
+        .await;
+    assert_eq!(other.body["code"], "invitation_unavailable");
+    let device = a.body["device_id"].as_str().unwrap();
+    let revoked = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{device}"),
+            None,
+            &[
+                ("authorization", &format!("Bearer {OPERATOR}")),
+                ("if-match", "\"r-1\""),
+            ],
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{:?}", revoked.body);
+    let replay = f
+        .call("POST", "/api/v2/auth/invitations/redeem", Some(input), &[])
+        .await;
+    assert_eq!(replay.body["code"], "invitation_unavailable");
+}
+#[tokio::test]
+async fn administrator_user_disable_fences_siblings_and_stale_edits() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Household").await;
+    let mut devices = vec![];
+    for n in 0..2 {
+        let inv = access_invite(&f, &user, &format!("invite-{n}")).await;
+        let r = f
+            .call(
+                "POST",
+                "/api/v2/auth/invitations/redeem",
+                Some(redemption(&inv["code"], "0123456789abcdef0123456789abcdef")),
+                &[],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        devices.push(r.body);
+    }
+    let auth = format!("Bearer {OPERATOR}");
+    let d0 = devices[0]["device_id"].as_str().unwrap();
+    let r = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{d0}"),
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let token = format!("Bearer {}", devices[1]["access_token"].as_str().unwrap());
+    assert_eq!(
+        f.call("GET", "/api/v2/me", None, &[("authorization", &token)])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let mut input = user.clone();
+    input.as_object_mut().unwrap().remove("id");
+    input.as_object_mut().unwrap().remove("revision");
+    input["disabled"] = json!(true);
+    let path = format!("/api/v2/users/{}", user["id"].as_str().unwrap());
+    let r = f
+        .call(
+            "PUT",
+            &path,
+            Some(input.clone()),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(
+        f.call("GET", "/api/v2/me", None, &[("authorization", &token)])
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.call(
+            "PUT",
+            &path,
+            Some(input),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::PRECONDITION_FAILED
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+#[tokio::test]
+async fn administrator_pairing_deny_competes_with_approval() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let request = f
+        .call(
+            "POST",
+            "/api/v2/auth/pairings",
+            Some(json!({"device_name":"Unknown TV","client_name":"test"})),
+            &[],
+        )
+        .await;
+    let auth = format!("Bearer {OPERATOR}");
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "deny"),
+    ];
+    let list = f.call("GET", "/api/v2/auth/pairings", None, &headers).await;
+    assert_eq!(list.body["items"][0]["device_name"], "Unknown TV");
+    let id = request.body["id"].as_str().unwrap();
+    let path = format!("/api/v2/auth/pairings/{id}/deny");
+    assert_eq!(
+        f.call("POST", &path, None, &headers).await.status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.call("POST", &path, None, &headers).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let approve = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{id}/approve"),
+            Some(json!({"user_code":request.body["user_code"],"profile_ids":[],"permissions":[]})),
+            &[("authorization", &auth), ("idempotency-key", "approve")],
+        )
+        .await;
+    assert_eq!(approve.body["code"], "pairing_already_decided");
+    let claim = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{id}/claim"),
+            Some(json!({"device_code":request.body["device_code"]})),
+            &[],
+        )
+        .await;
+    assert_eq!(claim.body["code"], "pairing_denied");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM devices")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+#[tokio::test]
+async fn administrator_last_usable_admin_and_invitation_rate_limit() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (id, _) = f.pair(&[], &["system:admin"]).await;
+    let auth = format!("Bearer {OPERATOR}");
+    let r = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/devices/{id}"),
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(r.body["code"], "last_administrator");
+    let (_backup, _) = f.pair(&[], &["system:admin"]).await;
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/devices/{id}"),
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    for _ in 0..30 {
+        let r = f
+            .call(
+                "POST",
+                "/api/v2/auth/invitations/redeem",
+                Some(redemption(
+                    &json!("invalid"),
+                    "0123456789abcdef0123456789abcdef",
+                )),
+                &[],
+            )
+            .await;
+        assert_eq!(r.body["code"], "invitation_unavailable");
+    }
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(redemption(
+                &json!("invalid"),
+                "0123456789abcdef0123456789abcdef"
+            )),
+            &[]
+        )
+        .await
+        .status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn administrator_legacy_siblings_become_managed_and_last_admin_downgrade_rolls_back() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (original, _) = f.pair(&["default"], &["catalog:read", "events:read"]).await;
+    let auth = bearer(OPERATOR);
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM devices WHERE id=?")
+        .bind(&original)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let user = f
+        .call(
+            "GET",
+            &format!("/api/v2/users/{user_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await
+        .body;
+    let invitation = access_invite(&f, &user, "legacy-sibling").await;
+    let sibling = f
+        .call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(redemption(
+                &invitation["code"],
+                "0123456789abcdef0123456789abcdef",
+            )),
+            &[],
+        )
+        .await;
+    assert_eq!(sibling.status, StatusCode::OK, "{:?}", sibling.body);
+    let legacy: bool = sqlx::query_scalar("SELECT legacy FROM access_users WHERE id=?")
+        .bind(&user_id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert!(!legacy);
+    let narrower = json!({"library_ids":[],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[],"permissions":["events:read"]});
+    let r = f
+        .call(
+            "PUT",
+            &format!("/api/v2/devices/{original}/policy"),
+            Some(narrower.clone()),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    // A per-device edit no longer silently mutates the shared user ceiling.
+    let same = f
+        .call(
+            "GET",
+            &format!("/api/v2/users/{user_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await
+        .body;
+    assert_eq!(same, user);
+    let mut edit = user.clone();
+    edit.as_object_mut().unwrap().remove("id");
+    edit.as_object_mut().unwrap().remove("revision");
+    edit["permissions"] = json!(["events:read"]);
+    assert_eq!(
+        f.call(
+            "PUT",
+            &format!("/api/v2/users/{user_id}"),
+            Some(edit),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let me = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[(
+                "authorization",
+                &bearer(sibling.body["access_token"].as_str().unwrap()),
+            )],
+        )
+        .await;
+    assert_eq!(me.body["permissions"], json!(["events:read"]));
+    assert_eq!(me.body["policy_revision"], "2");
+    let (admin_id, _) = f.pair(&[], &["system:admin"]).await;
+    let r = f
+        .call(
+            "PUT",
+            &format!("/api/v2/devices/{admin_id}/policy"),
+            Some(narrower),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(r.body["code"], "last_administrator");
+    let admin = f
+        .call(
+            "GET",
+            &format!("/api/v2/devices/{admin_id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(admin.body["permissions"], json!(["system:admin"]));
+}
+#[tokio::test]
+async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let user = access_user(&f, "Invite target").await;
+    let auth = bearer(OPERATOR);
+    let expired = access_invite(&f, &user, "expired").await;
+    sqlx::query("UPDATE access_invitations SET expires_at=? WHERE id=?")
+        .bind(playscale::now())
+        .bind(expired["id"].as_str().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let input = redemption(&expired["code"], "0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        f.call("POST", "/api/v2/auth/invitations/redeem", Some(input), &[])
+            .await
+            .body["code"],
+        "invitation_unavailable"
+    );
+    let invite = access_invite(&f, &user, "race").await;
+    let path = format!(
+        "/api/v2/auth/invitations/{}",
+        invite["id"].as_str().unwrap()
+    );
+    let (claimed, revoked) = tokio::join!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(redemption(
+                &invite["code"],
+                "0123456789abcdef0123456789abcdef"
+            )),
+            &[]
+        ),
+        f.call(
+            "DELETE",
+            &path,
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+    );
+    assert_ne!(claimed.status.is_success(), revoked.status.is_success());
+    assert!(claimed.status.is_success() || revoked.status.is_success());
+    // Two admins permit revoking the issuer while keeping a usable administrator.
+    let (issuer, token) = f.pair(&[], &["system:admin"]).await;
+    let _backup = f.pair(&[], &["system:admin"]).await;
+    let issued=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":"1","profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&bearer(&token)),("idempotency-key","issuer-invite")]).await;
+    assert_eq!(issued.status, StatusCode::CREATED, "{:?}", issued.body);
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/devices/{issuer}"),
+            None,
+            &[("authorization", &auth), ("if-match", "\"r-1\"")]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(redemption(
+                &issued.body["code"],
+                "0123456789abcdef0123456789abcdef"
+            )),
+            &[]
+        )
+        .await
+        .body["code"],
+        "invitation_unavailable"
+    );
 }

@@ -97,9 +97,12 @@ type Pairing struct {
 }
 
 type PairingApproval struct {
-	UserCode    string   `json:"user_code"`
-	ProfileIDs  []string `json:"profile_ids"`
-	Permissions []string `json:"permissions"`
+	UserID       string       `json:"user_id,omitempty"`
+	UserRevision string       `json:"user_revision,omitempty"`
+	Policy       *GrantPolicy `json:"policy,omitempty"`
+	UserCode     string       `json:"user_code"`
+	ProfileIDs   []string     `json:"profile_ids"`
+	Permissions  []string     `json:"permissions"`
 }
 
 // Credential.AccessToken is a secret; never print or log it.
@@ -110,6 +113,8 @@ type Credential struct {
 }
 
 type Device struct {
+	UserID      *string  `json:"user_id"`
+	ClientName  string   `json:"client_name"`
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Revision    string   `json:"revision"`
