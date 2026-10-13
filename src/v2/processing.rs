@@ -185,8 +185,17 @@ async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Val
     let available = tokio::time::timeout(std::time::Duration::from_secs(5), command.status())
         .await
         .is_ok_and(|r| r.is_ok_and(|s| s.success()));
+    // Filters this FFmpeg was observed to have, not assumed.
+    let observed = crate::processing::filters(&app).await;
+    let mut filters = vec!["scale"];
+    if observed.zscale {
+        filters.push("zscale");
+    }
+    if observed.tonemap {
+        filters.push("tonemap");
+    }
     Ok(Json(
-        json!({"ffmpeg_digest":digest,"pipelines":[{"id":"software_h264","decode":"ffmpeg","filters":["scale"],"encode":"libx264","backend":"software","available":available,"qualification":"unqualified","receipt_id":Value::Null}],"interactive_slots":0,"background_slots":1}),
+        json!({"ffmpeg_digest":digest,"pipelines":[{"id":"software_h264","decode":"ffmpeg","filters":filters,"encode":"libx264","backend":"software","available":available,"qualification":"unqualified","receipt_id":Value::Null}],"interactive_slots":0,"background_slots":1}),
     ))
 }
 

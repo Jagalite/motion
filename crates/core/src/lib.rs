@@ -2,6 +2,7 @@
 pub mod access;
 pub mod artwork;
 pub mod catalog;
+pub mod color;
 pub mod components;
 pub mod delivery;
 pub mod delivery_admission;

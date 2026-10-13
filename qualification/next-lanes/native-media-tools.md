@@ -153,10 +153,10 @@ apply to the new FFmpeg bytes.
 
 | Case | Tool artifact | Production route |
 |---|---|---|
-| HDR10 (PQ) → SDR BT.709 | supported, pixel-verified | **refused** (`hdr_unsupported`) until M4 policy lands |
-| HLG → SDR | supported, property-verified | **refused** |
+| HDR10 (PQ) → SDR BT.709 | supported, pixel-verified | **refused** at this lane; implemented for single-file live conversions by completion item 3A |
+| HLG → SDR | supported, property-verified | **refused** at this lane; implemented by item 3A (not pixel-tested through the server) |
 | Dolby Vision profile 5 (IPT-PQ-c2, no HDR10 base) | not supported by zscale/tonemap | must stay **refused** |
-| DV 7/8.1 (HDR10-compatible base layer) | base layer tone-mappable as PQ | **refused**; needs DV side-data probe |
+| DV 7/8.1 (HDR10-compatible base layer) | base layer tone-mappable as PQ | **refused** at this lane; item 3A probes the DV configuration and admits profiles 7/8 with an HDR10 (or 8.4 HLG) base layer |
 | HDR10+ dynamic metadata | ignored (static tone map) | n/a |
 | HDR preserve (original bytes to HDR client) | unchanged | unchanged |
 | Styled ASS/SSA burn-in | supported (libass) | **refused** (`subtitle_format_unsupported`) |

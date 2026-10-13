@@ -111,6 +111,8 @@ pub async fn capabilities(
             playscale_core::access::IDEMPOTENCY_RETENTION_SECONDS.to_string(),
         ),
     ]);
+    let filters = crate::processing::filters(&app).await;
+    let tone_mapping = filters.zscale && filters.tonemap;
     let mut playback = feature("playback.v2", true, true);
     playback.limits = BTreeMap::from([
         (
@@ -148,7 +150,26 @@ pub async fn capabilities(
             }
             .into(),
         ),
-        ("unsupported", "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast".into()),
+        (
+            "hdr",
+            // Tone mapping is advertised only when this server's FFmpeg has
+            // the filters; the source facts still decide per title.
+            if tone_mapping {
+                "preserve_original_for_hdr_clients,tone_map_to_sdr_on_single_file_conversions:pq,hlg,dolby_vision_7_8_with_hdr10_or_hlg_base"
+            } else {
+                "preserve_original_for_hdr_clients"
+            }
+            .into(),
+        ),
+        (
+            "unsupported",
+            if tone_mapping {
+                "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion_on_multipart,hdr_preparation,cast"
+            } else {
+                "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast"
+            }
+            .into(),
+        ),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),
     ]);

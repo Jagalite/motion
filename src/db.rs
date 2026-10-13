@@ -45,6 +45,47 @@ pub struct Track {
     pub commentary: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Colour facts beyond the transfer, probed since completion item 3.
+    /// Rows probed earlier lack them (`color_probed` false) and are re-probed
+    /// by the next scan when their transfer is HDR.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub color_probed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_primaries: Option<String>,
+    /// Matrix coefficients (ffprobe `color_space`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_space: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_range: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mastering_peak_nits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cll_nits: Option<u32>,
+    /// Dolby Vision profile and base-layer signal compatibility ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dolby_vision: Option<(u8, u8)>,
+}
+
+impl Track {
+    /// The probed colour facts the core HDR policy decides from.
+    pub fn color_facts(&self) -> playscale_core::color::ColorFacts<'_> {
+        playscale_core::color::ColorFacts {
+            transfer: self.color_transfer.as_deref(),
+            primaries: self.color_primaries.as_deref(),
+            matrix: self.color_space.as_deref(),
+            range: self.color_range.as_deref(),
+            mastering_peak_nits: self.mastering_peak_nits,
+            max_cll_nits: self.max_cll_nits,
+            dolby_vision: self.dolby_vision,
+        }
+    }
+
+    /// An HDR video stream probed before colour facts were recorded.
+    pub fn lacks_color_facts(&self) -> bool {
+        self.kind == "video"
+            && !self.color_probed
+            && playscale_core::color::hdr(self.color_transfer.as_deref()).is_some()
+    }
 }
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Item {

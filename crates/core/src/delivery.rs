@@ -53,8 +53,11 @@ pub struct SourceStreams<'a> {
     pub video: Option<&'a str>,
     /// The selected audio stream; None when audio is omitted.
     pub audio: Option<&'a str>,
-    /// PQ or HLG transfer: no live route has a qualified tone-mapping path.
+    /// PQ or HLG transfer.
     pub hdr: bool,
+    /// An HDR source this conversion may tone-map to SDR (`color::tone_map`
+    /// accepted its facts with the observed filters). Copies never do.
+    pub tone_map: bool,
     /// Every source stream (hence the container) starts at media time zero.
     /// Stream copy keeps source timestamps, which equal timeline time only then.
     pub starts_at_zero: bool,
@@ -164,7 +167,9 @@ pub fn burnable_subtitle(codec: &str) -> bool {
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.
 pub fn live_route_supported(operation: Operation, s: &SourceStreams<'_>) -> bool {
-    if s.hdr || s.video.is_none() {
+    // HDR pixels are only ever converted to SDR by an explicit tone map.
+    let hdr_ok = !s.hdr || (s.tone_map && operation == Operation::VideoTranscode);
+    if !hdr_ok || s.video.is_none() {
         return false;
     }
     let details = s.details.is_some_and(|d| {
@@ -214,6 +219,10 @@ pub struct Pin {
     /// (`playback_session::adaptive`). Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub adaptive: bool,
+    /// The HDR-to-SDR tone map this conversion applies (`color::tone_map`).
+    /// Omitted for SDR sources and byte routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone_map: Option<crate::color::ToneMap>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1163,6 +1172,7 @@ mod tests {
             parts: vec![],
             max_bitrate_bps: None,
             adaptive: false,
+            tone_map: None,
         }
     }
     fn step(d: &mut Delivery, input: Input) -> Result<Vec<Effect>, Error> {
@@ -1564,6 +1574,7 @@ mod tests {
             video,
             audio,
             hdr,
+            tone_map: false,
             starts_at_zero: true,
             eight_bit_420: true,
             details: Some(VideoDetails {
@@ -1590,6 +1601,15 @@ mod tests {
             Operation::VideoTranscode,
             &streams(Some("hevc"), None, true)
         ));
+        // An accepted tone map admits HDR to a conversion only, never a copy.
+        let mapped = SourceStreams {
+            tone_map: true,
+            ..streams(Some("h264"), Some("aac"), true)
+        };
+        assert!(live_route_supported(Operation::VideoTranscode, &mapped));
+        assert!(!live_route_supported(Operation::Remux, &mapped));
+        assert!(!live_route_supported(Operation::AudioConvert, &mapped));
+        assert_eq!(copy_operation(&mapped), None);
         assert!(!live_route_supported(Operation::Original, &h264_aac));
         let offset = SourceStreams {
             starts_at_zero: false,

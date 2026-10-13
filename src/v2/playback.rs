@@ -523,9 +523,9 @@ async fn multipart_of(
                 continue 'versions;
             };
             // Every part must pass the core live-conversion rule itself (no
-            // HDR: there is no tone mapping), not only the first.
+            // HDR: a multipart join is never tone-mapped), not only the first.
             if !core::readable(principal, file_facts(conn, file).await?.as_ref())
-                || !delivery::live_transcodable(&row, None)
+                || !delivery::live_transcodable(&row, None, None)
                 || rows.first().is_some_and(|first: &db::ItemRow| {
                     first.library_id != row.library_id || !compatible_parts(first, &row)
                 })
@@ -998,6 +998,8 @@ pub async fn plan(
     body: Body<PlanInput>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::PlaybackRequest)?;
+    // Which tone-mapping filters this server's FFmpeg has (cached once).
+    let filters = crate::processing::filters(&app).await;
     let input = body.value;
     if !matches!(
         input.tracks.subtitle_policy.as_str(),
@@ -1473,8 +1475,14 @@ pub async fn plan(
                 carries_selection,
             })
             .collect(),
+        // One file's conversion may tone-map HDR to SDR (`color::tone_map`);
+        // a multipart join never does.
         transcodable: input.quality.hdr_policy != "reject_conversion"
-            && delivery::live_transcodable(&bound.file, audio),
+            && delivery::live_transcodable(
+                &bound.file,
+                audio,
+                Some(filters).filter(|_| !multipart),
+            ),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
         // A requested cap is kept when the conversion can be capped at it
@@ -2009,6 +2017,9 @@ pub async fn create_delivery(
 ) -> Result<Response, Problem> {
     caller.require(Permission::PlaybackRequest)?;
     let key = idempotency_key(&headers)?;
+    // Admission decides tone mapping from the cached filter observation
+    // inside its write transaction: warm it first.
+    crate::processing::filters(&app).await;
     let input = body.value;
     let claims = open(&app, &input.plan_token)?;
     if claims.principal != caller.principal.id {
@@ -2256,6 +2267,7 @@ pub async fn change_delivery(
     body: Body<DeliveryChange>,
 ) -> Result<Response, Problem> {
     let key = idempotency_key(&headers)?;
+    crate::processing::filters(&app).await;
     // A stream-copy replan needs the source's bitstream details: observe them
     // before the write transaction. A probe failure is reported only for a new
     // change, after an exact retry had the chance to replay.

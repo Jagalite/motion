@@ -521,6 +521,42 @@ fn parse_playlist(text: &str) -> (Vec<Published>, bool) {
     (out, text.lines().any(|l| l == "#EXT-X-ENDLIST"))
 }
 
+/// Output colour tags of a tone-mapped conversion: SDR BT.709, limited range.
+const SDR_TAGS: [&str; 8] = [
+    "-color_primaries",
+    "bt709",
+    "-color_trc",
+    "bt709",
+    "-colorspace",
+    "bt709",
+    "-color_range",
+    "tv",
+];
+
+/// The HDR-to-SDR filter chain for a pinned tone map: zimg linearizes the
+/// source with explicit input properties (never trusting possibly incomplete
+/// stream tags), converts primaries, applies FFmpeg's Hable curve for the
+/// pinned peak and encodes display-referred BT.709 limited range. The same
+/// chain is pixel-verified in `scripts/test_media_transforms.py`.
+fn tone_map_graph(t: playscale_core::color::ToneMap) -> String {
+    use playscale_core::color::{Range, Transfer};
+    let transfer = match t.transfer {
+        Transfer::Pq => "smpte2084",
+        Transfer::Hlg => "arib-std-b67",
+    };
+    let range = match t.range {
+        Range::Limited => "limited",
+        Range::Full => "full",
+    };
+    // zscale's npl maps linear 1.0 to 100 nits, so the peak is in those units.
+    let peak = f64::from(t.peak_nits) / 100.0;
+    format!(
+        "zscale=tin={transfer}:pin=bt2020:min=bt2020nc:rin={range}:t=linear:npl=100:p=bt2020:m=bt2020nc:r=full,\
+         format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0:peak={peak},\
+         zscale=t=bt709:m=bt709:r=limited,format=yuv420p"
+    )
+}
+
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
@@ -544,9 +580,13 @@ fn arguments(
     parts: Option<PartInputs<'_>>,
     cap: Option<playscale_core::playback_session::RateCap>,
     adaptive: bool,
+    tone_map: Option<playscale_core::color::ToneMap>,
     directory: &FsPath,
 ) -> Vec<String> {
     let copy = copies_video(operation);
+    // A tone map applies to one file's conversion only (never a copy or a
+    // multipart join, which the pin never carries it for).
+    let tone_map = tone_map.filter(|_| !copy && parts.is_none());
     // An adaptive conversion of one file without a burned subtitle: a second,
     // capped low variant from the same decoded and scaled picture.
     let adaptive = adaptive && !copy && burn.is_none() && parts.is_none();
@@ -607,6 +647,16 @@ fn arguments(
         args.push(format!("{}.{:03}", length / 1000, length % 1000));
     }
     const SCALE: &str = "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
+    // The source picture: tone-mapped to SDR BT.709 first when the pin says so.
+    let video = match tone_map {
+        Some(t) => format!("[0:v:0]{}[hv];", tone_map_graph(t)),
+        None => String::new(),
+    };
+    let source = if tone_map.is_some() {
+        "[hv]"
+    } else {
+        "[0:v:0]"
+    };
     // A burned bitmap subtitle's canvas is scaled to the source video's size
     // (its canvas may differ, e.g. 720x480 DVD on another resolution) and
     // overlaid before the output is scaled, so nothing is cropped. In
@@ -665,8 +715,9 @@ fn arguments(
         }
         (Some(index), None) => {
             args.push("-filter_complex".into());
+            // Subpictures are SDR: they are drawn on the already tone-mapped picture.
             args.push(format!(
-                "[0:s:{index}][0:v:0]scale2ref=w=iw:h=ih[sub][base];\
+                "{video}[0:s:{index}]{source}scale2ref=w=iw:h=ih[sub][base];\
                  [base][sub]overlay=eof_action=pass:repeatlast=0,{SCALE}[v]"
             ));
             args.extend(["-map", "[v]"].map(str::to_owned));
@@ -674,10 +725,15 @@ fn arguments(
         (None, None) if adaptive => {
             args.push("-filter_complex".into());
             args.push(format!(
-                "[0:v:0]{SCALE},split=2[v][split];\
+                "{video}{source}{SCALE},split=2[v][split];\
                  [split]scale=w=-2:h='min({},ih)':force_divisible_by=2[low]",
                 playscale_core::playback_session::ADAPTIVE_LOW_HEIGHT
             ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (None, None) if tone_map.is_some() => {
+            args.push("-filter_complex".into());
+            args.push(format!("{video}{source}{SCALE}[v]"));
             args.extend(["-map", "[v]"].map(str::to_owned));
         }
         (None, None) => args.extend(["-map", "0:v:0"].map(str::to_owned)),
@@ -690,10 +746,13 @@ fn arguments(
     if copy {
         args.extend(["-c:v", "copy"].map(str::to_owned));
     } else {
-        if burn.is_none() && parts.is_none() && !adaptive {
+        if burn.is_none() && parts.is_none() && !adaptive && tone_map.is_none() {
             args.extend(["-vf", SCALE].map(str::to_owned));
         }
         args.extend(["-pix_fmt", "yuv420p"].map(str::to_owned));
+        if tone_map.is_some() {
+            args.extend(SDR_TAGS.map(str::to_owned));
+        }
         if hardware {
             // -allow_sw 0: fail rather than silently encode in software.
             args.extend(
@@ -809,6 +868,9 @@ fn arguments(
             ]
             .map(str::to_owned),
         );
+        if tone_map.is_some() {
+            args.extend(SDR_TAGS.map(str::to_owned));
+        }
         args.extend([
             "-maxrate".into(),
             low.video_max_bps.to_string(),
@@ -1677,6 +1739,7 @@ async fn run_generation(
             pin.max_bitrate_bps
                 .and_then(|b| playscale_core::playback_session::rate_cap(b, PEAK_WINDOW_MS)),
             pin.adaptive,
+            pin.tone_map,
             &directory,
         ))
         .stdin(Stdio::piped())
@@ -2802,6 +2865,7 @@ fn pin(
     subtitle: Option<u32>,
     operation: Operation,
     hardware: bool,
+    tone_map: Option<playscale_core::color::ToneMap>,
 ) -> Pin {
     let recipe = match operation {
         Operation::Remux => REMUX_RECIPE,
@@ -2819,17 +2883,70 @@ fn pin(
         parts: vec![],
         max_bitrate_bps: None,
         adaptive: false,
+        tone_map: tone_map.filter(|_| operation == Operation::VideoTranscode),
     }
 }
 
 /// Whether a live software transcode of `file` with this audio stream is
 /// admissible here (the core live-route rule, a probed duration, Unix).
-pub(crate) fn live_transcodable(file: &db::ItemRow, audio: Option<u32>) -> bool {
+/// `filters` is given only where a tone-mapped conversion can be delivered
+/// (one file, observed filters); otherwise HDR sources are not transcodable.
+pub(crate) fn live_transcodable(
+    file: &db::ItemRow,
+    audio: Option<u32>,
+    filters: Option<playscale_core::color::Filters>,
+) -> bool {
     cfg!(unix)
         && file
             .duration_seconds
             .is_some_and(|d| d.is_finite() && d > 0.0)
-        && validate_route(file, audio, Operation::VideoTranscode, false, None).is_ok()
+        && validate_route(file, audio, Operation::VideoTranscode, false, None, filters).is_ok()
+}
+
+/// The tone map a conversion of `file` applies (`color::tone_map` over its
+/// video stream's probed facts); None for SDR, for refused sources and where
+/// no filters were observed.
+pub(crate) fn tone_map_for(
+    file: &db::ItemRow,
+    filters: Option<playscale_core::color::Filters>,
+) -> Option<playscale_core::color::ToneMap> {
+    let streams: Vec<db::Track> = serde_json::from_str(&file.tracks_json).ok()?;
+    let video = streams.iter().find(|t| t.kind == "video")?;
+    playscale_core::color::tone_map(&video.color_facts(), filters?)
+        .ok()
+        .flatten()
+}
+
+/// Why HDR video cannot take this route, for the refusal message.
+fn hdr_refusal(
+    file: &db::ItemRow,
+    operation: Operation,
+    filters: Option<playscale_core::color::Filters>,
+) -> &'static str {
+    use playscale_core::color::Refusal;
+    if operation != Operation::VideoTranscode {
+        return "HDR video is never copied into an SDR route";
+    }
+    let Some(filters) = filters else {
+        return "HDR conversion is available only for single-file timelines";
+    };
+    let streams: Vec<db::Track> = serde_json::from_str(&file.tracks_json).unwrap_or_default();
+    let refusal = streams
+        .iter()
+        .find(|t| t.kind == "video")
+        .and_then(|v| playscale_core::color::tone_map(&v.color_facts(), filters).err());
+    match refusal {
+        Some(Refusal::ToolsUnavailable) => {
+            "This server's FFmpeg lacks the filters for HDR-to-SDR conversion"
+        }
+        Some(Refusal::DolbyVisionUnsupported) => {
+            "This Dolby Vision configuration has no HDR10 or HLG base layer to convert"
+        }
+        Some(Refusal::ColorUnknown) => {
+            "The HDR source's colour properties are unknown or unsupported; rescan it"
+        }
+        None => "Live conversion of HDR video is not supported",
+    }
 }
 
 /// What a plan observes about live hardware encoding here.
@@ -2865,10 +2982,10 @@ pub(crate) fn copy_candidate(
     file: &db::ItemRow,
     audio: Option<u32>,
 ) -> Option<Operation> {
-    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio) {
+    if !app.processing.settings.experimental_copy_routes || !live_transcodable(file, audio, None) {
         return None;
     }
-    with_streams(file, audio, None, core::copy_operation)
+    with_streams(file, audio, None, None, core::copy_operation)
         .ok()
         .flatten()
 }
@@ -2912,7 +3029,7 @@ pub(crate) fn copy_supported(
     details: &CopyDetails,
 ) -> bool {
     copies_video(operation)
-        && with_streams(file, audio, Some(details), |s| {
+        && with_streams(file, audio, Some(details), None, |s| {
             core::live_route_supported(operation, s)
         })
         .unwrap_or(false)
@@ -2937,6 +3054,7 @@ fn byte_pin(
         parts: vec![],
         max_bitrate_bps: None,
         adaptive: false,
+        tone_map: None,
     }
 }
 
@@ -2977,6 +3095,7 @@ fn with_streams<R>(
     file: &db::ItemRow,
     audio: Option<u32>,
     details: Option<&CopyDetails>,
+    filters: Option<playscale_core::color::Filters>,
     decide: impl FnOnce(&core::SourceStreams<'_>) -> R,
 ) -> Result<R, ApiError> {
     let streams: Vec<db::Track> =
@@ -2997,10 +3116,19 @@ fn with_streams<R>(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
     );
+    // A tone map is considered only where the caller can deliver one (one
+    // file, observed filters) and the core accepts the source's colour facts.
+    let tone_map = filters.is_some_and(|f| {
+        matches!(
+            playscale_core::color::tone_map(&video.color_facts(), f),
+            Ok(Some(_))
+        )
+    });
     Ok(decide(&core::SourceStreams {
         video: Some(video.codec.as_str()),
         audio: selected.map(|t| t.codec.as_str()),
         hdr,
+        tone_map,
         // Every stream, not only the video: the earliest one is the container
         // start that input seeking is relative to.
         starts_at_zero: streams
@@ -3020,6 +3148,7 @@ fn validate_route(
     operation: Operation,
     copy_enabled: bool,
     details: Option<&CopyDetails>,
+    filters: Option<playscale_core::color::Filters>,
 ) -> Result<(), ApiError> {
     if copies_video(operation) && !copy_enabled {
         return Err(ApiError::new(
@@ -3028,18 +3157,17 @@ fn validate_route(
             "Live stream-copy routes are not enabled on this server",
         ));
     }
-    let (supported, hdr) = with_streams(file, audio, details, |s| {
+    let (supported, hdr) = with_streams(file, audio, details, filters, |s| {
         (core::live_route_supported(operation, s), s.hdr)
     })?;
     if supported {
         return Ok(());
     }
     Err(if hdr {
-        // No live route has a qualified tone-mapping path.
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "hdr_unsupported",
-            "Live conversion of HDR video is not supported",
+            hdr_refusal(file, operation, filters),
         )
     } else {
         ApiError::new(
@@ -3357,9 +3485,17 @@ pub(crate) async fn change_live(
                         operation,
                         app.processing.settings.experimental_copy_routes,
                         selection.copy_details.as_ref(),
+                        None,
                     )?;
                     validate_subtitle(&file, selection.subtitle)?;
-                    pin(&file, selection.audio, selection.subtitle, operation, false)
+                    pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        operation,
+                        false,
+                        None,
+                    )
                 }
                 Route::Transcode | Route::HardwareTranscode => {
                     let hardware = selection.route == Route::HardwareTranscode;
@@ -3372,12 +3508,21 @@ pub(crate) async fn change_live(
                     {
                         return Err(backend_unavailable());
                     }
+                    // Tone mapping is decided for one file from the cached
+                    // filter observation (the v2 command warms it first).
+                    let filters = app
+                        .processing
+                        .filters
+                        .get()
+                        .copied()
+                        .filter(|_| selection.parts.is_empty());
                     validate_route(
                         &file,
                         selection.audio,
                         Operation::VideoTranscode,
                         app.processing.settings.experimental_copy_routes,
                         None,
+                        filters,
                     )?;
                     validate_subtitle(&file, selection.subtitle)?;
                     pin(
@@ -3386,6 +3531,7 @@ pub(crate) async fn change_live(
                         selection.subtitle,
                         Operation::VideoTranscode,
                         hardware,
+                        tone_map_for(&file, filters),
                     )
                 }
             };
@@ -3811,6 +3957,14 @@ async fn admit_owned(
             "Refresh the item",
         ));
     }
+    // One file's conversion may tone-map HDR, decided from the cached filter
+    // observation (the v2 command warms it before this transaction).
+    let filters = app
+        .processing
+        .filters
+        .get()
+        .copied()
+        .filter(|_| planned.as_ref().is_none_or(|p| p.parts.is_empty()) && !original);
     if !original {
         validate_route(
             &file,
@@ -3818,6 +3972,7 @@ async fn admit_owned(
             operation,
             app.processing.settings.experimental_copy_routes,
             copy_details.as_ref(),
+            filters,
         )?;
     }
     validate_subtitle(&file, r.subtitle_track)?;
@@ -3930,7 +4085,14 @@ async fn admit_owned(
                     if original {
                         byte_pin(&file, r.audio_track, r.subtitle_track, operation)
                     } else {
-                        pin(&file, r.audio_track, r.subtitle_track, operation, hardware)
+                        pin(
+                            &file,
+                            r.audio_track,
+                            r.subtitle_track,
+                            operation,
+                            hardware,
+                            tone_map_for(&file, filters),
+                        )
                     },
                     sidecar,
                 ),
@@ -4230,19 +4392,21 @@ pub async fn change(
                     "Create a new delivery",
                 ));
             }
+            // This (v1) change path never tone-maps: HDR stays refused.
             validate_route(
                 &file,
                 audio,
                 operation,
                 app.processing.settings.experimental_copy_routes,
                 details.as_ref(),
+                None,
             )?;
             validate_subtitle(&file, subtitle)?;
             Some((
                 current,
                 (
                     file.edition_id.clone(),
-                    pin(&file, audio, subtitle, operation, hardware),
+                    pin(&file, audio, subtitle, operation, hardware, None),
                 ),
             ))
         }
@@ -4981,26 +5145,48 @@ mod tests {
                 Some(0),
                 Operation::Remux,
                 true,
-                Some(&stale)
+                Some(&stale),
+                None
             ))
             .await
             .as_deref(),
             Some("route_unsupported")
         );
-        assert!(validate_route(&eligible, Some(0), Operation::Remux, true, Some(&details)).is_ok());
+        assert!(
+            validate_route(
+                &eligible,
+                Some(0),
+                Operation::Remux,
+                true,
+                Some(&details),
+                None
+            )
+            .is_ok()
+        );
         assert_eq!(
             code(validate_route(
                 &eligible,
                 Some(0),
                 Operation::Remux,
                 false,
-                Some(&details)
+                Some(&details),
+                None
             ))
             .await
             .as_deref(),
             Some("route_unqualified")
         );
-        assert!(validate_route(&eligible, Some(0), Operation::VideoTranscode, false, None).is_ok());
+        assert!(
+            validate_route(
+                &eligible,
+                Some(0),
+                Operation::VideoTranscode,
+                false,
+                None,
+                None
+            )
+            .is_ok()
+        );
         // Audio starting before zero moves the container start; 10-bit video
         // cannot be copied into the browser pipeline.
         for ineligible in [
@@ -5013,7 +5199,8 @@ mod tests {
                     Some(0),
                     Operation::Remux,
                     true,
-                    Some(&details)
+                    Some(&details),
+                    None
                 ))
                 .await
                 .as_deref(),
@@ -5040,6 +5227,7 @@ mod tests {
                 parts: vec![],
                 max_bitrate_bps: None,
                 adaptive: false,
+                tone_map: None,
             },
             0,
             Some(60_000),

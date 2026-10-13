@@ -303,7 +303,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -383,6 +383,20 @@ pub(crate) async fn inspect(
                 .as_str()
                 .filter(|t| t.len() <= 200)
                 .map(str::to_owned),
+            color_probed: true,
+            color_primaries: s["color_primaries"].as_str().map(str::to_owned),
+            color_space: s["color_space"].as_str().map(str::to_owned),
+            color_range: s["color_range"].as_str().map(str::to_owned),
+            mastering_peak_nits: side_data(s, "Mastering display metadata")
+                .and_then(|d| nits(&d["max_luminance"])),
+            max_cll_nits: side_data(s, "Content light level metadata")
+                .and_then(|d| nits(&d["max_content"])),
+            dolby_vision: side_data(s, "DOVI configuration record").and_then(|d| {
+                Some((
+                    u8::try_from(d["dv_profile"].as_u64()?).ok()?,
+                    u8::try_from(d["dv_bl_signal_compatibility_id"].as_u64()?).ok()?,
+                ))
+            }),
         })
         .collect();
     Ok(Found {
@@ -464,6 +478,12 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                     if stamp != row.fingerprint {
                         return Ok(None);
                     }
+                    // HDR streams probed before colour facts were recorded
+                    // are inspected again, so conversion policy has them.
+                    let tracks: Vec<Track> = serde_json::from_str(&row.tracks_json)?;
+                    if tracks.iter().any(Track::lacks_color_facts) {
+                        return Ok(None);
+                    }
                     Ok(Some(Found {
                         relative: row.relative_path,
                         title: row.title,
@@ -471,7 +491,7 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         fingerprint: stamp,
                         bytes: row.bytes,
                         duration: row.duration_seconds,
-                        tracks: serde_json::from_str(&row.tracks_json)?,
+                        tracks,
                         reused: true,
                         nfo: crate::nfo::Sidecar::Absent,
                     }))
@@ -896,5 +916,52 @@ mod inventory_tests {
         assert_eq!(found.incomplete.get("Mounted"), Some(&"mount_boundary"));
         assert!(found.complete.contains(""));
         assert!(!found.complete.contains("Mounted") && !found.complete.contains("Mounted/deeper"));
+    }
+}
+
+/// One entry of a stream's probed side data, by type.
+fn side_data<'a>(stream: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    stream["side_data_list"]
+        .as_array()?
+        .iter()
+        .find(|d| d["side_data_type"] == kind)
+}
+
+/// A luminance in whole nits from ffprobe: an integer, or a rational string
+/// such as `"10000000/10000"`.
+fn nits(value: &serde_json::Value) -> Option<u32> {
+    let nits = match value {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => match s.split_once('/') {
+            Some((n, d)) => n.trim().parse::<f64>().ok()? / d.trim().parse::<f64>().ok()?,
+            None => s.trim().parse().ok()?,
+        },
+        _ => return None,
+    };
+    (nits.is_finite() && nits >= 1.0 && nits <= f64::from(u32::MAX)).then(|| nits.round() as u32)
+}
+
+#[cfg(test)]
+mod color_probe_tests {
+    use super::{nits, side_data};
+    use serde_json::json;
+
+    #[test]
+    fn side_data_luminance_parses_rationals_and_integers() {
+        let stream = json!({"side_data_list":[
+            {"side_data_type":"Mastering display metadata","max_luminance":"10000000/10000"},
+            {"side_data_type":"Content light level metadata","max_content":1200},
+            {"side_data_type":"DOVI configuration record","dv_profile":8,"dv_bl_signal_compatibility_id":1}
+        ]});
+        assert_eq!(
+            side_data(&stream, "Mastering display metadata")
+                .and_then(|d| nits(&d["max_luminance"])),
+            Some(1000)
+        );
+        assert_eq!(nits(&json!(1200)), Some(1200));
+        assert_eq!(nits(&json!("0/1")), None);
+        assert_eq!(nits(&json!("1/0")), None);
+        assert_eq!(nits(&json!("x")), None);
+        assert!(side_data(&json!({}), "Mastering display metadata").is_none());
     }
 }

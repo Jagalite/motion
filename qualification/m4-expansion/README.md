@@ -67,7 +67,7 @@ qualified; the release checks are listed below.
 | Styled subtitles (ASS/SSA) and text burn-in | Refused | Still refused: burning text in, including styled subtitles with their fonts and attachments, needs libass, absent from the bundled and host FFmpeg |
 | Subtitles on multipart versions | Refused | Still refused (`subtitle_multipart_unavailable`): subtitle streams and sidecars belong to one part's file |
 | HDR preserve | Byte delivery to clients reporting HDR support | Unchanged (attempt, not a display-fidelity receipt) |
-| HDR tone-map to SDR | Refused | Still refused (deferral below) |
+| HDR tone-map to SDR | Refused | Still refused at PR #22. **Since completion item 3A:** implemented for single-file live conversions when the configured FFmpeg has `zscale` and `tonemap` and the probed facts are known (see [the completion ledger](../completion/README.md)) |
 | Adaptive bitrate | Missing | Implemented behind `processing.experimental_adaptive_bitrate` (off by default): an uncapped single-file software conversion without burn-in is one FFmpeg process encoding a 720p rung (3 Mb/s cap) and a 360p rung (800 kb/s cap) with shared keyframes; segment *n* is published only when both rungs have it; two execution units reserved; `BANDWIDTH`, `CODECS` and `RESOLUTION` per rung. Copies, hardware, capped, burned and multipart plans stay single variant |
 
 Fixtures are generated in the tests: FFmpeg `lavfi` media, a byte-level PGS

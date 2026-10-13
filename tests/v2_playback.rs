@@ -5921,3 +5921,239 @@ async fn administrators_see_who_is_watching_exact_bytes_and_finished_history() {
     assert_eq!(entry["bytes_sent"], (10_000 + rest).to_string());
     assert_eq!(finished(&f, &twin_id).await["end_reason"], "closed");
 }
+
+/// A uniform 10-bit limited-range picture (luma `code`, neutral chroma) with
+/// stereo silence, tagged with `params` (`setparams` options), as lossless
+/// FFV1 in Matroska. Written by the host ffmpeg; the tags are what the scanner
+/// probes.
+fn uniform_hdr_mkv(f: &Fixture, name: &str, code: u16, params: &str) {
+    let (width, height, frames) = (320usize, 180usize, 100usize);
+    let mut frame = Vec::with_capacity(width * height * 3);
+    for _ in 0..width * height {
+        frame.extend_from_slice(&code.to_le_bytes());
+    }
+    for _ in 0..width * height / 2 {
+        frame.extend_from_slice(&512u16.to_le_bytes());
+    }
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p10le",
+        ])
+        .args(["-s", "320x180", "-r", "25", "-i", "-"])
+        .args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "4"])
+        .args(["-vf", &format!("setparams={params}")])
+        .args(["-c:v", "ffv1", "-c:a", "aac", "-shortest"])
+        .arg(f.dir.path().join("media").join(name))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut input = child.stdin.take().unwrap();
+        for _ in 0..frames {
+            input.write_all(&frame).unwrap();
+        }
+    }
+    assert!(child.wait().unwrap().success());
+}
+
+/// Mean limited-range luma code of the 320x180 frame at `at` seconds: the
+/// Y plane of 8-bit yuv420p as coded (converting to `gray` would expand it
+/// to full range).
+fn mean_luma(path: &Path, at: &str) -> f64 {
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", at, "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let luma = &frame[..320 * 180];
+    assert_eq!(frame.len(), 320 * 180 * 3 / 2, "{at}");
+    luma.iter().map(|v| f64::from(*v)).sum::<f64>() / luma.len() as f64
+}
+
+async fn hdr_plan(f: &Fixture, auth: &str, timeline: &str) -> Reply {
+    let input = plan_input("default", timeline, "auto", None, &["http_range", "hls"]);
+    f.post("/api/v2/playback/plans", auth, None, input).await
+}
+
+/// 10-bit limited-range PQ code value of a 100-nit neutral patch (ST 2084).
+const PQ_100_NITS: u16 = 509;
+
+/// HDR10 sources play to SDR clients through a tone-mapped conversion whose
+/// pixels (not only tags) are SDR, decided from probed colour facts and the
+/// observed filters. Unknown facts and missing filters are refused. Needs an
+/// FFmpeg with zimg and tonemap: `MOTION_TONE_MAP_FFMPEG` (for example the
+/// N2 media-tools build); the refusals run without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let tagged = "color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv";
+
+    // Without the filters (an FFmpeg that cannot even list them): refused,
+    // and capabilities do not advertise tone mapping.
+    let none = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: "/usr/bin/false".into(),
+        ..Default::default()
+    })
+    .await;
+    uniform_hdr_mkv(&none, "hdr10.mkv", PQ_100_NITS, tagged);
+    none.scan().await;
+    let (timeline, _) = none.timeline().await;
+    let (_, auth) = none.device(&["default"], PLAYER).await;
+    let refused = hdr_plan(&none, &auth, &timeline).await;
+    assert_eq!(refused.body["status"], "blocked", "{}", refused.body);
+    let capabilities = none
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert!(
+        !capabilities.body.to_string().contains("tone_map_to_sdr"),
+        "{}",
+        capabilities.body
+    );
+
+    let Ok(ffmpeg) = std::env::var("MOTION_TONE_MAP_FFMPEG") else {
+        eprintln!("SKIPPED (tone mapping): MOTION_TONE_MAP_FFMPEG is not set");
+        return;
+    };
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: ffmpeg.into(),
+        ..Default::default()
+    })
+    .await;
+    uniform_hdr_mkv(&f, "hdr10.mkv", PQ_100_NITS, tagged);
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    // A row probed before colour facts were recorded is probed again by the
+    // next ordinary scan instead of being refused forever.
+    sqlx::query("UPDATE media_files SET tracks_json=json_remove(tracks_json,'$[0].color_probed','$[0].color_primaries','$[0].color_space','$[0].color_range')")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        hdr_plan(&f, &auth, &timeline).await.body["status"],
+        "blocked"
+    );
+    f.scan().await;
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM catalog_files")
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    assert!(
+        tracks.contains("\"color_primaries\":\"bt2020\""),
+        "{tracks}"
+    );
+
+    let planned = hdr_plan(&f, &auth, &timeline).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("hdr-tone-map-0000001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 0
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let fragment = f.dir.path().join("tone-mapped.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("/api/v2/streams/{id}/1/variants/main/init.mp4")).await,
+            get(format!("/api/v2/streams/{id}/1/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    // Hable for a 1,000-nit peak maps 100-nit diffuse white to about 151 in
+    // 8-bit limited BT.709 (pixel-verified in scripts/test_media_transforms.py);
+    // retagging the PQ code as BT.709 would give about 127.
+    let luma = mean_luma(&fragment, "0.5");
+    assert!((147.0..=155.0).contains(&luma), "tone-mapped luma {luma}");
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .args([
+            "stream=color_primaries,color_transfer,color_space,color_range",
+            "-of",
+            "json",
+        ])
+        .arg(&fragment)
+        .output()
+        .unwrap()
+        .stdout;
+    let tags: Value = serde_json::from_slice(&probe).unwrap();
+    assert_eq!(
+        tags["streams"][0],
+        json!({"color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"})
+    );
+    let capabilities = f
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert!(capabilities.body.to_string().contains("tone_map_to_sdr"));
+
+    // Unknown primaries and matrix: refused, never guessed.
+    let g = Fixture::with_settings(f.server.app.processing.settings.clone()).await;
+    uniform_hdr_mkv(
+        &g,
+        "untagged.mkv",
+        PQ_100_NITS,
+        "color_trc=smpte2084:range=tv",
+    );
+    g.scan().await;
+    let (timeline, _) = g.timeline().await;
+    let (_, auth) = g.device(&["default"], PLAYER).await;
+    let unknown = hdr_plan(&g, &auth, &timeline).await;
+    assert_eq!(unknown.body["status"], "blocked", "{}", unknown.body);
+}

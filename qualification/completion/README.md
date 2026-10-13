@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
+| 3 Production playback and preparation | 3A implemented, tested; 3B–3F not started | hdr PR | Sol review of 3A |
 | 4 Library-management UI | Not started | — | After item 2 |
 | 5 Offline breadth | Not started | — | After item 1 |
 | 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
@@ -216,10 +216,71 @@ item below is the single completion agent unless stated otherwise.
 
 ## 3. Production playback and preparation
 
-Not started. Inputs: N2 handoff section 6
-([native-media-tools.md](../next-lanes/native-media-tools.md)) and the M4
-deferral table ([m4-expansion/README.md](../m4-expansion/README.md)).
-Copy, hardware and ABR defaults stay unchanged.
+Item 3 is delivered in slices. Copy, hardware and ABR defaults stay unchanged.
+
+### 3A. HDR-to-SDR tone mapping on live conversions
+
+- **Source SHA:** branch `plan-completion/hdr-tone-map`, stacked on item 2.
+- **Implemented:**
+  - **Observation.** The scanner probes primaries, matrix (`color_space`),
+    range, mastering-display peak, MaxCLL and the Dolby Vision configuration
+    (profile, base-layer compatibility). They are stored in the track JSON,
+    so no migration is needed. Rows probed earlier are re-probed by the next
+    ordinary scan when their transfer is HDR (`color_probed`). The configured
+    FFmpeg's filters are observed once per process (`ffmpeg -filters`); a
+    failed probe reports none.
+  - **Core policy** `color::tone_map(facts, filters)`:
+    - SDR needs nothing;
+    - PQ/HLG with BT.2020 primaries, BT.2020 non-constant matrix and a known
+      range is tone-mapped with explicit input properties;
+    - the PQ peak comes from MaxCLL, then the mastering peak (100–10,000
+      nits), else 1,000 nits, recorded as assumed;
+    - Dolby Vision passes only with a matching HDR10 base layer (profiles 7/8,
+      compatibility 1) or HLG base layer (8.4).
+
+    Refused: unknown or other primaries, matrix or range
+    (`ColorUnknown`); other DV configurations, including profile 5; missing
+    filters. `delivery::live_route_supported` admits HDR only to a
+    conversion with an accepted tone map, never to a copy.
+  - **Pinning.** The tone map is decided at plan and admission time and
+    carried in the delivery `Pin` (`tone_map`), so execution never
+    re-derives it. Admission and replans read the cached filter observation
+    inside their write transactions (warmed before them). Multipart joins and
+    the legacy v1 change path never tone-map; HDR there stays refused.
+  - **Execution.** The N2-verified graph (zimg linearization, primaries
+    conversion, Hable for the pinned peak, BT.1886 BT.709 limited range)
+    runs before scaling, the bitmap burn-in overlay (subpictures are drawn on
+    the SDR picture) and the adaptive split. Outputs are tagged BT.709/tv,
+    including the low rung.
+  - **Capabilities.** `playback.v2` reports an `hdr` limit with the tone-map
+    route only when the filters are present; `hdr_conversion` stays in
+    `unsupported` otherwise. `/processing/capabilities` lists the observed
+    `zscale`/`tonemap`. HDR originals still go unchanged only to clients
+    reporting HDR support.
+- **Unsupported (explicit):** HDR preparation (the `h264720p` and
+  `video_profile` recipes still refuse HDR: their recipe identity would have
+  to pin the tone map); HDR on multipart timelines; dynamic HDR10+ metadata
+  (static curve only); GPU tone mapping. Physical HDR/SDR display fidelity is
+  a release check.
+- **Core/adapter boundary:** whether and how to tone-map is a core decision
+  from explicit facts (`color::tone_map`, `live_route_supported`). The
+  adapters observe facts (probe, filter listing), pin the decision and
+  execute it. The route-selection Stateless model is unchanged: it consumes
+  `transcodable`, which now also reflects an accepted tone map. The policy is
+  a pure function with exhaustive unit cases; no new state transition was
+  added.
+- **Focused evidence:** RESULTS_3A
+- **Review:** pending (GPT-6.1 Sol).
+
+### Remaining item 3 slices (not started)
+
+| Slice | Next step |
+|---|---|
+| 3B text/styled burn-in, fonts, offsets | Extend `burnable_subtitle`/`presents_subtitle` with a libass filter fact; `subtitles=si=` from the exact component |
+| 3C per-part subtitles; bitmap cues before the 20 s lookback | Per-part subtitle occurrence; second validated descriptor for early cues |
+| 3D subtitle-inclusive preparation and audio-component selection | Preparation pins by component with stale-source fencing |
+| 3E bitrate preference and UI control | Contract preference field, bridge and player control |
+| 3F custom video-profile preparation UI | Validated form over `video_profile` |
 
 ## 4. Library-management UI workflows
 

@@ -111,6 +111,8 @@ pub struct Runtime {
     pub hardware: Arc<crate::execution::Coordinator>,
     /// Whether this machine can open a VideoToolbox encoder session (probed once).
     pub videotoolbox: tokio::sync::OnceCell<bool>,
+    /// The tone-mapping filters the configured FFmpeg has (probed once).
+    pub filters: tokio::sync::OnceCell<playscale_core::color::Filters>,
     /// Executable that accepts `--internal-ffmpeg-supervisor`.
     pub supervisor: PathBuf,
     /// Live delivery sessions share the execution infrastructure.
@@ -126,6 +128,7 @@ impl Runtime {
             execution: crate::execution::Coordinator::new(crate::execution::BUDGET),
             hardware: crate::execution::Coordinator::new(crate::execution::HARDWARE_BUDGET),
             videotoolbox: tokio::sync::OnceCell::new(),
+            filters: tokio::sync::OnceCell::new(),
             supervisor: std::env::current_exe().unwrap_or_default(),
             deliveries: crate::delivery::Runtime::new(root.parent().unwrap_or(&root).join("live")),
             root,
@@ -1040,6 +1043,59 @@ pub async fn videotoolbox_available(app: &App) -> bool {
             )
         })
         .await
+}
+
+/// Which tone-mapping filters the configured FFmpeg lists (`ffmpeg -filters`),
+/// cached for the process. Unknown (a failed or slow probe) reports none, so
+/// HDR conversion is refused rather than attempted.
+pub async fn filters(app: &App) -> playscale_core::color::Filters {
+    *app.processing
+        .filters
+        .get_or_init(|| async {
+            let probe = Command::new(&app.processing.settings.ffmpeg)
+                .args(["-hide_banner", "-nostdin", "-filters"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(Duration::from_secs(20), probe).await {
+                Ok(Ok(output)) if output.status.success() => {
+                    listed_filters(&String::from_utf8_lossy(&output.stdout))
+                }
+                _ => Default::default(),
+            }
+        })
+        .await
+}
+
+/// Parse `ffmpeg -filters`: each filter line is flags, name, pads, description.
+fn listed_filters(text: &str) -> playscale_core::color::Filters {
+    let names: std::collections::BTreeSet<&str> = text
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let flags = fields.next()?;
+            (flags.len() <= 3 && flags.chars().all(|c| matches!(c, '.' | 'T' | 'S' | 'C')))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .collect();
+    playscale_core::color::Filters {
+        zscale: names.contains("zscale"),
+        tonemap: names.contains("tonemap"),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    #[test]
+    fn filters_are_read_from_the_listing_not_descriptions() {
+        let listing = "Filters:\n  T.. = Timeline support\n ---\n .S zscale            V->V       Apply resizing.\n .S tonemap           V->V       Conversion to/from different dynamic ranges.\n";
+        let found = super::listed_filters(listing);
+        assert!(found.zscale && found.tonemap);
+        let without = " .. scale  V->V  Mentions zscale and tonemap in a description.\n";
+        assert_eq!(super::listed_filters(without), Default::default());
+    }
 }
 
 pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
