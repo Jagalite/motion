@@ -949,11 +949,16 @@ test('selected subtitles are required: saved and verified with the title, or not
   const {cache, calls} = fakeCache();
   let serveSubtitles = false;
   const admits = [];
+  const reports = [];
   const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
     if (args[0] === 'admit') admits.push(args[2]);
     return cache(root, scope, args, input);
   }, quota: 100000,
-    api: async path => path.endsWith('/manifest') ? withSubtitles('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    api: async (path, options) => {
+      if (path.endsWith('/manifest')) return {...withSubtitles('d1'), download_revision: '2'};
+      if (path.endsWith('/transfer')) { reports.push(options.body); return {}; }
+      return {url: '/api/v2/media/files/f1/content?ticket=t'};
+    },
     fetchMedia: async url => url.includes('/subtitles') ? (serveSubtitles ? response(200, vtt) : response(503, '')) : response(200, media)});
   const target = agent.root('default');
   mkdirSync(join(target.path, 'staging'), {recursive: true});
@@ -965,6 +970,9 @@ test('selected subtitles are required: saved and verified with the title, or not
   assert.equal(await agent.transfer({id: 'd1'}, target), true);
   const published = JSON.parse(calls.find(c => c[1] === 'publish')[3]);
   assert.deepEqual(published.subtitles, {sha256: vttDigest, size: vtt.length});
+  const verified = reports.findLast(r => r.state === 'verified_local');
+  assert.equal(verified.download_revision, '2');
+  assert.equal(verified.bytes_received, String(media.length + vtt.length));
   assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.subtitles')), vtt);
 });
 
