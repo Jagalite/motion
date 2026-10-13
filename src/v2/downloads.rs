@@ -1091,13 +1091,6 @@ pub(crate) async fn release_subtitles(app: App) {
     }
 }
 
-/// The download's subtitle file: converted once from the pinned file
-/// revision's track (`delivery::download_subtitles`), then kept, so its
-/// digest is stable for the download. Conversion runs in its own task under
-/// the download's subtitle lock: concurrent and retried reads share it, a
-/// request that stops waiting never leaves a partial file in place, and a
-/// cancelled download is never converted or published.
-
 // Cached subtitle reads are bounded globally, including response lifetimes.
 fn subtitle_read_slot() -> Result<tokio::sync::OwnedSemaphorePermit, Problem> {
     static SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -1173,6 +1166,12 @@ async fn record_subtitle(
     Ok(())
 }
 
+/// The download's subtitle file: converted once from the pinned file
+/// revision's track (`delivery::download_subtitles`), then kept, so its
+/// digest is stable for the download. Conversion runs in its own task under
+/// the download's subtitle lock: concurrent and retried reads share it, a
+/// request that stops waiting never leaves a partial file in place, and a
+/// cancelled download is never converted or published.
 async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, Problem> {
     let failed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM download_subtitle_artifacts WHERE download_id=? AND state='failed')").bind(&row.id).fetch_one(&app.db).await?;
     if failed {
@@ -1187,7 +1186,13 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
             .await
             .map_err(|error| {
                 let (status, code, message) = error.parts();
-                Problem::new(status, code, message)
+                match code {
+                    "download_cancelled" => Problem::new(status, "download_cancelled", message),
+                    "subtitle_artifact_changed" => {
+                        Problem::new(status, "subtitle_artifact_changed", message)
+                    }
+                    _ => Problem::internal(message),
+                }
             })?;
         return Ok(bytes);
     }
