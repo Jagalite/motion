@@ -1637,6 +1637,8 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     assert_eq!(created.body["subtitle_track_id"], "s0");
     let id = created.body["id"].as_str().unwrap().to_owned();
     // Concurrent first reads share one conversion and name the same file.
+    let conversions = playscale::v2::downloads::subtitle_conversions;
+    let before = conversions();
     let path = format!("/api/v2/downloads/{id}/manifest");
     let (manifest, second, third) = tokio::join!(
         f.get(&path, &auth),
@@ -1646,7 +1648,7 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     assert_eq!(manifest.status, StatusCode::OK, "{}", manifest.body);
     assert_eq!(second.body["files"], manifest.body["files"]);
     assert_eq!(third.body["files"], manifest.body["files"]);
-    assert_eq!(playscale::v2::downloads::subtitle_conversions(&id), 1);
+    assert_eq!(conversions() - before, 1);
     let file = manifest.body["files"]
         .as_array()
         .unwrap()
@@ -1724,6 +1726,7 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
     let id = created.body["id"].as_str().unwrap().to_owned();
+    let before = conversions();
     let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
     let path = format!("/api/v2/downloads/{id}/manifest");
     let cancelling = async {
@@ -1743,7 +1746,7 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
     let (read, cancelled) = tokio::join!(f.get(&path, &auth), cancelling);
     assert_eq!(cancelled.status, StatusCode::NO_CONTENT);
     problem(&read, StatusCode::CONFLICT, "download_cancelled");
-    assert_eq!(playscale::v2::downloads::subtitle_conversions(&id), 0);
+    assert_eq!(conversions() - before, 0);
     let kept = root
         .parent()
         .unwrap_or(root)
@@ -1751,4 +1754,64 @@ async fn an_originals_text_subtitle_travels_as_pinned_webvtt() {
         .join(format!("{id}.vtt"));
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!kept.exists());
+
+    // A failing conversion (the revision's facts name a text subtitle the
+    // file does not carry) is attempted once for the reads waiting on it;
+    // a later read tries again.
+    let tracks: String = sqlx::query_scalar("SELECT tracks_json FROM media_files")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    let mut tracks: Vec<Value> = serde_json::from_str(&tracks).unwrap();
+    let mut phantom = tracks
+        .iter()
+        .find(|t| t["kind"] == "subtitle")
+        .unwrap()
+        .clone();
+    phantom["codec"] = json!("subrip");
+    phantom["index"] = json!(99);
+    tracks.push(phantom);
+    sqlx::query("UPDATE media_files SET tracks_json=?")
+        .bind(serde_json::to_string(&tracks).unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "subtitle-key-0005",
+            with_subtitle("s1", "require"),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    let before = conversions();
+    let held = playscale::v2::downloads::hold_subtitles(&f.app, &id).await;
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+    };
+    let (first, second, third, ()) = tokio::join!(
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        f.get(&path, &auth),
+        release
+    );
+    for read in [&first, &second, &third] {
+        problem(
+            read,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "download_subtitles_unavailable",
+        );
+    }
+    assert_eq!(conversions() - before, 1);
+    let again = f.get(&path, &auth).await;
+    problem(
+        &again,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "download_subtitles_unavailable",
+    );
+    assert_eq!(conversions() - before, 2);
 }

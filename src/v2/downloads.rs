@@ -908,21 +908,23 @@ fn subtitles_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
-/// Conversions run per download, for tests asserting none is duplicated.
+/// Download subtitle conversions started by this process (bounded
+/// instrumentation; tests assert no conversion is duplicated).
+static CONVERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[doc(hidden)]
-pub fn subtitle_conversions(download_id: &str) -> u64 {
-    conversions()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(download_id)
-        .copied()
-        .unwrap_or(0)
+pub fn subtitle_conversions() -> u64 {
+    CONVERSIONS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn conversions() -> &'static std::sync::Mutex<HashMap<String, u64>> {
-    static COUNTS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+/// When a download's last conversion failed, by its file path: reads that
+/// were already waiting share that failure instead of each converting
+/// again. Kept only for failing downloads, and briefly.
+fn failures() -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, std::time::Instant>> {
+    type Failures = HashMap<std::path::PathBuf, std::time::Instant>;
+    static FAILURES: std::sync::LazyLock<std::sync::Mutex<Failures>> =
         std::sync::LazyLock::new(Default::default);
-    &COUNTS
+    &FAILURES
 }
 
 /// Hold a download's subtitle lock (tests order a cancellation against a
@@ -989,6 +991,7 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
         row.file_id.clone(),
         row.file_revision.clone(),
     );
+    let asked = std::time::Instant::now();
     let converted = tokio::spawn(async move {
         let path = subtitles_path(&app, &id);
         let _held = subtitles_lock(&path).lock_owned().await;
@@ -996,17 +999,42 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
         if let Ok(bytes) = tokio::fs::read(&path).await {
             return Ok(bytes);
         }
+        // Or tried and failed: share that outcome rather than converting
+        // again for a read that may already have stopped waiting.
+        if failures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&path)
+            .is_some_and(|failed| *failed >= asked)
+        {
+            return Err(crate::api::ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "subtitles_unavailable",
+                "The subtitle track could not be converted; try again",
+            ));
+        }
         let cancelled =
             || crate::api::ApiError::conflict("download_cancelled", "The download was cancelled");
         if !active(&app, &id).await {
             return Err(cancelled());
         }
-        *conversions()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(id.clone())
-            .or_default() += 1;
-        let text = crate::delivery::download_subtitles(&app, &id, &file, &revision, index).await?;
+        CONVERSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let text =
+            match crate::delivery::download_subtitles(&app, &id, &file, &revision, index).await {
+                Ok(text) => {
+                    failures()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&path);
+                    text
+                }
+                Err(error) => {
+                    let mut failed = failures().lock().unwrap_or_else(|e| e.into_inner());
+                    failed.retain(|_, at| at.elapsed() < Duration::from_secs(600));
+                    failed.insert(path.clone(), std::time::Instant::now());
+                    return Err(error);
+                }
+            };
         let partial = path.with_extension(format!("vtt.{}", new_id()));
         let written = async {
             tokio::fs::create_dir_all(path.parent().unwrap_or(&path)).await?;

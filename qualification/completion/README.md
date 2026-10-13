@@ -1275,6 +1275,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   After the fixes: `v2_downloads` 11 passed (three runs); clippy clean.
 
+  Round 2 at `dc43cce` raised two P2 findings, both fixed:
+  - **S3:** a failed conversion was not shared. Reads already waiting (whose
+    callers may have stopped waiting) each converted again. A failure is
+    now recorded briefly per download, and reads that were waiting before
+    it return it without converting; a later read tries again. Integration
+    test: a phantom text track makes conversion fail; three queued reads
+    share one attempt, and a later read makes the second.
+  - **S4:** the test-only per-download conversion counter grew for the
+    process's lifetime. It is now a single process-wide counter, and tests
+    assert deltas.
+
+  After the fixes: `v2_downloads` 11 passed (three runs); clippy clean.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
