@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented and reviewed; 6D implemented (review pending); 6E not started | markers, embedded-chapters, previews, preview-schedules, player-previews and accessibility PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented and reviewed; 6D implemented and reviewed; 6E not started | markers, embedded-chapters, previews, preview-schedules, player-previews and accessibility PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1860,6 +1860,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     say which state an action applies to, not which action it is. Test:
     "Place" is found again after its group revision moved from 3 to 4.
     ui-bridge 48 passed.
+
+  Round 3 at `ab89b52` is clean: no actionable findings.
 
 ### Remaining item 6 work
 
