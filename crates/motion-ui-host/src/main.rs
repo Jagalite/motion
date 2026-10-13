@@ -57,7 +57,8 @@ enum CacheCommand {
         download_id: String,
     },
     /// The person's choice for progress recorded before a server restore:
-    /// discard or reapply, against the server's current history.
+    /// discard or reapply, against the server's current history. Reapply
+    /// reads the downloads' restored pins (a JSON array) from stdin.
     Restore {
         #[arg(long)]
         choice: String,
@@ -130,7 +131,18 @@ fn cache_command(args: CacheArgs) -> anyhow::Result<serde_json::Value> {
             viewing_epoch,
         } => {
             let choice = serde_json::from_value(serde_json::Value::String(choice))?;
-            serde_json::to_value(store.resolve_restore(choice, &viewing_epoch)?)?
+            // Re-applying reads the restored pins from stdin.
+            let pins: Vec<playscale_core::offline::DownloadIdentity> =
+                if matches!(choice, motion_ui_host::store::RestoreChoice::Reapply) {
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .take(1024 * 1024)
+                        .read_to_string(&mut input)?;
+                    serde_json::from_str(&input)?
+                } else {
+                    vec![]
+                };
+            serde_json::to_value(store.resolve_restore(choice, &viewing_epoch, &pins)?)?
         }
         CacheCommand::SettleRemoval {
             download_id,

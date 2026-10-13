@@ -693,10 +693,24 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
             .fetch_one(&restored)
             .await?;
+        // The new history and its baseline in one transaction: each
+        // timeline's viewing exactly as restored (`restore_baselines`).
+        let mut tx = restored.begin().await?;
         sqlx::query("UPDATE server_identity SET restore_epoch=?")
             .bind(&epoch)
-            .execute(&restored)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM restore_baselines")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) SELECT profile_id,timeline_id,revision,manual_epoch FROM timeline_viewing")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO restore_baseline_epoch(singleton,restore_epoch) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET restore_epoch=excluded.restore_epoch")
+            .bind(&epoch)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Some(epoch)
     } else {
         None

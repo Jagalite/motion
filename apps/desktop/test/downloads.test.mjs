@@ -597,12 +597,14 @@ test('progress from before a server restore waits for the person\'s choice', asy
   const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
   const fake = fakeCache();
   const paths = [];
+  let epoch = 'server:r2';
   const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
     fetchMedia: async () => assert.fail('no transfer'),
     api: async path => {
       paths.push(path);
       if (path === '/api/v2/system/capabilities') return {server_id: 'server', restore_epoch: 'r2'};
-      if (path.endsWith('/manifest')) return {...manifest('d1'), viewing_revision: '9', viewing_epoch: 'server:r2'};
+      if (path.endsWith('/manifest')) return {...manifest('d1'), viewing_revision: '9', viewing_epoch: epoch,
+        restored_viewing_revision: '4', restored_manual_epoch: '0'};
       if (path.includes('/viewing')) return {watched: false, position_ms: 0};
       throw new Error(path);
     }});
@@ -610,7 +612,8 @@ test('progress from before a server restore waits for the person\'s choice', asy
   mkdirSync(target.path, {recursive: true});
   writeFileSync(join(target.path, 'manifest.json'), '{}');
   const state = fake.state(target.path);
-  state.downloads.push({identity: {download_id: 'd1', timeline_id: 't1'}});
+  state.downloads.push({identity: {download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
+    base_viewing_revision: '3', base_manual_epoch: '0', viewing_epoch: 'server:r1'}});
   const old = e => ({...e, media: {...e.media, viewing_epoch: 'server:r1'}});
   state.events = [old(event(1)), old(event(2)), {...event(3), media: {...event(3).media, viewing_epoch: 'server:r2'}}];
   // Two positions from before the restore (r1); the third is current.
@@ -618,15 +621,21 @@ test('progress from before a server restore waits for the person\'s choice', asy
     [{root: target.name, profile_id: 'default', events: 2, titles: 1}]);
   await assert.rejects(agent.resolveRestore(target.name, 'merge'), /Unknown choice/);
   await assert.rejects(agent.resolveRestore('0'.repeat(32), 'discard'), /not on this device/);
-  // Keeping re-pins the downloads to the restored server first.
+  // Keeping pins the earlier progress to each download's base as restored.
   paths.length = 0;
   await agent.resolveRestore(target.name, 'reapply');
-  const calls = fake.calls.map(c => [c[1], ...c[2]]);
-  const rebased = calls.findIndex(c => c[0] === 'rebase');
-  const restored = calls.findIndex(c => c[0] === 'restore');
-  assert.ok(rebased >= 0 && rebased < restored, 'downloads are re-pinned before re-applying');
-  assert.deepEqual(calls[restored], ['restore', '--choice', 'reapply', '--viewing-epoch', 'server:r2']);
+  const restore = fake.calls.find(c => c[1] === 'restore');
+  assert.deepEqual(restore[2], ['--choice', 'reapply', '--viewing-epoch', 'server:r2']);
+  assert.deepEqual(JSON.parse(restore[3]), [{download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
+    base_viewing_revision: '4', base_manual_epoch: '0', viewing_epoch: 'server:r2'}]);
   assert.ok(paths.includes('/api/v2/downloads/d1/manifest'));
+  assert.ok(!fake.calls.some(c => c[1] === 'rebase'), 'the downloads are re-pinned by the next pass');
+  // Restored again meanwhile: nothing is changed and the choice is offered again.
+  fake.calls.length = 0;
+  epoch = 'server:r3';
+  await assert.rejects(agent.resolveRestore(target.name, 'reapply'), /changed again/);
+  assert.ok(!fake.calls.some(c => c[1] === 'restore'));
+  epoch = 'server:r2';
   // Discarding needs no server state beyond its identity.
   fake.calls.length = 0;
   await agent.resolveRestore(target.name, 'discard');

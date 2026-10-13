@@ -97,6 +97,11 @@ struct World {
     /// The server's restore epoch and how many restores happened.
     epoch: u8,
     restores: u8,
+    /// Server: the viewing base as restored (`restore_baselines`).
+    restored_base: (u64, u64),
+    /// Oracle facts since the restore: another authority wrote viewing.
+    viewing_since_restore: bool,
+    manual_since_restore: bool,
 }
 
 fn scope() -> CacheScope {
@@ -289,8 +294,8 @@ impl Model for Downloads {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.offline-download-reconciliation".into(),
-            model_version: 5,
-            properties_version: 5,
+            model_version: 6,
+            properties_version: 6,
             codec_version: 1,
             build: concat!(
                 include_str!("../src/downloads.rs"),
@@ -320,6 +325,9 @@ impl Model for Downloads {
             edits: 0,
             epoch: 0,
             restores: 0,
+            restored_base: (0, 0),
+            viewing_since_restore: false,
+            manual_since_restore: false,
         })
     }
 
@@ -472,6 +480,7 @@ impl Model for Downloads {
                 n.view.revision += 1;
                 n.view.position_ms = 5_000;
                 n.other_viewing = true;
+                n.viewing_since_restore = true;
             }
             Input::ManualOverride if w.manual < 1 => {
                 n.manual += 1;
@@ -480,6 +489,7 @@ impl Model for Downloads {
                 n.view.manual_watched = Some(false);
                 n.view.position_ms = 0;
                 n.other_manual = true;
+                n.manual_since_restore = true;
             }
             Input::TimelineEdit if w.edits < 1 => {
                 n.edits += 1;
@@ -497,12 +507,16 @@ impl Model for Downloads {
                 n.log = r.events;
             }
             Input::Reapply if earlier_progress(w) && w.download.is_some() => {
-                // The agent re-pins the download to the restored server first.
+                // Kept progress is pinned to the viewing base as restored,
+                // never the current one: anything written since the restore
+                // is newer (the oracle's facts since the restore).
                 let mut pin = identity(w);
                 pin.timeline_revision = w.download.as_ref().unwrap().timeline_revision.clone();
+                pin.base_viewing_revision = w.restored_base.0.to_string();
+                pin.base_manual_epoch = w.restored_base.1.to_string();
                 n.download = Some(pin.clone());
-                n.other_viewing = false;
-                n.other_manual = false;
+                n.other_viewing = w.viewing_since_restore;
+                n.other_manual = w.manual_since_restore;
                 let r = offline::reapply(
                     w.base,
                     w.base_epoch.map(epoch_name).as_deref(),
@@ -525,6 +539,10 @@ impl Model for Downloads {
                 n.lineage = None;
                 n.epoch += 1;
                 n.restores += 1;
+                // The baseline is captured with the new history.
+                n.restored_base = (n.view.revision, n.view.manual_epoch);
+                n.viewing_since_restore = false;
+                n.manual_since_restore = false;
             }
             _ => {}
         }
@@ -661,6 +679,7 @@ impl Model for Downloads {
                         && n.log.iter().all(|e| {
                             e.media.viewing_epoch == Some(history(w))
                                 && Some(&e.media) == n.download.as_ref()
+                                && e.media.base_viewing_revision == w.restored_base.0.to_string()
                         })
                         && n.base + n.log.len() as u64 >= w.base + w.log.len() as u64,
                 ));
@@ -755,7 +774,7 @@ fn offline_reconciliation_exhausts_bounded_interleavings() {
         stateless::explore::SearchTermination::GraphExhausted
     );
     println!(
-        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring and a discard or re-apply choice, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
+        "Offline reconciliation: {} states, {} transitions; {MAX_SEQUENCES} device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore with re-anchoring and a discard or re-apply (onto the restored baseline) choice, retention limit {RETENTION_LIMIT}; download/rebase, partial/complete/beyond, sync with acknowledgement, lost response, altered retry, stale replay, gap",
         report.states, report.transitions
     );
 }
@@ -880,4 +899,42 @@ fn reapplied_progress_is_applied_on_the_restored_server() {
     assert!(dropped.log.is_empty());
     let synced = Downloads.step(&dropped, &Input::Sync).unwrap();
     assert!(synced.outputs.is_empty() && synced.state.view == w.view);
+}
+
+#[test]
+fn viewing_written_after_the_restore_wins_over_kept_progress() {
+    let mut w = Downloads.initial_state().unwrap();
+    for input in [
+        Input::Download,
+        Input::Play(Position::Partial),
+        Input::Sync,
+        Input::Play(Position::Complete),
+        Input::Restore,
+        // Another session watches on the restored server before the choice.
+        Input::OnlineProgress,
+        Input::Reapply,
+    ] {
+        w = Downloads.step(&w, &input).unwrap().state;
+    }
+    let synced = Downloads.step(&w, &Input::Sync).unwrap();
+    assert_eq!(
+        synced.outputs,
+        vec![Some((Outcome::HistoryOnly, Some(Code::ViewingNewer)))]
+    );
+    assert_eq!(
+        synced.state.view.position_ms, 5_000,
+        "the newer session stands"
+    );
+    // A policy that pinned kept progress to the current view would apply it;
+    // the oracle refuses that.
+    let mut bad = synced.state.clone();
+    bad.view.position_ms = DURATION;
+    let mutation = Transition::accepted(bad, vec![Some((Outcome::Applied, None))]);
+    assert!(
+        Downloads
+            .check_transition(&w, &Input::Sync, &mutation.as_ref())
+            .unwrap()
+            .iter()
+            .any(|c| matches!(c.status, stateless::CheckStatus::Failed(_)))
+    );
 }

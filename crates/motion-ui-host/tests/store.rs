@@ -633,11 +633,33 @@ fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
     write(&log);
     assert!(
         store
-            .resolve_restore(RestoreChoice::Discard, "bad")
+            .resolve_restore(RestoreChoice::Discard, "bad", &[])
+            .is_err()
+    );
+    // The restored pin: this download's base as restored, under the current
+    // history. A pin for another history or download is refused.
+    let mut restored = entry("d1", media).identity;
+    restored.base_viewing_revision = "7".into();
+    let mut foreign = restored.clone();
+    foreign.viewing_epoch = Some("server:other".into());
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Reapply, "server:restore", &[foreign])
+            .is_err()
+    );
+    let mut unknown = restored.clone();
+    unknown.download_id = "d9".into();
+    assert!(
+        store
+            .resolve_restore(RestoreChoice::Reapply, "server:restore", &[unknown])
             .is_err()
     );
     let kept = store
-        .resolve_restore(RestoreChoice::Reapply, "server:restore")
+        .resolve_restore(
+            RestoreChoice::Reapply,
+            "server:restore",
+            std::slice::from_ref(&restored),
+        )
         .unwrap();
     assert_eq!(
         kept,
@@ -648,7 +670,7 @@ fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
     );
     let after = store.events().unwrap();
     assert_eq!(after.base_sequence, 4);
-    let pin = entry("d1", media).identity;
+    let pin = restored.clone();
     assert_eq!(
         after
             .events
@@ -664,14 +686,14 @@ fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
     // Nothing earlier is left: a second choice changes nothing.
     assert_eq!(
         store
-            .resolve_restore(RestoreChoice::Discard, "server:restore")
+            .resolve_restore(RestoreChoice::Discard, "server:restore", &[])
             .unwrap(),
         RestoreOutcome::default()
     );
     // Discarding instead drops them; the host still opens the log.
     write(&log);
     let dropped = store
-        .resolve_restore(RestoreChoice::Discard, "server:restore")
+        .resolve_restore(RestoreChoice::Discard, "server:restore", &[])
         .unwrap();
     assert_eq!(dropped.discarded, 2);
     let after = store.events().unwrap();

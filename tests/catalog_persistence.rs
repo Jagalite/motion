@@ -801,3 +801,43 @@ async fn timeline_repair_retracts_only_untouched_empty_cut_and_retries_atomicall
             .unwrap();
     assert_eq!(retained, 5.0);
 }
+
+/// A restore captures each timeline's viewing as restored, under the new
+/// history, in the same transaction that starts it: kept offline progress
+/// is pinned to this baseline (completion 5C).
+#[tokio::test]
+async fn restore_captures_the_viewing_baseline_of_the_new_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let live = db::connect(&path).await.unwrap();
+    sqlx::query("INSERT OR IGNORE INTO profiles(id,name) VALUES ('default','Default')")
+        .execute(&live)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,updated_at) VALUES ('default','t1',5,1,0)")
+        .execute(&live)
+        .await
+        .unwrap();
+    live.close().await;
+    let destination = dir.path().join("restored").join("motion.sqlite");
+    let receipt = db::restore_into(&path, &destination).await.unwrap();
+    let pool = SqlitePool::connect(&format!("sqlite://{}", destination.display()))
+        .await
+        .unwrap();
+    let baseline: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT profile_id,timeline_id,revision,manual_epoch FROM restore_baselines",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(baseline, [("default".into(), "t1".into(), 5, 1)]);
+    let (captured, current): (String, String) = sqlx::query_as(
+        "SELECT (SELECT restore_epoch FROM restore_baseline_epoch),(SELECT restore_epoch FROM server_identity)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(captured, current);
+    assert_eq!(Some(current), receipt.restore_epoch);
+    pool.close().await;
+}

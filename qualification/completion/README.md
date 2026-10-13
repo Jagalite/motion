@@ -827,12 +827,12 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   history (before a restore) used to wait on the device indefinitely.
   The desktop window now lists, per profile, how many saved positions for
   how many titles are waiting, and offers two choices:
-  - **Keep my offline progress (re-apply):** the agent re-pins the
-    profile's downloads to the restored server's current state (the
-    existing rebase). The cache then re-records each earlier observation,
-    in order, against its download's current pin (core
-    `offline::reapply`): same position, status and device time, a new
-    identity, and the next sequences after every retained event. The
+  - **Keep my offline progress (re-apply):** the cache re-records each
+    earlier observation, in order, against its download's viewing base
+    *as restored* (core `offline::reapply`, pins from
+    `restored_viewing_revision`; see review C1): same position, status and
+    device time, a new identity, and the next sequences after every
+    retained event. The
     earlier events are compacted, and the next batch re-anchors past them
     (part 1). The server decides the new events against its current
     state, so progress newer on the server still wins (`viewing_newer`).
@@ -879,7 +879,22 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
       sent, and the outcome is reported.
   - Pinned clippy with CI's flags: clean.
 - **Not covered:** the packaged Electron run of the choice (5F).
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** one P1 and three P2 findings, all
+  fixed. The design of Keep changed.
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | C1 (P1) | Keep pinned the earlier progress to the *current* viewing base read at the choice, so viewing written on the restored server after the restore was overwritten. The promised "newer server progress wins" did not hold | Fixed: a restore now captures each timeline's viewing as restored. Migration `0047_restore_baselines` adds `restore_baselines` and `restore_baseline_epoch`; `db::restore_into` fills them in the same transaction that starts the new history. The download manifest exposes `restored_viewing_revision` and `restored_manual_epoch` (null when unknown). Kept progress is pinned to that baseline, so any later write is newer and the server answers `viewing_newer`. The agent no longer re-pins entries before Keep; the next pass does. Model v6 pins Reapply to the restored baseline and tracks writes since the restore. New scenario test Restore → OnlineProgress → Reapply → Sync answers `viewing_newer`, and a mutation that applies it fails the oracle. Persistence test: a real restore captures the baseline under the new epoch |
+  | C2 | An earlier observation re-applied after a retained, current-history observation of the same download came last | Fixed: core `reapply` drops earlier observations of a download the device already observed in the current history (counted as dropped). Core test |
+  | C3 | A second restore between reading the history and the manifests dropped kept progress permanently | Fixed: if any download reports another history, Keep changes nothing and the choice stays offered. The cache refuses pins not under the given history or not matching its download (store test). JS test |
+  | C4 | The native library view covered the revealed panel | Fixed: the chrome page asks the host to lay out again (`motion:layout`) whenever the panel or status changes. Chrome test |
+
+  After round 1:
+  - Core 155, store 17, cache 9, `v2_downloads` 6,
+    `catalog_persistence` 14, contract 5 and JS 92 passed.
+  - `downloads_model` v6: 4,765,164 states and 76,242,624 transitions,
+    exhausted, in 186 s.
+  - Pinned clippy is clean.
 
 ### Remaining item 5 work (not started)
 

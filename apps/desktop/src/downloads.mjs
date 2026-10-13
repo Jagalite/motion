@@ -361,10 +361,12 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
   }
 
   /**
-   * Apply the person's choice for one root: `reapply` re-pins its downloads
-   * to the restored server's current state, then the cache re-records the
-   * earlier progress against those pins (offline::reapply); `discard` drops
-   * it (offline::discard). The next pass sends what remains.
+   * Apply the person's choice for one root. `reapply`: the cache re-records
+   * the earlier progress against each download's viewing base *as restored*
+   * (offline::reapply), so viewing written on the restored server since then
+   * wins; downloads whose restored base is unknown lose that progress.
+   * `discard` drops it (offline::discard). The next pass sends what remains
+   * and then re-pins the downloads as usual.
    */
   async function resolveRestore(rootName, choice) {
     if (!['discard', 'reapply'].includes(choice)) throw new Error('Unknown choice');
@@ -372,8 +374,22 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (!target) throw new Error('That offline library is not on this device');
     const current = await currentHistory();
     if (!current) throw new Error('The server identity could not be confirmed');
-    if (choice === 'reapply') await rebase(target, (await cache(target.path, target.scope, ['status'])).manifest);
-    return cache(target.path, target.scope, ['restore', '--choice', choice, '--viewing-epoch', current]);
+    if (choice === 'discard') return cache(target.path, target.scope, ['restore', '--choice', 'discard', '--viewing-epoch', current]);
+    const pins = [];
+    for (const entry of (await cache(target.path, target.scope, ['status'])).manifest.downloads) {
+      let pinned;
+      try { pinned = await api(`/api/v2/downloads/${encodeURIComponent(entry.identity.download_id)}/manifest`); }
+      catch (error) {
+        if (error.status === 409 || error.status === 404) continue;
+        throw error;
+      }
+      // Restored again meanwhile: nothing changes, and the choice is offered again.
+      if (pinned.viewing_epoch !== current) throw new Error('The server changed again. Choose again.');
+      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) continue;
+      pins.push({...entry.identity, base_viewing_revision: pinned.restored_viewing_revision,
+        base_manual_epoch: pinned.restored_manual_epoch, viewing_epoch: current});
+    }
+    return cache(target.path, target.scope, ['restore', '--choice', 'reapply', '--viewing-epoch', current], JSON.stringify(pins));
   }
 
   /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */

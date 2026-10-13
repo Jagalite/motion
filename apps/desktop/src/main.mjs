@@ -336,6 +336,9 @@ else {
     ipcMain.handle('motion:offline-roots', event => { authorize(event); return offlineRoots(cacheBase()).map(({name, label, titles, current}) => ({name, label, titles, current})); });
     // Offline progress recorded before the connected server was restored:
     // listed for an explicit choice, never resolved without one.
+    // The chrome page's header changed height (the restore panel or a
+    // status line): place the library view below it again.
+    ipcMain.handle('motion:layout', event => { authorize(event); resize(); });
     ipcMain.handle('motion:offline-restore', async event => {
       authorize(event);
       return downloads?.agent ? downloads.agent.restoreChoices() : [];

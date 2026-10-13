@@ -84,17 +84,20 @@ test('progress from before a server restore is offered for an explicit choice', 
   let choices = [{root: 'a'.repeat(32), profile_id: 'default', events: 3, titles: 2}];
   const chosen = [];
   const statusHandlers = [];
+  let layouts = 0;
   runInNewContext(readFileSync(new URL('../src/chrome.js', import.meta.url), 'utf8'), {
     document: {getElementById: node, createElement: tag => element(tag)},
     window: {motionHost: {onStatus: callback => statusHandlers.push(callback), offlineRoots: async () => [],
       offlineRestore: async () => choices,
-      chooseOfflineRestore: async (root, choice) => { chosen.push([root, choice]); choices = []; return {discarded: 0, reapplied: 3, dropped: 1}; }}},
+      chooseOfflineRestore: async (root, choice) => { chosen.push([root, choice]); choices = []; return {discarded: 0, reapplied: 3, dropped: 1}; },
+      layoutChanged: async () => { layouts++; }}},
   });
   const settle = () => new Promise(resolve => setImmediate(resolve));
   // The agent's status after a refused sync refreshes the choices.
   statusHandlers[0]('The server was restored from a backup.');
   await settle(); await settle();
   assert.equal(node('offline-restore').hidden, false);
+  assert.ok(layouts > 0, 'the library view is placed below the revealed panel');
   const item = node('offline-restore-list').children[0];
   assert.match(item.children[0].textContent, /3 saved positions for 2 titles/);
   const [keep, discard] = item.querySelectorAll('button');

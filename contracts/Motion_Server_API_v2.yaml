@@ -12566,6 +12566,18 @@ components:
           maxLength: 257
           description: server_id:restore_epoch of the history viewing_revision and manual_epoch belong
             to. Send it as X-Motion-Viewing-Epoch when synchronizing events based on this manifest.
+        restored_viewing_revision:
+          description: When this history began with a restore from a backup, the timeline's viewing revision
+            as restored (0 when it had none); null when unknown. Offline progress recorded before the restore
+            that the person keeps is based on it, so viewing written on the restored server since then wins.
+          anyOf:
+          - $ref: '#/components/schemas/Revision'
+          - type: 'null'
+        restored_manual_epoch:
+          description: The manual epoch as restored, with restored_viewing_revision; null when unknown.
+          anyOf:
+          - $ref: '#/components/schemas/Revision'
+          - type: 'null'
       required:
       - download_id
       - timeline_id

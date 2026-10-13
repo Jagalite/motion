@@ -1,6 +1,8 @@
 const form = document.getElementById('connect');
 const status = document.getElementById('status');
-const show = (text, error = false) => { status.textContent = text; status.setAttribute('role', error ? 'alert' : 'status'); };
+// The library view sits below the header; tell the host when its height may change.
+const relayout = () => { void window.motionHost.layoutChanged?.()?.catch?.(() => {}); };
+const show = (text, error = false) => { status.textContent = text; status.setAttribute('role', error ? 'alert' : 'status'); relayout(); };
 form.addEventListener('submit', async event => {
   event.preventDefault();
   const button = form.querySelector('button[type=submit]');
@@ -54,6 +56,7 @@ async function listRestoreChoices() {
     }));
     restorePanel.hidden = choices.length === 0;
   } catch { restorePanel.hidden = true; }
+  relayout();
 }
 
 // Several servers or profiles may have saved titles here: offer a choice

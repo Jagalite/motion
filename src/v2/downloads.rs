@@ -635,6 +635,24 @@ pub async fn manifest(
         sqlx::query_as("SELECT server_id,restore_epoch FROM server_identity WHERE singleton=1")
             .fetch_one(&mut *tx)
             .await?;
+    // The viewing base as it was restored, when this history began with a
+    // restore whose baseline was captured; unknown otherwise.
+    let captured: Option<String> =
+        sqlx::query_scalar("SELECT restore_epoch FROM restore_baseline_epoch WHERE singleton=1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    let restored = if captured.as_deref() == Some(restore_epoch.as_str()) {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT revision,manual_epoch FROM restore_baselines WHERE profile_id=? AND timeline_id=?",
+        )
+        .bind(&row.profile_id)
+        .bind(&row.timeline_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        Some(row.unwrap_or((0, 0)))
+    } else {
+        None
+    };
     tx.commit().await?;
     Ok(tagged(
         StatusCode::OK,
@@ -655,6 +673,8 @@ pub async fn manifest(
             "viewing_revision": view.revision.to_string(),
             "manual_epoch": view.manual_epoch.to_string(),
             "viewing_epoch": format!("{server_id}:{restore_epoch}"),
+            "restored_viewing_revision": restored.map(|(r, _)| r.to_string()),
+            "restored_manual_epoch": restored.map(|(_, e)| e.to_string()),
         }),
         row.revision,
     ))

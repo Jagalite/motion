@@ -311,12 +311,15 @@ pub fn discard(
 /// Re-apply progress recorded against an earlier history onto the restored
 /// server. Each leading foreign event becomes a new event, in order, with the
 /// same observation (position, status, device time) pinned to its
-/// download's current pin in `pins` (read from the restored server), with a
-/// new identity and the next sequences after every retained event; the
+/// download's restored pin in `pins`: the viewing base *as restored*
+/// (`restored_viewing_revision`), never the current one, so viewing written
+/// on the restored server since then is newer and wins (`viewing_newer`).
+/// New identities and the next sequences follow every retained event; the
 /// foreign events are compacted and the next batch re-anchors past them.
-/// The server then decides the new events against its current state, so an
-/// observation newer on the server still wins. Events whose download has no
-/// pin in `current` are dropped. Retained events are never renumbered.
+/// Dropped: events whose download has no restored pin in `current`, and
+/// events of a download for which the device already holds a newer,
+/// current-history observation (re-applied after it, the older observation
+/// would come last). Retained events are never renumbered.
 pub fn reapply(
     base: u64,
     base_epoch: Option<&str>,
@@ -329,8 +332,14 @@ pub fn reapply(
     let mut events = discarded.events;
     let mut next = next_sequence(discarded.base, &events)?;
     let mut dropped = 0;
+    // Downloads the device already observed in the current history.
+    let newer: Vec<String> = events
+        .iter()
+        .map(|e| e.media.download_id.clone())
+        .collect();
     for event in foreign {
-        let Some(pin) = pins.iter().find(|p| {
+        let superseded = newer.contains(&event.media.download_id);
+        let Some(pin) = pins.iter().filter(|_| !superseded).find(|p| {
             p.download_id == event.media.download_id
                 && p.timeline_id == event.media.timeline_id
                 && p.viewing_epoch.as_deref() == Some(current)
@@ -413,6 +422,23 @@ mod tests {
             status: "paused".into(),
             device_time: Some(format!("t{sequence}")),
         }
+    }
+
+    #[test]
+    fn an_earlier_observation_never_follows_a_newer_one_of_its_download() {
+        // "c" was downloaded again after the restore and played: its newer,
+        // current observation supersedes the earlier one.
+        let log = vec![
+            restored_event(3, "c", "s:old", 10),
+            restored_event(4, "c", "s:new", 40),
+        ];
+        let pin = DownloadIdentity {
+            viewing_epoch: Some("s:new".into()),
+            ..restored_event(0, "c", "s:new", 0).media
+        };
+        let resolved = reapply(2, Some("s:old"), &log, &[pin], "s:new").unwrap();
+        assert_eq!((resolved.base, resolved.dropped), (3, 1));
+        assert_eq!(resolved.events, log[1..]);
     }
 
     #[test]

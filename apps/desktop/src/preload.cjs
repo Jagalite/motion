@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('motionHost', Object.freeze({
   stopLocal: () => ipcRenderer.invoke('motion:stop-local'),
   openDownloads: root => ipcRenderer.invoke('motion:downloads', typeof root === 'string' ? root : null),
   offlineRoots: () => ipcRenderer.invoke('motion:offline-roots'),
+  layoutChanged: () => ipcRenderer.invoke('motion:layout'),
   offlineRestore: () => ipcRenderer.invoke('motion:offline-restore'),
   chooseOfflineRestore: (root, choice) => ipcRenderer.invoke('motion:offline-restore-choose', String(root), String(choice)),
   connect: request => ipcRenderer.invoke('motion:connect', request),

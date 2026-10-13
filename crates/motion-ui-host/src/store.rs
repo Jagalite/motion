@@ -518,14 +518,17 @@ impl Store {
     /// Apply the person's choice for progress recorded against an earlier
     /// history of a restored server (`current` is the server's history now):
     /// discard it (`offline::discard`), or re-apply it pinned to each
-    /// download's current pin (`offline::reapply`; the agent re-pins the
-    /// downloads first). One durable replacement of the event log; the next
-    /// batch re-anchors past the old events. Returns how many events were
+    /// download's restored pin (`offline::reapply`; `pins`, read by the agent
+    /// from the restored server: the viewing base as restored, under
+    /// `current`, for a download of this cache with its pinned timeline and
+    /// source). One durable replacement of the event log; the next batch
+    /// re-anchors past the old events. Returns how many events were
     /// discarded, re-applied and dropped.
     pub fn resolve_restore(
         &mut self,
         choice: RestoreChoice,
         current: &str,
+        pins: &[offline::DownloadIdentity],
     ) -> anyhow::Result<RestoreOutcome> {
         ensure!(offline::viewing_epoch(current), "invalid server history");
         let log = self.events()?;
@@ -541,17 +544,28 @@ impl Store {
                 current,
             ),
             RestoreChoice::Reapply => {
-                let pins: Vec<_> = self
-                    .manifest
-                    .downloads
-                    .iter()
-                    .map(|d| d.identity.clone())
-                    .collect();
+                for pin in pins {
+                    let entry = self
+                        .manifest
+                        .downloads
+                        .iter()
+                        .find(|d| d.identity.download_id == pin.download_id)
+                        .context("a pin names a download this cache does not hold")?;
+                    ensure!(
+                        pin.viewing_epoch.as_deref() == Some(current)
+                            && pin.timeline_id == entry.identity.timeline_id
+                            && pin.timeline_revision == entry.identity.timeline_revision
+                            && pin.source_revision == entry.identity.source_revision
+                            && offline::sequence(&pin.base_viewing_revision).is_some()
+                            && offline::sequence(&pin.base_manual_epoch).is_some(),
+                        "a pin does not describe this cache's download under the current history"
+                    );
+                }
                 offline::reapply(
                     log.base_sequence,
                     log.base_viewing_epoch.as_deref(),
                     &log.events,
-                    &pins,
+                    pins,
                     current,
                 )
                 .context("the device sequence is exhausted")?
