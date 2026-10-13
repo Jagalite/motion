@@ -3576,7 +3576,7 @@ async fn explicit_operator_source_keeps_administrative_event_disclosure() {
     let (initial, _) = sse(&mut body, 1).await;
     assert_eq!(initial[0].1["reason"], "initial_snapshot");
     sqlx::query(
-        "INSERT INTO change_events(topic,resource_id,kind) VALUES ('system','auth-test','updated')",
+        "INSERT INTO change_events(topic,resource_id,kind) VALUES ('system','auth-test','changed')",
     )
     .execute(&f.app.db)
     .await

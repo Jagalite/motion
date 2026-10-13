@@ -49,14 +49,22 @@ temporary and isolated from live state.
   compilation or execution pass.
 - Requested targets: `playscale-core --test caller_model` and
   `playscale --test access_api`, `cargo test --locked --no-run --jobs 2`.
-- Test binaries have not yet executed. Queue policy requires `--no-run`; record
-  their separate executions below before calling this checkpoint tested.
+- Local test binaries have not yet executed. Queue policy requires `--no-run`.
+- CI run `38341814710` on `558bdee` passed formatting, Clippy, the new caller
+  Stateless model (asserted 192 states and graph exhaustion), and 40/41 access
+  API tests. The remaining new operator SSE test used invalid fixture event kind
+  `updated`; SQLite requires `changed` or `deleted`. This checkpoint corrects the
+  fixture to `changed`; the complete access API rerun remains pending.
+- CI contract, client-controller and publication checks passed on `558bdee`.
+  These results are separate from the still-queued local Kyoto build.
 - The new Stateless model checks exact principals/grants, rejection outcomes and
   effect counts after deletion, revocation, generation rotation, policy downgrade
   and expiry, with explicit operator, device, session, ingress and wrong-device
   ingress observations. Declared bounds: one device/parent/session chain, time
   0/99/100, at most 1,000 states, 20,000 transitions and depth 20. Actual explored
-  counts are pending execution. It does not model unimplemented SSO transactions.
+  transition count was not printed by CI; the passing test asserts 192 states,
+  graph exhaustion and no skipped checks. It does not model unimplemented SSO
+  transactions.
 - New SQLite/API tests cover missing/malformed proof, stale cached principal,
   changed/deleted credential rows, operator continuity, session parent loss,
   ingress revocation and permission changes across transactional writes and SSE.
@@ -64,7 +72,7 @@ temporary and isolated from live state.
   and the full `origin/main...HEAD` diff: no actionable findings. Review covered
   caller provenance, core dispatch, write/SSE reauthentication, credential
   replacement/revocation, issuance, durable compatibility and regression tests.
-  This was source review; test evidence remains pending.
+  This was source review, separate from the partial CI execution recorded above.
 - Draft PR: https://github.com/Jagalite/motion/pull/38 (linked to this thread).
 
 No live browser, native/TUI walkthrough, provider, mail delivery, restore flow,
