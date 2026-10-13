@@ -233,6 +233,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                         prepared_downloads: vec![crate::facade::PreparedDownload {
                             label: "H.264 720p · audio 2 · subtitle 1".into(),
                             recipe_id: "h264720p".into(),
+                            version_id: "ver-prepared-720p".into(),
                             tracks_json: r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"require","audio_track_id":"a1","subtitle_track_id":"s0"}"#.into(),
                         }],
                     }]

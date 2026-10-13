@@ -683,21 +683,24 @@ impl UiQueryFacade for Queries {
                 // them; each is offered with exactly the selection it kept.
                 let prepared_downloads =
                     if who.can("downloads:manage") && who.can("processing:request") {
+                        // Every page: ready versions may follow pending ones.
                         let query = url::form_urlencoded::Serializer::new(String::new())
                             .append_pair("timeline_id", &timeline)
-                            .append_pair("limit", "50")
                             .finish();
-                        self.read(&format!("/processing/renditions?{query}"))
+                        self.list_all(&format!("/processing/renditions?{query}"), 5)
                             .await
-                            .ok()
-                            .and_then(|page| page["items"].as_array().cloned())
                             .unwrap_or_default()
                             .iter()
-                            .filter(|r| r["status"] == "ready" && r["tracks"].is_object())
+                            .filter(|r| {
+                                r["status"] == "ready"
+                                    && r["tracks"].is_object()
+                                    && r["version_id"].is_string()
+                            })
                             .map(|r| PreparedDownload {
                                 label: prepared_label(r),
                                 recipe_id: text(r, "recipe_id"),
                                 tracks_json: r["tracks"].to_string(),
+                                version_id: text(r, "version_id"),
                             })
                             .collect()
                     } else {

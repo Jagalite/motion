@@ -313,6 +313,60 @@ pub(crate) async fn publication_facts(
 /// two agreeing when both are given. Returns the record the worker encodes
 /// and playback matches (`processing::carries`): `a{n}` and `s{n}` ordinals
 /// of the revision, with the requested components.
+/// `processing::kept_subtitle` as a problem (preparations and downloads).
+pub(crate) fn kept_subtitle_problem(policy: &str, explicit: bool) -> Result<(), Problem> {
+    use playscale_core::processing::{KeptSubtitleRefusal, kept_subtitle};
+    kept_subtitle(policy, explicit).map_err(|refusal| match refusal {
+        KeptSubtitleRefusal::PolicyConflict => Problem::invalid(
+            "subtitle_policy_conflict",
+            "Explicit subtitles conflict with off",
+        ),
+        KeptSubtitleRefusal::Unsupported => Problem::invalid(
+            "preparation_tracks_unsupported",
+            "A prepared version keeps a subtitle only when one is chosen explicitly with require",
+        ),
+    })
+}
+
+/// The status of the playscale rendition whose output is `output_file`
+/// (core `processing::rendition_status` over the same facts
+/// `listRenditions` reports); None when the file is no rendition output.
+pub(crate) async fn output_rendition_status(
+    conn: &mut sqlx::SqliteConnection,
+    output_file: &str,
+) -> Result<Option<&'static str>, Problem> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        bool,
+        Option<String>,
+        String,
+        bool,
+        bool,
+    );
+    let row: Option<Row> = sqlx::query_as("SELECT p.timeline_id,j.source_file_id,j.source_revision,j.phase,j.expired,r.file_revision,f.revision,coalesce(o.available=1 AND o.revision=r.file_revision,0),f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) FROM preparations p JOIN processing_jobs j ON j.id=p.job_id JOIN media_files f ON f.id=j.source_file_id LEFT JOIN media_files o ON o.id=j.output_file_id LEFT JOIN renditions r ON r.source='playscale' AND r.external_id=j.id AND r.file_id=j.output_file_id WHERE j.output_file_id=? ORDER BY j.id DESC LIMIT 1")
+        .bind(output_file)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((timeline, file, revision, phase, expired, _, current, available, source_available)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let binding = exact_binding(conn, &timeline, &file, &revision).await?;
+    Ok(Some(playscale_core::processing::rendition_status(
+        &playscale_core::processing::RenditionFacts {
+            expired,
+            phase: serde_json::from_value(json!(phase)).map_err(Problem::internal)?,
+            source_current: source_available && current == revision,
+            binding_current: binding,
+            output_current: available,
+        },
+    )))
+}
+
 pub(crate) async fn selection(
     app: &App,
     conn: &mut sqlx::SqliteConnection,
@@ -490,21 +544,7 @@ async fn prepare(
     // Automatic subtitle selection depends on a profile, not a rendition.
     let explicit_subtitle =
         input.tracks.subtitle_component_id.is_some() || input.tracks.subtitle_track_id.is_some();
-    match (input.tracks.subtitle_policy.as_str(), explicit_subtitle) {
-        ("off", false) | ("require", true) => {}
-        ("off", true) => {
-            return Err(Problem::invalid(
-                "subtitle_policy_conflict",
-                "Explicit subtitles conflict with off",
-            ));
-        }
-        _ => {
-            return Err(Problem::invalid(
-                "preparation_tracks_unsupported",
-                "A preparation keeps a subtitle only when one is chosen explicitly with require",
-            ));
-        }
-    }
+    kept_subtitle_problem(&input.tracks.subtitle_policy, explicit_subtitle)?;
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
@@ -735,9 +775,18 @@ async fn renditions(
             |(file_id, file_revision)| json!({"file_id":file_id,"file_revision":file_revision}),
         );
         // The selection it kept, as recorded on its source revision; a
-        // download names exactly this (`createDownload` with `recipe_id`).
+        // download names exactly this (`createDownload` with `recipe_id`),
+        // and its generated version pins exactly this rendition.
         let tracks = serde_json::from_str::<Value>(&tracks).unwrap_or(Value::Null);
-        values.push((id.clone(),json!({"id":id,"revision":resource_revision.to_string(),"timeline_id":timeline,"source":{"file_id":file,"file_revision":revision},"output":output,"recipe_digest":digest,"job_id":id,"status":status,"recipe_id":recipe,"tracks":tracks})));
+        let version: Option<String> = match &output {
+            Some(o) => sqlx::query_scalar("SELECT v.id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE v.timeline_id=? AND v.origin='generated' AND b.file_id=? ORDER BY v.id LIMIT 1")
+                .bind(&timeline)
+                .bind(o["file_id"].as_str().unwrap_or_default())
+                .fetch_optional(&mut *tx)
+                .await?,
+            None => None,
+        };
+        values.push((id.clone(),json!({"id":id,"revision":resource_revision.to_string(),"timeline_id":timeline,"source":{"file_id":file,"file_revision":revision},"output":output,"recipe_digest":digest,"job_id":id,"status":status,"recipe_id":recipe,"tracks":tracks,"version_id":version})));
     }
     let result = page(&mut tx, &caller.principal, values, limit).await?;
     tx.commit().await?;

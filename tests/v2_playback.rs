@@ -4463,6 +4463,60 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         "{}",
         pinned.body
     );
+    // The subtitle policy follows the same rule as preparing (kept only
+    // when explicit and required).
+    for (key, policy, subtitle, code) in [
+        (
+            "prepared-download-0004",
+            "off",
+            json!("s0"),
+            "subtitle_policy_conflict",
+        ),
+        (
+            "prepared-download-0005",
+            "require",
+            Value::Null,
+            "preparation_tracks_unsupported",
+        ),
+        (
+            "prepared-download-0006",
+            "auto",
+            json!("s0"),
+            "preparation_tracks_unsupported",
+        ),
+    ] {
+        let body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+            "version_id": null, "recipe_id": "remux_mp4",
+            "tracks": {"audio_component_id": null, "subtitle_component_id": null,
+                "subtitle_policy": policy, "audio_track_id": "a1", "subtitle_track_id": subtitle}});
+        let refused = f
+            .post("/api/v2/downloads", &saver_auth, Some(key), body)
+            .await;
+        assert_eq!(refused.body["code"], code, "{}", refused.body);
+    }
+    // The rendition's generated version (as listed) pins exactly it.
+    let listed = f
+        .get(
+            &format!("/api/v2/processing/renditions?timeline_id={timeline}"),
+            &operator,
+        )
+        .await;
+    let version = listed.body["items"][0]["version_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pinned_body = json!({"device_id": saver, "profile_id": "default", "timeline_id": timeline,
+        "version_id": version, "recipe_id": "remux_mp4",
+        "tracks": listed.body["items"][0]["tracks"].clone()});
+    let exact = f
+        .post(
+            "/api/v2/downloads",
+            &saver_auth,
+            Some("prepared-download-0007"),
+            pinned_body,
+        )
+        .await;
+    assert_eq!(exact.status, StatusCode::ACCEPTED, "{}", exact.body);
     for (key, audio, subtitle) in [
         ("prepared-download-0002", "a0", Some("s0")),
         ("prepared-download-0003", "a1", None),

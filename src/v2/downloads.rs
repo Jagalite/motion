@@ -195,6 +195,7 @@ async fn observe(
     .bind(&row.file_id)
     .fetch_optional(&mut *conn)
     .await?;
+    let ready = super::processing::output_rendition_status(conn, &row.file_id).await?;
     let bound = bound.filter(|_| {
         rendition.as_ref().is_none_or(
             |(available, revision, registered, source, registered_source)| {
@@ -204,7 +205,7 @@ async fn observe(
                     registered,
                     source,
                     registered_source,
-                )
+                ) && ready.is_none_or(|status| status == "ready")
             },
         )
     });
@@ -432,6 +433,7 @@ async fn prepared_candidates(
     principal: &Principal,
     timeline: &str,
     version: Option<&str>,
+    recipe: &str,
     timeline_duration: Option<i64>,
     tracks: &TrackInput,
 ) -> Result<Vec<Candidate>, Problem> {
@@ -451,23 +453,36 @@ async fn prepared_candidates(
         i64,
         Option<f64>,
     );
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT v.id,f.id,f.revision,b.file_revision,(f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1)),\
-         r.file_revision,s.id,s.revision,r.source_revision,j.recipe,p.tracks_json,f.relative_path,f.bytes,f.duration_seconds \
-         FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
-         JOIN media_files f ON f.id=b.file_id JOIN renditions r ON r.file_id=f.id AND r.source='playscale' \
-         JOIN processing_jobs j ON j.id=r.external_id JOIN preparations p ON p.job_id=j.id \
-         JOIN media_files s ON s.id=r.source_file_id \
-         WHERE v.timeline_id=? AND v.origin='generated' AND f.generated=1 AND (? IS NULL OR v.id=?) \
-         AND b.start_ms IS NULL AND b.end_ms IS NULL \
-         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
-         ORDER BY r.updated_at DESC,v.id LIMIT 200",
-    )
-    .bind(timeline)
-    .bind(version)
-    .bind(version)
-    .fetch_all(&mut *conn)
-    .await?;
+    // Only the requested recipe, newest first, read page by page until a
+    // rendition carrying the selection is found or every one was examined.
+    let mut rows: Vec<Row> = Vec::new();
+    for page in 0..PREPARED_PAGES {
+        let batch: Vec<Row> = sqlx::query_as(
+            "SELECT v.id,f.id,f.revision,b.file_revision,(f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1)),\
+             r.file_revision,s.id,s.revision,r.source_revision,j.recipe,p.tracks_json,f.relative_path,f.bytes,f.duration_seconds \
+             FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
+             JOIN media_files f ON f.id=b.file_id JOIN renditions r ON r.file_id=f.id AND r.source='playscale' \
+             JOIN processing_jobs j ON j.id=r.external_id JOIN preparations p ON p.job_id=j.id \
+             JOIN media_files s ON s.id=r.source_file_id \
+             WHERE v.timeline_id=? AND v.origin='generated' AND f.generated=1 AND (? IS NULL OR v.id=?) AND j.recipe=? \
+             AND b.start_ms IS NULL AND b.end_ms IS NULL \
+             AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+             ORDER BY r.updated_at DESC,v.id LIMIT ? OFFSET ?",
+        )
+        .bind(timeline)
+        .bind(version)
+        .bind(version)
+        .bind(recipe)
+        .bind(PREPARED_PAGE)
+        .bind(page * PREPARED_PAGE)
+        .fetch_all(&mut *conn)
+        .await?;
+        let complete = (batch.len() as i64) < PREPARED_PAGE;
+        rows.extend(batch);
+        if complete {
+            break;
+        }
+    }
     let mut found = Vec::with_capacity(rows.len());
     for (
         version,
@@ -486,13 +501,16 @@ async fn prepared_candidates(
         seconds,
     ) in rows
     {
+        // Ready by the same facts listRenditions reports
+        // (`processing::rendition_status`), and its bytes as registered.
         let current = playscale_core::renditions::available(
             available,
             &revision,
             &registered,
             &source_revision,
             &registered_source,
-        );
+        ) && super::processing::output_rendition_status(conn, &file).await?
+            == Some("ready");
         // The selection on the source revision the rendition was prepared
         // from; a selection it cannot express there is carried by nothing.
         let streams: Vec<crate::db::Track> =
@@ -632,7 +650,7 @@ pub async fn create(
             .bind(&input.timeline_id)
             .fetch_one(&mut *tx)
             .await?;
-    let found = match input.recipe_id {
+    let found = match input.recipe_id.as_deref() {
         None => {
             candidates(
                 &mut tx,
@@ -643,13 +661,25 @@ pub async fn create(
             )
             .await?
         }
-        Some(_) => {
+        Some(recipe) => {
+            // The same rule as preparing it: a kept subtitle is explicit and
+            // required (`processing::kept_subtitle`).
+            let t = &input.tracks;
+            super::processing::kept_subtitle_problem(
+                match t.subtitle_policy {
+                    SubtitlePolicy::Off => "off",
+                    SubtitlePolicy::Auto => "auto",
+                    SubtitlePolicy::Require => "require",
+                },
+                t.subtitle_component_id.is_some() || t.subtitle_track_id.is_some(),
+            )?;
             prepared_candidates(
                 &app,
                 &mut tx,
                 &principal,
                 &input.timeline_id,
                 input.version_id.as_deref(),
+                recipe,
                 timeline_duration,
                 &input.tracks,
             )
@@ -1120,6 +1150,9 @@ pub struct ReanchorInput {
 }
 
 const MAX_BATCH: usize = 200;
+/// Prepared renditions of one recipe read per page, and pages at most.
+const PREPARED_PAGE: i64 = 200;
+const PREPARED_PAGES: i64 = 10;
 
 fn valid_id(s: &str) -> bool {
     !s.is_empty()

@@ -283,6 +283,7 @@ async fn downloads_pin_exact_originals_and_grant_only_their_bytes() {
     // Explicit refusals never substitute another selection.
     let mut recipe = input(&device, &timeline);
     recipe["recipe_id"] = json!("x");
+    recipe["tracks"]["subtitle_policy"] = json!("off");
     problem(
         &f.post("/api/v2/downloads", &auth, "download-key-0001", recipe)
             .await,

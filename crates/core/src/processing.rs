@@ -163,6 +163,27 @@ pub fn validate_output(
     Ok(())
 }
 
+/// Why a selection cannot be kept by a rendition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptSubtitleRefusal {
+    /// An explicit subtitle with `off`.
+    PolicyConflict,
+    /// `auto`, or `require` without an explicit subtitle: automatic selection
+    /// depends on a profile, never on a rendition.
+    Unsupported,
+}
+
+/// Whether a rendition's selection is expressible: it keeps a subtitle only
+/// when one is chosen explicitly with `require`, and none with `off`. Shared
+/// by preparing a rendition and downloading one.
+pub fn kept_subtitle(policy: &str, explicit: bool) -> Result<(), KeptSubtitleRefusal> {
+    match (policy, explicit) {
+        ("off", false) | ("require", true) => Ok(()),
+        ("off", true) => Err(KeptSubtitleRefusal::PolicyConflict),
+        _ => Err(KeptSubtitleRefusal::Unsupported),
+    }
+}
+
 /// What a playscale preparation encoded from its source revision, as
 /// recorded when it was requested: zero-based audio and subtitle stream
 /// ordinals of that revision. No audio selection means the recipe's default
@@ -312,6 +333,22 @@ pub fn finish_preparation(
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
+    #[test]
+    fn a_kept_subtitle_is_explicit_and_required() {
+        assert_eq!(kept_subtitle("off", false), Ok(()));
+        assert_eq!(kept_subtitle("require", true), Ok(()));
+        assert_eq!(
+            kept_subtitle("off", true),
+            Err(KeptSubtitleRefusal::PolicyConflict)
+        );
+        for (policy, explicit) in [("require", false), ("auto", false), ("auto", true)] {
+            assert_eq!(
+                kept_subtitle(policy, explicit),
+                Err(KeptSubtitleRefusal::Unsupported)
+            );
+        }
+    }
+
     #[test]
     fn renditions_carry_only_the_recorded_audio_and_subtitle() {
         let wanted = |audio, subtitle| Wanted {

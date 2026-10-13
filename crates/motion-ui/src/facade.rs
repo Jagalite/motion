@@ -136,6 +136,8 @@ pub struct PreparedDownload {
     pub recipe_id: String,
     /// The selection it kept (TrackSelection JSON), sent unchanged.
     pub tracks_json: String,
+    /// Its generated version: the download pins exactly this rendition.
+    pub version_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

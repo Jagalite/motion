@@ -12106,6 +12106,12 @@ components:
           anyOf:
           - $ref: '#/components/schemas/TrackSelection'
           - type: 'null'
+        version_id:
+          description: The generated version binding its output to the timeline; pin it (createDownload
+            version_id) to save exactly this rendition. Null before it is published.
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
       required:
       - id
       - revision

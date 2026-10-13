@@ -1060,7 +1060,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     either way.
   - Subtitles as separate offline files, and artwork and metadata files in
     the manifest, remain (5E part 2).
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** five P2 findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | E1 | `require` without a subtitle pin, or `off` with one, could match a rendition | Fixed: one core rule, `processing::kept_subtitle`, for preparing and downloading (explicit and required, or none). Refusals `subtitle_policy_conflict` and `preparation_tracks_unsupported`. Core and integration tests |
+  | E2 | Every offered version sent `version_id: null`, so the server could save a different rendition of the same recipe and selection | Fixed: `Rendition.version_id` (the generated version binding its output) is listed. The title page pins it, and the server honours the pin. Integration test downloads by the listed version |
+  | E3 | Readiness checked revisions only, so an unavailable source or disabled library still admitted the rendition and kept prepared downloads ready | Fixed: admission and observation use `processing::rendition_status` over the facts `listRenditions` reports (`output_rendition_status`) |
+  | E4 | The 200-candidate window could hide a matching rendition behind newer ones of other recipes | Fixed: the recipe is filtered in the query, and candidates are read page by page (up to 10 pages of 200) |
+  | E5 | The title page read only the first page of renditions | Fixed: every page is read (bounded) before keeping ready ones |
+
+  After the fixes: core 158, `v2_playback` 30, `v2_downloads` 8, compose
+  22, `v2_metadata_processing` 18, `m3_workflows` 2 and contract 5 passed;
+  pinned clippy is clean.
 
 ### Remaining item 5 work (not started)
 

@@ -738,7 +738,7 @@ pub(crate) async fn download_form(
                     <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
                     <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
                     <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
-                    <input type="hidden" name="version_id" data-type=(kind(Field::Json)) value="null">
+                    <input type="hidden" name="version_id" data-type=(kind(Field::Text)) value=(version.version_id.as_str())>
                     <input type="hidden" name="recipe_id" data-type=(kind(Field::Text)) value=(version.recipe_id.as_str())>
                     <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(version.tracks_json.as_str())>
                 )

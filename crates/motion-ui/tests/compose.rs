@@ -885,6 +885,7 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
         .expect("prepared version")..];
     let prepared = &prepared[..prepared.find("</form>").unwrap()];
     assert!(prepared.contains(r#"name="recipe_id" data-type="text" value="h264720p""#));
+    assert!(prepared.contains(r#"name="version_id" data-type="text" value="ver-prepared-720p""#));
     assert!(
         prepared.contains(r#"&quot;audio_track_id&quot;:&quot;a1&quot;"#),
         "{prepared}"
