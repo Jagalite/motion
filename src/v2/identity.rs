@@ -379,6 +379,11 @@ pub async fn approve_pairing(
         client_name: row.8.clone(),
     };
     auth::insert_device(&mut tx, &device).await?;
+    // Legacy approvals acquire an explicit owner during insertion. Publish the
+    // persisted identity in both the response and durable retry receipt.
+    let device = auth::load_device(&mut tx, &device.device.id)
+        .await?
+        .ok_or_else(|| Problem::internal("inserted device is missing"))?;
     let updated = sqlx::query(
         "UPDATE pairings SET phase='approved',device_id=? WHERE id=? AND phase='pending' AND denied=0",
     )

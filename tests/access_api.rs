@@ -3836,19 +3836,30 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
             "/api/v2/auth/pairings/{}/approve",
             p.body["id"].as_str().unwrap()
         );
+        let approval = json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]});
+        let key = format!("long-name-approval-{index}");
+        let headers = [
+            ("authorization", auth.as_str()),
+            ("idempotency-key", key.as_str()),
+        ];
         let approved = f
-            .call(
-                "POST",
-                &path,
-                Some(json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]})),
-                &[
-                    ("authorization", &auth),
-                    ("idempotency-key", &format!("long-name-approval-{index}")),
-                ],
-            )
+            .call("POST", &path, Some(approval.clone()), &headers)
             .await;
         assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
         assert_eq!(approved.body["name"], *name);
+        let replay = f.call("POST", &path, Some(approval), &headers).await;
+        assert_eq!(replay.status, StatusCode::OK);
+        assert_eq!(replay.body, approved.body);
+        let current = f
+            .call(
+                "GET",
+                &format!("/api/v2/devices/{}", approved.body["id"].as_str().unwrap()),
+                None,
+                &[("authorization", &auth)],
+            )
+            .await;
+        assert_eq!(current.status, StatusCode::OK);
+        assert_eq!(current.body, approved.body);
         let upath = format!(
             "/api/v2/users/{}",
             approved.body["user_id"].as_str().unwrap()
