@@ -180,7 +180,7 @@ impl Store {
             removals.len() <= MAX_REMOVALS && removals.iter().all(|id| offline::identifier(id)),
             "invalid removal record"
         );
-        Ok(Self {
+        let mut store = Self {
             path: path.to_owned(),
             root,
             root_sync,
@@ -190,7 +190,13 @@ impl Store {
             _lock: lock,
             manifest,
             removals,
-        })
+        };
+        // A removal whose intent is durable but whose copy a crash left in
+        // place is completed before anything reads the manifest.
+        for id in store.removals.clone() {
+            store.remove(&id)?;
+        }
+        Ok(store)
     }
 
     pub fn manifest(&self) -> &CacheManifest {

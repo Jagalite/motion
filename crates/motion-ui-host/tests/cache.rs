@@ -483,3 +483,56 @@ async fn a_saved_title_is_removed_from_the_offline_host() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(!dir.path().join("blobs").read_dir().unwrap().any(|_| true));
 }
+
+/// The manifest write commits but releasing the blob fails: the host still
+/// presents exactly what was committed and the open ticket stops serving.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partially_committed_removal_is_what_the_host_presents() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, _) = fixture();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache.clone()).await;
+    let (status, _, opened) = request(
+        &app,
+        "POST",
+        "/cache/open/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let opened: Value = serde_json::from_slice(&opened).unwrap();
+    let blobs = dir.path().join("blobs");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (status, _, _) = request(
+        &app,
+        "POST",
+        "/cache/remove/download",
+        &cookie,
+        Some(json!({})),
+    )
+    .await;
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "cleanup failed after the commit"
+    );
+    assert!(!cache.presents("download"));
+    let (_, _, body) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("data-remove-download")
+    );
+    let (status, _, _) = request(
+        &app,
+        "GET",
+        opened["media_url"].as_str().unwrap(),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

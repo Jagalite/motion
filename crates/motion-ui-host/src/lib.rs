@@ -250,6 +250,15 @@ impl Cache {
         let manifest: CacheManifest =
             serde_json::from_slice(&bounded(directory.open("manifest.json")?, MAX_MANIFEST)?)?;
         validate_manifest(&manifest)?;
+        // Complete removals a crash interrupted (`Store::open_held` replays
+        // them under the lock taken above) before presenting any title.
+        let manifest = if directory.exists("removals.json") {
+            crate::store::Store::open_held(path, &manifest.scope, lock.try_clone()?)?
+                .manifest()
+                .clone()
+        } else {
+            manifest
+        };
         let history = match directory.open("events.json") {
             Ok(file) => EventLog::parse(&bounded(file, MAX_LOG)?)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => EventLog::default(),
@@ -284,12 +293,18 @@ impl Cache {
     pub fn remove(&self, download_id: &str) -> anyhow::Result<bool> {
         let mut store =
             crate::store::Store::open_held(&self.path, &self.scope, self.lock.try_clone()?)?;
-        let removed = store.remove_by_person(download_id)?;
+        let removed = store.remove_by_person(download_id);
+        // Whatever the removal committed (its manifest write may succeed
+        // before a later cleanup step fails) is what the host presents.
         *self
             .manifest
             .write()
             .map_err(|_| anyhow::anyhow!("cache manifest failed"))? = store.manifest().clone();
-        Ok(removed)
+        removed
+    }
+    /// Whether `download_id` is a saved title the host presents.
+    pub fn presents(&self, download_id: &str) -> bool {
+        self.item(download_id).is_some()
     }
     fn record(&self, event: OfflineEvent) -> anyhow::Result<serde_json::Value> {
         let item = self
@@ -575,12 +590,14 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     let download = id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         // Cancellation of the HTTP handler cannot admit another copy while this
-        // blocking worker still consumes the snapshot disk budget.
-        let _single = _single;
-        cache.snapshot(&download)
+        // blocking worker still consumes the snapshot disk budget. The guard
+        // comes back with the result and is held until the ticket is
+        // installed, so no removal completes between the two.
+        let single = _single;
+        (cache.snapshot(&download), single)
     })
     .await;
-    let Ok(Ok((item, file))) = snapshot else {
+    let Ok((Ok((item, file)), _single)) = snapshot else {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
     let history = host.cache.history.lock().unwrap();
@@ -611,23 +628,30 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
 /// Remove a saved title from this device. Serialized with opening media,
 /// whose snapshot reads the blob being removed.
 async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
-    let Ok(_single) = host.opening.clone().try_lock_owned() else {
+    let Ok(single) = host.opening.clone().try_lock_owned() else {
         return StatusCode::CONFLICT.into_response();
     };
-    let cache = host.cache.clone();
-    let download = id.clone();
-    match tokio::task::spawn_blocking(move || cache.remove(&download)).await {
-        Ok(Ok(true)) => {
-            // An open player's ticket no longer names a saved title.
-            let mut media = host.media.lock().unwrap();
+    // The removal, its serialization and the ticket invalidation all live in
+    // the blocking task: cancelling this handler cannot release the guard
+    // while the removal runs, or skip invalidating an open player's ticket.
+    let worker = host.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        let _single = single;
+        let removed = worker.cache.remove(&id);
+        if !worker.cache.presents(&id) {
+            let mut media = worker.media.lock().unwrap();
             if media
                 .as_ref()
                 .is_some_and(|m| m.item.identity.download_id == id)
             {
                 *media = None;
             }
-            Json(json!({"removed": true})).into_response()
         }
+        removed
+    })
+    .await;
+    match removed {
+        Ok(Ok(true)) => Json(json!({"removed": true})).into_response(),
         Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
         _ => StatusCode::CONFLICT.into_response(),
     }

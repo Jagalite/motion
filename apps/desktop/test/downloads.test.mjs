@@ -541,3 +541,25 @@ test('a title removed on this device is deleted on the server and never saved ag
   assert.deepEqual(fake.calls.filter(c => c[1] === 'settle-removal').map(c => c[2]),
     [['--download-id', 'gone', '--outcome', 'failed'], ['--download-id', 'gone', '--outcome', 'absent']]);
 });
+
+test('a removal settled in this pass is not transferred from the list read before it', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const statuses = [];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000, status: m => statuses.push(m),
+    fetchMedia: async () => assert.fail('a removed title is never transferred'),
+    api: async (path, init = {}) => {
+      // The list was read before the deletion.
+      if (path.startsWith('/api/v2/downloads?')) return {items: [{id: 'gone', profile_id: 'default', state: 'ready'}], next_cursor: null};
+      if (path === '/api/v2/downloads/gone' && init.method === 'DELETE') return null;
+      if (path.startsWith('/api/v2/downloads/gone')) assert.fail('no manifest is read for it');
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).removals = ['gone'];
+  await agent.pass();
+  assert.deepEqual(fake.state(target.path).removals, []);
+  assert.ok(!statuses.some(m => /could not be saved/.test(m)), statuses.join('\n'));
+  assert.ok(fake.calls.some(c => c[1] === 'collect'), 'blob collection still runs');
+});

@@ -694,7 +694,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Not covered:** the Electron run of removal in the packaged offline
   window (5F).
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** five P2 findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | R1 | A removal settled in the pass was transferred again from the list read before the deletion | Fixed: every removal id read at the start of the pass stays out of it. JS test: a settled removal is not transferred, and collection still runs |
+  | R2 | A crash after the intent but before the copy went left the title presented indefinitely | Fixed: every writer open (`Store::open_with`) completes pending removals, and the host replays them under its lock before presenting. Store test |
+  | R3 | A cancelled removal handler released the serialization guard while the removal ran, and skipped ticket invalidation | Fixed: the guard, removal and invalidation live in the blocking task |
+  | R4 | Opening media released the guard before installing its ticket, so a removal could complete in between | Fixed: the guard returns with the snapshot and is held until the ticket is installed |
+  | R5 | A removal whose manifest write committed but whose blob release failed left the host's manifest and ticket stale | Fixed: the host presents what the store committed, whatever the result, and invalidates the ticket whenever the title is no longer presented. Host test with an unwritable blob directory |
+
+  After the fixes: store 14, cache 8 and JS 89 passed; pinned clippy is
+  clean. R3 and R4 are ordering fixes without a deterministic
+  cancellation test.
 
 ### Remaining item 5 work (not started)
 

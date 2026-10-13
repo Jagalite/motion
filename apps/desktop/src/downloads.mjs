@@ -354,6 +354,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         status(`Offline progress could not be reconciled yet (${error.code ?? error.status ?? error.message}). It stays on this device.`);
       }
       let before = await cache(target.path, target.scope, ['status']);
+      // Every title removed on this device stays out of this pass, settled or
+      // not: the download list was read before the server deleted it.
+      const removed = new Set(before.removals ?? []);
       // Titles the person removed on this device: delete each download on
       // the server, then settle the removal with its answer. Until it is
       // settled the cache refuses to save that download again.
@@ -371,7 +374,6 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         }
         before = await cache(target.path, target.scope, ['status']);
       }
-      const removed = new Set(before.removals ?? []);
       let local = before.manifest;
       const wanted = downloads.filter(d => d.profile_id === profile && !removed.has(d.id));
       // Cancelled, expired and no-longer-visible downloads leave this device,

@@ -499,3 +499,25 @@ fn only_the_held_lock_of_this_root_admits_a_writer() {
     assert!(store.manifest().downloads.is_empty());
     assert_eq!(store.removals(), ["d1"]);
 }
+
+/// A crash after the removal intent was written but before the copy went:
+/// the next writer or host completes the removal before presenting titles.
+#[test]
+fn an_interrupted_removal_is_completed_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"interrupted media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    drop(store);
+    // The intent is durable; the copy is still there.
+    std::fs::write(root.join("removals.json"), br#"["d1"]"#).unwrap();
+    let host = Cache::open(&root).unwrap();
+    assert!(!host.presents("d1"), "the host never presents it");
+    drop(host);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert!(store.manifest().downloads.is_empty());
+    assert!(blobs(&root).is_empty());
+    assert_eq!(store.removals(), ["d1"]);
+}
