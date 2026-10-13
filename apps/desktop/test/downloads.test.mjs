@@ -768,3 +768,27 @@ test('a removal report is retried until accepted, even if the server never heard
   await agent.pass();
   assert.deepEqual(reports, ['removed', 'removed']);
 });
+
+test('a copy is removed only once its removal is noted for reporting', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: [{id: 'ended', profile_id: 'default', state: 'cancelled', revision: '2', size_bytes: '20', device_transfer: null}], next_cursor: null};
+      if (init.method === 'PUT') throw Object.assign(new Error('offline'), {status: 503});
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'ended'}, size: 20});
+  // The journal cannot be written: the copy stays for a later pass.
+  mkdirSync(join(base, 'transfer-removed.json'));
+  await agent.pass();
+  assert.equal(fake.state(target.path).downloads.length, 1);
+  rmSync(join(base, 'transfer-removed.json'), {recursive: true});
+  await agent.pass();
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  assert.deepEqual(JSON.parse(readFileSync(join(base, 'transfer-removed.json'), 'utf8')), ['ended'],
+    'kept until its removed report is accepted');
+});

@@ -194,8 +194,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
    */
   const removedReports = join(base, 'transfer-removed.json');
   const pendingRemoved = () => new Set(readJson(removedReports, []));
+  /** Durably note a removal before it happens; false when that failed. */
   function noteRemoved(id) {
-    try { writeAtomically(removedReports, [...new Set([...pendingRemoved(), id])]); } catch { /* retried from the server's view */ }
+    try { writeAtomically(removedReports, [...new Set([...pendingRemoved(), id])]); return true; } catch { return false; }
   }
   function forgetRemoved(id) {
     try { writeAtomically(removedReports, [...pendingRemoved()].filter(other => other !== id)); } catch { /* retried next pass */ }
@@ -498,7 +499,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
             outcome = error.status === 404 ? 'absent' : 'failed';
             if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
           }
-          noteRemoved(id);
+          // Settle only once the removal is noted for its report; otherwise
+          // the intent stays and this is retried next pass.
+          if (!noteRemoved(id)) continue;
           await cache(target.path, target.scope, ['settle-removal', '--download-id', id, '--outcome', outcome]);
         }
         before = await cache(target.path, target.scope, ['status']);
@@ -511,7 +514,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       for (const id of present) {
         const listed = wanted.find(d => d.id === id);
         if (listed?.state !== 'ready') {
-          noteRemoved(id);
+          // Remove only once the removal is noted for its report; otherwise
+          // the copy stays until a later pass can note it.
+          if (!noteRemoved(id)) continue;
           await cache(target.path, target.scope, ['remove', '--download-id', id]);
           // An ended download still listed learns that its copy is gone.
           if (listed && await report(listed, 'removed', 0)) forgetRemoved(id);

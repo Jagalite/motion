@@ -1001,6 +1001,12 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   removal report of a never-reported copy is retried and then stops. JS
   96 passed.
 
+  Round 3 at `91f32c8` raised one P2: if the removal journal itself could
+  not be written, the copy was removed anyway and its evidence lost.
+  Fixed: a copy is removed, and a person's removal settled, only once the
+  removal is noted; otherwise it waits for a later pass. JS test with an
+  unwritable journal. JS 97 passed.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
