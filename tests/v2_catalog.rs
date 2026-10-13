@@ -2914,3 +2914,58 @@ async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
         4
     );
 }
+
+#[tokio::test]
+async fn later_manual_marker_correction_supersedes_earlier_value() {
+    let f = Fixture::new().await;
+    catalog(&f).await;
+    let op = bearer(OPERATOR);
+    let path = "/api/v2/catalog/timelines/film-a-ed/markers";
+    let timeline = f
+        .call(
+            "GET",
+            "/api/v2/catalog/timelines/film-a-ed",
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    let input = json!({"timeline_revision":timeline.body["revision"],"kind":"intro","start_ms":1000,"end_ms":5000,"label":"章".repeat(100)});
+    let first = f
+        .call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "manual-correction-first"),
+            ],
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let mut correction = input;
+    correction["start_ms"] = json!(2000);
+    correction["end_ms"] = json!(6000);
+    let second = f
+        .call(
+            "POST",
+            path,
+            Some(correction),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "manual-correction-second"),
+            ],
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::CREATED, "{}", second.body);
+    let page = f
+        .call(
+            "GET",
+            &format!("{path}?effective=true"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    assert_eq!(ids(&page), [second.body["id"].as_str().unwrap()]);
+    let all = f.call("GET", path, None, &[("authorization", &op)]).await;
+    assert_eq!(all.body["items"].as_array().unwrap().len(), 2);
+}
