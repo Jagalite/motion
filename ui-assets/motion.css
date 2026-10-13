@@ -37,7 +37,7 @@ main:focus, h1:focus { outline: none; }
 .brand-name { text-transform: lowercase; }
 .sidebar-nav { display: flex; flex-direction: column; flex: 1; }
 .nav-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.nav-heading { margin: 1.25rem .75rem .4rem; font-size: .75rem; font-weight: 700; color: var(--faint); }
+.nav-heading { margin: 1.25rem .75rem .4rem; font-size: .75rem; font-weight: 700; color: var(--muted); }
 .nav-link { position: relative; display: flex; align-items: center; gap: .75rem; padding: .55rem .75rem; border-radius: var(--radius-lg); text-decoration: none; color: var(--muted); font-weight: 600; }
 .nav-link.is-current { background: rgba(229, 160, 13, .12); color: var(--accent); }
 .nav-link.is-current::before { content: ""; position: absolute; left: -.75rem; top: .4rem; bottom: .4rem; width: 3px; border-radius: 0 3px 3px 0; background: var(--accent); }
