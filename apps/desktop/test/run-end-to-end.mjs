@@ -102,7 +102,9 @@ function sourceHashes() {
 }
 const sources = sourceHashes();
 const commit = execFileSync('git', ['rev-parse', 'HEAD'], {cwd: root}).toString().trim();
-const sourcesCommitted = execFileSync('git', ['status', '--porcelain', '--', ...tested()], {cwd: root}).toString().trim() === '';
+// The whole source directory, so a deleted tracked file counts as a change.
+const sourcesCommitted = execFileSync('git', ['status', '--porcelain', '--', 'apps/desktop/src', ...tested()], {cwd: root})
+  .toString().trim() === '';
 
 const options = {executable: server.path, dataDir: join(work, 'server'), demuxeDir, contractDigest};
 let owned = createOwnedServer(options);
