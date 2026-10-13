@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state and prepared-downloads PRs | Merge by user; then 5E part 2 |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented (review pending); offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads and offline-artwork PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1089,11 +1089,53 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   `v2_playback` 30, compose 22 and `m3_workflows` 2 passed; pinned clippy
   is clean.
 
+### 5E (part 2). The title's poster saved with the download
+
+- **Source SHA:** branch `plan-completion/offline-artwork`, stacked on 5E
+  part 1 (`plan-completion/prepared-downloads`).
+- **Implemented:** the offline downloads page now shows each title's
+  poster, saved with the download. Before, titles were text only.
+  - **Server:** the download manifest names the title's selected poster
+    as an `artwork` file, pinned by its SHA-256 (an artwork asset's ID is
+    its digest), with its size and asset URL. Only posters the device can
+    fetch are named (assets of the title, as asset content requires), up
+    to 8 MiB, PNG, JPEG or WebP.
+  - **Agent:** saves one media file and at most one poster. It fetches
+    the poster whole and verifies size and digest before staging it. A
+    poster that cannot be saved never blocks the title, which is then
+    saved without one.
+  - **Cache store:** publishes the poster into its own blob before the
+    media, so a published entry never names a missing or unverified image.
+    The entry records the poster (`CachedDownload.artwork`). Removal,
+    replacement and collection treat it as the entry's bytes. Crash
+    recovery needs it in place.
+  - **Host:** serves `/cache/artwork/{id}` from the blob, verified again,
+    behind the same cookie as every cache route, with `nosniff`.
+- **Core/adapter boundary:** no new correctness rule. Integrity is digest
+  verification in the store and host; selection and pinning stay with the
+  existing manifest.
+- **Evidence:**
+  - `v2_downloads`: 9 passed. New: no artwork without a selected poster;
+    a selected poster that is not an asset of the title is not offered;
+    otherwise media plus artwork, with the digest, size and name, and the
+    device fetches exactly those bytes.
+  - Store: 18 passed. New: a mismatched poster publishes nothing; the
+    poster blob is published, kept by collection and released by removal.
+  - Cache: 10 passed. New: the page shows the poster, the route serves it,
+    and it is refused without the cookie.
+  - JS: 98 passed. New: a verified poster is staged and published; a bad
+    one leaves the title saved without it.
+  - compose 22 and contract 5 passed.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:** subtitle sidecar files and a metadata document offline;
+  for now, a prepared version's kept text subtitle travels inside its MP4.
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5E part 2 subtitles, artwork and metadata as offline files | Manifest files for subtitle sidecars, artwork and metadata with pins; the offline host presents them | 5E part 1 |
+| 5E remaining: subtitle and metadata files offline | Subtitle sidecars and a metadata document in the manifest with pins; the offline player presents subtitles | 5E parts 1 and 2 |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work

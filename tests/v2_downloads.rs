@@ -1418,3 +1418,71 @@ async fn devices_report_their_own_copies_in_their_own_order() {
     assert_eq!(removed.body["device_transfer"]["state"], "removed");
     assert_eq!(removed.body["state"], "cancelled");
 }
+
+/// The title's selected poster travels with the download, pinned by its
+/// content digest; without one the manifest names only the media.
+#[tokio::test]
+async fn manifests_pin_the_titles_poster_by_digest() {
+    use sha2::Digest;
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"postered film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "poster-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let path = format!(
+        "/api/v2/downloads/{}/manifest",
+        created.body["id"].as_str().unwrap()
+    );
+    let roles = |m: &Value| -> Vec<String> {
+        m["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["role"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(roles(&f.get(&path, &auth).await.body), ["media"]);
+    let poster = b"\x89PNG poster bytes".to_vec();
+    let digest = format!("{:x}", sha2::Sha256::digest(&poster));
+    sqlx::query("INSERT INTO artwork_assets(id,mime,width,height,bytes) VALUES (?,?,1,1,?)")
+        .bind(&digest)
+        .bind("image/png")
+        .bind(&poster)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO artwork_selections(item_id,role,asset_id,revision) SELECT e.item_id,'poster',?,1 FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?")
+        .bind(&digest)
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    // Selected but not an asset of the title (unfetchable): not offered.
+    assert_eq!(roles(&f.get(&path, &auth).await.body), ["media"]);
+    sqlx::query("INSERT INTO item_artwork_assets(item_id,asset_id) SELECT e.item_id,? FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?")
+        .bind(&digest)
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let manifest = f.get(&path, &auth).await.body;
+    assert_eq!(roles(&manifest), ["media", "artwork"]);
+    let art = &manifest["files"][1];
+    assert_eq!(art["digest"], format!("sha256:{digest}"));
+    assert_eq!(art["size_bytes"], poster.len().to_string());
+    assert_eq!(art["relative_name"], "poster.png");
+    // The device can fetch exactly those bytes.
+    let (status, bytes) = f
+        .bytes(
+            art["media_url"].as_str().unwrap(),
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!((status, bytes), (StatusCode::OK, poster));
+}

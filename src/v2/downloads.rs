@@ -1043,7 +1043,50 @@ pub async fn manifest(
     } else {
         None
     };
+    // The title's selected poster travels with the download, pinned by its
+    // content digest (an artwork asset's ID is its SHA-256); only one the
+    // device can fetch (an asset of the title, as asset content requires).
+    let poster: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT a.id,a.mime,length(a.bytes) FROM timelines t JOIN editions e ON e.id=t.edition_id \
+         JOIN artwork_selections s ON s.item_id=e.item_id AND s.role='poster' \
+         JOIN artwork_assets a ON a.id=s.asset_id WHERE t.id=? \
+         AND EXISTS(SELECT 1 FROM (SELECT item_id,asset_id FROM artwork_contributions UNION SELECT item_id,asset_id FROM item_artwork_assets) c \
+         WHERE c.item_id=e.item_id AND c.asset_id=a.id)",
+    )
+    .bind(&row.timeline_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     tx.commit().await?;
+    let mut files = vec![json!({
+        "asset_id": row.file_id,
+        "relative_name": format!("media.{}", extension(&row.content_type)),
+        "digest": format!("sha256:{}", row.file_revision),
+        "size_bytes": row.size_bytes.to_string(),
+        "media_url": media_url(&row.file_id, &row.file_revision),
+        "role": "media",
+    })];
+    if let Some((asset, mime, bytes)) = poster.filter(|(id, mime, bytes)| {
+        is_sha256(id)
+            && matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/webp")
+            && (1..=MAX_ARTWORK_BYTES).contains(bytes)
+    }) {
+        let extension = match mime.as_str() {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            _ => "jpg",
+        };
+        files.push(json!({
+            "asset_id": asset,
+            "relative_name": format!("poster.{extension}"),
+            "digest": format!("sha256:{asset}"),
+            "size_bytes": bytes.to_string(),
+            "media_url": format!(
+                "/api/v2/media/assets/{asset}/content?revision={}",
+                super::metadata::ASSET_REVISION
+            ),
+            "role": "artwork",
+        }));
+    }
     Ok(tagged(
         StatusCode::OK,
         json!({
@@ -1052,14 +1095,7 @@ pub async fn manifest(
             "timeline_revision": row.timeline_revision.to_string(),
             "title": title,
             "duration_ms": row.duration_ms,
-            "files": [{
-                "asset_id": row.file_id,
-                "relative_name": format!("media.{}", extension(&row.content_type)),
-                "digest": format!("sha256:{}", row.file_revision),
-                "size_bytes": row.size_bytes.to_string(),
-                "media_url": media_url(&row.file_id, &row.file_revision),
-                "role": "media",
-            }],
+            "files": files,
             "viewing_revision": view.revision.to_string(),
             "manual_epoch": view.manual_epoch.to_string(),
             "viewing_epoch": format!("{server_id}:{restore_epoch}"),
@@ -1153,6 +1189,8 @@ const MAX_BATCH: usize = 200;
 /// Prepared renditions of one recipe read per page, and pages at most.
 const PREPARED_PAGE: i64 = 200;
 const PREPARED_PAGES: i64 = 10;
+/// Largest poster that travels with a download (the artwork upload bound).
+const MAX_ARTWORK_BYTES: i64 = 8 * 1024 * 1024;
 
 fn valid_id(s: &str) -> bool {
     !s.is_empty()

@@ -36,6 +36,7 @@ fn entry(id: &str, bytes: &[u8]) -> CachedDownload {
         size: bytes.len() as u64,
         content_type: "video/mp4".into(),
         resume_position_ms: None,
+        artwork: None,
     }
 }
 
@@ -700,4 +701,51 @@ fn progress_from_before_a_restore_is_reapplied_or_discarded_by_choice() {
     assert_eq!((after.base_sequence, after.events.len()), (4, 0));
     drop(store);
     Cache::open(&root).unwrap();
+}
+
+/// A poster is verified into its own blob before the entry that names it;
+/// a mismatch publishes nothing; removal and collection treat it as the
+/// entry's bytes.
+#[test]
+fn a_poster_is_published_and_released_with_its_download() {
+    use motion_ui::offline::CachedArtwork;
+    use motion_ui_host::store::artwork_staging_name;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"titled media";
+    let poster = b"poster bytes";
+    let with_poster = |poster: &[u8]| CachedDownload {
+        artwork: Some(CachedArtwork {
+            sha256: format!("{:x}", Sha256::digest(poster)),
+            size: poster.len() as u64,
+            content_type: "image/png".into(),
+        }),
+        ..entry("d1", media)
+    };
+    let stage_poster = |bytes: &[u8]| {
+        std::fs::write(
+            root.join("staging")
+                .join(artwork_staging_name("d1").unwrap()),
+            bytes,
+        )
+        .unwrap()
+    };
+    // A poster whose bytes do not match: nothing is published.
+    stage(&root, "d1", media);
+    stage_poster(b"other bytes!");
+    assert!(store.publish(with_poster(poster)).is_err());
+    assert!(store.manifest().downloads.is_empty());
+    stage_poster(poster);
+    assert_eq!(
+        store.publish(with_poster(poster)).unwrap(),
+        Publication::Published
+    );
+    let poster_blob = format!("{:x}", Sha256::digest(poster));
+    assert!(blobs(&root).contains(&poster_blob));
+    // Collection keeps a referenced poster; removal releases it.
+    store.collect().unwrap();
+    assert!(blobs(&root).contains(&poster_blob));
+    assert!(store.remove("d1").unwrap());
+    assert!(blobs(&root).is_empty());
 }

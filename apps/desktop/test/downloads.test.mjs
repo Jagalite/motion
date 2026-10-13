@@ -792,3 +792,27 @@ test('a copy is removed only once its removal is noted for reporting', async () 
   assert.deepEqual(JSON.parse(readFileSync(join(base, 'transfer-removed.json'), 'utf8')), ['ended'],
     'kept until its removed report is accepted');
 });
+
+test('a verified poster is saved with the title; a bad one never blocks it', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache, calls} = fakeCache();
+  const poster = Buffer.from('poster image bytes');
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  let served = poster;
+  const withPoster = id => ({...manifest(id), files: [...manifest(id).files,
+    {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+      media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]});
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async path => path.endsWith('/manifest') ? withPoster(path.split('/')[4]) : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => url.includes('/assets/') ? response(200, served) : response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1'}, target), true);
+  const published = JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]);
+  assert.deepEqual(published.artwork, {sha256: posterDigest, size: poster.length, content_type: 'image/png'});
+  assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.artwork')), poster);
+  // Bytes that do not match the digest: the title is saved without a poster.
+  served = Buffer.from('other image bytes!');
+  assert.equal(await agent.transfer({id: 'd2'}, target), true);
+  assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
+});

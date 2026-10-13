@@ -194,8 +194,27 @@ pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
                 .contains(&item.content_type.as_str()),
         "unsupported cache media"
     );
+    if let Some(art) = &item.artwork {
+        ensure!(
+            art.sha256.len() == 64
+                && art
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && art.size > 0
+                && art.size <= MAX_ARTWORK
+                && matches!(
+                    art.content_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp"
+                ),
+            "unsupported cache artwork"
+        );
+    }
     Ok(())
 }
+
+/// Largest poster saved with a download.
+pub const MAX_ARTWORK: u64 = 8 * 1024 * 1024;
 
 pub struct Cache {
     directory: Dir,
@@ -524,6 +543,7 @@ impl Host {
             .route("/cache/media/{ticket}", get(media))
             .route("/cache/events", post(record))
             .route("/cache/remove/{id}", post(remove))
+            .route("/cache/artwork/{id}", get(artwork))
             .route("/ui/{file}", get(motion_ui::ui_asset))
             .route("/assets/demuxe/{*file}", get(player_asset))
             .fallback_service(
@@ -658,6 +678,42 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     });
     Json(result).into_response()
 }
+/// A presented title's saved poster, verified against its digest again.
+async fn artwork(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let cache = host.cache.clone();
+    let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let Some(art) = cache.item(&id).and_then(|item| item.artwork) else {
+            return Ok(None);
+        };
+        let bytes = bounded(
+            cache.directory.open(format!("blobs/{}", art.sha256))?,
+            MAX_ARTWORK,
+        )?;
+        ensure!(
+            bytes.len() as u64 == art.size && format!("{:x}", Sha256::digest(&bytes)) == art.sha256,
+            "artwork checksum mismatch"
+        );
+        Ok(Some((art.content_type, bytes)))
+    })
+    .await;
+    match read {
+        Ok(Ok(Some((content_type, bytes)))) => (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, "private, no-store".to_owned()),
+                (
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff".to_owned(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    }
+}
+
 /// Remove a saved title from this device. Serialized with opening media,
 /// whose snapshot reads the blob being removed.
 async fn remove(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {

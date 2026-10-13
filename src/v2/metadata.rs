@@ -755,7 +755,7 @@ async fn decide_match(
 // ----------------------------------------------------------------- artwork
 
 /// Artwork assets are immutable and content-addressed by their SHA-256.
-const ASSET_REVISION: u64 = 1;
+pub(crate) const ASSET_REVISION: u64 = 1;
 
 #[derive(Serialize)]
 struct AssetBody {

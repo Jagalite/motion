@@ -40,6 +40,7 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
             size: 10,
             content_type: "video/mp4".into(),
             resume_position_ms: None,
+            artwork: None,
         }],
     };
     std::fs::write(
@@ -622,4 +623,38 @@ async fn interrupted_removals_are_never_presented_and_complete_later() {
             .unwrap()
             .contains("data-remove-download")
     );
+}
+
+/// The offline page shows a saved poster, served from its verified blob.
+#[tokio::test]
+async fn a_saved_poster_is_shown_offline() {
+    let (dir, mut manifest) = fixture();
+    let poster = b"poster image";
+    let digest = format!("{:x}", Sha256::digest(poster));
+    std::fs::write(dir.path().join("blobs").join(&digest), poster).unwrap();
+    manifest.downloads[0].artwork = Some(motion_ui::offline::CachedArtwork {
+        sha256: digest,
+        size: poster.len() as u64,
+        content_type: "image/png".into(),
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(
+        String::from_utf8(page)
+            .unwrap()
+            .contains(r#"src="/cache/artwork/download""#)
+    );
+    let (status, headers, bytes) =
+        request(&app, "GET", "/cache/artwork/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(bytes, poster);
+    let (status, _, _) = request(&app, "GET", "/cache/artwork/download", "", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

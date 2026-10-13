@@ -6,7 +6,7 @@
 // events (motion-ui-host cache, playscale_core::offline). This adapter only
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
-import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeSync, createWriteStream} from 'node:fs';
+import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -21,6 +21,9 @@ const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
 // The offline host copies a title into a private snapshot on the cache's own
 // volume before playing it and keeps 512 MiB free besides (new_snapshot).
 const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
+/** Posters saved with a download, by file extension. */
+const IMAGE_TYPES = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp'};
+const MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
 /** Transfer progress is reported to the server at most this often. */
 const PROGRESS_INTERVAL_MS = 15_000;
 
@@ -225,12 +228,38 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     }
   }
 
+  /** Fetch, verify and stage a poster; its cache description, or null. */
+  async function savePoster(id, poster, target) {
+    const sha256 = /^sha256:([0-9a-f]{64})$/.exec(poster.digest ?? '')?.[1];
+    const type = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(poster.relative_name ?? '')?.[1]];
+    const size = Number(poster.size_bytes);
+    if (!sha256 || !type || !(size > 0) || size > MAX_ARTWORK_BYTES) return null;
+    const response = await fetchMedia(poster.media_url, {range: null, signal: signal ?? AbortSignal.timeout(60000)});
+    if (response.status !== 200) return null;
+    const chunks = [];
+    let received = 0;
+    for await (const chunk of Readable.fromWeb(response.body)) {
+      received += chunk.length;
+      if (received > size) return null;
+      chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+    if (bytes.length !== size || createHash('sha256').update(bytes).digest('hex') !== sha256) return null;
+    const staged = join(target.path, 'staging', `${id}.artwork`);
+    mkdirSync(join(target.path, 'staging'), {recursive: true, mode: 0o700});
+    writeFileSync(staged, bytes, {mode: 0o600});
+    return {sha256, size, content_type: type};
+  }
+
   async function transfer(download, target) {
     const manifest = await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/manifest`);
-    const [file] = manifest.files;
+    // One media file and at most one poster; anything else is not saved yet.
+    const media = manifest.files.filter(f => f.role === 'media');
+    const posters = manifest.files.filter(f => f.role === 'artwork');
+    const [file] = media;
     const digest = /^sha256:([0-9a-f]{64})$/.exec(file?.digest ?? '')?.[1];
     const contentType = CONTENT_TYPES[/\.([a-z0-9]+)$/.exec(file?.relative_name ?? '')?.[1]];
-    if (manifest.files.length !== 1 || file.role !== 'media' || !digest || !contentType) {
+    if (media.length !== 1 || posters.length > 1 || media.length + posters.length !== manifest.files.length || !digest || !contentType) {
       status(`"${manifest.title}" needs files this device cannot save yet (subtitles, artwork or multiple parts).`);
       return false;
     }
@@ -239,11 +268,15 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
     }
+    // The poster: small, fetched whole and verified against its digest
+    // before publication; a poster that cannot be saved never blocks the title.
+    const artwork = posters.length ? await savePoster(download.id, posters[0], target).catch(() => null) : null;
     const entry = JSON.stringify({
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
-      title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType});
+      title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
+      ...(artwork ? {artwork} : {})});
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     // A publication that crashed after verifying its blob needs no new
