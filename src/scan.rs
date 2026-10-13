@@ -466,7 +466,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype,rotate:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,rotation,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -1255,5 +1255,42 @@ mod chapter_probe_tests {
         assert_eq!(found.tracks.len(), 1);
         assert_eq!(found.tracks[0].codec, "h264");
         assert_eq!(found.chapters, None);
+    }
+
+    #[tokio::test]
+    async fn scanner_requests_and_retains_display_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("film.mkv"), b"fixture").unwrap();
+        let probe = directory.path().join("probe");
+        // A probe cannot return facts excluded by -show_entries. Refuse the
+        // fixture unless both modern display-matrix and legacy tag fields
+        // are requested by the production scanner.
+        std::fs::write(&probe, r#"#!/bin/sh
+case "$*" in
+ *chapter=*) printf '%s' '{"chapters":[]}' ;;
+ *stream_tags=language,title,mimetype,rotate:*stream_side_data=side_data_type,rotation,*)
+ printf '%s' '{"format":{"duration":"120"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"video","codec_name":"h264","tags":{"rotate":"270"}}]}' ;;
+ *) exit 1 ;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let permit = std::sync::Arc::new(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        let found = inspect(
+            directory.path().to_owned(),
+            "film.mkv".into(),
+            &probe,
+            CancellationToken::new(),
+            permit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.tracks.len(), 2);
+        assert_eq!(found.tracks[0].rotation_degrees, 90);
+        assert_eq!(found.tracks[1].rotation_degrees, 270);
     }
 }
