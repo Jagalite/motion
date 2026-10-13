@@ -645,3 +645,31 @@ test('progress from before a server restore waits for the person\'s choice', asy
   assert.deepEqual(fake.calls.filter(c => c[1] !== 'status').map(c => [c[1], ...c[2]]),
     [['restore', '--choice', 'discard', '--viewing-epoch', 'server:r2']]);
 });
+
+test('a restore choice never interleaves with a download pass', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const order = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const agent = createDownloadAgent({base, identity, cache: async (root, scope, args, input) => {
+    order.push(args[0]);
+    return fake.cache(root, scope, args, input);
+  }, quota: 1000, fetchMedia: async () => assert.fail('no transfer'),
+  api: async path => {
+    if (path.startsWith('/api/v2/downloads?')) { order.push('list'); await gate; return {items: [], next_cursor: null}; }
+    if (path === '/api/v2/system/capabilities') return {server_id: 'server', restore_epoch: 'r2'};
+    throw new Error(path);
+  }});
+  const target = agent.root('default');
+  mkdirSync(target.path, {recursive: true});
+  writeFileSync(join(target.path, 'manifest.json'), '{}');
+  const passing = agent.pass();
+  const choosing = agent.resolveRestore(target.name, 'discard');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(!order.includes('restore'), 'the choice waits for the pass in progress');
+  release();
+  await passing;
+  await choosing;
+  assert.ok(order.lastIndexOf('collect') < order.indexOf('restore'), order.join(','));
+});

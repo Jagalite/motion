@@ -906,6 +906,13 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   After round 2: `catalog_persistence` 15, `v2_downloads` 7, Python
   backup 2 and JS 92 passed; pinned clippy is clean.
 
+  Round 3 at `5dc2c8d` raised one P2: the post-Keep re-pin could race a
+  scheduled pass. The pass could synchronize the kept events and advance
+  viewing after the re-pin had read its manifest, leaving the download
+  pinned behind the server. Fixed: the agent serializes passes and restore
+  choices, in arrival order, whoever starts them. JS test: a choice made
+  during a pass runs after it. JS 93 passed.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

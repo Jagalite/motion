@@ -483,5 +483,14 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     if (current) writeAtomically(join(base, 'current.json'), {root: current});
   }
 
-  return {pass, root, transfer, reconcile, withdraw, restoreChoices, resolveRestore};
+  // A pass and a restore choice each read and rewrite the same cache roots
+  // and causal pins: one at a time, in arrival order, whoever starts them.
+  let exclusive = Promise.resolve();
+  const serialized = operation => (...args) => {
+    const run = exclusive.then(() => operation(...args));
+    exclusive = run.catch(() => {});
+    return run;
+  };
+  return {pass: serialized(pass), root, transfer, reconcile, withdraw, restoreChoices,
+    resolveRestore: serialized(resolveRestore)};
 }
