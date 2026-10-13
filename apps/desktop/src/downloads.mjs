@@ -389,7 +389,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       pins.push({...entry.identity, base_viewing_revision: pinned.restored_viewing_revision,
         base_manual_epoch: pinned.restored_manual_epoch, viewing_epoch: current});
     }
-    return cache(target.path, target.scope, ['restore', '--choice', 'reapply', '--viewing-epoch', current], JSON.stringify(pins));
+    const outcome = await cache(target.path, target.scope, ['restore', '--choice', 'reapply', '--viewing-epoch', current], JSON.stringify(pins));
+    // The kept events carry the restored base; observations from now on use
+    // the current one. Re-pin now, not at the next pass (which may not run
+    // before the title is played offline). A crash in between only offers
+    // the choice again for observations made meanwhile.
+    await rebase(target, (await cache(target.path, target.scope, ['status'])).manifest);
+    return outcome;
   }
 
   /** One complete pass. Errors outside a single transfer stop the pass; the next pass resumes. */

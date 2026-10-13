@@ -80,12 +80,26 @@ def backup(data, output):
     return manifest
 
 
+# The same DDL as migration 0047, which creates these tables IF NOT EXISTS.
+RESTORE_BASELINE_EPOCH = """CREATE TABLE IF NOT EXISTS restore_baseline_epoch (
+ singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+ restore_epoch TEXT NOT NULL,
+ captured INTEGER NOT NULL DEFAULT 0 CHECK(captured IN (0,1))
+)"""
+
+
 def rotate_restore_epoch(database):
     """A restored database has a different history: event cursors issued
-    against the original must reset rather than resume overlapping positions."""
+    against the original must reset rather than resume overlapping positions.
+    The new epoch is recorded as a pending viewing baseline in the same
+    transaction; the server's first start captures it after migrations and
+    before serving anything (db::connect)."""
     with sqlite3.connect(database) as db:
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_identity'").fetchone():
             db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
+            db.execute(RESTORE_BASELINE_EPOCH)
+            db.execute("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) "
+                       "SELECT 1,restore_epoch,0 FROM server_identity WHERE singleton=1")
     db.close()
 
 

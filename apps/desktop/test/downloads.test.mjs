@@ -629,7 +629,10 @@ test('progress from before a server restore waits for the person\'s choice', asy
   assert.deepEqual(JSON.parse(restore[3]), [{download_id: 'd1', timeline_id: 't1', timeline_revision: '1', source_revision: digest,
     base_viewing_revision: '4', base_manual_epoch: '0', viewing_epoch: 'server:r2'}]);
   assert.ok(paths.includes('/api/v2/downloads/d1/manifest'));
-  assert.ok(!fake.calls.some(c => c[1] === 'rebase'), 'the downloads are re-pinned by the next pass');
+  const order = fake.calls.map(c => c[1]);
+  assert.ok(order.indexOf('restore') < order.lastIndexOf('rebase'),
+    'kept events first, then the downloads are re-pinned for observations from now on');
+  assert.deepEqual(fake.calls.filter(c => c[1] === 'rebase').map(c => c[2].slice(0, 2)), [['--download-id', 'd1']]);
   // Restored again meanwhile: nothing is changed and the choice is offered again.
   fake.calls.length = 0;
   epoch = 'server:r3';

@@ -1227,3 +1227,73 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
         8
     );
 }
+
+/// The manifest names the viewing base as restored only when the current
+/// history began with a restore whose baseline was captured.
+#[tokio::test]
+async fn manifests_name_the_restored_base_only_for_a_captured_restore() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"baseline film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "baseline-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/v2/downloads/{id}/manifest");
+    macro_rules! manifest {
+        () => {
+            f.get(&path, &auth).await.body
+        };
+    }
+    let never = manifest!();
+    assert_eq!(
+        (
+            &never["restored_viewing_revision"],
+            &never["restored_manual_epoch"]
+        ),
+        (&Value::Null, &Value::Null)
+    );
+    // A captured baseline of another (earlier) history is not this one's.
+    sqlx::query("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,'earlier',1)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(manifest!()["restored_viewing_revision"], Value::Null);
+    // The current history's captured baseline: as restored, or 0 without a row.
+    sqlx::query("UPDATE restore_baseline_epoch SET restore_epoch=(SELECT restore_epoch FROM server_identity)")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let none = manifest!();
+    assert_eq!(
+        (
+            &none["restored_viewing_revision"],
+            &none["restored_manual_epoch"]
+        ),
+        (&json!("0"), &json!("0"))
+    );
+    sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) VALUES ('default',?,7,2)")
+        .bind(&timeline)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let restored = manifest!();
+    assert_eq!(
+        (
+            &restored["restored_viewing_revision"],
+            &restored["restored_manual_epoch"]
+        ),
+        (&json!("7"), &json!("2"))
+    );
+    // Pending (not captured yet): unknown.
+    sqlx::query("UPDATE restore_baseline_epoch SET captured=0")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(manifest!()["restored_viewing_revision"], Value::Null);
+}

@@ -896,6 +896,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     exhausted, in 186 s.
   - Pinned clippy is clean.
 
+  Round 2 at `c22d5db` raised one P1 and one P2, both fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | C5 (P1) | The baseline was captured only by `db::restore_into`; the supported `scripts/backup.py restore` rotated the epoch without it, so Keep dropped everything | Fixed: both restore paths record the new epoch as a *pending* baseline (`restore_baseline_epoch.captured = 0`) in the transaction that rotates it. The Python tool creates the table in an older backup with the migration's DDL, which is now `IF NOT EXISTS`. The first server start captures the baseline in `db::connect`, after migrations and before serving. A baseline counts only when captured for the current epoch. Tests: Python (the restore leaves a pending baseline for its epoch); Rust (a pending marker is captured at the next start and never moves afterwards; `restore_into` captures it); `v2_downloads` (the manifest names the restored base only for a captured restore of the current epoch, 0 without a row, null when pending or of another epoch) |
+  | C6 | Keep left the downloads pinned to the old history until the next pass, which may not run before offline playback, so new observations were again from before the restore | Fixed: Keep re-pins the downloads to the current state right after rewriting the log (kept events keep their restored base). A crash in between only offers the choice again for observations made meanwhile. JS test |
+
+  After round 2: `catalog_persistence` 15, `v2_downloads` 7, Python
+  backup 2 and JS 92 passed; pinned clippy is clean.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

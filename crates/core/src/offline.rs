@@ -333,10 +333,7 @@ pub fn reapply(
     let mut next = next_sequence(discarded.base, &events)?;
     let mut dropped = 0;
     // Downloads the device already observed in the current history.
-    let newer: Vec<String> = events
-        .iter()
-        .map(|e| e.media.download_id.clone())
-        .collect();
+    let newer: Vec<String> = events.iter().map(|e| e.media.download_id.clone()).collect();
     for event in foreign {
         let superseded = newer.contains(&event.media.download_id);
         let Some(pin) = pins.iter().filter(|_| !superseded).find(|p| {

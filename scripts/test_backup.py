@@ -37,6 +37,19 @@ class RestoreEpoch(unittest.TestCase):
             self.assertNotEqual(epoch, 'original')
             self.assertRegex(epoch, '^[0-9a-f]{32}$')
 
+    def test_restore_records_a_pending_viewing_baseline_for_the_new_epoch(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            (root / 'data').mkdir()
+            database(root / 'data' / 'playscale.sqlite3')
+            backup.backup(root / 'data', root / 'backup')
+            backup.restore(root / 'backup', root / 'restored')
+            db = sqlite3.connect(root / 'restored' / 'playscale.sqlite3')
+            epoch = db.execute('SELECT restore_epoch FROM server_identity').fetchone()[0]
+            pending = db.execute('SELECT restore_epoch, captured FROM restore_baseline_epoch').fetchone()
+            db.close()
+            self.assertEqual(pending, (epoch, 0))
+
 
 if __name__ == '__main__':
     unittest.main()

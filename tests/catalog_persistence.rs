@@ -841,3 +841,55 @@ async fn restore_captures_the_viewing_baseline_of_the_new_history() {
     assert_eq!(Some(current), receipt.restore_epoch);
     pool.close().await;
 }
+
+/// The supported restore tool (scripts/backup.py) only records the new
+/// epoch as a pending baseline; the first start captures it after
+/// migrations, before serving, and never again for that epoch.
+#[tokio::test]
+async fn the_first_start_after_a_restore_captures_its_viewing_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let db = db::connect(&path).await.unwrap();
+    sqlx::query("INSERT INTO timeline_viewing(profile_id,timeline_id,revision,manual_epoch,updated_at) VALUES ('default','t1',5,1,0)")
+        .execute(&db)
+        .await
+        .unwrap();
+    // What the restore tool leaves: a rotated epoch and a pending baseline.
+    sqlx::query("UPDATE server_identity SET restore_epoch='restored-by-tool'")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT OR REPLACE INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,'restored-by-tool',0)")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let captured: (String, i64) =
+        sqlx::query_as("SELECT restore_epoch,captured FROM restore_baseline_epoch")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(captured, ("restored-by-tool".into(), 1));
+    let baseline: (i64, i64) = sqlx::query_as(
+        "SELECT revision,manual_epoch FROM restore_baselines WHERE timeline_id='t1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(baseline, (5, 1));
+    // Viewing written afterwards never moves the baseline.
+    sqlx::query("UPDATE timeline_viewing SET revision=6")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let db = db::connect(&path).await.unwrap();
+    let revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM restore_baselines WHERE timeline_id='t1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(revision, 5);
+    db.close().await;
+}

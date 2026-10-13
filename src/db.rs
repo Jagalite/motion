@@ -233,7 +233,41 @@ pub async fn connect_with(
         });
     }
     crate::upgrade::run(&db, backup.as_ref()).await?;
+    capture_restore_baseline(&db).await?;
     Ok(db)
+}
+
+/// After a restore (a pending `restore_baseline_epoch` for the current
+/// restore epoch), capture each timeline's viewing as restored: after
+/// migrations, before anything is served, in one transaction.
+async fn capture_restore_baseline(db: &SqlitePool) -> anyhow::Result<()> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('restore_baseline_epoch','restore_baselines','timeline_viewing','server_identity')",
+    )
+    .fetch_one(db)
+    .await?;
+    if tables < 4 {
+        return Ok(());
+    }
+    let mut tx = begin_write(db).await?;
+    let pending: Option<String> = sqlx::query_scalar(
+        "SELECT b.restore_epoch FROM restore_baseline_epoch b JOIN server_identity s ON s.restore_epoch=b.restore_epoch WHERE b.singleton=1 AND b.captured=0",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if pending.is_some() {
+        sqlx::query("DELETE FROM restore_baselines")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) SELECT profile_id,timeline_id,revision,manual_epoch FROM timeline_viewing")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE restore_baseline_epoch SET captured=1 WHERE singleton=1")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn prepare_upgrade(
@@ -693,24 +727,19 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
             .fetch_one(&restored)
             .await?;
-        // The new history and its baseline in one transaction: each
-        // timeline's viewing exactly as restored (`restore_baselines`).
+        // The new history and its pending baseline in one transaction; the
+        // database is migrated already, so the baseline is captured now.
         let mut tx = restored.begin().await?;
         sqlx::query("UPDATE server_identity SET restore_epoch=?")
             .bind(&epoch)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM restore_baselines")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT INTO restore_baselines(profile_id,timeline_id,revision,manual_epoch) SELECT profile_id,timeline_id,revision,manual_epoch FROM timeline_viewing")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("INSERT INTO restore_baseline_epoch(singleton,restore_epoch) VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET restore_epoch=excluded.restore_epoch")
+        sqlx::query("INSERT INTO restore_baseline_epoch(singleton,restore_epoch,captured) VALUES (1,?,0) ON CONFLICT(singleton) DO UPDATE SET restore_epoch=excluded.restore_epoch,captured=0")
             .bind(&epoch)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        capture_restore_baseline(&restored).await?;
         Some(epoch)
     } else {
         None

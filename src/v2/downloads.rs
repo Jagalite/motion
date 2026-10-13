@@ -637,10 +637,11 @@ pub async fn manifest(
             .await?;
     // The viewing base as it was restored, when this history began with a
     // restore whose baseline was captured; unknown otherwise.
-    let captured: Option<String> =
-        sqlx::query_scalar("SELECT restore_epoch FROM restore_baseline_epoch WHERE singleton=1")
-            .fetch_optional(&mut *tx)
-            .await?;
+    let captured: Option<String> = sqlx::query_scalar(
+        "SELECT restore_epoch FROM restore_baseline_epoch WHERE singleton=1 AND captured=1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
     let restored = if captured.as_deref() == Some(restore_epoch.as_str()) {
         let row: Option<(i64, i64)> = sqlx::query_as(
             "SELECT revision,manual_epoch FROM restore_baselines WHERE profile_id=? AND timeline_id=?",
