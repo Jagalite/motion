@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | Not started | — | After item 1 |
-| 6 M5 convenience and receiver | 6A implemented; 6B–6E not started | markers PR | Tests, Sol review |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -454,7 +454,19 @@ Not started. Depends on item 1.
   | `crates/motion-ui/tests/compose.rs` | 22 passed. New: manage-page marker list and form; player chapter and skip buttons with the detected label |
   | `tests/access_api.rs`, `tests/m3_workflows.rs` | 39 and 2 passed (pages that changed) |
   | `node --test packages/ui-bridge` | 43 passed. New: skip buttons only inside their interval; seconds sent as milliseconds |
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol):** round 1 at `43b0827` against item 4 raised four
+  P2 findings, all fixed in the follow-up commit:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | M1 | "Skip credits" ending exactly at the duration sent an invalid seek position | Fixed: `seekTarget` seeks just before the duration; JS test |
+  | M2 | Reads silently stopped at 2,000 markers, before pagination and before the effective view | Fixed: core `MAX_MARKERS` (1,000) is enforced at creation (409 `marker_limit`, `admits_another`); reads load every marker and refuse explicitly if the bound is ever exceeded; the effective view always sees all of them. Integration test fills a timeline to the bound, pages through every marker and is refused one more |
+  | M3 | The manage page and player kept only the first page of markers | Fixed: both read every page within the bound; past it the manage section reports unavailable |
+  | M4 | Positions beyond JSON-safe integers (or `i64`) were stored or failed with 500 | Fixed: core `validate` bounds positions by playback's `MAX_POSITION_MS` even without a known duration (422 `outside_timeline`); unit and integration tests |
+
+  After the fixes: core lib 148, `playscale` lib 68, compose 22, `v2_catalog`
+  20, contract 5, player JS 25 passed.
+
 
 ### Remaining item 6 work (not started)
 

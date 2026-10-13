@@ -680,11 +680,15 @@ impl UiQueryFacade for Queries {
                 audio_version: audio_source.as_ref().map(|s| s.0.clone()),
                 audio_file: audio_source.map(|(_, file, revision)| (file, revision)),
                 // Chapters and skip markers in effect; none if unreadable.
+                // Every page (a timeline holds at most core::MAX_MARKERS).
                 markers: self
-                    .list(&format!(
-                        "/catalog/timelines/{}/markers?effective=true&limit=200",
-                        segment(timeline_id)
-                    ))
+                    .list_all(
+                        &format!(
+                            "/catalog/timelines/{}/markers?effective=true",
+                            segment(timeline_id)
+                        ),
+                        5,
+                    )
                     .await
                     .unwrap_or_default()
                     .iter()
@@ -1382,11 +1386,13 @@ impl UiQueryFacade for Queries {
                         .await?
                     {
                         let revision = text(&t, "revision");
+                        // Every page; past the bound the section is
+                        // reported unavailable, never as a shorter list.
                         let rows = self
-                            .list(&format!(
-                                "/catalog/timelines/{}/markers?limit=200",
-                                segment(&text(&t, "id"))
-                            ))
+                            .list_all(
+                                &format!("/catalog/timelines/{}/markers", segment(&text(&t, "id"))),
+                                5,
+                            )
                             .await?;
                         out.push(TimelineMarkersView {
                             timeline_id: text(&t, "id"),

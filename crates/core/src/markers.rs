@@ -54,6 +54,24 @@ pub enum MarkerError {
     InvalidInterval,
     OutsideTimeline,
     InvalidLabel,
+    /// The timeline already holds `MAX_MARKERS` markers.
+    TooManyMarkers,
+}
+
+/// Markers one timeline may hold, of any provenance. Reads and the effective
+/// view always see all of them; creation stops here.
+pub const MAX_MARKERS: usize = 1_000;
+
+/// Positions beyond this are outside any timeline (the playback bound).
+const MAX_POSITION_MS: u64 = crate::timeline_viewing::MAX_POSITION_MS;
+
+/// Whether another marker may be added to a timeline holding `existing`.
+pub fn admits_another(existing: usize) -> Result<(), MarkerError> {
+    if existing >= MAX_MARKERS {
+        Err(MarkerError::TooManyMarkers)
+    } else {
+        Ok(())
+    }
 }
 
 /// Validate a marker against the reviewed timeline revision and duration.
@@ -72,6 +90,11 @@ pub fn validate(
     }
     if label.is_some_and(|l| l.trim().is_empty() || l.len() > 200) {
         return Err(MarkerError::InvalidLabel);
+    }
+    // Even without a known duration, positions stay within playback's bound
+    // (and safely inside JSON and SQLite integers).
+    if start_ms > MAX_POSITION_MS || end_ms.is_some_and(|e| e > MAX_POSITION_MS) {
+        return Err(MarkerError::OutsideTimeline);
     }
     match (kind, end_ms) {
         (Kind::Chapter, None) => {}
@@ -203,5 +226,24 @@ mod tests {
         });
         let ids: Vec<String> = effective(&stale, 2).into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["new"]);
+    }
+
+    #[test]
+    fn positions_and_counts_are_bounded_without_a_known_duration() {
+        let huge = super::MAX_POSITION_MS + 1;
+        assert_eq!(
+            validate(Kind::Chapter, huge, None, None, 1, 1, None),
+            Err(MarkerError::OutsideTimeline)
+        );
+        assert_eq!(
+            validate(Kind::Intro, 0, Some(huge), None, 1, 1, None),
+            Err(MarkerError::OutsideTimeline)
+        );
+        assert_eq!(validate(Kind::Chapter, 5, None, None, 1, 1, None), Ok(()));
+        assert_eq!(admits_another(MAX_MARKERS - 1), Ok(()));
+        assert_eq!(
+            admits_another(MAX_MARKERS),
+            Err(MarkerError::TooManyMarkers)
+        );
     }
 }

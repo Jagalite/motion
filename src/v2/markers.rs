@@ -148,11 +148,21 @@ async fn load(
         i64,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision,revision FROM markers WHERE timeline_id=? ORDER BY start_ms,id LIMIT 2000",
+        "SELECT id,kind,start_ms,end_ms,label,provenance,timeline_revision,revision FROM markers WHERE timeline_id=? ORDER BY start_ms,id LIMIT ?",
     )
     .bind(timeline)
+    .bind(core::MAX_MARKERS as i64 + 1)
     .fetch_all(conn)
     .await?;
+    // Creation keeps a timeline within the bound, so every marker is read
+    // and the effective view sees all of them; never a silent prefix.
+    if rows.len() > core::MAX_MARKERS {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "marker_limit",
+            "This timeline holds more markers than can be read at once",
+        ));
+    }
     rows.into_iter()
         .map(
             |(id, kind, start, end, label, provenance, recorded, revision)| {
@@ -202,6 +212,11 @@ fn rejected(e: MarkerError) -> Problem {
         MarkerError::InvalidLabel => {
             Problem::invalid("invalid_label", "Labels have 1-200 characters")
         }
+        MarkerError::TooManyMarkers => Problem::new(
+            StatusCode::CONFLICT,
+            "marker_limit",
+            "This timeline already holds the most markers it can",
+        ),
     }
 }
 
@@ -258,6 +273,11 @@ async fn create(
             .fetch_one(&mut *tx)
             .await?;
     let label = input.label.as_deref().map(str::trim);
+    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM markers WHERE timeline_id=?")
+        .bind(&timeline)
+        .fetch_one(&mut *tx)
+        .await?;
+    core::admits_another(existing.max(0) as usize).map_err(rejected)?;
     core::validate(
         input.kind,
         input.start_ms,

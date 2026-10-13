@@ -2765,6 +2765,68 @@ async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
             .status,
         StatusCode::NOT_FOUND
     );
+    // Positions beyond playback's bound are refused even without a known
+    // duration (no unsafe JSON integers, no SQLite overflow).
+    let mut huge = input.clone();
+    huge["start_ms"] = json!(9_007_199_254_740_991_u64);
+    huge["end_ms"] = Value::Null;
+    huge["kind"] = json!("chapter");
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(huge),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000005"),
+            ],
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "outside_timeline",
+    );
+    // A timeline holds at most MAX_MARKERS; every one stays readable.
+    let max = playscale_core::markers::MAX_MARKERS;
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) SELECT printf('bulk-%04d',i),'film-a-ed',?,'chapter',i*1000,NULL,NULL,'imported' FROM n")
+        .bind((max - 4) as i64)
+        .bind(revision.parse::<i64>().unwrap())
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.call(
+            "POST",
+            path,
+            Some(input.clone()),
+            &[
+                ("authorization", &op),
+                ("idempotency-key", "marker-create-0000006"),
+            ],
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "marker_limit",
+    );
+    let mut seen = 0;
+    let mut cursor: Option<String> = None;
+    loop {
+        let url = match &cursor {
+            Some(c) => format!("{path}?limit=200&cursor={c}"),
+            None => format!("{path}?limit=200"),
+        };
+        let page = f.call("GET", &url, None, &[("authorization", &op)]).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        seen += page.body["items"].as_array().unwrap().len();
+        match page.body["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(seen, max, "every marker is readable across pages");
+    sqlx::query("DELETE FROM markers WHERE id LIKE 'bulk-%'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
     // After the timeline changes, the old markers stay listed but none is in effect.
     sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id='film-a-ed'")
         .execute(&f.app.db)

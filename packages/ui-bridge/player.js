@@ -857,6 +857,15 @@ function close({unloading = false} = {}) {
   return state.closing;
 }
 
+/**
+ * A marker's seek position as the delivery accepts it: strictly before the
+ * duration (credits may end exactly at it), never negative.
+ */
+function seekTarget(position, duration) {
+  if (!Number.isSafeInteger(position) || position < 0) return 0;
+  return duration > 0 && position >= duration ? Math.max(0, duration - 1000) : position;
+}
+
 /** Show each skip button only while playback is inside its marker's interval. */
 function showSkips(logical) {
   for (const button of document.querySelectorAll('[data-marker-end]')) {
@@ -877,9 +886,7 @@ controls?.addEventListener('submit', event => {
 document.addEventListener('click', event => {
   const target = event.target?.closest?.('[data-player-seek]');
   if (!target || !state.element || state.changing) return;
-  const position = Number(target.dataset.playerSeek);
-  if (!Number.isSafeInteger(position) || position < 0) return;
-  void changePlayback({kind: 'seek', position_ms: position});
+  void changePlayback({kind: 'seek', position_ms: seekTarget(Number(target.dataset.playerSeek), Number(host.dataset.durationMs))});
 });
 controls?.addEventListener('click', event => {
   // Buttons hold an icon and a label; the click may land on either.

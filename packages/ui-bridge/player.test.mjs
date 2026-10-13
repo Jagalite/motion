@@ -486,3 +486,14 @@ test('skip buttons are shown only inside their marker interval', () => {
   showSkips(3050000);
   assert.deepEqual(buttons.map(b => b.hidden), [true, false]);
 });
+
+test('a skip to the end of the title seeks just before it', () => {
+  const {seekTarget} = runInNewContext(source.replace('export {close, maintainLease};', '({seekTarget});'), {
+    document: {getElementById: () => null, querySelector: () => null, addEventListener() {}}, addEventListener() {},
+  });
+  assert.equal(seekTarget(65000, 120000), 65000);
+  assert.equal(seekTarget(120000, 120000), 119000, 'credits ending at the duration');
+  assert.equal(seekTarget(500, 0), 500, 'unknown duration');
+  assert.equal(seekTarget(-1, 1000), 0);
+  assert.equal(seekTarget(Number.NaN, 1000), 0);
+});
