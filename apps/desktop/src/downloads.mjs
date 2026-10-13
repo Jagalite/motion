@@ -51,8 +51,32 @@ function readJson(path, fallback) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; }
 }
 
-/** The cache root to open offline: the most recently synchronized one. */
-export function currentRoot(base) {
+/**
+ * Every cache root on this device holding at least one saved title, with a
+ * label to choose it by (the server it came from and the profile), newest
+ * synchronized first marked current. Read-only; never opens a cache.
+ */
+export function offlineRoots(base) {
+  const roots = readJson(join(base, 'roots.json'), {});
+  const labels = readJson(join(base, 'labels.json'), {});
+  const current = readJson(join(base, 'current.json'), null)?.root;
+  return Object.entries(roots)
+    .filter(([name, scope]) => /^[0-9a-f]{32}$/.test(name) && scope && rootName(scope) === name)
+    .map(([name, scope]) => ({name, scope, titles: readJson(join(base, name, 'manifest.json'), null)?.downloads?.length ?? 0}))
+    .filter(root => root.titles > 0)
+    .map(({name, scope, titles}) => ({name, titles, current: name === current,
+      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id}`}));
+}
+
+/**
+ * The cache root to open offline: the chosen one when it is a saved root of
+ * this device (`offlineRoots`), else the most recently synchronized one.
+ */
+export function currentRoot(base, choice = null) {
+  if (choice !== null) {
+    if (!offlineRoots(base).some(root => root.name === choice)) throw new Error('That offline library is not on this device');
+    return join(base, choice);
+  }
   if (existsSync(join(base, 'manifest.json'))) return base; // A single root (development fixture).
   const name = readJson(join(base, 'current.json'), null)?.root;
   if (typeof name !== 'string' || !/^[0-9a-f]{32}$/.test(name) || !existsSync(join(base, name, 'manifest.json'))) {
@@ -79,7 +103,7 @@ export function wireEvent(event) {
  * @param {(root: string, scope: object, args: string[], input?: string) => Promise<any>} options.cache
  */
 export function createDownloadAgent({base, identity, api, fetchMedia, cache, quota, headroom = 1024 ** 3, status = () => {}, signal,
-  stallMs = 60_000}) {
+  stallMs = 60_000, serverLabel = null}) {
   mkdirSync(base, {recursive: true, mode: 0o700});
   const index = join(base, 'roots.json');
   const scopeFor = profile_id => ({...identity, profile_id});
@@ -90,6 +114,9 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const name = rootName(scope);
     const roots = readJson(index, {});
     if (!roots[name]) writeAtomically(index, {...roots, [name]: scope});
+    // A display label only (offlineRoots); never part of the cache scope.
+    const labels = readJson(join(base, 'labels.json'), {});
+    if (serverLabel && labels[name]?.server !== serverLabel) writeAtomically(join(base, 'labels.json'), {...labels, [name]: {server: serverLabel}});
     return {path: join(base, name), name, scope};
   }
 

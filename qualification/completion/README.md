@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | Not started | — | After item 1 |
+| 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -402,7 +402,46 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
 ## 5. Offline experience breadth
 
-Not started. Depends on item 1.
+### 5A. Choosing among several offline libraries
+
+- **Source SHA:** branch `plan-completion/offline-roots`, stacked on item 6A (`plan-completion/markers`).
+- **Implemented:** a device can hold saved titles from several servers and
+  profiles (one cache root each). The desktop now lists every root that has
+  saved titles, labelled by the server host it was saved from and the
+  profile, and lets the person choose which to open offline. Previously the
+  most recently synchronized root opened, with no choice.
+  - The agent records a display label per root in `labels.json`, separate
+    from the cache scope the cache tool validates.
+  - `offlineRoots` reads the root index and manifests read-only.
+  - `currentRoot(base, choice)` opens a chosen root only if it is a saved
+    root of this device.
+  - The main process validates the name before starting the offline host.
+  - The chrome page shows the chooser only when there is more than one
+    library. Labels are set with `textContent`.
+- **Unsupported (still open):** removing titles from the offline host;
+  prepared or track-selected downloads; the device transfer-state contract;
+  the restore recovery flow. Each is listed below with its next step.
+- **Core/adapter boundary:** no correctness rule changed. Which root may
+  open is a membership check against the device's own root index (adapter),
+  and the cache scope, lock and verified manifest still govern what the host
+  serves.
+- **Focused evidence:** `node --test apps/desktop/test/*.test.mjs
+  packages/ui-bridge/*.test.mjs`: 84 passed. New: two servers, one with an
+  empty root, are listed with labels and the current one; a chosen root
+  opens; an empty or unknown root is refused. The chrome test's harness
+  without the new IPC still passes.
+- **Review:** pending (GPT-6.1 Sol).
+- **Release checks:** the Electron run of the chooser with two real servers.
+
+### Remaining item 5 work (not started)
+
+| Slice | Next step | Dependency |
+|---|---|---|
+| 5B offline removal | A removal action in the offline host that takes the cache lock and calls `Store::remove` | Host lifecycle (lock held by the running host) |
+| 5C restore recovery | When sync answers `viewing_epoch_changed`, offer "re-base on the restored server" or "discard", as an explicit choice applied by the cache tool | Core rule for re-basing retained events onto a new history |
+| 5D transfer state | Contract operation for device-reported progress, owned by the device; never inferred by the server | Contract review |
+| 5E prepared and track-selected downloads | Manifest files for renditions, subtitles and artwork with pins | Item 3D (preparation by component) |
+| 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work
 

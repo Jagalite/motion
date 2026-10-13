@@ -26,13 +26,27 @@ document.getElementById('disconnect').addEventListener('click', async event => {
 
 window.motionHost.onStatus(message => show(message, true));
 
+// Several servers or profiles may have saved titles here: offer a choice
+// (labels are built with textContent, never markup).
+const rootChoice = document.getElementById('offline-root');
+async function listOfflineRoots() {
+  try {
+    const roots = await window.motionHost.offlineRoots();
+    rootChoice.replaceChildren(...roots.map(root => Object.assign(document.createElement('option'),
+      {value: root.name, selected: root.current, textContent: `${root.label} (${root.titles} saved)`})));
+    document.getElementById('offline-root-label').hidden = roots.length < 2;
+  } catch { /* No choice offered: the most recently synchronized library opens. */ }
+}
+void listOfflineRoots();
+
 for (const [id, operation, message] of [
   ['start-local', 'startLocal', 'Connected to the local server owned by this desktop. Quitting stops this server.'],
   ['stop-local', 'stopLocal', 'The desktop-owned server has stopped.'],
   ['downloads', 'openDownloads', 'Offline downloads are open. Progress is saved on this device.'],
 ]) document.getElementById(id).addEventListener('click', async event => {
   event.target.disabled = true;
-  try { await window.motionHost[operation](); show(message); }
+  const argument = id === 'downloads' && !document.getElementById('offline-root-label').hidden ? rootChoice.value : undefined;
+  try { await window.motionHost[operation](argument); show(message); if (id === 'downloads') void listOfflineRoots(); }
   catch (error) { show(error.message, true); }
   finally { event.target.disabled = false; }
 });

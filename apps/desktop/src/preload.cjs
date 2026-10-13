@@ -2,7 +2,8 @@ const {contextBridge, ipcRenderer} = require('electron');
 contextBridge.exposeInMainWorld('motionHost', Object.freeze({
   startLocal: () => ipcRenderer.invoke('motion:start-local'),
   stopLocal: () => ipcRenderer.invoke('motion:stop-local'),
-  openDownloads: () => ipcRenderer.invoke('motion:downloads'),
+  openDownloads: root => ipcRenderer.invoke('motion:downloads', typeof root === 'string' ? root : null),
+  offlineRoots: () => ipcRenderer.invoke('motion:offline-roots'),
   connect: request => ipcRenderer.invoke('motion:connect', request),
   disconnect: () => ipcRenderer.invoke('motion:disconnect'),
   onStatus: callback => {

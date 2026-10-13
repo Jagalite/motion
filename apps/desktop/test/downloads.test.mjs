@@ -4,7 +4,7 @@ import {mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
-import {cacheTitle, createDownloadAgent, currentRoot, rootName, wireEvent} from '../src/downloads.mjs';
+import {cacheTitle, createDownloadAgent, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
 
 const identity = {server_id: 'server', principal_id: 'device1', device_id: 'device1'};
 const media = Buffer.from('0123456789abcdefghij');
@@ -466,4 +466,31 @@ test('a stalled transfer fails alone and keeps its staged bytes for resume', asy
   await assert.rejects(agent.transfer({id: 'd1'}, target), /stalled/);
   assert.deepEqual(readFileSync(join(target.path, 'staging', 'd1.part')), media.subarray(0, 8));
   assert.ok(!fake.calls.some(c => c[1] === 'publish'));
+});
+
+test('several offline libraries are listed with labels and only saved roots can be chosen', () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const make = (server, label, profile, titles) => {
+    const agent = createDownloadAgent({base, identity: {...identity, server_id: server}, cache: fake.cache, quota: 1000,
+      fetchMedia: async () => assert.fail(), api: async () => assert.fail(), serverLabel: label});
+    const target = agent.root(profile);
+    mkdirSync(target.path, {recursive: true});
+    writeFileSync(join(target.path, 'manifest.json'), JSON.stringify({protocol: 1, downloads: Array(titles).fill({})}));
+    return target;
+  };
+  const home = make('server-a', 'motion.home', 'default', 2);
+  const cabin = make('server-b', 'motion.cabin', 'kids', 1);
+  const empty = make('server-c', 'motion.empty', 'default', 0);
+  writeFileSync(join(base, 'current.json'), JSON.stringify({root: cabin.name}));
+  const roots = offlineRoots(base);
+  assert.deepEqual(roots.map(r => [r.label, r.titles, r.current]).sort(), [
+    ['motion.cabin · profile kids', 1, true],
+    ['motion.home · profile default', 2, false],
+  ]);
+  assert.equal(currentRoot(base), cabin.path);
+  assert.equal(currentRoot(base, home.name), home.path);
+  // A root with nothing saved, or any other name, is not openable.
+  assert.throws(() => currentRoot(base, empty.name), /not on this device/);
+  assert.throws(() => currentRoot(base, '0'.repeat(32)), /not on this device/);
 });
