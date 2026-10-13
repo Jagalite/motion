@@ -23,7 +23,7 @@ item below is the single completion agent unless stated otherwise.
 | Item | State | PR | Next step |
 |---|---|---|---|
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
-| 1 Download correctness and retention | Implemented, tested | downloads PR | Sol review |
+| 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Not started | — | Scan history ordering |
 | 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
 | 4 Library-management UI | Not started | — | After item 2 |
@@ -98,8 +98,25 @@ item below is the single completion agent unless stated otherwise.
   observes `(next_sequence, pruned_through)`, deletes and records the floor in
   the request transaction. The agent only forwards the cache tool's base.
 - **Focused evidence (2026-10-12, darwin-arm64, Rust 1.98, Kyoto compile then
-  direct execution):** RESULTS_PLACEHOLDER
-- **Review:** pending (GPT-6.1 Sol).
+  direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `playscale-core` lib (adds `retain`, stale-copy, limit and `consumed` tests) | 141 passed |
+  | `downloads_model` exhaustive (Stateless) | passed: graph exhausted at 3,599,192 states and 50,388,688 transitions (437 s, 2.6 GB RSS, debug). Bounds: 4 device sequences, 2 online writes, 1 manual override, 1 timeline edit, 1 restore, retention limit 2; acknowledged sync, lost response, altered retry, stale replay, gap. New properties: records contiguous above the floor, floor never beyond the device's compaction, retained records within the limit, stale replays change nothing and get the required outcome |
+  | `downloads_model` mutation checks | 2 passed; pruning past the device's compaction is detected |
+  | `offline_model` (fuzz) | 3 passed |
+  | `tests/v2_downloads.rs` (real router and SQLite) | 5 passed. The new retention test covers: no report, then pruning; lost-response duplicate; floor and records after reopening the database; stale copy refused; ahead/malformed reports; a 404 batch pruning nothing; the 10,000 bound and its release |
+  | `motion-ui-host` lib and `store` | 1 and 11 passed |
+  | `node --test apps/desktop/test/*.test.mjs packages/ui-bridge/*.test.mjs` | 80 passed. New: sync without `downloads:manage` with a lost response then exact retry; refused sync keeps events; collection on owned roots only; acknowledgement reporting and stale-copy refusal. Mutating either fix fails its test |
+  | `run-download-workflow.mjs` (real server, agent, cache writer and host binaries) | passed all 8 checks; receipt [download-workflow-item1.json](download-workflow-item1.json). Its `commit` field is the base commit: the binaries were built from the uncommitted item-1 tree, whose non-test sources equal the item-1 commit |
+  | Pinned clippy 1.98 with CI flags (`-p playscale-core -p playscale -p motion-ui-host --all-targets`) | clean (Kyoto `07941d71`) |
+  | `cargo fmt --check`, `check_contract.py`, `contract_json.rb --check` | pass |
+
+  Kyoto compile jobs: `fe2d1dcb` (test binaries), `e4088e14` (model).
+- **Review:** GPT-6.1 Sol (high, read-only) reviewed `6faca67` against the docs
+  branch: no actionable regressions in the retention protocol, transactional
+  persistence or withdrawal changes.
 - **Release checks:** the N3 deferred rows (installed package, large or
   interrupted transfers, physical full disk, Electron/Demuxe on an
   agent-published root) remain in section 8 of the handoff.
