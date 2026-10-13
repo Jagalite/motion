@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested; 3C–3F not started | playback PR | Sol review |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
 | 4 Library-management UI | Not started | — | After item 2 |
 | 5 Offline breadth | Not started | — | After item 1 |
 | 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
@@ -345,6 +345,8 @@ follow-up commit:
 | # | Finding | Disposition |
 |---|---|---|
 | P5-3 | Re-probing keyed on the colour flag, an unrelated fact: rows written by this branch's intermediate probe had the flag but no attachment facts | Fixed: a stream `probe_version` (current 1) records which probe wrote the facts; HDR video and attachment streams from an older probe are re-probed. The test now keeps the old flag set while removing the attachment facts and the version, and the facts return after an ordinary scan. HDR and styled tests and `playscale` lib 67 passed |
+
+Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
 ### Remaining item 3 slices (not started)
 
