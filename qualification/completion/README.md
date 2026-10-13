@@ -593,10 +593,11 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     with ffprobe. It reads the subtitle stream's display sets in the 5
     minutes before the start (`-read_intervals`, no video decoding), with
     whether each draws anything, in file time.
-  - Core `delivery::burn_read_from` decides where reading begins:
-    - the last display set at or before the start, if it draws;
-    - otherwise the start itself;
-    - if the stream could not be read, the old bounded 20 s.
+  - Core `delivery::burn_read_from` decides where reading begins. If the
+    last display set at or before the start draws and has not ended by
+    itself, reading starts at its latest acquisition point (see round 2
+    below). Otherwise it starts at the start itself; if the stream could not
+    be read, at the old bounded 20 s.
   - The conversion keeps the original single-input graph (input seek, then
     an output trim to the start). A cue still showing at the start is
     therefore drawn, and video is decoded only from the cue's own display
@@ -624,6 +625,19 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     null sink also unblocked it, but cost seconds of CPU per start. The
     single-input graph cannot stall this way, and the new test's second
     case starts after the cue was cleared.
+
+  Round 2 at `a532117` raised one P1 and two P2 findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | B2 (P1) | A probe that did not exit when killed was dropped as "unavailable", so the generation (or a cancellation) could release capacity while it still held the source descriptor | Fixed: every lookback probe's `Stalled` child is handed to `lease.stuck` until it exits, as `copy_keyframe` does |
+  | B3 | A PGS composition reusing objects or a palette from its epoch was read from its own time, so the decoder lacked them (`Invalid palette id`) and the cue was omitted | Fixed: PGS sets are read from the stream's own segments (`ffmpeg -c copy -f sup`, no hex inflation, bounded at 64 MiB), each with its composition state. Core `burn_read_from` reads from the latest acquisition point (epoch start or acquisition point) at or before the showing cue; if that point is outside the window the cue is not restored. Integration test `pgs_compositions_reusing_objects_are_read_from_their_epoch` (epoch at 0 s, reuse at 30 s, start at 38 s): drawn |
+  | B4 | A DVD subpicture's own end time was ignored, so an expired cue made a later start decode up to 5 minutes of video needlessly | Fixed: DVD/DVB observations keep `end_display_time`; core treats a cue ended at or before the start as not showing. Core unit tests cover expired and still-showing subpictures |
+
+  The observation is now core `DisplaySet` (time, draws, own end,
+  acquisition). DVB page states are not parsed: each DVB subpicture is
+  treated as self-contained. After the fixes: core 163 and `v2_playback`
+  34 passed; clippy clean.
 
 ### Remaining item 3 slices (not started)
 

@@ -7707,3 +7707,179 @@ async fn bitmap_cues_established_long_before_a_start_are_drawn() {
     let cleared = sum / (220 * 40);
     assert!(cleared < 200, "box still drawn: {cleared}");
 }
+
+/// A PGS stream whose composition at 30 s reuses the object and palette its
+/// epoch defined at 0 s (shown 0-10 s, cleared, shown again from 30 s).
+fn pgs_reuse() -> Vec<u8> {
+    let (width, height, x, y, w, h) = (640u16, 480u16, 80u16, 80u16, 480u16, 120u16);
+    let be = |v: u16| v.to_be_bytes();
+    let segment = |pts_ms: u32, kind: u8, payload: &[u8]| {
+        let mut out = b"PG".to_vec();
+        out.extend((pts_ms * 90).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.push(kind);
+        out.extend((payload.len() as u16).to_be_bytes());
+        out.extend(payload);
+        out
+    };
+    let window = [&[1u8, 0][..], &be(x), &be(y), &be(w), &be(h)].concat();
+    let mut rle = Vec::new();
+    for _ in 0..h {
+        rle.extend([
+            0x00,
+            0xC0 | (w >> 8) as u8,
+            (w & 0xff) as u8,
+            0x01,
+            0x00,
+            0x00,
+        ]);
+    }
+    let mut ods = vec![0, 0, 0, 0xC0];
+    ods.extend(&((rle.len() + 4) as u32).to_be_bytes()[1..]);
+    ods.extend(be(w));
+    ods.extend(be(h));
+    ods.extend(&rle);
+    let pcs = |number: u16, state: u8, objects: bool| {
+        let mut p = [
+            &be(width)[..],
+            &be(height),
+            &[0x10],
+            &be(number),
+            &[state, 0, 0],
+        ]
+        .concat();
+        if objects {
+            p.extend([1, 0, 0, 0, 0]);
+            p.extend(be(x));
+            p.extend(be(y));
+        } else {
+            p.push(0);
+        }
+        p
+    };
+    [
+        segment(0, 0x16, &pcs(0, 0x80, true)),
+        segment(0, 0x17, &window),
+        segment(0, 0x14, &[0, 0, 1, 235, 128, 128, 255]),
+        segment(0, 0x15, &ods),
+        segment(0, 0x80, &[]),
+        segment(10000, 0x16, &pcs(1, 0x00, false)),
+        segment(10000, 0x17, &window),
+        segment(10000, 0x80, &[]),
+        // A normal composition: no palette or object of its own.
+        segment(30000, 0x16, &pcs(2, 0x00, true)),
+        segment(30000, 0x17, &window),
+        segment(30000, 0x80, &[]),
+        segment(45000, 0x16, &pcs(3, 0x00, false)),
+        segment(45000, 0x17, &window),
+        segment(45000, 0x80, &[]),
+    ]
+    .concat()
+}
+
+/// A PGS cue whose composition reuses objects its epoch defined earlier is
+/// read from that epoch, so a start inside it draws it (a decoder started
+/// at the composition itself has no palette or object to show).
+#[tokio::test(flavor = "multi_thread")]
+async fn pgs_compositions_reusing_objects_are_read_from_their_epoch() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "50");
+    let base = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+    let sup = f.dir.path().join("reuse.sup");
+    std::fs::write(&sup, pgs_reuse()).unwrap();
+    f.media(
+        "film.mkv",
+        &[
+            "-i",
+            base.to_str().unwrap(),
+            "-i",
+            sup.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+    input["source"] = f.source().await;
+    input["tracks"]["subtitle_track_id"] = json!("s0");
+    input["tracks"]["subtitle_policy"] = json!("require");
+    input["client"]["subtitle_modes"] = json!(["burned"]);
+    let planned = f.post("/api/v2/playback/plans", &auth, None, input).await;
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-epoch-001"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 38000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 38000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            reply.bytes
+        }
+    };
+    let base_url = format!("/api/v2/streams/{id}/1");
+    let fragment = f.dir.path().join("epoch.mp4");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mut sum = 0usize;
+    for y in 50..90 {
+        sum += frame[y * 320 + 50..y * 320 + 270]
+            .iter()
+            .map(|&p| p as usize)
+            .sum::<usize>();
+    }
+    let inside = sum / (220 * 40);
+    assert!(inside > 225, "reused cue not drawn: {inside}");
+}

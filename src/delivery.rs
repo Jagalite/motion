@@ -1014,41 +1014,97 @@ async fn probe_descriptor(
 }
 
 /// The display sets of bitmap subtitle stream `index` in the
-/// `BURN_LOOKBACK_MS` before `start_ms` (file time), each with whether it
-/// draws anything; read from the validated descriptor without decoding
-/// video. None when they cannot be read within the probe deadline.
+/// `BURN_LOOKBACK_MS` before `start_ms` (file time), read from the validated
+/// descriptor without decoding video. PGS sets come from the stream's own
+/// segments (each composition's state says whether a decoder can start
+/// there); DVD and DVB subpictures from their decoded frames, with any end
+/// they carry. None when they cannot be read; a probe that does not exit
+/// when killed stays accounted to the lease until it does.
 async fn bitmap_display_sets(
     app: &App,
     input: &std::fs::File,
     index: u32,
     start_ms: u64,
-) -> Option<Vec<(u64, bool)>> {
-    // ffprobe intervals are container timestamps; FFmpeg's -ss is relative
-    // to the container's start time.
-    let format: serde_json::Value = serde_json::from_slice(
-        &probe_descriptor(
+    lease: &execution::Lease,
+) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
+    use playscale_core::delivery::{BURN_LOOKBACK_MS, DisplaySet};
+    let owned = |result: Result<Vec<u8>, ProbeFailure>| match result {
+        Ok(output) => Some(output),
+        Err(ProbeFailure::Stalled(mut child)) => {
+            lease.stuck(async move {
+                let _ = child.wait().await;
+            });
+            None
+        }
+        Err(ProbeFailure::Unavailable) => None,
+    };
+    let stream = format!("s:{index}");
+    let info: serde_json::Value = serde_json::from_slice(&owned(
+        probe_descriptor(
             app,
             input,
-            &["-show_entries", "format=start_time", "-of", "json"],
+            &[
+                "-select_streams",
+                &stream,
+                "-show_entries",
+                "format=start_time:stream=codec_name",
+                "-of",
+                "json",
+            ],
         )
-        .await
-        .ok()?,
-    )
+        .await,
+    )?)
     .ok()?;
-    let origin = format["format"]["start_time"]
+    // Container timestamps start at the container's start time; FFmpeg's
+    // -ss is relative to it.
+    let origin = info["format"]["start_time"]
         .as_str()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
         .unwrap_or(0.0);
-    let from = start_ms.saturating_sub(playscale_core::delivery::BURN_LOOKBACK_MS);
+    let origin_ms = (origin * 1000.0).round() as u64;
+    let from = start_ms.saturating_sub(BURN_LOOKBACK_MS);
+    let seconds = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    if info["streams"][0]["codec_name"] == "hdmv_pgs_subtitle" {
+        let map = format!("0:s:{index}");
+        let (from_at, to_at) = (seconds(from), seconds(start_ms + 1));
+        let segments = owned(
+            run_descriptor(
+                &app.processing.settings.ffmpeg,
+                input,
+                &[
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-copyts",
+                    "-ss",
+                    &from_at,
+                    "-to",
+                    &to_at,
+                    "-i",
+                    "/dev/fd/3",
+                    "-map",
+                    &map,
+                    "-c",
+                    "copy",
+                    "-f",
+                    "sup",
+                    "pipe:1",
+                ],
+                MAX_PGS_PROBE_OUTPUT,
+                PROBE_DEADLINE,
+            )
+            .await,
+        )?;
+        return pgs_display_sets(&segments, origin_ms);
+    }
     let interval = format!(
         "{:.3}%{:.3}",
         origin + from as f64 / 1000.0,
         origin + start_ms as f64 / 1000.0 + 0.001
     );
-    let stream = format!("s:{index}");
-    let frames: serde_json::Value = serde_json::from_slice(
-        &probe_descriptor(
+    let frames: serde_json::Value = serde_json::from_slice(&owned(
+        probe_descriptor(
             app,
             input,
             &[
@@ -1058,24 +1114,72 @@ async fn bitmap_display_sets(
                 &stream,
                 "-show_frames",
                 "-show_entries",
-                "frame=pts_time,num_rects",
+                "frame=pts_time,num_rects,end_display_time",
                 "-of",
                 "json",
             ],
         )
-        .await
-        .ok()?,
-    )
+        .await,
+    )?)
     .ok()?;
     frames["frames"]
         .as_array()?
         .iter()
         .map(|frame| {
             let at = frame["pts_time"].as_str()?.parse::<f64>().ok()? - origin;
-            let draws = frame["num_rects"].as_u64()? > 0;
-            (at.is_finite() && at >= 0.0).then_some(((at * 1000.0).round() as u64, draws))
+            if !(at.is_finite() && at >= 0.0) {
+                return None;
+            }
+            let at_ms = (at * 1000.0).round() as u64;
+            // An end of u32::MAX (or none) means "until the next one".
+            let end = frame["end_display_time"]
+                .as_u64()
+                .filter(|end| *end > 0 && *end < u64::from(u32::MAX));
+            Some(DisplaySet {
+                at_ms,
+                draws: frame["num_rects"].as_u64()? > 0,
+                until_ms: end.map(|end| at_ms + end),
+                acquisition: true,
+            })
         })
         .collect()
+}
+
+/// Largest raw PGS segment stream read for the lookback (bitmaps included).
+const MAX_PGS_PROBE_OUTPUT: u64 = 64 * 1024 * 1024;
+
+/// The display sets of a raw PGS segment stream (`.sup`: "PG", 90 kHz PTS,
+/// DTS, type, size, payload): one per presentation composition, with
+/// whether it shows objects and whether its composition state (epoch start
+/// or acquisition point) lets a decoder start there. None if malformed.
+fn pgs_display_sets(
+    bytes: &[u8],
+    origin_ms: u64,
+) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
+    let mut sets = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let header = bytes.get(at..at + 13)?;
+        if &header[..2] != b"PG" {
+            return None;
+        }
+        let pts = u32::from_be_bytes(header[2..6].try_into().ok()?);
+        let size = usize::from(u16::from_be_bytes(header[11..13].try_into().ok()?));
+        let payload = bytes.get(at + 13..at + 13 + size)?;
+        if header[10] == 0x16 {
+            // Presentation composition: state at byte 7, object count at 10.
+            let state = *payload.get(7)?;
+            let objects = *payload.get(10)?;
+            sets.push(playscale_core::delivery::DisplaySet {
+                at_ms: (u64::from(pts) / 90).checked_sub(origin_ms)?,
+                draws: objects > 0,
+                until_ms: None,
+                acquisition: state & 0xC0 != 0,
+            });
+        }
+        at += 13 + size;
+    }
+    Some(sets)
 }
 
 /// Run a media tool reading the validated descriptor as fd 3 and collect its
@@ -1847,7 +1951,7 @@ async fn run_generation(
     let burn_from = match pinned_burn(&pin) {
         Some(Burn::Bitmap(index)) if durations.is_empty() && !copies_video(operation) => {
             let start = seek_ms + pin.clip.map_or(0, |clip| clip.start_ms);
-            let sets = bitmap_display_sets(&app, &input, index, start).await;
+            let sets = bitmap_display_sets(&app, &input, index, start, &lease).await;
             if stop.is_cancelled() {
                 return stopped(&app, &session);
             }

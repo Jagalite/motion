@@ -170,23 +170,49 @@ pub const BURN_LOOKBACK_MS: u64 = 300_000;
 /// could not be examined.
 pub const BURN_FALLBACK_LOOKBACK_MS: u64 = 20_000;
 
+/// A bitmap subtitle display set observed before a start, in file time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplaySet {
+    pub at_ms: u64,
+    /// It draws something (a clearing set draws nothing).
+    pub draws: bool,
+    /// When it stops showing by itself, if it says (DVD subpictures carry
+    /// an end; PGS cues show until the next set).
+    pub until_ms: Option<u64>,
+    /// A decoder can start here: it carries every object and palette it
+    /// shows (a PGS epoch start or acquisition point; every DVD subpicture).
+    pub acquisition: bool,
+}
+
 /// Where a conversion burning a bitmap subtitle starts reading so that a cue
 /// still showing at `start_ms` is drawn. `display_sets` are the stream's
-/// display sets in the `BURN_LOOKBACK_MS` before the start, in file time,
-/// each with whether it draws anything (a clearing set draws nothing); None
-/// when they could not be read. The last set at or before the start decides:
-/// one that draws is read from its own time; a clearing one, or none, needs
-/// nothing earlier than the start. Unknown: the bounded fallback lookback.
-pub fn burn_read_from(start_ms: u64, display_sets: Option<&[(u64, bool)]>) -> u64 {
+/// sets in the `BURN_LOOKBACK_MS` before the start; None when they could not
+/// be read. The last set at or before the start decides: if it draws and
+/// has not expired, reading starts at the latest acquisition point at or
+/// before it (where its objects are defined), so the cue decodes as in the
+/// file; if that point is outside the window, the cue is not restored.
+/// Otherwise nothing earlier than the start is needed. Unknown: the bounded
+/// fallback lookback.
+pub fn burn_read_from(start_ms: u64, display_sets: Option<&[DisplaySet]>) -> u64 {
     let Some(sets) = display_sets else {
         return start_ms.saturating_sub(BURN_FALLBACK_LOOKBACK_MS);
     };
     let floor = start_ms.saturating_sub(BURN_LOOKBACK_MS);
-    sets.iter()
-        .filter(|(at, _)| (floor..=start_ms).contains(at))
-        .max_by_key(|(at, _)| *at)
-        .filter(|(_, draws)| *draws)
-        .map_or(start_ms, |(at, _)| *at)
+    let window = || {
+        sets.iter()
+            .filter(|s| (floor..=start_ms).contains(&s.at_ms))
+    };
+    let Some(last) = window().max_by_key(|s| s.at_ms) else {
+        return start_ms;
+    };
+    if !last.draws || last.until_ms.is_some_and(|until| until <= start_ms) {
+        return start_ms;
+    }
+    window()
+        .filter(|s| s.acquisition && s.at_ms <= last.at_ms)
+        .map(|s| s.at_ms)
+        .max()
+        .unwrap_or(start_ms)
 }
 
 /// Styled text codecs (ASS/SSA): rendered faithfully only by libass, so only
@@ -1265,24 +1291,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_bitmap_cue_showing_at_the_start_is_read_from_its_display_set() {
+    fn a_bitmap_cue_showing_at_the_start_is_read_from_its_acquisition_point() {
+        let set = |at_ms, draws, acquisition| DisplaySet {
+            at_ms,
+            draws,
+            until_ms: None,
+            acquisition,
+        };
         let start = 400_000;
-        // A cue drawn at 200 s and not cleared before the start.
-        assert_eq!(burn_read_from(start, Some(&[(200_000, true)])), 200_000);
+        // A self-contained cue drawn at 200 s and not cleared before the start.
+        assert_eq!(
+            burn_read_from(start, Some(&[set(200_000, true, true)])),
+            200_000
+        );
         // Cleared before the start: nothing earlier is needed.
         assert_eq!(
-            burn_read_from(start, Some(&[(200_000, true), (300_000, false)])),
+            burn_read_from(
+                start,
+                Some(&[set(200_000, true, true), set(300_000, false, false)])
+            ),
             start
         );
         // The latest set decides, whatever the order read.
         assert_eq!(
-            burn_read_from(start, Some(&[(390_000, true), (300_000, false)])),
+            burn_read_from(
+                start,
+                Some(&[set(390_000, true, true), set(300_000, false, false)])
+            ),
             390_000
         );
+        // A composition reusing objects defined earlier is read from where
+        // they were defined (its epoch's acquisition point).
+        assert_eq!(
+            burn_read_from(
+                start,
+                Some(&[
+                    set(120_000, true, true),
+                    set(150_000, false, false),
+                    set(380_000, true, false)
+                ])
+            ),
+            120_000
+        );
+        // Its acquisition point is outside the window: not restored.
+        assert_eq!(
+            burn_read_from(start, Some(&[set(380_000, true, false)])),
+            start
+        );
+        // A subpicture that ended by itself before the start.
+        let expired = DisplaySet {
+            until_ms: Some(12_000),
+            ..set(10_000, true, true)
+        };
+        assert_eq!(burn_read_from(290_000, Some(&[expired])), 290_000);
+        let showing = DisplaySet {
+            until_ms: Some(295_000),
+            ..set(280_000, true, true)
+        };
+        assert_eq!(burn_read_from(290_000, Some(&[showing])), 280_000);
         // No sets in the window, or sets outside it: from the start.
         assert_eq!(burn_read_from(start, Some(&[])), start);
-        assert_eq!(burn_read_from(start, Some(&[(50_000, true)])), start);
-        assert_eq!(burn_read_from(start, Some(&[(401_000, true)])), start);
+        assert_eq!(
+            burn_read_from(start, Some(&[set(50_000, true, true)])),
+            start
+        );
+        assert_eq!(
+            burn_read_from(start, Some(&[set(401_000, true, true)])),
+            start
+        );
         // Unknown: the bounded fallback.
         assert_eq!(
             burn_read_from(start, None),
