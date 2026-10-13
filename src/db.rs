@@ -45,12 +45,13 @@ pub struct Track {
     pub commentary: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Colour facts beyond the transfer and attachment facts, probed since
-    /// completion item 3. Rows probed earlier lack them (`color_probed`
-    /// false) and HDR video or attachment streams are re-probed by the next
-    /// scan (`lacks_probe_facts`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub color_probed: bool,
+    /// The version of the probe that recorded this stream. Version 1
+    /// (completion item 3) records colour facts beyond the transfer and
+    /// attachment MIME types and sizes; streams recorded by an older probe
+    /// that later policies need facts from are probed again by the next scan
+    /// (`lacks_probe_facts`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub probe_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_primaries: Option<String>,
     /// Matrix coefficients (ffprobe `color_space`).
@@ -72,6 +73,13 @@ pub struct Track {
     pub attachment_bytes: Option<u64>,
 }
 
+/// The scanner's current stream probe version (`Track::probe_version`).
+pub const PROBE_VERSION: u32 = 1;
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 impl Track {
     /// The probed colour facts the core HDR policy decides from.
     pub fn color_facts(&self) -> playscale_core::color::ColorFacts<'_> {
@@ -90,7 +98,7 @@ impl Track {
     /// an HDR video stream's colour facts, or an attachment's MIME type and
     /// size (which bound burned-subtitle fonts). The next scan probes it again.
     pub fn lacks_probe_facts(&self) -> bool {
-        !self.color_probed
+        self.probe_version < PROBE_VERSION
             && match self.kind.as_str() {
                 "video" => playscale_core::color::hdr(self.color_transfer.as_deref()).is_some(),
                 "attachment" => true,

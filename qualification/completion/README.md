@@ -339,6 +339,13 @@ follow-up commit:
 |---|---|---|
 | P4-3 | Attachment rows probed before this change never gain MIME type and size, so burn-in would ignore their fonts until a full rescan | Fixed: `Track::lacks_probe_facts` re-probes legacy attachment streams, like legacy HDR video, in ordinary scans. The styled test strips the facts, scans incrementally and checks they return. Core lib 147, `playscale` lib 67, `delivery` 12 and `access_api` 39 passed; HDR and styled tests passed again |
 
+Round 3 at `14016af` (focused on that fix) raised one P2, fixed in the
+follow-up commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| P5-3 | Re-probing keyed on the colour flag, an unrelated fact: rows written by this branch's intermediate probe had the flag but no attachment facts | Fixed: a stream `probe_version` (current 1) records which probe wrote the facts; HDR video and attachment streams from an older probe are re-probed. The test now keeps the old flag set while removing the attachment facts and the version, and the facts return after an ordinary scan. HDR and styled tests and `playscale` lib 67 passed |
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |

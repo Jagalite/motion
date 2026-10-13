@@ -383,7 +383,7 @@ pub(crate) async fn inspect(
                 .as_str()
                 .filter(|t| t.len() <= 200)
                 .map(str::to_owned),
-            color_probed: true,
+            probe_version: db::PROBE_VERSION,
             mimetype: s["tags"]["mimetype"]
                 .as_str()
                 .filter(|_| s["codec_type"] == "attachment")

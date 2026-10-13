@@ -6050,7 +6050,7 @@ async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() 
     let (_, auth) = f.device(&["default"], PLAYER).await;
     // A row probed before colour facts were recorded is probed again by the
     // next ordinary scan instead of being refused forever.
-    sqlx::query("UPDATE media_files SET tracks_json=json_remove(tracks_json,'$[0].color_probed','$[0].color_primaries','$[0].color_space','$[0].color_range')")
+    sqlx::query("UPDATE media_files SET tracks_json=json_remove(tracks_json,'$[0].probe_version','$[0].color_primaries','$[0].color_space','$[0].color_range')")
         .execute(&f.server.app.db)
         .await
         .unwrap();
@@ -6273,7 +6273,9 @@ async fn styled_subtitles_are_burned_by_libass_from_the_exact_stream() {
         ),
         (Some("font/ttf"), Some(17))
     );
-    sqlx::query("UPDATE media_files SET tracks_json=(SELECT json_group_array(json_remove(value,'$.color_probed','$.mimetype','$.attachment_bytes')) FROM json_each(tracks_json))")
+    // As written by an intermediate probe: colour facts recorded (its old
+    // `color_probed` flag set) but no attachment facts and no probe version.
+    sqlx::query("UPDATE media_files SET tracks_json=(SELECT json_group_array(json_set(json_remove(value,'$.probe_version','$.mimetype','$.attachment_bytes'),'$.color_probed',json('true'))) FROM json_each(tracks_json))")
         .execute(&plain.server.app.db)
         .await
         .unwrap();
