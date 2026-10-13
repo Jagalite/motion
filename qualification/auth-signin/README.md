@@ -41,12 +41,13 @@ temporary and isolated from live state.
   local publication check passed.
 - The same initial CI failed to compile `caller_model`: its `Transition` struct
   initializer omitted `disposition`. Commit `558bdee` uses the existing
-  `Transition::accepted` constructor. The CI rerun and local compile remain
-  pending; initial source review did not establish compilation.
+  `Transition::accepted` constructor. It compiled in the CI run recorded below;
+  local compilation remains pending. Source review did not establish compilation.
 - Sol focused review of `558bdee`: no code findings. Its requested ledger
   correction (record the initial CI failures and pending rerun) is included here.
 - Kyoto compilation job `c74625e7ab664a35bb00bce08399415b`: submitted; not yet a
-  compilation or execution pass.
+  compilation or execution pass. Last observation: still queued; shared Kyoto
+  admission reported OS memory pressure. Do not bypass the queue.
 - Requested targets: `playscale-core --test caller_model` and
   `playscale --test access_api`, `cargo test --locked --no-run --jobs 2`.
 - Local test binaries have not yet executed. Queue policy requires `--no-run`.
@@ -54,7 +55,7 @@ temporary and isolated from live state.
   Stateless model (asserted 192 states and graph exhaustion), and 40/41 access
   API tests. The remaining new operator SSE test used invalid fixture event kind
   `updated`; SQLite requires `changed` or `deleted`. This checkpoint corrects the
-  fixture to `changed`; the complete access API rerun remains pending.
+  fixture to `changed` in `3a7452a`; the complete access API rerun remains pending.
 - CI contract, client-controller and publication checks passed on `558bdee`.
   These results are separate from the still-queued local Kyoto build.
 - The new Stateless model checks exact principals/grants, rejection outcomes and
@@ -73,6 +74,9 @@ temporary and isolated from live state.
   caller provenance, core dispatch, write/SSE reauthentication, credential
   replacement/revocation, issuance, durable compatibility and regression tests.
   This was source review, separate from the partial CI execution recorded above.
+- Sol final implementation/PR diff review at `3a7452a`: no code findings. Its
+  requested status wording correction is included here; no builds were run by
+  the reviewer.
 - Draft PR: https://github.com/Jagalite/motion/pull/38 (linked to this thread).
 
 No live browser, native/TUI walkthrough, provider, mail delivery, restore flow,
