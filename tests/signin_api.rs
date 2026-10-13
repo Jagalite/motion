@@ -1262,7 +1262,7 @@ async fn oidc_reservation_case(cancel_exchange: bool) {
     let callback = url::Url::parse(authorized.headers()["location"].to_str().unwrap()).unwrap();
     let path = format!("{}?{}", callback.path(), callback.query().unwrap());
     let wrong_browser = f.call("GET", &path, None, &[]).await;
-    assert_eq!(wrong_browser.status, StatusCode::FORBIDDEN);
+    assert_eq!(wrong_browser.status, StatusCode::BAD_REQUEST);
     assert_eq!(wrong_browser.body["code"], "signin_browser_mismatch");
     assert_eq!(f.transaction_state(id).await["phase"], "pending");
     let task = {
