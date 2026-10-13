@@ -155,6 +155,28 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
                 .collect()
         })
         .unwrap_or_default();
+    // Only text subtitles can be kept by a preparation (as mov_text).
+    let subtitle_tracks = v["tracks"]
+        .as_array()
+        .map(|tracks| {
+            tracks
+                .iter()
+                .filter(|t| t["kind"] == "subtitle")
+                .enumerate()
+                .filter(|(_, t)| {
+                    t["codec"]
+                        .as_str()
+                        .is_some_and(playscale_core::delivery::sidecar_subtitle)
+                })
+                .map(|(n, t)| {
+                    let mut label = vec![format!("Subtitle {}", n + 1)];
+                    label.extend(t["language"].as_str().map(str::to_owned));
+                    label.extend(t["title"].as_str().map(str::to_owned));
+                    (format!("s{n}"), label.join(" · "))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut label = format!("File {} · {}", n + 1, size(count(&v["size_bytes"])));
     if let Some(ms) = v["duration_ms"].as_u64() {
         label.push_str(&format!(" · {} min", ms.div_ceil(60_000)));
@@ -166,6 +188,7 @@ fn file_row(v: &Value, library_id: String, n: usize) -> FileRow {
         label,
         availability: availability(v),
         audio_tracks,
+        subtitle_tracks,
     }
 }
 /// Members of a smart collection shown on the organize page.
@@ -1172,14 +1195,14 @@ impl UiQueryFacade for Queries {
                 None
             };
             let (recipes, timelines) = if prepare {
-                // `video_profile` needs a full profile body; it stays an API operation.
+                // `video_profile` is offered by its own custom-profile form.
                 let recipes = self
                     .complete_list("/processing/recipes?limit=200")
                     .await
                     .ok()
                     .map(|rows| {
                         rows.iter()
-                            .filter(|r| r["purpose"] == "rendition" && r["id"] != "video_profile")
+                            .filter(|r| r["purpose"] == "rendition")
                             .map(|r| RecipeOption {
                                 id: text(r, "id"),
                                 name: text(r, "name"),

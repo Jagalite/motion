@@ -326,6 +326,9 @@ pub struct FileRow {
     pub availability: Availability,
     /// Audio streams as (planning track ID `a{n}`, label).
     pub audio_tracks: Vec<(String, String)>,
+    /// Text subtitle streams a preparation can keep, as (track ID `s{n}`,
+    /// label); `n` counts every subtitle stream of the revision.
+    pub subtitle_tracks: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

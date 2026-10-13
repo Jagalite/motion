@@ -16,7 +16,7 @@ use topcoat::{
 
 use crate::{
     app::{availability_text, empty, facade, principal, ui_error},
-    facade::{Availability, FilterTermView, MembershipRow, StoredMarkerView},
+    facade::{Availability, FileRow, FilterTermView, MembershipRow, StoredMarkerView},
 };
 
 /// How the bridge encodes one form field into the JSON body.
@@ -47,6 +47,13 @@ enum Field {
     Term,
     /// Seconds, sent as whole milliseconds (null when blank).
     SecondsMs,
+    /// Megabits per second, sent as whole bits per second.
+    Mbps,
+    /// Kilobits per second, sent as whole bits per second.
+    Kbps,
+    /// A chosen subtitle (null when blank) that also sets the subtitle
+    /// policy named by `data-policy`: `require` when chosen, else `off`.
+    SubtitleChoice,
 }
 
 impl Field {
@@ -64,8 +71,64 @@ impl Field {
             Field::Nullable => "nullable",
             Field::Term => "term",
             Field::SecondsMs => "seconds-ms",
+            Field::Mbps => "mbps",
+            Field::Kbps => "kbps",
+            Field::SubtitleChoice => "subtitle-choice",
         }
     }
+}
+
+/// Frame rates offered for a custom video profile, as the profile's JSON:
+/// null keeps the source's own cadence.
+const FRAME_RATES: [(&str, &str); 9] = [
+    ("null", "Same as the source"),
+    (r#"{"numerator":24000,"denominator":1001}"#, "23.976 fps"),
+    (r#"{"numerator":24,"denominator":1}"#, "24 fps"),
+    (r#"{"numerator":25,"denominator":1}"#, "25 fps"),
+    (r#"{"numerator":30000,"denominator":1001}"#, "29.97 fps"),
+    (r#"{"numerator":30,"denominator":1}"#, "30 fps"),
+    (r#"{"numerator":50,"denominator":1}"#, "50 fps"),
+    (r#"{"numerator":60000,"denominator":1001}"#, "59.94 fps"),
+    (r#"{"numerator":60,"denominator":1}"#, "60 fps"),
+];
+
+fn backend_text(backend: &str) -> &str {
+    match backend {
+        "software" => "Software",
+        "videotoolbox" => "VideoToolbox (hardware)",
+        other => other,
+    }
+}
+
+/// The track fields of a preparation form: the audio to keep, and a text
+/// subtitle to keep with it (which requires it: `subtitle_policy` require).
+#[component]
+async fn prepare_tracks(source: FileRow) -> Result<impl View> {
+    Ok(view! {
+        <label>"Audio "
+            <select name="tracks.audio_track_id" data-type=(kind(Field::Nullable))>
+                <option value="">"Default track"</option>
+                for (track, label) in source.audio_tracks.iter() {
+                    <option value=(track.as_str())>(label.as_str())</option>
+                }
+            </select>
+        </label>
+        if !source.subtitle_tracks.is_empty() {
+            <label>"Subtitle "
+                <select name="tracks.subtitle_track_id" data-type=(kind(Field::SubtitleChoice)) data-policy="tracks.subtitle_policy">
+                    <option value="">"None"</option>
+                    for (track, label) in source.subtitle_tracks.iter() {
+                        <option value=(track.as_str())>(label.as_str())</option>
+                    }
+                </select>
+            </label>
+        } else {
+            <input type="hidden" name="tracks.subtitle_track_id" data-type=(kind(Field::Json)) value="null">
+            <input type="hidden" name="tracks.subtitle_policy" data-type=(kind(Field::Text)) value="off">
+        }
+        <input type="hidden" name="tracks.audio_component_id" data-type=(kind(Field::Json)) value="null">
+        <input type="hidden" name="tracks.subtitle_component_id" data-type=(kind(Field::Json)) value="null">
+    })
 }
 
 /// A form the bridge turns into one public API call.
@@ -871,7 +934,7 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
             <section aria-labelledby="prepare-heading">
                 <h2 id="prepare-heading">"Prepared versions"</h2>
                 if let Some(timelines) = &model.timelines {
-                    <p class="muted small">"A prepared version is converted once and kept, so it plays without converting live. The chosen audio track is kept exactly; subtitles cannot be included in prepared versions yet."</p>
+                    <p class="muted small">"A prepared version is converted once and kept, so it plays without converting live. The chosen audio track is kept exactly, and a chosen text subtitle is kept with it; such a version plays only when that audio and subtitle are selected."</p>
                     for timeline in timelines.iter() {
                         <section class="edition" aria-label=(format!("Edition {}", timeline.edition))>
                             <h3>(timeline.edition.as_str())</h3>
@@ -897,30 +960,61 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                             }
                             if !recipes.is_empty() {
                                 for source in timeline.sources.iter() {
+                                    if recipes.iter().any(|r| r.id != "video_profile") {
                                     command_form(command: "POST /api/v2/processing/preparations".to_string(), label: "Prepare", idempotent: true, class: Some("command inline"),
                                         <input type="hidden" name="source" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": source.file_id, "file_revision": source.file_revision}).to_string())>
                                         <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline.id.as_str())>
                                         <span class="small">(source.label.as_str())</span>
                                         <label>"Recipe "
                                             <select name="recipe_id" data-type=(kind(Field::Text))>
-                                                for recipe in recipes.iter() {
+                                                for recipe in recipes.iter().filter(|r| r.id != "video_profile") {
                                                     <option value=(recipe.id.as_str())>(recipe.name.as_str()) if recipe.qualification != "qualified" { " (" (recipe.qualification.as_str()) ")" }</option>
                                                 }
                                             </select>
                                         </label>
-                                        <label>"Audio "
-                                            <select name="tracks.audio_track_id" data-type=(kind(Field::Nullable))>
-                                                <option value="">"Default track"</option>
-                                                for (track, label) in source.audio_tracks.iter() {
-                                                    <option value=(track.as_str())>(label.as_str())</option>
-                                                }
-                                            </select>
-                                        </label>
-                                        <input type="hidden" name="tracks.audio_component_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_component_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_track_id" data-type=(kind(Field::Json)) value="null">
-                                        <input type="hidden" name="tracks.subtitle_policy" data-type=(kind(Field::Text)) value="off">
+                                        prepare_tracks(source: source.clone())
                                     )
+                                    }
+                                    if let Some(custom) = recipes.iter().find(|r| r.id == "video_profile") {
+                                        <details class="custom-profile">
+                                            <summary>"Prepare with a custom video profile"</summary>
+                                            command_form(command: "POST /api/v2/processing/preparations".to_string(), label: "Prepare with this profile", idempotent: true, class: Some("command"),
+                                                <input type="hidden" name="source" data-type=(kind(Field::Json)) value=(serde_json::json!({"file_id": source.file_id, "file_revision": source.file_revision}).to_string())>
+                                                <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline.id.as_str())>
+                                                <input type="hidden" name="recipe_id" data-type=(kind(Field::Text)) value="video_profile">
+                                                <input type="hidden" name="video_profile.version" data-type=(kind(Field::Number)) value="1">
+                                                <span class="small">(source.label.as_str())</span>
+                                                if custom.backends.len() > 1 {
+                                                    <label>"Encoder "
+                                                        <select name="backend" data-type=(kind(Field::Text))>
+                                                            for backend in custom.backends.iter() {
+                                                                <option value=(backend.as_str())>(backend_text(backend))</option>
+                                                            }
+                                                        </select>
+                                                    </label>
+                                                }
+                                                <label>"Video codec "
+                                                    <select name="video_profile.codec" data-type=(kind(Field::Text))>
+                                                        <option value="h264">"H.264 (widest support)"</option>
+                                                        <option value="hevc">"HEVC (smaller files)"</option>
+                                                    </select>
+                                                </label>
+                                                <label>"Maximum width " <input type="number" name="video_profile.max_width" data-type=(kind(Field::Number)) required=(true) min="128" max="3840" step="2" value="1920"></label>
+                                                <label>"Maximum height " <input type="number" name="video_profile.max_height" data-type=(kind(Field::Number)) required=(true) min="72" max="2160" step="2" value="1080"></label>
+                                                <label>"Video bit rate (Mbps) " <input type="number" name="video_profile.video_bitrate" data-type=(kind(Field::Mbps)) required=(true) min="0.064" max="80" step="0.001" value="8"></label>
+                                                <label>"Audio bit rate (kbps) " <input type="number" name="video_profile.audio_bitrate" data-type=(kind(Field::Kbps)) required=(true) min="32" max="320" step="1" value="192"></label>
+                                                <label>"Frame rate "
+                                                    <select name="video_profile.frame_rate" data-type=(kind(Field::Json))>
+                                                        for (value, text) in FRAME_RATES {
+                                                            <option value=(value)>(text)</option>
+                                                        }
+                                                    </select>
+                                                </label>
+                                                <p class="muted small">"The picture keeps its shape within the maximum size and is never enlarged; even dimensions only. The bit rate is the encoder's target, not a guaranteed streaming rate."</p>
+                                                prepare_tracks(source: source.clone())
+                                            )
+                                        </details>
+                                    }
                                 }
                             }
                         </section>

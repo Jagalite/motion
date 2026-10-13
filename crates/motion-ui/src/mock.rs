@@ -514,6 +514,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     ("a0".into(), "English · AAC 2ch".into()),
                     ("a1".into(), "Français · AC-3 5.1".into()),
                 ],
+                subtitle_tracks: vec![("s1".into(), "English · subrip".into())],
             };
             let membership = |id: &str, name: &str, contains: bool| MembershipRow {
                 id: id.into(),
@@ -574,12 +575,20 @@ impl UiQueryFacade for MockUiQueryFacade {
                 artwork: write.then(Vec::new),
                 files: write.then(|| vec![file.clone()]),
                 recipes: prepare.then(|| {
-                    vec![RecipeOption {
-                        id: "h264720p".into(),
-                        name: "H.264 720p".into(),
-                        backends: vec!["software".into()],
-                        qualification: "partial".into(),
-                    }]
+                    vec![
+                        RecipeOption {
+                            id: "h264720p".into(),
+                            name: "H.264 720p".into(),
+                            backends: vec!["software".into()],
+                            qualification: "partial".into(),
+                        },
+                        RecipeOption {
+                            id: "video_profile".into(),
+                            name: "Bounded video profile".into(),
+                            backends: vec!["software".into(), "videotoolbox".into()],
+                            qualification: "unqualified".into(),
+                        },
+                    ]
                 }),
                 timelines: prepare.then(|| {
                     title

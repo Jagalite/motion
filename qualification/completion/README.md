@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; rest of 3C and 3F not started | playback, part-subtitles, preparation-tracks and bitrate PRs | Merge by user; then 3F |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented (review pending); rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -510,12 +510,50 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Review (GPT-6.1 Sol), round 1:** clean.
 
+### 3F. Custom video-profile preparation and subtitle choice on the manage page
+
+- **Source SHA:** branch `plan-completion/video-profile-ui`, stacked on 3E
+  (`plan-completion/bitrate`).
+- **Implemented:** the title's manage page now offers both preparation
+  options. Previously it offered neither, and the facade hid
+  `video_profile`.
+  - **Custom profile form:** "Prepare with a custom video profile" is a
+    separate form per source, so a fixed recipe never sends a profile. Its
+    controls mirror `VideoProfile`'s bounds:
+    - encoder (software or VideoToolbox, where listed);
+    - codec (H.264 or HEVC);
+    - maximum width 128–3840 and height 72–2160, even only;
+    - video bit rate 0.064–80 Mbps and audio 32–320 kbps, both sent as
+      whole bits per second (bridge `mbps`, `kbps`);
+    - frame rate: same as the source, or 23.976–60 fps as exact rationals.
+
+    The server's own validation stays authoritative, and its refusal is
+    shown by the form.
+  - **Subtitle choice (3D):** both forms offer the source's text
+    subtitles. A chosen subtitle sets `subtitle_policy` to `require`, and
+    "None" sets `off` (bridge `subtitle-choice`). Sources without a text
+    subtitle send `off` as before.
+- **Core/adapter boundary:** UI only. No rule changed; the server
+  validates every value (`VideoProfile::validate`, track selection).
+- **Evidence:**
+  - compose: 22 passed. New: the fixed form excludes `video_profile`; the
+    custom form's hidden recipe and version, bounded inputs, frame-rate
+    rationals and encoder choice; the subtitle choice.
+  - JS: 87 passed. New: the custom profile body has whole bit rates (also
+    from fractional Mbps), and the subtitle choice sets or clears its
+    policy.
+  - `m3_workflows`: 2 passed. New, through the real facade: the manage
+    page offers the custom form; the body it encodes with its defaults is
+    accepted (202), and an odd width is refused with
+    `invalid_video_profile`.
+  - Pinned clippy with CI's flags: clean.
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
 | 3C bitmap cues before the 20 s lookback; burned and automatic subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph; automatic selection over components present in every part |
-| 3F custom video-profile preparation UI | Validated form over `video_profile` |
 
 ## 4. Library-management UI workflows
 

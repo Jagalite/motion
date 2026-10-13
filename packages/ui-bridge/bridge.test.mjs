@@ -294,3 +294,27 @@ test('seconds are sent as whole milliseconds and blank as null', () => {
   const body = bridge.bodyOf(form([input('start_ms', 'seconds-ms', '12.3456'), input('end_ms', 'seconds-ms', ' ')]));
   assert.deepEqual(JSON.parse(JSON.stringify(body)), {start_ms: 12346, end_ms: null});
 });
+
+test('a custom video profile sends whole bit rates and a chosen subtitle requires it', () => {
+  const bridge = harness();
+  const subtitle = Object.assign(input('tracks.subtitle_track_id', 'subtitle-choice', 's1'),
+    {dataset: {type: 'subtitle-choice', policy: 'tracks.subtitle_policy'}});
+  const fields = [
+    input('recipe_id', 'text', 'video_profile'),
+    input('video_profile.version', 'number', '1'),
+    input('video_profile.max_width', 'number', '1920'),
+    input('video_profile.video_bitrate', 'mbps', '8.5'),
+    input('video_profile.audio_bitrate', 'kbps', '192'),
+    input('video_profile.frame_rate', 'json', '{"numerator":24000,"denominator":1001}'),
+    subtitle,
+  ];
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields))),
+    '{"recipe_id":"video_profile","video_profile":{"version":1,"max_width":1920,"video_bitrate":8500000,'
+    + '"audio_bitrate":192000,"frame_rate":{"numerator":24000,"denominator":1001}},'
+    + '"tracks":{"subtitle_track_id":"s1","subtitle_policy":"require"}}');
+  // Floating-point input still yields whole bits per second.
+  fields[3].value = '0.064';
+  assert.equal(bridge.bodyOf(form(fields)).video_profile.video_bitrate, 64000);
+  subtitle.value = '';
+  assert.equal(JSON.stringify(bridge.bodyOf(form(fields)).tracks), '{"subtitle_track_id":null,"subtitle_policy":"off"}');
+});

@@ -887,6 +887,57 @@ async fn library_workflow_runs_end_to_end_through_the_pages() {
     assert_eq!(finished["phase"], "completed", "{finished} {failure:?}");
     let html = f.ok_page(&op, &manage).await;
     assert!(html.contains(r#"data-rendition-status="ready""#), "{html}");
+    // A custom video profile has its own form; its body (as the bridge
+    // encodes the default values) is accepted, and the server's bounds
+    // refuse what the controls would not allow.
+    let custom = form(
+        &html,
+        "POST /api/v2/processing/preparations",
+        "video_profile.max_width",
+    );
+    assert!(
+        custom.markup.contains(r#"value="video_profile""#),
+        "{}",
+        custom.markup
+    );
+    let profile = |width: u32| {
+        json!({"source":file_ref,"timeline_id":timeline,"recipe_id":"video_profile",
+            "video_profile":{"version":1,"codec":"h264","max_width":width,"max_height":1080,
+                "video_bitrate":8_000_000,"audio_bitrate":192_000,"frame_rate":null},
+            "tracks":{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"off",
+                "audio_track_id":null,"subtitle_track_id":null}})
+    };
+    let refused = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(profile(1921)),
+            &[("idempotency-key", "n1-prepare-00002-key-padding")],
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        refused.body
+    );
+    assert_eq!(refused.body["code"], "invalid_video_profile");
+    let custom_job = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/processing/preparations",
+            Some(profile(1920)),
+            &[("idempotency-key", "n1-prepare-00003-key-padding")],
+        )
+        .await;
+    assert_eq!(
+        custom_job.status,
+        StatusCode::ACCEPTED,
+        "{:?}",
+        custom_job.body
+    );
     let processing_page = f.ok_page(&op, "/processing").await;
     assert!(processing_page.contains(job.body["id"].as_str().unwrap()));
 
