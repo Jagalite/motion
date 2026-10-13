@@ -51,8 +51,12 @@ temporary and isolated from live state.
 - New SQLite/API tests cover missing/malformed proof, stale cached principal,
   changed/deleted credential rows, operator continuity, session parent loss,
   ingress revocation and permission changes across transactional writes and SSE.
-- GPT-6.1 Sol preliminary implementation review: no actionable findings. Final
-  committed-diff review and test evidence remain pending.
+- GPT-6.1 Sol reviewed implementation commit `36607923ff3aeb235872694ad84c248e89032637`
+  and the full `origin/main...HEAD` diff: no actionable findings. Review covered
+  caller provenance, core dispatch, write/SSE reauthentication, credential
+  replacement/revocation, issuance, durable compatibility and regression tests.
+  This was source review; test evidence remains pending.
+- Draft PR: https://github.com/Jagalite/motion/pull/38 (linked to this thread).
 
 No live browser, native/TUI walkthrough, provider, mail delivery, restore flow,
 active playback qualification or production migration has been performed here.
