@@ -7792,6 +7792,8 @@ async fn pgs_compositions_reusing_objects_are_read_from_their_epoch() {
     std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
     let sup = f.dir.path().join("reuse.sup");
     std::fs::write(&sup, pgs_reuse()).unwrap();
+    // A container that starts at 50,000 s (as some recordings do): the
+    // lookback works in file time whatever the container's timestamps.
     f.media(
         "film.mkv",
         &[
@@ -7805,6 +7807,8 @@ async fn pgs_compositions_reusing_objects_are_read_from_their_epoch() {
             "1",
             "-c",
             "copy",
+            "-output_ts_offset",
+            "50000",
         ],
     );
     f.scan().await;

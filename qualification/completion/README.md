@@ -639,6 +639,21 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   treated as self-contained. After the fixes: core 163 and `v2_playback`
   34 passed; clippy clean.
 
+  Round 3 at `5ec48cd` raised one P1 and one P2 finding, both fixed:
+  - **B5 (P1):** after handing a stuck probe to the lease's reaper, the
+    generation still started an encoder on that lease, which the probe's
+    exit could release early. A stuck lookback probe is now its own
+    outcome (`StuckProbe`), and the generation fails instead of starting.
+    Not covered by an automated test (no probe that survives a kill).
+  - **B6:** SUP keeps 32-bit 90 kHz timestamps, so with `-copyts` a
+    container starting late (for example at 50,000 s) wrapped and lost
+    every observation. The export now applies
+    `-output_ts_offset -<start_time>`, so the timestamps are file time. The
+    epoch test's file now starts at 50,000 s and still draws the reused
+    cue.
+
+  After the fixes: `v2_playback` 34 passed; clippy clean.
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |

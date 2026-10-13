@@ -1018,22 +1018,40 @@ async fn probe_descriptor(
 /// descriptor without decoding video. PGS sets come from the stream's own
 /// segments (each composition's state says whether a decoder can start
 /// there); DVD and DVB subpictures from their decoded frames, with any end
-/// they carry. None when they cannot be read; a probe that does not exit
-/// when killed stays accounted to the lease until it does.
+/// they carry. Ok(None) when they cannot be read. A probe that does not
+/// exit when killed is handed to the lease until it does, and is an error:
+/// the generation must not start on that lease.
 async fn bitmap_display_sets(
     app: &App,
     input: &std::fs::File,
     index: u32,
     start_ms: u64,
     lease: &execution::Lease,
+) -> Result<Option<Vec<playscale_core::delivery::DisplaySet>>, StuckProbe> {
+    let mut stuck = false;
+    let sets = bitmap_display_sets_inner(app, input, index, start_ms, lease, &mut stuck).await;
+    if stuck { Err(StuckProbe) } else { Ok(sets) }
+}
+
+/// A lookback probe that did not exit when killed.
+struct StuckProbe;
+
+async fn bitmap_display_sets_inner(
+    app: &App,
+    input: &std::fs::File,
+    index: u32,
+    start_ms: u64,
+    lease: &execution::Lease,
+    stuck: &mut bool,
 ) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
     use playscale_core::delivery::{BURN_LOOKBACK_MS, DisplaySet};
-    let owned = |result: Result<Vec<u8>, ProbeFailure>| match result {
+    let mut owned = |result: Result<Vec<u8>, ProbeFailure>| match result {
         Ok(output) => Some(output),
         Err(ProbeFailure::Stalled(mut child)) => {
             lease.stuck(async move {
                 let _ = child.wait().await;
             });
+            *stuck = true;
             None
         }
         Err(ProbeFailure::Unavailable) => None,
@@ -1062,12 +1080,12 @@ async fn bitmap_display_sets(
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
         .unwrap_or(0.0);
-    let origin_ms = (origin * 1000.0).round() as u64;
     let from = start_ms.saturating_sub(BURN_LOOKBACK_MS);
     let seconds = |ms: u64| format!("{}.{:03}", ms / 1000, ms % 1000);
     if info["streams"][0]["codec_name"] == "hdmv_pgs_subtitle" {
         let map = format!("0:s:{index}");
         let (from_at, to_at) = (seconds(from), seconds(start_ms + 1));
+        let offset = format!("-{origin:.6}");
         let segments = owned(
             run_descriptor(
                 &app.processing.settings.ffmpeg,
@@ -1087,6 +1105,10 @@ async fn bitmap_display_sets(
                     &map,
                     "-c",
                     "copy",
+                    // File time (from the container's start): SUP keeps only
+                    // 32-bit 90 kHz timestamps, which absolute ones overflow.
+                    "-output_ts_offset",
+                    &offset,
                     "-f",
                     "sup",
                     "pipe:1",
@@ -1096,7 +1118,7 @@ async fn bitmap_display_sets(
             )
             .await,
         )?;
-        return pgs_display_sets(&segments, origin_ms);
+        return pgs_display_sets(&segments);
     }
     let interval = format!(
         "{:.3}%{:.3}",
@@ -1152,10 +1174,7 @@ const MAX_PGS_PROBE_OUTPUT: u64 = 64 * 1024 * 1024;
 /// DTS, type, size, payload): one per presentation composition, with
 /// whether it shows objects and whether its composition state (epoch start
 /// or acquisition point) lets a decoder start there. None if malformed.
-fn pgs_display_sets(
-    bytes: &[u8],
-    origin_ms: u64,
-) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
+fn pgs_display_sets(bytes: &[u8]) -> Option<Vec<playscale_core::delivery::DisplaySet>> {
     let mut sets = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
@@ -1171,7 +1190,7 @@ fn pgs_display_sets(
             let state = *payload.get(7)?;
             let objects = *payload.get(10)?;
             sets.push(playscale_core::delivery::DisplaySet {
-                at_ms: (u64::from(pts) / 90).checked_sub(origin_ms)?,
+                at_ms: u64::from(pts) / 90,
                 draws: objects > 0,
                 until_ms: None,
                 acquisition: state & 0xC0 != 0,
@@ -1951,7 +1970,15 @@ async fn run_generation(
     let burn_from = match pinned_burn(&pin) {
         Some(Burn::Bitmap(index)) if durations.is_empty() && !copies_video(operation) => {
             let start = seek_ms + pin.clip.map_or(0, |clip| clip.start_ms);
-            let sets = bitmap_display_sets(&app, &input, index, start, &lease).await;
+            let sets = match bitmap_display_sets(&app, &input, index, start, &lease).await {
+                Ok(sets) => sets,
+                // Its reaper now owns the lease's release: nothing may start
+                // on it.
+                Err(StuckProbe) => {
+                    tracing::warn!(delivery=%session.id, generation, "subtitle lookback probe did not exit");
+                    return fail(&app, &session);
+                }
+            };
             if stop.is_cancelled() {
                 return stopped(&app, &session);
             }
