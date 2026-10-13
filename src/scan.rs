@@ -23,9 +23,97 @@ pub struct Found {
     pub bytes: i64,
     pub duration: Option<f64>,
     pub tracks: Vec<Track>,
+    /// Container chapters; None when not probed (kept as stored).
+    pub chapters: Option<Vec<playscale_core::markers::FileChapter>>,
     pub reused: bool,
     /// Sidecar NFO observed and parsed beside the file (outside the writer).
     pub nfo: crate::nfo::Sidecar,
+}
+
+/// The chapters of an ffprobe JSON document, in file milliseconds.
+fn chapters_of(value: &serde_json::Value) -> Vec<playscale_core::markers::FileChapter> {
+    let millis = |v: &serde_json::Value| {
+        v.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s >= 0.0)
+            .map(|s| (s * 1000.0).round() as u64)
+    };
+    value["chapters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(1000)
+        .filter_map(|c| {
+            Some(playscale_core::markers::FileChapter {
+                start_ms: millis(&c["start_time"])?,
+                end_ms: millis(&c["end_time"]),
+                title: c["tags"]["title"]
+                    .as_str()
+                    .filter(|t| t.len() <= 1000)
+                    .map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// Probe only the chapters of an unchanged file (one probed before chapters
+/// were recorded), bound to the same opened file and fingerprint. None when
+/// it cannot be read now; the next scan tries again.
+async fn probe_chapters(
+    root: PathBuf,
+    relative: PathBuf,
+    ffprobe: &Path,
+    expected: &str,
+) -> Option<Vec<playscale_core::markers::FileChapter>> {
+    let (file, check) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let file = open_file(&root, &relative)?;
+        let check = file.try_clone()?;
+        Ok((file, check))
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let mut child = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "chapter=start_time,end_time:chapter_tags=title",
+            "-of",
+            "json",
+            "-i",
+            "pipe:0",
+        ])
+        .stdin(file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut output = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        (&mut stdout)
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut output)
+            .await
+            .ok()?;
+        child.wait().await.ok().filter(|s| s.success())
+    })
+    .await
+    .ok()
+    .flatten();
+    finished.filter(|_| output.len() <= 1024 * 1024)?;
+    let unchanged =
+        tokio::task::spawn_blocking(move || check.metadata().map(|m| fingerprint(&m)).ok())
+            .await
+            .ok()
+            .flatten()?;
+    if unchanged != expected {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output).ok()?;
+    Some(chapters_of(&value))
 }
 
 pub fn fingerprint(meta: &std::fs::Metadata) -> String {
@@ -303,7 +391,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
+            "format=duration:chapter=start_time,end_time:chapter_tags=title:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -407,6 +495,7 @@ pub(crate) async fn inspect(
             }),
         })
         .collect();
+    let chapters = matches!(result, Ok(Ok(()))).then(|| chapters_of(&value));
     Ok(Found {
         relative: rel,
         title,
@@ -415,6 +504,7 @@ pub(crate) async fn inspect(
         bytes,
         duration,
         tracks,
+        chapters,
         reused: false,
         nfo: crate::nfo::Sidecar::Absent,
     })
@@ -501,6 +591,12 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         bytes: row.bytes,
                         duration: row.duration_seconds,
                         tracks,
+                        // Stored chapters, or None when never probed (then
+                        // probed alone below, without hashing the file again).
+                        chapters: row
+                            .chapters_json
+                            .as_deref()
+                            .and_then(|j| serde_json::from_str(j).ok()),
                         reused: true,
                         nfo: crate::nfo::Sidecar::Absent,
                     }))
@@ -514,7 +610,16 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                         continue;
                     }
                 };
-            if let Some(file) = reused {
+            if let Some(mut file) = reused {
+                if file.chapters.is_none() {
+                    file.chapters = probe_chapters(
+                        path.clone(),
+                        relative.clone(),
+                        &app.ffprobe,
+                        &file.fingerprint,
+                    )
+                    .await;
+                }
                 found.push(file);
                 continue;
             }
@@ -720,8 +825,8 @@ async fn finish(
             let file_id = id.clone();
             let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
-            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available) VALUES (?,?,?,?,?,?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1 WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds")
-                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=coalesce(excluded.chapters_json,media_files.chapters_json) WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
+                .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).bind(file.chapters.as_ref().map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
             if first_version {
                 // Unknown equivalence is permitted only in the new, empty timeline.
                 crate::curation::create_version(

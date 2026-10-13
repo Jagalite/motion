@@ -48,6 +48,63 @@ pub struct Marker {
     pub timeline_revision: u64,
 }
 
+/// A chapter as the container records it (probed from the file), in file
+/// time.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileChapter {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub title: Option<String>,
+}
+
+/// At most this many chapters of a file become markers.
+pub const MAX_EMBEDDED_CHAPTERS: usize = 200;
+
+/// The embedded chapter markers of a timeline whose whole, single file
+/// records `chapters`, at the timeline's current revision (they are file
+/// facts, so they follow every revision of the timeline that still binds
+/// the file). Chapters outside the timeline, out of order or duplicated at
+/// a start are dropped rather than guessed; labels are trimmed and bounded.
+/// `id_prefix` names the file and its revision, so the identities change
+/// with the file's content.
+pub fn embedded_chapters(
+    chapters: &[FileChapter],
+    duration_ms: Option<u64>,
+    timeline_revision: u64,
+    id_prefix: &str,
+) -> Vec<Marker> {
+    let mut starts: Vec<u64> = Vec::new();
+    let mut markers = Vec::new();
+    for chapter in chapters {
+        if markers.len() == MAX_EMBEDDED_CHAPTERS {
+            break;
+        }
+        let inside =
+            duration_ms.is_none_or(|d| chapter.start_ms < d) && chapter.start_ms <= MAX_POSITION_MS;
+        if !inside || starts.contains(&chapter.start_ms) {
+            continue;
+        }
+        let label = chapter
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| t.chars().take(200).collect::<String>());
+        starts.push(chapter.start_ms);
+        markers.push(Marker {
+            id: format!("{id_prefix}-{}", markers.len()),
+            kind: Kind::Chapter,
+            start_ms: chapter.start_ms,
+            end_ms: None,
+            label,
+            provenance: Provenance::Embedded,
+            timeline_revision,
+        });
+    }
+    markers.sort_by_key(|m| m.start_ms);
+    markers
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarkerError {
     StaleTimeline,
@@ -155,6 +212,67 @@ pub fn effective(markers: &[Marker], timeline_revision: u64) -> Vec<Marker> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_chapters_become_embedded_markers_of_the_current_revision() {
+        let chapter = |start_ms, title: Option<&str>| FileChapter {
+            start_ms,
+            end_ms: None,
+            title: title.map(str::to_owned),
+        };
+        let markers = embedded_chapters(
+            &[
+                chapter(60_000, Some(" Second ")),
+                chapter(0, Some("First")),
+                chapter(60_000, Some("duplicate start")),
+                chapter(120_000, Some("   ")),
+                chapter(900_000, Some("beyond the end")),
+            ],
+            Some(600_000),
+            7,
+            "embedded-f1",
+        );
+        assert_eq!(
+            markers
+                .iter()
+                .map(|m| (
+                    m.start_ms,
+                    m.label.as_deref(),
+                    m.provenance,
+                    m.timeline_revision
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (0, Some("First"), Provenance::Embedded, 7),
+                (60_000, Some("Second"), Provenance::Embedded, 7),
+                (120_000, None, Provenance::Embedded, 7),
+            ]
+        );
+        // A manual chapter wins over all of them in the effective view.
+        let mut all = markers.clone();
+        all.push(Marker {
+            id: "manual".into(),
+            kind: Kind::Chapter,
+            start_ms: 30_000,
+            end_ms: None,
+            label: Some("Mine".into()),
+            provenance: Provenance::Manual,
+            timeline_revision: 7,
+        });
+        assert_eq!(
+            effective(&all, 7)
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["manual"]
+        );
+        // Bounded.
+        let many: Vec<_> = (0..300).map(|n| chapter(n * 1000, None)).collect();
+        assert_eq!(
+            embedded_chapters(&many, None, 1, "x").len(),
+            MAX_EMBEDDED_CHAPTERS
+        );
+    }
     fn m(id: &str, kind: Kind, start: u64, end: Option<u64>, p: Provenance) -> Marker {
         Marker {
             id: id.into(),

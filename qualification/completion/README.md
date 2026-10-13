@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork and offline-metadata PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented and tested (review pending); 6C–6E not started | markers and embedded-chapters PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1297,11 +1297,51 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   Round 3 at `916bc2d`: clean.
 
 
+### 6B. Embedded chapters from the container
+
+- **Source SHA:** branch `plan-completion/embedded-chapters`, stacked on
+  `plan-completion/offline-artwork` (it needs migrations 0047 and 0048).
+- **Implemented:**
+  - **Scan:** ffprobe records each file's container chapters (start, end and
+    title) in `media_files.chapters_json` (migration 0049, additive). It is
+    NULL until probed and an empty array when there are none. A file that
+    is unchanged and was scanned before chapters were recorded is probed for
+    chapters alone. It is not hashed again: the probe reads the opened file
+    and checks the fingerprint afterwards, and on any failure the next scan
+    tries again. A probe never clears stored chapters.
+  - **Core:** `markers::embedded_chapters` turns them into `embedded`
+    chapter markers. Chapters outside the duration, past `MAX_POSITION_MS`
+    or at a duplicate start are dropped rather than guessed. Labels are
+    trimmed and bounded, and `MAX_EMBEDDED_CHAPTERS` (200) applies.
+  - **Read path:** `listMarkers` derives the embedded markers at read time
+    from the timeline's whole, single-file original, at the timeline's
+    current revision. They are file facts and follow the timeline while it
+    binds that file revision. Their identities name the file revision, so
+    new content means new IDs. They take part in the effective view and its
+    snapshot digest, so manual corrections outrank them through the
+    existing precedence.
+- **Unsupported / limits:** chapters of multi-part, cut (in/out) or
+  generated versions are not mapped onto the timeline; those titles have no
+  embedded markers. Intro and credits detection (`detected`) is not
+  implemented.
+- **Core/adapter boundary:** what counts as a valid chapter and how it
+  ranks against other provenances are core decisions (`embedded_chapters`
+  plus the existing `effective`). The scanner and read path only supply
+  probed facts and the binding they belong to. Deriving at read time rather
+  than storing markers means no state can go stale against a timeline
+  revision.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core `markers` | 3 passed. New: ordering, drops (duplicate start, beyond the end), trimmed labels, manual precedence, the 200 bound |
+  | `tests/v2_playback.rs` `container_chapters_are_embedded_markers_of_the_timeline` | passed. A real ffmpeg file with two chapters lists them as `embedded` and in effect; they stay in effect after a timeline revision; a manual chapter outranks them while they stay listed; a file whose chapters were never recorded is probed for them on the next scan |
+  | `v2_playback`, `v2_catalog`, `scans`, `catalog_workflows`, `catalog_persistence` | 31, 20, 8, 27, 15 passed |
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |
 |---|---|---|
-| 6B embedded chapter extraction | Probe `-show_chapters` at scan; record `embedded` markers per timeline revision | None |
 | 6C server-generated previews | Bounded trick-play thumbnail job with publication validation, cancellation, retention and access control; then enable `preview` schedules | None |
 | 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
 | 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |

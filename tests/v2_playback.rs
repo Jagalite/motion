@@ -7135,3 +7135,117 @@ async fn styled_subtitles_are_burned_by_libass_from_the_exact_stream() {
         );
     }
 }
+
+/// Chapters a file's container records become embedded chapter markers of
+/// its timeline (6B): derived at read time at the timeline's current
+/// revision, outranked by a manual chapter, and probed alone (without
+/// hashing the file again) for files scanned before chapters were recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn container_chapters_are_embedded_markers_of_the_timeline() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let chapters = f.dir.path().join("chapters.txt");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=Opening\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=6000\ntitle=Middle\n",
+    )
+    .unwrap();
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-i",
+            chapters.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map_metadata",
+            "1",
+            "-map_chapters",
+            "1",
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let path = format!("/api/v2/catalog/timelines/{timeline}/markers");
+    let read = |query: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        let path = path.clone();
+        async move { f.get(&format!("{path}{query}"), &auth).await.body }
+    };
+    let labels = |page: &Value| -> Vec<(String, String)> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["label"].as_str().unwrap_or("").to_owned(),
+                    m["provenance"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let embedded = vec![
+        ("Opening".to_owned(), "embedded".to_owned()),
+        ("Middle".to_owned(), "embedded".to_owned()),
+    ];
+    assert_eq!(labels(&read("").await), embedded);
+    assert_eq!(labels(&read("?effective=true").await), embedded);
+    // A timeline edit keeps them in effect (file facts follow the timeline).
+    sqlx::query("UPDATE timelines SET revision=revision+1 WHERE id=?")
+        .bind(&timeline)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    assert_eq!(labels(&read("?effective=true").await), embedded);
+    // A manual chapter outranks the file's chapters; they stay listed.
+    let revision = f
+        .get(&format!("/api/v2/catalog/timelines/{timeline}"), &auth)
+        .await
+        .body["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let created = f
+        .post(
+            &path,
+            &bearer(OPERATOR),
+            Some("manual-chapter-0001"),
+            json!({"timeline_revision": revision, "kind": "chapter", "start_ms": 1000, "end_ms": null, "label": "Mine"}),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(
+        labels(&read("?effective=true").await),
+        [("Mine".to_owned(), "manual".to_owned())]
+    );
+    assert_eq!(read("").await["items"].as_array().unwrap().len(), 3);
+    // A file scanned before chapters were recorded is probed for them alone.
+    sqlx::query("UPDATE media_files SET chapters_json=NULL")
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    f.scan().await;
+    let stored: Option<String> = sqlx::query_scalar("SELECT chapters_json FROM media_files")
+        .fetch_one(&f.server.app.db)
+        .await
+        .unwrap();
+    assert!(
+        stored.as_deref().is_some_and(|c| c.contains("Opening")),
+        "{stored:?}"
+    );
+}

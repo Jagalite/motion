@@ -1620,6 +1620,7 @@ mod publication_tests {
                 bytes: 1,
                 duration: Some(1.0),
                 tracks: vec![],
+                chapters: None,
                 reused: false,
                 nfo: crate::nfo::Sidecar::Absent,
             };
@@ -1695,6 +1696,7 @@ mod publication_tests {
                     bytes: 1,
                     duration: Some(1.0),
                     tracks: vec![],
+                    chapters: None,
                     reused: false,
                     nfo: crate::nfo::Sidecar::Absent,
                 },

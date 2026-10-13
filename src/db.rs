@@ -138,6 +138,10 @@ pub struct ItemRow {
     pub duration_seconds: Option<f64>,
     pub tracks_json: String,
     pub available: bool,
+    /// Probed container chapters (`media_files.chapters_json`); None until
+    /// probed.
+    #[sqlx(default)]
+    pub chapters_json: Option<String>,
 }
 impl ItemRow {
     pub fn public(self) -> Item {

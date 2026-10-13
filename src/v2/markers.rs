@@ -83,7 +83,13 @@ async fn list(
         .bind(&timeline)
         .fetch_one(&mut *tx)
         .await?;
-    let markers = load(&mut tx, &timeline).await?;
+    let mut markers = load(&mut tx, &timeline).await?;
+    markers.extend(
+        embedded(&mut tx, &timeline, current as u64)
+            .await?
+            .into_iter()
+            .map(|m| (m, 1)),
+    );
     // The effective set depends on every marker and the current revision, so
     // its pages are bound to the snapshot they were read from: a cursor names
     // that snapshot, and a change between pages is refused rather than
@@ -156,6 +162,37 @@ async fn list(
     let page = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;
     Ok(Json(page))
+}
+
+/// The chapters the timeline's whole, single-file original records
+/// (`markers::embedded_chapters`), at its current revision: file facts, so
+/// they follow the timeline. Their identities name the file revision.
+async fn embedded(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+    revision: u64,
+) -> Result<Vec<Marker>, Problem> {
+    let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT f.revision,f.chapters_json,t.duration_ms FROM timelines t JOIN media_versions v ON v.timeline_id=t.id \
+         JOIN version_files b ON b.version_id=v.id AND b.part=1 JOIN media_files f ON f.id=b.file_id \
+         WHERE t.id=? AND v.origin='original' AND f.generated=0 AND b.file_revision=f.revision \
+         AND b.start_ms IS NULL AND b.end_ms IS NULL \
+         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
+         AND f.chapters_json IS NOT NULL AND f.chapters_json<>'[]' ORDER BY v.id LIMIT 1",
+    )
+    .bind(timeline)
+    .fetch_optional(conn)
+    .await?;
+    let Some((file_revision, Some(chapters), duration)) = row else {
+        return Ok(vec![]);
+    };
+    let chapters: Vec<core::FileChapter> = serde_json::from_str(&chapters).unwrap_or_default();
+    Ok(core::embedded_chapters(
+        &chapters,
+        duration.and_then(|d| u64::try_from(d).ok()),
+        revision,
+        &format!("embedded-{}", &file_revision[..file_revision.len().min(16)]),
+    ))
 }
 
 /// An identity of the facts the effective view is decided from: the

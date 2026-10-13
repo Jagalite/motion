@@ -5486,6 +5486,7 @@ mod tests {
             duration_seconds: Some(60.0),
             tracks_json,
             available: true,
+            chapters_json: None,
         };
         async fn code(result: Result<(), crate::api::ApiError>) -> Option<String> {
             let response = result.err()?.into_response();
