@@ -3748,6 +3748,7 @@ async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
         "/api/v2/auth/invitations/{}",
         invite["id"].as_str().unwrap()
     );
+    let revoke_headers = [("authorization", auth.as_str()), ("if-match", "\"r-1\"")];
     let (claimed, revoked) = tokio::join!(
         f.call(
             "POST",
@@ -3758,12 +3759,7 @@ async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
             )),
             &[]
         ),
-        f.call(
-            "DELETE",
-            &path,
-            None,
-            &[("authorization", &auth), ("if-match", "\"r-1\"")]
-        )
+        f.call("DELETE", &path, None, &revoke_headers)
     );
     assert_ne!(claimed.status.is_success(), revoked.status.is_success());
     assert!(claimed.status.is_success() || revoked.status.is_success());
@@ -3879,22 +3875,22 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
     let root = format!("/api/v2/auth/pairings/{}", p.body["id"].as_str().unwrap());
     let apath = format!("{root}/approve");
     let dpath = format!("{root}/deny");
+    let approve_headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "race-approve"),
+    ];
+    let deny_headers = [
+        ("authorization", auth.as_str()),
+        ("idempotency-key", "race-deny"),
+    ];
     let (a, d) = tokio::join!(
         f.call(
             "POST",
             &apath,
             Some(json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]})),
-            &[
-                ("authorization", &auth),
-                ("idempotency-key", "race-approve")
-            ]
+            &approve_headers
         ),
-        f.call(
-            "POST",
-            &dpath,
-            None,
-            &[("authorization", &auth), ("idempotency-key", "race-deny")]
-        )
+        f.call("POST", &dpath, None, &deny_headers)
     );
     assert_ne!(
         a.status.is_success(),
@@ -3972,19 +3968,10 @@ async fn administrator_user_last_admin_race_and_stale_credential_do_not_lock_out
     a["disabled"] = json!(true);
     let mut b = user_edit(two.body);
     b["permissions"] = json!([]);
+    let edit_headers = [("authorization", auth.as_str()), ("if-match", "\"r-1\"")];
     let (a, b) = tokio::join!(
-        f.call(
-            "PUT",
-            &first_path,
-            Some(a),
-            &[("authorization", &auth), ("if-match", "\"r-1\"")]
-        ),
-        f.call(
-            "PUT",
-            &second_path,
-            Some(b),
-            &[("authorization", &auth), ("if-match", "\"r-1\"")]
-        )
+        f.call("PUT", &first_path, Some(a), &edit_headers),
+        f.call("PUT", &second_path, Some(b), &edit_headers)
     );
     assert_ne!(a.status.is_success(), b.status.is_success());
     assert_eq!(
