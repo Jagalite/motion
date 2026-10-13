@@ -63,3 +63,13 @@ checksums, partial migrations and contradictory mixed histories must be rejected
 Tests must prove preservation of users, owner associations, credentials, linked
 identities, user restrictions and replay/revocation state for each supported
 lineage. The source database remains unchanged; activation is a separate step.
+
+## Heavy CI trace metadata follow-up
+
+The access trace replay failure on the integrated branch was a provenance-field
+encoding limit, not a failed access invariant. `access.rs` grew to 66,014 bytes;
+embedding its whole text in `ModelMetadata.build` exceeded Stateless's default
+65,536-byte per-string trace bound. Access and caller models now record a
+`sha256:` fingerprint of the complete compile-time source (71 bytes). All model
+versions, state/transition limits, inputs, checks and exact-replay expectations
+are retained. No trace read/record limits are relaxed. Focused validation pending.

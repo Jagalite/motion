@@ -5,6 +5,7 @@ use playscale_core::access::{
     idempotency, recheck, replace_policy, resume, revoke,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use stateless::{
     Check, Enumerate, Model, ModelCodec, ModelError, ModelMetadata, Transition, TransitionRef,
 };
@@ -190,7 +191,12 @@ impl Model for Access {
             model_version: 3,
             properties_version: 3,
             codec_version: 3,
-            build: include_str!("../src/access.rs").into(),
+            // Fingerprint the complete source without embedding an unbounded string
+            // in the trace header (Stateless defaults to 64 KiB per string).
+            build: format!(
+                "sha256:{:x}",
+                Sha256::digest(include_bytes!("../src/access.rs"))
+            ),
         }
     }
     fn initial_state(&self) -> Result<State, ModelError> {
@@ -893,6 +899,9 @@ fn trace_policy_change_then_revocation_replays_exactly() {
         },
         Input::Revoke { stale: false },
     ]);
+    let metadata = Access.metadata();
+    assert_eq!(metadata.build.len(), "sha256:".len() + 64);
+    assert!(metadata.build.len() <= stateless::trace::ReadLimits::default().max_string_bytes);
     let trace = stateless::execution::record(&Access, inputs, Default::default(), 10).unwrap();
     let replay = stateless::execution::replay(&Access, &trace, Default::default()).unwrap();
     assert_eq!(replay.outcome, stateless::execution::ReplayOutcome::Exact);

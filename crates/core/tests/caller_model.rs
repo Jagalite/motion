@@ -3,6 +3,7 @@ use playscale_core::access::{
     AccessError, Authentication, Credential, CredentialKind, Device, Grant, Mode, Permission,
     Policy, Principal, authenticate_caller,
 };
+use sha2::{Digest, Sha256};
 use stateless::{Check, Enumerate, Model, ModelError, ModelMetadata, Transition, TransitionRef};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -149,7 +150,12 @@ impl Model for Callers {
             model_version: 1,
             properties_version: 1,
             codec_version: 1,
-            build: include_str!("../src/access.rs").into(),
+            // Fingerprint the complete source without embedding an unbounded string
+            // in the trace header (Stateless defaults to 64 KiB per string).
+            build: format!(
+                "sha256:{:x}",
+                Sha256::digest(include_bytes!("../src/access.rs"))
+            ),
         }
     }
 
