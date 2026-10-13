@@ -1045,7 +1045,7 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         .await;
     assert_eq!(m.status, StatusCode::OK);
     let text = String::from_utf8(m.bytes).unwrap();
-    assert!(text.contains("CODECS=\"avc1.64001f,mp4a.40.2\""), "{text}");
+    assert!(text.contains("CODECS=\"avc1."), "{text}");
     assert!(text.contains("variants/main/index.m3u8"), "{text}");
     let (_, other) = f.device(&["default"], PLAYER).await;
     problem(
@@ -1076,6 +1076,21 @@ async fn conversion_streams_hls_and_switches_audio_from_the_original() {
         )
         .await;
     assert_eq!(init.status, StatusCode::OK);
+    let avcc = init
+        .bytes
+        .windows(4)
+        .position(|w| w == b"avcC")
+        .expect("H.264 initialization");
+    let actual = format!(
+        "avc1.{:02x}{:02x}{:02x}",
+        init.bytes[avcc + 5],
+        init.bytes[avcc + 6],
+        init.bytes[avcc + 7]
+    );
+    assert!(
+        text.contains(&format!("CODECS=\"{actual},mp4a.40.2\"")),
+        "{text}"
+    );
     let first = f
         .call(
             "GET",
@@ -1295,6 +1310,16 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         restored_epoch,
         identity_before["restore_epoch"].as_str().unwrap()
     );
+    let denied = restored
+        .call("GET", "/api/v2/profiles", None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::UNAUTHORIZED,
+        "restored credentials must be paired again"
+    );
+    // The operator can still exercise the independent history-epoch fence.
+    let auth = bearer(OPERATOR);
     for (method, target, body, extra) in [
         (
             "POST",
@@ -4231,6 +4256,98 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
+
+    // A live v2 byte delivery pins this generated artifact without creating a
+    // legacy playback_sessions row. Retention must honor that real ownership.
+    sqlx::query("UPDATE processing_jobs SET updated_at=0 WHERE id=?")
+        .bind(&job)
+        .execute(&f.server.app.db)
+        .await
+        .unwrap();
+    let delivery = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("prepared-gc-pin-0001"),
+            json!({"plan_token":pinned.body["plan_token"],"start_ms":0}),
+        )
+        .await;
+    assert_eq!(delivery.status, StatusCode::CREATED, "{}", delivery.body);
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT available FROM media_files WHERE id=?")
+            .bind(&rendition)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap(),
+        1
+    );
+    let id = delivery.body["id"].as_str().unwrap();
+    let generation = delivery.body["active"]["generation"].as_str().unwrap();
+    // Retain an admitted response without polling its body. It must own the
+    // generated file independently of the delivery's runtime lifetime.
+    let expected = std::fs::read(Path::new(&path.0).join(&path.1)).unwrap();
+    let held = api::router(f.server.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v2/streams/{id}/{generation}/content"))
+                .header("host", "127.0.0.1:8787")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+    let removed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while f.server.app.processing.deliveries.is_live(id) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("closed prepared delivery did not retire");
+    assert_eq!(
+        playscale::maintenance::clean(&f.server.app).await.unwrap(),
+        0,
+        "an admitted response must retain its artifact after delivery retirement"
+    );
+    assert!(Path::new(&path.0).join(&path.1).exists());
+    let bytes = held.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), expected.as_slice());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let removed = playscale::maintenance::clean(&f.server.app).await.unwrap();
+            if removed == 1 {
+                break;
+            }
+            assert_eq!(removed, 0);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("generated artifact stayed pinned after its last reader completed");
+    assert!(!Path::new(&path.0).join(&path.1).exists());
+    let cleaned: (i64, i64, i64) = sqlx::query_as(
+        "SELECT f.available,p.expired,p.cache_cleaned FROM processing_jobs p JOIN media_files f ON f.id=p.output_file_id WHERE p.id=?",
+    )
+    .bind(&job)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    assert_eq!(cleaned, (0, 1, 1));
 }
 
 /// A preparation keeps the selected audio component and an explicitly chosen
