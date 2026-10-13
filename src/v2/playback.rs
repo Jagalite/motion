@@ -1250,15 +1250,12 @@ pub async fn plan(
         }
     }
     let explicit = cs.or(sub);
-    // A multipart timeline delivers an explicitly chosen embedded text
-    // subtitle that occurs in every part: each part's own stream, joined in
-    // timeline time. Sidecars, burned subtitles and automatic selection
-    // belong to one file and are not delivered across parts yet.
+    // A multipart timeline delivers an embedded text subtitle component
+    // that occurs in every part, chosen explicitly or automatically: each
+    // part's own stream, joined in timeline time. Sidecars and burned
+    // subtitles belong to one file and are not delivered across parts yet.
     let multipart = !bound.parts.is_empty();
-    if multipart
-        && (sidecar_name.is_some()
-            || (explicit.is_none() && input.tracks.subtitle_policy == "require"))
-    {
+    if multipart && sidecar_name.is_some() {
         return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
     }
     if let Some(chosen) = explicit.filter(|_| multipart) {
@@ -1274,9 +1271,12 @@ pub async fn plan(
         .await?
         {
             Some(per_part)
-                if per_part
-                    .iter()
-                    .all(|(_, codec)| playscale_core::delivery::sidecar_subtitle(codec)) =>
+                if playscale_core::parts::joinable_subtitle(
+                    &per_part
+                        .iter()
+                        .map(|(_, c)| Some(c.as_str()))
+                        .collect::<Vec<_>>(),
+                ) =>
             {
                 for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
                     part.subtitle = Some(ordinal);
@@ -1306,10 +1306,8 @@ pub async fn plan(
     use playscale_core::components::{
         AutomaticSubtitle, SubtitleMode, SubtitleOption, automatic_subtitle,
     };
-    let automatic = !multipart
-        && explicit.is_none()
-        && sidecar_name.is_none()
-        && input.tracks.subtitle_policy != "off";
+    let automatic =
+        explicit.is_none() && sidecar_name.is_none() && input.tracks.subtitle_policy != "off";
     let require = input.tracks.subtitle_policy == "require";
     let candidates = if automatic {
         subtitle_candidates(
@@ -1375,7 +1373,13 @@ pub async fn plan(
         _ if !automatic => (explicit, sidecar_name),
         _ if require => match choose(None) {
             AutomaticSubtitle::None => (None, None),
-            AutomaticSubtitle::Selected(i) => candidates[i].choice.clone(),
+            AutomaticSubtitle::Selected(i) => {
+                // Across parts: each part's own occurrence of the component.
+                for (part, ordinal) in bound.parts.iter_mut().zip(&candidates[i].parts) {
+                    part.subtitle = Some(*ordinal);
+                }
+                candidates[i].choice.clone()
+            }
             AutomaticSubtitle::Unavailable => {
                 return Ok(Json(blocked(&input, "subtitle_unavailable")).into_response());
             }
@@ -1598,7 +1602,7 @@ pub async fn plan(
     // A prepared plan pins the chosen rendition and plays its default streams:
     // its only audio and, when it carries the selected text subtitle
     // (`processing::carries`), its only subtitle.
-    let (route, chosen, audio, subtitle) = match decided {
+    let (route, mut chosen, audio, subtitle) = match decided {
         core::Plan::Ready(route) => (route, bound, audio, subtitle),
         core::Plan::Prepared(i) => {
             let p = prepared
@@ -1645,6 +1649,9 @@ pub async fn plan(
         true => match choose(Some(route)) {
             AutomaticSubtitle::Selected(i) => {
                 let (embedded, name) = candidates[i].choice.clone();
+                for (part, ordinal) in chosen.parts.iter_mut().zip(&candidates[i].parts) {
+                    part.subtitle = Some(*ordinal);
+                }
                 resolve_subtitle(
                     &mut conn,
                     &chosen.file,
@@ -1882,6 +1889,9 @@ struct SubtitleCandidate {
     burned: bool,
     /// This client can be given it on some route.
     deliverable: bool,
+    /// Across parts: its subtitle ordinal in every part, in part order
+    /// (empty for one file).
+    parts: Vec<u32>,
 }
 
 /// The timeline's subtitle components that occur on exactly the bound file
@@ -1914,6 +1924,40 @@ async fn subtitle_candidates(
                 else {
                     continue;
                 };
+                // Across parts only a text component occurring in every part
+                // is delivered (joined), never burned.
+                if !bound.parts.is_empty() {
+                    let per_part = multipart_tracks(
+                        conn,
+                        components,
+                        bound,
+                        Kind::Subtitle,
+                        streams,
+                        position as u32,
+                    )
+                    .await?;
+                    let text = per_part.as_ref().is_some_and(|parts| {
+                        playscale_core::parts::joinable_subtitle(
+                            &parts
+                                .iter()
+                                .map(|(_, c)| Some(c.as_str()))
+                                .collect::<Vec<_>>(),
+                        )
+                    });
+                    out.push(SubtitleCandidate {
+                        language: component.language.clone(),
+                        roles: component.roles.clone(),
+                        choice: (Some(position as u32), None),
+                        burned: false,
+                        deliverable: text && accepts_text,
+                        parts: per_part
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(ordinal, _)| ordinal)
+                            .collect(),
+                    });
+                    continue;
+                }
                 use playscale_core::delivery::{Presentation, presentation};
                 let presented = presentation(&track.codec, accepts_text, accepts_burned, libass);
                 (
@@ -1925,6 +1969,8 @@ async fn subtitle_candidates(
                     presented.is_some(),
                 )
             }
+            // A sidecar belongs to one file.
+            Some(SubtitleOccurrence::Sidecar(_)) if !bound.parts.is_empty() => continue,
             Some(SubtitleOccurrence::Sidecar(name)) => {
                 let format: Option<String> = sqlx::query_scalar(
                     "SELECT format FROM sidecar_subtitles WHERE file_id=? AND name=?",
@@ -1947,6 +1993,7 @@ async fn subtitle_candidates(
             choice,
             burned,
             deliverable,
+            parts: vec![],
         });
     }
     Ok(out)

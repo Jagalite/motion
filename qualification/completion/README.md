@@ -549,11 +549,43 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Review (GPT-6.1 Sol), round 1:** clean.
 
+### 3C (part 2). Automatic subtitles across parts
+
+- **Source SHA:** branch `plan-completion/multipart-subtitles`, stacked on
+  `plan-completion/offline-subtitles` (the top of the server stack).
+- **Implemented:**
+  - Automatic subtitle selection (`auto`, and `require` without an explicit
+    choice) now works on multipart versions. The candidates are subtitle
+    components that occur in every part (`multipart_tracks`). One is
+    deliverable only when every part's occurrence is plain text and the
+    client presents text: the new core `parts::joinable_subtitle`, which
+    the explicit multipart path uses too. The chosen component is pinned
+    to each part's own stream and joined in timeline time, as an explicit
+    choice is.
+  - Sidecars are never candidates across parts. A part without the
+    component means `auto` plays without subtitles and `require` is
+    refused (`subtitle_unavailable`, as for one file), never another
+    part's track alone.
+  - `V2_PLAYBACK.md` now states the multipart subtitle rule.
+- **Core/adapter boundary:** language, role and mode selection is the
+  existing core `automatic_subtitle`. What can be joined across parts is
+  core `joinable_subtitle`. The adapter maps components to each part's
+  tracks from observed facts. The route model is unchanged (multipart
+  still only converts; no new transition).
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core | 162 passed. New: `a_subtitle_joins_across_parts_only_as_text_in_every_part` |
+  | `tests/v2_playback.rs` `multipart_text_subtitles_are_joined_in_timeline_time` | passed. New: with the profile's English subtitles `always`, a part without the component gives `auto` without subtitles and `require` refused; with it in every part, `auto` selects `s0` and the delivery publishes both parts' cues joined |
+  | `multipart_versions_play_their_parts_in_order` | passed. `require` without subtitles in any part now answers `subtitle_unavailable`, as a single file does |
+  | `v2_playback` 32, `route_selection_model` | passed; clippy clean |
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
-| 3C bitmap cues before the 20 s lookback; burned and automatic subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph; automatic selection over components present in every part |
+| 3C bitmap cues before the 20 s lookback; burned subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph |
 
 ## 4. Library-management UI workflows
 

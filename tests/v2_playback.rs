@@ -4884,7 +4884,7 @@ async fn multipart_versions_play_their_parts_in_order() {
     );
     assert_eq!(
         plan("auto", "require").await.body["reason_codes"][0],
-        "subtitle_multipart_unavailable"
+        "subtitle_unavailable"
     );
     let converted = plan("auto", "auto").await;
     assert_eq!(
@@ -5313,6 +5313,76 @@ async fn multipart_text_subtitles_are_joined_in_timeline_time() {
         "{cues:?}"
     );
     assert_eq!(cues.len(), 3, "{cues:?}");
+    // Automatic selection across parts: the profile's English subtitles,
+    // only as a text component every part carries.
+    let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    let mut document = prefs.body.clone();
+    document["subtitle_mode"] = json!("always");
+    document["audio_languages"] = json!(["eng"]);
+    document["subtitle_languages"] = json!(["eng"]);
+    let replaced = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    let automatic = |policy: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_policy"] = json!(policy);
+            input["client"]["subtitle_modes"] = json!(["text", "hls_text"]);
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    // A part without the component: "auto" plays without subtitles and
+    // "require" is refused, never another part's track alone.
+    bind_second("c-nosubs.mp4").await;
+    let without = automatic("auto").await;
+    assert_eq!(without.body["status"], "ready", "{}", without.body);
+    assert_eq!(without.body["tracks"]["subtitle_track_id"], Value::Null);
+    assert_eq!(
+        automatic("require").await.body["reason_codes"][0],
+        "subtitle_unavailable"
+    );
+    bind_second("b-part2.mp4").await;
+    let selected = automatic("auto").await;
+    assert_eq!(selected.body["status"], "ready", "{}", selected.body);
+    assert_eq!(selected.body["tracks"]["subtitle_track_id"], "s0");
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-subtitles-auto"),
+            json!({"plan_token": selected.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let auto_id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&auto_id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let playlist = get(done["active"]["subtitles_url"].as_str().unwrap().to_owned()).await;
+    let mut joined = String::new();
+    for name in playlist.lines().filter_map(|l| l.strip_prefix("../../")) {
+        joined += &get(format!("/api/v2/streams/{auto_id}/1/{name}")).await;
+    }
+    assert!(
+        joined.contains("first part") && joined.contains("second part"),
+        "{joined}"
+    );
     // Burned subtitles are not delivered across parts.
     let burned = plan("require", json!(["burned"])).await;
     assert_eq!(burned.body["status"], "blocked", "{}", burned.body);

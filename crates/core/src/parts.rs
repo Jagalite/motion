@@ -143,9 +143,32 @@ pub fn locate(durations: &[u64], logical_ms: u64) -> Option<(usize, u64)> {
     None
 }
 
+/// Whether a subtitle component can be delivered across parts: it occurs
+/// in every part (one codec per part, none missing) and each occurrence is
+/// plain text, joined in timeline time (`subtitles::join_parts`). A burned
+/// or styled occurrence in any part is not delivered across parts.
+pub fn joinable_subtitle(codecs: &[Option<&str>]) -> bool {
+    !codecs.is_empty()
+        && codecs
+            .iter()
+            .all(|c| c.is_some_and(crate::delivery::sidecar_subtitle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subtitle_joins_across_parts_only_as_text_in_every_part() {
+        assert!(joinable_subtitle(&[Some("mov_text"), Some("subrip")]));
+        assert!(!joinable_subtitle(&[Some("mov_text"), None]));
+        assert!(!joinable_subtitle(&[
+            Some("mov_text"),
+            Some("hdmv_pgs_subtitle")
+        ]));
+        assert!(!joinable_subtitle(&[Some("ass"), Some("ass")]));
+        assert!(!joinable_subtitle(&[]));
+    }
     fn part(part: u32, duration: Option<u64>, start: Option<u64>, end: Option<u64>) -> BoundPart {
         BoundPart {
             part,
