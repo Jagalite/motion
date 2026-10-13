@@ -254,6 +254,18 @@ mod tests {
             .unwrap();
         drop(permit);
         assert_eq!(slots.available_permits(), 1);
-        assert!(artifacts.claim_cleanup("file".into()).is_some());
+        // Tuple fields drop in order: the semaphore can wake this task before
+        // the blocking thread finishes releasing the artifact pin. Observe
+        // both releases instead of assuming they form one atomic operation.
+        let _cleanup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(cleanup) = artifacts.claim_cleanup("file".into()) {
+                    break cleanup;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed blocking operation retained its artifact pin");
     }
 }

@@ -174,6 +174,14 @@ checks the complete escaped attribute (including a quote-breakout attempt and
 Unicode) before checking the surrounding markup. Topcoat already escapes the
 attribute correctly; no production escaping behavior is changed.
 
+CI at `d0ed838` confirmed the search and contract repairs. It exposed a race
+in `cancelled_io_keeps_admission_until_blocking_operation_finishes`: acquiring
+the released semaphore did not prove that the next tuple field, the artifact
+pin, had finished dropping on the blocking thread. The test now independently
+waits for cleanup admission within its deadline. Its pre-release assertions
+still require both capacity and artifact ownership to remain held while the
+operation is blocked. Production drop ordering and core policy are unchanged.
+
 These repairs do not change state-dependent production decisions. Validation:
 Kyoto test rebuild `c2af4d6279114aa4b6d08bd47f4f4609` includes the UI composition
 target and remains pending. It replaces the pressure-deferred
