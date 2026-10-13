@@ -1195,3 +1195,188 @@ async fn fresh_login_ignores_existing_session_but_identity_changes_do_not() {
         }
     }
 }
+
+/// Real HTTP token exchange is held outside SQLite. The second router request
+/// must observe the durable reservation while the first is still in flight.
+async fn oidc_reservation_case(cancel_exchange: bool) {
+    let mut child = tokio::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qualification/auth-signin/callback-provider.mjs"
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let mut port = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        output.read_line(&mut port),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let origin = format!("http://127.0.0.1:{}", port.trim().parse::<u16>().unwrap());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let f = Arc::new(Fixture::new().await);
+    let configured = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/settings",
+            Some(json!({"public_origin":ORIGIN})),
+            Some(&json!("1")),
+        )
+        .await;
+    assert_eq!(configured.status, StatusCode::OK, "{}", configured.body);
+    let provider = f.operator("POST", "/api/v2/admin/auth/providers", Some(json!({
+        "name":"Callback fault fixture", "issuer":origin, "client_id":"motion-test", "enabled":false,
+        "client_secret":{"action":"replace","value":"fixture-only"},
+        "destinations":[{"origin":origin,"address":"127.0.0.1"},{"origin":ORIGIN,"address":"127.0.0.1"}]
+    })), None).await;
+    assert_eq!(provider.status, StatusCode::CREATED, "{}", provider.body);
+    let provider_id = provider.body["id"].as_str().unwrap();
+    let started = f
+        .operator(
+            "POST",
+            &format!("/api/v2/auth/oidc/{provider_id}/start"),
+            Some(json!({"purpose":"test"})),
+            None,
+        )
+        .await;
+    assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+    let id = started.body["transaction_id"].as_str().unwrap();
+    let cookie = started.cookie("motion_signin").unwrap();
+    let authorized = client
+        .get(started.body["authorization_url"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::FOUND);
+    let callback = url::Url::parse(authorized.headers()["location"].to_str().unwrap()).unwrap();
+    let path = format!("{}?{}", callback.path(), callback.query().unwrap());
+    let wrong_browser = f.call("GET", &path, None, &[]).await;
+    assert_eq!(wrong_browser.status, StatusCode::FORBIDDEN);
+    assert_eq!(wrong_browser.body["code"], "signin_browser_mismatch");
+    assert_eq!(f.transaction_state(id).await["phase"], "pending");
+    let task = {
+        let f = f.clone();
+        let path = path.clone();
+        let cookie = cookie.clone();
+        tokio::spawn(async move { f.call("GET", &path, None, &[("cookie", &cookie)]).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let observed: Value = client
+                .get(format!("{origin}/fixture/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if observed["exchanges"] == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first callback reached the held token exchange");
+    // A separate pool reader sees the committed state while network I/O is held.
+    assert_eq!(f.transaction_state(id).await["phase"], "exchanging");
+    assert_eq!(f.families().await, 0);
+    let duplicate = f.call("GET", &path, None, &[("cookie", &cookie)]).await;
+    assert_eq!(duplicate.status, StatusCode::CONFLICT, "{}", duplicate.body);
+    assert_eq!(duplicate.body["code"], "signin_already_used");
+    if cancel_exchange {
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        // Reopen the actual database and reconstruct runtime as after restart.
+        let mut f = Arc::try_unwrap(f)
+            .ok()
+            .expect("cancelled request released its app");
+        f.app.db.close().await;
+        f.app.db = db::connect(&f._directory.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        f.app.access = Arc::new(playscale::v2::Runtime::new(
+            AccessMode::Restricted,
+            [73; 32],
+        ));
+        assert_eq!(f.transaction_state(id).await["phase"], "exchanging");
+        let replay = f.call("GET", &path, None, &[("cookie", &cookie)]).await;
+        assert_eq!(replay.status, StatusCode::CONFLICT, "{}", replay.body);
+        assert!(replay.cookie("motion_session").is_none());
+        assert_eq!(f.families().await, 0);
+        let tested: Option<i64> =
+            sqlx::query_scalar("SELECT login_test_at FROM signin_providers WHERE id=?")
+                .bind(provider_id)
+                .fetch_one(&f.app.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            tested, None,
+            "cancelled callback cannot publish provider test success"
+        );
+    } else {
+        client
+            .post(format!("{origin}/fixture/release"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let completed = task.await.unwrap();
+        assert_eq!(
+            completed.status,
+            StatusCode::SEE_OTHER,
+            "{}",
+            completed.body
+        );
+        assert!(
+            completed.cookie("motion_session").is_none(),
+            "provider tests never issue a login family"
+        );
+        assert_eq!(f.transaction_state(id).await["phase"], "consumed");
+        assert_eq!(f.families().await, 0);
+        let effects: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM signin_audit WHERE action='oidc.login' AND outcome='tested'",
+        )
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+        assert_eq!(effects, 1, "exactly one provider-test success is published");
+        let replay = f.call("GET", &path, None, &[("cookie", &cookie)]).await;
+        assert_eq!(replay.status, StatusCode::CONFLICT);
+    }
+    let observed: Value = client
+        .get(format!("{origin}/fixture/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        observed["exchanges"], 1,
+        "duplicates and restart never retry the provider code"
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn oidc_callback_reservation_fences_concurrent_exchange_and_duplicate_effects() {
+    oidc_reservation_case(false).await;
+}
+
+#[tokio::test]
+async fn oidc_callback_cancellation_and_restart_preserve_the_reservation() {
+    oidc_reservation_case(true).await;
+}
