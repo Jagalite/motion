@@ -63,7 +63,6 @@ async fn optional_caller(app: &App, headers: &HeaderMap) -> Result<Option<Caller
 }
 #[derive(sqlx::FromRow)]
 struct TxRow {
-    id: String,
     provider_id: Option<String>,
     state_json: String,
     nonce: Option<String>,
@@ -83,7 +82,7 @@ impl TxRow {
     }
 }
 async fn txrow(c: &mut sqlx::SqliteConnection, id: &str) -> Result<TxRow, Problem> {
-    Ok(sqlx::query_as("SELECT id,provider_id,state_json,nonce,verifier,address,code_hash,return_to,actor_id,actor_credential_hash,identity_id,result,ceiling_json FROM signin_transactions WHERE id=?").bind(id).fetch_optional(c).await?.ok_or_else(Problem::not_found)?)
+    sqlx::query_as("SELECT provider_id,state_json,nonce,verifier,address,code_hash,return_to,actor_id,actor_credential_hash,identity_id,result,ceiling_json FROM signin_transactions WHERE id=?").bind(id).fetch_optional(c).await?.ok_or_else(Problem::not_found)
 }
 enum Step {
     Reserve,

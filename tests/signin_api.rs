@@ -383,8 +383,12 @@ impl Fixture {
         self.mail.latest_code().await
     }
     async fn enrolled(&self) -> (Value, String, String) {
+        self.enrolled_with(&["catalog:read", "playback:request"])
+            .await
+    }
+    async fn enrolled_with(&self, permissions: &[&str]) -> (Value, String, String) {
         self.configure_mail().await;
-        let user = self.user(&["catalog:read", "playback:request"]).await;
+        let user = self.user(permissions).await;
         let (device, token) = self.paired(&user).await;
         let proof = self.proof(&token, "identity.link", "email").await;
         let approved = self.approve(&proof, OPERATOR).await;
@@ -1048,4 +1052,64 @@ async fn mail_outage_retries_the_same_challenge_and_erases_delivered_payload() {
         StatusCode::OK
     );
     assert_eq!(f.families().await, 1);
+}
+
+#[tokio::test]
+async fn disabling_email_ends_an_admitted_event_stream_and_preserves_pairing() {
+    let f = Fixture::new().await;
+    let (_, _, paired) = f.enrolled_with(&["catalog:read", "events:read"]).await;
+    let (id, binding, code) = f.challenge().await;
+    let signed = f.email_finish(&id, &binding, &code).await;
+    let cookie = signed.cookie("motion_session").unwrap();
+    let response = api::router(f.app.clone(), None)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v2/events")
+                .header("host", "127.0.0.1:8787")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body();
+    let initial = tokio::time::timeout(std::time::Duration::from_secs(5), stream.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&initial).contains("initial_snapshot"));
+    let configuration = f
+        .operator("GET", "/api/v2/admin/auth/email", None, None)
+        .await;
+    let disabled = f.operator("PUT", "/api/v2/admin/auth/email", Some(json!({"enabled":false,"host":"127.0.0.1","port":f.mail.port,"username":"","from":"motion@example.invalid","loopback_test":true,"password":{"action":"retain"}})), Some(&configuration.body["revision"])).await;
+    assert_eq!(disabled.status, StatusCode::OK, "{}", disabled.body);
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(5), stream.frame())
+        .await
+        .expect("admitted SSE must close after method revocation");
+    assert!(
+        ended.is_none(),
+        "revoked family must not receive another hint"
+    );
+    let rejected = f
+        .call("GET", "/api/v2/me", None, &[("cookie", &cookie)])
+        .await;
+    assert_eq!(rejected.status, StatusCode::UNAUTHORIZED);
+    let independent = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("authorization", &bearer(&paired))],
+        )
+        .await;
+    assert_eq!(independent.status, StatusCode::OK);
+    let revoked: i64 = sqlx::query_scalar("SELECT count(*) FROM signin_families WHERE revoked=1")
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(revoked, 1);
 }

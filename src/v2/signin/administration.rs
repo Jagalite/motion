@@ -854,12 +854,11 @@ pub async fn overview(State(app): State<App>, caller: Caller) -> Result<Json<Val
     let ids:Vec<String>=sqlx::query_scalar("SELECT DISTINCT d.id FROM devices d JOIN credentials c ON c.device_id=d.id AND c.kind='device' AND c.generation=d.generation WHERE d.revoked=0 AND c.expires_at>? AND EXISTS(SELECT 1 FROM json_each(d.permissions) WHERE value='system:admin')").bind(now()).fetch_all(&mut *tx).await?;
     let mut admins = 0;
     for id in ids {
-        if let Some(row) = auth::load_device(&mut tx, &id).await? {
-            if access_admin::usable_admin(&row.device, true, now())
-                && family_valid(&mut tx, &id).await?
-            {
-                admins += 1;
-            }
+        if let Some(row) = auth::load_device(&mut tx, &id).await?
+            && access_admin::usable_admin(&row.device, true, now())
+            && family_valid(&mut tx, &id).await?
+        {
+            admins += 1;
         }
     }
     let mut errors = Vec::new();
@@ -1174,8 +1173,8 @@ pub async fn get_proof(
         return Err(Problem::not_found());
     }
     let mut value = proof_value(&row, &epoch(&mut tx).await?);
-    if let Some(approver) = row.get::<Option<String>, _>("approved_by") {
-        if actor_valid(
+    if let Some(approver) = row.get::<Option<String>, _>("approved_by")
+        && actor_valid(
             &mut tx,
             &approver,
             row.get::<Option<String>, _>("approver_credential_hash")
@@ -1183,9 +1182,8 @@ pub async fn get_proof(
         )
         .await
         .is_err()
-        {
-            value["status"] = json!("invalidated");
-        }
+    {
+        value["status"] = json!("invalidated");
     }
     Ok(Json(value))
 }

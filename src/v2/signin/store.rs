@@ -36,7 +36,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len())
@@ -368,13 +368,13 @@ pub(super) async fn revoke_families(
                 .bind(id)
                 .fetch_optional(&mut *c)
                 .await?;
-        if let Some(device) = device {
-            if let Some(row) = auth::load_device(c, &device).await? {
-                let mut next = row.device.clone();
-                next.revoked = true;
-                next.revision += 1;
-                changes.push((row.device, next));
-            }
+        if let Some(device) = device
+            && let Some(row) = auth::load_device(c, &device).await?
+        {
+            let mut next = row.device.clone();
+            next.revoked = true;
+            next.revision += 1;
+            changes.push((row.device, next));
         }
     }
     access_management::guard_admin_change(c, &changes).await?;
