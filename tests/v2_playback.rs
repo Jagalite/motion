@@ -7529,7 +7529,8 @@ async fn bitmap_cues_established_long_before_a_start_are_drawn() {
     let base = f.dir.path().join("base.mp4");
     std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
     let sup = f.dir.path().join("box.sup");
-    // One cue from 1 s to 45 s on a 640x480 canvas over 320x240 video.
+    // One cue on a 640x480 canvas over 320x240 video; muxing places its
+    // display set at the file's start, and its clearing set 44 s later.
     std::fs::write(&sup, pgs_box(640, 480, (80, 80, 480, 120), 1000, 45000)).unwrap();
     f.media(
         "film.mkv",
@@ -7560,7 +7561,8 @@ async fn bitmap_cues_established_long_before_a_start_are_drawn() {
         "{}",
         planned.body
     );
-    // Starting at 40 s: the cue's display set is 39 s earlier.
+    // Starting at 40 s: the cue's display set is 40 s earlier, beyond any
+    // fixed short lookback.
     let admitted = f
         .post(
             "/api/v2/playback/delivery-sessions",
@@ -7631,4 +7633,77 @@ async fn bitmap_cues_established_long_before_a_start_are_drawn() {
     };
     let (inside, below) = (mean(50, 50), mean(50, 150));
     assert!(inside > 225 && below < 200, "box {inside}, picture {below}");
+    let closed = f
+        .call(
+            "DELETE",
+            &format!("/api/v2/playback/delivery-sessions/{id}"),
+            None,
+            &[("authorization", &auth)],
+        )
+        .await;
+    assert_eq!(closed.status, StatusCode::NO_CONTENT);
+    // Starting after the cue was cleared: nothing is drawn, and the
+    // conversion plays on (no earlier reading, no waiting for cues).
+    let planned = {
+        let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+        input["source"] = f.source().await;
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(["burned"]);
+        f.post("/api/v2/playback/plans", &auth, None, input).await
+    };
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("burned-lookback-002"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 46000}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let ready = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) > 46000
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(ready["active"]["status"], "failed", "{ready}");
+    let base_url = format!("/api/v2/streams/{id}/1");
+    std::fs::write(
+        &fragment,
+        [
+            get(format!("{base_url}/variants/main/init.mp4")).await,
+            get(format!("{base_url}/segments/0.m4s")).await,
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let frame = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&fragment)
+        .args([
+            "-ss",
+            "0.5",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(frame.len(), 320 * 240);
+    let mut sum = 0usize;
+    for y in 50..90 {
+        sum += frame[y * 320 + 50..y * 320 + 270]
+            .iter()
+            .map(|&p| p as usize)
+            .sum::<usize>();
+    }
+    let cleared = sum / (220 * 40);
+    assert!(cleared < 200, "box still drawn: {cleared}");
 }

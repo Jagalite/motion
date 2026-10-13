@@ -588,29 +588,42 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Source SHA:** branch `plan-completion/bitmap-lookback`, stacked on
   `plan-completion/multipart-subtitles`.
 - **Implemented:**
-  - A single-file conversion that burns a bitmap subtitle (PGS, DVD, DVB)
-    reads the subtitle from its own descriptor of the source. The
-    descriptor is validated like the source (root identity, fingerprint),
-    opened in the same preparation and inherited as fd 5.
-  - That input seeks `BURN_LOOKBACK_MS` (now 5 minutes) before the start,
-    without accurate seeking: FFmpeg 8's accurate-seek trim would drop
-    exactly the earlier cues. `-itsoffset` places the subtitle's time on
-    the video's.
-  - The video input now seeks to the start itself, so a start no longer
-    decodes 20 s of video that is thrown away.
-- **Limits:** a cue established more than 5 minutes before a start or seek
-  is not restored. The window bounds the extra reading a start costs.
-  Burned subtitles across parts remain refused.
-- **Core/adapter boundary:** an adapter (FFmpeg arguments and descriptor)
-  change. Which subtitle is burned, and on which routes, is unchanged in
-  core.
+  - Before a single-file conversion burns a bitmap subtitle (PGS, DVD,
+    DVB) from a start, the adapter probes the validated source descriptor
+    with ffprobe. It reads the subtitle stream's display sets in the 5
+    minutes before the start (`-read_intervals`, no video decoding), with
+    whether each draws anything, in file time.
+  - Core `delivery::burn_read_from` decides where reading begins:
+    - the last display set at or before the start, if it draws;
+    - otherwise the start itself;
+    - if the stream could not be read, the old bounded 20 s.
+  - The conversion keeps the original single-input graph (input seek, then
+    an output trim to the start). A cue still showing at the start is
+    therefore drawn, and video is decoded only from the cue's own display
+    set, never a fixed window.
+- **Limits:** a cue established more than 5 minutes before a start is not
+  restored. Burned subtitles across parts remain refused.
+- **Core/adapter boundary:** where to read from is a pure core decision
+  over observed display sets (unit-tested, including the unknown case).
+  The adapter only probes and builds FFmpeg arguments.
 - **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
 
   | Check | Result |
   |---|---|
-  | `tests/v2_playback.rs` `bitmap_cues_established_long_before_a_start_are_drawn` | passed. A cue from 1 s to 45 s, delivered from 40 s (39 s after its display set): the box is drawn in the first segment. It failed (box not drawn) with the old 20 s lookback and with accurate seeking on the subtitle input |
+  | core | 163 passed. New: `a_bitmap_cue_showing_at_the_start_is_read_from_its_display_set` |
+  | `tests/v2_playback.rs` `bitmap_cues_established_long_before_a_start_are_drawn` | passed. A cue displayed from the file start and cleared 44 s later: delivered from 40 s the box is drawn; delivered from 46 s nothing is drawn and the conversion plays on |
   | `bitmap_subtitles_are_burned_into_conversions_only` | passed. From 0 s and from 8 s inside a cue |
   | `v2_playback` | 33 passed; clippy clean |
+- **Review (GPT-6.1 Sol):** round 1 at `026cbdd` raised one P1 finding:
+  - **B1 (P1):** the first design read the subtitle through a second,
+    subtitle-only input. On FFmpeg 8.1.2 that input stalls the graph when
+    its window holds no drawable cue: with nothing else from that input,
+    the subtitle-to-video conversion never advances. Reproduced with a
+    7-minute file.
+  - **Fix:** the redesign above. Feeding the second input's video to a
+    null sink also unblocked it, but cost seconds of CPU per start. The
+    single-input graph cannot stall this way, and the new test's second
+    case starts after the cue was cleared.
 
 ### Remaining item 3 slices (not started)
 

@@ -163,6 +163,32 @@ pub fn burnable_subtitle(codec: &str) -> bool {
     matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle")
 }
 
+/// How far before a start the bitmap subtitle stream is examined for a
+/// display set still showing there.
+pub const BURN_LOOKBACK_MS: u64 = 300_000;
+/// How far before a start a burned-bitmap conversion reads when the stream
+/// could not be examined.
+pub const BURN_FALLBACK_LOOKBACK_MS: u64 = 20_000;
+
+/// Where a conversion burning a bitmap subtitle starts reading so that a cue
+/// still showing at `start_ms` is drawn. `display_sets` are the stream's
+/// display sets in the `BURN_LOOKBACK_MS` before the start, in file time,
+/// each with whether it draws anything (a clearing set draws nothing); None
+/// when they could not be read. The last set at or before the start decides:
+/// one that draws is read from its own time; a clearing one, or none, needs
+/// nothing earlier than the start. Unknown: the bounded fallback lookback.
+pub fn burn_read_from(start_ms: u64, display_sets: Option<&[(u64, bool)]>) -> u64 {
+    let Some(sets) = display_sets else {
+        return start_ms.saturating_sub(BURN_FALLBACK_LOOKBACK_MS);
+    };
+    let floor = start_ms.saturating_sub(BURN_LOOKBACK_MS);
+    sets.iter()
+        .filter(|(at, _)| (floor..=start_ms).contains(at))
+        .max_by_key(|(at, _)| *at)
+        .filter(|(_, draws)| *draws)
+        .map_or(start_ms, |(at, _)| *at)
+}
+
 /// Styled text codecs (ASS/SSA): rendered faithfully only by libass, so only
 /// burned into converted video, never flattened to WebVTT.
 pub fn styled_subtitle(codec: &str) -> bool {
@@ -1237,6 +1263,33 @@ pub fn media_playlist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bitmap_cue_showing_at_the_start_is_read_from_its_display_set() {
+        let start = 400_000;
+        // A cue drawn at 200 s and not cleared before the start.
+        assert_eq!(burn_read_from(start, Some(&[(200_000, true)])), 200_000);
+        // Cleared before the start: nothing earlier is needed.
+        assert_eq!(
+            burn_read_from(start, Some(&[(200_000, true), (300_000, false)])),
+            start
+        );
+        // The latest set decides, whatever the order read.
+        assert_eq!(
+            burn_read_from(start, Some(&[(390_000, true), (300_000, false)])),
+            390_000
+        );
+        // No sets in the window, or sets outside it: from the start.
+        assert_eq!(burn_read_from(start, Some(&[])), start);
+        assert_eq!(burn_read_from(start, Some(&[(50_000, true)])), start);
+        assert_eq!(burn_read_from(start, Some(&[(401_000, true)])), start);
+        // Unknown: the bounded fallback.
+        assert_eq!(
+            burn_read_from(start, None),
+            start - BURN_FALLBACK_LOOKBACK_MS
+        );
+        assert_eq!(burn_read_from(5_000, None), 0);
+    }
     fn pin(tracks: &[&str]) -> Pin {
         Pin {
             source_file: "f".into(),
