@@ -1364,7 +1364,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 ### 5F. End-to-end: download, offline in Electron with Demuxe, reconnect
 
 - **Source SHA:** branch `plan-completion/offline-end-to-end`, stacked on
-  `plan-completion/offline-subtitles-device`. The receipt names `fc4b5e9`.
+  `plan-completion/offline-subtitles-device`. The receipt names `6453f0c`.
   The binaries were built from its parent, whose non-test sources are
   identical.
 - **Run (`apps/desktop/test/run-end-to-end.mjs`):**
@@ -1401,6 +1401,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - macOS arm64 debug binaries, unpackaged Electron, audio muted.
   - No screen reader, physical audio/video or packaged-app observations;
     those remain item 8 release checks.
+- **Review (GPT-6.1 Sol):** round 1 at `7ba37ae` (same content as
+  `fc4b5e9`) raised one P2 finding, fixed:
+  - **Provenance:** the receipt hashed the desktop sources after the
+    multi-minute run, so a change during it could name bytes that were
+    never tested. The commit, source hashes and whether the tested files
+    are committed (`sources_committed`) are now captured before anything
+    runs. The files are hashed again at the end, and a change fails the
+    receipt. The run was repeated: it passed at `6453f0c` with
+    `sources_committed: true`.
 
 ### Remaining item 5 work
 

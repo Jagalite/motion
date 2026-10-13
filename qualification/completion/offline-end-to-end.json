@@ -43,12 +43,13 @@
     "apps/desktop/src/preload.cjs": "6a49ff6575e8b623133343c0a99e087e2920c6aed853f5f59147d42f6fa34c27",
     "apps/desktop/src/recovery.mjs": "a06fe121e7413e095c23723fd045313476fd7cb43b0caf6b654bf474adce301f",
     "apps/desktop/test/offline-smoke.mjs": "66b67e357e1c368adc597350bd1c96829d5c754313b9ebb7a750d7a52e0c0b9e",
-    "apps/desktop/test/run-end-to-end.mjs": "fcdc00822ad9d6bf2e74f8d528a7a5c24b910d1febe0576e93443ec9c944bda9",
+    "apps/desktop/test/run-end-to-end.mjs": "a97a4def7da0bc3bbc89debdeee9e5bca50ed8c9dd88c8d4689eb288f6b7d5a7",
     "packages/ui-bridge/offline-player.js": "74f5f8ea2c9cebb35f46e6726a286b3c09fe0a7120dc85bb665d2fab89cc4285"
   },
-  "commit": "fc4b5e9fb5279873b5a1342df93574b514f3a70a",
-  "recorded_at": "2026-10-13T11:31:39.845Z",
-  "artifacts": "$TMPDIR/motion-end-to-end-vK5ZNJ",
+  "commit": "6453f0c2d37e2329186216fbe0847c084e4ea8c4",
+  "sources_committed": true,
+  "recorded_at": "2026-10-13T11:34:29.521Z",
+  "artifacts": "$TMPDIR/motion-end-to-end-mlQElz",
   "limitations": [
     "The download is driven by the production agent module from Node, not from the Electron main process (sign-in UI not exercised).",
     "One device, one profile, one complete MP4 original with one text subtitle; macOS arm64 debug binaries; unpackaged Electron; audio muted.",
