@@ -49,6 +49,10 @@ applying any pending migration to an existing database.
 | 0042 | `0042_operational_metrics.sql` | Server metrics | bounded operational samples and process-lifetime failed-job observation deduplication |
 | 0043 | `0043_playback_monitoring.sql` | Playback monitoring | administrator session history with transfer counters, a viewing-by-delivery index, and three playback metric series (rebuilds `operational_metrics`) |
 | 0044 | `0044_offline_downloads.sql` | A13 (N3 downloads, PR #31) | device downloads, download ticket link, offline sequences/events/lineage |
+| 0050 | `0050_review_download_inventory.sql` | Rewrite review U06 | bounded active download inventory independent of cancelled history; 0045-0049 reserved for concurrent completion/access work |
+| 0051 | `0051_preparation_dependencies.sql` | Rewrite review A05 | invalidate preparation revisions only for source, binding and output dependencies |
+| 0052 | `0052_artwork_selection_revisions.sql` | Rewrite review C11 | advance role selection readback ETags when contribution facts change |
+| 0053 | `0053_event_ownership.sql` | Rewrite review A07 | retain organization and logical schedule scope for authorized invalidation after deletion/moves |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 

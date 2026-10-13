@@ -2108,3 +2108,247 @@ async fn parameterized_preparation_persists_profile_and_fences_changed_inputs() 
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn accepting_match_requires_whole_work_and_relationship_write_scope() {
+    for affected in ["source", "target", "relationship", "order_owner"] {
+        let f = Fixture::new().await;
+        let operator = bearer(OPERATOR);
+        let writer = f.device(&["catalog:read", "catalog:write"], true).await;
+        if affected == "relationship" {
+            sqlx::query("INSERT INTO item_relationships(id,source_item_id,target_item_id,kind) VALUES ('foreign-edge','film-b','film-a','extra_of')")
+                .execute(&f.app.db).await.unwrap();
+        } else if affected == "order_owner" {
+            sqlx::query("INSERT INTO order_groups(id,edition_id,name,kind) VALUES ('hidden-order','ed-film-b','Hidden','custom')")
+                .execute(&f.app.db).await.unwrap();
+            sqlx::query("UPDATE timelines SET order_group_id='hidden-order',order_position=1 WHERE id='ed-film-a'")
+                .execute(&f.app.db).await.unwrap();
+        } else {
+            let edition = if affected == "source" {
+                "ed-film-a"
+            } else {
+                "ed-film-a2"
+            };
+            sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes) VALUES ('shared',?,?,'shared.mkv','shared-rev','fp',1)")
+                .bind(edition).bind(&f.hidden).execute(&f.app.db).await.unwrap();
+            sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,'shared','shared-rev')")
+                .bind(if affected == "source" { "file-a" } else { "file-a2" }).execute(&f.app.db).await.unwrap();
+        }
+        let created = f.call("POST", "/api/v2/catalog/matches",
+            Some(json!({"file":{"file_id":"file-a","file_revision":"rev-a"},"library_id":f.library,"provider":null})),
+            &[("authorization", &operator), ("idempotency-key", "merge-scope-proposal")]).await;
+        assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+        let proposal_before: String = sqlx::query_scalar("SELECT json_group_array(json_object('id',id,'revision',revision,'status',status)) FROM match_proposals")
+            .fetch_one(&f.app.db).await.unwrap();
+        let counts_before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM items),(SELECT count(*) FROM item_aliases),(SELECT count(*) FROM catalog_receipts)")
+            .fetch_one(&f.app.db).await.unwrap();
+        let request = format!(
+            "/api/v2/catalog/matches/{}/decision",
+            created.body["id"].as_str().unwrap()
+        );
+        let denied = f
+            .call(
+                "PUT",
+                &request,
+                Some(json!({"decision":"accept","candidate_id":"local:film-a2"})),
+                &[
+                    ("authorization", &writer),
+                    ("if-match", created.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert!(
+            matches!(denied.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND),
+            "{affected}: {:?}",
+            denied.body
+        );
+        let proposal_after: String = sqlx::query_scalar("SELECT json_group_array(json_object('id',id,'revision',revision,'status',status)) FROM match_proposals")
+            .fetch_one(&f.app.db).await.unwrap();
+        assert_eq!(proposal_before, proposal_after);
+        let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM items),(SELECT count(*) FROM item_aliases),(SELECT count(*) FROM catalog_receipts)")
+            .fetch_one(&f.app.db).await.unwrap();
+        assert_eq!(
+            counts, counts_before,
+            "denied match has no mutation effects"
+        );
+    }
+}
+
+#[tokio::test]
+async fn preparation_revisions_follow_actual_dependencies() {
+    let f = Fixture::new().await;
+    for (job, file, timeline, revision) in [
+        ("pa", "file-a", "ed-film-a", "rev-a"),
+        ("pb", "file-b", "ed-film-b", "rev-b"),
+    ] {
+        sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at) VALUES (?,?,?,'remux_mp4','software',?,'queued',0,0)")
+            .bind(job).bind(file).bind(revision).bind(job).execute(&f.app.db).await.unwrap();
+        sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json) VALUES (?,?,'recipe','{}')")
+            .bind(job).bind(timeline).execute(&f.app.db).await.unwrap();
+    }
+    async fn revisions(db: &sqlx::SqlitePool) -> Vec<i64> {
+        sqlx::query_scalar("SELECT revision FROM preparations ORDER BY job_id")
+            .fetch_all(db)
+            .await
+            .unwrap()
+    }
+    let original = revisions(&f.app.db).await;
+    sqlx::query("UPDATE items SET title='Unrelated metadata' WHERE id='film-a2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_files SET revision='changed' WHERE id='file-a2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        revisions(&f.app.db).await,
+        original,
+        "unrelated catalog changes do not fan out"
+    );
+    sqlx::query("UPDATE media_files SET available=0 WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let source = revisions(&f.app.db).await;
+    assert!(source[0] > original[0]);
+    assert_eq!(source[1], original[1]);
+    sqlx::query("UPDATE libraries SET enabled=0 WHERE id=?")
+        .bind(&f.hidden)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let disabled = revisions(&f.app.db).await;
+    assert_eq!(disabled[0], source[0]);
+    assert!(disabled[1] > source[1]);
+    sqlx::query("INSERT INTO version_files(version_id,part,file_id,file_revision,start_ms,end_ms) VALUES ('file-a',2,'file-a2','changed',0,1000)").execute(&f.app.db).await.unwrap();
+    let multipart = revisions(&f.app.db).await;
+    assert!(multipart[0] > disabled[0]);
+    assert_eq!(multipart[1], disabled[1]);
+    sqlx::query("DELETE FROM version_files WHERE version_id='file-a' AND part=2")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let single = revisions(&f.app.db).await;
+    assert!(single[0] > multipart[0]);
+    assert_eq!(single[1], multipart[1]);
+    sqlx::query("UPDATE media_versions SET origin='generated' WHERE id='file-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let changed_version = revisions(&f.app.db).await;
+    assert!(changed_version[0] > single[0]);
+    assert_eq!(changed_version[1], single[1]);
+}
+
+#[tokio::test]
+async fn every_artwork_role_has_scoped_selection_readback() {
+    let f = Fixture::new().await;
+    let operator = bearer(OPERATOR);
+    let reader = f.device(&["catalog:read"], true).await;
+    let asset = f.artwork("film-a", b"role artwork").await;
+    let path = "/api/v2/catalog/items/film-a/artwork/selection";
+    for role in ["poster", "backdrop", "thumbnail", "banner"] {
+        // Register the uploaded asset as item-owned, so all role pins may select it.
+        sqlx::query(
+            "INSERT OR IGNORE INTO item_artwork_assets(item_id,asset_id) VALUES ('film-a',?)",
+        )
+        .bind(&asset)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+        let before = f.call("GET", path, None, &auth(&reader)).await;
+        assert_eq!(before.status, StatusCode::OK, "{}", before.body);
+        let chosen = f
+            .call(
+                "PUT",
+                path,
+                Some(json!({"role":role,"asset_id":asset})),
+                &[
+                    ("authorization", &operator),
+                    ("if-match", before.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(chosen.status, StatusCode::OK, "{}", chosen.body);
+        let after = f.call("GET", path, None, &auth(&reader)).await;
+        assert_eq!(after.headers["etag"], chosen.headers["etag"]);
+        let value = after.body["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == role)
+            .unwrap();
+        assert_eq!(value["asset_id"], asset);
+        assert_eq!(value["pinned"], true);
+        assert_eq!(value["selection_revision"], "1");
+        assert_eq!(value["conflict"], false);
+    }
+    assert_eq!(
+        f.call(
+            "GET",
+            "/api/v2/catalog/items/film-b/artwork/selection",
+            None,
+            &auth(&reader)
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn artwork_contribution_changes_advance_selection_etags() {
+    let f = Fixture::new().await;
+    let reader = f.device(&["catalog:read"], true).await;
+    let path = "/api/v2/catalog/items/film-a/artwork/selection";
+    let poster = |body: &Value| body["roles"][0].clone();
+    let before = f.call("GET", path, None, &auth(&reader)).await;
+    let asset = f.artwork("film-a", b"first artwork").await;
+    let local = f.call("GET", path, None, &auth(&reader)).await;
+    assert_ne!(before.headers["etag"], local.headers["etag"]);
+    assert_eq!(poster(&local.body)["asset_id"], asset);
+    assert_eq!(poster(&local.body)["sources"], json!(["local"]));
+
+    sqlx::query("UPDATE artwork_contributions SET source='provider-one' WHERE item_id='film-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let imported = f.call("GET", path, None, &auth(&reader)).await;
+    assert_ne!(local.headers["etag"], imported.headers["etag"]);
+    assert_eq!(poster(&imported.body)["sources"], json!(["provider-one"]));
+    let other = f.artwork("film-a2", b"other artwork").await;
+    sqlx::query("INSERT INTO artwork_contributions VALUES ('film-a','poster','provider-two',?,1)")
+        .bind(&other)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let conflict = f.call("GET", path, None, &auth(&reader)).await;
+    assert_ne!(imported.headers["etag"], conflict.headers["etag"]);
+    assert!(poster(&conflict.body)["asset_id"].is_null());
+    assert_eq!(poster(&conflict.body)["conflict"], true);
+    assert_eq!(
+        poster(&conflict.body)["sources"],
+        json!(["provider-one", "provider-two"])
+    );
+
+    // An ownership move changes both the old and new item's representation.
+    let other_path = "/api/v2/catalog/items/film-a2/artwork/selection";
+    let other_before = f.call("GET", other_path, None, &auth(&reader)).await;
+    sqlx::query("UPDATE artwork_contributions SET item_id='film-a2' WHERE item_id='film-a' AND source='provider-two'")
+        .execute(&f.app.db).await.unwrap();
+    let moved = f.call("GET", path, None, &auth(&reader)).await;
+    let other_after = f.call("GET", other_path, None, &auth(&reader)).await;
+    assert_ne!(conflict.headers["etag"], moved.headers["etag"]);
+    assert_ne!(other_before.headers["etag"], other_after.headers["etag"]);
+    assert_eq!(poster(&moved.body)["asset_id"], asset);
+    assert_eq!(poster(&moved.body)["conflict"], false);
+    sqlx::query("DELETE FROM artwork_contributions WHERE item_id='film-a'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let removed = f.call("GET", path, None, &auth(&reader)).await;
+    assert_ne!(moved.headers["etag"], removed.headers["etag"]);
+    assert!(poster(&removed.body)["asset_id"].is_null());
+    assert_eq!(poster(&removed.body)["sources"], json!([]));
+}

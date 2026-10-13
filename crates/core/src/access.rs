@@ -720,6 +720,14 @@ pub enum Resource {
         prior: BTreeSet<String>,
     },
     Profile(String),
+    Organization {
+        current_profile: Option<String>,
+        prior_profile: Option<String>,
+    },
+    Schedule {
+        current_library: Option<String>,
+        prior_library: Option<String>,
+    },
     Device(String),
     Job {
         requester: String,
@@ -748,6 +756,22 @@ pub fn visible(principal: &Principal, resource: &Resource) -> bool {
                     .any(|l| principal.policy.library_ids.contains(l))
         }
         Resource::Profile(id) => principal.may_use_profile(id),
+        Resource::Organization {
+            current_profile, ..
+        } => {
+            principal.allows(Permission::CollectionsWrite)
+                && current_profile
+                    .as_ref()
+                    .is_some_and(|id| principal.may_use_profile(id))
+        }
+        Resource::Schedule {
+            current_library, ..
+        } => {
+            principal.allows(Permission::SourcesManage)
+                && current_library
+                    .as_ref()
+                    .is_some_and(|id| catalog_scope(principal).library(id))
+        }
         Resource::Device(id) => principal.device_id.as_deref() == Some(id),
         Resource::Job { requester } => owns_job(principal, requester),
         Resource::Administrative => false,
@@ -841,6 +865,28 @@ pub fn disclose(principal: &Principal, resource: &Resource) -> Disclosure {
         && principal.allows(Permission::CatalogRead)
         && !principal.policy.rating_restricted();
     match resource {
+        Resource::Organization { prior_profile, .. }
+            if principal.allows(Permission::EventsRead)
+                && principal.allows(Permission::CollectionsWrite)
+                && prior_profile
+                    .as_ref()
+                    .map_or(!principal.grant.profile_ids.is_empty(), |id| {
+                        principal.may_use_profile(id)
+                    }) =>
+        {
+            Disclosure::Reset
+        }
+        Resource::Schedule { prior_library, .. }
+            if catalog
+                && principal.allows(Permission::SourcesManage)
+                && prior_library
+                    .as_ref()
+                    .map_or(!principal.policy.library_ids.is_empty(), |id| {
+                        catalog_scope(principal).library(id)
+                    }) =>
+        {
+            Disclosure::Reset
+        }
         Resource::Item { libraries, prior }
             if catalog
                 && (prior
@@ -1339,6 +1385,77 @@ mod tests {
             disclose(&Principal::operator(), &orphan),
             Disclosure::Deliver
         );
+    }
+
+    #[test]
+    fn organization_and_schedule_disclosure_preserves_prior_scope_without_naming_it() {
+        let mut cases = 0;
+        for mask in 0..64 {
+            let mut principal = authenticate(
+                &cred(CredentialKind::Device, 1000),
+                None,
+                Some(&device()),
+                0,
+            )
+            .unwrap();
+            principal.grant.permissions.clear();
+            for (bit, permission) in [
+                (1, Permission::EventsRead),
+                (2, Permission::CatalogRead),
+                (4, Permission::CollectionsWrite),
+                (8, Permission::SourcesManage),
+            ] {
+                if mask & bit != 0 {
+                    principal.grant.permissions.insert(permission);
+                }
+            }
+            let assigned = mask & 16 != 0;
+            principal.grant.profile_ids = if assigned {
+                ["visible".into()].into()
+            } else {
+                BTreeSet::new()
+            };
+            principal.policy.library_ids = principal.grant.profile_ids.clone();
+            principal.policy.allow_unrated = mask & 32 != 0;
+            for current in [None, Some("visible"), Some("hidden")] {
+                for prior in [None, Some("visible"), Some("hidden")] {
+                    for schedule in [false, true] {
+                        let resource = if schedule {
+                            Resource::Schedule {
+                                current_library: current.map(str::to_owned),
+                                prior_library: prior.map(str::to_owned),
+                            }
+                        } else {
+                            Resource::Organization {
+                                current_profile: current.map(str::to_owned),
+                                prior_profile: prior.map(str::to_owned),
+                            }
+                        };
+                        let permitted = mask & 1 != 0
+                            && assigned
+                            && if schedule {
+                                mask & 2 != 0 && mask & 8 != 0 && mask & 32 != 0
+                            } else {
+                                mask & 4 != 0
+                            };
+                        let expected = if permitted && current == Some("visible") {
+                            Disclosure::Deliver
+                        } else if permitted && prior != Some("hidden") {
+                            Disclosure::Reset
+                        } else {
+                            Disclosure::Withhold
+                        };
+                        assert_eq!(
+                            disclose(&principal, &resource),
+                            expected,
+                            "mask={mask}, resource={resource:?}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 1152);
     }
 
     #[test]

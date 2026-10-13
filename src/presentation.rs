@@ -791,11 +791,10 @@ impl UiQueryFacade for Queries {
     fn downloads<'a>(&'a self, _: &'a UiPrincipal) -> BoxFuture<'a, UiResult<Vec<DownloadRow>>> {
         Box::pin(async move {
             let mut rows = Vec::new();
-            // Every record, not the first page; past the bound the page
-            // reports unavailable rather than a partial list. Cancelled
-            // records need no action and are not shown.
+            // The server caps uncancelled demands at 500 per device. Filter
+            // history before pagination so cancelled transfers cannot hide them.
             for v in self
-                .list_all("/downloads", 25)
+                .list_all("/downloads?active_only=true", 3)
                 .await?
                 .into_iter()
                 .filter(|v| v["state"] != "cancelled")

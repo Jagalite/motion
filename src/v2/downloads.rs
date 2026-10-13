@@ -497,23 +497,37 @@ pub async fn create(
 
 // -------------------------------------------------------------------- reads
 
+#[derive(Deserialize)]
+pub struct DownloadQuery {
+    #[serde(flatten)]
+    page: PageQuery,
+    /// Keep cancelled demand history available to explicit history clients.
+    #[serde(default)]
+    active_only: bool,
+}
+
 pub async fn list(
     State(app): State<App>,
     caller: Caller,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<DownloadQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
     let device = device(&caller.principal, None)?;
-    let limit = q.limit()?;
+    let limit = q.page.limit()?;
+    let active = if q.active_only {
+        " AND state='ready'"
+    } else {
+        ""
+    };
     let mut tx = app.db.begin().await?;
     let profiles: Vec<&String> = caller.principal.grant.profile_ids.iter().collect();
     let rows: Vec<Row> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM downloads WHERE device_id=? AND principal_id=? AND id>? \
+        "SELECT {COLUMNS} FROM downloads WHERE device_id=? AND principal_id=? AND id>?{active} \
          AND (? OR profile_id IN (SELECT value FROM json_each(?))) ORDER BY id LIMIT ?"
     ))
     .bind(&device)
     .bind(&caller.principal.id)
-    .bind(q.after()?)
+    .bind(q.page.after()?)
     .bind(caller.principal.is_admin())
     .bind(serde_json::to_string(&profiles).map_err(Problem::internal)?)
     .bind(i64::from(limit) + 1)

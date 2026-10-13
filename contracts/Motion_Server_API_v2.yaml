@@ -3840,6 +3840,28 @@ paths:
       required: true
       schema:
         $ref: '#/components/schemas/Id'
+    get:
+      operationId: getArtworkSelection
+      summary: Read effective artwork and selection provenance for every role
+      tags: [metadata]
+      x-required-permission: catalog:read
+      responses:
+        '200':
+          description: Role selections with item ETag, immutable asset identities, local selection revisions and contributing sources.
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtworkSelectionView'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
     put:
       operationId: selectArtwork
       summary: Select artwork for a logical item
@@ -6632,6 +6654,12 @@ paths:
       parameters:
       - $ref: '#/components/parameters/Cursor'
       - $ref: '#/components/parameters/Limit'
+      - name: active_only
+        in: query
+        description: Filter cancelled history before pagination. Uncancelled demands are capped at 500 per device, including derived-expired demands.
+        schema:
+          type: boolean
+          default: false
   /api/v2/downloads/{download_id}:
     parameters:
     - name: download_id
@@ -10933,6 +10961,41 @@ components:
       - size_bytes
       - content_url
       - source_revision
+    ArtworkSelectionView:
+      type: object
+      additionalProperties: false
+      required: [item_id, revision, roles]
+      properties:
+        item_id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        roles:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: object
+            additionalProperties: false
+            required: [role, asset_id, selection_revision, pinned, sources, conflict]
+            properties:
+              role:
+                type: string
+                enum: [poster, backdrop, thumbnail, banner]
+              asset_id:
+                anyOf:
+                - $ref: '#/components/schemas/Id'
+                - type: 'null'
+              selection_revision:
+                $ref: '#/components/schemas/Revision'
+              pinned:
+                type: boolean
+              sources:
+                type: array
+                items:
+                  type: string
+              conflict:
+                type: boolean
     ArtworkSelection:
       type: object
       additionalProperties: false

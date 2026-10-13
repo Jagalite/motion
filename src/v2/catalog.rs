@@ -428,6 +428,30 @@ pub(crate) async fn curatable_item(
     Ok(row)
 }
 
+/// Every work whose relationships or order membership a merge can mutate
+/// must be writable. Call under the same writer reservation as the mutation.
+pub(crate) async fn authorize_merge_scope(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    sources: &[String],
+    target: &str,
+) -> Result<(), Problem> {
+    let mut affected: BTreeSet<String> = sources.iter().cloned().collect();
+    affected.insert(target.to_owned());
+    for source in sources.iter().filter(|source| source.as_str() != target) {
+        let owners: Vec<String> = sqlx::query_scalar(
+            "SELECT source_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT target_item_id FROM item_relationships WHERE source_item_id=? OR target_item_id=? UNION SELECT owner.item_id FROM timelines t JOIN editions moved ON moved.id=t.edition_id JOIN order_groups g ON g.id=t.order_group_id JOIN editions owner ON owner.id=g.edition_id WHERE moved.item_id=?",
+        )
+        .bind(source).bind(source).bind(source).bind(source).bind(source)
+        .fetch_all(&mut *conn).await?;
+        affected.extend(owners);
+    }
+    for item in affected {
+        curatable_item(conn, scope, &item, false).await?;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ExternalIdentity {
     provider: String,
@@ -484,25 +508,9 @@ pub(crate) async fn item_body(
         namespace_version: String::new(),
     })
     .collect();
-    let pinned: Option<String> = sqlx::query_scalar(
-        "SELECT asset_id FROM artwork_selections WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_optional(&mut *conn)
-    .await?
-    .flatten();
-    let contributions: Vec<(String, String)> = sqlx::query_as(
-        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role='poster'",
-    )
-    .bind(&row.id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let local = contributions
-        .iter()
-        .find(|(s, _)| s == "local")
-        .map(|(_, a)| a.clone());
-    let candidates = contributions.into_iter().map(|(_, a)| a).collect();
-    let (artwork_id, _) = playscale_core::artwork::resolve(pinned, local, &candidates);
+    let artwork_id = super::metadata::resolved_artwork(conn, &row.id, "poster")
+        .await?
+        .asset_id;
     // Count only visible timelines: a hidden edition must not alter the
     // viewer's default selection or disclose itself through that count.
     let (clause, all, ids) = scope_clause(scope, "f.library_id");
@@ -1315,11 +1323,7 @@ async fn plan(
 ) -> Result<(Reviewed, Vec<String>, Vec<String>), Problem> {
     match preview {
         Preview::Merge(request) => {
-            let participants: BTreeSet<&String> =
-                request.sources.iter().chain([&request.target]).collect();
-            for participant in participants {
-                curatable_item(conn, scope, participant, false).await?;
-            }
+            authorize_merge_scope(conn, scope, &request.sources, &request.target).await?;
             let plan = crate::curation::preview_merge_on(conn, request)
                 .await
                 .map_err(curation_problem)?;
@@ -1542,11 +1546,7 @@ pub async fn commit_reconciliation(
     let envelope = open_plan(&app, &input.plan_token, &principal.id)?;
     let result = match &envelope.change {
         Reviewed::Merge { plan } => {
-            let participants: BTreeSet<&String> =
-                plan.retired.iter().chain([&plan.target]).collect();
-            for participant in participants {
-                curatable_item(&mut tx, &scope, participant, false).await?;
-            }
+            authorize_merge_scope(&mut tx, &scope, &plan.retired, &plan.target).await?;
             crate::curation::merge_in_transaction(&mut tx, plan)
                 .await
                 .map_err(curation_problem)?;

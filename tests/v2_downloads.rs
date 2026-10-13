@@ -953,6 +953,10 @@ async fn the_downloads_page_lists_every_actionable_record() {
         )
         .await;
     assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    // A long cancelled history sorts before the actionable records. Filtering
+    // after a fixed number of history pages would make this UI unavailable.
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5001) INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) SELECT printf('history-%05d',n.x),1,d.principal_id,d.device_id,d.profile_id,d.timeline_id,d.timeline_revision,d.version_id,d.file_id,d.file_revision,d.content_type,d.size_bytes,d.duration_ms,'cancelled',0,0 FROM downloads d CROSS JOIN n WHERE d.id=?")
+        .bind(created.body["id"].as_str().unwrap()).execute(&f.app.db).await.unwrap();
     // More records than one API page: 205 ready and one cancelled.
     for n in 0..206 {
         sqlx::query(

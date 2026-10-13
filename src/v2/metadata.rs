@@ -31,6 +31,7 @@ use playscale_core::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sqlx::SqliteConnection;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn routes() -> Router<App> {
@@ -55,7 +56,7 @@ pub fn routes() -> Router<App> {
         )
         .route(
             "/catalog/items/{item_id}/artwork/selection",
-            put(select_artwork),
+            get(get_artwork_selection).put(select_artwork),
         )
         .route(
             "/media/assets/{asset_id}/content",
@@ -683,6 +684,21 @@ async fn decide_match(
             )));
         }
     }
+    if let Decision::Accept { candidate_id } = &decision {
+        let subject: String = sqlx::query_scalar("SELECT item_id FROM catalog_files WHERE id=?")
+            .bind(&proposal.file_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        super::catalog::curatable_item(&mut tx, &scope, &subject, false).await?;
+        if let Some(target) = proposal
+            .candidates
+            .iter()
+            .find(|candidate| &candidate.id == candidate_id)
+            .and_then(|candidate| candidate.item_id.as_deref())
+        {
+            super::catalog::authorize_merge_scope(&mut tx, &scope, &[subject], target).await?;
+        }
+    }
     let decided = service::decide_in_transaction(&mut tx, &id, expected, decision)
         .await
         .map_err(|e| match e {
@@ -981,6 +997,78 @@ async fn upload_artwork(
     tx.commit().await?;
     Ok(tagged(StatusCode::CREATED, &value, 1))
 }
+#[derive(Serialize)]
+pub(crate) struct ResolvedArtwork {
+    role: String,
+    pub(crate) asset_id: Option<String>,
+    selection_revision: String,
+    pinned: bool,
+    sources: Vec<String>,
+    conflict: bool,
+}
+
+/// The same role resolver supplies item posters and explicit selection reads.
+pub(crate) async fn resolved_artwork(
+    conn: &mut SqliteConnection,
+    item: &str,
+    role: &str,
+) -> Result<ResolvedArtwork, Problem> {
+    let selection: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT asset_id,revision FROM artwork_selections WHERE item_id=? AND role=?",
+    )
+    .bind(item)
+    .bind(role)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let contributions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role=? ORDER BY source",
+    ).bind(item).bind(role).fetch_all(&mut *conn).await?;
+    let pin = selection.as_ref().and_then(|(asset, _)| asset.clone());
+    let local = contributions
+        .iter()
+        .find(|(source, _)| source == "local")
+        .map(|(_, asset)| asset.clone());
+    let candidates = contributions
+        .iter()
+        .map(|(_, asset)| asset.clone())
+        .collect();
+    let pinned = pin.is_some();
+    let (asset_id, conflict) = playscale_core::artwork::resolve(pin, local, &candidates);
+    let sources = contributions
+        .into_iter()
+        .filter(|(_, asset)| asset_id.as_ref().is_none_or(|selected| selected == asset))
+        .map(|(source, _)| source)
+        .collect();
+    Ok(ResolvedArtwork {
+        role: role.into(),
+        asset_id,
+        selection_revision: selection.map_or(0, |(_, revision)| revision).to_string(),
+        pinned,
+        sources,
+        conflict,
+    })
+}
+
+async fn get_artwork_selection(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::CatalogRead)?;
+    let mut tx = app.db.begin().await?;
+    let (item, _) =
+        super::catalog::load_item(&mut tx, &core::catalog_scope(&caller.principal), &id, true)
+            .await?;
+    let mut roles = Vec::new();
+    for role in ["poster", "backdrop", "thumbnail", "banner"] {
+        roles.push(resolved_artwork(&mut tx, &item.id, role).await?);
+    }
+    let body =
+        serde_json::json!({"item_id":item.id,"revision":item.revision.to_string(),"roles":roles});
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, &body, item.revision as u64))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtworkSelectionInput {
