@@ -152,7 +152,7 @@ Its archive SHA-256 is
 the extracted server binary is
 `c1b25a94076ba0f2aab1eb8b3695142ed8dc7572ddf5c4b6f6a32a1a97791560`.
 The fixture uses restricted mode, a new database and private configuration under
-`/Volumes/seed1/Projects/motion-tui-access-artifacts`, with no live settings.
+an isolated build/artifact directory, with no live settings.
 A normal paired administrator performs all access changes through the actual
 terminal in a PTY. The protected operator file was used only to bootstrap that
 fixture administrator. Browser actions use the T3 collaborative browser.
