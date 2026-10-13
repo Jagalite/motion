@@ -117,7 +117,7 @@ fn version_label(edition: &str, v: &Value, item_files: &[Value]) -> String {
         .iter()
         .find(|f| first.is_some_and(|id| f["id"] == id))
     {
-        if let Some(bytes) = text(file, "size_bytes").parse::<f64>().ok() {
+        if let Ok(bytes) = text(file, "size_bytes").parse::<f64>() {
             parts.push(format!("{:.1} GB", bytes / 1e9));
         }
         if let Some(ms) = file["duration_ms"]
