@@ -36,6 +36,15 @@ Builds use Kyoto with `RUSTC` pinned to the 1.98.0 toolchain and isolated target
 temporary and isolated from live state.
 
 - Formatting and `git diff --check`: passed.
+- Initial CI on `3660792` failed publication privacy because this ledger used
+  absolute machine paths; portable locations fixed that in `a838d25` and the
+  local publication check passed.
+- The same initial CI failed to compile `caller_model`: its `Transition` struct
+  initializer omitted `disposition`. Commit `558bdee` uses the existing
+  `Transition::accepted` constructor. The CI rerun and local compile remain
+  pending; initial source review did not establish compilation.
+- Sol focused review of `558bdee`: no code findings. Its requested ledger
+  correction (record the initial CI failures and pending rerun) is included here.
 - Kyoto compilation job `c74625e7ab664a35bb00bce08399415b`: submitted; not yet a
   compilation or execution pass.
 - Requested targets: `playscale-core --test caller_model` and
