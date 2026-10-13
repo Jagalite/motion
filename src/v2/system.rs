@@ -165,6 +165,8 @@ pub async fn capabilities(
     let features = vec![
         api,
         feature("identity.pairing", true, true),
+        feature("identity.access_management", true, true),
+        feature("identity.invitations", true, true),
         feature("identity.browser_sessions", true, true),
         feature(
             "identity.trusted_private_ingress",

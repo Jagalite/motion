@@ -63,6 +63,7 @@ pub enum Purpose {
     PairingCode,
     Ticket,
     IngressCsrf,
+    Invitation,
 }
 
 impl Purpose {
@@ -74,6 +75,7 @@ impl Purpose {
             Self::PairingCode => "mdc",
             Self::Ticket => "mtk",
             Self::IngressCsrf => "csrf",
+            Self::Invitation => "min",
         }
     }
 }
@@ -95,6 +97,7 @@ pub struct DeviceRow {
     pub device: Device,
     pub name: String,
     pub client_name: String,
+    pub user_id: Option<String>,
 }
 
 type DeviceTuple = (
@@ -108,11 +111,23 @@ type DeviceTuple = (
     bool,
     i64,
     Option<i64>,
+    Option<String>,
 );
 
 fn decode(row: DeviceTuple) -> Result<DeviceRow, Problem> {
-    let (id, name, client_name, revision, profiles, permissions, policy, revoked, generation, exp) =
-        row;
+    let (
+        id,
+        name,
+        client_name,
+        revision,
+        profiles,
+        permissions,
+        policy,
+        revoked,
+        generation,
+        exp,
+        user_id,
+    ) = row;
     Ok(DeviceRow {
         device: Device {
             id,
@@ -128,10 +143,11 @@ fn decode(row: DeviceTuple) -> Result<DeviceRow, Problem> {
         },
         name,
         client_name,
+        user_id,
     })
 }
 
-const DEVICE_COLUMNS: &str = "id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at";
+const DEVICE_COLUMNS: &str = "id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at,user_id";
 
 pub async fn load_device(
     conn: &mut sqlx::SqliteConnection,
@@ -140,9 +156,21 @@ pub async fn load_device(
     let row: Option<DeviceTuple> =
         sqlx::query_as(&format!("SELECT {DEVICE_COLUMNS} FROM devices WHERE id=?"))
             .bind(id)
-            .fetch_optional(conn)
+            .fetch_optional(&mut *conn)
             .await?;
-    row.map(decode).transpose()
+    let mut row = row.map(decode).transpose()?;
+    if let Some(row) = &mut row {
+        let user = match &row.user_id {
+            Some(id) => super::access_management::load_user(conn, id).await?,
+            None => None,
+        };
+        if user.as_ref().is_none_or(|user| {
+            !playscale_core::access_admin::within(&row.device.grant, &row.device.policy, user)
+        }) {
+            row.device.revoked = true;
+        }
+    }
+    Ok(row)
 }
 
 pub async fn list_devices(
@@ -169,7 +197,31 @@ pub async fn insert_device(
     row: &DeviceRow,
 ) -> Result<(), Problem> {
     let d = &row.device;
-    sqlx::query("INSERT INTO devices(id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+    let user_id = match &row.user_id {
+        Some(id) => {
+            // Explicit association makes this a managed user. Its ceiling must
+            // no longer mirror one legacy device's policy endpoint.
+            sqlx::query("UPDATE access_users SET legacy=0 WHERE id=?")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+            id.clone()
+        }
+        None => {
+            let id = format!("user-{}", d.id);
+            let owner_name = format!("Device identity: {}", row.name);
+            let owner_name = if owner_name.chars().count() > 100 {
+                owner_name.chars().take(99).chain(['…']).collect::<String>()
+            } else {
+                owner_name
+            };
+            sqlx::query("INSERT INTO access_users(id,name,revision,profile_ids,permissions,policy,legacy,created_at) VALUES (?,?,1,?,?,?,1,?)")
+                .bind(&id).bind(owner_name).bind(json(&d.grant.profile_ids))
+                .bind(json(&d.grant.permissions)).bind(json(&d.policy)).bind(crate::now()).execute(&mut *conn).await?;
+            id
+        }
+    };
+    sqlx::query("INSERT INTO devices(id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at,created_at,user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&d.id)
         .bind(&row.name)
         .bind(&row.client_name)
@@ -181,6 +233,7 @@ pub async fn insert_device(
         .bind(d.generation as i64)
         .bind(d.credential_expires_at)
         .bind(crate::now())
+        .bind(user_id)
         .execute(conn)
         .await?;
     Ok(())

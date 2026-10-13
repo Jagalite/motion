@@ -2,6 +2,7 @@
 //! preconditions, idempotency records and pages. Access decisions are made by
 //! `playscale_core::access`; this module supplies stored facts and executes
 //! the decided effects inside one SQLite transaction.
+mod access_management;
 pub mod admin;
 pub mod auth;
 pub mod catalog;
@@ -326,8 +327,23 @@ impl From<AccessError> for Problem {
                 StatusCode::CONFLICT,
                 "The pairing expired; start a new pairing",
             ),
+            PairingDenied => (StatusCode::CONFLICT, "The pairing was denied"),
+            UserDisabled => (StatusCode::CONFLICT, "The access user is disabled"),
+            PolicyLimitExceeded => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Combined device restrictions exceed 200 blocked labels; adjust the device policy or approve a new device before changing this user",
+            ),
+            GrantExceeded => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "The grant exceeds the user access",
+            ),
+            LastAdministrator => (
+                StatusCode::CONFLICT,
+                "Keep another usable administrator device before removing this access",
+            ),
+            InvitationUnavailable => (StatusCode::CONFLICT, "The invitation is unavailable"),
             PairingPending => (StatusCode::CONFLICT, "The pairing is awaiting approval"),
-            PairingDecided => (StatusCode::CONFLICT, "The pairing was already approved"),
+            PairingDecided => (StatusCode::CONFLICT, "The pairing already has a decision"),
             UserCodeMismatch => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "The user code does not match the pairing",
@@ -757,7 +773,34 @@ pub fn router() -> Router<App> {
         .route("/admin/metrics", get(system::metrics))
         .route("/system/capabilities", get(system::capabilities))
         .route("/me", get(identity::me))
-        .route("/auth/pairings", post(identity::create_pairing))
+        .route(
+            "/auth/pairings",
+            post(identity::create_pairing).get(access_management::list_pairings),
+        )
+        .route(
+            "/auth/pairings/{pairing_id}/deny",
+            post(access_management::deny_pairing),
+        )
+        .route(
+            "/users",
+            get(access_management::list_users).post(access_management::create_user),
+        )
+        .route(
+            "/users/{user_id}",
+            get(access_management::get_user).put(access_management::replace_user),
+        )
+        .route(
+            "/auth/invitations",
+            get(access_management::list_invitations).post(access_management::create_invitation),
+        )
+        .route(
+            "/auth/invitations/redeem",
+            post(access_management::redeem_invitation),
+        )
+        .route(
+            "/auth/invitations/{invitation_id}",
+            axum::routing::delete(access_management::revoke_invitation),
+        )
         .route(
             "/auth/pairings/{pairing_id}/approve",
             post(identity::approve_pairing),

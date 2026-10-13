@@ -125,6 +125,8 @@ func (m Model) tableChrome(f frame) (strip, detail []string) {
 func (m Model) tableStrip(width int) []string {
 	cw := (width - 6) / 4
 	switch m.route.page {
+	case pagePairings, pageUsers, pageInvitations:
+		return m.accessDetail(width)
 	case pageNowPlaying, pageHistory:
 		if width < 60 {
 			return nil
@@ -306,7 +308,11 @@ func (m Model) tableDetail(width int) []string {
 			if d.ID != id {
 				continue
 			}
-			lines := append([]string{kv("ID", fgStyle.Render(clean(d.ID)))}, chipLines(d.Permissions, inner)...)
+			owner := "Unassigned"
+			if d.UserID != nil {
+				owner = m.userName(*d.UserID)
+			}
+			lines := append([]string{"Owner: " + owner + " · Client: " + clean(d.ClientName) + " · d revoke device"}, chipLines(d.Permissions, inner)...)
 			for len(lines) < 3 {
 				lines = append(lines, "")
 			}
