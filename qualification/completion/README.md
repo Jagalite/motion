@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented (review pending); rest of 3C and 3F not started | playback, part-subtitles, preparation-tracks and bitrate PRs | Merge by user; then 3F |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; rest of 3C and 3F not started | playback, part-subtitles, preparation-tracks and bitrate PRs | Merge by user; then 3F |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -508,7 +508,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     and refuses five malformed limits.
   - `access_api` 39 passed, `m3_workflows` 2, `server` 46, contract 5.
   - Pinned clippy with CI's flags: clean.
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** clean.
 
 ### Remaining item 3 slices (not started)
 
