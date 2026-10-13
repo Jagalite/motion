@@ -84,6 +84,11 @@ async fn list(
         .fetch_one(&mut *tx)
         .await?;
     let markers = load(&mut tx, &timeline).await?;
+    // The effective set depends on every marker and the current revision, so
+    // its pages are bound to the snapshot they were read from: a cursor names
+    // that snapshot, and a change between pages is refused rather than
+    // joining pages of two different effective sets.
+    let snapshot = query.effective.then(|| snapshot(current, &markers));
     let mut markers = if query.effective {
         core::effective(
             &markers.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
@@ -102,10 +107,28 @@ async fn list(
         markers
     };
     markers.sort_by(|(a, _), (b, _)| (a.start_ms, &a.id).cmp(&(b.start_ms, &b.id)));
-    // Keyset over (start, id), encoded as "<start>:<id>".
-    let after = match after.as_str() {
-        "" => None,
-        cursor => Some(
+    // Keyset over (start, id), encoded as "<start>:<id>"; for the effective
+    // view prefixed with its snapshot as "<snapshot>.<start>:<id>".
+    let after = match (after.as_str(), &snapshot) {
+        ("", _) => None,
+        (cursor, Some(snapshot)) => match cursor.split_once('.') {
+            Some((read, rest)) if read == snapshot => Some(rest),
+            Some(_) => {
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    "markers_changed",
+                    "The markers changed since the first page; read them again",
+                ));
+            }
+            None => {
+                return Err(Problem::bad("invalid_cursor", "The page cursor is invalid"));
+            }
+        },
+        (cursor, None) => Some(cursor),
+    };
+    let after = match after {
+        None => None,
+        Some(cursor) => Some(
             cursor
                 .split_once(':')
                 .and_then(|(s, id)| Some((s.parse::<u64>().ok()?, id.to_owned())))
@@ -122,7 +145,10 @@ async fn list(
         .take(limit as usize + 1)
         .map(|(m, revision)| {
             (
-                format!("{}:{}", m.start_ms, m.id),
+                match &snapshot {
+                    Some(snapshot) => format!("{snapshot}.{}:{}", m.start_ms, m.id),
+                    None => format!("{}:{}", m.start_ms, m.id),
+                },
                 body(&timeline, m, revision),
             )
         })
@@ -130,6 +156,20 @@ async fn list(
     let page = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;
     Ok(Json(page))
+}
+
+/// An identity of the facts the effective view is decided from: the
+/// timeline revision and every marker with its revision.
+fn snapshot(timeline_revision: i64, markers: &[(Marker, u64)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut ids: Vec<(&str, u64)> = markers.iter().map(|(m, r)| (m.id.as_str(), *r)).collect();
+    ids.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(timeline_revision.to_string());
+    for (id, revision) in ids {
+        digest.update(format!("\n{id}/{revision}"));
+    }
+    format!("{:x}", digest.finalize())[..32].to_owned()
 }
 
 /// Every stored marker of the timeline with its own revision.
@@ -273,11 +313,9 @@ async fn create(
             .fetch_one(&mut *tx)
             .await?;
     let label = input.label.as_deref().map(str::trim);
-    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM markers WHERE timeline_id=?")
-        .bind(&timeline)
-        .fetch_one(&mut *tx)
-        .await?;
-    core::admits_another(existing.max(0) as usize).map_err(rejected)?;
+    crate::markers::admission(&mut tx, &timeline)
+        .await?
+        .map_err(rejected)?;
     core::validate(
         input.kind,
         input.start_ms,

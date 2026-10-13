@@ -2787,7 +2787,7 @@ async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
     );
     // A timeline holds at most MAX_MARKERS; every one stays readable.
     let max = playscale_core::markers::MAX_MARKERS;
-    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) SELECT printf('bulk-%04d',i),'film-a-ed',?,'chapter',i*1000,NULL,NULL,'imported' FROM n")
+    sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?) INSERT INTO markers(id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) SELECT printf('bulk-%04d',i),'film-a-ed',?,'chapter',i*1000,NULL,NULL,'embedded' FROM n")
         .bind((max - 4) as i64)
         .bind(revision.parse::<i64>().unwrap())
         .execute(&f.app.db)
@@ -2807,6 +2807,25 @@ async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
         StatusCode::CONFLICT,
         "marker_limit",
     );
+    // The adapter's other creation path enforces the same bound.
+    assert!(matches!(
+        playscale::markers::create(
+            &f.app,
+            "film-a-ed",
+            revision.parse().unwrap(),
+            playscale::markers::NewMarker {
+                kind: playscale_core::markers::Kind::Chapter,
+                start_ms: 500,
+                end_ms: None,
+                label: None,
+                provenance: playscale_core::markers::Provenance::Detected,
+            },
+        )
+        .await,
+        Err(playscale::markers::MarkersError::Rejected(
+            playscale_core::markers::MarkerError::TooManyMarkers
+        ))
+    ));
     let mut seen = 0;
     let mut cursor: Option<String> = None;
     loop {
@@ -2823,6 +2842,55 @@ async fn markers_are_revision_bound_and_manual_corrections_take_effect() {
         }
     }
     assert_eq!(seen, max, "every marker is readable across pages");
+    // Effective pages are bound to one snapshot (here the embedded chapters
+    // span several pages): any marker changing between pages refuses the
+    // next page instead of mixing two effective sets.
+    let effective = format!("{path}?effective=true&limit=200");
+    let first = f
+        .call("GET", &effective, None, &[("authorization", &op)])
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let next = first.body["next_cursor"].as_str().unwrap().to_owned();
+    let resumed = |cursor: &str| {
+        let q = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("cursor", cursor)
+            .finish();
+        format!("{effective}&{q}")
+    };
+    let unchanged = f
+        .call("GET", &resumed(&next), None, &[("authorization", &op)])
+        .await;
+    assert_eq!(unchanged.status, StatusCode::OK, "{}", unchanged.body);
+    sqlx::query("UPDATE markers SET revision=revision+1 WHERE id='chap-2'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    problem(
+        &f.call("GET", &resumed(&next), None, &[("authorization", &op)])
+            .await,
+        StatusCode::CONFLICT,
+        "markers_changed",
+    );
+    // A plain cursor is not accepted by the effective view.
+    let plain = f
+        .call(
+            "GET",
+            &format!("{path}?limit=200"),
+            None,
+            &[("authorization", &op)],
+        )
+        .await;
+    problem(
+        &f.call(
+            "GET",
+            &resumed(plain.body["next_cursor"].as_str().unwrap()),
+            None,
+            &[("authorization", &op)],
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_cursor",
+    );
     sqlx::query("DELETE FROM markers WHERE id LIKE 'bulk-%'")
         .execute(&f.app.db)
         .await

@@ -3983,7 +3983,10 @@ paths:
         required: false
         description: Only the markers in effect for the timeline's current revision (a manual correction
           outranks embedded, imported and detected markers). Otherwise every marker, each with the timeline
-          revision it was validated against and its provenance.
+          revision it was validated against and its provenance. The effective set is decided over every
+          marker, so a page cursor of this view is bound to the set it was read from; if markers or the
+          timeline change between pages, the next page is refused with 409 `markers_changed` and the
+          reader starts again.
         schema:
           type: boolean
     post:

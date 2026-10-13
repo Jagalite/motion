@@ -467,6 +467,17 @@ Not started. Depends on item 1.
   After the fixes: core lib 148, `playscale` lib 68, compose 22, `v2_catalog`
   20, contract 5, player JS 25 passed.
 
+  Round 2 at `0bb34b3` raised two P2 findings, both fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | M5 | Effective pages were each decided in their own transaction, so a change between pages could join two effective sets (embedded chapters plus a later manual one) | Fixed: an effective-view cursor names a snapshot (digest of the timeline revision and every marker ID and revision); a change between pages is refused with 409 `markers_changed`. The player restarts the read, up to three times, then shows none. Integration test changes a marker between pages and is refused; a plain cursor is refused by the effective view |
+  | M6 | The older adapter `markers::create` did not enforce `MAX_MARKERS` | Fixed: both creation paths share `markers::admission` in their write transaction; the integration test is refused by both at the bound |
+
+  After round 2: `v2_catalog` markers test, `catalog_workflows` 27,
+  contract 5, `playscale` lib 68 passed; pinned clippy with CI's flags
+  clean.
+
 
 ### Remaining item 6 work (not started)
 

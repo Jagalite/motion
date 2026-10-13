@@ -39,6 +39,20 @@ pub struct NewMarker<'a> {
     pub provenance: Provenance,
 }
 
+/// Whether the timeline may hold one more marker (core `admits_another`),
+/// counted in the caller's write transaction. Every creation path checks it,
+/// so every marker of a timeline stays readable.
+pub(crate) async fn admission(
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+) -> Result<Result<(), MarkerError>, sqlx::Error> {
+    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM markers WHERE timeline_id=?")
+        .bind(timeline)
+        .fetch_one(conn)
+        .await?;
+    Ok(core::admits_another(existing.max(0) as usize))
+}
+
 /// Add a marker validated against the reviewed timeline revision.
 pub async fn create(
     app: &App,
@@ -71,6 +85,9 @@ pub async fn create(
         duration.and_then(|d| u64::try_from(d).ok()),
     )
     .map_err(MarkersError::Rejected)?;
+    admission(&mut tx, timeline)
+        .await?
+        .map_err(MarkersError::Rejected)?;
     let id = new_id();
     let as_i64 = |v: u64| i64::try_from(v).map_err(|e| MarkersError::Storage(e.into()));
     sqlx::query("INSERT INTO markers (id,timeline_id,timeline_revision,kind,start_ms,end_ms,label,provenance) VALUES (?,?,?,?,?,?,?,?)")

@@ -305,6 +305,23 @@ impl Queries {
     /// Every row of a paged list, bounded to `pages` pages of 200. Callers
     /// use server filters and orderings to keep the read narrow; beyond the
     /// bound this reports unavailable rather than a partial view.
+    /// Every page of a timeline's effective markers (a timeline holds at
+    /// most `MAX_MARKERS`). Pages are bound to one snapshot: a change between
+    /// pages is refused, and the read starts again a few times before showing
+    /// none, never a mix of two effective sets.
+    async fn effective_markers(&self, timeline_id: &str) -> Vec<Value> {
+        let path = format!(
+            "/catalog/timelines/{}/markers?effective=true",
+            segment(timeline_id)
+        );
+        for _ in 0..3 {
+            if let Ok(markers) = self.list_all(&path, 5).await {
+                return markers;
+            }
+        }
+        vec![]
+    }
+
     async fn list_all(&self, path: &str, pages: usize) -> UiResult<Vec<Value>> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let mut rows = Vec::new();
@@ -680,17 +697,9 @@ impl UiQueryFacade for Queries {
                 audio_version: audio_source.as_ref().map(|s| s.0.clone()),
                 audio_file: audio_source.map(|(_, file, revision)| (file, revision)),
                 // Chapters and skip markers in effect; none if unreadable.
-                // Every page (a timeline holds at most core::MAX_MARKERS).
                 markers: self
-                    .list_all(
-                        &format!(
-                            "/catalog/timelines/{}/markers?effective=true",
-                            segment(timeline_id)
-                        ),
-                        5,
-                    )
+                    .effective_markers(timeline_id)
                     .await
-                    .unwrap_or_default()
                     .iter()
                     .map(|m| MarkerView {
                         kind: text(m, "kind"),
