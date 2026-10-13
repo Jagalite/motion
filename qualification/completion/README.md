@@ -22,7 +22,7 @@ item below is the single completion agent unless stated otherwise.
 
 | Item | State | PR | Next step |
 |---|---|---|---|
-| 0 Plan reconciliation | Implemented (docs) | pending | Sol review; merge by user |
+| 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Not started | — | S30 agent change |
 | 2 Library query scaling | Not started | — | Scan history ordering |
 | 3 Production playback and preparation | Not started | — | Filter and color-fact observation |
@@ -47,7 +47,9 @@ item below is the single completion agent unless stated otherwise.
 - **Focused evidence:** `python3 scripts/check_publication.py`-equivalent
   source scan of changed files (no machine paths or private hosts); link check
   of changed relative links. No application build is needed.
-- **Review:** pending (GPT-6.1 Sol).
+- **Review:** GPT-6.1 Sol (high effort, read-only) reviewed `8d19d28` against
+  `origin/main`: no actionable findings. It independently reran the privacy
+  scan, the relative-link check and the 152/156 served-operation count.
 - **Release checks:** none.
 
 ## 1. Download correctness and bounded storage
