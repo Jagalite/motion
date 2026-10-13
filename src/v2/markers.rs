@@ -85,7 +85,7 @@ async fn list(
         .await?;
     let mut markers = load(&mut tx, &timeline).await?;
     markers.extend(
-        embedded(&mut tx, &timeline, current as u64)
+        embedded(&mut tx, &caller.principal, &timeline, current as u64)
             .await?
             .into_iter()
             .map(|m| (m, 1)),
@@ -166,33 +166,52 @@ async fn list(
 
 /// The chapters the timeline's whole, single-file original records
 /// (`markers::embedded_chapters`), at its current revision: file facts, so
-/// they follow the timeline. Their identities name the file revision.
+/// they follow the timeline. Their identities name the file revision. Only
+/// an original the caller may read is a source (as for playback), so a
+/// copy in another library never discloses its chapters.
 async fn embedded(
     conn: &mut sqlx::SqliteConnection,
+    principal: &access::Principal,
     timeline: &str,
     revision: u64,
 ) -> Result<Vec<Marker>, Problem> {
-    let row: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
-        "SELECT f.revision,f.chapters_json,t.duration_ms FROM timelines t JOIN media_versions v ON v.timeline_id=t.id \
+    type Row = (String, String, Option<String>, Option<i64>, Option<f64>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT f.id,f.revision,f.chapters_json,t.duration_ms,f.duration_seconds FROM timelines t JOIN media_versions v ON v.timeline_id=t.id \
          JOIN version_files b ON b.version_id=v.id AND b.part=1 JOIN media_files f ON f.id=b.file_id \
          WHERE t.id=? AND v.origin='original' AND f.generated=0 AND b.file_revision=f.revision \
          AND b.start_ms IS NULL AND b.end_ms IS NULL \
          AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1) \
-         AND f.chapters_json IS NOT NULL AND f.chapters_json<>'[]' ORDER BY v.id LIMIT 1",
+         AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1) \
+         AND f.chapters_json IS NOT NULL AND f.chapters_json<>'[]' ORDER BY v.id,f.id LIMIT 100",
     )
     .bind(timeline)
-    .fetch_optional(conn)
+    .fetch_all(&mut *conn)
     .await?;
-    let Some((file_revision, Some(chapters), duration)) = row else {
-        return Ok(vec![]);
-    };
-    let chapters: Vec<core::FileChapter> = serde_json::from_str(&chapters).unwrap_or_default();
-    Ok(core::embedded_chapters(
-        &chapters,
-        duration.and_then(|d| u64::try_from(d).ok()),
-        revision,
-        &format!("embedded-{}", &file_revision[..file_revision.len().min(16)]),
-    ))
+    for (file, file_revision, chapters, timeline_ms, file_seconds) in rows {
+        if !playscale_core::playback_session::readable(
+            principal,
+            super::content::file_facts(conn, &file).await?.as_ref(),
+        ) {
+            continue;
+        }
+        let chapters: Vec<core::FileChapter> =
+            serde_json::from_str(chapters.as_deref().unwrap_or("[]")).unwrap_or_default();
+        // The timeline's duration, else the whole file's (scan-created
+        // timelines record none), so chapters past the media's end drop.
+        let duration = timeline_ms.and_then(|d| u64::try_from(d).ok()).or_else(|| {
+            file_seconds
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .map(|s| (s * 1000.0).floor() as u64)
+        });
+        return Ok(core::embedded_chapters(
+            &chapters,
+            duration,
+            revision,
+            &format!("embedded-{}", &file_revision[..file_revision.len().min(16)]),
+        ));
+    }
+    Ok(vec![])
 }
 
 /// An identity of the facts the effective view is decided from: the

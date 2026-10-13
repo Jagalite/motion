@@ -1337,6 +1337,17 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   | core `markers` | 3 passed. New: ordering, drops (duplicate start, beyond the end), trimmed labels, manual precedence, the 200 bound |
   | `tests/v2_playback.rs` `container_chapters_are_embedded_markers_of_the_timeline` | passed. A real ffmpeg file with two chapters lists them as `embedded` and in effect; they stay in effect after a timeline revision; a manual chapter outranks them while they stay listed; a file whose chapters were never recorded is probed for them on the next scan |
   | `v2_playback`, `v2_catalog`, `scans`, `catalog_workflows`, `catalog_persistence` | 31, 20, 8, 27, 15 passed |
+- **Review (GPT-6.1 Sol):** round 1 at `d0ca53f` raised one P1 and three
+  P2 findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | C1 (P1) | The source original was chosen without the caller's scope, so a chaptered copy in another library could disclose its chapter titles and positions | Fixed: candidate originals are filtered as playback does (enabled library, `readable` on the file's facts) before one is chosen. Integration test with a timeline whose originals are in two libraries: each scoped caller sees only its own library's chapters |
+  | C2 | `coalesce` carried stored chapters onto replaced content whose chapters could not be probed, and they were never probed again | Fixed: stored chapters are kept only while the content revision is unchanged; otherwise NULL, so the next scan retries. Integration test replaces the file with unprobeable bytes |
+  | C3 | Scan-created timelines have no duration, so chapters past the media's end were not dropped | Fixed: the whole file's probed duration bounds them when the timeline has none. Integration test |
+  | C4 | The chapter-only probe was awaited directly, ignoring cancellation and shutdown for up to 30 s | Fixed: it runs under the same job-state and shutdown polling as a full inspection; dropping it kills ffprobe. Not covered by a dedicated test (no stalling ffprobe fixture) |
+
+  After the fixes: `v2_playback` 32, `scans` 8, `v2_catalog` 20 passed; clippy clean.
 
 ### Remaining item 6 work (not started)
 

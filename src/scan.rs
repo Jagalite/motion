@@ -612,13 +612,26 @@ pub async fn run_scan(app: &App, job: &JobRow, shutdown: &CancellationToken) -> 
                 };
             if let Some(mut file) = reused {
                 if file.chapters.is_none() {
-                    file.chapters = probe_chapters(
+                    // Interruptible like a full inspection: dropping the
+                    // probe kills its ffprobe child.
+                    let probe = probe_chapters(
                         path.clone(),
                         relative.clone(),
                         &app.ffprobe,
                         &file.fingerprint,
-                    )
-                    .await;
+                    );
+                    tokio::pin!(probe);
+                    file.chapters = loop {
+                        tokio::select! {
+                            chapters = &mut probe => break chapters,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                let current = db::get_job(&app.db, &job.id).await?;
+                                if shutdown.is_cancelled() || !current.state()?.executing(job.attempt.try_into()?) {
+                                    stop.cancel(); anyhow::bail!("scan interrupted");
+                                }
+                            }
+                        }
+                    };
                 }
                 found.push(file);
                 continue;
@@ -825,7 +838,7 @@ async fn finish(
             let file_id = id.clone();
             let file_relative = file.relative.clone();
             let edition_timeline = edition.clone();
-            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=coalesce(excluded.chapters_json,media_files.chapters_json) WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
+            sqlx::query("INSERT INTO media_files (id,edition_id,library_id,relative_path,revision,fingerprint,bytes,duration_seconds,tracks_json,available,chapters_json) VALUES (?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(id) DO UPDATE SET relative_path=excluded.relative_path,revision=excluded.revision,fingerprint=excluded.fingerprint,bytes=excluded.bytes,duration_seconds=excluded.duration_seconds,tracks_json=excluded.tracks_json,available=1,chapters_json=CASE WHEN excluded.chapters_json IS NOT NULL THEN excluded.chapters_json WHEN media_files.revision=excluded.revision THEN media_files.chapters_json END WHERE media_files.revision<>excluded.revision OR media_files.fingerprint<>excluded.fingerprint OR media_files.relative_path<>excluded.relative_path OR media_files.available=0 OR media_files.tracks_json<>excluded.tracks_json OR media_files.duration_seconds IS NOT excluded.duration_seconds OR (excluded.chapters_json IS NOT NULL AND media_files.chapters_json IS NOT excluded.chapters_json)")
                 .bind(id).bind(edition).bind(&job.library_id).bind(file.relative).bind(file.revision).bind(file.fingerprint).bind(file.bytes).bind(file.duration).bind(serde_json::to_string(&file.tracks)?).bind(file.chapters.as_ref().map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
             if first_version {
                 // Unknown equivalence is permitted only in the new, empty timeline.

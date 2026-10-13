@@ -7248,4 +7248,143 @@ async fn container_chapters_are_embedded_markers_of_the_timeline() {
         stored.as_deref().is_some_and(|c| c.contains("Opening")),
         "{stored:?}"
     );
+    // A scan-created timeline records no duration; the file's own bounds
+    // the chapters, so one past the media's end is dropped.
+    let db = &f.server.app.db;
+    sqlx::query("UPDATE timelines SET duration_ms=NULL WHERE id=?")
+        .bind(&timeline)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"UPDATE media_files SET chapters_json='[{"start_ms":0,"end_ms":2000,"title":"Opening"},{"start_ms":9000,"end_ms":null,"title":"Past the end"}]'"#,
+    )
+    .execute(db)
+    .await
+    .unwrap();
+    assert_eq!(
+        labels(&read("").await)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect::<Vec<_>>(),
+        ["Opening", "Mine"]
+    );
+    // Replaced content whose chapters cannot be probed keeps none of the
+    // old ones: they belonged to the previous revision.
+    let before: String = sqlx::query_scalar("SELECT revision FROM media_files")
+        .fetch_one(db)
+        .await
+        .unwrap();
+    std::fs::write(
+        f.dir.path().join("media").join("film.mp4"),
+        b"not a media file any more",
+    )
+    .unwrap();
+    f.scan().await;
+    let (after, stored): (String, Option<String>) =
+        sqlx::query_as("SELECT revision,chapters_json FROM media_files")
+            .fetch_one(db)
+            .await
+            .unwrap();
+    assert_ne!(after, before);
+    assert_eq!(stored, None, "stale chapters on a new revision");
+}
+
+/// Embedded chapters come only from an original the caller may read: a
+/// chaptered copy of the same timeline in another library discloses
+/// nothing to a caller scoped to the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn embedded_chapters_come_only_from_readable_originals() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    f.scan().await;
+    let other_root = f.dir.path().join("other");
+    std::fs::create_dir(&other_root).unwrap();
+    let chapters = f.dir.path().join("chapters.txt");
+    std::fs::write(
+        &chapters,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=3000\ntitle=Hidden\n",
+    )
+    .unwrap();
+    let status = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+        ])
+        .arg("-i")
+        .arg(&chapters)
+        .args([
+            "-map",
+            "0",
+            "-map_chapters",
+            "1",
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(other_root.join("cut.mp4"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let other = db::add_library(&f.server.app.db, "Other", &other_root)
+        .await
+        .unwrap()
+        .id;
+    f.scan_library(&other).await;
+    let db = &f.server.app.db;
+    let (timeline, edition): (String, String) = sqlx::query_as(
+        "SELECT t.id,t.edition_id FROM timelines t JOIN media_files f ON f.edition_id=t.edition_id WHERE f.relative_path='film.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    let (file, version): (String, String) = sqlx::query_as(
+        "SELECT f.id,b.version_id FROM media_files f JOIN version_files b ON b.file_id=f.id WHERE f.relative_path='cut.mp4'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE media_files SET edition_id=? WHERE id=?")
+        .bind(&edition)
+        .bind(&file)
+        .execute(db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_versions SET timeline_id=? WHERE id=?")
+        .bind(&timeline)
+        .bind(&version)
+        .execute(db)
+        .await
+        .unwrap();
+    for (library, expected) in [(f.library.clone(), 0), (other.clone(), 1)] {
+        let (device, auth) = f.device(&["default"], PLAYER).await;
+        f.policy(&device, &[library.as_str()], PLAYER, "\"r-2\"")
+            .await;
+        let page = f
+            .get(
+                &format!("/api/v2/catalog/timelines/{timeline}/markers"),
+                &auth,
+            )
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        let embedded: Vec<_> = page.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["provenance"] == "embedded")
+            .collect();
+        assert_eq!(embedded.len(), expected, "{library}: {}", page.body);
+    }
 }
