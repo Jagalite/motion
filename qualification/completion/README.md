@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented (review pending); offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads and offline-artwork PRs | Merge by user; then 5F |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads and offline-artwork PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1160,6 +1160,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   Covered by a store test and an agent test against the real cache tool
   (it runs when `MOTION_UI_HOST_BINARY` names a built binary). Store 20
   and desktop JS 56 passed, with the real-cache test run.
+
+  Round 4 at `bf78128` is clean: no actionable findings.
 
 ### Remaining item 5 work (not started)
 
