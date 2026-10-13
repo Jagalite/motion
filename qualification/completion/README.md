@@ -654,6 +654,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   After the fixes: `v2_playback` 34 passed; clippy clean.
 
+  Round 4 at `aa963d5` is clean: no actionable findings.
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
