@@ -8,8 +8,7 @@ retained; the integration is validated together before landing on main.
 ## Repair ownership and independent review
 
 - [Access repairs](access-fixes.md): 37bcbeb, five administrator access findings.
-- [Completion repairs](completion-fixes.md): checkpoint 9e6e42f and subsequent
-  repair batch; detailed dispositions distinguish fixed descendants from new fixes.
+- [Completion repairs](completion-fixes.md): checkpoints 9e6e42f, a4cd66a and 505ee18; detailed dispositions distinguish fixed descendants from new fixes.
 - [Library/marker repairs](completion-ui-fixes.md): 35ddbff, scoped descendant
   choices, durable manual correction order, chapter selection and probe bounds.
 - [Preview repairs](preview-fixes.md): 064833b/0196469, shared core admission,
@@ -24,7 +23,10 @@ review. It then reviewed 35ddbff and integration 81710ef and found the scanner
 was not requesting rotation fields. 5c4d219 requests both display-matrix rotation
 and the legacy rotate tag and adds a production-scanner observation regression;
 Sol rechecked the repair. These reviews are source evidence, not Rust test or
-browser qualification. The final completion batch has a separate review pending.
+browser qualification. Sol reviewed a4cd66a and 505ee18, then converter admission repair c618fe8 and
+populated restore regression3717d0d. Bounded cache, transfer-status expectation
+and subtitle directory durability observations were repaired before acceptance.
+No source blocker remained in those reviewed commits; CI still gates merging.
 
 ## Integration correctness boundaries
 

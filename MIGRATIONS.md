@@ -69,6 +69,8 @@ applying any pending migration to an existing database.
 | 0061 | `0061_issued_viewing_histories.sql` | Restore reconciliation | only known issued epochs may re-anchor offline sequences |
 | 0062 | `0062_marker_creation_order.sql` | Marker corrections | persisted creation order for manual corrections |
 
+| 0063 | `0063_download_subtitle_artifacts.sql` | Required download artifacts | durable subtitle digest, size and failure state |
+
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
