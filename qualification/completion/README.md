@@ -26,7 +26,7 @@ item below is the single completion agent unless stated otherwise.
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
-| 4 Library-management UI | Implemented | library-ui PR | Tests, Sol review |
+| 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | Not started | — | After item 1 |
 | 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
