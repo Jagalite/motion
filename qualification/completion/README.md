@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented (review pending); 5C–5F not started | offline-roots and offline-removal PRs | Merge by user; then 5C |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C–5F not started | offline-roots and offline-removal PRs | Merge by user; then 5C |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -737,6 +737,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   a server confirmation does not settle; a reopen keeps the intent and the
   host does not present the title; once the cleanup can run, it settles.
   Core 151, store 15 and cache 9 passed.
+
+  Round 4 at `0496fc7`: clean.
 
 ### Remaining item 5 work (not started)
 
