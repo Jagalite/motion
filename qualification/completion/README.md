@@ -444,6 +444,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Review, round 2:** one P2, fixed. When only one library remained, the
   hidden chooser named no root, so the emptied most recent root opened. The
   surviving root is now always named.
+- **Review, round 3:** clean.
 - **Release checks:** the Electron run of the chooser with two real servers.
 
 ### Remaining item 5 work (not started)
