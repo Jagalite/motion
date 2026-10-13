@@ -1271,6 +1271,7 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
     for reanchor in [
         json!({"from_viewing_epoch": after, "through": "3"}),
         json!({"from_viewing_epoch": "another-server:r1", "through": "3"}),
+        json!({"from_viewing_epoch": format!("{server}:invented"), "through": "1000"}),
         json!({"from_viewing_epoch": before, "through": "x"}),
     ] {
         problem(
