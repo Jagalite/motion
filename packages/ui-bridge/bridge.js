@@ -162,13 +162,20 @@ function definitelyRejected(error) {
 // After a command the page is rendered again by the server. A keyboard or
 // screen-reader user keeps their place: the form that ran gets focus again
 // and its status says the command was done. A form is recognised by what it
-// acts on (its command, fixed fields and fixed body, not its revision), and
+// acts on (its command, fixed fields and fixed body, not its revision or
+// revision preconditions), and
 // only when exactly one form on the new page matches; otherwise (it is gone,
 // or several look alike) focus goes to the main content. Never another
 // entry's action, which a repeated key press would then run.
 const AFTER_COMMAND = 'motion:after-command';
+// Revision preconditions (expected_revision, expected_group_revision,
+// timeline_revision, …) change with every successful command; they say
+// which state an action applies to, not which action it is.
+const PRECONDITION = /(^|\.)expected_|revision$/;
 function formIdentity(form) {
-  const fixed = [...form.querySelectorAll('input[type="hidden"][name]')].map(input => `${input.name}=${input.value}`);
+  const fixed = [...form.querySelectorAll('input[type="hidden"][name]')]
+    .filter(input => !PRECONDITION.test(input.name))
+    .map(input => `${input.name}=${input.value}`);
   const body = form.querySelector('[data-json-body]')?.value ?? '';
   return JSON.stringify([form.dataset.command, fixed, body]);
 }

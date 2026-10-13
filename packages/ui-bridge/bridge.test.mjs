@@ -368,6 +368,20 @@ test('after a command reloads the page, focus returns to the same action, never 
   runInNewContext(source, context());
   assert.equal(details.open, true);
   assert.deepEqual(focused.at(-1), 'PUT /api/v2/libraries/l1 l1');
+  // A revision precondition that every success advances is not identity:
+  // "Place" is found again after its group revision moved on.
+  const place = (revision) => {
+    const form = makeForm('POST /api/v2/catalog/order-groups/g1/placements', 'g1');
+    const fields = [{name: 'timeline_id', value: 't1'}, {name: 'expected_group_revision', value: revision}];
+    form.querySelectorAll = s => s.startsWith('input[type="hidden"]') ? fields : [];
+    return form;
+  };
+  forms = [place('3')];
+  before.reloadAfter(forms[0]);
+  forms = [place('4')];
+  runInNewContext(source, context());
+  assert.deepEqual(focused.at(-1), 'POST /api/v2/catalog/order-groups/g1/placements g1');
+  assert.equal(forms[0].status.textContent, 'Done.');
   // Another page: nothing is moved.
   const count = focused.length;
   before.reloadAfter(forms[0]);

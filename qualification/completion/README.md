@@ -1852,6 +1852,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   fall back too; a closed disclosure is opened; another page moves
   nothing. ui-bridge 48 passed.
 
+  Round 2 at `8035b65` raised one P2 finding, fixed:
+  - **Revision preconditions:** hidden `expected_*` and `…revision`
+    fields (such as the Place form's `expected_group_revision`) change with
+    every successful command. Including them in the identity sent focus to
+    the main content instead of back to Place. They are now excluded: they
+    say which state an action applies to, not which action it is. Test:
+    "Place" is found again after its group revision moved from 3 to 4.
+    ui-bridge 48 passed.
+
 ### Remaining item 6 work
 
 | Slice | Next step | Blocker |
