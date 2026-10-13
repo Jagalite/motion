@@ -353,11 +353,62 @@ pub struct MembershipRow {
     pub toggle_body: String,
 }
 
+/// A title that could be merged into the one being managed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeCandidate {
+    pub id: String,
+    pub title: String,
+    pub revision: String,
+}
+
+/// One version of a title's timelines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionRow {
+    pub id: String,
+    pub label: String,
+}
+
+/// An explicit play order (aired, DVD, absolute, custom) of one edition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderGroupView {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub edition: String,
+    /// The group revision a placement is fenced with.
+    pub revision: String,
+}
+
+/// One of the title's timelines and its current place in an order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderedTimeline {
+    pub id: String,
+    pub edition: String,
+    pub etag: String,
+    pub group_id: Option<String>,
+    pub position: Option<u64>,
+}
+
+/// The title's explicit play orders and where its timelines are placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderingView {
+    /// (edition ID, label) an order can be created for.
+    pub editions: Vec<(String, String)>,
+    pub groups: Vec<OrderGroupView>,
+    pub timelines: Vec<OrderedTimeline>,
+}
+
 /// Everything the title management page shows. Sections are `None` when the
 /// principal lacks the permission or the read is unavailable; the page says which.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemManageView {
     pub item: ItemCard,
+    /// The item's catalog revision (merge and split plans are fenced by it).
+    pub item_revision: String,
+    /// Other readable titles with this one's title, as merge sources.
+    pub merge_candidates: Option<Vec<MergeCandidate>>,
+    /// Every version of the item's timelines, as split choices.
+    pub versions: Option<Vec<VersionRow>>,
     pub library_ids: Vec<String>,
     pub match_state: String,
     pub item_etag: String,
@@ -368,6 +419,8 @@ pub struct ItemManageView {
     pub timelines: Option<Vec<PrepareTimeline>>,
     pub collections: Option<Vec<MembershipRow>>,
     pub playlists: Option<Vec<MembershipRow>>,
+    /// Play orders (catalog:write).
+    pub ordering: Option<OrderingView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +429,8 @@ pub struct CollectionView {
     pub name: String,
     /// manual | smart
     pub kind: String,
+    /// The saved filter a smart collection follows.
+    pub filter_id: Option<String>,
     pub etag: String,
     pub items: Vec<ItemCard>,
     /// Exact replacement bodies removing each listed item, in `items` order.
@@ -399,11 +454,32 @@ pub struct PlaylistView {
     pub entry_bodies: Vec<(String, Option<String>)>,
 }
 
+/// One condition of a saved filter, as the API stores it (`FilterTerm`); the
+/// value is rendered as text (`true`, `1990`, `movie`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterTermView {
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+}
+
+/// A saved filter of the current profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFilterView {
+    pub id: String,
+    pub name: String,
+    pub etag: String,
+    pub terms: Vec<FilterTermView>,
+    /// A smart collection uses it (the server refuses deleting it).
+    pub in_use: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrganizeView {
     pub profile_id: String,
     pub collections: Vec<CollectionView>,
     pub playlists: Vec<PlaylistView>,
+    pub filters: Vec<SavedFilterView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

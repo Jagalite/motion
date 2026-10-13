@@ -26,7 +26,7 @@ item below is the single completion agent unless stated otherwise.
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
-| 4 Library-management UI | Not started | — | After item 2 |
+| 4 Library-management UI | Implemented | library-ui PR | Tests, Sol review |
 | 5 Offline breadth | Not started | — | After item 1 |
 | 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
@@ -359,8 +359,36 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
 ## 4. Library-management UI workflows
 
-Not started. Online provider matching and provider artwork remain the approved
-deferral.
+- **Source SHA:** branch `plan-completion/library-ui`, stacked on item 3.
+- **Implemented** (all through existing public operations, except one
+  additive read field):
+
+  | Workflow | Where | How |
+  |---|---|---|
+  | Saved filters and smart collections | `/organize` "Saved filters" | Typed condition fields (kind, title contains, genre, tag, year from/to, watched, available) encoded by a new bridge `term` field type. "Make smart collection" sends the exact body for that filter. Edits are If-Match guarded and carry conditions the form cannot show unchanged. A filter in use is not offered for deletion (the server refuses it too) |
+  | Play orders and timeline placement | Manage page "Play order" | Create an order (aired, DVD, absolute, custom) for an edition against the item validator; place each timeline with its validator and the destination group's revision |
+  | Merge and split | Manage page "Duplicates and versions" | Merge candidates are readable titles found by this title, each with a precomputed body pinning both revisions. Split chooses versions and a new title. Both preview first and commit exactly that plan (existing bridge plan flow) |
+  | Library and source deletion | `/sources` disclosures | States what is and is not removed (no media is deleted; a used source is not offered; a source with cataloged files is disabled instead). Requires an explicit confirmation and the revision the page showed |
+  | Backdrop, banner and thumbnail | Manage page artwork | A role selector per image. The API does not report non-poster selections, and the page says so |
+  | Readable match proposals | `/matches` | `Match.subject` (additive): the file name, plus the title it is cataloged under when the caller may read it |
+- **Unsupported / limits:** current backdrop/banner/thumbnail choices are
+  not shown (no read exists). Merge candidates come from a title search (20),
+  not a duplicate detector. Play orders list up to 20 timelines per title.
+- **Core/adapter boundary:** no new state-dependent rule. Revision
+  preconditions, idempotency, plan tokens, merge/split validity, deletion
+  refusal and filter validation are existing server/core decisions; the
+  pages carry exact validators and bodies only.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | `crates/motion-ui/tests/compose.rs` | 22 passed. New assertions cover filter forms (typed terms, kept unrepresentable conditions, guarded edit, smart-collection body), play-order forms (item and timeline validators, group revision), merge and split plan forms, deletion disclosures (confirmation, validator, a used source not offered) and artwork role selection |
+  | `tests/m3_workflows.rs` | 2 passed. New `library_management_workflows_run_through_the_pages` runs against the real server and scanner. It saves a filter and makes a smart collection from the page's exact body; the edit is guarded (a stale replay gets 412); the in-use filter is not offered for deletion. It creates a play order and places the timeline through the page's form values, reads a match proposal, previews and commits a merge (the retired ID resolves to the target), and deletes the library through its guarded form while the title and the media file remain |
+  | `tests/v2_metadata_processing.rs` | 18 passed. `Match.subject` names the file and its readable title |
+  | `tests/access_api.rs` | 39 passed |
+  | `node --test` bridge and desktop suites | 81 passed. New: typed filter terms, only chosen criteria sent, an empty conjunction kept |
+  | Contract checks (`check_contract.py`, `contract_json.rb --check`) | pass |
+- **Review:** pending (GPT-6.1 Sol).
 
 ## 5. Offline experience breadth
 

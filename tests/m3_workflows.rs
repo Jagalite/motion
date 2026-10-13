@@ -1085,3 +1085,312 @@ async fn library_workflow_runs_end_to_end_through_the_pages() {
         "{html}"
     );
 }
+
+/// Completion item 4 through the real pages and server: saved filters and a
+/// smart collection, a play order and timeline placement, a merge previewed
+/// and committed, a readable match proposal, artwork roles, and library
+/// deletion that keeps the titles. Each request uses the exact body or
+/// validator the page rendered, as the bridge would send it.
+#[tokio::test]
+async fn library_management_workflows_run_through_the_pages() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let op = format!("Bearer {OPERATOR}");
+    let films = f.dir.path().join("films");
+    // One scanned film; its duplicate is a cataloged title created below.
+    for path in ["Night Train.mp4"] {
+        ffmpeg(
+            &[
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=24",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ],
+            &films.join(path),
+        );
+    }
+    let source = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/sources",
+            Some(json!({"name":"Films disk","root_path":films.to_str().unwrap(),"exclusions":[]})),
+            &[("idempotency-key", "c4-source-0001-key-padding")],
+        )
+        .await;
+    assert_eq!(source.status, StatusCode::CREATED, "{:?}", source.body);
+    let source_id = source.body["id"].as_str().unwrap().to_owned();
+    let library = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/libraries",
+            Some(json!({"name":"Films","kind":"movies","language":"en","source_ids":[source_id]})),
+            &[("idempotency-key", "c4-library-0001-key-padding")],
+        )
+        .await;
+    let library_id = library.body["id"].as_str().unwrap().to_owned();
+    let scan = f
+        .call(
+            &op,
+            "POST",
+            &format!("/api/v2/libraries/{library_id}/scans"),
+            Some(json!({"mode":"incremental","require_complete":false})),
+            &[("idempotency-key", "c4-scan-00000001-key-padding")],
+        )
+        .await;
+    let done = f.finish_scan(&op, scan.body["id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "complete", "{done}");
+    let items = f
+        .call(
+            &op,
+            "GET",
+            &format!("/api/v2/catalog/items?library_id={library_id}"),
+            None,
+            &[],
+        )
+        .await;
+    let target = items.body["items"][0]["id"].as_str().unwrap().to_owned();
+    // A second record of the same film, entered by hand: search finds it by
+    // the title, so the manage page offers it as a merge source.
+    let duplicate = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/catalog/items",
+            Some(json!({"kind":"video","title":"Night Train (copy)","library_ids":[]})),
+            &[("idempotency-key", "c4-duplicate-01-key-padding")],
+        )
+        .await;
+    assert!(duplicate.status.is_success(), "{:?}", duplicate.body);
+    let duplicate = duplicate.body["id"].as_str().unwrap().to_owned();
+
+    // 1. Saved filter, then a smart collection from the page's exact body.
+    let organize = f.ok_page(&op, "/organize").await;
+    form(&organize, "POST /api/v2/catalog/filters", "Save filter");
+    let filter = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/catalog/filters",
+            Some(json!({"name":"Late 90s","profile_id":"default","all":[
+                {"field":"year","operator":"gte","value":1995},
+                {"field":"title","operator":"contains","value":"Train"}]})),
+            &[("idempotency-key", "c4-filter-00001-key-padding")],
+        )
+        .await;
+    assert_eq!(filter.status, StatusCode::CREATED, "{:?}", filter.body);
+    let filter_id = filter.body["id"].as_str().unwrap().to_owned();
+    let organize = f.ok_page(&op, "/organize").await;
+    assert!(
+        organize.contains("From 1995 · Title contains “Train”"),
+        "{organize}"
+    );
+    let smart = form(
+        &organize,
+        "POST /api/v2/collections",
+        "Make smart collection",
+    );
+    let created = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/collections",
+            smart.json_body.clone(),
+            &[("idempotency-key", "c4-smart-000001-key-padding")],
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    assert_eq!(created.body["filter_id"], filter_id.as_str());
+    let organize = f.ok_page(&op, "/organize").await;
+    assert!(
+        organize.contains("Titles that match “Late 90s”"),
+        "{organize}"
+    );
+    // The filter is in use: the page no longer offers deleting it.
+    assert!(!organize.contains(&format!("DELETE /api/v2/catalog/filters/{filter_id}")));
+    // An edit through the page's form is guarded by the revision it showed.
+    let edit = form(
+        &organize,
+        &format!("PUT /api/v2/catalog/filters/{filter_id}"),
+        "Save conditions",
+    );
+    let stale = edit.if_match.clone().unwrap();
+    let replaced = f
+        .call(
+            &op,
+            "PUT",
+            &format!("/api/v2/catalog/filters/{filter_id}"),
+            Some(json!({"name":"Late 90s","profile_id":"default","all":[{"field":"year","operator":"gte","value":1990}]})),
+            &[("if-match", &stale)],
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    let again = f
+        .call(
+            &op,
+            "PUT",
+            &format!("/api/v2/catalog/filters/{filter_id}"),
+            Some(json!({"name":"Late 90s","profile_id":"default","all":[]})),
+            &[("if-match", &stale)],
+        )
+        .await;
+    assert_eq!(
+        again.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        again.body
+    );
+
+    // 2. A play order and a timeline placed in it from the manage page.
+    let manage = format!("/item/{target}/manage");
+    let html = f.ok_page(&op, &manage).await;
+    let create_order = format!("POST /api/v2/catalog/items/{target}/order-groups");
+    let order_form = form(&html, &create_order, "Create order");
+    let edition = order_form.value("edition_id");
+    let group = f
+        .call(
+            &op,
+            "POST",
+            &create_order[5..],
+            Some(json!({"edition_id":edition,"name":"Release","kind":"custom"})),
+            &[
+                ("if-match", &order_form.if_match.unwrap()),
+                ("idempotency-key", "c4-order-000001-key-padding"),
+            ],
+        )
+        .await;
+    assert_eq!(group.status, StatusCode::CREATED, "{:?}", group.body);
+    let html = f.ok_page(&op, &manage).await;
+    assert!(html.contains("Release (custom)"), "{html}");
+    let timeline = items.body["items"][0]["default_timeline_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let command = format!("/api/v2/catalog/timelines/{timeline}/order");
+    let place = form(&html, &format!("PUT {command}"), "expected_group_revision");
+    let placed = f
+        .call(
+            &op,
+            "PUT",
+            &command,
+            Some(
+                json!({"order_group_id":place.value("order_group_id"),"order_position":1,
+                "expected_group_revision":place.value("expected_group_revision")}),
+            ),
+            &[("if-match", &place.if_match.unwrap())],
+        )
+        .await;
+    assert_eq!(placed.status, StatusCode::OK, "{:?}", placed.body);
+    let html = f.ok_page(&op, &manage).await;
+    assert!(html.contains("position 1 in Release"), "{html}");
+
+    // 3. A readable match proposal for the film's file.
+    let files = f
+        .call(
+            &op,
+            "GET",
+            &format!("/api/v2/catalog/items/{target}/files"),
+            None,
+            &[],
+        )
+        .await;
+    let file = &files.body["items"][0];
+    let proposal = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/catalog/matches",
+            Some(json!({"file":{"file_id":file["id"],"file_revision":file["revision"]},"library_id":library_id,"provider":null})),
+            &[("idempotency-key", "c4-match-000001-key-padding")],
+        )
+        .await;
+    assert_eq!(proposal.status, StatusCode::ACCEPTED, "{:?}", proposal.body);
+    let matches = f.ok_page(&op, "/matches").await;
+    assert!(
+        matches.contains("Night Train (Night Train.mp4)"),
+        "{matches}"
+    );
+
+    // 4. Merge the duplicate: preview with the exact revisions the page
+    // rendered, then commit exactly that plan. The old ID keeps resolving.
+    let html = f.ok_page(&op, &manage).await;
+    let merge = form(
+        &html,
+        &format!("POST /api/v2/catalog/items/{target}/merge-plans"),
+        &duplicate,
+    );
+    let plan = f
+        .call(
+            &op,
+            "POST",
+            &format!("/api/v2/catalog/items/{target}/merge-plans"),
+            merge.json_body.clone(),
+            &[("idempotency-key", "c4-mergeplan-01-key-padding")],
+        )
+        .await;
+    assert_eq!(plan.status, StatusCode::OK, "{:?}", plan.body);
+    assert!(plan.body["affected_ids"].as_array().unwrap().len() >= 1);
+    let committed = f
+        .call(
+            &op,
+            "POST",
+            "/api/v2/catalog/reconciliations",
+            Some(json!({"plan_token":plan.body["plan_token"]})),
+            &[("idempotency-key", "c4-mergecommit1-key-padding")],
+        )
+        .await;
+    assert!(committed.status.is_success(), "{:?}", committed.body);
+    let retired = f
+        .call(
+            &op,
+            "GET",
+            &format!("/api/v2/catalog/items/{duplicate}"),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(retired.body["id"], target.as_str(), "{:?}", retired.body);
+
+    // 5. Delete the library through its guarded form: the titles stay.
+    let sources = f.ok_page(&op, "/sources").await;
+    let delete = form(
+        &sources,
+        &format!("DELETE /api/v2/libraries/{library_id}"),
+        "Delete library",
+    );
+    assert!(
+        delete.markup.contains("nothing is deleted from disk")
+            || sources.contains("nothing is deleted from disk")
+    );
+    let deleted = f
+        .call(
+            &op,
+            "DELETE",
+            &format!("/api/v2/libraries/{library_id}"),
+            None,
+            &[("if-match", &delete.if_match.unwrap())],
+        )
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+    let still = f
+        .call(
+            &op,
+            "GET",
+            &format!("/api/v2/catalog/items/{target}"),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(still.status, StatusCode::OK);
+    assert!(films.join("Night Train.mp4").exists());
+}

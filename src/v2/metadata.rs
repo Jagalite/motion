@@ -331,13 +331,61 @@ struct CandidateBody {
     confidence: Option<f64>,
 }
 
+/// What a proposal is about, readably: the file's name and the title it is
+/// currently cataloged under when the caller may read that title.
+#[derive(Serialize, Clone, Default)]
+struct SubjectBody {
+    file_name: String,
+    item_id: Option<String>,
+    title: Option<String>,
+}
+
 #[derive(Serialize)]
 struct MatchBody {
     id: String,
     revision: String,
     file: FileRef,
+    subject: SubjectBody,
     status: Status,
     candidates: Vec<CandidateBody>,
+}
+
+/// Readable subjects of proposals whose files lie in the caller's scope (as
+/// every listed or read proposal's does). The current title is named only
+/// when the caller may read it; otherwise only the file name is shown.
+async fn subjects(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &CatalogScope,
+    proposals: &[Proposal],
+) -> Result<std::collections::HashMap<String, SubjectBody>, Problem> {
+    let mut out = std::collections::HashMap::new();
+    for p in proposals {
+        if out.contains_key(&p.file_id) {
+            continue;
+        }
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT f.relative_path,i.id,i.title FROM media_files f LEFT JOIN editions e ON e.id=f.edition_id LEFT JOIN items i ON i.id=e.item_id WHERE f.id=?",
+        )
+        .bind(&p.file_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((path, item, title)) = row else {
+            continue;
+        };
+        let visible = match &item {
+            Some(item) => visible_item(conn, scope, item).await?,
+            None => false,
+        };
+        out.insert(
+            p.file_id.clone(),
+            SubjectBody {
+                file_name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
+                item_id: item.filter(|_| visible),
+                title: title.filter(|_| visible),
+            },
+        );
+    }
+    Ok(out)
 }
 
 const PROPOSAL: &str = "p.id,p.revision,p.file_id,p.file_revision,p.status,p.candidates_json,p.decision_json FROM match_proposals p JOIN media_files f ON f.id=p.file_id";
@@ -362,10 +410,15 @@ async fn readable_items(
     Ok(readable)
 }
 
-fn match_body(p: Proposal, readable: &BTreeSet<String>) -> MatchBody {
+fn match_body(
+    p: Proposal,
+    readable: &BTreeSet<String>,
+    subjects: &std::collections::HashMap<String, SubjectBody>,
+) -> MatchBody {
     MatchBody {
         id: p.id,
         revision: p.revision.to_string(),
+        subject: subjects.get(&p.file_id).cloned().unwrap_or_default(),
         file: FileRef {
             file_id: p.file_id,
             file_revision: p.file_revision,
@@ -415,8 +468,9 @@ async fn respond_match(
     proposal: Proposal,
 ) -> Result<(MatchBody, u64), Problem> {
     let readable = readable_items(conn, scope, std::slice::from_ref(&proposal)).await?;
+    let subjects = subjects(conn, scope, std::slice::from_ref(&proposal)).await?;
     let revision = proposal.revision;
-    Ok((match_body(proposal, &readable), revision))
+    Ok((match_body(proposal, &readable, &subjects), revision))
 }
 
 fn matching_problem(e: MatchingError) -> Problem {
@@ -492,9 +546,10 @@ async fn list_matches(
         .collect::<anyhow::Result<Vec<_>>>()
         .map_err(Problem::internal)?;
     let readable = readable_items(&mut tx, &scope, &proposals).await?;
+    let subjects = subjects(&mut tx, &scope, &proposals).await?;
     let rows = proposals
         .into_iter()
-        .map(|p| (p.id.clone(), match_body(p, &readable)))
+        .map(|p| (p.id.clone(), match_body(p, &readable, &subjects)))
         .collect();
     let page = page(&mut tx, &caller.principal, rows, limit).await?;
     tx.commit().await?;

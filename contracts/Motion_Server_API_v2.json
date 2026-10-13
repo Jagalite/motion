@@ -16607,6 +16607,43 @@
           "file": {
             "$ref": "#/components/schemas/FileRef"
           },
+          "subject": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "The proposal's file, readably. title and item_id name the title the file is currently cataloged under only when the caller may read it; otherwise both are null and only the file name is shown.",
+            "properties": {
+              "file_name": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "item_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/Id"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "title": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 500
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "file_name",
+              "item_id",
+              "title"
+            ]
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -16630,6 +16667,7 @@
           "id",
           "revision",
           "file",
+          "subject",
           "status",
           "candidates"
         ]

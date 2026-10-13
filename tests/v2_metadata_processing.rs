@@ -612,6 +612,10 @@ async fn matches_create_replay_decide_and_scope() {
     assert_eq!(created.headers["etag"], "\"r-1\"");
     assert_eq!(created.body["status"], "review");
     assert_eq!(
+        created.body["subject"],
+        json!({"file_name":"Film (2001).mkv","item_id":"film-a","title":"Film"})
+    );
+    assert_eq!(
         created.body["file"],
         json!({"file_id":"file-a","file_revision":"rev-a"})
     );
@@ -1140,7 +1144,8 @@ async fn match_presentation_uses_authorized_candidates_and_api_revision() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("File file-a"), "{html}");
+    // The proposal names the file's current title and file name, not an ID.
+    assert!(html.contains("Film (Film (2001).mkv)"), "{html}");
     assert!(html.contains("Film"), "{html}");
     assert!(!html.contains("file-b"), "{html}");
     // The form must send the same strong validator as the API representation.

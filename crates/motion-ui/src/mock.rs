@@ -515,6 +515,26 @@ impl UiQueryFacade for MockUiQueryFacade {
             };
             Ok(ItemManageView {
                 item: card(title),
+                item_revision: "7".into(),
+                merge_candidates: write.then(|| {
+                    vec![MergeCandidate {
+                        id: "dup1".into(),
+                        title: title.title.into(),
+                        revision: "2".into(),
+                    }]
+                }),
+                versions: write.then(|| {
+                    vec![
+                        VersionRow {
+                            id: "v1".into(),
+                            label: "Original · 1080p".into(),
+                        },
+                        VersionRow {
+                            id: "v2".into(),
+                            label: "Original · Director's cut".into(),
+                        },
+                    ]
+                }),
                 library_ids: vec![title.library.into()],
                 match_state: if title.needs_review {
                     "ambiguous"
@@ -558,6 +578,27 @@ impl UiQueryFacade for MockUiQueryFacade {
                 }),
                 collections: organize.then(|| vec![membership("col1", "Weekend", false)]),
                 playlists: organize.then(Vec::new),
+                ordering: write.then(|| OrderingView {
+                    editions: vec![("ed1".into(), "Original".into())],
+                    groups: vec![OrderGroupView {
+                        id: "og1".into(),
+                        name: "Aired".into(),
+                        kind: "aired".into(),
+                        edition: "Original".into(),
+                        revision: "4".into(),
+                    }],
+                    timelines: title
+                        .timeline
+                        .map(|tl| OrderedTimeline {
+                            id: tl.into(),
+                            edition: "Original".into(),
+                            etag: "\"r-2\"".into(),
+                            group_id: Some("og1".into()),
+                            position: Some(3),
+                        })
+                        .into_iter()
+                        .collect(),
+                }),
             })
         })
     }
@@ -573,6 +614,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     id: "col1".into(),
                     name: "Weekend".into(),
                     kind: "manual".into(),
+                    filter_id: None,
                     etag: "\"r-1\"".into(),
                     items: vec![card(&TITLES[0])],
                     remove_bodies: vec![format!(
@@ -581,6 +623,29 @@ impl UiQueryFacade for MockUiQueryFacade {
                     )],
                 }],
                 playlists: vec![],
+                filters: vec![SavedFilterView {
+                    id: "flt1".into(),
+                    name: "Unwatched 90s films".into(),
+                    etag: "\"r-1\"".into(),
+                    terms: vec![
+                        FilterTermView {
+                            field: "kind".into(),
+                            operator: "eq".into(),
+                            value: "movie".into(),
+                        },
+                        FilterTermView {
+                            field: "year".into(),
+                            operator: "gte".into(),
+                            value: "1990".into(),
+                        },
+                        FilterTermView {
+                            field: "person_id".into(),
+                            operator: "eq".into(),
+                            value: "p7".into(),
+                        },
+                    ],
+                    in_use: false,
+                }],
             })
         })
     }

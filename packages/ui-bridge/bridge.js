@@ -61,6 +61,16 @@ function bodyOf(form) {
       case 'optional': if (text !== '') place(body, name, input.value); break;
       case 'optional-int': if (text !== '') place(body, name, Number(text)); break;
       case 'nullable': place(body, name, text === '' ? null : input.value); break;
+      // One typed filter term ({field, operator, value}) appended to the
+      // array at `name`, only when a value is chosen; the array always exists.
+      case 'term': {
+        const terms = body[name] ??= [];
+        if (text === '') break;
+        const value = input.dataset.valueType === 'int' ? Number(text)
+          : input.dataset.valueType === 'bool' ? text === 'true' : text;
+        terms.push({field: input.dataset.field, operator: input.dataset.operator, value});
+        break;
+      }
       case 'member': {
         const path = name.split('.');
         let target = body;

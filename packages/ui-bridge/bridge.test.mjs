@@ -265,3 +265,26 @@ test('desktop-only download actions are revealed only inside the desktop host', 
     assert.equal(action.hidden, !revealed);
   }
 });
+
+test('filter terms are typed and only chosen criteria are sent', () => {
+  const bridge = harness();
+  const term = (field, operator, valueType, value) =>
+    ({name: 'all', dataset: {type: 'term', field, operator, valueType}, value});
+  const body = bridge.bodyOf(form([
+    input('name', 'text', 'Unwatched 90s'),
+    term('kind', 'eq', 'text', 'movie'),
+    term('title', 'contains', 'text', ''),
+    term('year', 'gte', 'int', '1990'),
+    term('year', 'lte', 'int', ' 1999 '),
+    term('watched', 'eq', 'bool', 'false'),
+    term('availability', 'eq', 'bool', ''),
+  ]));
+  assert.deepEqual(JSON.parse(JSON.stringify(body)), {name: 'Unwatched 90s', all: [
+    {field: 'kind', operator: 'eq', value: 'movie'},
+    {field: 'year', operator: 'gte', value: 1990},
+    {field: 'year', operator: 'lte', value: 1999},
+    {field: 'watched', operator: 'eq', value: false},
+  ]});
+  // No criteria at all is an empty conjunction, not a missing field.
+  assert.deepEqual(JSON.parse(JSON.stringify(bridge.bodyOf(form([term('title', 'contains', 'text', '')])))), {all: []});
+});

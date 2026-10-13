@@ -438,6 +438,17 @@ async fn command_forms_name_public_operations_with_preconditions() {
         sources.contains("Partial — some folders could not be read; nothing unseen was removed")
     );
     assert!(sources.contains("1 incomplete"));
+    // Deletion explains its exact effect, needs explicit confirmation and is
+    // guarded by the revision the page showed. A source a library still uses
+    // is not offered for removal.
+    assert!(sources.contains(r#"data-command="DELETE /api/v2/libraries/lib1" data-idempotent="false" data-if-match="&quot;r-4&quot;""#), "{sources}");
+    assert!(sources.contains("nothing is deleted from disk"));
+    assert!(
+        sources.contains(r#"<input type="checkbox" required="">"#),
+        "{sources}"
+    );
+    assert!(!sources.contains(r#"data-command="DELETE /api/v2/sources/src1""#));
+    assert!(sources.contains("Remove it from those libraries first"));
     let (_, _, matches) = get_page(&admin, "/matches").await;
     assert!(matches.contains(r#"data-command="PUT /api/v2/catalog/matches/m1/decision" data-idempotent="false" data-if-match="&quot;r1&quot;""#));
     assert!(matches.contains(r#"value="reject""#) && matches.contains(r#"value="defer""#));
@@ -643,6 +654,38 @@ async fn title_management_names_exact_operations_and_unsupported_parts() {
     assert!(html.contains(
         r#"data-command="POST /api/v2/catalog/items/item1/metadata/refresh" data-idempotent="true""#
     ));
+    // Merge and split preview first and commit exactly the shown plan.
+    assert!(
+        html.contains(
+            r#"data-command="POST /api/v2/catalog/items/item1/merge-plans" data-idempotent="true""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains("&quot;expected_revisions&quot;:{&quot;dup1&quot;:&quot;2&quot;,&quot;item1&quot;:&quot;7&quot;}"), "{html}");
+    assert!(html.contains(r#"data-plan-commit="POST /api/v2/catalog/reconciliations""#));
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/items/item1/split-plans""#));
+    assert!(
+        html.contains(r#"name="version_ids" data-type="member" value="v2""#),
+        "{html}"
+    );
+    // Play orders: created against the item, placements fenced by the
+    // timeline and the destination group's revision.
+    assert!(html.contains("Aired (aired) · Original"), "{html}");
+    assert!(html.contains("position 3 in Aired"), "{html}");
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/items/item1/order-groups" data-idempotent="true" data-if-match="&quot;r-7&quot;""#), "{html}");
+    assert!(
+        html.contains(r#"data-if-match="&quot;r-2&quot;""#)
+            && html.contains(r#"/order" data-idempotent="false""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="expected_group_revision" data-type="text" value="4""#),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"name="order_position" data-type="number" value="3""#),
+        "{html}"
+    );
     // Artwork upload sends the file itself; selection is checked against the item.
     assert!(html.contains(
         r#"data-command="POST /api/v2/catalog/items/item1/artwork" data-idempotent="true""#
@@ -704,6 +747,32 @@ async fn collections_page_creates_and_edits_with_exact_bodies() {
     assert!(html.contains(r#"data-command="POST /api/v2/playlists" data-idempotent="true""#));
     assert!(html.contains(r#"data-command="DELETE /api/v2/collections/col1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
     assert!(html.contains("Arrival of the Night Train"));
+    // Saved filters: readable conditions, a smart collection from exactly
+    // this filter, guarded edits that keep conditions the form cannot show.
+    assert!(html.contains("Unwatched 90s films"));
+    assert!(
+        html.contains("Kind is movie · From 1990 · Person p7"),
+        "{html}"
+    );
+    assert!(html.contains(r#"data-command="POST /api/v2/catalog/filters" data-idempotent="true""#));
+    assert!(html.contains(r#"data-command="PUT /api/v2/catalog/filters/flt1" data-idempotent="false" data-if-match="&quot;r-1&quot;""#));
+    assert!(html.contains(r#"data-command="DELETE /api/v2/catalog/filters/flt1""#));
+    assert!(
+        html.contains("&quot;kind&quot;:&quot;smart&quot;")
+            && html.contains("&quot;filter_id&quot;:&quot;flt1&quot;"),
+        "{html}"
+    );
+    assert!(
+        html.contains(r#"<option value="movie" selected="">"#),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            r#"data-field="year" data-operator="gte" data-value-type="int" value="1990""#
+        ),
+        "{html}"
+    );
+    assert!(html.contains(r#"type="hidden" name="all" data-type="term" data-field="person_id" data-operator="eq" data-value-type="text" value="p7""#), "{html}");
     let viewer = app(Some(principal("everyone", VIEWER)), None);
     let (status, _, _) = get_page(&viewer, "/organize").await;
     assert_eq!(status, StatusCode::FORBIDDEN);

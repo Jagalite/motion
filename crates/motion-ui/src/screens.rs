@@ -16,7 +16,7 @@ use topcoat::{
 
 use crate::{
     app::{availability_text, empty, facade, principal, ui_error},
-    facade::{Availability, MembershipRow},
+    facade::{Availability, FilterTermView, MembershipRow},
 };
 
 /// How the bridge encodes one form field into the JSON body.
@@ -42,6 +42,9 @@ enum Field {
     OptionalInt,
     /// Text sent as JSON null when blank.
     Nullable,
+    /// One typed filter term appended to the array named by the input, only
+    /// when a value is chosen (`data-field`, `data-operator`, `data-value-type`).
+    Term,
 }
 
 impl Field {
@@ -57,6 +60,7 @@ impl Field {
             Field::Optional => "optional",
             Field::OptionalInt => "optional-int",
             Field::Nullable => "nullable",
+            Field::Term => "term",
         }
     }
 }
@@ -222,6 +226,17 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
         .iter()
         .map(|l| (l.library.id.clone(), l.library.name.clone()))
         .collect();
+    // The libraries each source belongs to: a source is removable only once
+    // no library uses it (the server refuses otherwise).
+    let used_by = |source: &str| -> Vec<String> {
+        model
+            .libraries
+            .iter()
+            .filter(|l| l.source_ids.iter().any(|id| id == source))
+            .map(|l| l.library.name.clone())
+            .collect()
+    };
+    let source_users: Vec<Vec<String>> = model.sources.iter().map(|s| used_by(&s.id)).collect();
     let kinds = [
         ("movies", "Movies"),
         ("television", "Television"),
@@ -240,7 +255,7 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                 empty(message: "No sources yet. Add a folder on the server to start.")
             } else {
                 <ul class="rows">
-                    for source in model.sources {
+                    for (source, users) in model.sources.into_iter().zip(source_users) {
                         <li data-source=(source.id.as_str())><strong>(source.name.as_str())</strong> " · " (availability_text(source.availability))
                             <div class="muted small"><code>(source.root_path.as_str())</code></div>
                             <details class="disclosure">
@@ -250,6 +265,17 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                                     <input type="hidden" data-plan-commit=(format!("POST /api/v2/sources/{}/relocation", source.id))>
                                     <label>"New folder on the server " <input name="new_root_path" data-type=(kind(Field::Text)) required=(true) maxlength="4096" value=(source.root_path.as_str())></label>
                                 )
+                            </details>
+                            <details class="disclosure">
+                                <summary>"Remove this source…"</summary>
+                                if users.is_empty() {
+                                    <p class="muted small">"Nothing is deleted from the folder. If titles were found in it, the source is kept but disabled and its files are marked unavailable, keeping their history and corrections; otherwise its registration is removed. Not possible while a scan or preparation uses it."</p>
+                                    command_form(command: format!("DELETE /api/v2/sources/{}", source.id), label: "Remove source", if_match: Some(source.etag.clone()), class: Some("command inline"),
+                                        <label><input type="checkbox" required=(true)> " I understand what removing this source does"</label>
+                                    )
+                                } else {
+                                    <p class="muted small">(format!("Used by {}. Remove it from those libraries first (Edit library).", users.join(", ")))</p>
+                                }
                             </details>
                         </li>
                     }
@@ -297,6 +323,13 @@ pub(crate) async fn sources(cx: &Cx) -> Result<impl View> {
                                         <label><input type="checkbox" name="source_ids" value=(id.as_str()) data-type=(kind(Field::Member)) checked=(row.source_ids.contains(id))>" " (name.as_str())</label>
                                     }
                                 </fieldset>
+                            )
+                        </details>
+                        <details class="disclosure">
+                            <summary>"Delete this library…"</summary>
+                            <p class="muted small">"Removes only the library and its finished scan history. Its sources, files, titles, corrections, collections and viewing history stay, and nothing is deleted from disk. Not possible while one of its scans is pending."</p>
+                            command_form(command: format!("DELETE /api/v2/libraries/{}", row.library.id), label: "Delete library", if_match: Some(row.etag.clone()), class: Some("command inline"),
+                                <label><input type="checkbox" required=(true)> " I understand what deleting this library does"</label>
                             )
                         </details>
                     </li>
@@ -737,12 +770,17 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                                     <img src=(art.content_url.as_str()) alt="" loading="lazy" decoding="async">
                                     if art.selected {
                                         <p class="small">"Current poster"</p>
-                                    } else {
-                                        command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/artwork/selection"), label: "Use as poster", if_match: Some(model.item_etag.clone()), class: Some("command inline"),
-                                            <input type="hidden" name="role" data-type=(kind(Field::Text)) value="poster">
-                                            <input type="hidden" name="asset_id" data-type=(kind(Field::Text)) value=(art.id.as_str())>
-                                        )
                                     }
+                                    command_form(command: format!("PUT /api/v2/catalog/items/{item_id}/artwork/selection"), label: "Use", if_match: Some(model.item_etag.clone()), class: Some("command inline"),
+                                        <label>"As "
+                                            <select name="role" data-type=(kind(Field::Text))>
+                                                for (value, text) in [("poster", "Poster"), ("backdrop", "Backdrop"), ("banner", "Banner"), ("thumbnail", "Thumbnail")] {
+                                                    <option value=(value) selected=(value == "poster" && !art.selected)>(text)</option>
+                                                }
+                                            </select>
+                                        </label>
+                                        <input type="hidden" name="asset_id" data-type=(kind(Field::Text)) value=(art.id.as_str())>
+                                    )
                                 </li>
                             }
                         </ul>
@@ -750,7 +788,7 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                     command_form(command: format!("POST /api/v2/catalog/items/{item_id}/artwork"), label: "Upload", idempotent: true, file_body: true, class: Some("command inline"),
                         <label>"Image " <input type="file" name="file" accept="image/png,image/jpeg,image/webp" required=(true)></label>
                     )
-                    <p class="muted small">"PNG, JPEG or WebP, up to 8 MB. Online artwork providers are not available yet."</p>
+                    <p class="muted small">"PNG, JPEG or WebP, up to 8 MB. Backdrop, banner and thumbnail choices are saved, but only the current poster is shown here. Online artwork providers are not available yet."</p>
                 } else {
                     empty(message: "Artwork is unavailable right now.")
                 }
@@ -873,10 +911,232 @@ pub(crate) async fn manage_item(cx: &Cx) -> Result<impl View> {
                 }
             </section>
         }
+
+        if can_write {
+            <section aria-labelledby="reconcile-heading">
+                <h2 id="reconcile-heading">"Duplicates and versions"</h2>
+                <p class="muted">"Merging joins another title into this one; splitting moves versions to a new title. Each shows its effect first and changes nothing until you apply it. The old title’s address keeps working and viewing history stays with each timeline."</p>
+                if let Some(candidates) = model.merge_candidates.clone() {
+                    if candidates.is_empty() {
+                        <p class="muted">"No other title with this name was found."</p>
+                    } else {
+                        <h3>"Merge into this title"</h3>
+                        <ul class="rows">
+                            for candidate in candidates.iter() {
+                                <li><a href=(format!("/item/{}", candidate.id))>(candidate.title.as_str())</a>
+                                    command_form(command: format!("POST /api/v2/catalog/items/{item_id}/merge-plans"), label: "Check merge", idempotent: true, class: Some("command inline plan"),
+                                        json_body: Some(serde_json::json!({
+                                            "source_item_ids": [candidate.id],
+                                            "target_item_id": item_id,
+                                            "expected_revisions": {candidate.id.clone(): candidate.revision, item_id.clone(): model.item_revision},
+                                        }).to_string()),
+                                        <input type="hidden" data-plan-commit="POST /api/v2/catalog/reconciliations">
+                                    )
+                                </li>
+                            }
+                        </ul>
+                    }
+                } else {
+                    empty(message: "Possible duplicates are unavailable right now.")
+                }
+                if let Some(versions) = model.versions.clone() {
+                    if versions.len() > 1 {
+                        <h3>"Split versions into a new title"</h3>
+                        command_form(command: format!("POST /api/v2/catalog/items/{item_id}/split-plans"), label: "Check split", idempotent: true, class: Some("command plan"),
+                            <fieldset>
+                                <legend>"Versions to move"</legend>
+                                for version in versions.iter() {
+                                    <label><input type="checkbox" name="version_ids" data-type=(kind(Field::Member)) value=(version.id.as_str())> " " (version.label.as_str())</label>
+                                }
+                            </fieldset>
+                            <label>"New title " <input name="new_title" data-type=(kind(Field::Text)) required=(true) maxlength="500"></label>
+                            <input type="hidden" name="expected_revision" data-type=(kind(Field::Text)) value=(model.item_revision.as_str())>
+                            <input type="hidden" data-plan-commit="POST /api/v2/catalog/reconciliations">
+                        )
+                    }
+                }
+            </section>
+            <section aria-labelledby="order-heading">
+                <h2 id="order-heading">"Play order"</h2>
+                <p class="muted">"An explicit order (for example as aired or as on disc) decides what plays next. Placing a timeline keeps its files and viewing history."</p>
+                if let Some(ordering) = model.ordering.clone() {
+                    if ordering.groups.is_empty() {
+                        <p class="muted">"No play orders yet."</p>
+                    } else {
+                        <ul class="rows">
+                            for group in ordering.groups.iter() {
+                                <li>(format!("{} ({}) · {}", group.name, group.kind, group.edition))</li>
+                            }
+                        </ul>
+                    }
+                    if !ordering.timelines.is_empty() {
+                        <h3>"Timelines"</h3>
+                        <ul class="rows">
+                            for (n, timeline) in ordering.timelines.iter().enumerate() {
+                                <li>
+                                    (format!("Timeline {} ({})", n + 1, timeline.edition)) " · "
+                                    (match (timeline.group_id.as_ref().and_then(|g| ordering.groups.iter().find(|x| &x.id == g)), timeline.position) {
+                                        (Some(group), Some(position)) => format!("position {position} in {}", group.name),
+                                        _ => "not placed".to_string(),
+                                    })
+                                    for group in ordering.groups.iter() {
+                                        command_form(command: format!("PUT /api/v2/catalog/timelines/{}/order", timeline.id), label: "Place", if_match: Some(timeline.etag.clone()), class: Some("command inline"),
+                                            <label>(format!("Position in {} ", group.name))
+                                                <input type="number" min="0" max="4294967295" required=(true) name="order_position" data-type=(kind(Field::Number))
+                                                    value=(if timeline.group_id.as_deref() == Some(group.id.as_str()) { timeline.position.map(|p| p.to_string()).unwrap_or_default() } else { String::new() })>
+                                            </label>
+                                            <input type="hidden" name="order_group_id" data-type=(kind(Field::Text)) value=(group.id.as_str())>
+                                            <input type="hidden" name="expected_group_revision" data-type=(kind(Field::Text)) value=(group.revision.as_str())>
+                                        )
+                                    }
+                                </li>
+                            }
+                        </ul>
+                    }
+                    if !ordering.editions.is_empty() {
+                        <h3>"New play order"</h3>
+                        command_form(command: format!("POST /api/v2/catalog/items/{item_id}/order-groups"), label: "Create order", idempotent: true, if_match: Some(model.item_etag.clone()), class: Some("command inline"),
+                            <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200"></label>
+                            <label>"Kind "
+                                <select name="kind" data-type=(kind(Field::Text))>
+                                    for (value, text) in [("aired", "As aired"), ("dvd", "As on disc"), ("absolute", "Absolute"), ("custom", "Custom")] {
+                                        <option value=(value)>(text)</option>
+                                    }
+                                </select>
+                            </label>
+                            <label>"Edition "
+                                <select name="edition_id" data-type=(kind(Field::Text))>
+                                    for (id, label) in ordering.editions.iter() {
+                                        <option value=(id.as_str())>(label.as_str())</option>
+                                    }
+                                </select>
+                            </label>
+                        )
+                    }
+                } else {
+                    empty(message: "Play orders are unavailable right now.")
+                }
+            </section>
+        }
     })
 }
 
 // --- Collections and playlists ----------------------------------------------
+
+/// The filter conditions the form edits, one slot each: (field, operator,
+/// label, value type).
+const FILTER_SLOTS: [(&str, &str, &str, &str); 8] = [
+    ("kind", "eq", "Kind", "text"),
+    ("title", "contains", "Title contains", "text"),
+    ("genre", "eq", "Genre", "text"),
+    ("tag", "eq", "Tag", "text"),
+    ("year", "gte", "Year from", "int"),
+    ("year", "lte", "Year to", "int"),
+    ("watched", "eq", "Watched", "bool"),
+    ("availability", "eq", "Available", "bool"),
+];
+
+/// The terms a filter form shows in its slots (the first of each), and the
+/// rest, which it carries unchanged so editing never drops a condition.
+fn filter_slots(terms: &[FilterTermView]) -> (Vec<Option<String>>, Vec<FilterTermView>) {
+    let mut values = vec![None; FILTER_SLOTS.len()];
+    let mut rest = Vec::new();
+    for term in terms {
+        match FILTER_SLOTS
+            .iter()
+            .position(|(f, o, _, _)| *f == term.field && *o == term.operator)
+        {
+            Some(slot) if values[slot].is_none() => values[slot] = Some(term.value.clone()),
+            _ => rest.push(term.clone()),
+        }
+    }
+    (values, rest)
+}
+
+/// A filter's conditions in words.
+fn filter_text(terms: &[FilterTermView]) -> String {
+    if terms.is_empty() {
+        return "Every title".into();
+    }
+    terms
+        .iter()
+        .map(
+            |t| match (t.field.as_str(), t.operator.as_str(), t.value.as_str()) {
+                ("watched", _, "true") => "Watched".into(),
+                ("watched", _, _) => "Not watched".into(),
+                ("availability", _, "true") => "Available".into(),
+                ("availability", _, _) => "Unavailable".into(),
+                ("year", "gte", v) => format!("From {v}"),
+                ("year", "lte", v) => format!("Until {v}"),
+                ("title", "contains", v) => format!("Title contains “{v}”"),
+                ("person_id", _, v) => format!("Person {v}"),
+                (field, "contains", v) => format!("{} contains “{v}”", capitalized(field)),
+                (field, _, v) => format!("{} is {v}", capitalized(field)),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn capitalized(field: &str) -> String {
+    let mut chars = field.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// The condition fields of a saved filter form, prefilled from `terms`.
+#[component]
+async fn filter_fields(
+    name: String,
+    profile: String,
+    terms: Vec<FilterTermView>,
+) -> Result<impl View> {
+    let (values, rest) = filter_slots(&terms);
+    let value = move |slot: usize| values[slot].clone().unwrap_or_default();
+    Ok(view! {
+        <label>"Name " <input name="name" data-type=(kind(Field::Text)) required=(true) maxlength="200" value=(name.as_str())></label>
+        <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile.as_str())>
+        <fieldset class="filter-terms">
+            <legend>"Titles that match all of these (leave blank to ignore)"</legend>
+            <label>"Kind "
+                <select name="all" data-type=(kind(Field::Term)) data-field="kind" data-operator="eq" data-value-type="text">
+                    for (v, text) in [("", "Any"), ("movie", "Movie"), ("series", "Series"), ("season", "Season"), ("episode", "Episode"), ("unclassified", "Unclassified")] {
+                        <option value=(v) selected=(value(0) == v)>(text)</option>
+                    }
+                </select>
+            </label>
+            for slot in 1..4 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <input name="all" data-type=(kind(Field::Term)) data-field=(FILTER_SLOTS[slot].0) data-operator=(FILTER_SLOTS[slot].1) data-value-type="text" maxlength="256" value=(value(slot))>
+                </label>
+            }
+            for slot in 4..6 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <input type="number" min="1" max="9999" name="all" data-type=(kind(Field::Term)) data-field="year" data-operator=(FILTER_SLOTS[slot].1) data-value-type="int" value=(value(slot))>
+                </label>
+            }
+            for slot in 6..8 {
+                <label>(FILTER_SLOTS[slot].2) " "
+                    <select name="all" data-type=(kind(Field::Term)) data-field=(FILTER_SLOTS[slot].0) data-operator="eq" data-value-type="bool">
+                        <option value="" selected=(value(slot).is_empty())>"Either"</option>
+                        <option value="true" selected=(value(slot) == "true")>"Yes"</option>
+                        <option value="false" selected=(value(slot) == "false")>"No"</option>
+                    </select>
+                </label>
+            }
+            if !rest.is_empty() {
+                <p class="muted small">(format!("Also kept unchanged: {}.", filter_text(&rest)))</p>
+                for term in rest.iter() {
+                    <input type="hidden" name="all" data-type=(kind(Field::Term)) data-field=(term.field.as_str()) data-operator=(term.operator.as_str())
+                        data-value-type=(match term.field.as_str() { "year" => "int", "watched" | "availability" => "bool", _ => "text" })
+                        value=(term.value.as_str())>
+                }
+            }
+        </fieldset>
+    })
+}
 
 #[page("/organize")]
 pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
@@ -897,7 +1157,12 @@ pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
                             if collection.kind == "smart" { <span class="muted small">" · smart"</span> }
                         </h3>
                         if collection.kind == "smart" {
-                            <p class="muted">"Its titles follow a saved filter, which can be changed through the API only."</p>
+                            <p class="muted">
+                                (match model.filters.iter().find(|f| Some(&f.id) == collection.filter_id.as_ref()) {
+                                    Some(filter) => format!("Titles that match “{}”: {}. Change the conditions under Saved filters.", filter.name, filter_text(&filter.terms)),
+                                    None => "Its titles follow a saved filter of another profile or one you cannot read.".to_string(),
+                                })
+                            </p>
                         } else if collection.items.is_empty() {
                             <p class="muted">"Empty."</p>
                         } else {
@@ -920,6 +1185,37 @@ pub(crate) async fn organize(cx: &Cx) -> Result<impl View> {
                 <input type="hidden" name="kind" data-type=(kind(Field::Text)) value="manual">
                 <input type="hidden" name="item_ids" data-type=(kind(Field::Json)) value="[]">
                 <input type="hidden" name="filter_id" data-type=(kind(Field::Json)) value="null">
+            )
+        </section>
+        <section aria-labelledby="filters-heading">
+            <h2 id="filters-heading">"Saved filters"</h2>
+            <p class="muted">"A saved filter describes titles by their details. Make a smart collection from it to browse them; the collection follows later changes."</p>
+            if model.filters.is_empty() {
+                empty(message: "No saved filters yet.")
+            } else {
+                for filter in model.filters.iter() {
+                    <section class="collection" aria-labelledby=(format!("flt-{}", filter.id))>
+                        <h3 id=(format!("flt-{}", filter.id))>(filter.name.as_str())</h3>
+                        <p>(filter_text(&filter.terms))</p>
+                        command_form(command: "POST /api/v2/collections".to_string(), label: "Make smart collection", idempotent: true, class: Some("command inline"),
+                            json_body: Some(serde_json::json!({"name": filter.name, "profile_id": profile, "kind": "smart", "item_ids": [], "filter_id": filter.id}).to_string()))
+                        <details>
+                            <summary>"Change conditions"</summary>
+                            command_form(command: format!("PUT /api/v2/catalog/filters/{}", filter.id), label: "Save conditions", if_match: Some(filter.etag.clone()), class: Some("command"),
+                                filter_fields(name: filter.name.clone(), profile: profile.clone(), terms: filter.terms.clone())
+                            )
+                        </details>
+                        if filter.in_use {
+                            <p class="muted small">"A smart collection uses this filter; delete that collection first to delete the filter."</p>
+                        } else {
+                            command_form(command: format!("DELETE /api/v2/catalog/filters/{}", filter.id), label: "Delete filter", if_match: Some(filter.etag.clone()), class: Some("command inline"))
+                        }
+                    </section>
+                }
+            }
+            <h3>"New saved filter"</h3>
+            command_form(command: "POST /api/v2/catalog/filters".to_string(), label: "Save filter", idempotent: true, class: Some("command"),
+                filter_fields(name: String::new(), profile: profile.clone(), terms: Vec::new())
             )
         </section>
         <section aria-labelledby="playlists-heading">

@@ -790,7 +790,17 @@ impl UiQueryFacade for Queries {
                     let candidates = v["candidates"].as_array().ok_or(UiError::Unavailable)?;
                     Ok(MatchRow {
                         id: text(v, "id"),
-                        subject: format!("File {}", text(&v["file"], "file_id")),
+                        // The title the file is cataloged under, when
+                        // readable; otherwise its file name.
+                        subject: match v["subject"]["title"].as_str() {
+                            Some(title) => {
+                                format!("{title} ({})", text(&v["subject"], "file_name"))
+                            }
+                            None => match v["subject"]["file_name"].as_str() {
+                                Some(name) if !name.is_empty() => name.to_owned(),
+                                _ => format!("File {}", text(&v["file"], "file_id")),
+                            },
+                        },
                         status: text(v, "status"),
                         etag: v2::etag(revision).to_str().unwrap().to_owned(),
                         candidates: candidates
@@ -927,6 +937,7 @@ impl UiQueryFacade for Queries {
                         .await?;
                     let mut originals = std::collections::HashSet::new();
                     let mut out = Vec::new();
+                    let mut version_rows = Vec::new();
                     for row in rows {
                         let timeline = text(&row, "id");
                         let edition = editions
@@ -940,6 +951,12 @@ impl UiQueryFacade for Queries {
                                 segment(&timeline)
                             ))
                             .await?;
+                        for v in &versions {
+                            version_rows.push(VersionRow {
+                                id: text(v, "id"),
+                                label: format!("{edition} · {}", text(v, "label")),
+                            });
+                        }
                         let mut whole = Vec::new();
                         for v in versions.iter().filter(|v| v["origin"] == "original") {
                             let bindings = v["files"].as_array().cloned().unwrap_or_default();
@@ -964,7 +981,7 @@ impl UiQueryFacade for Queries {
                         }
                         out.push((timeline, edition, whole));
                     }
-                    UiResult::Ok((out, originals))
+                    UiResult::Ok((out, originals, version_rows))
                 }
                 .await
                 .ok()
@@ -974,7 +991,7 @@ impl UiQueryFacade for Queries {
             // Original files, with the item library that holds each file's
             // source (a match proposal is scoped to that library).
             let files = match &structure {
-                Some((_, originals)) => {
+                Some((_, originals, _)) => {
                     let libraries = self.complete_list("/libraries?limit=200").await.ok();
                     self.complete_list(&format!("{path}/files?limit=200"))
                         .await
@@ -1100,7 +1117,7 @@ impl UiQueryFacade for Queries {
                 // timeline filter. Past the read bound (or on a failed read)
                 // they are reported unknown while preparing stays available.
                 let mut renditions = std::collections::HashMap::new();
-                for (timeline, _, _) in structure.iter().flat_map(|(rows, _)| rows) {
+                for (timeline, _, _) in structure.iter().flat_map(|(rows, _, _)| rows) {
                     let rows = self
                         .list_all(
                             &format!("/processing/renditions?timeline_id={}", segment(timeline)),
@@ -1110,7 +1127,7 @@ impl UiQueryFacade for Queries {
                         .ok();
                     renditions.insert(timeline.clone(), rows);
                 }
-                let timelines = structure.as_ref().map(|(rows, _)| {
+                let timelines = structure.as_ref().map(|(rows, _, _)| {
                     rows.iter()
                         .map(|(timeline, edition, whole)| PrepareTimeline {
                             renditions: renditions.get(timeline).cloned().flatten().map(|all| {
@@ -1212,8 +1229,92 @@ impl UiQueryFacade for Queries {
             } else {
                 (None, None)
             };
+            // Play orders of this title's editions and its timelines' places.
+            let ordering = if write {
+                async {
+                    let editions = self
+                        .complete_list(&format!("{path}/editions?limit=200"))
+                        .await?;
+                    let label = |id: &Value| {
+                        editions
+                            .iter()
+                            .find(|e| e["id"] == *id)
+                            .map(|e| text(e, "label"))
+                            .unwrap_or_default()
+                    };
+                    let groups = self
+                        .complete_list(&format!("{path}/order-groups?limit=200"))
+                        .await?
+                        .iter()
+                        .map(|g| OrderGroupView {
+                            id: text(g, "id"),
+                            name: text(g, "name"),
+                            kind: text(g, "kind"),
+                            edition: label(&g["edition_id"]),
+                            revision: text(g, "revision"),
+                        })
+                        .collect();
+                    let timelines = self
+                        .complete_list(&format!("{path}/timelines?limit=20"))
+                        .await?
+                        .iter()
+                        .map(|t| {
+                            Ok(OrderedTimeline {
+                                id: text(t, "id"),
+                                edition: label(&t["edition_id"]),
+                                etag: tag(t)?,
+                                group_id: t["order_group_id"].as_str().map(str::to_owned),
+                                position: t["order_position"].as_u64(),
+                            })
+                        })
+                        .collect::<UiResult<Vec<_>>>()?;
+                    UiResult::Ok(OrderingView {
+                        editions: editions
+                            .iter()
+                            .map(|e| (text(e, "id"), text(e, "label")))
+                            .collect(),
+                        groups,
+                        timelines,
+                    })
+                }
+                .await
+                .ok()
+            } else {
+                None
+            };
+            // Merge candidates: other readable titles found by this one's
+            // title, each with the exact revisions a merge plan is fenced by.
+            let item_revision = text(&value, "revision");
+            let merge_candidates = if write {
+                let q = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("q", &card.title)
+                    .finish();
+                self.list(&format!("/catalog/search?limit=20&{q}"))
+                    .await
+                    .ok()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter(|r| r["id"] != item_id.as_str())
+                            .map(|r| MergeCandidate {
+                                id: text(r, "id"),
+                                title: text(r, "title"),
+                                revision: text(r, "revision"),
+                            })
+                            .collect()
+                    })
+            } else {
+                None
+            };
+            let versions = if write {
+                structure.as_ref().map(|(_, _, versions)| versions.clone())
+            } else {
+                None
+            };
             Ok(ItemManageView {
                 item: card,
+                item_revision,
+                merge_candidates,
+                versions,
                 library_ids,
                 match_state: text(&value, "match_state"),
                 item_etag: item_etag.ok_or(UiError::Unavailable)?,
@@ -1224,6 +1325,7 @@ impl UiQueryFacade for Queries {
                 timelines,
                 collections,
                 playlists,
+                ordering,
             })
         })
     }
@@ -1307,6 +1409,7 @@ impl UiQueryFacade for Queries {
                     id: text(c, "id"),
                     name: text(c, "name"),
                     kind: text(c, "kind"),
+                    filter_id: c["filter_id"].as_str().map(str::to_owned),
                     etag: tag(c)?,
                     items,
                     remove_bodies,
@@ -1358,10 +1461,43 @@ impl UiQueryFacade for Queries {
                     entry_bodies: bodies,
                 });
             }
+            // The profile's saved filters, with whether a smart collection
+            // still uses each (deleting one in use is refused).
+            let mut filters = Vec::new();
+            for f in self
+                .list_all("/catalog/filters", 5)
+                .await?
+                .iter()
+                .filter(mine)
+            {
+                let id = text(f, "id");
+                filters.push(SavedFilterView {
+                    in_use: collections
+                        .iter()
+                        .any(|c| c.filter_id.as_deref() == Some(id.as_str())),
+                    id,
+                    name: text(f, "name"),
+                    etag: tag(f)?,
+                    terms: f["all"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|t| FilterTermView {
+                            field: text(t, "field"),
+                            operator: text(t, "operator"),
+                            value: match &t["value"] {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            },
+                        })
+                        .collect(),
+                });
+            }
             Ok(OrganizeView {
                 profile_id: who.profile_id.clone(),
                 collections,
                 playlists,
+                filters,
             })
         })
     }
