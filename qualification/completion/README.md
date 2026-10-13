@@ -993,6 +993,14 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   After the fixes: JS 95, `v2_downloads` 8 and contract 5 passed; pinned
   clippy is clean.
 
+  Round 2 at `e7b517d` raised one P2: a removal report was lost when the
+  server had never accepted an earlier report for that copy (for example
+  one saved before reports existed). Fixed: removals the device makes are
+  kept durably (`transfer-removed.json`) until the server accepts their
+  `removed` report, and retried on later passes. JS test: a refused
+  removal report of a never-reported copy is retried and then stops. JS
+  96 passed.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

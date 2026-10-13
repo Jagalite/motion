@@ -736,3 +736,35 @@ test('reports are reconciled on later passes and never block downloads', async (
   await agent.pass();
   assert.deepEqual(reports, []);
 });
+
+test('a removal report is retried until accepted, even if the server never heard of the copy', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const reports = [];
+  let accept = false;
+  let listed = [{id: 'once', profile_id: 'default', state: 'cancelled', revision: '2', size_bytes: '20', device_transfer: null}];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: listed, next_cursor: null};
+      if (init.method === 'PUT' && path.endsWith('/transfer')) {
+        reports.push(init.body.state);
+        if (!accept) throw Object.assign(new Error('offline'), {status: 503});
+        listed = listed.map(d => ({...d, device_transfer: {state: 'removed', download_revision: '2'}}));
+        return {};
+      }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  // A copy saved before reports existed; its download was cancelled.
+  fake.state(target.path).downloads.push({identity: {download_id: 'once'}, size: 20});
+  await agent.pass();
+  assert.deepEqual(reports, ['removed'], 'removed, but the report was refused');
+  assert.equal(fake.state(target.path).downloads.length, 0);
+  // Later passes retry until the server accepts it, then stop.
+  accept = true;
+  await agent.pass();
+  await agent.pass();
+  assert.deepEqual(reports, ['removed', 'removed']);
+});

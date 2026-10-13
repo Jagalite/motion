@@ -187,8 +187,23 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
    * revision it listed; the server stores them as reported.
    */
   const reports = join(base, 'transfer-reports.json');
+  /**
+   * Copies this device removed whose `removed` report the server has not
+   * accepted yet: kept (durably) until it does, so the report is retried on
+   * later passes even when the server never heard of the copy.
+   */
+  const removedReports = join(base, 'transfer-removed.json');
+  const pendingRemoved = () => new Set(readJson(removedReports, []));
+  function noteRemoved(id) {
+    try { writeAtomically(removedReports, [...new Set([...pendingRemoved(), id])]); } catch { /* retried from the server's view */ }
+  }
+  function forgetRemoved(id) {
+    try { writeAtomically(removedReports, [...pendingRemoved()].filter(other => other !== id)); } catch { /* retried next pass */ }
+  }
+
+  /** Report a state; true when the server accepted it (or it was a duplicate). */
   async function report(download, state, bytes) {
-    if (!download?.revision) return;
+    if (!download?.revision) return false;
     // A sequence is sent only once it is persisted; failing to persist it is
     // a reporting failure only, never a transfer failure.
     let sequence;
@@ -197,13 +212,15 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       sequence = (Number(sequences[download.id]) || 0) + 1;
       writeAtomically(reports, {...sequences, [download.id]: sequence});
     } catch {
-      return;
+      return false;
     }
     try {
       await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/transfer`, {method: 'PUT',
         body: {sequence: String(sequence), download_revision: String(download.revision), state, bytes_received: String(bytes)}});
+      return true;
     } catch (error) {
       if (signal?.aborted) throw error;
+      return false;
     }
   }
 
@@ -481,6 +498,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
             outcome = error.status === 404 ? 'absent' : 'failed';
             if (outcome === 'failed') status(`A title removed on this device is still listed by the server (${error.code ?? error.status ?? error.message}); it will not be saved again.`);
           }
+          noteRemoved(id);
           await cache(target.path, target.scope, ['settle-removal', '--download-id', id, '--outcome', outcome]);
         }
         before = await cache(target.path, target.scope, ['status']);
@@ -493,9 +511,10 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       for (const id of present) {
         const listed = wanted.find(d => d.id === id);
         if (listed?.state !== 'ready') {
+          noteRemoved(id);
           await cache(target.path, target.scope, ['remove', '--download-id', id]);
           // An ended download still listed learns that its copy is gone.
-          if (listed) await report(listed, 'removed', 0);
+          if (listed && await report(listed, 'removed', 0)) forgetRemoved(id);
         }
       }
       // Bring the server's view of this device's copies up to date: a
@@ -503,6 +522,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       // existed, and copies removed through the offline window. Only what
       // the device knows locally is reported.
       const saved = new Set(local.downloads.map(entry => entry.identity.download_id));
+      const pending = pendingRemoved();
       for (const listed of downloads.filter(d => d.profile_id === profile)) {
         if (signal?.aborted) return;
         const reported = listed.device_transfer;
@@ -510,8 +530,10 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         if (listed.state === 'ready' && saved.has(listed.id) && !(current && reported.state === 'verified_local')) {
           await report(listed, 'verified_local', Number(listed.size_bytes) || 0);
         } else if (listed.state !== 'ready' && !saved.has(listed.id) && !before.staged.includes(listed.id)
-          && reported && !(current && reported.state === 'removed')) {
-          await report(listed, 'removed', 0);
+          && (pending.has(listed.id) || reported) && !(current && reported.state === 'removed')) {
+          if (await report(listed, 'removed', 0)) forgetRemoved(listed.id);
+        } else if (current && reported.state === 'removed') {
+          forgetRemoved(listed.id);
         }
       }
       let failed = false;
