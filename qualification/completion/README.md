@@ -1679,6 +1679,24 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   168, `v2_playback` 36, `access_api` 39, contract 5, `jobs_model` 3
   passed; clippy clean.
 
+  Round 2 at `7549b60` raised one P1 and two P2 findings, all fixed:
+  - **V7 (P1):** round 1 had edited the already-pushed migration 0051
+    (its checksum). That would stop the server for any database that ran it.
+    0051 is restored byte for byte, and the unique active-job index comes in
+    a new migration, 0052. It first cancels any duplicate active jobs,
+    keeping the oldest per revision.
+  - **V8:** when a renderer's exit was not confirmed, `finish` still
+    removed its staging and held witness, so a restart could not account
+    for it. A stuck attempt's staging is now kept; retention leaves it
+    until the witness is free.
+  - **V9:** `round=down` put the last frame of each interval in the tile
+    before it (seconds 9, 19, 24 for tiles 0, 10, 20). `round=up` keeps the
+    latest frame at or before each position (0, 10, 20), with exact counts
+    re-verified (3, 11, 20, 25, 1,001 s; sparse key frames). The test's
+    video now encodes its second as brightness, and thumbnails 0, 1 and 2
+    are checked to show seconds 0, 10 and 20. `v2_playback` 36 passed;
+    clippy clean.
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |

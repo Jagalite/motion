@@ -14,8 +14,7 @@ CREATE TABLE preview_jobs (
  created_at INTEGER NOT NULL,
  error TEXT
 );
--- At most one active job per revision: never duplicated work.
-CREATE UNIQUE INDEX preview_jobs_active ON preview_jobs(file_id,file_revision) WHERE phase IN ('queued','running','cancelling');
+CREATE INDEX preview_jobs_active ON preview_jobs(file_id,file_revision) WHERE phase IN ('queued','running','cancelling');
 CREATE TRIGGER preview_job_revision AFTER UPDATE OF phase,attempt,error ON preview_jobs BEGIN
  UPDATE preview_jobs SET revision=revision+1 WHERE id=NEW.id;
  INSERT INTO change_events(topic,resource_id) VALUES ('job',NEW.id); END;

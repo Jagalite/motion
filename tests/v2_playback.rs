@@ -8145,7 +8145,25 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         return;
     }
     let f = Fixture::new().await;
-    two_audio_mp4(&f, "25");
+    // 25 s whose brightness is the second it shows (9 levels per second),
+    // so each thumbnail's content says which picture it is.
+    f.media(
+        "film.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=160x120:r=24:d=25,format=gray,geq=lum='trunc(T)*9'",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "24",
+            "-pix_fmt",
+            "yuv420p",
+        ],
+    );
     f.scan().await;
     let (timeline, _) = f.timeline().await;
     let (_, auth) = f.device(&["default"], PLAYER).await;
@@ -8249,6 +8267,29 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         .unwrap()
         .stdout;
     assert_eq!(String::from_utf8_lossy(&size).trim(), "1600,1200");
+    // Thumbnail n shows the picture at n * 10 s (the frame at or before it).
+    for (n, second) in [(0u32, 0u32), (1, 10), (2, 20)] {
+        let tile = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&image)
+            .args([
+                "-vf",
+                &format!("crop=40:40:{}:40", n * 160 + 60),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "gray",
+                "-",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        let mean = tile.iter().map(|&p| u32::from(p)).sum::<u32>() / tile.len() as u32;
+        assert!(
+            mean.abs_diff(second * 9) <= 6,
+            "thumbnail {n} shows brightness {mean}, not second {second}"
+        );
+    }
     // The cancelled job rendered nothing, and its record says so.
     let cancelled = f
         .get(&format!("/api/v2/jobs/{cancelled_id}"), &operator)

@@ -356,7 +356,9 @@ pub async fn worker(app: App, stop: CancellationToken) -> anyhow::Result<()> {
             if stop.is_cancelled() {
                 return Ok(());
             }
-            finish(&app, &job, rendered).await?;
+            // A renderer not confirmed gone keeps its staging (and witness),
+            // so recovery after a restart still accounts for it.
+            finish(&app, &job, rendered, lease.is_stuck()).await?;
         }
         drop(lease);
     }
@@ -498,11 +500,13 @@ async fn render(
     tokio::fs::create_dir_all(&staging).await?;
     let (w, h) = (layout.tile_width, layout.tile_height);
     // One thumbnail per tile, at exactly 0, interval, 2·interval, …: the
-    // last frame at or before each (key frames only), and one at the end of
-    // a part-interval (`eof_action=pass`). Sheets are assembled here, so
-    // their tiles are counted, never padded with blanks.
+    // last frame at or before each (key frames only; `round=up` places a
+    // frame in the first slot at or after its time, so each slot keeps the
+    // latest frame not after it), and one for a final part-interval
+    // (`eof_action=pass`). Sheets are assembled here, so their tiles are
+    // counted, never padded with blanks.
     let filter = format!(
-        "fps=fps=1000/{interval}:start_time=0:round=down:eof_action=pass,\
+        "fps=fps=1000/{interval}:start_time=0:round=up:eof_action=pass,\
          scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1",
         interval = layout.interval_ms,
     );
@@ -652,6 +656,7 @@ async fn finish(
     app: &App,
     job: &Started,
     rendered: anyhow::Result<(Layout, Vec<Sheet>, bool)>,
+    stuck: bool,
 ) -> anyhow::Result<()> {
     if let Err(error) = &rendered {
         tracing::warn!(job_id=%job.id, %error, "preview rendering failed");
@@ -779,7 +784,9 @@ async fn finish(
         .await?;
     tx.commit().await?;
     drop(_guard);
-    let _ = tokio::fs::remove_dir_all(&staging).await;
+    if !stuck {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+    }
     Ok(())
 }
 
