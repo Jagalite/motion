@@ -163,6 +163,46 @@ pub fn burnable_subtitle(codec: &str) -> bool {
     matches!(codec, "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvb_subtitle")
 }
 
+/// Styled text codecs (ASS/SSA): rendered faithfully only by libass, so only
+/// burned into converted video, never flattened to WebVTT.
+pub fn styled_subtitle(codec: &str) -> bool {
+    matches!(codec, "ass" | "ssa")
+}
+
+/// How a selected embedded subtitle stream reaches the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Presentation {
+    /// Delivered as WebVTT (sidecar or in-manifest rendition).
+    Text,
+    /// Bitmap subpictures overlaid on converted video.
+    BurnBitmap,
+    /// Text or styled subtitles rendered by libass into converted video.
+    BurnText,
+}
+
+/// The presentation of an embedded subtitle stream with `codec` for a client
+/// that presents text (`accepts_text`) or burned subtitles
+/// (`accepts_burned`), given whether this server's FFmpeg has libass
+/// (`libass`). Plain text prefers a text track; styled text is only burned;
+/// bitmaps are only overlaid. None: this client cannot be given it.
+pub fn presentation(
+    codec: &str,
+    accepts_text: bool,
+    accepts_burned: bool,
+    libass: bool,
+) -> Option<Presentation> {
+    if burnable_subtitle(codec) {
+        return accepts_burned.then_some(Presentation::BurnBitmap);
+    }
+    let plain = sidecar_subtitle(codec);
+    if plain && accepts_text {
+        return Some(Presentation::Text);
+    }
+    ((plain || styled_subtitle(codec)) && accepts_burned && libass)
+        .then_some(Presentation::BurnText)
+}
+
 /// Whether a live segmented route can serve these streams. Stream copy is only
 /// offered for H.264 into fMP4; remux also copies AAC (or no audio), audio
 /// conversion copies H.264 and converts any other audio to AAC.
@@ -1736,6 +1776,32 @@ mod tests {
             "",
         ] {
             assert!(!sidecar_subtitle(codec), "{codec}");
+        }
+    }
+
+    #[test]
+    fn subtitles_are_presented_without_losing_meaning() {
+        use Presentation::*;
+        let cases = [
+            // codec, text, burned, libass, expected
+            ("subrip", true, true, true, Some(Text)),
+            ("subrip", false, true, true, Some(BurnText)),
+            ("subrip", false, true, false, None),
+            ("subrip", false, false, true, None),
+            ("ass", true, true, true, Some(BurnText)),
+            ("ass", true, false, true, None),
+            ("ass", true, true, false, None),
+            ("ssa", false, true, true, Some(BurnText)),
+            ("hdmv_pgs_subtitle", true, true, false, Some(BurnBitmap)),
+            ("dvd_subtitle", true, false, true, None),
+            ("eia_608", true, true, true, None),
+        ];
+        for (codec, text, burned, libass, expected) in cases {
+            assert_eq!(
+                presentation(codec, text, burned, libass),
+                expected,
+                "{codec} {text} {burned} {libass}"
+            );
         }
     }
 }

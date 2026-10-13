@@ -5998,7 +5998,7 @@ const PQ_100_NITS: u16 = 509;
 /// HDR10 sources play to SDR clients through a tone-mapped conversion whose
 /// pixels (not only tags) are SDR, decided from probed colour facts and the
 /// observed filters. Unknown facts and missing filters are refused. Needs an
-/// FFmpeg with zimg and tonemap: `MOTION_TONE_MAP_FFMPEG` (for example the
+/// FFmpeg with zimg and tonemap: `MOTION_FILTER_FFMPEG` (for example the
 /// N2 media-tools build); the refusals run without it.
 #[tokio::test(flavor = "multi_thread")]
 async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() {
@@ -6035,8 +6035,8 @@ async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() 
         capabilities.body
     );
 
-    let Ok(ffmpeg) = std::env::var("MOTION_TONE_MAP_FFMPEG") else {
-        eprintln!("SKIPPED (tone mapping): MOTION_TONE_MAP_FFMPEG is not set");
+    let Ok(ffmpeg) = std::env::var("MOTION_FILTER_FFMPEG") else {
+        eprintln!("SKIPPED (tone mapping): MOTION_FILTER_FFMPEG is not set");
         return;
     };
     let f = Fixture::with_settings(playscale::processing::Settings {
@@ -6156,4 +6156,257 @@ async fn hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters() 
     let (_, auth) = g.device(&["default"], PLAYER).await;
     let unknown = hdr_plan(&g, &auth, &timeline).await;
     assert_eq!(unknown.body["status"], "blocked", "{}", unknown.body);
+}
+
+/// An ASS script whose one event draws a filled white rectangle (a drawing,
+/// so no font is needed) from `start` to `end` on a 320x240 canvas.
+fn ass_box(rectangle: (u32, u32, u32, u32), start: &str, end: &str) -> String {
+    let (x0, y0, x1, y1) = rectangle;
+    format!(
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n\
+         [V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n\
+         [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,{start},{end},Default,,0,0,0,,{{\\an7\\pos(0,0)\\p1}}m {x0} {y0} l {x1} {y0} {x1} {y1} {x0} {y1}{{\\p0}}\n"
+    )
+}
+
+/// Styled (ASS) subtitles are burned into conversions by libass from the
+/// exact selected stream, at the right file time after a seek, with the
+/// file's attachments extracted; never flattened to WebVTT, and refused
+/// where the FFmpeg lacks libass. Needs `MOTION_FILTER_FFMPEG` (an FFmpeg with
+/// libass); the refusals run without it.
+#[tokio::test(flavor = "multi_thread")]
+async fn styled_subtitles_are_burned_by_libass_from_the_exact_stream() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let build = |f: &Fixture| {
+        two_audio_mp4(f, "20");
+        let base = f.dir.path().join("base.mp4");
+        std::fs::rename(f.dir.path().join("media/film.mp4"), &base).unwrap();
+        // Two English tracks: the selected one draws high, the other low.
+        let high = f.dir.path().join("high.ass");
+        let low = f.dir.path().join("low.ass");
+        std::fs::write(
+            &high,
+            ass_box((40, 40, 260, 100), "0:00:02.00", "0:00:15.00"),
+        )
+        .unwrap();
+        std::fs::write(
+            &low,
+            ass_box((40, 140, 260, 200), "0:00:00.00", "0:00:20.00"),
+        )
+        .unwrap();
+        let font = f.dir.path().join("font.ttf");
+        std::fs::write(&font, b"not really a font").unwrap();
+        f.media(
+            "film.mkv",
+            &[
+                "-i",
+                base.to_str().unwrap(),
+                "-i",
+                high.to_str().unwrap(),
+                "-i",
+                low.to_str().unwrap(),
+                "-attach",
+                font.to_str().unwrap(),
+                "-metadata:s:t",
+                "mimetype=font/ttf",
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:1",
+                "language=eng",
+                "-c",
+                "copy",
+            ],
+        );
+    };
+    let input = |timeline: &str, source: &Value, modes: &[&str]| {
+        let mut input = plan_input("default", timeline, "auto", None, &["http_range", "hls"]);
+        input["source"] = source.clone();
+        input["tracks"]["subtitle_track_id"] = json!("s0");
+        input["tracks"]["subtitle_policy"] = json!("require");
+        input["client"]["subtitle_modes"] = json!(modes);
+        input
+    };
+
+    // Without libass: styled subtitles are refused, never sent as WebVTT.
+    let plain = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: "/usr/bin/false".into(),
+        ..Default::default()
+    })
+    .await;
+    build(&plain);
+    plain.scan().await;
+    let (timeline, _) = plain.timeline().await;
+    let (_, auth) = plain.device(&["default"], PLAYER).await;
+    let source = plain.source().await;
+    let refused = plain
+        .post(
+            "/api/v2/playback/plans",
+            &auth,
+            None,
+            input(&timeline, &source, &["text", "burned"]),
+        )
+        .await;
+    assert_eq!(
+        refused.body["reason_codes"][0], "subtitle_format_unsupported",
+        "{}",
+        refused.body
+    );
+
+    let Ok(ffmpeg) = std::env::var("MOTION_FILTER_FFMPEG") else {
+        eprintln!("SKIPPED (libass): MOTION_FILTER_FFMPEG is not set");
+        return;
+    };
+    let f = Fixture::with_settings(playscale::processing::Settings {
+        ffmpeg: ffmpeg.into(),
+        ..Default::default()
+    })
+    .await;
+    build(&f);
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let plan = |modes: &'static [&'static str]| {
+        let body = input(&timeline, &source, modes);
+        let f = &f;
+        let auth = auth.clone();
+        async move { f.post("/api/v2/playback/plans", &auth, None, body).await }
+    };
+    // A text-only client cannot be given styled subtitles.
+    assert_eq!(
+        plan(&["text"]).await.body["reason_codes"][0],
+        "subtitle_format_unsupported"
+    );
+    // The fragment's mean luma inside the selected track's box and the other
+    // track's box, `at` seconds into the first segment.
+    let boxes = |id: String, at: &'static str| {
+        let f = &f;
+        let auth = auth.clone();
+        async move {
+            let mut bytes = Vec::new();
+            for path in ["variants/main/init.mp4", "segments/0.m4s"] {
+                let reply = f
+                    .call(
+                        "GET",
+                        &format!("/api/v2/streams/{id}/1/{path}"),
+                        None,
+                        &[("authorization", &auth)],
+                    )
+                    .await;
+                assert_eq!(reply.status, StatusCode::OK, "{path}");
+                bytes.extend(reply.bytes);
+            }
+            let fragment = f.dir.path().join(format!("styled-{id}-{at}.mp4"));
+            std::fs::write(&fragment, bytes).unwrap();
+            let frame = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&fragment)
+                .args([
+                    "-ss",
+                    at,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-",
+                ])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(frame.len(), 320 * 240);
+            let mean = |y0: usize| {
+                let mut sum = 0usize;
+                for y in y0 + 10..y0 + 50 {
+                    sum += frame[y * 320 + 60..y * 320 + 240]
+                        .iter()
+                        .map(|&p| p as usize)
+                        .sum::<usize>();
+                }
+                sum / (180 * 40)
+            };
+            (mean(40), mean(140))
+        }
+    };
+    for (key, start_ms, before, during) in [
+        // From the start: nothing before 2 s, the box from then on.
+        ("styled-burn-0000001", 0, Some("1"), "3"),
+        // A seek into the event: drawn although its start precedes the seek.
+        ("styled-burn-0000002", 8000, None, "0.5"),
+    ] {
+        let planned = plan(&["text", "burned"]).await;
+        assert_eq!(
+            planned.body["operation"], "video_transcode",
+            "{}",
+            planned.body
+        );
+        let admitted = f
+            .post(
+                "/api/v2/playback/delivery-sessions",
+                &auth,
+                Some(key),
+                json!({"plan_token": planned.body["plan_token"], "start_ms": start_ms}),
+            )
+            .await;
+        assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+        let id = admitted.body["id"].as_str().unwrap().to_owned();
+        let ready = f
+            .until(&id, &auth, |d| {
+                d["active"]["available_end_ms"].as_u64().unwrap_or(0) > start_ms
+                    || d["active"]["status"] == "failed"
+            })
+            .await;
+        assert_ne!(ready["active"]["status"], "failed", "{ready}");
+        assert_eq!(
+            ready["active"]["subtitles_url"],
+            Value::Null,
+            "burned, not a track"
+        );
+        if let Some(at) = before {
+            let (selected, other) = boxes(id.clone(), at).await;
+            assert!(
+                selected < 200 && other < 200,
+                "before the cue: {selected}, {other}"
+            );
+        }
+        let (selected, other) = boxes(id.clone(), during).await;
+        // Only the selected stream is drawn, not its same-language sibling.
+        assert!(
+            selected > 225 && other < 200,
+            "cue {selected}, other track {other}"
+        );
+        // The file's attachment was extracted under a fixed name.
+        let fonts = f
+            .server
+            .app
+            .processing
+            .deliveries
+            .root
+            .join(&id)
+            .join("burn-fonts-0/font0");
+        assert_eq!(std::fs::read(&fonts).unwrap(), b"not really a font");
+        assert_eq!(
+            f.call(
+                "DELETE",
+                &format!("/api/v2/playback/delivery-sessions/{id}"),
+                None,
+                &[("authorization", &auth)]
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
+    }
 }

@@ -557,6 +557,11 @@ fn tone_map_graph(t: playscale_core::color::ToneMap) -> String {
     )
 }
 
+/// Per-delivery files of a burned text subtitle, beside the generations:
+/// `burn-text-<n>.ass` and the font directory `burn-fonts-<n>`.
+const BURN_TEXT: &str = "burn-text-";
+const BURN_FONTS: &str = "burn-fonts-";
+
 /// FFmpeg's own playlist only needs to cover what one observation can miss.
 const FFMPEG_LIST_SIZE: &str = "30";
 
@@ -576,7 +581,7 @@ fn arguments(
     start_ms: u64,
     end_ms: Option<u64>,
     audio: Option<u32>,
-    burn: Option<u32>,
+    burn: Option<Burn>,
     parts: Option<PartInputs<'_>>,
     cap: Option<playscale_core::playback_session::RateCap>,
     adaptive: bool,
@@ -605,7 +610,8 @@ fn arguments(
     // start, so cues still showing there are drawn. Output time zero is the
     // start either way.
     let burn = burn.filter(|_| !copy);
-    let input_ms = if burn.is_some() {
+    // libass reads every event of an extracted subtitle: no lookback.
+    let input_ms = if matches!(burn, Some(Burn::Bitmap(_))) {
         start_ms.saturating_sub(BURN_LOOKBACK_MS)
     } else {
         start_ms
@@ -713,7 +719,28 @@ fn arguments(
                 args.extend(["-map", "[ja]"].map(str::to_owned));
             }
         }
-        (Some(index), None) => {
+        (Some(Burn::Text { index, attachments }), None) => {
+            // libass renders the subtitle extracted for this delivery
+            // (`ensure_burn_text`), referenced relative to the generation
+            // directory (FFmpeg's working directory) so no path needs
+            // filtergraph escaping. Its events are in file time: frames are
+            // shifted to file time for rendering and back. Text is drawn on
+            // the already tone-mapped picture.
+            let fonts = if attachments > 0 {
+                format!(":fontsdir=../{BURN_FONTS}{index}")
+            } else {
+                String::new()
+            };
+            let origin = at(start_ms);
+            args.push("-filter_complex".into());
+            args.push(format!(
+                "{video}{source}setpts=PTS+{origin}/TB,\
+                 subtitles=filename=../{BURN_TEXT}{index}.ass{fonts},\
+                 setpts=PTS-{origin}/TB,{SCALE}[v]"
+            ));
+            args.extend(["-map", "[v]"].map(str::to_owned));
+        }
+        (Some(Burn::Bitmap(index)), None) => {
             args.push("-filter_complex".into());
             // Subpictures are SDR: they are drawn on the already tone-mapped picture.
             args.push(format!(
@@ -1723,7 +1750,22 @@ async fn run_generation(
     } else {
         (None, start_ms)
     };
+    // A burned text subtitle is extracted once per delivery, with its fonts,
+    // before the encoder starts; it renders nothing it could not read.
+    if let Some(Burn::Text { index, attachments }) = pinned_burn(&pin) {
+        let extracted = ensure_burn_text(&app, &session, index, attachments).await;
+        if stop.is_cancelled() {
+            return stopped(&app, &session);
+        }
+        if let Err(error) = extracted {
+            let (_, code, _) = error.parts();
+            tracing::warn!(delivery=%session.id, generation, code, "burned subtitle unavailable");
+            return fail(&app, &session);
+        }
+    }
     let mut supervisor = Command::new(&app.processing.supervisor);
+    // Relative filter inputs (a burned subtitle) resolve from here.
+    supervisor.current_dir(&directory);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
         .arg(&app.processing.settings.ffmpeg)
@@ -2718,35 +2760,96 @@ fn pinned_subtitle(pin: &Pin) -> Option<u32> {
 
 const SIDECAR_TRACK: &str = "subtitle-sidecar:";
 const BURN_TRACK: &str = "subtitle-burn:";
+const BURN_TEXT_TRACK: &str = "subtitle-burn-text:";
+/// Font attachments extracted for one burned text subtitle, at most.
+pub(crate) const MAX_BURN_ATTACHMENTS: u32 = 64;
 
-/// A bitmap subtitle stream burned into this generation's video.
-fn pinned_burn(pin: &Pin) -> Option<u32> {
-    pin.tracks
-        .iter()
-        .find_map(|t| t.strip_prefix(BURN_TRACK).and_then(|i| i.parse().ok()))
+/// An embedded subtitle stream burned into converted video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Burn {
+    /// Bitmap subpictures (PGS, DVD, DVB), overlaid.
+    Bitmap(u32),
+    /// Text or styled (ASS/SSA) subtitles rendered by libass with the file's
+    /// font attachments (`attachments` of them).
+    Text { index: u32, attachments: u32 },
 }
 
-/// Pin a burned bitmap subtitle in place of an absent text one.
-fn with_burn(mut pin: Pin, burn: Option<u32>) -> Pin {
-    if let Some(index) = burn {
+impl Burn {
+    /// The burned embedded subtitle stream.
+    pub(crate) fn index(self) -> u32 {
+        match self {
+            Burn::Bitmap(index) | Burn::Text { index, .. } => index,
+        }
+    }
+}
+
+/// A bitmap burn serializes as its bare stream number, as before text burns
+/// existed, so request digests of bitmap burns are unchanged.
+impl serde::Serialize for Burn {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Burn::Bitmap(index) => serializer.serialize_u32(index),
+            Burn::Text { index, attachments } => {
+                serde_json::json!({"text": index, "attachments": attachments}).serialize(serializer)
+            }
+        }
+    }
+}
+
+/// The subtitle stream burned into this generation's video.
+fn pinned_burn(pin: &Pin) -> Option<Burn> {
+    pin.tracks.iter().find_map(|t| {
+        if let Some(rest) = t.strip_prefix(BURN_TEXT_TRACK) {
+            let (index, attachments) = rest.split_once(':')?;
+            return Some(Burn::Text {
+                index: index.parse().ok()?,
+                attachments: attachments.parse().ok()?,
+            });
+        }
+        t.strip_prefix(BURN_TRACK)?.parse().ok().map(Burn::Bitmap)
+    })
+}
+
+/// Pin a burned subtitle in place of an absent text one.
+fn with_burn(mut pin: Pin, burn: Option<Burn>) -> Pin {
+    if let Some(burn) = burn {
         for track in &mut pin.tracks {
             if track == "subtitle:none" {
-                *track = format!("{BURN_TRACK}{index}");
+                *track = match burn {
+                    Burn::Bitmap(index) => format!("{BURN_TRACK}{index}"),
+                    Burn::Text { index, attachments } => {
+                        format!("{BURN_TEXT_TRACK}{index}:{attachments}")
+                    }
+                };
             }
         }
     }
     pin
 }
 
-/// A burned subtitle must be an embedded bitmap stream, and burn-in is a
-/// video transform: only a transcode can carry it.
+/// The font attachments of `file` a text burn-in extracts, bounded.
+pub(crate) fn burn_attachments(file: &db::ItemRow) -> u32 {
+    serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
+        .map(|streams| streams.iter().filter(|t| t.kind == "attachment").count() as u32)
+        .unwrap_or(0)
+        .min(MAX_BURN_ATTACHMENTS)
+}
+
+/// A burned subtitle must be an embedded stream the kind of burn renders
+/// (`core::presentation`): bitmap subpictures, or text/styled subtitles with
+/// the observed libass filter. Burn-in is a video transform: only a
+/// transcode can carry it.
 fn validate_burn(
     file: &db::ItemRow,
-    burn: Option<u32>,
+    burn: Option<Burn>,
     operation: Operation,
+    libass: bool,
 ) -> Result<(), ApiError> {
-    let Some(index) = burn else {
+    let Some(burn) = burn else {
         return Ok(());
+    };
+    let index = match burn {
+        Burn::Bitmap(index) | Burn::Text { index, .. } => index,
     };
     let streams: Vec<db::Track> =
         serde_json::from_str(&file.tracks_json).map_err(ApiError::internal)?;
@@ -2756,13 +2859,21 @@ fn validate_burn(
         .nth(index as usize)
         .map(|t| t.codec.as_str())
         .ok_or_else(|| ApiError::bad("Unknown subtitle track"))?;
-    if operation == Operation::VideoTranscode && core::burnable_subtitle(codec) {
+    let renders = match burn {
+        Burn::Bitmap(_) => core::burnable_subtitle(codec),
+        Burn::Text { attachments, .. } => {
+            libass
+                && (core::sidecar_subtitle(codec) || core::styled_subtitle(codec))
+                && attachments == burn_attachments(file)
+        }
+    };
+    if operation == Operation::VideoTranscode && renders {
         Ok(())
     } else {
         Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "subtitle_unsupported",
-            "Only bitmap subtitles are burned, and only into a transcode",
+            "This subtitle cannot be burned here, and only a transcode burns subtitles",
         ))
     }
 }
@@ -3242,8 +3353,8 @@ pub(crate) struct Planned {
     pub network: &'static str,
     /// A selected sidecar subtitle (embedded ones use `subtitle_track`).
     pub sidecar: Option<Sidecar>,
-    /// An embedded bitmap subtitle burned into the converted video.
-    pub burn: Option<u32>,
+    /// An embedded subtitle burned into the converted video.
+    pub burn: Option<Burn>,
     /// The interval of the file the planned timeline is.
     pub clip: Option<playscale_core::parts::Clip>,
     /// Every part of a multipart timeline, in order; empty for one file.
@@ -3416,7 +3527,7 @@ pub(crate) struct Selection {
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
     pub sidecar: Option<Sidecar>,
-    pub burn: Option<u32>,
+    pub burn: Option<Burn>,
     pub clip: Option<playscale_core::parts::Clip>,
     pub parts: Vec<playscale_core::parts::PartPin>,
     pub max_bitrate_bps: Option<u64>,
@@ -3536,7 +3647,12 @@ pub(crate) async fn change_live(
                 }
             };
             validate_sidecar(conn, &file.id, selection.sidecar.as_ref()).await?;
-            validate_burn(&file, selection.burn, pin.operation)?;
+            validate_burn(
+                &file,
+                selection.burn,
+                pin.operation,
+                app.processing.filters.get().is_some_and(|f| f.subtitles),
+            )?;
             // The timeline's interval and part layout are fixed for the
             // delivery; the selected audio in each part may change.
             if selection.clip != basis.clip
@@ -3979,7 +4095,12 @@ async fn admit_owned(
     let sidecar = planned.as_ref().and_then(|p| p.sidecar.as_ref());
     validate_sidecar(&mut transaction, &file.id, sidecar).await?;
     let burn = planned.as_ref().and_then(|p| p.burn);
-    validate_burn(&file, burn, operation)?;
+    validate_burn(
+        &file,
+        burn,
+        operation,
+        app.processing.filters.get().is_some_and(|f| f.subtitles),
+    )?;
     // An interval is a clip of the file: only a conversion presents it, and
     // the delivery's logical duration is the interval's.
     let clip = planned.as_ref().and_then(|p| p.clip);
@@ -5019,6 +5140,131 @@ async fn ensure_subtitles(
     // Publish into the existing delivery directory only: if cleanup removed it,
     // the delivery is gone and nothing is resurrected.
     let partial = path.with_extension("vtt.partial");
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &text).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&partial, &path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::not_found());
+    }
+    Ok(())
+}
+
+/// Extract (once per delivery) the embedded subtitle stream `index` as ASS
+/// and its `attachments` font attachments, from the validated source, into
+/// the delivery directory beside the generations. Attachments are written
+/// under fixed names, never the names the media file carries.
+async fn ensure_burn_text(
+    app: &App,
+    session: &Arc<Session>,
+    index: u32,
+    attachments: u32,
+) -> Result<(), ApiError> {
+    let _extraction = session.subtitles.lock().await;
+    let directory = app.processing.deliveries.root.join(&session.id);
+    let path = directory.join(format!("{BURN_TEXT}{index}.ass"));
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let _slot = app
+        .processing
+        .deliveries
+        .subtitle_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| subtitles_unavailable())?;
+    let fonts = directory.join(format!("{BURN_FONTS}{index}"));
+    let _ = tokio::fs::remove_dir_all(&fonts).await;
+    tokio::fs::create_dir_all(&fonts)
+        .await
+        .map_err(ApiError::internal)?;
+    let source = session.source.clone();
+    let expected = source.fingerprint.clone();
+    let input = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || source_valid(&source)),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?
+    .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
+    let mut args: Vec<String> = ["-v", "error", "-nostdin", "-y"]
+        .map(str::to_owned)
+        .to_vec();
+    for attachment in 0..attachments.min(MAX_BURN_ATTACHMENTS) {
+        args.push(format!("-dump_attachment:t:{attachment}"));
+        args.push(
+            fonts
+                .join(format!("font{attachment}"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    args.extend(
+        [
+            "-i",
+            "/dev/fd/3",
+            "-map",
+            &format!("0:s:{index}"),
+            "-c:s",
+            "ass",
+            "-f",
+            "ass",
+            "pipe:1",
+        ]
+        .map(str::to_owned),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let converted = run_descriptor(
+        &app.processing.settings.ffmpeg,
+        &input,
+        &args,
+        MAX_SUBTITLE_BYTES,
+        Duration::from_secs(120),
+    )
+    .await;
+    let text = match converted {
+        Ok(text)
+            if text.starts_with(b"[Script Info]")
+                || text.starts_with(b"\xEF\xBB\xBF[Script Info]") =>
+        {
+            text
+        }
+        Ok(_) | Err(ProbeFailure::Unavailable) => return Err(subtitles_unavailable()),
+        Err(ProbeFailure::Stalled(mut child)) => {
+            tracing::error!(delivery=%session.id, "subtitle extraction did not exit when killed");
+            let _ = child.wait().await;
+            return Err(subtitles_unavailable());
+        }
+    };
+    // The extractor read the descriptor after it was validated: observe it
+    // again before publishing under the pinned fingerprint.
+    let unchanged = tokio::time::timeout(
+        PROBE_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            input
+                .metadata()
+                .is_ok_and(|m| scan::fingerprint(&m) == expected)
+        }),
+    )
+    .await
+    .map_err(|_| subtitles_unavailable())?
+    .map_err(ApiError::internal)?;
+    if !unchanged {
+        return Err(ApiError::conflict(
+            "source_revision_changed",
+            "Create a new delivery",
+        ));
+    }
+    let partial = path.with_extension("ass.partial");
     let written = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)

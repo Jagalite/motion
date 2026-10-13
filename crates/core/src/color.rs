@@ -21,11 +21,15 @@ pub struct ColorFacts<'a> {
     pub dolby_vision: Option<(u8, u8)>,
 }
 
-/// Which tone-mapping filters the configured FFmpeg has (observed).
+/// Which of the filters Motion's policies depend on the configured FFmpeg
+/// has (observed, never assumed).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Filters {
     pub zscale: bool,
     pub tonemap: bool,
+    /// libass text and styled subtitle rendering (`subtitles`).
+    #[serde(default)]
+    pub subtitles: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ mod tests {
     const TOOLS: Filters = Filters {
         zscale: true,
         tonemap: true,
+        subtitles: false,
     };
 
     fn hdr10() -> ColorFacts<'static> {
@@ -227,10 +232,12 @@ mod tests {
             Filters {
                 zscale: true,
                 tonemap: false,
+                subtitles: true,
             },
             Filters {
                 zscale: false,
                 tonemap: true,
+                subtitles: true,
             },
         ] {
             assert_eq!(tone_map(&hdr10(), tools), Err(Refusal::ToolsUnavailable));

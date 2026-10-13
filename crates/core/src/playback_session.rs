@@ -405,6 +405,10 @@ pub enum Subtitle {
     /// The zero-based embedded bitmap subtitle stream (PGS, DVD, DVB) of the
     /// pinned file, burned into converted video.
     Bitmap(u32),
+    /// The zero-based embedded text or styled (ASS/SSA) subtitle stream of
+    /// the pinned file, rendered by libass into converted video with the
+    /// file's `attachments` font attachments (`delivery::presentation`).
+    BurnedText { index: u32, attachments: u32 },
 }
 
 /// A plan's subtitle claim: the current form, or a bare stream number from

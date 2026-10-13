@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A implemented, tested; 3B–3F not started | hdr PR | Sol review of 3A |
+| 3 Production playback and preparation | 3A and 3B implemented, tested; 3C–3F not started | playback PR | Sol review |
 | 4 Library-management UI | Not started | — | After item 2 |
 | 5 Offline breadth | Not started | — | After item 1 |
 | 6 M5 convenience and receiver | Not started | — | Marker/preview inventory |
@@ -220,7 +220,7 @@ Item 3 is delivered in slices. Copy, hardware and ABR defaults stay unchanged.
 
 ### 3A. HDR-to-SDR tone mapping on live conversions
 
-- **Source SHA:** branch `plan-completion/hdr-tone-map`, stacked on item 2.
+- **Source SHA:** branch `plan-completion/playback`, stacked on item 2.
 - **Implemented:**
   - **Observation.** The scanner probes primaries, matrix (`color_space`),
     range, mastering-display peak, MaxCLL and the Dolby Vision configuration
@@ -272,11 +272,44 @@ Item 3 is delivered in slices. Copy, hardware and ABR defaults stay unchanged.
 - **Focused evidence:** RESULTS_3A
 - **Review:** pending (GPT-6.1 Sol).
 
+### 3B. Text and styled subtitle burn-in
+
+- **Source SHA:** same branch as 3A.
+- **Implemented:**
+  - **Core `delivery::presentation(codec, accepts_text, accepts_burned,
+    libass)`** decides how an embedded subtitle reaches the client:
+    - plain text as a text track when the client presents text;
+    - otherwise plain or styled text rendered by libass into a conversion,
+      when the client accepts burned subtitles and the observed FFmpeg has
+      the `subtitles` filter;
+    - bitmaps by the existing overlay.
+
+    ASS/SSA are never flattened to WebVTT. A new plan claim
+    `Subtitle::BurnedText{index, attachments}` and pin track
+    `subtitle-burn-text:<n>:<attachments>` carry the exact embedded stream.
+  - **Execution.** Once per delivery and before the encoder starts, the
+    selected stream is extracted as ASS from the validated source descriptor
+    (fingerprint re-checked before publication). The file's font attachments
+    are dumped under fixed names (`burn-fonts-<n>/font<k>`, never names from
+    the media file; at most 64). The encoder runs in the generation
+    directory and references both by fixed relative names, so no path needs
+    filtergraph escaping. Frames are shifted to file time for rendering and
+    back, so a seek, a resumed start or an interval shows the right events
+    without a lookback. Text is drawn after any tone map.
+  - **Capabilities.** `styled_subtitles` and `text_burn_in` leave
+    `unsupported` only when libass is observed; the subtitle limit then lists
+    `embedded_text_and_styled_burned_in_conversion_with_font_attachments`.
+- **Unsupported (explicit):** sidecar (external file) burn-in; burn-in on
+  multipart versions; font rendering from attachments is wired but not
+  verified against a deterministic font fixture.
+- **Core/adapter boundary:** the presentation choice is a pure core decision
+  from codec, client modes and the observed filter; the adapter extracts,
+  checks fingerprints and executes.
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
-| 3B text/styled burn-in, fonts, offsets | Extend `burnable_subtitle`/`presents_subtitle` with a libass filter fact; `subtitles=si=` from the exact component |
 | 3C per-part subtitles; bitmap cues before the 20 s lookback | Per-part subtitle occurrence; second validated descriptor for early cues |
 | 3D subtitle-inclusive preparation and audio-component selection | Preparation pins by component with stale-source fencing |
 | 3E bitrate preference and UI control | Contract preference field, bridge and player control |

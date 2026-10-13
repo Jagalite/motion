@@ -1083,6 +1083,7 @@ fn listed_filters(text: &str) -> playscale_core::color::Filters {
     playscale_core::color::Filters {
         zscale: names.contains("zscale"),
         tonemap: names.contains("tonemap"),
+        subtitles: names.contains("subtitles"),
     }
 }
 
@@ -1092,7 +1093,7 @@ mod filter_tests {
     fn filters_are_read_from_the_listing_not_descriptions() {
         let listing = "Filters:\n  T.. = Timeline support\n ---\n .S zscale            V->V       Apply resizing.\n .S tonemap           V->V       Conversion to/from different dynamic ranges.\n";
         let found = super::listed_filters(listing);
-        assert!(found.zscale && found.tonemap);
+        assert!(found.zscale && found.tonemap && !found.subtitles);
         let without = " .. scale  V->V  Mentions zscale and tonemap in a description.\n";
         assert_eq!(super::listed_filters(without), Default::default());
     }

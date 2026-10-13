@@ -136,7 +136,19 @@ pub async fn capabilities(
         ("timeline_binding", "whole,interval,multipart".into()),
         (
             "subtitles",
-            "text_webvtt_on_original:embedded_or_srt_vtt_sidecar,text_hls_rendition_on_live_routes_for_hls_text_clients,bitmap_burned_in_conversion,automatic_by_profile_language_and_role".into(),
+            {
+                let mut modes = vec![
+                    "text_webvtt_on_original:embedded_or_srt_vtt_sidecar",
+                    "text_hls_rendition_on_live_routes_for_hls_text_clients",
+                    "bitmap_burned_in_conversion",
+                ];
+                // Only where this server's FFmpeg has libass.
+                if filters.subtitles {
+                    modes.push("embedded_text_and_styled_burned_in_conversion_with_font_attachments");
+                }
+                modes.push("automatic_by_profile_language_and_role");
+                modes.join(",")
+            },
         ),
         ("components", "embedded_and_sidecar_revision_bound,rendition_audio".into()),
         ("bitrate_caps", "conversion_vbv_peak_measured_per_segment".into()),
@@ -163,12 +175,20 @@ pub async fn capabilities(
         ),
         (
             "unsupported",
-            if tone_mapping {
-                "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion_on_multipart,hdr_preparation,cast"
-            } else {
-                "styled_subtitles,text_burn_in,subtitles_on_multipart,prepared_track_pins,hdr_conversion,cast"
-            }
-            .into(),
+            {
+                let mut unsupported = vec![];
+                if !filters.subtitles {
+                    unsupported.extend(["styled_subtitles", "text_burn_in"]);
+                }
+                unsupported.extend(["sidecar_burn_in", "subtitles_on_multipart", "prepared_track_pins"]);
+                if tone_mapping {
+                    unsupported.extend(["hdr_conversion_on_multipart", "hdr_preparation"]);
+                } else {
+                    unsupported.push("hdr_conversion");
+                }
+                unsupported.push("cast");
+                unsupported.join(",")
+            },
         ),
         ("playhead", "heartbeat_ordered_observation".into()),
         ("viewing_restart", "recoverable".into()),

@@ -1271,6 +1271,7 @@ pub async fn plan(
             &streams,
             accepts_text,
             accepts_burned,
+            filters.subtitles,
         )
         .await?
     } else {
@@ -1342,6 +1343,7 @@ pub async fn plan(
         &streams,
         accepts_text,
         accepts_burned,
+        filters.subtitles,
         subtitle,
         sidecar_name,
     )
@@ -1550,8 +1552,7 @@ pub async fn plan(
     // Selected text subtitles are a WebVTT sidecar with byte delivery of the
     // original, or an HLS subtitle rendition on a live route for a client that
     // selects in-manifest live text. Shaka refuses an external text track on a
-    // live presentation, and burning text in needs libass, which the bundled
-    // FFmpeg does not include.
+    // live presentation. Text burned in by libass (`burn`) is a conversion.
     if (subtitle.is_some() || sidecar.is_some())
         && !core::presents_subtitle(route, false, live_text)
     {
@@ -1569,6 +1570,7 @@ pub async fn plan(
                     &streams,
                     accepts_text,
                     accepts_burned,
+                    filters.subtitles,
                     embedded,
                     name,
                 )
@@ -1595,7 +1597,12 @@ pub async fn plan(
                 name: sidecar.name,
                 fingerprint: sidecar.fingerprint,
             }),
-            (None, None, Some(index)) => Some(core::Subtitle::Bitmap(index)),
+            (None, None, Some(delivery::Burn::Bitmap(index))) => {
+                Some(core::Subtitle::Bitmap(index))
+            }
+            (None, None, Some(delivery::Burn::Text { index, attachments })) => {
+                Some(core::Subtitle::BurnedText { index, attachments })
+            }
             (None, None, None) => None,
         },
         clip: chosen.clip,
@@ -1630,7 +1637,7 @@ pub async fn plan(
         "operation": serde_json::to_value(route.operation()).map_err(Problem::internal)?,
         "reason_codes": [],
         "warnings": warnings,
-        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn)),
+        "tracks": tracks_json(&input.tracks, audio, subtitle.or(burn.map(delivery::Burn::index))),
     }))
     .into_response())
 }
@@ -1798,6 +1805,7 @@ async fn subtitle_candidates(
     streams: &[db::Track],
     accepts_text: bool,
     accepts_burned: bool,
+    libass: bool,
 ) -> Result<Vec<SubtitleCandidate>, Problem> {
     use playscale_core::components::{Kind, SubtitleOccurrence, subtitle_occurrence};
     let mut out = Vec::new();
@@ -1818,12 +1826,15 @@ async fn subtitle_candidates(
                 else {
                     continue;
                 };
-                let text = playscale_core::delivery::sidecar_subtitle(&track.codec);
-                let bitmap = playscale_core::delivery::burnable_subtitle(&track.codec);
+                use playscale_core::delivery::{Presentation, presentation};
+                let presented = presentation(&track.codec, accepts_text, accepts_burned, libass);
                 (
                     (Some(position as u32), None),
-                    bitmap && accepts_burned,
-                    (text && accepts_text) || (bitmap && accepts_burned),
+                    matches!(
+                        presented,
+                        Some(Presentation::BurnBitmap | Presentation::BurnText)
+                    ),
+                    presented.is_some(),
                 )
             }
             Some(SubtitleOccurrence::Sidecar(name)) => {
@@ -1853,20 +1864,33 @@ async fn subtitle_candidates(
     Ok(out)
 }
 
-/// Resolve a subtitle choice on `file`: an embedded text subtitle for a
-/// client that presents text, an embedded bitmap one burned for a client that
-/// accepts burned subtitles, or a plain-text sidecar pinned with the
-/// fingerprint it was scanned with. Anything else is a blocked reason, never
-/// a substitute.
+/// Resolve a subtitle choice on `file` by core `presentation`: an embedded
+/// text subtitle for a client that presents text, an embedded bitmap one, or
+/// a text or styled one rendered by libass, burned for a client that accepts
+/// burned subtitles, or a plain-text sidecar pinned with the fingerprint it
+/// was scanned with. Anything else is a blocked reason, never a substitute.
+#[allow(clippy::type_complexity)]
 async fn resolve_subtitle(
     conn: &mut sqlx::SqliteConnection,
     file: &db::ItemRow,
     streams: &[db::Track],
     accepts_text: bool,
     accepts_burned: bool,
+    libass: bool,
     embedded: Option<u32>,
     sidecar: Option<String>,
-) -> Result<Result<(Option<u32>, Option<delivery::Sidecar>, Option<u32>), &'static str>, Problem> {
+) -> Result<
+    Result<
+        (
+            Option<u32>,
+            Option<delivery::Sidecar>,
+            Option<delivery::Burn>,
+        ),
+        &'static str,
+    >,
+    Problem,
+> {
+    use playscale_core::delivery::{Presentation, presentation};
     if let Some(index) = embedded {
         let codec = &streams
             .iter()
@@ -1875,12 +1899,20 @@ async fn resolve_subtitle(
             .ok_or_else(|| Problem::internal("selected subtitle stream missing"))?
             .codec;
         return Ok(
-            if playscale_core::delivery::burnable_subtitle(codec) && accepts_burned {
-                Ok((None, None, Some(index)))
-            } else if playscale_core::delivery::sidecar_subtitle(codec) && accepts_text {
-                Ok((Some(index), None, None))
-            } else {
-                Err("subtitle_format_unsupported")
+            match presentation(codec, accepts_text, accepts_burned, libass) {
+                Some(Presentation::Text) => Ok((Some(index), None, None)),
+                Some(Presentation::BurnBitmap) => {
+                    Ok((None, None, Some(delivery::Burn::Bitmap(index))))
+                }
+                Some(Presentation::BurnText) => Ok((
+                    None,
+                    None,
+                    Some(delivery::Burn::Text {
+                        index,
+                        attachments: delivery::burn_attachments(file),
+                    }),
+                )),
+                None => Err("subtitle_format_unsupported"),
             },
         );
     }
@@ -1910,9 +1942,12 @@ fn embedded_subtitle(claims: &Claims) -> Option<u32> {
     }
 }
 
-fn burned_subtitle(claims: &Claims) -> Option<u32> {
+fn burned_subtitle(claims: &Claims) -> Option<delivery::Burn> {
     match claims.subtitle {
-        Some(core::Subtitle::Bitmap(index)) => Some(index),
+        Some(core::Subtitle::Bitmap(index)) => Some(delivery::Burn::Bitmap(index)),
+        Some(core::Subtitle::BurnedText { index, attachments }) => {
+            Some(delivery::Burn::Text { index, attachments })
+        }
         _ => None,
     }
 }
