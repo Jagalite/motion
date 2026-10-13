@@ -4607,6 +4607,41 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         let other = plan(audio, subtitle).await;
         assert_ne!(other.body["operation"], "prepared", "{}", other.body);
     }
+    // Automatic selection must happen before testing prepared candidates.
+    let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    let mut document = prefs.body.clone();
+    document["subtitle_mode"] = json!("always");
+    document["subtitle_languages"] = json!(["eng"]);
+    let updated = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(document),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert_eq!(updated.status, StatusCode::OK);
+    let mut automatic = pinned_plan_input(
+        "default",
+        &timeline,
+        "convert",
+        "a1",
+        &["http_range", "hls"],
+        &source,
+    );
+    automatic["tracks"]["subtitle_policy"] = json!("auto");
+    let automatic = f
+        .post("/api/v2/playback/plans", &auth, None, automatic)
+        .await;
+    assert_eq!(
+        automatic.body["operation"], "prepared",
+        "{}",
+        automatic.body
+    );
+    assert_eq!(automatic.body["tracks"]["subtitle_track_id"], "s0");
     // The subtitle is delivered from the rendition's bytes.
     let admitted = f
         .post(
