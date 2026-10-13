@@ -60,9 +60,9 @@ function fakeCache() {
         return {base_sequence: String(s.base), events: s.events};
       }
       case 'settle-removal': {
-        // Mirrors offline::settles: only the server's confirmation settles.
+        // Mirrors offline::settles: the server's confirmation, and no copy left here.
         const [, id, , outcome] = args.slice(1);
-        if (!['deleted', 'absent'].includes(outcome)) return {settled: false};
+        if (!['deleted', 'absent'].includes(outcome) || s.downloads.some(d => d.identity.download_id === id)) return {settled: false};
         s.removals = (s.removals ?? []).filter(r => r !== id);
         return {settled: true};
       }

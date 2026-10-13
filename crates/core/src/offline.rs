@@ -241,9 +241,11 @@ pub fn may_publish(download_id: &str, pending_removals: &[String]) -> bool {
 }
 
 /// A pending removal is settled only once the server confirms the download
-/// itself is gone; until then the device keeps refusing to save it again.
-pub fn settles(outcome: Deletion) -> bool {
-    matches!(outcome, Deletion::Deleted | Deletion::Absent)
+/// itself is gone and its copy is gone from this device; until then the
+/// device keeps refusing to save it again and never presents it. The intent
+/// is the only record suppressing a copy a failed removal left behind.
+pub fn settles(outcome: Deletion, saved_locally: bool) -> bool {
+    matches!(outcome, Deletion::Deleted | Deletion::Absent) && !saved_locally
 }
 
 #[cfg(test)]
@@ -256,9 +258,12 @@ mod tests {
         assert!(!may_publish("d1", &pending));
         assert!(may_publish("d2", &pending));
         assert!(may_publish("d1", &[]));
-        assert!(settles(Deletion::Deleted));
-        assert!(settles(Deletion::Absent));
-        assert!(!settles(Deletion::Failed));
+        assert!(settles(Deletion::Deleted, false));
+        assert!(settles(Deletion::Absent, false));
+        assert!(!settles(Deletion::Failed, false));
+        // A copy still saved here keeps its intent, whatever the server says.
+        assert!(!settles(Deletion::Deleted, true));
+        assert!(!settles(Deletion::Absent, true));
     }
     fn event() -> OfflineEvent {
         OfflineEvent {

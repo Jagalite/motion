@@ -521,3 +521,42 @@ fn an_interrupted_removal_is_completed_on_reopen() {
     assert!(blobs(&root).is_empty());
     assert_eq!(store.removals(), ["d1"]);
 }
+
+/// A removal whose local cleanup failed keeps its intent even after the
+/// server confirms the deletion: the intent is all that suppresses the copy.
+#[cfg(unix)]
+#[test]
+fn a_removal_is_settled_only_once_its_copy_is_gone() {
+    use playscale_core::offline::Deletion;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let media = b"stuck media";
+    stage(&root, "d1", media);
+    store.publish(entry("d1", media)).unwrap();
+    // A partial re-transfer that cannot be deleted (read-only staging).
+    stage(&root, "d1", b"partial");
+    let staging = root.join("staging");
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(store.remove_by_person("d1").is_err(), "the cleanup failed");
+    assert_eq!(store.removals(), ["d1"]);
+    assert_eq!(
+        store.manifest().downloads.len(),
+        1,
+        "the copy is still listed"
+    );
+    // The server deleted it, but the copy is still here: not settled.
+    assert!(!store.settle_removal("d1", Deletion::Deleted).unwrap());
+    drop(store);
+    let store = Store::open(&root, &scope()).unwrap();
+    assert_eq!(store.removals(), ["d1"], "a reopen keeps the intent too");
+    drop(store);
+    let host = Cache::open(&root).unwrap();
+    assert!(!host.presents("d1"));
+    drop(host);
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut store = Store::open(&root, &scope()).unwrap();
+    assert!(store.settle_removal("d1", Deletion::Deleted).unwrap());
+    assert!(store.manifest().downloads.is_empty() && store.removals().is_empty());
+}

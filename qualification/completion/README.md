@@ -728,6 +728,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     reported as removed. Cache 9, store 14 and JS 89 passed; pinned
     clippy is clean.
 
+  Round 3 at `3e5df95` raised one P2: with replay best effort, a server
+  confirmation could clear the intent while a copy that a failed cleanup
+  left behind was still saved, so the title reappeared. Fixed: core
+  `offline::settles(outcome, saved_locally)` settles only when the server
+  confirms and no copy remains here. Settlement first completes the local
+  removal, best effort. Store test: the cleanup fails (read-only staging);
+  a server confirmation does not settle; a reopen keeps the intent and the
+  host does not present the title; once the cleanup can run, it settles.
+  Core 151, store 15 and cache 9 passed.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

@@ -260,7 +260,8 @@ impl Store {
     }
 
     /// Settle a pending removal with the server's answer to deleting the
-    /// download (`offline::settles`). Returns whether it is now settled.
+    /// download and whether its copy is gone here (`offline::settles`).
+    /// Returns whether it is now settled.
     pub fn settle_removal(
         &mut self,
         download_id: &str,
@@ -269,7 +270,16 @@ impl Store {
         if offline::may_publish(download_id, &self.removals) {
             return Ok(true);
         }
-        if !offline::settles(outcome) {
+        // Complete the local removal first (best effort); the intent stays
+        // while any copy remains (`offline::settles`).
+        let _ = self.remove(download_id);
+        let saved = self
+            .manifest
+            .downloads
+            .iter()
+            .any(|d| d.identity.download_id == download_id)
+            || self.staged()?.iter().any(|id| id == download_id);
+        if !offline::settles(outcome, saved) {
             return Ok(false);
         }
         let next = self
