@@ -16794,6 +16794,7 @@ components:
         usable_administrators:
           type: integer
           format: int64
+          description: Number of currently usable administrator device principals, not distinct users or independent recovery accounts. Several devices can belong to one user.
         pending_requests:
           type: integer
           format: int64

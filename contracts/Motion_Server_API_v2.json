@@ -15,10 +15,14 @@
   ],
   "security": [
     {
-      "bearerAuth": []
+      "bearerAuth": [
+
+      ]
     },
     {
-      "cookieAuth": []
+      "cookieAuth": [
+
+      ]
     }
   ],
   "x-contract-status": "finalized-design-not-implemented",
@@ -112,7 +116,9 @@
           }
         },
         "description": "Returns this OpenAPI document; not a runtime capability assertion.",
-        "security": []
+        "security": [
+
+        ]
       }
     },
     "/api/v2/system/health": {
@@ -175,7 +181,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": []
+        "security": [
+
+        ]
       }
     },
     "/api/v2/system/capabilities": {
@@ -315,77 +323,6 @@
       }
     },
     "/api/v2/auth/pairings": {
-      "post": {
-        "operationId": "createPairing",
-        "summary": "Create a rate-limited pairing request",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "201": {
-            "description": "Create a rate-limited pairing request.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Pairing"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "security": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PairingRequest"
-              }
-            }
-          }
-        }
-      },
       "get": {
         "operationId": "listPairings",
         "summary": "List pairing requests and recent outcomes",
@@ -460,6 +397,79 @@
             "$ref": "#/components/parameters/Limit"
           }
         ]
+      },
+      "post": {
+        "operationId": "createPairing",
+        "summary": "Create a rate-limited pairing request",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "Create a rate-limited pairing request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pairing"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "security": [
+
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairingRequest"
+              }
+            }
+          }
+        }
       }
     },
     "/api/v2/auth/pairings/{pairing_id}/approve": {
@@ -630,7 +640,9 @@
           }
         },
         "description": "Unapproved returns 409 pairing_pending. A lost acknowledgement can be replayed with the same device code only until pairing expiry; encrypted response retention is required. Device credential expires unless renewed by explicit pairing.",
-        "security": [],
+        "security": [
+
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -704,7 +716,9 @@
           }
         },
         "description": "Always enforce exact Origin/Host and bootstrap/ingress trust. Set HttpOnly SameSite cookie; Secure on HTTPS. Never infer administrator authority from loopback alone.",
-        "security": [],
+        "security": [
+
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -910,7 +924,9 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           }
         ],
         "requestBody": {
@@ -1305,6 +1321,721 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/AccessPolicyInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/users": {
+      "get": {
+        "operationId": "listAccessUsers",
+        "summary": "List named access users",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "List permitted devices.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessUserPage"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ]
+      },
+      "post": {
+        "operationId": "createAccessUser",
+        "summary": "Create an access identity",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "Create a profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessUser"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessUserInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/users/{user_id}": {
+      "parameters": [
+        {
+          "name": "user_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getAccessUser",
+        "summary": "Read an access user",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Read a device and its revision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessUser"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin"
+      },
+      "put": {
+        "operationId": "replaceAccessUser",
+        "summary": "Replace user grants and enabled state",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Replace mutable profile settings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessUser"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessUserInput"
+              }
+            }
+          }
+        },
+        "description": "If-Match protects the reviewed user revision. Changes atomically narrow all owned devices and advance their revisions. Disabling deletes their credentials and dependent tickets. Widening never silently widens existing devices. The last usable administrator cannot be disabled or demoted. Offline bytes cannot be retroactively erased; unsynchronized viewing records remain retained."
+      }
+    },
+    "/api/v2/auth/pairings/{pairing_id}/deny": {
+      "parameters": [
+        {
+          "name": "pairing_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "denyPairing",
+        "summary": "Deny a pending pairing request",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "204": {
+            "description": "Revoke device credentials and fence its deliveries."
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "description": "The immutable pending request is the decision precondition; deny and approve compete atomically. Repeating the same denial key returns its saved acknowledgement."
+      }
+    },
+    "/api/v2/auth/invitations": {
+      "get": {
+        "operationId": "listAccessInvitations",
+        "summary": "List invitation metadata without codes",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "List permitted devices.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessInvitationPage"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ]
+      },
+      "post": {
+        "operationId": "createAccessInvitation",
+        "summary": "Issue a single-use access invitation",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "Create a profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessInvitation"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessInvitationInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/auth/invitations/{invitation_id}": {
+      "parameters": [
+        {
+          "name": "invitation_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "delete": {
+        "operationId": "revokeAccessInvitation",
+        "summary": "Revoke an unused invitation",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "204": {
+            "description": "Revoke device credentials and fence its deliveries."
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          },
+          "412": {
+            "$ref": "#/components/responses/E412"
+          },
+          "428": {
+            "$ref": "#/components/responses/E428"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ]
+      }
+    },
+    "/api/v2/auth/invitations/redeem": {
+      "post": {
+        "operationId": "redeemAccessInvitation",
+        "summary": "Redeem preapproved access",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Claim approved device credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Credential"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "security": [
+
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvitationRedemption"
               }
             }
           }
@@ -11832,13 +12563,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -11977,13 +12714,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -12179,13 +12922,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -12324,13 +13073,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -12483,13 +13238,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -12615,13 +13376,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -12768,13 +13535,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -12894,13 +13667,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -13047,13 +13826,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -13173,13 +13958,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -13334,13 +14125,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -13460,13 +14257,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -13670,13 +14473,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -13807,13 +14616,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       }
@@ -14017,13 +14832,19 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
       },
@@ -14154,728 +14975,21 @@
         ],
         "security": [
           {
-            "bearerAuth": []
+            "bearerAuth": [
+
+            ]
           },
           {
-            "cookieAuth": []
+            "cookieAuth": [
+
+            ]
           },
           {
-            "mediaTicket": []
+            "mediaTicket": [
+
+            ]
           }
         ]
-      }
-    },
-    "/api/v2/users": {
-      "get": {
-        "operationId": "listAccessUsers",
-        "summary": "List named access users",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "200": {
-            "description": "List permitted devices.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessUserPage"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Cursor"
-          },
-          {
-            "$ref": "#/components/parameters/Limit"
-          }
-        ]
-      },
-      "post": {
-        "operationId": "createAccessUser",
-        "summary": "Create an access identity",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "201": {
-            "description": "Create a profile.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessUser"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/Csrf"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AccessUserInput"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v2/users/{user_id}": {
-      "parameters": [
-        {
-          "name": "user_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "$ref": "#/components/schemas/Id"
-          }
-        }
-      ],
-      "get": {
-        "operationId": "getAccessUser",
-        "summary": "Read an access user",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "200": {
-            "description": "Read a device and its revision.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessUser"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "x-required-permission": "system:admin"
-      },
-      "put": {
-        "operationId": "replaceAccessUser",
-        "summary": "Replace user grants and enabled state",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "200": {
-            "description": "Replace mutable profile settings.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessUser"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          },
-          "412": {
-            "$ref": "#/components/responses/E412"
-          },
-          "428": {
-            "$ref": "#/components/responses/E428"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IfMatch"
-          },
-          {
-            "$ref": "#/components/parameters/Csrf"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AccessUserInput"
-              }
-            }
-          }
-        },
-        "description": "If-Match protects the reviewed user revision. Changes atomically narrow all owned devices and advance their revisions. Disabling deletes their credentials and dependent tickets. Widening never silently widens existing devices. The last usable administrator cannot be disabled or demoted. Offline bytes cannot be retroactively erased; unsynchronized viewing records remain retained."
-      }
-    },
-    "/api/v2/auth/pairings/{pairing_id}/deny": {
-      "parameters": [
-        {
-          "name": "pairing_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "$ref": "#/components/schemas/Id"
-          }
-        }
-      ],
-      "post": {
-        "operationId": "denyPairing",
-        "summary": "Deny a pending pairing request",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "204": {
-            "description": "Revoke device credentials and fence its deliveries."
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          },
-          "412": {
-            "$ref": "#/components/responses/E412"
-          },
-          "428": {
-            "$ref": "#/components/responses/E428"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/Csrf"
-          }
-        ],
-        "description": "The immutable pending request is the decision precondition; deny and approve compete atomically. Repeating the same denial key returns its saved acknowledgement."
-      }
-    },
-    "/api/v2/auth/invitations": {
-      "get": {
-        "operationId": "listAccessInvitations",
-        "summary": "List invitation metadata without codes",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "200": {
-            "description": "List permitted devices.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessInvitationPage"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Cursor"
-          },
-          {
-            "$ref": "#/components/parameters/Limit"
-          }
-        ]
-      },
-      "post": {
-        "operationId": "createAccessInvitation",
-        "summary": "Issue a single-use access invitation",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "201": {
-            "description": "Create a profile.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AccessInvitation"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/Csrf"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AccessInvitationInput"
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v2/auth/invitations/{invitation_id}": {
-      "parameters": [
-        {
-          "name": "invitation_id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "$ref": "#/components/schemas/Id"
-          }
-        }
-      ],
-      "delete": {
-        "operationId": "revokeAccessInvitation",
-        "summary": "Revoke an unused invitation",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "204": {
-            "description": "Revoke device credentials and fence its deliveries."
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "401": {
-            "$ref": "#/components/responses/E401"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "404": {
-            "$ref": "#/components/responses/E404"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          },
-          "412": {
-            "$ref": "#/components/responses/E412"
-          },
-          "428": {
-            "$ref": "#/components/responses/E428"
-          }
-        },
-        "x-required-permission": "system:admin",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/IfMatch"
-          },
-          {
-            "$ref": "#/components/parameters/Csrf"
-          }
-        ]
-      }
-    },
-    "/api/v2/auth/invitations/redeem": {
-      "post": {
-        "operationId": "redeemAccessInvitation",
-        "summary": "Redeem preapproved access",
-        "tags": [
-          "identity"
-        ],
-        "x-owner": "A08",
-        "x-milestone": "M1",
-        "x-status": "implementation_target",
-        "responses": {
-          "200": {
-            "description": "Claim approved device credentials.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Credential"
-                }
-              }
-            },
-            "headers": {
-              "ETag": {
-                "schema": {
-                  "type": "string",
-                  "maxLength": 256
-                },
-                "description": "Strong resource ETag where a resource revision is returned."
-              },
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/E400"
-          },
-          "403": {
-            "$ref": "#/components/responses/E403"
-          },
-          "409": {
-            "$ref": "#/components/responses/E409"
-          },
-          "413": {
-            "$ref": "#/components/responses/E413"
-          },
-          "422": {
-            "$ref": "#/components/responses/E422"
-          },
-          "429": {
-            "$ref": "#/components/responses/E429"
-          },
-          "500": {
-            "$ref": "#/components/responses/E500"
-          },
-          "503": {
-            "$ref": "#/components/responses/E503"
-          }
-        },
-        "security": [],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/InvitationRedemption"
-              }
-            }
-          }
-        }
       }
     },
     "/api/v2/devices/{device_id}/user": {
@@ -15033,7 +15147,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": []
+        "security": [
+
+        ]
       }
     },
     "/api/v2/auth/oidc/{provider_id}/start": {
@@ -15092,7 +15208,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": [],
+        "security": [
+
+        ],
         "parameters": [
           {
             "name": "provider_id",
@@ -15176,7 +15294,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": [],
+        "security": [
+
+        ],
         "parameters": [
           {
             "name": "state",
@@ -15261,7 +15381,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": [],
+        "security": [
+
+        ],
         "parameters": [
           {
             "$ref": "#/components/parameters/Csrf"
@@ -15344,7 +15466,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": [],
+        "security": [
+
+        ],
         "parameters": [
           {
             "name": "transaction_id",
@@ -15426,7 +15550,9 @@
             "$ref": "#/components/responses/E503"
           }
         },
-        "security": [],
+        "security": [
+
+        ],
         "parameters": [
           {
             "name": "transaction_id",
@@ -17720,7 +17846,8 @@
         "type": "string",
         "pattern": "^sha256:[a-f0-9]{64}$"
       },
-      "JsonValue": {},
+      "JsonValue": {
+      },
       "MediaKind": {
         "type": "string",
         "enum": [
@@ -17954,6 +18081,16 @@
               }
             ]
           },
+          "user_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "profile_ids": {
             "type": "array",
             "items": {
@@ -17973,16 +18110,6 @@
               "paired",
               "trusted_private",
               "integration"
-            ]
-          },
-          "user_id": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Id"
-              },
-              {
-                "type": "null"
-              }
             ]
           }
         },
@@ -18010,6 +18137,414 @@
           "ttl_seconds"
         ],
         "description": "Issue short-lived API access from the authenticated device or integration credential. Scope is inherited and never expanded; revocation is checked against the parent credential."
+      },
+      "GrantPolicy": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "library_ids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 200
+          },
+          "allow_unrated": {
+            "type": "boolean"
+          },
+          "allowed_ratings": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxItems": 200
+          },
+          "deny_rated": {
+            "type": "boolean",
+            "default": false,
+            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
+          },
+          "blocked_labels": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "maxItems": 200
+          }
+        },
+        "required": [
+          "library_ids",
+          "allow_unrated",
+          "allowed_ratings",
+          "blocked_labels"
+        ]
+      },
+      "AccessUserInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "profile_ids": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GrantPolicy"
+          }
+        },
+        "required": [
+          "name",
+          "disabled",
+          "profile_ids",
+          "permissions",
+          "policy"
+        ]
+      },
+      "AccessUser": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "profile_ids": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GrantPolicy"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "name",
+          "disabled",
+          "profile_ids",
+          "permissions",
+          "policy"
+        ]
+      },
+      "PairingSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "client_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "user_code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "denied",
+              "claimed",
+              "expired"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "device_name",
+          "client_name",
+          "user_code",
+          "created_at",
+          "expires_at",
+          "status"
+        ]
+      },
+      "AccessInvitationInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "user_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "profile_ids": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GrantPolicy"
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "minimum": 60,
+            "maximum": 86400
+          }
+        },
+        "required": [
+          "user_id",
+          "user_revision",
+          "profile_ids",
+          "permissions",
+          "policy",
+          "ttl_seconds"
+        ],
+        "description": "Explicit grant bounded by the selected user revision. Administration is never selected by default. Any later user edit or issuer credential/revision loss invalidates unused invitations and claim retries."
+      },
+      "AccessInvitation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "user_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "profile_ids": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            }
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/GrantPolicy"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "unused",
+              "claimed",
+              "revoked",
+              "expired",
+              "invalidated"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "id",
+          "user_id",
+          "revision",
+          "profile_ids",
+          "permissions",
+          "policy",
+          "created_at",
+          "expires_at",
+          "status"
+        ],
+        "description": "Code is a scoped bearer secret returned only on creation or an authorized creation retry; never in lists, logs, events or URLs. Claim consumes it atomically with one device credential. Revoke a claimed invitation by revoking its device."
+      },
+      "InvitationRedemption": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "claim_id": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{32}$"
+          },
+          "device_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "client_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "required": [
+          "code",
+          "claim_id",
+          "device_name",
+          "client_name"
+        ],
+        "description": "Generate a random 128-bit claim_id; retain the exact body across transport retries. A different claimant cannot replay an issued credential. Global durable admission is 30 attempts per 60 seconds, including unknown codes, and survives restart."
+      },
+      "AccessUserPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessUser"
+            },
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "event_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "read_revision",
+          "event_cursor"
+        ],
+        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
+      },
+      "PairingSummaryPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PairingSummary"
+            },
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "event_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "read_revision",
+          "event_cursor"
+        ],
+        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
+      },
+      "AccessInvitationPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessInvitation"
+            },
+            "maxItems": 200
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "event_cursor": {
+            "$ref": "#/components/schemas/Cursor"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "read_revision",
+          "event_cursor"
+        ],
+        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
       },
       "PairingRequest": {
         "type": "object",
@@ -18366,6 +18901,11 @@
             },
             "maxItems": 200
           },
+          "deny_rated": {
+            "type": "boolean",
+            "default": false,
+            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
+          },
           "blocked_labels": {
             "type": "array",
             "items": {
@@ -18376,11 +18916,6 @@
           },
           "permissions": {
             "$ref": "#/components/schemas/Permissions"
-          },
-          "deny_rated": {
-            "type": "boolean",
-            "default": false,
-            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
           }
         },
         "required": [
@@ -18414,6 +18949,11 @@
             },
             "maxItems": 200
           },
+          "deny_rated": {
+            "type": "boolean",
+            "default": false,
+            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
+          },
           "blocked_labels": {
             "type": "array",
             "items": {
@@ -18424,11 +18964,6 @@
           },
           "permissions": {
             "$ref": "#/components/schemas/Permissions"
-          },
-          "deny_rated": {
-            "type": "boolean",
-            "default": false,
-            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
           }
         },
         "required": [
@@ -24513,414 +25048,6 @@
         ],
         "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
       },
-      "GrantPolicy": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "library_ids": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Id"
-            },
-            "maxItems": 200
-          },
-          "allow_unrated": {
-            "type": "boolean"
-          },
-          "allowed_ratings": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "maxLength": 64
-            },
-            "maxItems": 200
-          },
-          "blocked_labels": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "maxLength": 100
-            },
-            "maxItems": 200
-          },
-          "deny_rated": {
-            "type": "boolean",
-            "default": false,
-            "description": "Deny all rated content; allowed_ratings must then be empty. Unrated eligibility remains independent."
-          }
-        },
-        "required": [
-          "library_ids",
-          "allow_unrated",
-          "allowed_ratings",
-          "blocked_labels"
-        ]
-      },
-      "AccessUserInput": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "disabled": {
-            "type": "boolean"
-          },
-          "profile_ids": {
-            "type": "array",
-            "maxItems": 200,
-            "items": {
-              "$ref": "#/components/schemas/Id"
-            }
-          },
-          "permissions": {
-            "$ref": "#/components/schemas/Permissions"
-          },
-          "policy": {
-            "$ref": "#/components/schemas/GrantPolicy"
-          }
-        },
-        "required": [
-          "name",
-          "disabled",
-          "profile_ids",
-          "permissions",
-          "policy"
-        ]
-      },
-      "AccessUser": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/Id"
-          },
-          "revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "disabled": {
-            "type": "boolean"
-          },
-          "profile_ids": {
-            "type": "array",
-            "maxItems": 200,
-            "items": {
-              "$ref": "#/components/schemas/Id"
-            }
-          },
-          "permissions": {
-            "$ref": "#/components/schemas/Permissions"
-          },
-          "policy": {
-            "$ref": "#/components/schemas/GrantPolicy"
-          }
-        },
-        "required": [
-          "id",
-          "revision",
-          "name",
-          "disabled",
-          "profile_ids",
-          "permissions",
-          "policy"
-        ]
-      },
-      "PairingSummary": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/Id"
-          },
-          "device_name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "client_name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "user_code": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 32
-          },
-          "created_at": {
-            "$ref": "#/components/schemas/Timestamp"
-          },
-          "expires_at": {
-            "$ref": "#/components/schemas/Timestamp"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "pending",
-              "approved",
-              "denied",
-              "claimed",
-              "expired"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "device_name",
-          "client_name",
-          "user_code",
-          "created_at",
-          "expires_at",
-          "status"
-        ]
-      },
-      "AccessInvitationInput": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "user_id": {
-            "$ref": "#/components/schemas/Id"
-          },
-          "user_revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "profile_ids": {
-            "type": "array",
-            "maxItems": 200,
-            "items": {
-              "$ref": "#/components/schemas/Id"
-            }
-          },
-          "permissions": {
-            "$ref": "#/components/schemas/Permissions"
-          },
-          "policy": {
-            "$ref": "#/components/schemas/GrantPolicy"
-          },
-          "ttl_seconds": {
-            "type": "integer",
-            "minimum": 60,
-            "maximum": 86400
-          }
-        },
-        "required": [
-          "user_id",
-          "user_revision",
-          "profile_ids",
-          "permissions",
-          "policy",
-          "ttl_seconds"
-        ],
-        "description": "Explicit grant bounded by the selected user revision. Administration is never selected by default. Any later user edit or issuer credential/revision loss invalidates unused invitations and claim retries."
-      },
-      "AccessInvitation": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "id": {
-            "$ref": "#/components/schemas/Id"
-          },
-          "user_id": {
-            "$ref": "#/components/schemas/Id"
-          },
-          "revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "profile_ids": {
-            "type": "array",
-            "maxItems": 200,
-            "items": {
-              "$ref": "#/components/schemas/Id"
-            }
-          },
-          "permissions": {
-            "$ref": "#/components/schemas/Permissions"
-          },
-          "policy": {
-            "$ref": "#/components/schemas/GrantPolicy"
-          },
-          "created_at": {
-            "$ref": "#/components/schemas/Timestamp"
-          },
-          "expires_at": {
-            "$ref": "#/components/schemas/Timestamp"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "unused",
-              "claimed",
-              "revoked",
-              "expired",
-              "invalidated"
-            ]
-          },
-          "code": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          }
-        },
-        "required": [
-          "id",
-          "user_id",
-          "revision",
-          "profile_ids",
-          "permissions",
-          "policy",
-          "created_at",
-          "expires_at",
-          "status"
-        ],
-        "description": "Code is a scoped bearer secret returned only on creation or an authorized creation retry; never in lists, logs, events or URLs. Claim consumes it atomically with one device credential. Revoke a claimed invitation by revoking its device."
-      },
-      "InvitationRedemption": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "code": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "claim_id": {
-            "type": "string",
-            "pattern": "^[0-9a-fA-F]{32}$"
-          },
-          "device_name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "client_name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 100
-          }
-        },
-        "required": [
-          "code",
-          "claim_id",
-          "device_name",
-          "client_name"
-        ],
-        "description": "Generate a random 128-bit claim_id; retain the exact body across transport retries. A different claimant cannot replay an issued credential. Global durable admission is 30 attempts per 60 seconds, including unknown codes, and survives restart."
-      },
-      "AccessUserPage": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AccessUser"
-            },
-            "maxItems": 200
-          },
-          "next_cursor": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Cursor"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "read_revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "event_cursor": {
-            "$ref": "#/components/schemas/Cursor"
-          }
-        },
-        "required": [
-          "items",
-          "next_cursor",
-          "read_revision",
-          "event_cursor"
-        ],
-        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
-      },
-      "PairingSummaryPage": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PairingSummary"
-            },
-            "maxItems": 200
-          },
-          "next_cursor": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Cursor"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "read_revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "event_cursor": {
-            "$ref": "#/components/schemas/Cursor"
-          }
-        },
-        "required": [
-          "items",
-          "next_cursor",
-          "read_revision",
-          "event_cursor"
-        ],
-        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
-      },
-      "AccessInvitationPage": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AccessInvitation"
-            },
-            "maxItems": 200
-          },
-          "next_cursor": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Cursor"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "read_revision": {
-            "$ref": "#/components/schemas/Revision"
-          },
-          "event_cursor": {
-            "$ref": "#/components/schemas/Cursor"
-          }
-        },
-        "required": [
-          "items",
-          "next_cursor",
-          "read_revision",
-          "event_cursor"
-        ],
-        "description": "One committed read snapshot per response. Subsequent cursor pages are not a frozen database snapshot. See the event reset protocol in the design."
-      },
       "DeviceUserInput": {
         "type": "object",
         "additionalProperties": false,
@@ -25530,7 +25657,8 @@
           },
           "usable_administrators": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Number of currently usable administrator device principals, not distinct users or independent recovery accounts. Several devices can belong to one user."
           },
           "pending_requests": {
             "type": "integer",

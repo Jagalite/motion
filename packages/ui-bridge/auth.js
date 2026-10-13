@@ -574,7 +574,8 @@ async function activitySection(parent) {
 async function overviewSection(parent) {
   const area = section(parent, 'overview', 'Overview', 'New arrivals need an invitation or explicit administrator approval. Verified email does not grant administrator access.');
   const overview = await api('GET', '/admin/auth/overview');
-  detail(area, 'Usable administrators', overview.usable_administrators);
+  detail(area, 'Usable administrator devices', overview.usable_administrators);
+  area.append(node('p', 'Several administrator devices can belong to one user. This count does not represent independent recovery accounts.', {class: 'muted'}));
   detail(area, 'Pending access requests', overview.pending_requests);
   detail(area, 'Public origin', overview.public_origin || 'Not configured');
   if (overview.restored_hold) area.append(node('p', 'New SSO and email sign-ins are held after restore. The local operator must review the restored authentication configuration before resuming them.', {class: 'notice', role: 'alert'}));
