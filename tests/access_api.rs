@@ -3349,3 +3349,239 @@ async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn caller_source_requires_proof_and_rechecks_current_credential_identity() {
+    use playscale::v2::auth;
+    use playscale_core::access::{Permission, Principal};
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, token) = f.pair(&["default"], &["events:read"]).await;
+    let mut headers = HeaderMap::new();
+    for value in [
+        None,
+        Some("Bearer "),
+        Some("Bearer unknown"),
+        Some("Basic operator"),
+    ] {
+        headers.remove("authorization");
+        if let Some(value) = value {
+            headers.insert("authorization", value.parse().unwrap());
+        }
+        assert!(
+            auth::resolve(&f.app, &axum::http::Method::GET, &headers)
+                .await
+                .is_err()
+        );
+    }
+    headers.insert("authorization", bearer(&token).parse().unwrap());
+    let mut caller = auth::resolve(&f.app, &axum::http::Method::GET, &headers)
+        .await
+        .unwrap();
+    assert!(!caller.is_local_operator());
+    assert!(caller.ingress_device_id().is_none());
+    assert_eq!(caller.credential().unwrap().1.device_id, device);
+    // Cached presentation state cannot select operator reauthentication.
+    caller.principal = Principal::operator();
+    let mut tx = db::begin_write(&f.app.db).await.unwrap();
+    let current = caller.reauthorize(&mut tx, None).await.unwrap();
+    assert_eq!(current.id, device);
+    assert!(!current.is_admin());
+    assert_eq!(
+        caller
+            .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+            .await
+            .unwrap_err()
+            .code,
+        "permission_denied"
+    );
+    tx.rollback().await.unwrap();
+    let hash = auth::token_hash(&token);
+    // Replacing immutable identity at the same hash must not silently change
+    // the authority of a request already admitted under the original row.
+    sqlx::query("UPDATE credentials SET expires_at=expires_at+1 WHERE token_hash=?")
+        .bind(&hash)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut tx = db::begin_write(&f.app.db).await.unwrap();
+    assert_eq!(
+        caller.reauthenticate(&mut tx).await.unwrap_err().code,
+        "credential_revoked"
+    );
+    tx.rollback().await.unwrap();
+    sqlx::query("DELETE FROM credentials WHERE token_hash=?")
+        .bind(&hash)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let mut tx = db::begin_write(&f.app.db).await.unwrap();
+    assert_eq!(
+        caller.reauthorize(&mut tx, None).await.unwrap_err().code,
+        "credential_revoked"
+    );
+    tx.rollback().await.unwrap();
+    headers.insert("authorization", bearer(OPERATOR).parse().unwrap());
+    let operator = auth::resolve(&f.app, &axum::http::Method::GET, &headers)
+        .await
+        .unwrap();
+    assert!(operator.is_local_operator());
+    assert!(operator.credential().is_none());
+    assert!(operator.ingress_device_id().is_none());
+    let mut tx = db::begin_write(&f.app.db).await.unwrap();
+    assert_eq!(
+        operator
+            .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+            .await
+            .unwrap(),
+        Principal::operator()
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn caller_sources_close_session_and_ingress_streams_when_authority_disappears() {
+    use playscale::v2::{ApiSettings, IngressSettings, Runtime, auth};
+    use playscale_core::access::{Mode, Permission};
+    for ingress in [false, true] {
+        let mut f = Fixture::new(AccessMode::Restricted).await;
+        let (device, token) = f.pair(&["default"], &["events:read", "system:admin"]).await;
+        let mut request = f.request("GET", "/api/v2/events", None, &[]);
+        if ingress {
+            let settings = ApiSettings {
+                trusted_ingress: Some(IngressSettings {
+                    socket: f._dir.path().join("unused.sock"),
+                    login_header: "tailscale-user-login".into(),
+                    logins: [("alice@example.com".into(), device.clone())].into(),
+                }),
+                ..Default::default()
+            };
+            f.app.access = Arc::new(
+                Runtime::new(AccessMode::Restricted, auth::random_key()).with_settings(settings),
+            );
+            request
+                .headers_mut()
+                .insert("tailscale-user-login", "alice@example.com".parse().unwrap());
+            request.extensions_mut().insert(auth::TrustedIngress);
+        } else {
+            let session = f
+                .call(
+                    "POST",
+                    "/api/v2/auth/session",
+                    Some(json!({"kind":"credential", "credential":token})),
+                    &[("origin", ORIGIN)],
+                )
+                .await;
+            assert_eq!(session.status, StatusCode::OK);
+            let cookie = session.headers["set-cookie"]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("cookie", cookie.parse().unwrap());
+        }
+        let caller = auth::resolve_with(
+            &f.app,
+            &axum::http::Method::GET,
+            request.headers(),
+            ingress.then_some(auth::TrustedIngress),
+        )
+        .await
+        .unwrap();
+        assert!(!caller.is_local_operator());
+        assert_eq!(
+            caller.ingress_device_id(),
+            ingress.then_some(device.as_str())
+        );
+        assert_eq!(caller.credential().is_some(), !ingress);
+        if ingress {
+            assert_eq!(caller.principal.mode, Mode::TrustedPrivate);
+            assert!(!caller.principal.is_admin());
+            let mut tx = db::begin_write(&f.app.db).await.unwrap();
+            assert_eq!(
+                caller
+                    .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+                    .await
+                    .unwrap_err()
+                    .code,
+                "permission_denied"
+            );
+            tx.rollback().await.unwrap();
+        }
+        let response = f.raw(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let (initial, _) = sse(&mut body, 1).await;
+        assert_eq!(initial[0].1["reason"], "initial_snapshot");
+        // Downgrades apply to both shared write checks and the next SSE hint.
+        sqlx::query(
+            "UPDATE devices SET permissions='[\"events:read\"]',revision=revision+1 WHERE id=?",
+        )
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+        let mut tx = db::begin_write(&f.app.db).await.unwrap();
+        let current = caller
+            .reauthorize(&mut tx, Some(Permission::EventsRead))
+            .await
+            .unwrap();
+        assert!(!current.is_admin());
+        assert_eq!(current.policy_revision, 2);
+        tx.rollback().await.unwrap();
+        let (reset, _) = sse(&mut body, 1).await;
+        assert_eq!(reset[0].1["reason"], "policy_changed");
+        if ingress {
+            sqlx::query("UPDATE devices SET revoked=1,revision=revision+1 WHERE id=?")
+                .bind(&device)
+                .execute(&f.app.db)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("DELETE FROM credentials WHERE token_hash=?")
+                .bind(auth::token_hash(&token))
+                .execute(&f.app.db)
+                .await
+                .unwrap();
+        }
+        let mut tx = db::begin_write(&f.app.db).await.unwrap();
+        assert_eq!(
+            caller.reauthorize(&mut tx, None).await.unwrap_err().code,
+            "credential_revoked"
+        );
+        tx.rollback().await.unwrap();
+        let (events, ended) = sse(&mut body, 1).await;
+        assert!(
+            ended && events.is_empty(),
+            "revoked source must close without disclosure: {events:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_operator_source_keeps_administrative_event_disclosure() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let response = f
+        .raw(f.request(
+            "GET",
+            "/api/v2/events",
+            None,
+            &[("authorization", &bearer(OPERATOR))],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let (initial, _) = sse(&mut body, 1).await;
+    assert_eq!(initial[0].1["reason"], "initial_snapshot");
+    sqlx::query(
+        "INSERT INTO change_events(topic,resource_id,kind) VALUES ('system','auth-test','updated')",
+    )
+    .execute(&f.app.db)
+    .await
+    .unwrap();
+    let (events, _) = sse(&mut body, 1).await;
+    assert_eq!(events[0].0, "changed");
+    assert_eq!(events[0].1["resource_id"], "auth-test");
+}

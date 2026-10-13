@@ -13,7 +13,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use playscale_core::access::{
-    AccessError, Credential, CredentialKind, Device, Grant, Permission, Principal, authenticate,
+    AccessError, Authentication, Credential, CredentialKind, Device, Grant, Permission, Principal,
+    authenticate_caller,
 };
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -283,10 +284,12 @@ pub async fn authenticate_stored(
         None => None,
     };
     let device = load_device(conn, &stored.credential.device_id).await?;
-    let principal = authenticate(
-        &stored.credential,
-        parent.as_ref(),
-        device.as_ref().map(|d| &d.device),
+    let principal = authenticate_caller(
+        Authentication::Credential {
+            credential: Some(&stored.credential),
+            parent: parent.as_ref(),
+            device: device.as_ref().map(|d| &d.device),
+        },
         now,
     )?;
     Ok((principal, device))
@@ -296,13 +299,18 @@ pub async fn authenticate_stored(
 #[derive(Clone, Debug)]
 pub struct Caller {
     pub principal: Principal,
-    /// Hash and row of the presented credential; absent for the operator
-    /// and for trusted-ingress callers.
-    pub credential: Option<(String, Credential)>,
-    /// Present only for cookie sessions.
+    // Only the resolver can construct this proof. Adding a new method requires
+    // an explicit reauthentication branch, never an absent-field fallback.
+    source: CallerSource,
+    /// Present for cookie sessions and verified ambient ingress.
     pub csrf: Option<String>,
-    /// Device mapped from a verified private-ingress login.
-    pub ingress: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum CallerSource {
+    LocalOperator,
+    Credential { hash: String, admitted: Credential },
+    TrustedIngress { device_id: String },
 }
 
 /// Marks requests that arrived through the trusted private-ingress listener.
@@ -317,6 +325,26 @@ pub fn ingress_csrf(app: &App, login: &str) -> String {
 }
 
 impl Caller {
+    /// Durable authority reference for existing ticket/job storage. Absence
+    /// alone does not establish operator authority; retain the principal ID.
+    pub fn credential(&self) -> Option<(&str, &Credential)> {
+        match &self.source {
+            CallerSource::Credential { hash, admitted } => Some((hash, admitted)),
+            _ => None,
+        }
+    }
+
+    pub fn ingress_device_id(&self) -> Option<&str> {
+        match &self.source {
+            CallerSource::TrustedIngress { device_id } => Some(device_id),
+            _ => None,
+        }
+    }
+
+    pub fn is_local_operator(&self) -> bool {
+        matches!(self.source, CallerSource::LocalOperator)
+    }
+
     pub fn require(&self, permission: Permission) -> Result<(), Problem> {
         if self.principal.allows(permission) {
             Ok(())
@@ -333,22 +361,44 @@ impl Caller {
         conn: &mut sqlx::SqliteConnection,
         permission: Option<Permission>,
     ) -> Result<Principal, Problem> {
-        let principal = match (&self.credential, &self.ingress) {
-            (None, Some(device_id)) => {
-                let device = load_device(conn, device_id).await?;
-                playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device))?
-            }
-            (None, None) => Principal::operator(),
-            (Some((hash, _)), _) => {
-                let stored = load_credential(conn, hash)
-                    .await?
-                    .ok_or(AccessError::CredentialRevoked)?;
-                authenticate_stored(conn, &stored, crate::now()).await?.0
-            }
-        };
+        let principal = self.reauthenticate(conn).await?;
         match permission {
             Some(p) if !principal.allows(p) => Err(AccessError::Forbidden(p).into()),
             _ => Ok(principal),
+        }
+    }
+
+    /// Shared by transactional writes and each event-stream disclosure. Reload
+    /// current rows; the cached principal and credential are not authority.
+    pub async fn reauthenticate(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<Principal, Problem> {
+        let now = crate::now();
+        match &self.source {
+            CallerSource::TrustedIngress { device_id } => {
+                let device = load_device(conn, device_id).await?;
+                Ok(authenticate_caller(
+                    Authentication::TrustedIngress {
+                        device_id,
+                        device: device.as_ref().map(|d| &d.device),
+                    },
+                    now,
+                )?)
+            }
+            CallerSource::LocalOperator => Ok(authenticate_caller(
+                Authentication::VerifiedLocalOperator,
+                now,
+            )?),
+            CallerSource::Credential { hash, admitted } => {
+                let stored = load_credential(conn, hash)
+                    .await?
+                    .ok_or(AccessError::CredentialRevoked)?;
+                if stored.credential != *admitted {
+                    return Err(AccessError::CredentialRevoked.into());
+                }
+                Ok(authenticate_stored(conn, &stored, now).await?.0)
+            }
         }
     }
 }
@@ -409,8 +459,13 @@ pub async fn resolve_with(
             .get(login)
             .ok_or(AccessError::Unauthenticated)?;
         let device = load_device(&mut conn, device_id).await?;
-        let principal =
-            playscale_core::access::authenticate_ingress(device.as_ref().map(|d| &d.device))?;
+        let principal = authenticate_caller(
+            Authentication::TrustedIngress {
+                device_id,
+                device: device.as_ref().map(|d| &d.device),
+            },
+            now,
+        )?;
         let csrf = ingress_csrf(app, login);
         if !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
             // Ingress identity is ambient, like a cookie: unsafe requests need
@@ -432,18 +487,18 @@ pub async fn resolve_with(
         }
         return Ok(Caller {
             principal,
-            credential: None,
+            source: CallerSource::TrustedIngress {
+                device_id: device_id.clone(),
+            },
             csrf: Some(csrf),
-            ingress: Some(device_id.clone()),
         });
     }
     if let Some(token) = bearer(headers)? {
         if is_operator(app, token) {
             return Ok(Caller {
-                principal: Principal::operator(),
-                credential: None,
+                principal: authenticate_caller(Authentication::VerifiedLocalOperator, now)?,
+                source: CallerSource::LocalOperator,
                 csrf: None,
-                ingress: None,
             });
         }
         let hash = token_hash(token);
@@ -454,9 +509,11 @@ pub async fn resolve_with(
         let (principal, _) = authenticate_stored(&mut conn, &stored, now).await?;
         return Ok(Caller {
             principal,
-            credential: Some((hash, stored.credential)),
+            source: CallerSource::Credential {
+                hash,
+                admitted: stored.credential,
+            },
             csrf: None,
-            ingress: None,
         });
     }
     let token = session_cookie(headers).ok_or(AccessError::Unauthenticated)?;
@@ -484,9 +541,11 @@ pub async fn resolve_with(
     }
     Ok(Caller {
         principal,
-        credential: Some((hash, stored.credential)),
+        source: CallerSource::Credential {
+            hash,
+            admitted: stored.credential,
+        },
         csrf: Some(csrf),
-        ingress: None,
     })
 }
 

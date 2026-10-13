@@ -451,7 +451,7 @@ async fn prepare(
     }
     let id = crate::new_id();
     sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id,video_profile) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(&input.backend).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).bind(input.video_profile.as_ref().map(sqlx::types::Json)).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential().map(|(hash,_)|hash)).bind(caller.ingress_device_id()).execute(&mut *tx).await?;
     let value = super::jobs::row(&mut tx, &id, &principal).await?.wire();
     record
         .save(

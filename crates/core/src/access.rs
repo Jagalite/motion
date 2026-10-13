@@ -407,6 +407,41 @@ pub struct Credential {
     pub expires_at: i64,
 }
 
+/// Authentication facts supplied by a trusted adapter, never deserialized from
+/// client input. Missing device/credential observations cannot select the local
+/// operator path: that source requires explicit proof from the adapter.
+pub enum Authentication<'a> {
+    VerifiedLocalOperator,
+    Credential {
+        credential: Option<&'a Credential>,
+        parent: Option<&'a Credential>,
+        device: Option<&'a Device>,
+    },
+    TrustedIngress {
+        device_id: &'a str,
+        device: Option<&'a Device>,
+    },
+}
+
+pub fn authenticate_caller(source: Authentication<'_>, now: i64) -> Result<Principal, AccessError> {
+    match source {
+        Authentication::VerifiedLocalOperator => Ok(Principal::operator()),
+        Authentication::Credential {
+            credential,
+            parent,
+            device,
+        } => authenticate(
+            credential.ok_or(AccessError::CredentialRevoked)?,
+            parent,
+            device,
+            now,
+        ),
+        Authentication::TrustedIngress { device_id, device } => {
+            authenticate_ingress(device.filter(|d| d.id == device_id))
+        }
+    }
+}
+
 /// Every request re-derives the principal from the current device row, so a
 /// revocation, rotation or policy change applies to the next request. A child
 /// (access or session) credential additionally requires its parent device

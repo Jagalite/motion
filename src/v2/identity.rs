@@ -527,7 +527,7 @@ pub async fn create_session(
             };
             let caller =
                 auth::resolve_with(&app, &axum::http::Method::GET, &headers, Some(marker)).await?;
-            if caller.ingress.is_none() {
+            if caller.ingress_device_id().is_none() {
                 return Err(AccessError::Unauthenticated.into());
             }
             let mut conn = app.db.acquire().await?;
@@ -651,7 +651,7 @@ async fn bootstrap_device(
 }
 
 fn cookie_session(caller: &Caller) -> Result<(&str, &core::Credential, &str), Problem> {
-    match (&caller.credential, &caller.csrf) {
+    match (caller.credential(), &caller.csrf) {
         (Some((hash, credential)), Some(csrf)) => Ok((hash, credential, csrf)),
         _ => Err(Problem::not_found()),
     }
@@ -695,8 +695,7 @@ pub async fn issue_access_token(
     body: Body<AccessTokenInput>,
 ) -> Result<Response, Problem> {
     let Some((parent_hash, parent)) = caller
-        .credential
-        .clone()
+        .credential()
         .filter(|(_, c)| c.kind == CredentialKind::Device && caller.csrf.is_none())
     else {
         return Err(AccessError::ParentCredentialRequired.into());
@@ -731,7 +730,7 @@ pub async fn issue_access_token(
         .await?
         .ok_or(AccessError::CredentialRevoked)?;
     let child = core::derive(
-        &parent,
+        parent,
         &device.device,
         CredentialKind::Access,
         body.value.ttl_seconds,
@@ -743,7 +742,7 @@ pub async fn issue_access_token(
         &mut tx,
         &auth::token_hash(&token),
         &child,
-        Some(&parent_hash),
+        Some(parent_hash),
         None,
     )
     .await?;

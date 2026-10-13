@@ -84,7 +84,7 @@ async fn create(
         ));
     }
     let id = crate::new_id();
-    sqlx::query("INSERT INTO backup_jobs(id,requester_id,credential_hash,ingress_id,include_generated_media,created_at) VALUES (?,?,?,?,?,?)").bind(&id).bind(&p.id).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).bind(body.value.include_generated_media).bind(crate::now()).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO backup_jobs(id,requester_id,credential_hash,ingress_id,include_generated_media,created_at) VALUES (?,?,?,?,?,?)").bind(&id).bind(&p.id).bind(caller.credential().map(|(hash,_)|hash)).bind(caller.ingress_device_id()).bind(body.value.include_generated_media).bind(crate::now()).execute(&mut *tx).await?;
     let row: Row = sqlx::query_as("SELECT * FROM backup_jobs WHERE id=?")
         .bind(id)
         .fetch_one(&mut *tx)
