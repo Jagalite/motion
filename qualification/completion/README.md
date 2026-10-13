@@ -1364,7 +1364,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 ### 5F. End-to-end: download, offline in Electron with Demuxe, reconnect
 
 - **Source SHA:** branch `plan-completion/offline-end-to-end`, stacked on
-  `plan-completion/offline-subtitles-device`. The receipt names `6453f0c`.
+  `plan-completion/offline-subtitles-device`. The receipt names `00b7c9b`.
   The binaries were built from its parent, whose non-test sources are
   identical.
 - **Run (`apps/desktop/test/run-end-to-end.mjs`):**
@@ -1410,6 +1410,12 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     runs. The files are hashed again at the end, and a change fails the
     receipt. The run was repeated: it passed at `6453f0c` with
     `sources_committed: true`.
+
+  Round 2 at `6453f0c` raised one P2 finding, fixed:
+  - **Deleted sources:** the committed-state check listed only existing
+    files, so a deleted tracked desktop source still counted as committed.
+    It now covers the whole `apps/desktop/src` directory. The run passed
+    again at `00b7c9b`.
 
 ### Remaining item 5 work
 
