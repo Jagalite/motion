@@ -156,13 +156,14 @@ async fn clean_with(
             phase: String,
             updated_at: i64,
             last_active_playback: Option<i64>,
+            download_pinned: bool,
         }
         // Read bounded pages of observations; the core owns retention eligibility.
         let mut rows = Vec::new();
         let mut offset = 0i64;
         let clock = now();
         loop {
-            let page: Vec<Observation> = sqlx::query_as("SELECT p.id,p.output_file_id,p.attempt,p.phase,p.updated_at,(SELECT max(s.updated_at) FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused')) AS last_active_playback FROM processing_jobs p WHERE p.cache_cleaned=0 AND (p.phase IN ('failed','cancelled') OR (p.phase='completed' AND p.updated_at<?)) AND NOT EXISTS(SELECT 1 FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused') AND s.updated_at>?) ORDER BY p.updated_at,p.id LIMIT 200 OFFSET ?")
+            let page: Vec<Observation> = sqlx::query_as("SELECT p.id,p.output_file_id,p.attempt,p.phase,p.updated_at,(SELECT max(s.updated_at) FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused')) AS last_active_playback,EXISTS(SELECT 1 FROM downloads d WHERE d.file_id=p.output_file_id AND d.state!='cancelled') AS download_pinned FROM processing_jobs p WHERE p.cache_cleaned=0 AND (p.phase IN ('failed','cancelled') OR (p.phase='completed' AND p.updated_at<?)) AND NOT EXISTS(SELECT 1 FROM playback_sessions s WHERE s.file_id=p.output_file_id AND s.status IN ('playing','paused') AND s.updated_at>?) ORDER BY p.updated_at,p.id LIMIT 200 OFFSET ?")
                 .bind(playscale_core::maintenance::retention_cutoff(clock, app.processing.settings.retention_seconds)).bind(playscale_core::maintenance::playback_cutoff(clock)).bind(offset).fetch_all(&mut *tx).await?;
             let count = page.len();
             for Observation {
@@ -172,6 +173,7 @@ async fn clean_with(
                 phase,
                 updated_at,
                 last_active_playback,
+                download_pinned,
             } in page
             {
                 let state = playscale_core::maintenance::CacheEntry {
@@ -183,7 +185,11 @@ async fn clean_with(
                     updated_at,
                     last_active_playback,
                 };
-                if state.removable(clock, app.processing.settings.retention_seconds) {
+                if state.removable_with_download(
+                    clock,
+                    app.processing.settings.retention_seconds,
+                    download_pinned,
+                ) {
                     let cleanup = if let Some(file) = &file {
                         let Some(claim) = app.processing.artifacts.claim_cleanup(file.clone())
                         else {
@@ -388,9 +394,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::{Mutex, Semaphore};
-    #[tokio::test]
-    async fn stalled_cache_delete_does_not_hold_writer_and_keeps_io_admission() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn cache_fixture(dir: &tempfile::TempDir) -> App {
         let db = db::connect(&dir.path().join("db.sqlite")).await.unwrap();
         let library = db::add_library(&db, "fixture", dir.path()).await.unwrap();
         sqlx::query("INSERT INTO items (id,title,kind) VALUES ('item','Fixture','video')")
@@ -404,7 +408,7 @@ mod tests {
         sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available) VALUES ('file','edition',?,'fixture.mp4','hash','stamp',1,'[]',1)").bind(library.id).execute(&db).await.unwrap();
         sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available,generated) SELECT 'output',edition_id,library_id,'generated.mp4','output-revision','output-stamp',1,'[]',1,1 FROM media_files WHERE id='file'").execute(&db).await.unwrap();
         sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,output_file_id) VALUES ('job','file','hash','h264720p','software','key','completed',0,0,'output')").execute(&db).await.unwrap();
-        let app = App {
+        App {
             health: Arc::new(crate::operations::Health::new(false)),
             db,
             admin_token: Arc::new("test".into()),
@@ -426,7 +430,58 @@ mod tests {
                 playscale_core::access::AccessMode::TrustedHousehold,
                 crate::v2::auth::random_key(),
             )),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn downloaded_prefix_does_not_starve_later_cache_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = cache_fixture(&dir).await;
+        // More pinned outputs than one enumeration page; the unpinned job is
+        // ordered last and must still be selected by the same sweep.
+        sqlx::query("UPDATE processing_jobs SET updated_at=1 WHERE id='job'")
+            .execute(&app.db)
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(&app.db).await.unwrap();
+        for index in 0..200 {
+            let file = format!("pinned-{index:03}");
+            sqlx::query("INSERT INTO media_files(id,edition_id,library_id,relative_path,revision,fingerprint,bytes,tracks_json,available,generated) SELECT ?,edition_id,library_id,?,'r','stamp',1,'[]',1,1 FROM media_files WHERE id='file'")
+                .bind(&file).bind(format!("{file}.mp4")).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,output_file_id) VALUES (?,'file','hash','h264720p','software',?,'completed',0,0,?)")
+                .bind(&file).bind(&file).bind(&file).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO downloads(id,revision,principal_id,device_id,profile_id,timeline_id,timeline_revision,version_id,file_id,file_revision,content_type,size_bytes,duration_ms,state,created_at,updated_at) VALUES (?,1,'d','d','default','t',1,'v',?,'r','video/mp4',1,1000,'ready',0,0)")
+                .bind(&file).bind(&file).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(
+            clean_with(&app, |path| {
+                assert_eq!(path.file_name().unwrap(), "job");
+                Ok(true)
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM media_files WHERE id LIKE 'pinned-%' AND available=1",
+        )
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+        assert_eq!(retained, 200);
+        let cleaned: bool =
+            sqlx::query_scalar("SELECT cache_cleaned FROM processing_jobs WHERE id='job'")
+                .fetch_one(&app.db)
+                .await
+                .unwrap();
+        assert!(cleaned);
+    }
+
+    #[tokio::test]
+    async fn stalled_cache_delete_does_not_hold_writer_and_keeps_io_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = cache_fixture(&dir).await;
         let (entered, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let active = app.processing.artifacts.pin(["output".into()]).unwrap();
         assert_eq!(
