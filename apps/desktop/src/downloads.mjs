@@ -278,11 +278,19 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
       ...(artwork ? {artwork} : {})});
     const posterBytes = posters.length ? Math.max(0, Number(posters[0].size_bytes) || 0) : 0;
+    // The poster as the cache would record it, when its description is valid.
+    const posterSha = /^sha256:([0-9a-f]{64})$/.exec(posters[0]?.digest ?? '')?.[1];
+    const posterType = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(posters[0]?.relative_name ?? '')?.[1]];
+    const posterIdentity = posterSha && posterType && posterBytes > 0 && posterBytes <= MAX_ARTWORK_BYTES
+      ? {sha256: posterSha, size: posterBytes, content_type: posterType} : null;
     const staged = join(target.path, 'staging', `${download.id}.part`);
     let have = existsSync(staged) ? statSync(staged).size : 0;
     // A publication that crashed after verifying its blob needs no new
     // transfer or space: the cache tool re-verifies and publishes it.
-    if (have === 0 && (await cache(target.path, target.scope, ['recover'], entryFor(null))).recovered) {
+    // Recovered with its poster when that is verified in place too (the
+    // cache checks), otherwise without it.
+    if (have === 0 && ((posterIdentity && (await cache(target.path, target.scope, ['recover'], entryFor(posterIdentity))).recovered)
+        || (await cache(target.path, target.scope, ['recover'], entryFor(null))).recovered)) {
       writeAtomically(join(base, 'current.json'), {root: target.name});
       await report(download, 'verified_local', size);
       return true;
@@ -356,7 +364,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     }
     // The poster last, once the media is staged and its space admitted;
     // fetched whole and verified, it never blocks the title.
-    const artwork = withPoster ? await savePoster(download.id, posters[0], target).catch(() => null) : null;
+    // Only the poster's own failures are tolerated: a disconnect stops here,
+    // before publication, like any other transfer.
+    const artwork = withPoster ? await savePoster(download.id, posters[0], target).catch(error => {
+      if (signal?.aborted) throw error;
+      return null;
+    }) : null;
+    if (signal?.aborted) throw signal.reason ?? new Error('Downloads stopped');
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.
     await cache(target.path, target.scope, ['publish'], entryFor(artwork));

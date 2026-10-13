@@ -1140,6 +1140,16 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   After the fixes: store 19, cache 10 and JS 99 passed.
 
+  Round 2 at `b59749d` raised two P2 findings, both fixed:
+  - **Disconnect:** a disconnect during the poster fetch was swallowed
+    and the staged media still published. Only the poster's own failures
+    are tolerated now; a disconnect stops before publication.
+  - **Recovery:** crash recovery published without the poster even when
+    its verified blob was in place. Recovery is tried with the poster
+    first (the cache checks it is in place), then without it.
+
+  JS test covers both. JS 100 passed.
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |

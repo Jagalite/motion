@@ -835,3 +835,32 @@ test('a poster is saved only within the admitted space; without room the title i
   assert.equal(JSON.parse(calls.filter(c => c[1] === 'publish').at(-1)[3]).artwork, undefined);
   assert.ok(!existsSync(join(target.path, 'staging', 'd1.artwork')));
 });
+
+test('a disconnect during the poster stops before publication; recovery keeps a verified poster', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const poster = Buffer.from('poster image bytes');
+  const posterDigest = createHash('sha256').update(poster).digest('hex');
+  const withPoster = id => ({...manifest(id), files: [...manifest(id).files,
+    {asset_id: posterDigest, relative_name: 'poster.png', digest: `sha256:${posterDigest}`, size_bytes: String(poster.length),
+      media_url: `/api/v2/media/assets/${posterDigest}/content?revision=1`, role: 'artwork'}]});
+  const controller = new AbortController();
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 100000, signal: controller.signal,
+    api: async path => path.endsWith('/manifest') ? withPoster(path.split('/')[4]) : {url: '/api/v2/media/files/f1/content?ticket=t'},
+    fetchMedia: async url => {
+      if (url.includes('/assets/')) { controller.abort(new Error('disconnected')); throw new Error('aborted'); }
+      return response(200, media);
+    }});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  await assert.rejects(agent.transfer({id: 'd1'}, target), /disconnected|aborted/);
+  assert.ok(!fake.calls.some(c => c[1] === 'publish'), 'nothing published after the disconnect');
+  // Crash recovery: offered first with the poster.
+  const recovering = fakeCache();
+  recovering.state(agent.root('default').path).recoverable = ['d2'];
+  const again = createDownloadAgent({base, identity, cache: recovering.cache, quota: 100000,
+    api: async path => withPoster(path.split('/')[4]), fetchMedia: async () => assert.fail('no transfer')});
+  assert.equal(await again.transfer({id: 'd2'}, again.root('default')), true);
+  const recovered = JSON.parse(recovering.calls.find(c => c[1] === 'recover')[3]);
+  assert.equal(recovered.artwork.sha256, posterDigest);
+});
