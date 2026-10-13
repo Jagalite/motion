@@ -1,0 +1,12 @@
+Edit access for Walkthrough household
+
+
+
+  Confirm this access change? y apply · n edit · Esc cancel
+  User: Walkthrough household · enabled
+  Permissions: catalog:read, viewing:write, playback:request
+  Profiles: Everyone
+  Libraries: none
+  Device: Walkthrough terminal · motion-terminal · enabled
+  Device: Web browser · Motion web · enabled
+  Revocation cannot erase downloaded bytes. Viewing outboxes are preserved.
