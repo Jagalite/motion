@@ -1364,6 +1364,17 @@ async fn devices_report_their_own_copies_in_their_own_order() {
         StatusCode::CONFLICT,
         "download_changed",
     );
+    // Beyond the stored range: refused, never a server error.
+    problem(
+        &put(
+            json!({"sequence": "9223372036854775808", "download_revision": "1",
+                "state": "transferring", "bytes_received": "1"}),
+            auth.clone(),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_transfer",
+    );
     // Never verified while incomplete, never beyond the size.
     for bad in [
         report(4, "1", "verified_local", 999),

@@ -981,7 +981,17 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Not covered:** queued reports (the agent has no queue yet), and the
   packaged Electron run (5F).
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** four P2 findings, all fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | T1 | A lost terminal report (verified or removed) was never retried, and copies saved before reports existed never reported | Fixed: every pass reconciles the server's view with what the device knows. A saved copy whose current report is not `verified_local` reports it; an ended download with no copy here, whose current report is not `removed`, reports that. JS test |
+  | T2 | A title removed through the offline window never reported `removed` | Fixed by the same reconciliation, with the post-cancellation revision from the next listing. JS test |
+  | T3 | Failing to persist the report sequence aborted the transfer and the pass | Fixed: a sequence is sent only once persisted, and a persistence failure is a reporting failure only. JS test with an unwritable sequence file |
+  | T4 | A sequence beyond `i64` passed admission and failed the database constraint (500) | Fixed: numbers beyond 9223372036854775807 are refused as `invalid_transfer` and documented in the contract. Integration case |
+
+  After the fixes: JS 95, `v2_downloads` 8 and contract 5 passed; pinned
+  clippy is clean.
 
 ### Remaining item 5 work (not started)
 

@@ -702,3 +702,37 @@ test('the device reports its own copy in its own order, never blocking a transfe
   await again.transfer({id: 'd1', revision: '3'}, target).catch(() => {});
   assert.ok(reports.slice(2).every(r => Number(r.sequence) > 2), JSON.stringify(reports));
 });
+
+test('reports are reconciled on later passes and never block downloads', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const fake = fakeCache();
+  const reports = [];
+  const listed = [
+    // Saved here (before reports existed, or its final report was lost).
+    {id: 'kept', profile_id: 'default', state: 'ready', revision: '2', size_bytes: '20', device_transfer: null},
+    // Removed through the offline window, cancelled since; last reported saved.
+    {id: 'gone', profile_id: 'default', state: 'cancelled', revision: '3', size_bytes: '20',
+      device_transfer: {state: 'verified_local', download_revision: '2'}},
+    // Already reported as removed under its current revision: nothing to say.
+    {id: 'done', profile_id: 'default', state: 'cancelled', revision: '3', size_bytes: '20',
+      device_transfer: {state: 'removed', download_revision: '3'}},
+  ];
+  const agent = createDownloadAgent({base, identity, cache: fake.cache, quota: 1000,
+    fetchMedia: async () => assert.fail('no transfer'),
+    api: async (path, init = {}) => {
+      if (path.startsWith('/api/v2/downloads?')) return {items: listed, next_cursor: null};
+      if (init.method === 'PUT' && path.endsWith('/transfer')) { reports.push([path.split('/')[4], init.body.state, init.body.download_revision]); return {}; }
+      if (path === '/api/v2/offline/sync') return {results: [], next_device_sequence: '1'};
+      throw new Error(path);
+    }});
+  const target = agent.root('default');
+  fake.state(target.path).downloads.push({identity: {download_id: 'kept'}, size: 20});
+  await agent.pass();
+  assert.deepEqual(reports, [['kept', 'verified_local', '2'], ['gone', 'removed', '3']]);
+  // A sequence that cannot be persisted is not sent, and nothing else fails.
+  rmSync(join(base, 'transfer-reports.json'), {force: true});
+  mkdirSync(join(base, 'transfer-reports.json'));
+  reports.length = 0;
+  await agent.pass();
+  assert.deepEqual(reports, []);
+});

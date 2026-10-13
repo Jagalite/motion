@@ -640,6 +640,20 @@ pub async fn report_transfer(
         state: input.state,
         bytes_received: number(&input.bytes_received, "bytes_received")?,
     };
+    // Stored losslessly as SQLite integers: the supported range ends there.
+    if [
+        incoming.sequence,
+        incoming.download_revision,
+        incoming.bytes_received,
+    ]
+    .iter()
+    .any(|v| i64::try_from(*v).is_err())
+    {
+        return Err(Problem::invalid(
+            "invalid_transfer",
+            "sequence, download_revision and bytes_received must not exceed 9223372036854775807",
+        ));
+    }
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::DownloadsManage))

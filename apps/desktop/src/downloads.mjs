@@ -189,9 +189,16 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
   const reports = join(base, 'transfer-reports.json');
   async function report(download, state, bytes) {
     if (!download?.revision) return;
-    const sequences = readJson(reports, {});
-    const sequence = (Number(sequences[download.id]) || 0) + 1;
-    writeAtomically(reports, {...sequences, [download.id]: sequence});
+    // A sequence is sent only once it is persisted; failing to persist it is
+    // a reporting failure only, never a transfer failure.
+    let sequence;
+    try {
+      const sequences = readJson(reports, {});
+      sequence = (Number(sequences[download.id]) || 0) + 1;
+      writeAtomically(reports, {...sequences, [download.id]: sequence});
+    } catch {
+      return;
+    }
     try {
       await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/transfer`, {method: 'PUT',
         body: {sequence: String(sequence), download_revision: String(download.revision), state, bytes_received: String(bytes)}});
@@ -489,6 +496,22 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
           await cache(target.path, target.scope, ['remove', '--download-id', id]);
           // An ended download still listed learns that its copy is gone.
           if (listed) await report(listed, 'removed', 0);
+        }
+      }
+      // Bring the server's view of this device's copies up to date: a
+      // terminal report that failed earlier, copies saved before reports
+      // existed, and copies removed through the offline window. Only what
+      // the device knows locally is reported.
+      const saved = new Set(local.downloads.map(entry => entry.identity.download_id));
+      for (const listed of downloads.filter(d => d.profile_id === profile)) {
+        if (signal?.aborted) return;
+        const reported = listed.device_transfer;
+        const current = reported && reported.download_revision === listed.revision;
+        if (listed.state === 'ready' && saved.has(listed.id) && !(current && reported.state === 'verified_local')) {
+          await report(listed, 'verified_local', Number(listed.size_bytes) || 0);
+        } else if (listed.state !== 'ready' && !saved.has(listed.id) && !before.staged.includes(listed.id)
+          && reported && !(current && reported.state === 'removed')) {
+          await report(listed, 'removed', 0);
         }
       }
       let failed = false;

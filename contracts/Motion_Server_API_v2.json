@@ -19159,6 +19159,7 @@
       "DownloadTransferInput": {
         "type": "object",
         "additionalProperties": false,
+        "description": "Every number must not exceed 9223372036854775807 (invalid_transfer).",
         "properties": {
           "sequence": {
             "$ref": "#/components/schemas/Revision"
