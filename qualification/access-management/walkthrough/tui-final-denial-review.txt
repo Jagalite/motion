@@ -1,0 +1,5 @@
+Deny pairing request?
+
+
+
+  Confirm this access change? y apply · n edit · Esc cancel

@@ -4,7 +4,8 @@ Implementation branch: `feat/tui-access`, based on `origin/main` `28f4b32`.
 One implementation agent, with GPT-6.1 Sol read-only review. No live database or
 credentials were used. Application source head: `b183d54`. Core/API source is unchanged from the fully
 passing `6980c60` CI run. Interactive testing found and fixed terminal focus and
-browser feedback defects; refreshed presentation artifacts are pending below. No merge or deployment is authorized by this task.
+browser feedback defects. The refreshed presentation check also passed, as
+recorded below. No merge or deployment is authorized by this task.
 
 ## Correctness boundary
 
@@ -138,10 +139,10 @@ PR: https://github.com/Jagalite/motion/pull/36 (draft, not merged).
   Original and reconstructed packages each passed their 13 runtime checks.
   These package receipts explicitly exclude browser qualification.
 - Live-conversion user changes passed in the 28-test `v2_playback` CI target.
-  The local real TUI/browser walkthrough is recorded below. A rebuilt server
-  embedding the final feedback text is queued as Kyoto job
-  `970b895cd7f6468e8e122a0d4e14aa86`. A terminal refresh with corrected list
-  titles is queued as `08fdacd250e54ac19732cb34319ed0ad`.
+  The local real TUI/browser walkthrough is recorded below. Kyoto server build
+  `970b895cd7f6468e8e122a0d4e14aa86` and terminal build
+  `08fdacd250e54ac19732cb34319ed0ad` both completed successfully. The server
+  was pressure-deferred once before its successful attempt.
 
 ## Interactive walkthrough and follow-up fixes
 
@@ -201,13 +202,35 @@ exclusion (19/19 passed). Sol found no correctness issue in these fixes.
 Fast CI [38343775889](https://github.com/Jagalite/motion/actions/runs/38343775889)
 at `b183d54` passed: formatting/strict Clippy, 51 access API tests, 4 administrator
 core tests, 5 download tests, 105 JavaScript tests, Go client suites and contract.
-The refreshed compiled presentation check remains pending; full CI
-[38343776222](https://github.com/Jagalite/motion/actions/runs/38343776222) is running. Server/API/core source is unchanged, while the bridge is embedded into
-server binaries and therefore requires a new artifact for that final check.
+Full CI [38343776222](https://github.com/Jagalite/motion/actions/runs/38343776222)
+at `b183d54` passed heavy tests, real-process integration/upgrade/restore and
+packaging. The refreshed compiled presentation check also passed using the
+completed Kyoto binaries. Server/API/core source is unchanged; the new server
+serves bridge bytes identical to the final source file (SHA-256
+`f7c96b55a41769f2c78a6d058d80d3444efda878c8982417c4c37600c05200f8`).
 
-Release packaging, installed-app upgrades, native credential-store qualification,
+Release signing/distribution, installed-app upgrades, native credential-store qualification,
 public ingress abuse testing and cross-platform UI qualification are separate.
 
 The [walkthrough receipt](walkthrough/receipt.json), [final API state](walkthrough/final-state.json),
 terminal snapshots and browser screenshots are retained in `walkthrough/`.
 They contain disposable fixture identities, not credentials or invitation codes.
+
+## Final presentation confirmation
+
+The [final presentation receipt](walkthrough/final-presentation-receipt.json)
+binds the final application trees to the successful Kyoto server/terminal builds.
+Through the native browser, a new request was denied from the refreshed TUI.
+The browser displayed “An administrator denied this pairing request. Ask them
+before starting a new request.” The unavailable invitation displayed “This
+invitation is no longer available. Ask an administrator for a new code.” Both
+had `role=alert`; no secret appeared in session storage or the page URL. All three
+refreshed TUI panel titles were observed and saved. The final browser screenshot
+call failed in T3, while click/type/evaluate succeeded; its final DOM observations
+are retained alongside the earlier successful walkthrough PNGs. This is a
+screenshot limitation, not a claimed final screenshot pass.
+
+GPT-6.1 Sol confirmed the final application diff and evidence scope with no new
+finding. All earlier findings are resolved. The temporary fixture processes were
+stopped after verification. Final evidence commits change documentation only;
+application source remains `b183d54` with successful fast and full CI.

@@ -1,5 +1,5 @@
 {
-  "status": "functional_walkthrough_passed; refreshed_feedback_artifact_pending",
+  "status": "passed",
   "server_source": "6980c6007a58f0654e7bbd0518c212500c56ad14",
   "server_binary_sha256": "c1b25a94076ba0f2aab1eb8b3695142ed8dc7572ddf5c4b6f6a32a1a97791560",
   "server_archive_sha256": "821562602a0383a308fbdadba453efda1eb5a673dbfab85bd0ffca62c5ca7887",
@@ -23,11 +23,11 @@
     "user_disable_all_owned_devices",
     "last_usable_administrator_preserved"
   ],
-  "remaining": "Rebuilt b183d54 bridge feedback and terminal list titles",
   "source_trees": {
     "src": "90fe958cb4be82384a80f1f5371ed6a7851b9ad4",
     "crates/core": "86471b7c22a471e646e481e161552ec9fe13d667",
     "migrations": "61bf317d24d159bd244be9591a2641d1cf555e6c",
     "contracts": "c23a0403ac684e99a38509044969bc8614eed29a"
-  }
+  },
+  "final_presentation_receipt": "final-presentation-receipt.json"
 }
