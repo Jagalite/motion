@@ -1261,10 +1261,16 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
                     return Err(error);
                 }
             };
-        let reserve_root = app.processing.root.clone();
+        // The processing cache may not exist on a first download. Check the
+        // actual subtitle destination's filesystem before writing any bytes.
+        let reserve_root = path
+            .parent()
+            .ok_or_else(|| crate::api::ApiError::internal("missing subtitle directory"))?
+            .to_path_buf();
         let required = text.len() as u64;
         let reserve = app.storage.settings.min_free_bytes;
         tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&reserve_root)?;
             crate::storage::require_space(&reserve_root, required, reserve)
         })
         .await

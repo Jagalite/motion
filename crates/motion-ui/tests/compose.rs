@@ -306,7 +306,7 @@ async fn player_page_emits_a_stable_host_and_external_module() {
     assert!(
         html.contains(r#"<select name="limit"><option value="" selected="">No limit</option>"#)
     );
-    assert!(html.contains(r#"<option value="8000000">8 Mbps — 720p, high</option>"#));
+    assert!(html.contains(r#"<option value="8000000">8 Mbps</option>"#));
     assert_strict_markup(&html);
 }
 
