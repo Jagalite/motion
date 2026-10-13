@@ -64,6 +64,11 @@ pub struct Track {
     /// Dolby Vision profile and base-layer signal compatibility ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dolby_vision: Option<(u8, u8)>,
+    /// An attachment's declared MIME type and size (bounds font extraction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_bytes: Option<u64>,
 }
 
 impl Track {

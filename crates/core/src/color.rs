@@ -96,11 +96,12 @@ pub fn tone_map(facts: &ColorFacts<'_>, filters: Filters) -> Result<Option<ToneM
         return Ok(None);
     };
     if let Some((profile, compatibility)) = facts.dolby_vision {
-        // Profile 8.1/7 carry an HDR10 base layer (compatibility 1), 8.4 an
-        // HLG one (4): those base layers are ordinary PQ/HLG pictures. Every
-        // other configuration needs a Dolby Vision decoder.
+        // Profile 8.1 and 7 carry an HDR10 base layer (compatibility 1, or 6
+        // for UHD Blu-ray profile 7), 8.4 an HLG one (4): those base layers are
+        // ordinary PQ/HLG pictures. Every other configuration needs a Dolby
+        // Vision decoder.
         let base_layer = match (profile, compatibility) {
-            (7 | 8, 1) => Some(Transfer::Pq),
+            (7 | 8, 1) | (7, 6) => Some(Transfer::Pq),
             (8, 4) => Some(Transfer::Hlg),
             _ => None,
         };
@@ -223,6 +224,9 @@ mod tests {
             ((8, 4), Err(Refusal::DolbyVisionUnsupported)),
             ((8, 1), Ok(())),
             ((7, 1), Ok(())),
+            // UHD Blu-ray profile 7: an HDR10-compatible base layer.
+            ((7, 6), Ok(())),
+            ((8, 6), Err(Refusal::DolbyVisionUnsupported)),
         ] {
             dv.dolby_vision = Some(config);
             assert_eq!(tone_map(&dv, TOOLS).map(|_| ()), expected, "{config:?}");

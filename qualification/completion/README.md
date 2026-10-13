@@ -269,8 +269,7 @@ Item 3 is delivered in slices. Copy, hardware and ABR defaults stay unchanged.
   `transcodable`, which now also reflects an accepted tone map. The policy is
   a pure function with exhaustive unit cases; no new state transition was
   added.
-- **Focused evidence:** RESULTS_3A
-- **Review:** pending (GPT-6.1 Sol).
+- **Focused evidence:** recorded under 3B, which shares the branch and runs.
 
 ### 3B. Text and styled subtitle burn-in
 
@@ -305,6 +304,33 @@ Item 3 is delivered in slices. Copy, hardware and ABR defaults stay unchanged.
 - **Core/adapter boundary:** the presentation choice is a pure core decision
   from codec, client modes and the observed filter; the adapter extracts,
   checks fingerprints and executes.
+
+### Item 3 evidence and review (3A and 3B)
+
+2026-10-13, darwin-arm64, Rust 1.98; compiled through Kyoto, executed
+directly. The pixel tests use the N2 media-tools FFmpeg (zimg, libass) via
+`MOTION_FILTER_FFMPEG`. Host Homebrew FFmpeg/ffprobe write and inspect the
+fixtures.
+
+| Check | Result |
+|---|---|
+| `playscale-core` lib (`color::tone_map` refusals, peaks and DV configurations; `presentation`; `burn_fonts`; tone map only on conversions) | 147 passed |
+| `playscale` lib (filter listing parser, side-data parsing, relative executables) | 67 passed |
+| `hdr_sources_are_tone_mapped_to_sdr_only_with_known_facts_and_filters` | passed. 100-nit PQ patch delivered at Y ≈ 151 (limited range; a retag would give about 127), output tagged BT.709/tv. Refused with no filters and with unknown primaries/matrix. Capabilities advertise tone mapping only with the filters. Rows without colour facts are re-probed by an ordinary scan |
+| `styled_subtitles_are_burned_by_libass_from_the_exact_stream` | passed. Only the selected one of two same-language ASS tracks is drawn, nothing before its event, drawn after a seek into it. The attachment is extracted under a fixed name. Refused as a text track and without libass |
+| `bitmap_subtitles_are_burned_into_conversions_only`, `conversion_streams_hls_and_switches_audio_from_the_original` | passed (regressions) |
+| Full `tests/v2_playback.rs` | 28 tests: 27 passed in one run; `copied_manifests_declare_the_source_rate` timed out under host load and passed rerun alone. The adaptive and hardware tests likewise passed alone after load timeouts with two threads |
+| Core models (Stateless) | passed: access, delivery (760 s), delivery_observation, demands, identity, jobs, matching, offline, organization, playback_monitor, playback_session, processing, route_selection, scan_coverage and others |
+| Pinned clippy 1.98, CI flags | clean after one `some_filter` fix |
+
+**Review (GPT-6.1 Sol)**, round 1 at `0a6c6f6` against item 2: three P2
+findings, all fixed in the follow-up commit:
+
+| # | Finding | Disposition |
+|---|---|---|
+| P1-3 | Running the encoder in the generation directory broke relative executable paths (`--ffmpeg ./tools/ffmpeg`) for every live conversion | Fixed: `resolved_executable` joins a relative path with directory components to the server's working directory before spawning; bare names still use PATH. Unit-tested |
+| P2-3 | Dolby Vision profile 7 with compatibility ID 6 (UHD Blu-ray HDR10 base layer) was refused | Fixed: `(7, 6)` maps to a PQ base layer; `(8, 6)` stays refused. Unit-tested |
+| P3-3 | Font attachments were dumped without a byte bound | Fixed: the scanner records attachment MIME type and size. Core `burn_fonts` admits attachments only when every one is a font of known size (≤ 16 MiB each, ≤ 64 MiB total, ≤ 64); otherwise none are extracted and libass uses system fonts. Extraction also requires free space for the largest admissible set |
 
 ### Remaining item 3 slices (not started)
 

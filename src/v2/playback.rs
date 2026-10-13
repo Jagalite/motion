@@ -1480,11 +1480,7 @@ pub async fn plan(
         // One file's conversion may tone-map HDR to SDR (`color::tone_map`);
         // a multipart join never does.
         transcodable: input.quality.hdr_policy != "reject_conversion"
-            && delivery::live_transcodable(
-                &bound.file,
-                audio,
-                (!multipart).then_some(filters),
-            ),
+            && delivery::live_transcodable(&bound.file, audio, (!multipart).then_some(filters)),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
         // A requested cap is kept when the conversion can be capped at it

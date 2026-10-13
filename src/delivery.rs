@@ -557,6 +557,19 @@ fn tone_map_graph(t: playscale_core::color::ToneMap) -> String {
     )
 }
 
+/// An executable path that stays valid when the child's working directory
+/// changes: a relative path with directory components is joined to the
+/// server's working directory; a bare name is left for PATH lookup.
+fn resolved_executable(path: &FsPath) -> std::path::PathBuf {
+    if path.is_relative() && path.components().count() > 1 {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_owned())
+    } else {
+        path.to_owned()
+    }
+}
+
 /// Per-delivery files of a burned text subtitle, beside the generations:
 /// `burn-text-<n>.ass` and the font directory `burn-fonts-<n>`.
 const BURN_TEXT: &str = "burn-text-";
@@ -1763,12 +1776,14 @@ async fn run_generation(
             return fail(&app, &session);
         }
     }
-    let mut supervisor = Command::new(&app.processing.supervisor);
-    // Relative filter inputs (a burned subtitle) resolve from here.
+    // Relative filter inputs (a burned subtitle) resolve from the generation
+    // directory, so executables given as relative paths are resolved against
+    // the server's own working directory first; bare names still use PATH.
+    let mut supervisor = Command::new(resolved_executable(&app.processing.supervisor));
     supervisor.current_dir(&directory);
     supervisor
         .arg("--internal-ffmpeg-supervisor")
-        .arg(&app.processing.settings.ffmpeg)
+        .arg(resolved_executable(&app.processing.settings.ffmpeg))
         .args(arguments(
             operation,
             pin.recipe_digest.as_deref() == Some(VIDEOTOOLBOX_RECIPE),
@@ -2829,10 +2844,15 @@ fn with_burn(mut pin: Pin, burn: Option<Burn>) -> Pin {
 
 /// The font attachments of `file` a text burn-in extracts, bounded.
 pub(crate) fn burn_attachments(file: &db::ItemRow) -> u32 {
-    serde_json::from_str::<Vec<db::Track>>(&file.tracks_json)
-        .map(|streams| streams.iter().filter(|t| t.kind == "attachment").count() as u32)
-        .unwrap_or(0)
-        .min(MAX_BURN_ATTACHMENTS)
+    let Ok(streams) = serde_json::from_str::<Vec<db::Track>>(&file.tracks_json) else {
+        return 0;
+    };
+    let attachments: Vec<(Option<&str>, Option<u64>)> = streams
+        .iter()
+        .filter(|t| t.kind == "attachment")
+        .map(|t| (t.mimetype.as_deref(), t.attachment_bytes))
+        .collect();
+    core::burn_fonts(&attachments).min(MAX_BURN_ATTACHMENTS)
 }
 
 /// A burned subtitle must be an embedded stream the kind of burn renders
@@ -5182,6 +5202,18 @@ async fn ensure_burn_text(
         .try_acquire_owned()
         .map_err(|_| subtitles_unavailable())?;
     let fonts = directory.join(format!("{BURN_FONTS}{index}"));
+    // The pinned attachments were admitted by their probed sizes
+    // (`core::burn_fonts`); room for the largest admissible set is required.
+    if attachments > 0 {
+        let floor = app.storage.settings.min_free_bytes;
+        let directory = directory.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::storage::require_space(&directory, core::MAX_FONTS_TOTAL_BYTES, floor)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(|_| subtitles_unavailable())?;
+    }
     let _ = tokio::fs::remove_dir_all(&fonts).await;
     tokio::fs::create_dir_all(&fonts)
         .await
@@ -5306,6 +5338,28 @@ pub async fn segment(
 #[cfg(test)]
 mod tests {
     use super::{CopyDetails, Operation, db, parse_copy_details, validate_route};
+
+    #[test]
+    fn executables_survive_a_changed_working_directory() {
+        use std::path::Path;
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            super::resolved_executable(Path::new("ffmpeg")),
+            Path::new("ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("/opt/ff/ffmpeg")),
+            Path::new("/opt/ff/ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("./tools/ffmpeg")),
+            cwd.join("./tools/ffmpeg")
+        );
+        assert_eq!(
+            super::resolved_executable(Path::new("tools/ffmpeg")),
+            cwd.join("tools/ffmpeg")
+        );
+    }
 
     #[test]
     fn copy_details_parse_profile_level_field_order_and_rotation() {

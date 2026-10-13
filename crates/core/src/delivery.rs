@@ -169,6 +169,42 @@ pub fn styled_subtitle(codec: &str) -> bool {
     matches!(codec, "ass" | "ssa")
 }
 
+/// Font attachments extracted for one burned subtitle: at most this many,
+/// each at most `MAX_FONT_BYTES`, together at most `MAX_FONTS_TOTAL_BYTES`.
+pub const MAX_FONTS: usize = 64;
+pub const MAX_FONT_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_FONTS_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many of a file's attachments (probed MIME type and size, in stream
+/// order) a burned subtitle extracts as fonts: all of them when every one is
+/// a font of known size within the bounds, otherwise none (libass then uses
+/// system fonts). Unknown sizes are never trusted.
+pub fn burn_fonts(attachments: &[(Option<&str>, Option<u64>)]) -> u32 {
+    let font = |mime: &str| {
+        mime.starts_with("font/")
+            || matches!(
+                mime,
+                "application/x-truetype-font"
+                    | "application/x-font-ttf"
+                    | "application/x-font-otf"
+                    | "application/vnd.ms-opentype"
+                    | "application/font-sfnt"
+            )
+    };
+    let mut total = 0u64;
+    for (mime, bytes) in attachments {
+        let Some(bytes) = *bytes else { return 0 };
+        total = total.saturating_add(bytes);
+        if !mime.is_some_and(font) || bytes > MAX_FONT_BYTES {
+            return 0;
+        }
+    }
+    if attachments.len() > MAX_FONTS || total > MAX_FONTS_TOTAL_BYTES {
+        return 0;
+    }
+    attachments.len() as u32
+}
+
 /// How a selected embedded subtitle stream reaches the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1777,6 +1813,28 @@ mod tests {
         ] {
             assert!(!sidecar_subtitle(codec), "{codec}");
         }
+    }
+
+    #[test]
+    fn only_bounded_font_attachments_are_extracted() {
+        let font = (Some("font/ttf"), Some(1_000));
+        assert_eq!(burn_fonts(&[]), 0);
+        assert_eq!(
+            burn_fonts(&[font, (Some("application/x-truetype-font"), Some(5))]),
+            2
+        );
+        // Unknown size, a non-font, an oversized font: none at all.
+        assert_eq!(burn_fonts(&[font, (Some("font/otf"), None)]), 0);
+        assert_eq!(burn_fonts(&[font, (Some("image/jpeg"), Some(10))]), 0);
+        assert_eq!(burn_fonts(&[(None, Some(10))]), 0);
+        assert_eq!(
+            burn_fonts(&[(Some("font/ttf"), Some(MAX_FONT_BYTES + 1))]),
+            0
+        );
+        let big = (Some("font/ttf"), Some(MAX_FONT_BYTES));
+        assert_eq!(burn_fonts(&[big; 4]), 4);
+        assert_eq!(burn_fonts(&[big; 5]), 0, "aggregate bound");
+        assert_eq!(burn_fonts(&[(Some("font/ttf"), Some(1)); MAX_FONTS + 1]), 0);
     }
 
     #[test]

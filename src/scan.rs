@@ -303,7 +303,7 @@ pub(crate) async fn inspect(
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time:stream_tags=language,title:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
+            "format=duration:stream=index,codec_type,codec_name,width,height,avg_frame_rate,bit_rate,pix_fmt,color_transfer,color_primaries,color_space,color_range,start_time,extradata_size:stream_tags=language,title,mimetype:stream_disposition=default,forced,hearing_impaired,comment:stream_side_data=side_data_type,max_luminance,max_content,dv_profile,dv_bl_signal_compatibility_id",
             "-of",
             "json",
             "-i",
@@ -384,6 +384,14 @@ pub(crate) async fn inspect(
                 .filter(|t| t.len() <= 200)
                 .map(str::to_owned),
             color_probed: true,
+            mimetype: s["tags"]["mimetype"]
+                .as_str()
+                .filter(|_| s["codec_type"] == "attachment")
+                .filter(|m| m.len() <= 200)
+                .map(str::to_owned),
+            attachment_bytes: s["extradata_size"]
+                .as_u64()
+                .filter(|_| s["codec_type"] == "attachment"),
             color_primaries: s["color_primaries"].as_str().map(str::to_owned),
             color_space: s["color_space"].as_str().map(str::to_owned),
             color_range: s["color_range"].as_str().map(str::to_owned),
