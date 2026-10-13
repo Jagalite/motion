@@ -7,7 +7,7 @@ screen are not advertised or enabled by this change.
 ## A1 checkpoint: explicit caller authority
 
 Base: `origin/main` at `28f4b32c0df0c31d636488fdb524c23549c89bdc`.
-Worktree: `/Volumes/seed1/Projects/motion-auth-signin`.
+Worktree: `motion-auth-signin` under the seed1 volume's `Projects` directory.
 
 Request callers now carry one private, explicit source: proven local operator,
 stored credential, or verified ingress device. Missing credential/ingress fields
@@ -31,8 +31,8 @@ uses the explicit caller source for its operator exemption.
 ## Verification
 
 Builds use Kyoto with `RUSTC` pinned to the 1.98.0 toolchain and isolated target
-`/Volumes/seed1/Projects/motion-auth-signin-target`. Receipts and raw logs belong in
-`/Volumes/seed1/Projects/motion-auth-signin-artifacts`; all database fixtures are
+`motion-auth-signin-target` under the same seed1 `Projects` directory. Receipts and raw logs belong in
+`motion-auth-signin-artifacts` alongside that target; all database fixtures are
 temporary and isolated from live state.
 
 - Formatting and `git diff --check`: passed.
