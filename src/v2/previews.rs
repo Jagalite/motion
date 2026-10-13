@@ -956,6 +956,7 @@ fn orphan_page(root: &std::path::Path) -> Vec<(String, String, PathBuf)> {
             Some(Ok(entry)) => {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !name.starts_with('.')
+                    && entry.file_type().is_ok_and(|kind| kind.is_dir())
                     && let Ok(revisions) = std::fs::read_dir(entry.path())
                 {
                     walk.revisions = Some((name, revisions));

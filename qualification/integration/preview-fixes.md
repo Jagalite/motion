@@ -31,8 +31,8 @@ remain authoritative. Adapters observe database and filesystem facts, serialize
 admission/publication/deletion, retain execution ownership, and enforce durable ordering.
 
 Added verification:
-- core table covers 128 admission fact combinations including capacity boundaries;
-- Stateless model explores all 32 fact states and six request/invalidation inputs,
+- core table covers 64 admission fact combinations including capacity boundaries;
+- Stateless model is configured to explore all 32 fact states and six request/invalidation inputs,
   checking exact enqueue count and no duplicate admission after an accepted request;
 - server regression extends preview lifecycle with metadata-only invalidation,
   stale retry rejection and oversized sparse sheet refusal;
