@@ -1300,7 +1300,7 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 ### 6B. Embedded chapters from the container
 
 - **Source SHA:** branch `plan-completion/embedded-chapters`, stacked on
-  `plan-completion/offline-artwork` (it needs migrations 0047 and 0048).
+  `plan-completion/offline-metadata` (it needs migrations 0047 and 0048).
 - **Implemented:**
   - **Scan:** ffprobe records each file's container chapters (start, end and
     title) in `media_files.chapters_json` (migration 0049, additive). It is
