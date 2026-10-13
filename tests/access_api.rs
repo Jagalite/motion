@@ -1370,7 +1370,14 @@ async fn revocation_after_admission_is_enforced_inside_the_transaction() {
 fn served_contract_matches_reviewed_yaml() {
     let json: Value = serde_json::from_str(playscale::v2::system::CONTRACT_JSON).unwrap();
     let yaml = std::str::from_utf8(playscale::v2::system::CONTRACT_YAML).unwrap();
-    let yaml_paths = yaml.lines().filter(|l| l.starts_with("  /api/v2/")).count();
+    let yaml_paths = yaml
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|line| {
+            line.trim_start_matches(['\"', '\''])
+                .starts_with("/api/v2/")
+        })
+        .count();
     assert_eq!(json["paths"].as_object().unwrap().len(), yaml_paths);
     // Full parity needs a YAML parser; the development tool provides one.
     let status = std::process::Command::new("ruby")
@@ -3351,12 +3358,12 @@ async fn topcoat_hashed_assets_are_identity_independent_and_immutable() {
 
 // Administrator access management runs through real HTTP and SQLite.
 async fn access_user(f: &Fixture, name: &str) -> Value {
-    let response=f.call("POST","/api/v2/users",Some(json!({"name":name,"disabled":false,"profile_ids":["default"],"permissions":["catalog:read","playback:request","events:read"],"policy":{"library_ids":[f.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",name)]).await;
+    let response=f.call("POST","/api/v2/users",Some(json!({"name":name,"disabled":false,"profile_ids":["default"],"permissions":["catalog:read","playback:request","events:read"],"policy":{"library_ids":[f.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",&format!("access-user-{}",uuid::Uuid::new_v4()))]).await;
     assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
     response.body
 }
 async fn access_invite(f: &Fixture, user: &Value, key: &str) -> Value {
-    let response=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":user["revision"],"profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",key)]).await;
+    let response=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":user["revision"],"profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&format!("Bearer {OPERATOR}")),("idempotency-key",&format!("access-invite-{key}"))]).await;
     assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
     response.body
 }
@@ -3523,7 +3530,7 @@ async fn administrator_pairing_deny_competes_with_approval() {
     let auth = format!("Bearer {OPERATOR}");
     let headers = [
         ("authorization", auth.as_str()),
-        ("idempotency-key", "deny"),
+        ("idempotency-key", "pairing-deny-fixture-01"),
     ];
     let list = f.call("GET", "/api/v2/auth/pairings", None, &headers).await;
     assert_eq!(list.body["items"][0]["device_name"], "Unknown TV");
@@ -3542,7 +3549,10 @@ async fn administrator_pairing_deny_competes_with_approval() {
             "POST",
             &format!("/api/v2/auth/pairings/{id}/approve"),
             Some(json!({"user_code":request.body["user_code"],"profile_ids":[],"permissions":[]})),
-            &[("authorization", &auth), ("idempotency-key", "approve")],
+            &[
+                ("authorization", &auth),
+                ("idempotency-key", "pairing-approve-fixture-01"),
+            ],
         )
         .await;
     assert_eq!(approve.body["code"], "pairing_already_decided");
@@ -3766,7 +3776,7 @@ async fn administrator_invitation_expiry_issuer_loss_and_revoke_claim_race() {
     // Two admins permit revoking the issuer while keeping a usable administrator.
     let (issuer, token) = f.pair(&[], &["system:admin"]).await;
     let _backup = f.pair(&[], &["system:admin"]).await;
-    let issued=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":"1","profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&bearer(&token)),("idempotency-key","issuer-invite")]).await;
+    let issued=f.call("POST","/api/v2/auth/invitations",Some(json!({"user_id":user["id"],"user_revision":"1","profile_ids":user["profile_ids"],"permissions":user["permissions"],"policy":user["policy"],"ttl_seconds":600})),&[("authorization",&bearer(&token)),("idempotency-key","issuer-invitation-fixture-01")]).await;
     assert_eq!(issued.status, StatusCode::CREATED, "{:?}", issued.body);
     assert_eq!(
         f.call(
@@ -3833,7 +3843,7 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
                 Some(json!({"user_code":p.body["user_code"],"profile_ids":[],"permissions":[]})),
                 &[
                     ("authorization", &auth),
-                    ("idempotency-key", &format!("long-{index}")),
+                    ("idempotency-key", &format!("long-name-approval-{index}")),
                 ],
             )
             .await;
@@ -3877,11 +3887,11 @@ async fn administrator_pairing_decision_race_and_generated_name_bounds() {
     let dpath = format!("{root}/deny");
     let approve_headers = [
         ("authorization", auth.as_str()),
-        ("idempotency-key", "race-approve"),
+        ("idempotency-key", "pairing-race-approve-01"),
     ];
     let deny_headers = [
         ("authorization", auth.as_str()),
-        ("idempotency-key", "race-deny"),
+        ("idempotency-key", "pairing-race-deny-01"),
     ];
     let (a, d) = tokio::join!(
         f.call(
@@ -4084,7 +4094,7 @@ async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
             Some(ticket_input.clone()),
             &[
                 ("authorization", &auth),
-                ("idempotency-key", "user-ticket-key"),
+                ("idempotency-key", "user-content-ticket-key-01"),
             ],
         )
         .await;
@@ -4134,7 +4144,7 @@ async fn administrator_user_changes_fence_sessions_children_tickets_and_sse() {
             Some(ticket_input),
             &[
                 ("authorization", &auth),
-                ("idempotency-key", "user-ticket-key")
+                ("idempotency-key", "user-content-ticket-key-01")
             ]
         )
         .await
