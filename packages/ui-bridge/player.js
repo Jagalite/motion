@@ -449,6 +449,73 @@ async function disposePlayer(element) {
   if (!element) return;
   await Promise.race([element.destroy().catch(() => {}), sleep(2000)]);
   element.remove();
+  // The thumbnail sheets this player held.
+  for (const url of await Promise.all(sheetUrls.get(element)?.values() ?? [])) if (url) URL.revokeObjectURL(url);
+  sheetUrls.delete(element);
+}
+
+/**
+ * The trick-play thumbnail for `seconds` from a ready previews manifest
+ * (getTimelinePreviews): the thumbnail at or before it (core
+ * `previews::tile_at`), as its sheet and the crop within it. Null beyond the
+ * last thumbnail, or for a manifest this page cannot trust.
+ */
+function previewFrame(manifest, seconds, origin) {
+  if (manifest?.status !== 'ready' || !(seconds >= 0)) return null;
+  const {interval_ms: interval, tile_width: width, tile_height: height, columns, rows, tiles, sheets} = manifest;
+  if (![interval, width, height, columns, rows, tiles].every(n => Number.isInteger(n) && n > 0) || !Array.isArray(sheets)) return null;
+  const index = Math.floor(seconds * 1000 / interval);
+  if (index >= tiles) return null;
+  const perSheet = columns * rows;
+  const sheet = sheets[Math.floor(index / perSheet)];
+  // Only this server's own sheet route.
+  if (typeof sheet !== 'string' || !sheet.startsWith('/api/v2/media/files/')) return null;
+  const within = index % perSheet;
+  return {
+    time: index * interval / 1000, width, height,
+    image: {uris: [new URL(sheet, origin).href], crop: {x: (within % columns) * width, y: Math.floor(within / columns) * height, width, height}},
+    path: 'motion-previews', temporalAccuracy: 'approximate', timestampKind: 'interval',
+  };
+}
+
+/** Each player's fetched thumbnail sheets, as local object URLs by sheet. */
+const sheetUrls = new WeakMap();
+
+/**
+ * Offer the timeline's server-rendered thumbnails to the player's preview
+ * lane (Demuxe `AuthoredPreviewProvider`) when they are ready. Demuxe
+ * fetches preview images without credentials, so each sheet is fetched once
+ * here with this session and handed over as a local `blob:` URL (revoked
+ * with the player). Optional: without them, or on any failure, the player
+ * keeps its own previews.
+ */
+async function attachPreviews(element, base, timeline) {
+  try {
+    const {AuthoredPreviewProvider} = await import(`${base}web/generated/index.js`);
+    if (typeof AuthoredPreviewProvider !== 'function' || typeof element.player?.preview?.addProvider !== 'function') return;
+    const manifest = await api('GET', `/api/v2/catalog/timelines/${encodeURIComponent(timeline)}/previews`, undefined, undefined, AbortSignal.timeout(10000));
+    if (manifest?.status !== 'ready' || !element.isConnected) return;
+    const sheets = new Map();
+    sheetUrls.set(element, sheets);
+    const local = url => {
+      if (!sheets.has(url)) {
+        sheets.set(url, fetch(url, {credentials: 'same-origin', redirect: 'error', signal: AbortSignal.timeout(10000)})
+          .then(response => response.ok ? response.blob() : null)
+          .then(blob => blob && blob.size <= 4 * 1024 * 1024 && element.isConnected ? URL.createObjectURL(blob) : null)
+          .catch(() => null)
+          // A sheet that could not be read is tried again on a later lookup.
+          .then(local => { if (!local) sheets.delete(url); return local; }));
+      }
+      return sheets.get(url);
+    };
+    element.player.preview.addProvider(new AuthoredPreviewProvider(async ({time}) => {
+      const frame = previewFrame(manifest, time, location.origin);
+      const url = frame && await local(frame.image.uris[0]);
+      return url ? {...frame, image: {...frame.image, uris: [url]}} : null;
+    }));
+  } catch {
+    // Previews are an enhancement; playback never depends on them.
+  }
 }
 
 async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false} = {}) {
@@ -471,6 +538,7 @@ async function preparePlayer(generation, position, current, savedPreferences = n
   host.append(element);
   try {
     await openGeneration(element, generation, position, location.origin);
+    void attachPreviews(element, data.demuxeBase, data.timelineId);
     if (generation.subtitles_url && generation.transport === 'hls') {
       // A live generation's selected subtitle is its manifest's subtitle
       // rendition: select that (the only in-manifest subtitle) and show it.

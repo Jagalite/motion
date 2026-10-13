@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C rest, 6D, 6E not started | markers, embedded-chapters, previews and preview-schedules PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C part 2 implemented and reviewed; 6C part 3 implemented (review pending); 6C rest, 6D, 6E not started | markers, embedded-chapters, previews, preview-schedules and player-previews PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1740,11 +1740,44 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `7268760` is clean: no actionable findings.
 
+### 6C (part 3). Server thumbnails in the player
+
+- **Source SHA:** branch `plan-completion/player-previews`, stacked on
+  `plan-completion/preview-schedules`.
+- **Implemented (`packages/ui-bridge/player.js`):**
+  - `previewFrame(manifest, seconds, origin)` is pure, mirroring core
+    `previews::tile_at`. It returns the thumbnail at or before a position
+    as its sheet and crop. It returns nothing beyond the last thumbnail or
+    for a manifest that is not ready, is malformed, or points at a sheet
+    outside this server's route.
+  - When a player opens, `attachPreviews` reads `getTimelinePreviews` and,
+    when ready, registers a Demuxe `AuthoredPreviewProvider` (highest
+    priority) in the player's preview lane.
+  - Demuxe fetches authored preview images without credentials, and the
+    sheet route requires the session. So each sheet is fetched once with
+    the session and handed to Demuxe as a local `blob:` URL with the crop.
+    A failed sheet is retried on a later lookup, and all sheets are
+    revoked when the player is disposed.
+  - Optional throughout: without ready previews, or on any failure, the
+    player keeps its own previews.
+- **Core/adapter boundary:** the position-to-thumbnail rule is core
+  `tile_at`, mirrored and tested in the bridge. Fetching and handing over
+  sheets is presentation glue.
+- **Evidence (2026-10-13):**
+
+  | Check | Result |
+  |---|---|
+  | `node --test packages/ui-bridge` | 46 passed. New: crops at and between positions and on a second sheet; nothing beyond the end, for a pending or malformed manifest, or for a foreign sheet URL |
+  | Electron 44.7.0 with the deployed Demuxe (manual harness: local server, `demuxe-player` on a sample MP4, `AuthoredPreviewProvider` returning a `blob:` sheet with a crop, then `preview.request` at 12 s) | Demuxe validated and returned the frame unchanged: path `motion-previews`, time 10 s, 160×90, `blob:` URI, crop at x=160. That is the result shape `attachPreviews` produces |
+- **Not covered:** an automated end-to-end run of the online player
+  showing thumbnails while scrubbing (needs the full server and player in
+  a browser). The online player's other paths have the same gap; it
+  remains an item 8 release check.
+
 ### Remaining item 6 work (not started)
 
 | Slice | Next step | Blocker |
 |---|---|---|
-| 6C remaining: player thumbnails | Register a Demuxe `AuthoredPreviewProvider` in the player from `getTimelinePreviews` (sheet URL and crop per position, core `tile_at`) | 6C parts 1–2 |
 | 6D desktop workflow/focus/accessibility fixes | Exercise the new flows with keyboard and screen reader | None |
 | 6E TV/cast receiver | Reviewed device/control contract, then one physical receiver proof | **Physical receiver hardware is not available to this agent.** Contract work can proceed; qualification cannot |
 
