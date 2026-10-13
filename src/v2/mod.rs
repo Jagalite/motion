@@ -329,6 +329,10 @@ impl From<AccessError> for Problem {
             ),
             PairingDenied => (StatusCode::CONFLICT, "The pairing was denied"),
             UserDisabled => (StatusCode::CONFLICT, "The access user is disabled"),
+            PolicyLimitExceeded => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Combined device restrictions exceed 200 blocked labels; adjust the device policy or approve a new device before changing this user",
+            ),
             GrantExceeded => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "The grant exceeds the user access",

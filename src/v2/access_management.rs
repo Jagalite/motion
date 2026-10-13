@@ -118,7 +118,8 @@ pub(super) async fn validate_grant(
         "library_ids",
         &policy.library_ids.iter().cloned().collect::<Vec<_>>(),
     )?;
-    if policy.allowed_ratings.len() > 200 || policy.blocked_labels.len() > 200 {
+    if policy.allowed_ratings.len() > 200 || policy.blocked_labels.len() > admin::MAX_BLOCKED_LABELS
+    {
         return Err(Problem::invalid(
             "invalid_field",
             "Too many rating or label restrictions",

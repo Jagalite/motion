@@ -35,7 +35,24 @@ Early GPT-6.1 Sol source review identified:
 - P2 truncated invitation codes on narrow terminals: wrap without dropping bytes.
   Width 20/40/60/100 regression added.
 
-Review of implementation commits and the final PR diff is pending.
+Sol review of `a2119ac` added two P2 findings, fixed in `9405c42`:
+
+- Authorization withdrawal retained an access dialog: sign-out, verified admin
+  loss and refused access now clear modal/caches and advance the epoch. Late
+  issuance results cannot reveal a code. Regression passed.
+- Generated legacy owner names exceeded 100 characters: truncate by Unicode
+  character with an ellipsis; preserve the original device name. Migration probe
+  includes long ASCII, Unicode and whitespace-boundary names.
+
+Follow-up review confirmed these fixes and requested stronger positive model
+outcomes, affected-device details, and user-change integration coverage. These
+are added. It also caught an incorrect test expectation (download creation is
+202, ticket creation 201), corrected before execution. Final diff review at `42b3eaa` found one P2: repeated user restriction changes
+could accumulate more than 200 device blocked labels. Core now rejects that
+proposal before any user/device update, with a clear API error. It never truncates
+security restrictions. Boundary and transaction rollback tests are added;
+execution and focused follow-up review are pending.
+PR: https://github.com/Jagalite/motion/pull/36 (draft, not merged).
 
 ## Verification status
 
@@ -43,18 +60,32 @@ Review of implementation commits and the final PR diff is pending.
   no code in session storage, and terminal denial feedback.
 - OpenAPI: YAML/JSON parity and validation passed (110 paths, 166 operations,
   173 schemas).
-- Kyoto Go test compilation job `335abcd85e904c699511841a5d24cb52` completed.
-  API, CLI, store and terminal tests passed; TUI regression exposed a fixture
-  initialization issue, now fixed with a bounded selection check, rerun pending.
-- Core model: 648 states / 9,072 transitions, graph exhausted; exact issue count,
-  replay identity, recipient binding, denial finality, stale revisions, user ceiling
-  and last usable administrator checked. Two tests passed. Six existing access
-  regression tests passed; the older four-million-state-budget graph was not rerun.
-- API/SQLite compilation, strict lint, real TUI
-  and browser walkthrough, final review and PR remain pending.
-- `upgrade.py` runs the actual migration SQL against the preceding SQLite schema,
-  passed: two legacy devices retained unchanged IDs/grants/credentials and separate
-  explicit owners; zero foreign-key violations.
+- Kyoto Go build `ecf86a2aa16b4e678a4ff88c87bd420b` and test compilation
+  `b034431c6b5f4a5d877f5a72053f6bdb` completed. Separately executed API 23,
+  store 2 and TUI 70 tests passed. CLI retry test compilation
+  `466263e91c984ba9b62e98102d1f058b` completed; 14 CLI tests passed, including lost-response claim identity and private storage.
+- Core model compilation `6efc6961a9a942d8aa14ee5b9f19c3d1` completed.
+  Three separately executed tests passed. The finite graph exhausted 2,808 states
+  and 50,544 transitions: two administrators and user disable/demotion/revocation,
+  one pairing, one invitation, two claim identities, one target-user revision
+  change, issue/replay/revoke/expiry/issuer loss. Independent expected outcomes
+  check successful actions as well as refusals; exact issuance count/identity,
+  replay identity, recipient binding, decision finality, stale revisions, user
+  ceiling and last usable administrator are checked. Separate boundary tables
+  exercise each grant dimension, credential presence/expiry and rate limits.
+  Six existing access regression tests passed; the older four-million-state-budget
+  graph was not rerun. This model does not exhaust arbitrary users/devices or
+  SQLite/worker scheduling; the adapter tests cover those separately.
+- Viewing writer 14 tests passed, including exact pending event identity retained
+  in its original scoped archive on 401/403 before active state is cleared.
+  Bridge/player/desktop outbox/download/recovery suites: 61 passed.
+- `upgrade.py` runs the actual migration SQL against the preceding SQLite schema:
+  five legacy devices retained unchanged IDs/grants/credentials and separate
+  explicit owners; names meet the Unicode bound; zero foreign-key violations.
+- Rust API/SQLite test compilation, strict lint, real TUI/browser walkthrough and
+  final review are pending. Submitted work is not a passed gate. The initial
+  Rust compile was pressure-deferred three times and cancelled in favor of a
+  single-compiler job. No shared Kyoto policy was changed.
 
 Release packaging, installed-app upgrades, native credential-store qualification,
 public ingress abuse testing and cross-platform UI qualification are separate.

@@ -36,7 +36,10 @@ Grants are bounded by the selected user's access and revision. User edits narrow
 existing devices immediately; widening a user does not silently widen an earlier
 device approval. Pair a new device for a wider grant. Ratings are comma separated;
 an empty allowed-rating list means any rating, and **Allow unrated content** is
-separate. Library and profile selections are explicit. Administration permits all
+separate. Library and profile selections are explicit. Device-specific blocked labels stay
+in effect when a user changes. If combining them would exceed 200 labels, the
+whole user edit is refused without changing any device. Adjust the device policy
+explicitly or approve a new device before retrying. Administration permits all
 operations and overrides ordinary resource restrictions; grant it deliberately.
 
 Existing devices retain their IDs, credentials, profiles and grants after upgrade.

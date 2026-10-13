@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const INVITATION_TTL_MAX: i64 = 86_400;
 pub const REDEMPTION_WINDOW: i64 = 60;
 pub const REDEMPTION_LIMIT: u32 = 30;
+pub const MAX_BLOCKED_LABELS: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct User {
@@ -129,6 +130,11 @@ pub fn constrain(device: &Device, user: &User) -> Result<Device, AccessError> {
                 }
             }
         }
+    }
+    // Repeated ceilings accumulate restrictions. Reject overflow atomically;
+    // truncating this union would silently widen an existing device's access.
+    if next.policy.blocked_labels.len() > MAX_BLOCKED_LABELS {
+        return Err(AccessError::PolicyLimitExceeded);
     }
     Ok(next)
 }

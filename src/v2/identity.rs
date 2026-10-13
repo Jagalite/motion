@@ -941,7 +941,7 @@ pub async fn replace_policy(
         (1..=max).contains(&v.chars().count()) && !v.chars().any(char::is_control)
     };
     let labels_ok = input.allowed_ratings.len() <= 200
-        && input.blocked_labels.len() <= 200
+        && input.blocked_labels.len() <= playscale_core::access_admin::MAX_BLOCKED_LABELS
         && input.permissions.len() <= 32
         && input.allowed_ratings.iter().all(|r| text_ok(r, 64))
         && input.blocked_labels.iter().all(|l| text_ok(l, 100));

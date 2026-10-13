@@ -4254,3 +4254,74 @@ async fn administrator_invitation_replay_observes_current_user_and_limiter_survi
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().contains_key("retry-after"));
 }
+
+#[tokio::test]
+async fn administrator_user_label_overflow_rolls_back_every_revision_and_restriction() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let (device, token) = f.pair(&["default"], &["catalog:read"]).await;
+    let auth = bearer(OPERATOR);
+    let path = format!("/api/v2/devices/{device}/policy");
+    let labels: Vec<_> = (0..200).map(|i| format!("old-{i}")).collect();
+    let policy = json!({"library_ids":[],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":labels,"permissions":["catalog:read"]});
+    let changed = f
+        .call(
+            "PUT",
+            &path,
+            Some(policy),
+            &[("authorization", &auth), ("if-match", "\"r-1\"")],
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK);
+    let upath = format!("/api/v2/users/user-{device}");
+    let user = f
+        .call("GET", &upath, None, &[("authorization", &auth)])
+        .await;
+    for labels in [
+        vec!["one-more".to_owned()],
+        (0..200).map(|i| format!("new-{i}")).collect(),
+    ] {
+        let mut edit = user_edit(user.body.clone());
+        edit["policy"]["blocked_labels"] = json!(labels);
+        let refused = f
+            .call(
+                "PUT",
+                &upath,
+                Some(edit),
+                &[
+                    ("authorization", &auth),
+                    ("if-match", user.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            refused.body
+        );
+        assert_eq!(refused.body["code"], "policy_limit_exceeded");
+        assert_eq!(
+            f.call("GET", &upath, None, &[("authorization", &auth)])
+                .await
+                .body,
+            user.body
+        );
+        assert_eq!(
+            f.call("GET", &path, None, &[("authorization", &auth)])
+                .await
+                .body,
+            changed.body
+        );
+        assert_eq!(
+            f.call(
+                "GET",
+                "/api/v2/me",
+                None,
+                &[("authorization", &bearer(&token))]
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+    }
+}

@@ -600,3 +600,35 @@ fn every_grant_dimension_and_admin_credential_boundary_is_enforced() {
     assert_eq!(admin::preserve_admin(2, 1), Ok(()));
     assert_eq!(admin::preserve_admin(0, 0), Ok(()));
 }
+
+#[test]
+fn repeated_user_restrictions_never_overflow_or_drop_device_labels() {
+    let mut user = Access.initial_state().unwrap().user;
+    let mut device = Device::approved("d".into(), grant());
+    device.policy.blocked_labels = (0..200).map(|i| format!("old-{i}")).collect();
+    user.policy.blocked_labels = device.policy.blocked_labels.clone();
+    let unchanged = admin::constrain(&device, &user).unwrap();
+    assert_eq!(unchanged.policy.blocked_labels.len(), 200);
+    user.policy.blocked_labels = (0..200).map(|i| format!("new-{i}")).collect();
+    assert_eq!(
+        admin::constrain(&device, &user),
+        Err(AccessError::PolicyLimitExceeded)
+    );
+    user.policy.blocked_labels = ["new".into()].into();
+    assert_eq!(
+        admin::constrain(&device, &user),
+        Err(AccessError::PolicyLimitExceeded)
+    );
+    device.policy.blocked_labels.remove("old-0");
+    let full = admin::constrain(&device, &user).unwrap();
+    assert_eq!(full.policy.blocked_labels.len(), 200);
+    assert!(full.policy.blocked_labels.contains("new"));
+    user.policy.blocked_labels.clear();
+    let kept = admin::constrain(&full, &user).unwrap();
+    assert_eq!(kept.policy.blocked_labels, full.policy.blocked_labels);
+    user.policy.blocked_labels = ["another".into()].into();
+    assert_eq!(
+        admin::constrain(&kept, &user),
+        Err(AccessError::PolicyLimitExceeded)
+    );
+}
