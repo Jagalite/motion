@@ -3607,7 +3607,17 @@ pub(crate) async fn change_live(
                         Operation::Original,
                     )
                 }
-                Route::Prepared => byte_pin(&file, selection.audio, None, Operation::Prepared),
+                // A replan keeps the text subtitle the rendition carries
+                // (`processing::carries` decided it at planning).
+                Route::Prepared => {
+                    validate_subtitle(&file, selection.subtitle)?;
+                    byte_pin(
+                        &file,
+                        selection.audio,
+                        selection.subtitle,
+                        Operation::Prepared,
+                    )
+                }
                 Route::Remux | Route::AudioConvert => {
                     let operation = selection.route.operation();
                     validate_route(

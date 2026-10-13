@@ -464,7 +464,12 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Not covered:**
   - choosing the subtitle in a preparation UI (3F);
   - downloads of renditions with subtitles (5E).
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** two P2 findings, both fixed:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | P1 | A replan of a prepared delivery rebuilt its pin without the carried subtitle | Fixed: the prepared replan validates and keeps the selected text subtitle. The integration test replans the prepared delivery and requires the pending generation's `subtitles_url` |
+  | P2 | A worker from before this change would strip the subtitle yet publish the job, because the recipe digest was unchanged | Fixed: a kept subtitle is part of the preparation's digest (`recipe_digest(..., subtitle)`), recomputed at publication from the stored selection. An older worker computes the historical digest and cannot publish. Preparations without a subtitle keep their digest. Unit test |
 
 ### Remaining item 3 slices (not started)
 

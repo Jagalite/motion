@@ -57,24 +57,31 @@ pub(crate) fn recipe(id: &str) -> Option<Value> {
 
 // Fixed software recipes retain their historical digest. Parameterized recipes
 // bind all persisted encoder inputs, so recovery/publication cannot substitute
-// a different profile or backend under a previous preparation identity.
+// a different profile or backend under a previous preparation identity. A
+// kept text subtitle (`subtitle`) is such an input too: a worker that predates
+// it (and would strip it) computes another digest and cannot publish.
 fn recipe_digest(
     id: &str,
     backend: &str,
     profile: Option<&crate::encoding::VideoProfile>,
+    subtitle: bool,
 ) -> Option<String> {
     let descriptor = recipe(id)?;
     let base = descriptor["digest"].as_str()?;
-    if profile.is_none() && backend == "software" && id != "video_profile" {
+    if profile.is_none() && backend == "software" && id != "video_profile" && !subtitle {
         return Some(base.to_owned());
     }
     if (id == "video_profile") != profile.is_some() {
         return None;
     }
-    let inputs =
-        serde_json::to_vec(&json!({"semantics":base,"backend":backend,"video_profile":profile}))
-            .ok()?;
-    Some(format!("sha256:{}", super::sha256(&inputs)))
+    let mut inputs = json!({"semantics":base,"backend":backend,"video_profile":profile});
+    if subtitle {
+        inputs["subtitle"] = json!("selected-text-mov_text");
+    }
+    Some(format!(
+        "sha256:{}",
+        super::sha256(&serde_json::to_vec(&inputs).ok()?)
+    ))
 }
 fn software_backend() -> String {
     "software".into()
@@ -247,11 +254,20 @@ pub(crate) async fn publication_facts(
     conn: &mut sqlx::SqliteConnection,
     job: &crate::processing::ProcessingJob,
 ) -> anyhow::Result<Option<(String, playscale_core::processing::PreparationFacts)>> {
-    type Stored = (String, String, Option<String>, Option<String>, String);
-    let row:Option<Stored>=sqlx::query_as("SELECT p.timeline_id,p.recipe_digest,p.credential_hash,p.ingress_id,j.requester_id FROM preparations p JOIN processing_jobs j ON j.id=p.job_id WHERE p.job_id=?").bind(&job.id).fetch_optional(&mut *conn).await?;
-    let Some((timeline, digest, hash, ingress, owner)) = row else {
+    type Stored = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    );
+    let row:Option<Stored>=sqlx::query_as("SELECT p.timeline_id,p.recipe_digest,p.credential_hash,p.ingress_id,j.requester_id,p.tracks_json FROM preparations p JOIN processing_jobs j ON j.id=p.job_id WHERE p.job_id=?").bind(&job.id).fetch_optional(&mut *conn).await?;
+    let Some((timeline, digest, hash, ingress, owner, tracks)) = row else {
         return Ok(None);
     };
+    // The selection is part of the preparation's identity (`recipe_digest`).
+    let subtitle = serde_json::from_str::<Value>(&tracks)?["subtitle_track_id"].is_string();
     let principal = crate::metadata_jobs::principal(
         conn,
         &owner,
@@ -284,6 +300,7 @@ pub(crate) async fn publication_facts(
                 &job.recipe,
                 &job.backend,
                 job.video_profile.as_deref(),
+                subtitle,
             )
             .is_some_and(|current| current == digest),
         },
@@ -451,10 +468,11 @@ async fn prepare(
             .validate()
             .map_err(|reason| Problem::invalid("invalid_video_profile", reason))?;
     }
-    let digest = recipe_digest(
+    recipe_digest(
         &input.recipe_id,
         &input.backend,
         input.video_profile.as_ref(),
+        false,
     )
     .ok_or_else(|| Problem::invalid("invalid_video_profile", "Invalid recipe inputs"))?;
 
@@ -588,6 +606,13 @@ async fn prepare(
         input.tracks,
     )
     .await?;
+    let digest = recipe_digest(
+        &input.recipe_id,
+        &input.backend,
+        input.video_profile.as_ref(),
+        tracks_record.subtitle_track_id.is_some(),
+    )
+    .ok_or_else(|| Problem::invalid("invalid_video_profile", "Invalid recipe inputs"))?;
     let queued: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
     )
@@ -726,20 +751,26 @@ mod recipe_identity_tests {
             audio_bitrate: 96_000,
             frame_rate: None,
         };
-        let initial = recipe_digest("video_profile", "software", Some(&profile)).unwrap();
+        let initial = recipe_digest("video_profile", "software", Some(&profile), false).unwrap();
         assert_ne!(
             Some(initial.clone()),
-            recipe_digest("video_profile", "videotoolbox", Some(&profile))
+            recipe_digest("video_profile", "videotoolbox", Some(&profile), false)
         );
         profile.max_width = 640;
         assert_ne!(
             Some(initial),
-            recipe_digest("video_profile", "software", Some(&profile))
+            recipe_digest("video_profile", "software", Some(&profile), false)
         );
         assert_eq!(
-            recipe_digest("remux_mp4", "software", None).unwrap(),
+            recipe_digest("remux_mp4", "software", None, false).unwrap(),
             recipe("remux_mp4").unwrap()["digest"].as_str().unwrap()
         );
-        assert!(recipe_digest("video_profile", "software", None).is_none());
+        // A kept subtitle is part of the identity: a worker that would strip
+        // it computes the historical digest and cannot publish the job.
+        assert_ne!(
+            recipe_digest("remux_mp4", "software", None, true).unwrap(),
+            recipe_digest("remux_mp4", "software", None, false).unwrap()
+        );
+        assert!(recipe_digest("video_profile", "software", None, false).is_none());
     }
 }

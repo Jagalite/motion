@@ -4389,6 +4389,25 @@ async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
         vtt.contains("00:01.000 --> 00:03.000") && vtt.contains("Kept caption"),
         "{vtt}"
     );
+    // A replan of the prepared delivery for the same selection keeps it.
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let again = plan("a1", Some("s0")).await;
+    assert_eq!(again.body["operation"], "prepared", "{}", again.body);
+    let staged = f
+        .post(
+            &format!("/api/v2/playback/delivery-sessions/{id}/changes"),
+            &auth,
+            Some("prepared-subtitles-replan-1"),
+            json!({"kind":"replan", "expected_generation":"1",
+                "plan_token":again.body["plan_token"], "position_ms":1500}),
+        )
+        .await;
+    assert_eq!(staged.status, StatusCode::ACCEPTED, "{}", staged.body);
+    assert!(
+        staged.body["pending"]["subtitles_url"].is_string(),
+        "{}",
+        staged.body
+    );
 }
 
 /// One gray frame of `path` at `at` seconds (320x240 sources).
