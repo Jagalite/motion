@@ -1483,7 +1483,7 @@ pub async fn plan(
             && delivery::live_transcodable(
                 &bound.file,
                 audio,
-                Some(filters).filter(|_| !multipart),
+                (!multipart).then_some(filters),
             ),
         // The software live recipe scales to at most LIVE_MAX_HEIGHT lines and
         // targets quality (CRF), so it cannot promise any bitrate limit.
