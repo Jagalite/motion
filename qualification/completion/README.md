@@ -28,7 +28,7 @@ item below is the single completion agent unless stated otherwise.
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented and reviewed; 5E part 4 server side implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork, offline-metadata and offline-subtitles PRs | Merge by user; then 5F |
-| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented (review pending); 6C rest, 6D, 6E not started | markers, embedded-chapters and previews PRs | Re-review; merge by user |
+| 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B implemented, tested, reviewed; 6C part 1 implemented and reviewed; 6C rest, 6D, 6E not started | markers, embedded-chapters and previews PRs | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
 
@@ -1696,6 +1696,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
     video now encodes its second as brightness, and thumbnails 0, 1 and 2
     are checked to show seconds 0, 10 and 20. `v2_playback` 36 passed;
     clippy clean.
+
+  Round 3 at `12107f8` is clean: no actionable findings.
 
 ### Remaining item 6 work (not started)
 
