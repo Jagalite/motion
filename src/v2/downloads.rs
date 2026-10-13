@@ -1829,7 +1829,9 @@ pub async fn sync(
                     core::ReanchorRefusal::OtherServer => {
                         "A re-anchor continues only this server's own earlier history"
                     }
-                    core::ReanchorRefusal::UnknownHistory => "The earlier history was not issued by this server",
+                    core::ReanchorRefusal::UnknownHistory => {
+                        "The earlier history was not issued by this server"
+                    }
                     core::ReanchorRefusal::SameHistory => {
                         "The current history's sequence is never skipped"
                     }

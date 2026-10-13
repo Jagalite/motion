@@ -254,10 +254,11 @@ pub async fn replace_user(
     validate_grant(&mut tx, &next.grant, &next.policy).await?;
     if let Revised::Next(revision) = core::revise(previous.revision, expected, next != previous)? {
         next.revision = revision;
-        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM devices WHERE user_id=? AND revoked=0")
-            .bind(&id)
-            .fetch_all(&mut *tx)
-            .await?;
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM devices WHERE user_id=? AND revoked=0")
+                .bind(&id)
+                .fetch_all(&mut *tx)
+                .await?;
         let mut changes = vec![];
         for device_id in ids {
             let row = auth::load_device(&mut tx, &device_id)

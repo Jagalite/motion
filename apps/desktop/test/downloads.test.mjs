@@ -498,8 +498,8 @@ test('several offline libraries are listed with labels and only saved roots can 
   writeFileSync(join(base, 'current.json'), JSON.stringify({root: cabin.name}));
   const roots = offlineRoots(base);
   assert.deepEqual(roots.map(r => [r.label, r.titles, r.current]).sort(), [
-    ['motion.cabin · profile kids', 1, true],
-    ['motion.home · profile default', 2, false],
+    ['motion.cabin · profile kids · account device1 · device device1', 1, true],
+    ['motion.home · profile default · account device1 · device device1', 2, false],
   ]);
   assert.equal(currentRoot(base), cabin.path);
   assert.equal(currentRoot(base, home.name), home.path);
