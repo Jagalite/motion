@@ -673,3 +673,32 @@ test('a restore choice never interleaves with a download pass', async () => {
   await choosing;
   assert.ok(order.lastIndexOf('collect') < order.indexOf('restore'), order.join(','));
 });
+
+test('the device reports its own copy in its own order, never blocking a transfer', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+  const {cache} = fakeCache();
+  const reports = [];
+  let refuse = true;
+  const agent = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async (path, init = {}) => {
+      if (init.method === 'PUT' && path === '/api/v2/downloads/d1/transfer') {
+        reports.push(init.body);
+        // A failed report never stops the transfer.
+        if (refuse) { refuse = false; throw Object.assign(new Error('busy'), {status: 503}); }
+        return {};
+      }
+      return path.endsWith('/manifest') ? manifest('d1') : {url: '/api/v2/media/files/f1/content?ticket=t'};
+    },
+    fetchMedia: async () => response(200, media)});
+  const target = agent.root('default');
+  mkdirSync(join(target.path, 'staging'), {recursive: true});
+  assert.equal(await agent.transfer({id: 'd1', revision: '3'}, target), true);
+  assert.deepEqual(reports.map(r => [r.sequence, r.download_revision, r.state, r.bytes_received]),
+    [['1', '3', 'transferring', '0'], ['2', '3', 'verified_local', String(media.length)]]);
+  // The sequence persists across agents (restarts) and keeps increasing.
+  const again = createDownloadAgent({base, identity, cache, quota: 1000,
+    api: async (path, init = {}) => { if (init.method === 'PUT') reports.push(init.body); return path.endsWith('/manifest') ? manifest('d1') : {}; },
+    fetchMedia: async () => assert.fail('already saved')});
+  await again.transfer({id: 'd1', revision: '3'}, target).catch(() => {});
+  assert.ok(reports.slice(2).every(r => Number(r.sequence) > 2), JSON.stringify(reports));
+});

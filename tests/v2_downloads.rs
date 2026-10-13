@@ -1297,3 +1297,112 @@ async fn manifests_name_the_restored_base_only_for_a_captured_restore() {
         .unwrap();
     assert_eq!(manifest!()["restored_viewing_revision"], Value::Null);
 }
+
+/// The download's own device reports its copy; the server stores it as
+/// reported (never derived from its own state), in the device's order,
+/// about the current revision, and after the download ends only removal.
+#[tokio::test]
+async fn devices_report_their_own_copies_in_their_own_order() {
+    let f = Fixture::new().await;
+    let media: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    let (timeline, _, _) = f.scanned("film.mp4", &media).await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "transfer-download-01",
+            input(&device, &timeline),
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::ACCEPTED, "{:?}", created.body);
+    let id = created.body["id"].as_str().unwrap().to_owned();
+    // Ready on the server is not a verified local copy.
+    assert_eq!(created.body["state"], "ready");
+    assert_eq!(
+        f.get(&format!("/api/v2/downloads/{id}"), &auth).await.body["device_transfer"],
+        Value::Null
+    );
+    let path = format!("/api/v2/downloads/{id}/transfer");
+    let report = |sequence: u64, revision: &str, state: &str, bytes: u64| {
+        json!({"sequence": sequence.to_string(), "download_revision": revision,
+            "state": state, "bytes_received": bytes.to_string()})
+    };
+    let put = |body: Value, auth: String| {
+        let f = &f;
+        let path = path.clone();
+        async move {
+            f.call("PUT", &path, Some(body), &[("authorization", &auth)])
+                .await
+        }
+    };
+    let partial = put(report(1, "1", "transferring", 400), auth.clone()).await;
+    assert_eq!(partial.status, StatusCode::OK, "{:?}", partial.body);
+    assert_eq!(partial.body["device_transfer"]["state"], "transferring");
+    assert_eq!(partial.body["device_transfer"]["bytes_received"], "400");
+    // An exact retry; an earlier or reused sequence; another revision.
+    assert_eq!(
+        put(report(1, "1", "transferring", 400), auth.clone())
+            .await
+            .status,
+        StatusCode::OK
+    );
+    problem(
+        &put(report(1, "1", "transferring", 500), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "transfer_report_conflict",
+    );
+    let verified = put(report(3, "1", "verified_local", 1000), auth.clone()).await;
+    assert_eq!(verified.body["device_transfer"]["state"], "verified_local");
+    problem(
+        &put(report(2, "1", "transferring", 900), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "transfer_report_stale",
+    );
+    problem(
+        &put(report(4, "2", "removed", 0), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "download_changed",
+    );
+    // Never verified while incomplete, never beyond the size.
+    for bad in [
+        report(4, "1", "verified_local", 999),
+        report(4, "1", "transferring", 1001),
+    ] {
+        problem(
+            &put(bad, auth.clone()).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_transfer",
+        );
+    }
+    // Another device of the principal cannot report it.
+    let (_, other) = f.device(&["default"], &PERMISSIONS).await;
+    problem(
+        &put(report(5, "1", "removed", 0), other).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+    // The listing carries the report as stored.
+    let listed = f.get("/api/v2/downloads?limit=10", &auth).await;
+    assert_eq!(listed.body["items"][0]["device_transfer"]["sequence"], "3");
+    // After cancellation only the copy's removal is accepted.
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/v2/downloads/{id}"),
+            None,
+            &[("authorization", &auth)]
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    problem(
+        &put(report(5, "2", "transferring", 1), auth.clone()).await,
+        StatusCode::CONFLICT,
+        "download_ended",
+    );
+    let removed = put(report(5, "2", "removed", 0), auth.clone()).await;
+    assert_eq!(removed.body["device_transfer"]["state"], "removed");
+    assert_eq!(removed.body["state"], "cancelled");
+}

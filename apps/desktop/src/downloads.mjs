@@ -21,6 +21,8 @@ const MAX_MEDIA_BYTES = 64 * 1024 ** 3;
 // The offline host copies a title into a private snapshot on the cache's own
 // volume before playing it and keeps 512 MiB free besides (new_snapshot).
 const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
+/** Transfer progress is reported to the server at most this often. */
+const PROGRESS_INTERVAL_MS = 15_000;
 
 export const rootName = scope => createHash('sha256')
   .update([scope.server_id, scope.principal_id, scope.profile_id, scope.device_id].join('\n')).digest('hex').slice(0, 32);
@@ -178,6 +180,26 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     return items;
   }
 
+  /**
+   * Report this device's copy of a download to the server (best effort; a
+   * failed report is superseded by the next). Reports carry this device's
+   * own increasing sequence, persisted per download, and the download
+   * revision it listed; the server stores them as reported.
+   */
+  const reports = join(base, 'transfer-reports.json');
+  async function report(download, state, bytes) {
+    if (!download?.revision) return;
+    const sequences = readJson(reports, {});
+    const sequence = (Number(sequences[download.id]) || 0) + 1;
+    writeAtomically(reports, {...sequences, [download.id]: sequence});
+    try {
+      await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/transfer`, {method: 'PUT',
+        body: {sequence: String(sequence), download_revision: String(download.revision), state, bytes_received: String(bytes)}});
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+
   async function transfer(download, target) {
     const manifest = await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/manifest`);
     const [file] = manifest.files;
@@ -203,6 +225,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     // transfer or space: the cache tool re-verifies and publishes it.
     if (have === 0 && (await cache(target.path, target.scope, ['recover'], entry)).recovered) {
       writeAtomically(join(base, 'current.json'), {root: target.name});
+      await report(download, 'verified_local', size);
       return true;
     }
     if (have > size) { truncateSync(staged, 0); have = 0; }
@@ -223,6 +246,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return false;
     }
     if (have < size) {
+      await report(download, 'transferring', have);
       const ticket = await api('/api/v2/content-access', {method: 'POST', idempotent: true,
         body: {purpose: 'download', delivery_id: null, generation: null, file: null, download_id: download.id, ttl_seconds: 3600}});
       // An inactivity deadline (not a total one: large transfers are slow but
@@ -247,9 +271,16 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
           throw new Error(`The server refused the transfer (${response.status})`);
         }
         let written = have;
+        let reported = Date.now();
         const bounded = new Transform({transform(chunk, _encoding, done) {
           alive();
           written += chunk.length;
+          // Progress at most every 15 s; out-of-order arrivals are refused
+          // by sequence on the server, never applied backward.
+          if (Date.now() - reported >= PROGRESS_INTERVAL_MS && written <= size) {
+            reported = Date.now();
+            void report(download, 'transferring', written).catch(() => {});
+          }
           done(written > size ? new Error('The transfer is larger than its manifest') : null, chunk);
         }});
         await pipeline(Readable.fromWeb(response.body), bounded, createWriteStream(staged, {flags: have > 0 ? 'a' : 'w', mode: 0o600}), {signal: transferSignal});
@@ -266,6 +297,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     // Openable offline as soon as one verified copy exists, even if a later
     // transfer in this pass fails.
     writeAtomically(join(base, 'current.json'), {root: target.name});
+    await report(download, 'verified_local', size);
     return true;
   }
 
@@ -452,7 +484,12 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       // published copies and unpublished staged transfers alike.
       const present = new Set([...local.downloads.map(entry => entry.identity.download_id), ...before.staged]);
       for (const id of present) {
-        if (wanted.find(d => d.id === id)?.state !== 'ready') await cache(target.path, target.scope, ['remove', '--download-id', id]);
+        const listed = wanted.find(d => d.id === id);
+        if (listed?.state !== 'ready') {
+          await cache(target.path, target.scope, ['remove', '--download-id', id]);
+          // An ended download still listed learns that its copy is gone.
+          if (listed) await report(listed, 'removed', 0);
+        }
       }
       let failed = false;
       for (const download of wanted.filter(d => d.state === 'ready')) {
@@ -464,6 +501,8 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
           if (signal?.aborted) throw error;
           failed = true;
           status(`A download could not be saved yet: ${error.message}`);
+          const staged = join(target.path, 'staging', `${download.id}.part`);
+          await report(download, 'failed', Math.min(existsSync(staged) ? statSync(staged).size : 0, Number(download.size_bytes) || 0));
         }
       }
       // Every still-ready demand has now had its chance to recover a verified

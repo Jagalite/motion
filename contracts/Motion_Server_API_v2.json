@@ -10608,6 +10608,101 @@
         "x-required-permission": "downloads:manage"
       }
     },
+    "/api/v2/downloads/{download_id}/transfer": {
+      "parameters": [
+        {
+          "name": "download_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "reportDownloadTransfer",
+        "summary": "Report this device's copy of its download",
+        "description": "Only the download's own device reports what it holds (queued, transferring, verified_local, failed or removed, with the bytes it has). Reports carry the device's own increasing sequence and the download revision the device observed; an exact retry changes nothing, an earlier sequence is refused as transfer_report_stale and a reused one with other content as transfer_report_conflict, a report about another revision as download_changed, and after the download ended only removed is accepted (download_ended). verified_local requires every byte. The server stores the report as reported and never derives one from its own state.",
+        "tags": [
+          "offline"
+        ],
+        "x-owner": "A13",
+        "x-milestone": "M5",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "The download with this device's stored report.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Download"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "description": "Strong resource ETag where a resource revision is returned."
+              },
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "downloads:manage",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DownloadTransferInput"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v2/offline/sync": {
       "post": {
         "operationId": "syncOffline",
@@ -19026,6 +19121,17 @@
                 "type": "null"
               }
             ]
+          },
+          "device_transfer": {
+            "description": "What the download's own device last reported about its copy (reportDownloadTransfer), as reported; null when it reported nothing. The server's state above never implies it.",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DownloadTransfer"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -19038,6 +19144,70 @@
           "manifest_asset_id",
           "size_bytes",
           "job_id"
+        ]
+      },
+      "DownloadTransferState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "transferring",
+          "verified_local",
+          "failed",
+          "removed"
+        ]
+      },
+      "DownloadTransferInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sequence": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "download_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DownloadTransferState"
+          },
+          "bytes_received": {
+            "$ref": "#/components/schemas/UInt64"
+          }
+        },
+        "required": [
+          "sequence",
+          "download_revision",
+          "state",
+          "bytes_received"
+        ]
+      },
+      "DownloadTransfer": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sequence": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "download_revision": {
+            "$ref": "#/components/schemas/Revision"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DownloadTransferState"
+          },
+          "bytes_received": {
+            "$ref": "#/components/schemas/UInt64"
+          },
+          "reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the server received the report (the device's clock is not used)."
+          }
+        },
+        "required": [
+          "sequence",
+          "download_revision",
+          "state",
+          "bytes_received",
+          "reported_at"
         ]
       },
       "DownloadFile": {

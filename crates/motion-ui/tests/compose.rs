@@ -853,6 +853,11 @@ async fn downloads_are_requested_and_cancelled_through_public_operations() {
     assert_eq!(status, StatusCode::OK);
     assert_strict_markup(&page);
     assert!(page.contains(r#"data-command="DELETE /api/v2/downloads/download1""#));
+    // The device's own report, in its words (512 MiB of 1.5 GB).
+    assert!(
+        page.contains("On the device") && page.contains("Saving — 35%"),
+        "{page}"
+    );
     assert!(page.contains("Ready to save"));
     let (_, _, home) = get_page(&saver, "/").await;
     assert!(home.contains(r#"href="/downloads""#));

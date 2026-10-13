@@ -39,6 +39,10 @@ pub fn routes() -> Router<App> {
         .route("/downloads", post(create).get(list))
         .route("/downloads/{download_id}", get(read).delete(cancel))
         .route("/downloads/{download_id}/manifest", get(manifest))
+        .route(
+            "/downloads/{download_id}/transfer",
+            axum::routing::put(report_transfer),
+        )
         .route("/offline/sync", post(sync))
 }
 
@@ -203,6 +207,30 @@ fn state_name(state: core::State) -> &'static str {
     }
 }
 
+/// The device's last report about its copy, as stored.
+type Transfer = (i64, i64, String, i64, i64);
+
+async fn transfer(conn: &mut SqliteConnection, id: &str) -> Result<Option<Transfer>, Problem> {
+    Ok(sqlx::query_as(
+        "SELECT sequence,download_revision,state,bytes_received,reported_at FROM download_transfers WHERE download_id=?",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await?)
+}
+
+fn transfer_json(transfer: Option<&Transfer>) -> Value {
+    transfer.map_or(Value::Null, |(sequence, revision, state, bytes, at)| {
+        json!({
+            "sequence": sequence.to_string(),
+            "download_revision": revision.to_string(),
+            "state": state,
+            "bytes_received": bytes.to_string(),
+            "reported_at": super::timestamp(*at),
+        })
+    })
+}
+
 fn download_json(row: &Row, state: core::State) -> Value {
     json!({
         "id": row.id,
@@ -215,6 +243,8 @@ fn download_json(row: &Row, state: core::State) -> Value {
         "manifest_asset_id": null,
         "size_bytes": row.size_bytes.to_string(),
         "job_id": null,
+        // Filled from the device's reports (`current_json`); none yet.
+        "device_transfer": null,
     })
 }
 
@@ -224,10 +254,10 @@ async fn current_json(
     row: &Row,
 ) -> Result<Value, Problem> {
     let current = observe(conn, principal, row).await?;
-    Ok(download_json(
-        row,
-        core::state(row.stored(), &row.pin(), &current),
-    ))
+    let mut body = download_json(row, core::state(row.stored(), &row.pin(), &current));
+    // As the device reported it; never derived from the server's state.
+    body["device_transfer"] = transfer_json(transfer(conn, &row.id).await?.as_ref());
+    Ok(body)
 }
 
 fn tagged(status: StatusCode, body: Value, revision: i64) -> Response {
@@ -575,6 +605,115 @@ pub async fn cancel(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferInput {
+    sequence: String,
+    download_revision: String,
+    state: core::TransferState,
+    bytes_received: String,
+}
+
+/// The download's own device reports its local copy
+/// (`core::accept_transfer`): about the current revision, in the device's
+/// order, consistent with the size; after the download ended only the
+/// copy's removal. Returns the download with the stored report.
+pub async fn report_transfer(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    body: Body<TransferInput>,
+) -> Result<Response, Problem> {
+    caller.require(Permission::DownloadsManage)?;
+    let input = body.value;
+    let number = |v: &str, name: &str| {
+        viewing::decimal(v).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_transfer",
+                format!("{name} must be a decimal number"),
+            )
+        })
+    };
+    let incoming = core::TransferReport {
+        sequence: number(&input.sequence, "sequence")?,
+        download_revision: number(&input.download_revision, "download_revision")?,
+        state: input.state,
+        bytes_received: number(&input.bytes_received, "bytes_received")?,
+    };
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::DownloadsManage))
+        .await?;
+    // Only the download's own principal and device: everyone else is not found.
+    let row = owned(&mut tx, &principal, &id).await?;
+    let current = observe(&mut tx, &principal, &row).await?;
+    let ended = core::state(row.stored(), &row.pin(), &current) != core::State::Ready;
+    let previous = match transfer(&mut tx, &row.id).await? {
+        None => None,
+        Some((sequence, revision, state, bytes, _)) => Some(core::TransferReport {
+            sequence: sequence as u64,
+            download_revision: revision as u64,
+            state: serde_json::from_value(Value::String(state)).map_err(Problem::internal)?,
+            bytes_received: bytes as u64,
+        }),
+    };
+    let refused =
+        |code: &'static str, detail: &str| Problem::new(StatusCode::CONFLICT, code, detail);
+    match core::accept_transfer(
+        previous.as_ref(),
+        &incoming,
+        row.revision as u64,
+        row.size_bytes as u64,
+        ended,
+    ) {
+        Ok(core::TransferDecision::Record) => {
+            sqlx::query("INSERT INTO download_transfers(download_id,sequence,download_revision,state,bytes_received,reported_at) VALUES (?,?,?,?,?,?) ON CONFLICT(download_id) DO UPDATE SET sequence=excluded.sequence,download_revision=excluded.download_revision,state=excluded.state,bytes_received=excluded.bytes_received,reported_at=excluded.reported_at")
+                .bind(&row.id)
+                .bind(incoming.sequence as i64)
+                .bind(incoming.download_revision as i64)
+                .bind(serde_json::to_value(incoming.state).map_err(Problem::internal)?.as_str())
+                .bind(incoming.bytes_received as i64)
+                .bind(now())
+                .execute(&mut *tx)
+                .await?;
+        }
+        Ok(core::TransferDecision::Unchanged) => {}
+        Err(core::TransferRefusal::DownloadChanged) => {
+            return Err(refused(
+                "download_changed",
+                "The download changed; read it again",
+            ));
+        }
+        Err(core::TransferRefusal::Stale) => {
+            return Err(refused(
+                "transfer_report_stale",
+                "A later report was already received",
+            ));
+        }
+        Err(core::TransferRefusal::Conflict) => {
+            return Err(refused(
+                "transfer_report_conflict",
+                "That report sequence was used for another report",
+            ));
+        }
+        Err(core::TransferRefusal::Ended) => {
+            return Err(refused(
+                "download_ended",
+                "This download ended; only the copy's removal can be reported",
+            ));
+        }
+        Err(core::TransferRefusal::InvalidProgress) => {
+            return Err(Problem::invalid(
+                "invalid_transfer",
+                "The progress does not fit the download (bytes beyond its size, or verified while incomplete)",
+            ));
+        }
+    }
+    let body = current_json(&mut tx, &principal, &row).await?;
+    tx.commit().await?;
+    Ok(tagged(StatusCode::OK, body, row.revision))
+}
+
 fn media_url(file_id: &str, revision: &str) -> String {
     let mut url = url::Url::parse("http://motion.invalid/api/v2/media/files/").unwrap();
     url.path_segments_mut()
@@ -707,6 +846,7 @@ pub(crate) async fn delete_profile(
 ) -> Result<(), Problem> {
     for statement in [
         "UPDATE content_tickets SET revoked=1 WHERE download_id IN (SELECT id FROM downloads WHERE profile_id=?)",
+        "DELETE FROM download_transfers WHERE download_id IN (SELECT id FROM downloads WHERE profile_id=?)",
         "DELETE FROM downloads WHERE profile_id=?",
         "DELETE FROM offline_events WHERE profile_id=?",
         "DELETE FROM offline_sequences WHERE profile_id=?",

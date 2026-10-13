@@ -426,6 +426,94 @@ pub fn retain(
     })
 }
 
+/// What a device reports about its own copy of a download. Only the
+/// download's device knows it; the server stores the report as reported and
+/// never derives one (a ready download is not a verified local copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    Queued,
+    Transferring,
+    /// The device verified the complete file against the pinned digest.
+    VerifiedLocal,
+    Failed,
+    /// The device removed its copy.
+    Removed,
+}
+
+/// One device report, in the device's own order (`sequence`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TransferReport {
+    pub sequence: u64,
+    /// The download revision the device observed when it reported.
+    pub download_revision: u64,
+    pub state: TransferState,
+    pub bytes_received: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferDecision {
+    /// Store the report (it replaces the previous one).
+    Record,
+    /// An exact retry of the stored report.
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferRefusal {
+    /// The report describes another revision of the download.
+    DownloadChanged,
+    /// The device already reported something later.
+    Stale,
+    /// The same report sequence with other content.
+    Conflict,
+    /// More bytes than the download has, a verified copy that is not
+    /// complete, or a removed copy that still holds bytes.
+    InvalidProgress,
+    /// A cancelled or expired download only learns that its copy was removed.
+    Ended,
+}
+
+/// Admit a device's report about its own copy: about the download's current
+/// revision, consistent with its size, after anything it reported before (an
+/// exact retry changes nothing), and after a download ended only its removal.
+pub fn accept_transfer(
+    previous: Option<&TransferReport>,
+    incoming: &TransferReport,
+    download_revision: u64,
+    size_bytes: u64,
+    ended: bool,
+) -> Result<TransferDecision, TransferRefusal> {
+    if incoming.download_revision != download_revision {
+        return Err(TransferRefusal::DownloadChanged);
+    }
+    let progress_valid = incoming.bytes_received <= size_bytes
+        && match incoming.state {
+            TransferState::VerifiedLocal => incoming.bytes_received == size_bytes,
+            TransferState::Removed => incoming.bytes_received == 0,
+            _ => true,
+        };
+    if incoming.sequence == 0 || !progress_valid {
+        return Err(TransferRefusal::InvalidProgress);
+    }
+    if let Some(previous) = previous {
+        if incoming.sequence == previous.sequence {
+            return if incoming == previous {
+                Ok(TransferDecision::Unchanged)
+            } else {
+                Err(TransferRefusal::Conflict)
+            };
+        }
+        if incoming.sequence < previous.sequence {
+            return Err(TransferRefusal::Stale);
+        }
+    }
+    if ended && incoming.state != TransferState::Removed {
+        return Err(TransferRefusal::Ended);
+    }
+    Ok(TransferDecision::Record)
+}
+
 /// Why a re-anchor was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReanchorRefusal {
@@ -943,6 +1031,90 @@ mod tests {
         assert_eq!(
             reanchor(current, "server:r1", 1 << 53, 3, retention),
             Err(ReanchorRefusal::Invalid)
+        );
+    }
+
+    #[test]
+    fn transfer_reports_are_the_devices_own_in_its_order() {
+        let report = |sequence, state, bytes_received| TransferReport {
+            sequence,
+            download_revision: 1,
+            state,
+            bytes_received,
+        };
+        let partial = report(2, TransferState::Transferring, 40);
+        assert_eq!(
+            accept_transfer(None, &partial, 1, 100, false),
+            Ok(TransferDecision::Record)
+        );
+        // A retry is unchanged; reordering never moves a report backward.
+        assert_eq!(
+            accept_transfer(Some(&partial), &partial, 1, 100, false),
+            Ok(TransferDecision::Unchanged)
+        );
+        assert_eq!(
+            accept_transfer(
+                Some(&partial),
+                &report(1, TransferState::Queued, 0),
+                1,
+                100,
+                false
+            ),
+            Err(TransferRefusal::Stale)
+        );
+        assert_eq!(
+            accept_transfer(
+                Some(&partial),
+                &report(2, TransferState::Transferring, 50),
+                1,
+                100,
+                false
+            ),
+            Err(TransferRefusal::Conflict)
+        );
+        let verified = report(3, TransferState::VerifiedLocal, 100);
+        assert_eq!(
+            accept_transfer(Some(&partial), &verified, 1, 100, false),
+            Ok(TransferDecision::Record)
+        );
+        // Never claimed without the whole file, never beyond it.
+        for bad in [
+            report(3, TransferState::VerifiedLocal, 99),
+            report(3, TransferState::Transferring, 101),
+            report(3, TransferState::Removed, 1),
+            report(0, TransferState::Queued, 0),
+        ] {
+            assert_eq!(
+                accept_transfer(Some(&partial), &bad, 1, 100, false),
+                Err(TransferRefusal::InvalidProgress),
+                "{bad:?}"
+            );
+        }
+        // About another revision of the download.
+        assert_eq!(
+            accept_transfer(Some(&partial), &verified, 2, 100, false),
+            Err(TransferRefusal::DownloadChanged)
+        );
+        // After the download ended, only the removal of the copy.
+        assert_eq!(
+            accept_transfer(
+                Some(&verified),
+                &report(4, TransferState::Transferring, 1),
+                1,
+                100,
+                true
+            ),
+            Err(TransferRefusal::Ended)
+        );
+        assert_eq!(
+            accept_transfer(
+                Some(&verified),
+                &report(4, TransferState::Removed, 0),
+                1,
+                100,
+                true
+            ),
+            Ok(TransferDecision::Record)
         );
     }
 

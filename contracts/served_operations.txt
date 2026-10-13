@@ -146,6 +146,7 @@ replaceQueue
 replaceSavedFilter
 replaceSchedule
 replaceViewingDelivery
+reportDownloadTransfer
 retryJob
 revokeContentAccess
 revokeDevice

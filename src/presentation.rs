@@ -966,6 +966,14 @@ impl UiQueryFacade for Queries {
                     title,
                     state: text(&v, "state"),
                     size_bytes: text(&v, "size_bytes").parse().unwrap_or(0),
+                    device_transfer: v["device_transfer"].is_object().then(|| {
+                        (
+                            text(&v["device_transfer"], "state"),
+                            text(&v["device_transfer"], "bytes_received")
+                                .parse()
+                                .unwrap_or(0),
+                        )
+                    }),
                 });
             }
             Ok(rows)

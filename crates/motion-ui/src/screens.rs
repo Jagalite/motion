@@ -653,6 +653,25 @@ fn size_text(bytes: u64) -> String {
 
 /// This device's download demands. The desktop host transfers ready ones and
 /// removes local copies of cancelled or expired ones when it next connects.
+/// What the device reported about its copy, in its words: the server never
+/// infers it from its own state.
+fn device_transfer_text(report: Option<&(String, u64)>, size: u64) -> String {
+    let Some((state, bytes)) = report else {
+        return "Not reported yet".into();
+    };
+    let percent = (*bytes as f64 * 100.0 / size.max(1) as f64)
+        .floor()
+        .min(100.0);
+    match state.as_str() {
+        "queued" => "Waiting to save".into(),
+        "transferring" => format!("Saving — {percent:.0}%"),
+        "verified_local" => "Saved and verified".into(),
+        "failed" => format!("Saving stopped at {percent:.0}%; it retries"),
+        "removed" => "Removed from the device".into(),
+        _ => "Unknown".into(),
+    }
+}
+
 #[page("/downloads")]
 pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
@@ -665,7 +684,7 @@ pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
         } else {
             <div class="table-scroll" role="region" aria-label="Downloads" tabindex="0"><table>
                 <caption class="visually-hidden">"Downloads"</caption>
-                <thead><tr><th scope="col">"Title"</th><th scope="col">"State"</th><th scope="col">"Size"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
+                <thead><tr><th scope="col">"Title"</th><th scope="col">"State"</th><th scope="col">"On the device"</th><th scope="col">"Size"</th><th scope="col"><span class="visually-hidden">"Actions"</span></th></tr></thead>
                 <tbody>
                     for row in rows {
                         <tr>
@@ -676,6 +695,7 @@ pub(crate) async fn downloads(cx: &Cx) -> Result<impl View> {
                                 "cancelled" => "Cancelled",
                                 _ => "Unknown",
                             })</td>
+                            <td>(device_transfer_text(row.device_transfer.as_ref(), row.size_bytes))</td>
                             <td>(size_text(row.size_bytes))</td>
                             <td>
                                 if row.state != "cancelled" {

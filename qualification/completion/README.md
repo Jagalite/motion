@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D–5F not started | offline-roots, offline-removal, restore-recovery and restore-choice PRs | Merge by user; then 5D |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented (review pending); 5E and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice and transfer-state PRs | Merge by user; then 5E |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -915,11 +915,78 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `27e2c8b`: clean.
 
+### 5D. Device-reported transfer state
+
+- **Source SHA:** branch `plan-completion/transfer-state`, stacked on 5C
+  part 2 (`plan-completion/restore-choice`).
+- **Implemented:** the server shows what each download's own device
+  reports about its copy. It never derives that from its own state.
+  - **Server:** `Download.state` stays the server's lifecycle (ready,
+    cancelled, expired). A new optional `Download.device_transfer` carries
+    the device's last report as stored: queued, transferring,
+    verified_local, failed or removed, with bytes, the device's sequence,
+    the download revision it observed, and the server's receive time.
+  - **Operation:** `reportDownloadTransfer` (`PUT
+    /downloads/{id}/transfer`) accepts reports only from the download's own
+    principal and device; anyone else gets 404.
+  - **Desktop agent:** reports best effort; a failed report never blocks a
+    transfer. It sends:
+    - `transferring` at start and at most every 15 s;
+    - `verified_local` after publication or recovery;
+    - `failed` when a transfer fails;
+    - `removed` when it removes the copy of an ended download that is
+      still listed.
+
+    Its sequence is persisted per download, so it keeps increasing across
+    restarts.
+  - **Downloads page:** a new "On the device" column ("Saving — 35%",
+    "Saved and verified", ...), separate from the server's state.
+- **Correctness rule:** core `downloads::accept_transfer` admits a report:
+  - only about the download's current revision (`download_changed`);
+  - consistent with its size: `verified_local` only with every byte,
+    never beyond the size, `removed` with none (`invalid_transfer`);
+  - in the device's order: an exact retry changes nothing; an earlier
+    sequence is `transfer_report_stale`, and a reused one with other
+    content is `transfer_report_conflict`;
+  - after the download ended, only `removed` (`download_ended`).
+- **Core/adapter boundary:**
+  - **Core:** the whole admission rule, with the previous report, the
+    revision, the size and whether the download ended as explicit inputs.
+  - **Adapter:** stores the report as reported (migration
+    `0048_download_transfers`, one row per download, deleted with the
+    profile) in the request's write transaction.
+- **Stateless:** new `transfer_reports_model` against
+  `accept_transfer`:
+  - three reports (partial, verified, removed) delivered in any order and
+    repeatedly, one cancellation, and a revision refresh;
+  - properties: only what the device sent is stored; verified only when
+    complete; never backward; only about the current revision; required
+    outcomes;
+  - result: 682 states and 5,456 transitions, exhausted;
+  - a mutation test catches a server accepting reports out of order.
+- **Evidence:**
+  - Core lib: 156 passed (`accept_transfer`).
+  - `v2_downloads`: 8 passed. New:
+    `devices_report_their_own_copies_in_their_own_order` covers:
+    - no report until the device makes one;
+    - retry, conflict, stale, changed revision and invalid progress;
+    - another device of the principal refused;
+    - the listing carries the report;
+    - after cancellation, only removed.
+  - compose: 22 passed ("On the device" column and wording).
+  - JS: 94 passed. New: transferring then verified with increasing
+    sequences and the listed revision; a failed report does not block;
+    the sequence persists across agents.
+  - Contract: 5 passed (`reportDownloadTransfer` served).
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:** queued reports (the agent has no queue yet), and the
+  packaged Electron run (5F).
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5D transfer state | Contract operation for device-reported progress, owned by the device; never inferred by the server | Contract review |
 | 5E prepared and track-selected downloads | Manifest files for renditions, subtitles and artwork with pins | Item 3D (preparation by component) |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 

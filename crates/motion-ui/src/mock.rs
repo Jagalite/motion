@@ -466,6 +466,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                 id: "download1".into(),
                 title: "Arrival".into(),
                 state: "ready".into(),
+                device_transfer: Some(("transferring".into(), 512 * 1024 * 1024)),
                 size_bytes: 1_500_000_000,
             }])
         })

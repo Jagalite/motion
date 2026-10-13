@@ -547,6 +547,9 @@ pub struct DownloadRow {
     /// ready | cancelled | expired
     pub state: String,
     pub size_bytes: u64,
+    /// What the device last reported about its copy (state, bytes), as it
+    /// reported it; None when it reported nothing.
+    pub device_transfer: Option<(String, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
