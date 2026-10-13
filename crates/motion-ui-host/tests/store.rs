@@ -868,6 +868,13 @@ fn a_corrupt_poster_does_not_block_recovering_its_media() {
     assert!(!store.recover(with_poster.clone()).unwrap());
     assert!(!staged.exists());
     assert!(store.manifest().downloads.is_empty());
+    // Corrupt staging must not mask an already verified shared blob.
+    std::fs::write(&staged, b"corrupt again").unwrap();
+    std::fs::write(root.join("blobs").join(&poster_sha), poster).unwrap();
+    assert!(store.recover(with_poster).unwrap());
+    assert!(store.manifest().downloads[0].artwork.is_some());
+    store.remove("d1").unwrap();
+    std::fs::write(root.join("blobs").join(entry("d1", media).sha256), media).unwrap();
     // The media alone is still recovered.
     assert!(store.recover(entry("d1", media)).unwrap());
     assert_eq!(store.manifest().downloads, vec![entry("d1", media)]);
@@ -947,4 +954,30 @@ fn a_staged_poster_alone_is_a_staged_download() {
     assert_eq!(store.staged().unwrap(), ["d1", "d2"]);
     assert!(!store.remove("d1").unwrap(), "nothing published");
     assert_eq!(store.staged().unwrap(), ["d2"]);
+}
+
+#[test]
+fn an_existing_compacted_log_learns_its_confirmed_epoch_before_a_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    stage(&root, "d1", b"media");
+    store.publish(entry("d1", b"media")).unwrap();
+    std::fs::write(
+        root.join("events.json"),
+        serde_json::to_vec(&EventLog {
+            base_sequence: 7,
+            base_viewing_epoch: None,
+            events: vec![],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .rebase("d1", "0", "0", "server:restore", None)
+        .unwrap();
+    assert_eq!(
+        store.events().unwrap().base_viewing_epoch.as_deref(),
+        Some("server:restore")
+    );
 }

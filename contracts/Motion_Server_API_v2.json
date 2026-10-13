@@ -23744,6 +23744,10 @@
           "download_id": {
             "$ref": "#/components/schemas/Id"
           },
+          "download_revision": {
+            "$ref": "#/components/schemas/Revision",
+            "description": "Current download revision after required artifacts are prepared; use for transfer reports."
+          },
           "timeline_id": {
             "$ref": "#/components/schemas/Id"
           },

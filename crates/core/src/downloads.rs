@@ -318,6 +318,19 @@ pub fn cancel(stored: Stored) -> (Stored, bool) {
     (Stored::Cancelled, stored != Stored::Cancelled)
 }
 
+/// Required artifacts contribute to the transfer proof. Missing or failed
+/// subtitle preparation cannot be reported as a verified local copy.
+pub fn transfer_bytes(
+    media: u64,
+    requires_subtitle: bool,
+    subtitle_bytes: Option<u64>,
+) -> Option<u64> {
+    if !requires_subtitle {
+        return Some(media);
+    }
+    media.checked_add(subtitle_bytes.filter(|n| *n > 0)?)
+}
+
 /// Byte grants and manifests are issued only for a current, ready demand.
 pub fn transferable(state: State) -> bool {
     state == State::Ready
@@ -569,6 +582,16 @@ pub fn accept_transfer(
     Ok(TransferDecision::Record)
 }
 
+/// The compacted prefix and retained batch must describe one contiguous log.
+pub fn reanchor_batch(
+    through: u64,
+    acknowledged: Option<u64>,
+    first_sequence: Option<u64>,
+) -> bool {
+    acknowledged == Some(through)
+        && first_sequence.is_none_or(|first| through.checked_add(1) == Some(first))
+}
+
 /// Why a re-anchor was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReanchorRefusal {
@@ -774,6 +797,15 @@ mod tests {
             prepared: None,
             text_subtitles: vec![],
         }
+    }
+
+    #[test]
+    fn required_subtitles_are_part_of_the_transfer_proof() {
+        assert_eq!(transfer_bytes(100, false, None), Some(100));
+        assert_eq!(transfer_bytes(100, true, None), None);
+        assert_eq!(transfer_bytes(100, true, Some(0)), None);
+        assert_eq!(transfer_bytes(100, true, Some(20)), Some(120));
+        assert_eq!(transfer_bytes(u64::MAX, true, Some(1)), None);
     }
 
     #[test]

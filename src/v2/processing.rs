@@ -209,7 +209,7 @@ async fn capabilities(State(app): State<App>, caller: Caller) -> Result<Json<Val
 fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(d)
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tracks {
     #[serde(deserialize_with = "nullable")]

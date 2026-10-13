@@ -1261,5 +1261,6 @@ pub async fn delete_profile(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    tokio::spawn(super::downloads::release_subtitles(app.clone()));
     Ok(StatusCode::NO_CONTENT.into_response())
 }

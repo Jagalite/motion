@@ -287,6 +287,19 @@ async fn current_json(
 ) -> Result<Value, Problem> {
     let current = observe(conn, principal, row).await?;
     let mut body = download_json(row, core::state(row.stored(), &row.pin(), &current));
+    let subtitle_size: Option<i64> = sqlx::query_scalar(
+        "SELECT size_bytes FROM download_subtitle_artifacts WHERE download_id=? AND state='ready'",
+    )
+    .bind(&row.id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(total) = core::transfer_bytes(
+        row.size_bytes as u64,
+        row.subtitle_track_id.is_some(),
+        subtitle_size.map(|n| n as u64),
+    ) {
+        body["size_bytes"] = json!(total.to_string());
+    }
     // As the device reported it; never derived from the server's state.
     body["device_transfer"] = transfer_json(transfer(conn, &row.id).await?.as_ref());
     Ok(body)
@@ -381,17 +394,39 @@ async fn text_subtitles(conn: &mut SqliteConnection, file: &str) -> Result<Vec<S
         .collect())
 }
 
+// Retain one example of each refusal, or the first eligible candidate.
+// This preserves the core's refusal precedence without retaining every row.
+fn retain_candidate(found: &mut Vec<Candidate>, candidate: Candidate, request: &Request) -> bool {
+    let decision = core::choose(request, std::slice::from_ref(&candidate), 0);
+    if decision.is_ok() {
+        found.clear();
+        found.push(candidate);
+        return true;
+    }
+    if !found
+        .iter()
+        .any(|c| core::choose(request, std::slice::from_ref(c), 0).err() == decision.clone().err())
+    {
+        found.push(candidate);
+    }
+    false
+}
+
 async fn candidates(
     conn: &mut SqliteConnection,
     principal: &Principal,
     timeline: &str,
     version: Option<&str>,
     timeline_duration: Option<i64>,
+    request: &Request,
 ) -> Result<Vec<Candidate>, Problem> {
     // A requested version is filtered before the bound. Without one, whole
     // single-part available originals come first, so unsupported or
     // unavailable versions cannot crowd an eligible one out of the window.
-    let rows: Vec<CandidateRow> = sqlx::query_as(
+    let mut found = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let rows: Vec<CandidateRow> = sqlx::query_as(
         "SELECT v.id,f.id,f.revision,b.file_revision,v.origin,f.generated,\
          (SELECT count(*) FROM version_files o WHERE o.version_id=v.id),\
          (b.start_ms IS NOT NULL OR b.end_ms IS NOT NULL),\
@@ -400,57 +435,66 @@ async fn candidates(
          FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
          JOIN media_files f ON f.id=b.file_id WHERE v.timeline_id=? AND (? IS NULL OR v.id=?) \
          ORDER BY (v.origin='original' AND f.generated=0 AND f.available=1 AND b.start_ms IS NULL AND b.end_ms IS NULL \
-         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1)) DESC,v.id,f.id LIMIT 500",
+         AND NOT EXISTS(SELECT 1 FROM version_files o WHERE o.version_id=v.id AND o.part<>1)) DESC,v.id,f.id LIMIT 200 OFFSET ?",
     )
     .bind(timeline)
     .bind(version)
     .bind(version)
+    .bind(offset)
     .fetch_all(&mut *conn)
     .await?;
-    let mut found = Vec::with_capacity(rows.len());
-    for (
-        version,
-        file,
-        revision,
-        bound,
-        origin,
-        generated,
-        parts,
-        interval,
-        available,
-        path,
-        bytes,
-        seconds,
-    ) in rows
-    {
-        let facts = file_facts(conn, &file).await?;
-        let subtitles = text_subtitles(conn, &file).await?;
-        let duration_ms = timeline_duration
-            .filter(|d| *d > 0)
-            .map(|d| d as u64)
-            .or_else(|| {
-                seconds
-                    .filter(|s| s.is_finite() && *s > 0.0)
-                    .map(|s| (s * 1000.0).round() as u64)
-            });
-        found.push(Candidate {
-            version_id: version,
-            file_id: file,
-            // The device verifies the SHA-256 content revision; any other
-            // revision form cannot be attested.
-            bound_current: bound == revision && is_sha256(&revision),
-            file_revision: revision,
-            original: origin == "original" && !generated,
-            parts: u32::try_from(parts).unwrap_or(u32::MAX),
+        let count = rows.len();
+        for (
+            version,
+            file,
+            revision,
+            bound,
+            origin,
+            generated,
+            parts,
             interval,
             available,
-            readable: access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
-            content_type: content_type(&path),
-            size_bytes: u64::try_from(bytes).unwrap_or(0),
-            duration_ms,
-            prepared: None,
-            text_subtitles: subtitles,
-        });
+            path,
+            bytes,
+            seconds,
+        ) in rows
+        {
+            let facts = file_facts(conn, &file).await?;
+            let subtitles = text_subtitles(conn, &file).await?;
+            let duration_ms = timeline_duration
+                .filter(|d| *d > 0)
+                .map(|d| d as u64)
+                .or_else(|| {
+                    seconds
+                        .filter(|s| s.is_finite() && *s > 0.0)
+                        .map(|s| (s * 1000.0).round() as u64)
+                });
+            let candidate = Candidate {
+                version_id: version,
+                file_id: file,
+                // The device verifies the SHA-256 content revision; any other
+                // revision form cannot be attested.
+                bound_current: bound == revision && is_sha256(&revision),
+                file_revision: revision,
+                original: origin == "original" && !generated,
+                parts: u32::try_from(parts).unwrap_or(u32::MAX),
+                interval,
+                available,
+                readable: access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
+                content_type: content_type(&path),
+                size_bytes: u64::try_from(bytes).unwrap_or(0),
+                duration_ms,
+                prepared: None,
+                text_subtitles: subtitles,
+            };
+            if retain_candidate(&mut found, candidate, request) {
+                return Ok(found);
+            }
+        }
+        if count < 200 {
+            break;
+        }
+        offset += count as i64;
     }
     Ok(found)
 }
@@ -470,6 +514,7 @@ async fn prepared_candidates(
     recipe: &str,
     timeline_duration: Option<i64>,
     tracks: &TrackInput,
+    request: &Request,
 ) -> Result<Vec<Candidate>, Problem> {
     type Row = (
         String,
@@ -489,9 +534,13 @@ async fn prepared_candidates(
     );
     // Only the requested recipe, newest first, read page by page until a
     // rendition carrying the selection is found or every one was examined.
-    let mut rows: Vec<Row> = Vec::new();
-    for page in 0..PREPARED_PAGES {
-        let batch: Vec<Row> = sqlx::query_as(
+    let mut found = Vec::new();
+    let mut page = 0i64;
+    loop {
+        // Cache only this bounded page, never every historical source revision.
+        let mut selections: HashMap<(String, String), Option<super::processing::Tracks>> =
+            HashMap::new();
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT v.id,f.id,f.revision,b.file_revision,(f.available=1 AND f.library_id IN (SELECT id FROM libraries WHERE enabled=1)),\
              r.file_revision,s.id,s.revision,r.source_revision,j.recipe,p.tracks_json,f.relative_path,f.bytes,f.duration_seconds \
              FROM media_versions v JOIN version_files b ON b.version_id=v.id AND b.part=1 \
@@ -511,131 +560,141 @@ async fn prepared_candidates(
         .bind(page * PREPARED_PAGE)
         .fetch_all(&mut *conn)
         .await?;
-        let complete = (batch.len() as i64) < PREPARED_PAGE;
-        rows.extend(batch);
+        let complete = (rows.len() as i64) < PREPARED_PAGE;
+        for (
+            version,
+            file,
+            revision,
+            bound,
+            available,
+            registered,
+            source,
+            source_revision,
+            registered_source,
+            recipe,
+            recorded,
+            path,
+            bytes,
+            seconds,
+        ) in rows
+        {
+            // Ready by the same facts listRenditions reports
+            // (`processing::rendition_status`), and its bytes as registered.
+            let current = playscale_core::renditions::available(
+                available,
+                &revision,
+                &registered,
+                &source_revision,
+                &registered_source,
+            ) && super::processing::output_rendition_status(conn, &file).await?
+                == Some("ready");
+            // The selection on the source revision the rendition was prepared
+            // from; a selection it cannot express there is carried by nothing.
+            let streams: Vec<crate::db::Track> =
+                sqlx::query_scalar::<_, String>("SELECT tracks_json FROM media_files WHERE id=?")
+                    .bind(&source)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map(|json| serde_json::from_str(&json).unwrap_or_default())?;
+            let requested = super::processing::Tracks {
+                audio_component_id: tracks.audio_component_id.clone(),
+                subtitle_component_id: tracks.subtitle_component_id.clone(),
+                subtitle_policy: match tracks.subtitle_policy {
+                    SubtitlePolicy::Off => "off",
+                    SubtitlePolicy::Auto => "auto",
+                    SubtitlePolicy::Require => "require",
+                }
+                .into(),
+                audio_track_id: tracks.audio_track_id.clone(),
+                subtitle_track_id: tracks.subtitle_track_id.clone(),
+            };
+            let selection_key = (source.clone(), source_revision.clone());
+            let resolved = if let Some(cached) = selections.get(&selection_key) {
+                cached.clone()
+            } else {
+                let resolved = super::processing::selection(
+                    app,
+                    conn,
+                    timeline,
+                    &super::processing::FileRef {
+                        file_id: source.clone(),
+                        file_revision: source_revision.clone(),
+                    },
+                    &streams,
+                    requested,
+                )
+                .await
+                .ok();
+                selections.insert(selection_key, resolved.clone());
+                resolved
+            };
+            let carries = match resolved {
+                Some(selection) => {
+                    let ordinal = |id: Option<&String>, prefix: char| {
+                        id.and_then(|i| i.strip_prefix(prefix)?.parse::<u32>().ok())
+                    };
+                    let record: Option<super::processing::Tracks> =
+                        serde_json::from_str(&recorded).ok();
+                    let default_audio = streams.iter().any(|t| t.kind == "audio").then_some(0);
+                    let audio = ordinal(selection.audio_track_id.as_ref(), 'a').or(default_audio);
+                    let wanted = playscale_core::processing::Wanted {
+                        audio,
+                        audio_chosen: selection.audio_track_id.is_some(),
+                        default_audio,
+                        subtitle: match ordinal(selection.subtitle_track_id.as_ref(), 's') {
+                            Some(n) => playscale_core::processing::WantedSubtitle::Text(n),
+                            None => playscale_core::processing::WantedSubtitle::None,
+                        },
+                    };
+                    let carried = match record {
+                        Some(r) => playscale_core::processing::Carried::Encoded(
+                            playscale_core::processing::Encoded {
+                                audio: ordinal(r.audio_track_id.as_ref(), 'a'),
+                                subtitle: ordinal(r.subtitle_track_id.as_ref(), 's'),
+                            },
+                        ),
+                        None => playscale_core::processing::Carried::Unreadable,
+                    };
+                    playscale_core::processing::carries(carried, wanted)
+                }
+                None => false,
+            };
+            let facts = file_facts(conn, &file).await?;
+            let subtitles = text_subtitles(conn, &file).await?;
+            let candidate = Candidate {
+                version_id: version,
+                file_id: file,
+                bound_current: current && bound == revision && is_sha256(&revision),
+                file_revision: revision,
+                original: false,
+                parts: 1,
+                interval: false,
+                available,
+                readable: access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
+                content_type: content_type(&path),
+                size_bytes: u64::try_from(bytes).unwrap_or(0),
+                duration_ms: timeline_duration
+                    .filter(|d| *d > 0)
+                    .map(|d| d as u64)
+                    .or_else(|| {
+                        seconds
+                            .filter(|s| s.is_finite() && *s > 0.0)
+                            .map(|s| (s * 1000.0).round() as u64)
+                    }),
+                prepared: Some(playscale_core::downloads::Prepared {
+                    recipe_id: recipe,
+                    carries_selection: carries,
+                }),
+                text_subtitles: subtitles,
+            };
+            if retain_candidate(&mut found, candidate, request) {
+                return Ok(found);
+            }
+        }
         if complete {
             break;
         }
-    }
-    let mut found = Vec::with_capacity(rows.len());
-    for (
-        version,
-        file,
-        revision,
-        bound,
-        available,
-        registered,
-        source,
-        source_revision,
-        registered_source,
-        recipe,
-        recorded,
-        path,
-        bytes,
-        seconds,
-    ) in rows
-    {
-        // Ready by the same facts listRenditions reports
-        // (`processing::rendition_status`), and its bytes as registered.
-        let current = playscale_core::renditions::available(
-            available,
-            &revision,
-            &registered,
-            &source_revision,
-            &registered_source,
-        ) && super::processing::output_rendition_status(conn, &file).await?
-            == Some("ready");
-        // The selection on the source revision the rendition was prepared
-        // from; a selection it cannot express there is carried by nothing.
-        let streams: Vec<crate::db::Track> =
-            sqlx::query_scalar::<_, String>("SELECT tracks_json FROM media_files WHERE id=?")
-                .bind(&source)
-                .fetch_one(&mut *conn)
-                .await
-                .map(|json| serde_json::from_str(&json).unwrap_or_default())?;
-        let requested = super::processing::Tracks {
-            audio_component_id: tracks.audio_component_id.clone(),
-            subtitle_component_id: tracks.subtitle_component_id.clone(),
-            subtitle_policy: match tracks.subtitle_policy {
-                SubtitlePolicy::Off => "off",
-                SubtitlePolicy::Auto => "auto",
-                SubtitlePolicy::Require => "require",
-            }
-            .into(),
-            audio_track_id: tracks.audio_track_id.clone(),
-            subtitle_track_id: tracks.subtitle_track_id.clone(),
-        };
-        let resolved = super::processing::selection(
-            app,
-            conn,
-            timeline,
-            &super::processing::FileRef {
-                file_id: source.clone(),
-                file_revision: source_revision.clone(),
-            },
-            &streams,
-            requested,
-        )
-        .await;
-        let carries = match resolved {
-            Ok(selection) => {
-                let ordinal = |id: Option<&String>, prefix: char| {
-                    id.and_then(|i| i.strip_prefix(prefix)?.parse::<u32>().ok())
-                };
-                let record: Option<super::processing::Tracks> =
-                    serde_json::from_str(&recorded).ok();
-                let default_audio = streams.iter().any(|t| t.kind == "audio").then_some(0);
-                let audio = ordinal(selection.audio_track_id.as_ref(), 'a').or(default_audio);
-                let wanted = playscale_core::processing::Wanted {
-                    audio,
-                    audio_chosen: selection.audio_track_id.is_some(),
-                    default_audio,
-                    subtitle: match ordinal(selection.subtitle_track_id.as_ref(), 's') {
-                        Some(n) => playscale_core::processing::WantedSubtitle::Text(n),
-                        None => playscale_core::processing::WantedSubtitle::None,
-                    },
-                };
-                let carried = match record {
-                    Some(r) => playscale_core::processing::Carried::Encoded(
-                        playscale_core::processing::Encoded {
-                            audio: ordinal(r.audio_track_id.as_ref(), 'a'),
-                            subtitle: ordinal(r.subtitle_track_id.as_ref(), 's'),
-                        },
-                    ),
-                    None => playscale_core::processing::Carried::Unreadable,
-                };
-                playscale_core::processing::carries(carried, wanted)
-            }
-            Err(_) => false,
-        };
-        let facts = file_facts(conn, &file).await?;
-        let subtitles = text_subtitles(conn, &file).await?;
-        found.push(Candidate {
-            version_id: version,
-            file_id: file,
-            bound_current: current && bound == revision && is_sha256(&revision),
-            file_revision: revision,
-            original: false,
-            parts: 1,
-            interval: false,
-            available,
-            readable: access::admit_file_bytes(principal, facts.as_ref()).is_ok(),
-            content_type: content_type(&path),
-            size_bytes: u64::try_from(bytes).unwrap_or(0),
-            duration_ms: timeline_duration
-                .filter(|d| *d > 0)
-                .map(|d| d as u64)
-                .or_else(|| {
-                    seconds
-                        .filter(|s| s.is_finite() && *s > 0.0)
-                        .map(|s| (s * 1000.0).round() as u64)
-                }),
-            prepared: Some(playscale_core::downloads::Prepared {
-                recipe_id: recipe,
-                carries_selection: carries,
-            }),
-            text_subtitles: subtitles,
-        });
+        page += 1;
     }
     Ok(found)
 }
@@ -686,6 +745,17 @@ pub async fn create(
             .bind(&input.timeline_id)
             .fetch_one(&mut *tx)
             .await?;
+    let request = Request {
+        version_id: input.version_id.clone(),
+        recipe_id: input.recipe_id.clone(),
+        tracks: Tracks {
+            audio_component_id: input.tracks.audio_component_id.clone(),
+            subtitle_component_id: input.tracks.subtitle_component_id.clone(),
+            audio_track_id: input.tracks.audio_track_id.clone(),
+            subtitle_track_id: input.tracks.subtitle_track_id.clone(),
+            subtitle_policy: input.tracks.subtitle_policy,
+        },
+    };
     let found = match input.recipe_id.as_deref() {
         None => {
             candidates(
@@ -694,6 +764,7 @@ pub async fn create(
                 &input.timeline_id,
                 input.version_id.as_deref(),
                 timeline_duration,
+                &request,
             )
             .await?
         }
@@ -718,6 +789,7 @@ pub async fn create(
                 recipe,
                 timeline_duration,
                 &input.tracks,
+                &request,
             )
             .await?
         }
@@ -996,7 +1068,7 @@ async fn active(app: &App, download_id: &str) -> bool {
 /// Remove subtitle files (and partial ones) whose download is no longer an
 /// active demand (cancelled or gone), each under its lock. Best effort: a
 /// leftover is removed by a later call.
-async fn release_subtitles(app: App) {
+pub(crate) async fn release_subtitles(app: App) {
     let directory = subtitles_path(&app, "x");
     let Some(directory) = directory.parent() else {
         return;
@@ -1025,9 +1097,95 @@ async fn release_subtitles(app: App) {
 /// the download's subtitle lock: concurrent and retried reads share it, a
 /// request that stops waiting never leaves a partial file in place, and a
 /// cancelled download is never converted or published.
+
+// Cached subtitle reads are bounded globally, including response lifetimes.
+fn subtitle_read_slot() -> Result<tokio::sync::OwnedSemaphorePermit, Problem> {
+    static SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+    SLOTS.clone().try_acquire_owned().map_err(|_| {
+        Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subtitle_reads_busy",
+            "Subtitle reads are busy; retry shortly",
+        )
+    })
+}
+async fn read_subtitle(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::other("subtitle exceeds bound"));
+    }
+    Ok(bytes)
+}
+async fn record_subtitle(
+    app: &App,
+    id: &str,
+    bytes: Option<&[u8]>,
+) -> Result<(), crate::api::ApiError> {
+    use sha2::Digest;
+    let mut tx = crate::db::begin_write(&app.db).await?;
+    let active: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM downloads WHERE id=? AND state='ready')")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !active {
+        return Err(crate::api::ApiError::conflict(
+            "download_cancelled",
+            "The download was cancelled",
+        ));
+    }
+    let digest = bytes.map(|b| format!("{:x}", sha2::Sha256::digest(b)));
+    let changed = sqlx::query("INSERT INTO download_subtitle_artifacts(download_id,state,size_bytes,digest) VALUES (?,?,?,?) ON CONFLICT(download_id) DO NOTHING")
+        .bind(id).bind(if bytes.is_some() { "ready" } else { "failed" }).bind(bytes.map_or(0, |b| b.len() as i64)).bind(digest).execute(&mut *tx).await?.rows_affected();
+    if changed != 0 {
+        sqlx::query("UPDATE downloads SET revision=revision+1,updated_at=? WHERE id=?")
+            .bind(now())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let recorded: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT state,size_bytes,digest FROM download_subtitle_artifacts WHERE download_id=?",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if let Some(bytes) = bytes {
+        let expected = format!("{:x}", sha2::Sha256::digest(bytes));
+        if recorded.0 != "ready"
+            || recorded.1 != bytes.len() as i64
+            || recorded.2.as_deref() != Some(expected.as_str())
+        {
+            return Err(crate::api::ApiError::conflict(
+                "subtitle_artifact_changed",
+                "The pinned subtitle artifact changed",
+            ));
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, Problem> {
+    let failed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM download_subtitle_artifacts WHERE download_id=? AND state='failed')").bind(&row.id).fetch_one(&app.db).await?;
+    if failed {
+        return Err(Problem::invalid(
+            "subtitle_conversion_failed",
+            "The selected subtitle cannot be converted; cancel this download and choose another track",
+        ));
+    }
     let path = subtitles_path(app, &row.id);
-    if let Ok(bytes) = tokio::fs::read(&path).await {
+    if let Ok(bytes) = read_subtitle(&path).await {
+        record_subtitle(app, &row.id, Some(&bytes))
+            .await
+            .map_err(Problem::internal)?;
         return Ok(bytes);
     }
     let index = track
@@ -1044,8 +1202,17 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
     let converted = tokio::spawn(async move {
         let path = subtitles_path(&app, &id);
         let _held = subtitles_lock(&path).lock_owned().await;
+        let failed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM download_subtitle_artifacts WHERE download_id=? AND state='failed')").bind(&id).fetch_one(&app.db).await?;
+        if failed {
+            return Err(crate::api::ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subtitle_conversion_failed",
+                "The selected subtitle cannot be converted",
+            ));
+        }
         // Another read converted it while this one waited.
-        if let Ok(bytes) = tokio::fs::read(&path).await {
+        if let Ok(bytes) = read_subtitle(&path).await {
+            record_subtitle(&app, &id, Some(&bytes)).await?;
             return Ok(bytes);
         }
         let cancelled =
@@ -1076,6 +1243,9 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
                     text
                 }
                 Err(error) => {
+                    if error.parts().1 == "subtitle_conversion_failed" {
+                        record_subtitle(&app, &id, None).await?;
+                    }
                     let expired = error.parts().1 == "source_revision_changed";
                     let mut failed = failures().lock().unwrap_or_else(|e| e.into_inner());
                     failed.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
@@ -1083,6 +1253,15 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
                     return Err(error);
                 }
             };
+        let reserve_root = app.processing.root.clone();
+        let required = text.len() as u64;
+        let reserve = app.storage.settings.min_free_bytes;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::require_space(&reserve_root, required, reserve)
+        })
+        .await
+        .map_err(crate::api::ApiError::internal)?
+        .map_err(crate::api::ApiError::internal)?;
         let partial = path.with_extension(format!("vtt.{}", new_id()));
         let written = async {
             tokio::fs::create_dir_all(path.parent().unwrap_or(&path)).await?;
@@ -1102,7 +1281,19 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
         if published.is_err() {
             let _ = tokio::fs::remove_file(&partial).await;
         }
-        published.map(|()| text)
+        published?;
+        #[cfg(unix)]
+        tokio::fs::File::open(
+            path.parent()
+                .ok_or_else(|| crate::api::ApiError::internal("missing subtitle directory"))?,
+        )
+        .await
+        .map_err(crate::api::ApiError::internal)?
+        .sync_all()
+        .await
+        .map_err(crate::api::ApiError::internal)?;
+        record_subtitle(&app, &id, Some(&text)).await?;
+        Ok(text)
     });
     match tokio::time::timeout(Duration::from_secs(30), converted).await {
         Ok(Ok(Ok(text))) => Ok(text),
@@ -1116,7 +1307,13 @@ async fn ensure_subtitles(app: &App, row: &Row, track: &str) -> Result<Vec<u8>, 
             "download_cancelled",
             "The download was cancelled",
         )),
-        // Still converting, or the conversion failed: try again later.
+        Ok(Ok(Err(error))) if error.parts().1 == "subtitle_conversion_failed" => {
+            Err(Problem::invalid(
+                "subtitle_conversion_failed",
+                "The selected subtitle cannot be converted; cancel this download and choose another track",
+            ))
+        }
+        // Still converting, or a transient failure: try again later.
         _ => Err(Problem::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "download_subtitles_unavailable",
@@ -1139,6 +1336,7 @@ async fn subtitles(
     Query(query): Query<SubtitlesQuery>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
+    let permit = subtitle_read_slot()?;
     let mut tx = app.db.begin().await?;
     let row = owned(&mut tx, &caller.principal, &id).await?;
     let current = observe(&mut tx, &caller.principal, &row).await?;
@@ -1151,7 +1349,7 @@ async fn subtitles(
         ));
     }
     let bytes = match row.subtitle_track_id {
-        Some(_) => tokio::fs::read(subtitles_path(&app, &row.id)).await.ok(),
+        Some(_) => read_subtitle(&subtitles_path(&app, &row.id)).await.ok(),
         None => None,
     }
     .ok_or_else(Problem::not_found)?;
@@ -1163,7 +1361,11 @@ async fn subtitles(
             "The subtitles changed; read the manifest again",
         ));
     }
-    Ok(([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], bytes).into_response())
+    let body = axum::body::Body::from_stream(async_stream::stream! {
+        let _permit = permit;
+        yield Ok::<_, std::io::Error>(bytes);
+    });
+    Ok(([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], body).into_response())
 }
 
 #[derive(Deserialize)]
@@ -1232,13 +1434,31 @@ pub async fn report_transfer(
             bytes_received: bytes as u64,
         }),
     };
+    let subtitle_size: Option<i64> = sqlx::query_scalar(
+        "SELECT size_bytes FROM download_subtitle_artifacts WHERE download_id=? AND state='ready'",
+    )
+    .bind(&row.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let transfer_size = core::transfer_bytes(
+        row.size_bytes as u64,
+        row.subtitle_track_id.is_some(),
+        subtitle_size.map(|n| n as u64),
+    );
+    if transfer_size.is_none() && incoming.state == core::TransferState::VerifiedLocal {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_subtitles_unavailable",
+            "Required subtitles have not been prepared",
+        ));
+    }
     let refused =
         |code: &'static str, detail: &str| Problem::new(StatusCode::CONFLICT, code, detail);
     match core::accept_transfer(
         previous.as_ref(),
         &incoming,
         row.revision as u64,
-        row.size_bytes as u64,
+        transfer_size.unwrap_or(row.size_bytes as u64),
         ended,
     ) {
         Ok(core::TransferDecision::Record) => {
@@ -1317,6 +1537,7 @@ pub async fn manifest(
     Path(id): Path<String>,
 ) -> Result<Response, Problem> {
     caller.require(Permission::DownloadsManage)?;
+    let _subtitle_read = subtitle_read_slot()?;
     let mut tx = app.db.begin().await?;
     let row = owned(&mut tx, &caller.principal, &id).await?;
     let current = observe(&mut tx, &caller.principal, &row).await?;
@@ -1380,22 +1601,46 @@ pub async fn manifest(
     // The title's selected poster travels with the download, pinned by its
     // content digest (an artwork asset's ID is its SHA-256); only one the
     // device can fetch (an asset of the title, as asset content requires).
-    let poster: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT a.id,a.mime,length(a.bytes) FROM timelines t JOIN editions e ON e.id=t.edition_id \
-         JOIN artwork_selections s ON s.item_id=e.item_id AND s.role='poster' \
-         JOIN artwork_assets a ON a.id=s.asset_id WHERE t.id=? \
-         AND EXISTS(SELECT 1 FROM (SELECT item_id,asset_id FROM artwork_contributions UNION SELECT item_id,asset_id FROM item_artwork_assets) c \
-         WHERE c.item_id=e.item_id AND c.asset_id=a.id)",
+    let explicit: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT asset_id FROM artwork_selections WHERE item_id=? AND role='poster'",
     )
-    .bind(&row.timeline_id)
+    .bind(&item)
     .fetch_optional(&mut *tx)
     .await?;
+    let contributions: Vec<(String, String)> = sqlx::query_as("SELECT source,asset_id FROM artwork_contributions WHERE item_id=? AND role='poster' ORDER BY source").bind(&item).fetch_all(&mut *tx).await?;
+    let local = contributions
+        .iter()
+        .find(|(source, _)| source == "local")
+        .map(|(_, id)| id.clone());
+    let candidates = contributions.iter().map(|(_, id)| id.clone()).collect();
+    let (selected, _) = playscale_core::artwork::resolve(explicit.flatten(), local, &candidates);
+    let poster: Option<(String, String, i64)> = match selected {
+        None => None,
+        Some(selected) => sqlx::query_as("SELECT a.id,a.mime,length(a.bytes) FROM artwork_assets a WHERE a.id=? AND EXISTS(SELECT 1 FROM (SELECT item_id,asset_id FROM artwork_contributions UNION SELECT item_id,asset_id FROM item_artwork_assets) c WHERE c.item_id=? AND c.asset_id=a.id)").bind(selected).bind(&item).fetch_optional(&mut *tx).await?,
+    };
     tx.commit().await?;
     // The selected text subtitle travels as WebVTT, pinned by digest.
     let subtitles = match &row.subtitle_track_id {
         Some(track) => Some(ensure_subtitles(&app, &row, track).await?),
         None => None,
     };
+    // Conversion may have awaited external work; reauthorize all state before
+    // returning names, metadata or artifact grants from the earlier snapshot.
+    let mut current_tx = app.db.begin().await?;
+    let principal = caller
+        .reauthorize(&mut current_tx, Some(Permission::DownloadsManage))
+        .await?;
+    let latest = owned(&mut current_tx, &principal, &id).await?;
+    let observation = observe(&mut current_tx, &principal, &latest).await?;
+    if !core::transferable(core::state(latest.stored(), &latest.pin(), &observation)) {
+        return Err(Problem::new(
+            StatusCode::CONFLICT,
+            "download_expired",
+            "The download changed during subtitle preparation; read it again",
+        ));
+    }
+    current_tx.commit().await?;
+    let row = latest;
     let mut files = vec![json!({
         "asset_id": row.file_id,
         "relative_name": format!("media.{}", extension(&row.content_type)),
@@ -1428,6 +1673,7 @@ pub async fn manifest(
     }
     let mut body = json!({
             "download_id": row.id,
+            "download_revision": row.revision.to_string(),
             "timeline_id": row.timeline_id,
             "timeline_revision": row.timeline_revision.to_string(),
             "title": title,
@@ -1543,7 +1789,6 @@ pub struct ReanchorInput {
 const MAX_BATCH: usize = 200;
 /// Prepared renditions of one recipe read per page, and pages at most.
 const PREPARED_PAGE: i64 = 200;
-const PREPARED_PAGES: i64 = 10;
 /// Largest poster that travels with a download (the artwork upload bound).
 const MAX_ARTWORK_BYTES: i64 = 8 * 1024 * 1024;
 
@@ -1767,11 +2012,7 @@ pub async fn sync(
         })?),
     };
     if let Some((_, through)) = &reanchor {
-        if acknowledged != Some(*through)
-            || events
-                .first()
-                .is_some_and(|e| through.checked_add(1) != Some(e.sequence))
-        {
+        if !core::reanchor_batch(*through, acknowledged, events.first().map(|e| e.sequence)) {
             return Err(Problem::invalid(
                 "invalid_reanchor",
                 "The re-anchor must match the acknowledgement and the first retained sequence",

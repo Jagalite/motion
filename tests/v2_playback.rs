@@ -1785,7 +1785,13 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
     );
     let mut document = prefs.body.clone();
     // A streaming limit is a positive decimal string.
-    for bad in [json!("0"), json!("08"), json!(8000000), json!("8e6")] {
+    for bad in [
+        json!("0"),
+        json!("08"),
+        json!(8000000),
+        json!("8e6"),
+        json!(u64::MAX.to_string()),
+    ] {
         let mut invalid = document.clone();
         invalid["max_bitrate_bps"] = bad;
         let refused = f
@@ -1801,6 +1807,21 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
             .await;
         assert!(refused.status.is_client_error(), "{:?}", refused.body);
     }
+    let mut original_capped = document.clone();
+    original_capped["quality_mode"] = json!("original");
+    original_capped["max_bitrate_bps"] = json!("8000000");
+    let refused = f
+        .call(
+            "PUT",
+            "/api/v2/profiles/default/preferences",
+            Some(original_capped),
+            &[
+                ("authorization", &auth),
+                ("if-match", prefs.headers["etag"].to_str().unwrap()),
+            ],
+        )
+        .await;
+    assert!(refused.status.is_client_error());
     document["max_bitrate_bps"] = json!("8000000");
     document["completion_percent"] = json!(50);
     let replaced = f

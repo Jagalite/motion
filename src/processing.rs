@@ -881,6 +881,36 @@ async fn convert(
         media_ms,
     )
     .await?;
+    if subtitle.is_some() {
+        // Probe shape alone does not prove the selected subtitle decodes.
+        let mut decode_subtitle = Command::new(&app.processing.settings.ffmpeg);
+        decode_subtitle
+            .args(["-v", "error", "-xerror", "-nostdin", "-y", "-i"])
+            .arg(&output)
+            .args([
+                "-map",
+                "0:s:0",
+                "-c:s",
+                "webvtt",
+                "-progress",
+                "pipe:1",
+                "-f",
+                "webvtt",
+            ])
+            .arg(directory.join("validated-subtitles.vtt"));
+        command(
+            app,
+            job,
+            stop,
+            lease,
+            &directory.join(".owner"),
+            &mut decode_subtitle,
+            false,
+            media_ms,
+        )
+        .await?;
+        tokio::fs::remove_file(directory.join("validated-subtitles.vtt")).await?;
+    }
     let (root, identity): (String, String) =
         sqlx::query_as("SELECT root,root_identity FROM libraries WHERE id=?")
             .bind(&source.library_id)
