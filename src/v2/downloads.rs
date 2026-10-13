@@ -1012,12 +1012,21 @@ pub async fn manifest(
             ));
         }
     }
-    let title: String = sqlx::query_scalar(
-        "SELECT i.title FROM timelines t JOIN editions e ON e.id=t.edition_id JOIN items i ON i.id=e.item_id WHERE t.id=?",
+    let (title, item): (String, String) = sqlx::query_as(
+        "SELECT i.title,i.id FROM timelines t JOIN editions e ON e.id=t.edition_id JOIN items i ON i.id=e.item_id WHERE t.id=?",
     )
     .bind(&row.timeline_id)
     .fetch_one(&mut *tx)
     .await?;
+    // The title's descriptive metadata, as the catalog resolves it, bounded
+    // for the device (`offline::offline_metadata`); carried in the manifest
+    // itself, so the manifest pins it.
+    let metadata = crate::metadata::documents(&mut tx, &item)
+        .await
+        .map_err(Problem::internal)?;
+    let metadata = playscale_core::offline::offline_metadata(
+        &playscale_core::metadata::resolve(&metadata.docs).values,
+    );
     let view = viewing::load_view(&mut tx, &row.profile_id, &row.timeline_id).await?;
     // Read in the same snapshot as the base, so the pair names one history.
     let (server_id, restore_epoch): (String, String) =
@@ -1087,9 +1096,7 @@ pub async fn manifest(
             "role": "artwork",
         }));
     }
-    Ok(tagged(
-        StatusCode::OK,
-        json!({
+    let mut body = json!({
             "download_id": row.id,
             "timeline_id": row.timeline_id,
             "timeline_revision": row.timeline_revision.to_string(),
@@ -1101,9 +1108,11 @@ pub async fn manifest(
             "viewing_epoch": format!("{server_id}:{restore_epoch}"),
             "restored_viewing_revision": restored.map(|(r, _)| r.to_string()),
             "restored_manual_epoch": restored.map(|(_, e)| e.to_string()),
-        }),
-        row.revision,
-    ))
+    });
+    if let Some(metadata) = metadata {
+        body["metadata"] = json!(metadata);
+    }
+    Ok(tagged(StatusCode::OK, body, row.revision))
 }
 
 /// A download byte grant: the exact pinned file revision of a ready download

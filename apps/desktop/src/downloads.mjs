@@ -41,6 +41,20 @@ function writeAtomically(path, value) {
 }
 
 /** The cache stores titles of at most 1,024 UTF-8 bytes; shorten on a character boundary. */
+/**
+ * The manifest's descriptive metadata as the cache records it: only the
+ * known fields of the expected types (the cache refuses unknown ones, and
+ * drops values out of its bounds), or null.
+ */
+export function cacheMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const kept = {};
+  if (Number.isInteger(metadata.release_year) && Math.abs(metadata.release_year) <= 9999) kept.release_year = metadata.release_year;
+  if (typeof metadata.description === 'string') kept.description = metadata.description;
+  if (Array.isArray(metadata.genres) && metadata.genres.every(g => typeof g === 'string')) kept.genres = metadata.genres;
+  return Object.keys(kept).length ? kept : null;
+}
+
 export function cacheTitle(title) {
   const encoder = new TextEncoder();
   if (encoder.encode(title).length <= 1024) return title;
@@ -271,12 +285,13 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       status(`"${manifest.title}" is larger than a device download can hold (64 GiB).`);
       return false;
     }
+    const metadata = cacheMetadata(manifest.metadata);
     const entryFor = artwork => JSON.stringify({
       identity: {download_id: download.id, timeline_id: manifest.timeline_id, timeline_revision: manifest.timeline_revision,
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
       title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
-      ...(artwork ? {artwork} : {})});
+      ...(artwork ? {artwork} : {}), ...(metadata ? {metadata} : {})});
     const posterBytes = posters.length ? Math.max(0, Number(posters[0].size_bytes) || 0) : 0;
     // The poster as the cache would record it, when its description is valid.
     const posterSha = /^sha256:([0-9a-f]{64})$/.exec(posters[0]?.digest ?? '')?.[1];

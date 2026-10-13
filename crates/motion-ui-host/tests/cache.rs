@@ -41,6 +41,7 @@ fn fixture() -> (tempfile::TempDir, CacheManifest) {
             content_type: "video/mp4".into(),
             resume_position_ms: None,
             artwork: None,
+            metadata: None,
         }],
     };
     std::fs::write(
@@ -657,4 +658,29 @@ async fn a_saved_poster_is_shown_offline() {
     assert_eq!(bytes, poster);
     let (status, _, _) = request(&app, "GET", "/cache/artwork/download", "", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The offline pages show the saved metadata, escaped like every value.
+#[tokio::test]
+async fn saved_metadata_is_shown_offline() {
+    let (dir, mut manifest) = fixture();
+    manifest.downloads[0].metadata = Some(playscale_core::offline::OfflineMetadata {
+        release_year: Some(1999),
+        description: Some("A <described> title.".into()),
+        genres: vec!["Drama".into(), "Mystery".into()],
+    });
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let cache = Arc::new(Cache::open(dir.path()).unwrap());
+    let (app, cookie) = authenticated(cache).await;
+    let (_, _, page) = request(&app, "GET", "/", &cookie, None).await;
+    assert!(String::from_utf8(page).unwrap().contains("1999 · "));
+    let (status, _, page) = request(&app, "GET", "/download/download", &cookie, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.contains("1999 · Drama, Mystery"), "{page}");
+    assert!(page.contains("A &lt;described&gt; title."), "{page}");
 }

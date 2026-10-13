@@ -37,6 +37,7 @@ fn entry(id: &str, bytes: &[u8]) -> CachedDownload {
         content_type: "video/mp4".into(),
         resume_position_ms: None,
         artwork: None,
+        metadata: None,
     }
 }
 
@@ -748,6 +749,54 @@ fn a_poster_is_published_and_released_with_its_download() {
     assert!(blobs(&root).contains(&poster_blob));
     assert!(store.remove("d1").unwrap());
     assert!(blobs(&root).is_empty());
+}
+
+/// Saved metadata is kept within its bounds; out of bounds it is dropped
+/// rather than refusing the title.
+#[test]
+fn metadata_is_kept_within_bounds_and_never_refuses_a_title() {
+    use playscale_core::offline::OfflineMetadata;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let mut store = Store::open(&root, &scope()).unwrap();
+    let described = OfflineMetadata {
+        release_year: Some(1999),
+        description: Some("Saved with its description".into()),
+        genres: vec!["Drama".into()],
+    };
+    for (id, bytes, metadata, kept) in [
+        (
+            "d1",
+            &b"first"[..],
+            described.clone(),
+            Some(described.clone()),
+        ),
+        (
+            "d2",
+            &b"second"[..],
+            OfflineMetadata {
+                genres: vec!["g".into(); 11],
+                ..described.clone()
+            },
+            None,
+        ),
+    ] {
+        stage(&root, id, bytes);
+        let entry = CachedDownload {
+            metadata: Some(metadata),
+            ..entry(id, bytes)
+        };
+        assert_eq!(store.publish(entry).unwrap(), Publication::Published);
+        let saved = store
+            .manifest()
+            .downloads
+            .iter()
+            .find(|d| d.identity.download_id == id)
+            .unwrap()
+            .metadata
+            .clone();
+        assert_eq!(saved, kept, "{id}");
+    }
 }
 
 /// A corrupt optional poster never blocks recovering verified media: the

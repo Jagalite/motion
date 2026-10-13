@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {cacheTitle, createDownloadAgent, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
+import {cacheMetadata, cacheTitle, createDownloadAgent, currentRoot, offlineRoots, rootName, wireEvent} from '../src/downloads.mjs';
 
 const identity = {server_id: 'server', principal_id: 'device1', device_id: 'device1'};
 const media = Buffer.from('0123456789abcdefghij');
@@ -904,4 +904,34 @@ test('with the real cache, a corrupt poster never blocks recovering verified med
     const {manifest: saved} = await cache(target.path, target.scope, ['status']);
     assert.deepEqual(saved.downloads.map(d => [d.identity.download_id, d.artwork ?? null]), [['d1', null]]);
     assert.ok(!existsSync(join(target.path, 'blobs', posterDigest)), 'the corrupt poster is discarded');
+  });
+
+test('only the known, well-typed metadata fields are handed to the cache', () => {
+  assert.equal(cacheMetadata(undefined), null);
+  assert.equal(cacheMetadata([]), null);
+  assert.equal(cacheMetadata({rating: 'PG'}), null);
+  assert.deepEqual(cacheMetadata({release_year: 1999, description: 'Plot', genres: ['Drama'], rating: 'PG'}),
+    {release_year: 1999, description: 'Plot', genres: ['Drama']});
+  assert.deepEqual(cacheMetadata({release_year: 1e12, description: 3, genres: ['Drama', 4]}), null);
+});
+
+test('with the real cache, a title is saved with its metadata, and bad metadata never blocks it',
+  {skip: !process.env.MOTION_UI_HOST_BINARY && 'MOTION_UI_HOST_BINARY is not set'}, async () => {
+    const base = mkdtempSync(join(tmpdir(), 'motion-agent-'));
+    const cache = realCache(process.env.MOTION_UI_HOST_BINARY);
+    const metadata = {d1: {release_year: 1999, description: 'Plot', genres: ['Drama'], future_field: true},
+      d2: {genres: Array.from({length: 11}, (_, n) => `Genre ${n}`)}};
+    const agent = createDownloadAgent({base, identity, cache, quota: 100000,
+      api: async path => {
+        const id = path.split('/')[4];
+        return path.endsWith('/manifest') ? {...manifest(id), metadata: metadata[id]} : path.endsWith('/transfer') ? {} : {url: '/api/v2/media/files/f1/content?ticket=t'};
+      },
+      fetchMedia: async () => response(200, media)});
+    const target = agent.root('default');
+    await cache(target.path, target.scope, ['status']);
+    assert.equal(await agent.transfer({id: 'd1'}, target), true);
+    assert.equal(await agent.transfer({id: 'd2'}, target), true);
+    const {manifest: saved} = await cache(target.path, target.scope, ['status']);
+    assert.deepEqual(Object.fromEntries(saved.downloads.map(d => [d.identity.download_id, d.metadata ?? null])),
+      {d1: {release_year: 1999, description: 'Plot', genres: ['Drama']}, d2: null});
   });

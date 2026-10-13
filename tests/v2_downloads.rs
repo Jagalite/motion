@@ -1486,3 +1486,62 @@ async fn manifests_pin_the_titles_poster_by_digest() {
         .await;
     assert_eq!((status, bytes), (StatusCode::OK, poster));
 }
+
+/// The manifest carries the title's descriptive metadata as the catalog
+/// resolves it (a local correction outranks the NFO), bounded for the
+/// device, and nothing when the title has none.
+#[tokio::test]
+async fn manifests_carry_the_titles_bounded_metadata() {
+    let f = Fixture::new().await;
+    let (timeline, _, _) = f.scanned("film.mp4", b"described film").await;
+    let (device, auth) = f.device(&["default"], &PERMISSIONS).await;
+    let created = f
+        .post(
+            "/api/v2/downloads",
+            &auth,
+            "metadata-download-1",
+            input(&device, &timeline),
+        )
+        .await;
+    let path = format!(
+        "/api/v2/downloads/{}/manifest",
+        created.body["id"].as_str().unwrap()
+    );
+    let manifest = f.get(&path, &auth).await.body;
+    assert!(manifest.get("metadata").is_none(), "{manifest}");
+    let item: String = sqlx::query_scalar(
+        "SELECT e.item_id FROM timelines t JOIN editions e ON e.id=t.edition_id WHERE t.id=?",
+    )
+    .bind(&timeline)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    let genres: Vec<String> = (0..12).map(|n| format!("Genre {n}")).collect();
+    for (source, values) in [
+        (
+            "nfo",
+            json!({"release_year": 1999, "description": "From the NFO", "genres": genres}),
+        ),
+        (
+            "local",
+            json!({"description": "A corrected description.", "cast": [{"name": "Not offline"}]}),
+        ),
+    ] {
+        sqlx::query("INSERT INTO metadata_documents VALUES (?,?,1,NULL,?,1)")
+            .bind(&item)
+            .bind(source)
+            .bind(json!({"values": values, "tags": [], "excluded_tags": []}).to_string())
+            .execute(&f.app.db)
+            .await
+            .unwrap();
+    }
+    let manifest = f.get(&path, &auth).await.body;
+    assert_eq!(
+        manifest["metadata"],
+        json!({
+            "release_year": 1999,
+            "description": "A corrected description.",
+            "genres": genres[..10],
+        })
+    );
+}

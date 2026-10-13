@@ -407,7 +407,10 @@ impl Store {
     /// Verify the staged transfer of `entry` and publish it atomically.
     /// A failed verification removes the staged bytes and changes nothing
     /// visible; an exact repeat is idempotent.
-    pub fn publish(&mut self, entry: CachedDownload) -> anyhow::Result<Publication> {
+    pub fn publish(&mut self, mut entry: CachedDownload) -> anyhow::Result<Publication> {
+        // Optional metadata never refuses a title: what is out of bounds is
+        // dropped (`offline::kept_metadata`).
+        entry.metadata = offline::kept_metadata(entry.metadata.take());
         validate_download(&entry)?;
         let id = entry.identity.download_id.clone();
         ensure!(

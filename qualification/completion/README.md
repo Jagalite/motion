@@ -27,7 +27,7 @@ item below is the single completion agent unless stated otherwise.
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
 | 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented and reviewed; 3F implemented and reviewed; rest of 3C not started | playback, part-subtitles, preparation-tracks, bitrate and video-profile-ui PRs | Merge by user; then item 5B |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
-| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads and offline-artwork PRs | Merge by user; then 5F |
+| 5 Offline breadth | 5A implemented and reviewed; 5B implemented and reviewed; 5C part 1 implemented and reviewed; 5C part 2 implemented and reviewed; 5D implemented and reviewed; 5E part 1 implemented and reviewed; 5E part 2 (poster) implemented and reviewed; 5E part 3 (metadata) implemented (review pending); offline subtitle files and 5F not started | offline-roots, offline-removal, restore-recovery, restore-choice, transfer-state, prepared-downloads, offline-artwork and offline-metadata PRs | Merge by user; then 5F |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
 | 7 M6 and parity backlog | Not started | — | After items 1–6 |
 | 8 Release qualification | Not started | — | After feature implementation |
@@ -1163,11 +1163,50 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 4 at `bf78128` is clean: no actionable findings.
 
+### 5E (part 3). The title's metadata saved with the download
+
+- **Source SHA:** branch `plan-completion/offline-metadata`, stacked on
+  `plan-completion/offline-artwork`.
+- **Implemented:**
+  - **Core:** `offline::offline_metadata` decides what of a title's resolved
+    metadata travels offline: release year, description and genres. Text is
+    cut at a character boundary (4,000 description characters, 10 genres of
+    64 characters, deduplicated). `offline::kept_metadata` decides what a
+    device keeps: only metadata within those bounds and not empty. Anything
+    else is dropped, never refusing the title.
+  - **Server:** the download manifest carries `metadata` (additive and
+    optional; contract schema `OfflineMetadata`) resolved in the same read
+    as the manifest, so a local correction outranks an NFO. It is inline,
+    so the manifest pins it.
+  - **Agent:** passes only the known, well-typed fields to the cache, which
+    refuses unknown fields, so a later server field cannot block a title.
+  - **Cache store:** applies `kept_metadata` on publication and recovery and
+    records the result in `CachedDownload.metadata`.
+  - **Offline pages:** the list shows the year. The title page shows year,
+    genres and the description (escaped).
+- **Why inline, not a `metadata` file:** current agents refuse a manifest
+  naming any file role they cannot save, so a metadata file would stop
+  every download for them. The contract's `metadata` file role stays
+  unused.
+- **Core/adapter boundary:** selection, bounds and what a device keeps are
+  core policies shared by the server and the cache. The adapters only read
+  the resolved values and record the result.
+- **Focused evidence (2026-10-13, Kyoto compile, direct execution):**
+
+  | Check | Result |
+  |---|---|
+  | core `offline` | 12 passed. New: bounds, deduplication, cut at a character boundary, nothing when none; what the server produces is kept, out-of-bounds or empty metadata is dropped |
+  | `tests/v2_downloads.rs` `manifests_carry_the_titles_bounded_metadata` | passed. No `metadata` without any; NFO plus a local correction resolve to the local description, the NFO year and the first 10 genres; cast does not travel |
+  | Store | 21 passed. New: metadata within bounds is kept; 11 genres are dropped while the title is still published |
+  | Cache | 11 passed. New: the list shows the year and the title page shows year, genres and the escaped description |
+  | Desktop JS (with `MOTION_UI_HOST_BINARY`) | 58 passed. New: field filtering; with the real cache tool, a title is saved with its metadata minus an unknown field, and out-of-bounds metadata never blocks a title |
+  | `v2_downloads` 10, contract 5, compose 22 | passed; clippy clean |
+
 ### Remaining item 5 work (not started)
 
 | Slice | Next step | Dependency |
 |---|---|---|
-| 5E remaining: subtitle and metadata files offline | Subtitle sidecars and a metadata document in the manifest with pins; the offline player presents subtitles | 5E parts 1 and 2 |
+| 5E remaining: subtitle files offline | Text subtitle WebVTT renditions pinned by digest, served at exactly that digest for the download; the offline player presents them | 5E parts 1–3 |
 | 5F end-to-end | Real Electron/Demuxe download → offline → reconnect run | All of the above |
 
 ## 6. M5 convenience and receiver work

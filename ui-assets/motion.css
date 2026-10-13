@@ -81,6 +81,7 @@ progress::-moz-progress-bar { background: var(--accent); }
 .shelf-title { font-size: 1.2rem; font-weight: 700; margin: 0 0 .9rem; }
 .card-title { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-meta, .muted { color: var(--muted); }
+.overview { max-width: 65ch; line-height: 1.5; white-space: pre-line; }
 .card-meta { display: flex; align-items: center; flex-wrap: wrap; font-size: .85rem; }
 .meta-sep { display: inline-block; width: 3px; height: 3px; border-radius: 50%; background: currentColor; margin: 0 .5rem; opacity: .7; }
 .availability { color: var(--muted); }

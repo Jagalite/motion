@@ -12677,6 +12677,27 @@ components:
       - size_bytes
       - media_url
       - role
+    OfflineMetadata:
+      type: object
+      additionalProperties: false
+      description: The title's descriptive metadata as the catalog resolves it, bounded for a device and
+        shown offline. Absent when the title has none. Carried in the manifest, so the manifest pins it.
+      properties:
+        release_year:
+          type: integer
+          minimum: 1
+          maximum: 9999
+        description:
+          type: string
+          maxLength: 16000
+          description: At most 4000 characters.
+        genres:
+          type: array
+          maxItems: 10
+          items:
+            type: string
+            maxLength: 256
+            description: At most 64 characters.
     DownloadManifest:
       type: object
       additionalProperties: false
@@ -12719,6 +12740,8 @@ components:
           anyOf:
           - $ref: '#/components/schemas/Revision'
           - type: 'null'
+        metadata:
+          $ref: '#/components/schemas/OfflineMetadata'
       required:
       - download_id
       - timeline_id

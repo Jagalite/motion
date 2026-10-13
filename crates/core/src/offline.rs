@@ -387,9 +387,146 @@ pub fn settles(outcome: Deletion, saved_locally: bool) -> bool {
     matches!(outcome, Deletion::Deleted | Deletion::Absent) && !saved_locally
 }
 
+/// Descriptive metadata saved with a download and shown offline. Optional
+/// and bounded: it never blocks saving a title, and a cache entry stays
+/// small.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_year: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+}
+
+pub const MAX_DESCRIPTION_CHARS: usize = 4000;
+pub const MAX_GENRES: usize = 10;
+pub const MAX_GENRE_CHARS: usize = 64;
+
+fn bounded_text(value: &str, max: usize) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| {
+        value
+            .chars()
+            .take(max)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    })
+}
+
+/// What of a title's resolved metadata (`metadata::resolve` values) travels
+/// offline: release year, description and genres, bounded (text is cut at
+/// a character boundary, genres deduplicated in order). None when nothing
+/// remains.
+pub fn offline_metadata(
+    values: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Option<OfflineMetadata> {
+    let mut genres: Vec<String> = Vec::new();
+    for genre in values
+        .get("genres")
+        .and_then(|g| g.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|g| g.as_str())
+        .filter_map(|g| bounded_text(g, MAX_GENRE_CHARS))
+    {
+        if genres.len() == MAX_GENRES {
+            break;
+        }
+        if !genres.contains(&genre) {
+            genres.push(genre);
+        }
+    }
+    let metadata = OfflineMetadata {
+        release_year: values
+            .get("release_year")
+            .and_then(|y| y.as_i64())
+            .filter(|y| (1..=9999).contains(y))
+            .map(|y| y as i32),
+        description: values
+            .get("description")
+            .and_then(|d| d.as_str())
+            .and_then(|d| bounded_text(d, MAX_DESCRIPTION_CHARS)),
+        genres,
+    };
+    (metadata != OfflineMetadata::default()).then_some(metadata)
+}
+
+/// The metadata a device keeps from what it received: only within the
+/// bounds `offline_metadata` produces and not empty. Anything else is
+/// dropped rather than refusing the title it came with.
+pub fn kept_metadata(metadata: Option<OfflineMetadata>) -> Option<OfflineMetadata> {
+    let text_ok = |t: &str, max: usize| !t.trim().is_empty() && t.chars().count() <= max;
+    metadata.filter(|m| {
+        *m != OfflineMetadata::default()
+            && m.release_year.is_none_or(|y| (1..=9999).contains(&y))
+            && m.description
+                .as_deref()
+                .is_none_or(|d| text_ok(d, MAX_DESCRIPTION_CHARS))
+            && m.genres.len() <= MAX_GENRES
+            && m.genres.iter().all(|g| text_ok(g, MAX_GENRE_CHARS))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_metadata_is_bounded_and_what_the_device_keeps() {
+        let values = serde_json::json!({
+            "title": "Film",
+            "release_year": 1999,
+            "description": format!("  {}  ", "é".repeat(MAX_DESCRIPTION_CHARS + 5)),
+            "genres": ["Drama", " drama ", "Drama", "", "x".repeat(70)],
+            "cast": [{"name": "A"}],
+        });
+        let values: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(values).unwrap();
+        let metadata = offline_metadata(&values).unwrap();
+        assert_eq!(metadata.release_year, Some(1999));
+        assert_eq!(
+            metadata.description.as_deref().map(|d| d.chars().count()),
+            Some(MAX_DESCRIPTION_CHARS)
+        );
+        assert_eq!(
+            metadata.genres,
+            ["Drama", "drama", &"x".repeat(MAX_GENRE_CHARS)]
+        );
+        // What the server produces is what the device keeps.
+        assert_eq!(
+            kept_metadata(Some(metadata.clone())),
+            Some(metadata.clone())
+        );
+        // Nothing descriptive: no metadata at all.
+        let bare = std::collections::BTreeMap::from([("title".into(), serde_json::json!("Film"))]);
+        assert_eq!(offline_metadata(&bare), None);
+        // Out of bounds, or empty, is dropped rather than kept.
+        for bad in [
+            OfflineMetadata::default(),
+            OfflineMetadata {
+                release_year: Some(0),
+                ..Default::default()
+            },
+            OfflineMetadata {
+                description: Some("x".repeat(MAX_DESCRIPTION_CHARS + 1)),
+                ..Default::default()
+            },
+            OfflineMetadata {
+                genres: vec!["g".into(); MAX_GENRES + 1],
+                ..Default::default()
+            },
+            OfflineMetadata {
+                genres: vec![" ".into()],
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(kept_metadata(Some(bad)), None);
+        }
+    }
 
     fn restored_event(
         sequence: u64,

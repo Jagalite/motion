@@ -4,7 +4,7 @@ use crate::{
     assets,
     facade::{BoxFuture, UiResult},
 };
-use playscale_core::offline::{CacheScope, DownloadIdentity};
+use playscale_core::offline::{CacheScope, DownloadIdentity, OfflineMetadata};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use topcoat::{
@@ -30,6 +30,10 @@ pub struct CachedDownload {
     /// The title's poster, saved and verified with the download.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<CachedArtwork>,
+    /// The title's descriptive metadata from the manifest
+    /// (`offline::kept_metadata`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<OfflineMetadata>,
 }
 
 /// A verified image saved with a download (its blob is named by SHA-256).
@@ -85,7 +89,11 @@ async fn downloads(cx: &Cx) -> Result<impl View> {
                 if item.artwork.is_some() {
                     <img class="card-art" src=(format!("/cache/artwork/{}", item.identity.download_id)) alt="" loading="lazy" decoding="async">
                 }
-                <span class="card-title">(item.title.as_str())</span><span class="card-meta">"Saved on this device"</span></a>
+                <span class="card-title">(item.title.as_str())</span>
+                <span class="card-meta">
+                    if let Some(year) = item.metadata.as_ref().and_then(|m| m.release_year) { (year.to_string()) " · " }
+                    "Saved on this device"
+                </span></a>
                 <button type="button" class="card-action" data-remove-download=(item.identity.download_id.as_str())>"Remove from this device"</button></li>
         }
         </ul>
@@ -107,6 +115,16 @@ async fn player(cx: &Cx) -> Result<impl View> {
         .ok_or_else(topcoat::router::error::not_found)?;
     Ok(view! {
         <h1>(item.title)</h1>
+        if let Some(metadata) = &item.metadata {
+            if metadata.release_year.is_some() || !metadata.genres.is_empty() {
+                <p class="muted">
+                    if let Some(year) = metadata.release_year { (year.to_string()) }
+                    if metadata.release_year.is_some() && !metadata.genres.is_empty() { " · " }
+                    (metadata.genres.join(", "))
+                </p>
+            }
+            if let Some(description) = &metadata.description { <p class="overview">(description.as_str())</p> }
+        }
         <div id="motion-offline-player" class="player-host" data-download-id=(item.identity.download_id) data-demuxe-base=(assets::DEMUXE_BASE)>
             <p class="status-panel" role="status">"Verifying saved media…"</p>
         </div>
