@@ -199,6 +199,12 @@ item below is the single completion agent unless stated otherwise.
   |---|---|---|
   | L6 | Rowids are reused after a library's newest requests are deleted, so a later page could contain a new admission | Fixed: durable admission sequence (counter and trigger, migration 0046) for recent order, cursors and pruning. The test deletes the newest history between page reads, admits through the API and checks the later page |
 
+  Round 3 at `3fc8b84` (focused on L6) raised one P2:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | L7 | Rewriting migration 0046 breaks databases created by this PR's earlier commits (SQLx checksum mismatch) | Not applicable, with rationale: 0046 has never been on `main` or in a release. [MIGRATIONS.md](../../MIGRATIONS.md) already treats databases from pre-merge branch builds as development-only and not upgradable, and the rule against rewriting applies to merged migrations. The 0046 row there now says it was finalized before merge. If the PR is merged, 0046 is fixed from then on |
+
   After the round-1 fixes: core lib 142, `playscale` lib 64, `v2_catalog` 19 (the
   scan test ran three times), `v2_metadata_processing` 18, `access_api` 39,
   `m3_workflows` 1 passed; clippy clean (Kyoto `415cb9b5`, `e59a0b6c`).
