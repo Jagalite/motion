@@ -45,6 +45,12 @@ pub struct PartPin {
     /// Omitted when absent, so pins without it serialize as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<u32>,
+    /// The zero-based subtitle stream of this part that carries the selected
+    /// text subtitle component, delivered as WebVTT joined across the parts
+    /// (`subtitles::join_parts`); None when no subtitle is selected. Omitted
+    /// when absent, so pins without it serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u32>,
 }
 
 /// Whether two multipart layouts are the same timeline: the same files,
@@ -244,23 +250,36 @@ mod tests {
     }
 
     #[test]
-    fn layouts_compare_parts_not_audio_selection() {
+    fn layouts_compare_parts_not_track_selection() {
         let pin = |file: &str, audio| PartPin {
             file: file.into(),
             revision: "r".into(),
             duration_ms: 1_000,
             audio,
+            subtitle: None,
         };
         assert!(same_layout(
             &[pin("a", Some(0)), pin("b", Some(1))],
             &[pin("a", Some(1)), pin("b", Some(0))]
         ));
+        let subtitled = PartPin {
+            subtitle: Some(2),
+            ..pin("a", None)
+        };
+        assert!(same_layout(
+            std::slice::from_ref(&subtitled),
+            &[pin("a", None)]
+        ));
+        assert_eq!(
+            serde_json::to_string(&subtitled).unwrap(),
+            r#"{"file":"a","revision":"r","duration_ms":1000,"subtitle":2}"#
+        );
         assert!(!same_layout(&[pin("a", None)], &[pin("b", None)]));
         assert!(!same_layout(
             &[pin("a", None)],
             &[pin("a", None), pin("b", None)]
         ));
-        // Absent audio serializes as before the field existed.
+        // Absent audio and subtitle serialize as before the field existed.
         assert_eq!(
             serde_json::to_string(&pin("a", None)).unwrap(),
             r#"{"file":"a","revision":"r","duration_ms":1000}"#

@@ -4632,6 +4632,242 @@ async fn multipart_versions_play_their_parts_in_order() {
     assert_eq!(fenced["status"], "failed", "{fenced}");
 }
 
+/// An explicitly chosen text subtitle of a multipart version is delivered
+/// across its parts: each part's own stream of the component, its cues moved
+/// by the parts before it into timeline time, as the live generation's
+/// subtitle rendition. A part without the component refuses the choice.
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_text_subtitles_are_joined_in_timeline_time() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    let captions = |name: &str, cues: &str| {
+        let path = f.dir.path().join(name);
+        std::fs::write(&path, cues).unwrap();
+        path
+    };
+    let first_cues = captions(
+        "first.srt",
+        "1\n00:00:01,000 --> 00:00:02,000\nfirst part\n\n2\n00:00:04,000 --> 00:00:05,000\nfirst late\n",
+    );
+    let second_cues = captions(
+        "second.srt",
+        "1\n00:00:01,000 --> 00:00:02,000\nsecond part\n",
+    );
+    for (name, cues) in [
+        ("a-part1.mp4", Some(&first_cues)),
+        ("b-part2.mp4", Some(&second_cues)),
+        ("c-nosubs.mp4", None),
+    ] {
+        let mut args = vec![
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100",
+        ];
+        if let Some(cues) = cues {
+            args.extend([
+                "-i",
+                cues.to_str().unwrap(),
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-map",
+                "2",
+            ]);
+            args.extend(["-c:s", "mov_text", "-metadata:s:s:0", "language=eng"]);
+        }
+        args.extend([
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+            "-metadata:s:a:0",
+            "language=eng",
+        ]);
+        f.media(name, &args);
+    }
+    f.scan().await;
+    let file = |name: &str| {
+        let db = f.server.app.db.clone();
+        let name = name.to_owned();
+        async move {
+            sqlx::query_as::<_, (String, String, f64)>(
+                "SELECT id,revision,duration_seconds FROM media_files WHERE relative_path=?",
+            )
+            .bind(name)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (first, _, first_seconds) = file("a-part1.mp4").await;
+    let (version, timeline): (String, String) = sqlx::query_as(
+        "SELECT v.id,v.timeline_id FROM media_versions v JOIN version_files b ON b.version_id=v.id WHERE b.file_id=?",
+    )
+    .bind(&first)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE media_files SET edition_id=(SELECT edition_id FROM media_files WHERE id=?) \
+         WHERE relative_path IN ('b-part2.mp4','c-nosubs.mp4')",
+    )
+    .bind(&first)
+    .execute(&f.server.app.db)
+    .await
+    .unwrap();
+    let bind_second = |name: &'static str| {
+        let db = f.server.app.db.clone();
+        let version = version.clone();
+        let file = file(name);
+        async move {
+            let (id, revision, _) = file.await;
+            sqlx::query("DELETE FROM version_files WHERE version_id=? AND part=2")
+                .bind(&version)
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO version_files(version_id,part,file_id,file_revision) VALUES (?,2,?,?)",
+            )
+            .bind(&version)
+            .bind(id)
+            .bind(revision)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+    };
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    // The English subtitle component, as the timeline's components name it.
+    let subtitle_component = || {
+        let db = f.server.app.db.clone();
+        let timeline = timeline.clone();
+        async move {
+            playscale::components::timeline_components(&db, &timeline)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|c| c.kind == playscale_core::components::Kind::Subtitle)
+                .unwrap()
+                .id
+        }
+    };
+    let plan = |policy: &'static str, modes: Value| {
+        let f = &f;
+        let auth = auth.clone();
+        let timeline = timeline.clone();
+        async move {
+            let mut input = plan_input("default", &timeline, "auto", None, &["hls"]);
+            input["tracks"]["subtitle_component_id"] = json!(subtitle_component().await);
+            input["tracks"]["subtitle_policy"] = json!(policy);
+            input["client"]["subtitle_modes"] = modes;
+            f.post("/api/v2/playback/plans", &auth, None, input).await
+        }
+    };
+    let text = || json!(["text", "hls_text"]);
+    // A part without the chosen subtitle component cannot carry it.
+    bind_second("c-nosubs.mp4").await;
+    let refused = plan("require", text()).await;
+    assert_eq!(
+        refused.body["reason_codes"][0], "subtitle_multipart_unavailable",
+        "{}",
+        refused.body
+    );
+    bind_second("b-part2.mp4").await;
+    let planned = plan("require", text()).await;
+    assert_eq!(
+        planned.body["operation"], "video_transcode",
+        "{}",
+        planned.body
+    );
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("multipart-subtitles-1"),
+            json!({"plan_token": planned.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let id = admitted.body["id"].as_str().unwrap().to_owned();
+    let done = f
+        .until(&id, &auth, |d| {
+            d["active"]["available_end_ms"].as_u64().unwrap_or(0) >= 11_800
+                || d["active"]["status"] == "failed"
+        })
+        .await;
+    assert_ne!(done["active"]["status"], "failed", "{done}");
+    let url = done["active"]["subtitles_url"].as_str().unwrap().to_owned();
+    let get = |path: String| {
+        let auth = auth.clone();
+        let f = &f;
+        async move {
+            let reply = f
+                .call("GET", &path, None, &[("authorization", &auth)])
+                .await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            String::from_utf8(reply.bytes).unwrap()
+        }
+    };
+    // Every segment of the rendition, its cues in media time.
+    let playlist = get(url).await;
+    let mut cues = std::collections::BTreeMap::new();
+    for name in playlist.lines().filter_map(|l| l.strip_prefix("../../")) {
+        let segment = get(format!("/api/v2/streams/{id}/1/{name}")).await;
+        for block in segment.split("\n\n").skip(1) {
+            let mut lines = block.lines();
+            let timing = lines.next().unwrap().to_owned();
+            cues.insert(lines.collect::<Vec<_>>().join("\n"), timing);
+        }
+    }
+    let origin = done["active"]["media_time_origin_ms"].as_u64().unwrap();
+    let at = |ms: u64| {
+        let ms = ms - origin;
+        let (s, ms) = (ms / 1000, ms % 1000);
+        format!("{:02}:{:02}:{:02}.{ms:03}", s / 3600, s / 60 % 60, s % 60)
+    };
+    // The second part's cue follows the first part's pinned duration.
+    let offset = (first_seconds * 1000.0) as u64;
+    assert_eq!(
+        cues.get("first part"),
+        Some(&format!("{} --> {}", at(1_000), at(2_000))),
+        "{cues:?}"
+    );
+    assert_eq!(
+        cues.get("first late"),
+        Some(&format!("{} --> {}", at(4_000), at(5_000))),
+        "{cues:?}"
+    );
+    assert_eq!(
+        cues.get("second part"),
+        Some(&format!(
+            "{} --> {}",
+            at(offset + 1_000),
+            at(offset + 2_000)
+        )),
+        "{cues:?}"
+    );
+    assert_eq!(cues.len(), 3, "{cues:?}");
+    // Burned subtitles are not delivered across parts.
+    let burned = plan("require", json!(["burned"])).await;
+    assert_eq!(burned.body["status"], "blocked", "{}", burned.body);
+}
+
 /// A bitrate cap is kept by a capped conversion: byte delivery cannot promise
 /// a peak, the encoder is VBV-limited below the cap, every published segment
 /// is measured within it, and the manifest advertises it. A cap too small to

@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C–3F not started | playback PR | Merge by user; then 3C |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented (review pending); rest of 3C and 3D–3F not started | playback PR, part-subtitles PR | Merge by user; then 3D |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -348,11 +348,60 @@ follow-up commit:
 
 Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
+### 3C (text). Subtitles across the parts of a multipart version
+
+- **Source SHA:** branch `plan-completion/part-subtitles`, stacked on 5A
+  (`plan-completion/offline-roots`).
+- **Implemented:** a film split across files can now play an explicitly
+  chosen text subtitle (SubRip, mov_text, WebVTT) across every part.
+  Previously any subtitle choice on a multipart version was refused
+  (`subtitle_multipart_unavailable`).
+  - The plan resolves the subtitle component to each part's own
+    occurrence. This uses the same rule as multipart audio
+    (`components::per_file_tracks`, generalised to `multipart_tracks`).
+  - The plan pins each part's stream in `PartPin.subtitle`. The field is
+    omitted when absent, so older pins serialize unchanged, and
+    `same_layout` ignores it.
+  - The delivery converts each part's stream from that part's validated
+    descriptor and checks each descriptor again after conversion.
+  - Core `subtitles::join_parts` moves each part's cues by the pinned
+    durations before it. A cue is cut at its part's end, and one starting
+    at or after the end is dropped.
+  - The joined WebVTT is served through the live subtitle rendition used
+    for single files.
+- **Still refused, with `subtitle_multipart_unavailable`:**
+  - a component missing from some part, or not text in every part;
+  - burned (bitmap or styled) subtitles across parts;
+  - sidecars;
+  - automatic selection, and `require` without an explicit choice.
+- **Core/adapter boundary:** two pure policies are in core:
+  - which stream each part delivers (`per_file_tracks`, exact
+    file-and-revision occurrences);
+  - how part cues map to timeline time (`join_parts`).
+
+  The adapter supplies probed streams and codecs and runs the converter.
+  Revision fencing of every part is unchanged: later parts are validated
+  sources, and a changed part fails the generation.
+- **Evidence:**
+  - Core lib: 149 passed. New: `join_parts` covers offsets, cutting at the
+    part end, dropping, an empty part and the round trip through
+    `parse_webvtt`. `same_layout` ignores the subtitle, and the pin
+    serializes compatibly.
+  - `playscale` lib: 68 passed.
+  - `v2_playback`: 29 passed. New:
+    `multipart_text_subtitles_are_joined_in_timeline_time` uses two real
+    MP4 parts with mov_text English subtitles. It reads every segment of
+    the live rendition: the second part's cue starts at the first part's
+    pinned duration plus 1 s, and the first part's cues are unchanged. A
+    part without the component, and a burned-only client, are refused.
+  - Pinned clippy with CI's flags: clean.
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
-| 3C per-part subtitles; bitmap cues before the 20 s lookback | Per-part subtitle occurrence; second validated descriptor for early cues |
+| 3C bitmap cues before the 20 s lookback; burned and automatic subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph; automatic selection over components present in every part |
 | 3D subtitle-inclusive preparation and audio-component selection | Preparation pins by component with stale-source fencing |
 | 3E bitrate preference and UI control | Contract preference field, bridge and player control |
 | 3F custom video-profile preparation UI | Validated form over `video_profile` |

@@ -4914,6 +4914,15 @@ async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<Pat
         }
         let pin = &d.generations[&generation].pin;
         match (pinned_subtitle(pin), pinned_sidecar(pin)) {
+            // A multipart timeline pins each part's occurrence of the text
+            // subtitle component.
+            (Some(_), _) if !pin.parts.is_empty() => SubtitleSource::Parts(
+                pin.parts
+                    .iter()
+                    .map(|p| Some((p.subtitle?, p.duration_ms)))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(ApiError::not_found)?,
+            ),
             (Some(index), _) => SubtitleSource::Embedded(index),
             (None, Some((fingerprint, name))) => SubtitleSource::Sidecar(Sidecar {
                 name: name.to_owned(),
@@ -4928,6 +4937,11 @@ async fn converted_subtitles(app: &App, id: &str, generation: u64) -> Result<Pat
             use sha2::{Digest, Sha256};
             let digest = Sha256::digest(format!("{}/{}", sidecar.fingerprint, sidecar.name));
             format!("subtitles-sidecar-{:x}.vtt", digest)
+        }
+        SubtitleSource::Parts(parts) => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("{parts:?}"));
+            format!("subtitles-parts-{:x}.vtt", digest)
         }
     };
     let path = app
@@ -5048,6 +5062,11 @@ enum SubtitleSource {
     Embedded(u32),
     /// A plain-text sidecar next to the delivered file.
     Sidecar(Sidecar),
+    /// A multipart timeline's text subtitle: each part's embedded subtitle
+    /// stream and pinned duration, in part order (the first part is the
+    /// session's source, the later ones its validated `parts`). Converted
+    /// part by part and joined in timeline time (`subtitles::join_parts`).
+    Parts(Vec<(u32, u64)>),
 }
 
 async fn ensure_subtitles(
@@ -5069,8 +5088,10 @@ async fn ensure_subtitles(
         .map_err(|_| subtitles_unavailable())?;
     // A sidecar is opened like the media file: under the same validated root,
     // and only while its fingerprint is still the pinned one.
-    let (source, format, map) = match &selected {
-        SubtitleSource::Embedded(index) => (session.source.clone(), None, format!("0:s:{index}")),
+    let text = match &selected {
+        SubtitleSource::Embedded(index) => {
+            convert_subtitle(&app, &session, session.source.clone(), None, *index).await?
+        }
         SubtitleSource::Sidecar(sidecar) => {
             let format = match sidecar
                 .name
@@ -5091,9 +5112,62 @@ async fn ensure_subtitles(
                 fingerprint: sidecar.fingerprint.clone(),
                 ..session.source.clone()
             };
-            (source, Some(format), "0:s:0".to_owned())
+            convert_subtitle(&app, &session, source, Some(format), 0).await?
+        }
+        SubtitleSource::Parts(parts) => {
+            if parts.len() != session.parts.len() + 1 {
+                return Err(ApiError::not_found());
+            }
+            let sources = std::iter::once(&session.source).chain(&session.parts);
+            let mut converted = Vec::with_capacity(parts.len());
+            for (source, (index, duration)) in sources.zip(parts) {
+                let text = convert_subtitle(&app, &session, source.clone(), None, *index).await?;
+                let cues = std::str::from_utf8(&text)
+                    .ok()
+                    .and_then(playscale_core::subtitles::parse_webvtt)
+                    .ok_or_else(subtitles_unavailable)?;
+                converted.push((cues, *duration));
+            }
+            let joined = playscale_core::subtitles::webvtt(&playscale_core::subtitles::join_parts(
+                &converted,
+            ));
+            if joined.len() as u64 > MAX_SUBTITLE_BYTES {
+                return Err(subtitles_unavailable());
+            }
+            joined.into_bytes()
         }
     };
+    // Publish into the existing delivery directory only: if cleanup removed it,
+    // the delivery is gone and nothing is resurrected.
+    let partial = path.with_extension("vtt.partial");
+    let written = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &text).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&partial, &path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::not_found());
+    }
+    Ok(())
+}
+
+/// Convert subtitle stream `index` of `source` (opened beneath its validated
+/// root, only while its fingerprint is the pinned one) to WebVTT in its file
+/// time, observing the descriptor again before the result is used.
+async fn convert_subtitle(
+    app: &App,
+    session: &Arc<Session>,
+    source: Source,
+    format: Option<&'static str>,
+    index: u32,
+) -> Result<Vec<u8>, ApiError> {
     let expected = source.fingerprint.clone();
     let opened = tokio::time::timeout(
         PROBE_DEADLINE,
@@ -5104,6 +5178,7 @@ async fn ensure_subtitles(
     .map_err(ApiError::internal)?;
     let input = opened
         .map_err(|_| ApiError::conflict("source_revision_changed", "Create a new delivery"))?;
+    let map = format!("0:s:{index}");
     let mut args = vec!["-v", "error", "-nostdin"];
     if let Some(format) = format {
         args.extend(["-f", format]);
@@ -5157,25 +5232,7 @@ async fn ensure_subtitles(
             "Create a new delivery",
         ));
     }
-    // Publish into the existing delivery directory only: if cleanup removed it,
-    // the delivery is gone and nothing is resurrected.
-    let partial = path.with_extension("vtt.partial");
-    let written = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .await?;
-        tokio::io::AsyncWriteExt::write_all(&mut file, &text).await?;
-        file.sync_all().await?;
-        tokio::fs::rename(&partial, &path).await
-    }
-    .await;
-    if written.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(ApiError::not_found());
-    }
-    Ok(())
+    Ok(text)
 }
 
 /// Extract (once per delivery) the embedded subtitle stream `index` as ASS

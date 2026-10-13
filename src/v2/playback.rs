@@ -553,8 +553,10 @@ async fn multipart_of(
                 file: row.id.clone(),
                 revision: row.revision.clone(),
                 duration_ms,
-                // Set from the plan's audio component (`multipart_audio`).
+                // Set from the plan's audio and subtitle components
+                // (`multipart_tracks`).
                 audio: None,
+                subtitle: None,
             })
             .collect();
         return Ok(Some(Bound {
@@ -1217,9 +1219,11 @@ pub async fn plan(
     // A multipart timeline plays the selected audio component in every part:
     // each part's own occurrence of it, never the first part's position.
     if let Some(audio) = audio.filter(|_| !bound.parts.is_empty()) {
-        match multipart_audio(&mut conn, &components, &bound, &streams, audio).await? {
+        use playscale_core::components::Kind;
+        match multipart_tracks(&mut conn, &components, &bound, Kind::Audio, &streams, audio).await?
+        {
             Some(per_part) => {
-                for (part, ordinal) in bound.parts.iter_mut().zip(per_part) {
+                for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
                     part.audio = Some(ordinal);
                 }
             }
@@ -1229,15 +1233,42 @@ pub async fn plan(
         }
     }
     let explicit = cs.or(sub);
-    // Subtitle streams and sidecars belong to one file: a multipart timeline
-    // has no subtitle to deliver across its parts yet.
+    // A multipart timeline delivers an explicitly chosen embedded text
+    // subtitle that occurs in every part: each part's own stream, joined in
+    // timeline time. Sidecars, burned subtitles and automatic selection
+    // belong to one file and are not delivered across parts yet.
     let multipart = !bound.parts.is_empty();
     if multipart
-        && (explicit.is_some()
-            || sidecar_name.is_some()
-            || input.tracks.subtitle_policy == "require")
+        && (sidecar_name.is_some()
+            || (explicit.is_none() && input.tracks.subtitle_policy == "require"))
     {
         return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
+    if let Some(chosen) = explicit.filter(|_| multipart) {
+        use playscale_core::components::Kind;
+        match multipart_tracks(
+            &mut conn,
+            &components,
+            &bound,
+            Kind::Subtitle,
+            &streams,
+            chosen,
+        )
+        .await?
+        {
+            Some(per_part)
+                if per_part
+                    .iter()
+                    .all(|(_, codec)| playscale_core::delivery::sidecar_subtitle(codec)) =>
+            {
+                for (part, (ordinal, _)) in bound.parts.iter_mut().zip(per_part) {
+                    part.subtitle = Some(ordinal);
+                }
+            }
+            _ => {
+                return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+            }
+        }
     }
     // An explicit choice (embedded or sidecar) conflicts with "off".
     if input.tracks.subtitle_policy == "off" && (explicit.is_some() || sidecar_name.is_some()) {
@@ -1352,6 +1383,10 @@ pub async fn plan(
         Ok(resolved) => resolved,
         Err(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
     };
+    // Across parts a subtitle is only delivered as text, never burned.
+    if multipart && burn.is_some() {
+        return Ok(Json(blocked(&input, "subtitle_multipart_unavailable")).into_response());
+    }
     let height = streams
         .iter()
         .find(|t| t.kind == "video")
@@ -1723,28 +1758,34 @@ async fn may_probe(
     .map_err(plan_problem)
 }
 
-/// The audio stream ordinal, in each part of a multipart binding, of the
-/// component that the first part's audio stream `audio` belongs to. None when
-/// that component has no single occurrence in some part.
-async fn multipart_audio(
+/// The stream ordinal of `kind` (audio or subtitle), in each part of a
+/// multipart binding, of the component that the first part's stream
+/// `ordinal` belongs to, with that stream's codec. None when that component
+/// has no single embedded occurrence in some part.
+async fn multipart_tracks(
     conn: &mut sqlx::SqliteConnection,
     components: &[playscale_core::components::Component],
     bound: &Bound,
+    kind: playscale_core::components::Kind,
     streams: &[db::Track],
-    audio: u32,
-) -> Result<Option<Vec<u32>>, Problem> {
+    ordinal: u32,
+) -> Result<Option<Vec<(u32, String)>>, Problem> {
     use playscale_core::components::{Kind, component_of, per_file_tracks};
+    let name = match kind {
+        Kind::Audio => "audio",
+        Kind::Subtitle => "subtitle",
+    };
     let Some(index) = streams
         .iter()
-        .filter(|t| t.kind == "audio")
-        .nth(audio as usize)
+        .filter(|t| t.kind == name)
+        .nth(ordinal as usize)
         .map(|t| t.index)
     else {
         return Ok(None);
     };
     let Some(component) = component_of(
         components,
-        Kind::Audio,
+        kind,
         &bound.version,
         &bound.file.id,
         &bound.file.revision,
@@ -1768,14 +1809,15 @@ async fn multipart_audio(
             .await?;
         let part_streams: Vec<db::Track> =
             serde_json::from_str(&json).map_err(Problem::internal)?;
-        let Some(ordinal) = part_streams
+        let Some((ordinal, stream)) = part_streams
             .iter()
-            .filter(|t| t.kind == "audio")
-            .position(|t| t.index == track)
+            .filter(|t| t.kind == name)
+            .enumerate()
+            .find(|(_, t)| t.index == track)
         else {
             return Ok(None);
         };
-        ordinals.push(ordinal as u32);
+        ordinals.push((ordinal as u32, stream.codec.clone()));
     }
     Ok(Some(ordinals))
 }
