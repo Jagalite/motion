@@ -81,11 +81,22 @@ def backup(data, output):
 
 
 def rotate_restore_epoch(database):
-    """A restored database has a different history: event cursors issued
-    against the original must reset rather than resume overlapping positions."""
+    """Start a new history and withdraw every saved grant atomically.
+
+    Post-snapshot revocations cannot be recovered from a backup. Device records
+    remain for audit, but restored devices must be paired again. Older schemas
+    may not yet contain all authority tables.
+    """
     with sqlite3.connect(database) as db:
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_identity'").fetchone():
+        db.execute('PRAGMA foreign_keys=ON')
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'server_identity' in tables:
             db.execute("UPDATE server_identity SET restore_epoch=lower(hex(randomblob(16)))")
+        for table in ('content_tickets', 'pairings', 'idempotency_records', 'credentials'):
+            if table in tables:
+                db.execute(f'DELETE FROM {table}')
+        if 'devices' in tables:
+            db.execute('UPDATE devices SET revoked=1')
     db.close()
 
 

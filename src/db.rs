@@ -593,6 +593,10 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
     if let Some(parent) = destination.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    // The final path must not become bootable until authority withdrawal commits.
+    // VACUUM creates this unique staging file exclusively; publication below also
+    // refuses an existing destination even if it appeared during the restore.
+    let staging = destination.with_file_name(format!(".motion-restore-{}.sqlite", new_id()));
     // Copy through SQLite so committed WAL content is included and the
     // destination is a single clean file, never a torn file-level copy.
     {
@@ -602,15 +606,15 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         )
         .await?;
         sqlx::query("VACUUM INTO ?")
-            .bind(destination.to_str().context("destination must be UTF-8")?)
+            .bind(staging.to_str().context("destination must be UTF-8")?)
             .execute(&mut source)
             .await?;
         source.close().await?;
     }
-    let restored = match connect(destination).await {
+    let restored = match connect(&staging).await {
         Ok(db) => db,
         Err(error) => {
-            let _ = tokio::fs::remove_file(destination).await;
+            let _ = tokio::fs::remove_file(&staging).await;
             return Err(error.context("restored database could not be upgraded"));
         }
     };
@@ -624,23 +628,28 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         integrity == "ok" && dangling.is_empty(),
         "restored database failed integrity checks"
     );
-    let has_identity: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='server_identity'",
-    )
-    .fetch_one(&restored)
-    .await?;
-    let restore_epoch = if has_identity > 0 {
-        let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
-            .fetch_one(&restored)
-            .await?;
-        sqlx::query("UPDATE server_identity SET restore_epoch=?")
-            .bind(&epoch)
-            .execute(&restored)
-            .await?;
-        Some(epoch)
-    } else {
-        None
-    };
+    // A snapshot cannot prove which grants were revoked after it was taken.
+    // Restore therefore withdraws all saved authority; devices must pair again.
+    // Keep audit identities and user data, and commit invalidation with the epoch.
+    let mut authority = restored.begin().await?;
+    let epoch: String = sqlx::query_scalar("SELECT lower(hex(randomblob(16)))")
+        .fetch_one(&mut *authority)
+        .await?;
+    sqlx::query("UPDATE server_identity SET restore_epoch=?")
+        .bind(&epoch)
+        .execute(&mut *authority)
+        .await?;
+    for statement in [
+        "DELETE FROM content_tickets",
+        "DELETE FROM pairings",
+        "DELETE FROM idempotency_records",
+        "DELETE FROM credentials",
+        "UPDATE devices SET revoked=1",
+    ] {
+        sqlx::query(statement).execute(&mut *authority).await?;
+    }
+    authority.commit().await?;
+    let restore_epoch = Some(epoch);
     let schema_version: i64 =
         sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success=1")
             .fetch_one(&restored)
@@ -658,6 +667,18 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         .bind(serde_json::to_string(&receipt)?)
         .execute(&restored)
         .await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&restored)
+        .await?;
     restored.close().await;
+    tokio::fs::File::open(&staging).await?.sync_all().await?;
+    // A hard link publishes atomically without replacing a concurrent destination.
+    tokio::fs::hard_link(&staging, destination).await?;
+    tokio::fs::remove_file(&staging).await?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    tokio::fs::File::open(parent).await?.sync_all().await?;
     Ok(receipt)
 }

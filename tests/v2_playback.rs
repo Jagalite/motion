@@ -1267,6 +1267,16 @@ async fn restart_fences_deliveries_but_keeps_progress_and_drains_the_outbox() {
         restored_epoch,
         identity_before["restore_epoch"].as_str().unwrap()
     );
+    let denied = restored
+        .call("GET", "/api/v2/profiles", None, &[("authorization", &auth)])
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::UNAUTHORIZED,
+        "restored credentials must be paired again"
+    );
+    // The operator can still exercise the independent history-epoch fence.
+    let auth = bearer(OPERATOR);
     for (method, target, body, extra) in [
         (
             "POST",
