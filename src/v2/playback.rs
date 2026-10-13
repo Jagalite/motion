@@ -1336,7 +1336,7 @@ pub async fn plan(
                 language: c.language.clone(),
                 roles: c.roles.clone(),
                 deliverable: c.deliverable
-                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text)),
+                    && route.is_none_or(|r| core::presents_subtitle(r, c.burned, live_text, false)),
             })
             .collect();
         let mode = match preferences.subtitle_mode.as_str() {
@@ -1452,7 +1452,18 @@ pub async fn plan(
     let audio_chosen = input.tracks.audio_track_id.is_some()
         || input.tracks.audio_component_id.is_some()
         || audio != default_audio;
-    let subtitle_selected = subtitle.is_some() || sidecar.is_some() || burn.is_some();
+    use playscale_core::processing::{Wanted, WantedSubtitle};
+    let wanted = Wanted {
+        audio,
+        audio_chosen,
+        default_audio,
+        subtitle: match (subtitle, &sidecar, &burn) {
+            (None, None, None) => WantedSubtitle::None,
+            // A text subtitle presented as text; a rendition may carry it.
+            (Some(index), None, None) => WantedSubtitle::Text(index),
+            _ => WantedSubtitle::Other,
+        },
+    };
     let mut carries = Vec::with_capacity(prepared.len());
     for p in &prepared {
         let recorded: Option<(String, String, String)> = sqlx::query_as(
@@ -1462,35 +1473,36 @@ pub async fn plan(
         .bind(&p.file.id)
         .fetch_optional(&mut *conn)
         .await?;
-        let encoded = recorded
-            .filter(|(file, revision, _)| {
-                *file == bound.file.id && *revision == bound.file.revision
+        use playscale_core::processing::{Carried, Encoded};
+        let ordinal = |id: Option<String>, prefix: char| -> Result<Option<u32>, ()> {
+            id.map(|id| {
+                id.strip_prefix(prefix)
+                    .and_then(|n| n.parse().ok())
+                    .ok_or(())
             })
-            .and_then(|(_, _, tracks)| {
-                serde_json::from_str::<super::processing::Tracks>(&tracks).ok()
-            })
-            .map(|tracks| match tracks.audio_track_id {
-                // `a{n}`: the n-th audio stream of the source revision; an
-                // unreadable record describes nothing.
-                Some(id) => id
-                    .strip_prefix('a')
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .map(Some)
-                    .ok_or(()),
-                // No selection: the recipe encodes the first audio stream,
-                // or none when the source has no audio.
-                None => Ok(default_audio),
-            });
+            .transpose()
+        };
+        // `a{n}` and `s{n}`: streams of the source revision the preparation
+        // recorded; an unreadable record describes nothing.
+        let carried = match recorded.filter(|(file, revision, _)| {
+            *file == bound.file.id && *revision == bound.file.revision
+        }) {
+            None => Carried::Unrecorded,
+            Some((_, _, tracks)) => serde_json::from_str::<super::processing::Tracks>(&tracks)
+                .ok()
+                .and_then(|tracks| {
+                    Some(Encoded {
+                        audio: ordinal(tracks.audio_track_id, 'a').ok()?,
+                        subtitle: ordinal(tracks.subtitle_track_id, 's').ok()?,
+                    })
+                })
+                .map_or(Carried::Unreadable, Carried::Encoded),
+        };
         // A pinned version plays its own default streams (track and component
         // pins were refused above).
         carries.push(
-            !subtitle_selected
-                && (pinned_prepared
-                    || match encoded {
-                        Some(Ok(encoded)) => encoded == audio,
-                        Some(Err(())) => false,
-                        None => !audio_chosen,
-                    }),
+            (pinned_prepared && wanted.subtitle == WantedSubtitle::None)
+                || playscale_core::processing::carries(carried, wanted),
         );
     }
     let mut source = core::SourceFacts {
@@ -1566,16 +1578,36 @@ pub async fn plan(
             ));
         }
     }
-    // A prepared plan pins the chosen rendition and plays its default streams.
-    let (route, chosen, audio) = match decided {
-        core::Plan::Ready(route) => (route, bound, audio),
+    // A prepared plan pins the chosen rendition and plays its default streams:
+    // its only audio and, when it carries the selected text subtitle
+    // (`processing::carries`), its only subtitle.
+    let (route, chosen, audio, subtitle) = match decided {
+        core::Plan::Ready(route) => (route, bound, audio, subtitle),
         core::Plan::Prepared(i) => {
             let p = prepared
                 .into_iter()
                 .nth(i)
                 .ok_or_else(|| Problem::internal("prepared plan without rendition"))?;
             let audio = first_audio(&p.file);
-            (Route::Prepared, p, audio)
+            let subtitle = match subtitle {
+                None => None,
+                Some(_) => {
+                    let streams: Vec<db::Track> =
+                        serde_json::from_str(&p.file.tracks_json).map_err(Problem::internal)?;
+                    let subtitles: Vec<&db::Track> =
+                        streams.iter().filter(|t| t.kind == "subtitle").collect();
+                    match subtitles.as_slice() {
+                        [only] if playscale_core::delivery::sidecar_subtitle(&only.codec) => {
+                            Some(0)
+                        }
+                        _ => {
+                            return Ok(Json(blocked(&input, "subtitle_conversion_unavailable"))
+                                .into_response());
+                        }
+                    }
+                }
+            };
+            (Route::Prepared, p, audio, subtitle)
         }
         core::Plan::Blocked(reason) => return Ok(Json(blocked(&input, reason)).into_response()),
         core::Plan::Observe => return Err(Problem::internal("undecided plan")),
@@ -1584,8 +1616,9 @@ pub async fn plan(
     // original, or an HLS subtitle rendition on a live route for a client that
     // selects in-manifest live text. Shaka refuses an external text track on a
     // live presentation. Text burned in by libass (`burn`) is a conversion.
+    // A prepared rendition presents only the text subtitle it carries.
     if (subtitle.is_some() || sidecar.is_some())
-        && !core::presents_subtitle(route, false, live_text)
+        && !core::presents_subtitle(route, false, live_text, sidecar.is_none())
     {
         return Ok(Json(blocked(&input, "subtitle_conversion_unavailable")).into_response());
     }

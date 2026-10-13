@@ -4132,6 +4132,265 @@ async fn prepared_renditions_serve_exactly_the_audio_they_were_prepared_from() {
     assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "22050");
 }
 
+/// A preparation keeps the selected audio component and an explicitly chosen
+/// text subtitle of its exact source revision. Playback serves that rendition
+/// only for exactly that selection, delivering the subtitle from the
+/// rendition's own bytes; other selections are never substituted.
+#[tokio::test(flavor = "multi_thread")]
+async fn preparations_keep_the_selected_audio_component_and_text_subtitle() {
+    if !tools_available() {
+        eprintln!("SKIPPED: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let f = Fixture::new().await;
+    two_audio_mp4(&f, "6");
+    let original = f.dir.path().join("base.mp4");
+    std::fs::rename(f.dir.path().join("media/film.mp4"), &original).unwrap();
+    let srt = f.dir.path().join("captions.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nKept caption\n").unwrap();
+    f.media(
+        "film.mp4",
+        &[
+            "-i",
+            original.to_str().unwrap(),
+            "-i",
+            srt.to_str().unwrap(),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:a:0",
+            "language=eng",
+            "-metadata:s:a:1",
+            "language=jpn",
+            "-metadata:s:s:0",
+            "language=eng",
+        ],
+    );
+    f.scan().await;
+    let (timeline, _) = f.timeline().await;
+    let (_, auth) = f.device(&["default"], PLAYER).await;
+    let source = f.source().await;
+    let components = playscale::components::timeline_components(&f.server.app.db, &timeline)
+        .await
+        .unwrap();
+    let component = |kind, language: &str| {
+        components
+            .iter()
+            .find(|c| c.kind == kind && c.language.as_deref() == Some(language))
+            .unwrap()
+            .id
+            .clone()
+    };
+    use playscale_core::components::Kind;
+    let japanese = component(Kind::Audio, "jpn");
+    let captions = component(Kind::Subtitle, "eng");
+    let operator = bearer(OPERATOR);
+    let prepare = |tracks: Value, key: &'static str| {
+        let f = &f;
+        let operator = operator.clone();
+        let source = source.clone();
+        let timeline = timeline.clone();
+        async move {
+            f.post(
+                "/api/v2/processing/preparations",
+                &operator,
+                Some(key),
+                json!({"source": source, "timeline_id": timeline, "recipe_id": "remux_mp4",
+                    "tracks": tracks}),
+            )
+            .await
+        }
+    };
+    let tracks = |audio_component: Value,
+                  subtitle_component: Value,
+                  policy: &str,
+                  audio: Value,
+                  subtitle: Value| {
+        json!({"audio_component_id": audio_component, "subtitle_component_id": subtitle_component,
+            "subtitle_policy": policy, "audio_track_id": audio, "subtitle_track_id": subtitle})
+    };
+    // Refused: automatic subtitles, an explicit one with off, disagreeing
+    // pins, a component absent from this revision.
+    for (selection, status, code, key) in [
+        (
+            tracks(Value::Null, Value::Null, "auto", Value::Null, Value::Null),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "preparation_tracks_unsupported",
+            "prepare-refused-000001",
+        ),
+        (
+            tracks(
+                Value::Null,
+                json!(captions),
+                "off",
+                Value::Null,
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "subtitle_policy_conflict",
+            "prepare-refused-000002",
+        ),
+        (
+            tracks(
+                json!(japanese),
+                Value::Null,
+                "off",
+                json!("a0"),
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "track_component_conflict",
+            "prepare-refused-000003",
+        ),
+        (
+            tracks(
+                json!("not-a-component"),
+                Value::Null,
+                "off",
+                Value::Null,
+                Value::Null,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "component_unavailable",
+            "prepare-refused-000004",
+        ),
+    ] {
+        problem(&prepare(selection, key).await, status, code);
+    }
+    let prepared = prepare(
+        tracks(
+            json!(japanese),
+            json!(captions),
+            "require",
+            Value::Null,
+            Value::Null,
+        ),
+        "prepare-component-subtitle-1",
+    )
+    .await;
+    assert_eq!(prepared.status, StatusCode::ACCEPTED, "{}", prepared.body);
+    let job = prepared.body["id"].as_str().unwrap().to_owned();
+    // The record names the streams of this revision the components resolved to.
+    let recorded: String =
+        sqlx::query_scalar("SELECT tracks_json FROM preparations WHERE job_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    let recorded: Value = serde_json::from_str(&recorded).unwrap();
+    assert_eq!(
+        (&recorded["audio_track_id"], &recorded["subtitle_track_id"]),
+        (&json!("a1"), &json!("s0")),
+        "{recorded}"
+    );
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(playscale::processing::worker(
+        f.server.app.clone(),
+        stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let (phase, error): (String, Option<String>) =
+                sqlx::query_as("SELECT phase,error FROM processing_jobs WHERE id=?")
+                    .bind(&job)
+                    .fetch_one(&f.server.app.db)
+                    .await
+                    .unwrap();
+            if phase == "completed" {
+                break;
+            }
+            assert!(
+                !["failed", "cancelled"].contains(&phase.as_str()),
+                "{phase} {error:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("preparation did not complete");
+    stop.cancel();
+    let _ = worker.await;
+    let rendition: String =
+        sqlx::query_scalar("SELECT file_id FROM renditions WHERE external_id=?")
+            .bind(&job)
+            .fetch_one(&f.server.app.db)
+            .await
+            .unwrap();
+    // The rendition holds the Japanese (22.05 kHz) audio and one mov_text subtitle.
+    let path: (String, String) = sqlx::query_as(
+        "SELECT l.root,f.relative_path FROM media_files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?",
+    )
+    .bind(&rendition)
+    .fetch_one(&f.server.app.db)
+    .await
+    .unwrap();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,sample_rate",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(Path::new(&path.0).join(&path.1))
+        .output()
+        .unwrap();
+    let streams = String::from_utf8(probe.stdout).unwrap();
+    assert!(streams.contains("aac,audio,22050"), "{streams}");
+    assert_eq!(streams.matches(",audio,").count(), 1, "{streams}");
+    assert_eq!(streams.matches("mov_text,subtitle").count(), 1, "{streams}");
+    let plan = |audio: &str, subtitle: Option<&str>| {
+        let mut input = pinned_plan_input(
+            "default",
+            &timeline,
+            "convert",
+            audio,
+            &["http_range", "hls"],
+            &source,
+        );
+        input["tracks"]["subtitle_track_id"] = json!(subtitle);
+        input["tracks"]["subtitle_policy"] =
+            json!(if subtitle.is_some() { "require" } else { "off" });
+        f.post("/api/v2/playback/plans", &auth, None, input)
+    };
+    // Exactly the prepared selection: the rendition, with its own subtitle.
+    let kept = plan("a1", Some("s0")).await;
+    assert_eq!(kept.body["operation"], "prepared", "{}", kept.body);
+    assert_eq!(kept.body["source"]["file_id"], rendition.as_str());
+    // Without the subtitle, or with other audio: never the rendition.
+    for (audio, subtitle) in [("a1", None), ("a0", Some("s0"))] {
+        let other = plan(audio, subtitle).await;
+        assert_ne!(other.body["operation"], "prepared", "{}", other.body);
+    }
+    // The subtitle is delivered from the rendition's bytes.
+    let admitted = f
+        .post(
+            "/api/v2/playback/delivery-sessions",
+            &auth,
+            Some("prepared-subtitles-01"),
+            json!({"plan_token": kept.body["plan_token"], "start_ms": 0}),
+        )
+        .await;
+    assert_eq!(admitted.status, StatusCode::CREATED, "{}", admitted.body);
+    let url = admitted.body["active"]["subtitles_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}", admitted.body))
+        .to_owned();
+    let vtt = f.call("GET", &url, None, &[("authorization", &auth)]).await;
+    assert_eq!(vtt.status, StatusCode::OK);
+    let vtt = String::from_utf8(vtt.bytes).unwrap();
+    assert!(
+        vtt.contains("00:01.000 --> 00:03.000") && vtt.contains("Kept caption"),
+        "{vtt}"
+    );
+}
+
 /// One gray frame of `path` at `at` seconds (320x240 sources).
 fn gray_frame(path: &Path, at: &str) -> Vec<u8> {
     let frame = Command::new("ffmpeg")

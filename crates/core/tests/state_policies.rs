@@ -402,6 +402,7 @@ fn output_observations_must_meet_duration_track_codec_and_budget_rules() {
             max_height: 720,
             frame_rate: Some(30.0),
         }),
+        subtitle: false,
     };
     let mut observation = OutputObservation {
         bytes: 100,
@@ -423,6 +424,39 @@ fn output_observations_must_meet_duration_track_codec_and_budget_rules() {
     }];
     observation.tracks = &wrong;
     assert!(validate_output(&observation, &requirements).is_err());
+    // A selected text subtitle must be in the output exactly once, as
+    // mov_text; without a selection no subtitle may be.
+    let subtitle = |codec: &str| Track {
+        kind: "subtitle".into(),
+        codec: codec.into(),
+        width: None,
+        height: None,
+        frame_rate: None,
+    };
+    let with = vec![tracks[0].clone(), subtitle("mov_text")];
+    let twice = vec![
+        tracks[0].clone(),
+        subtitle("mov_text"),
+        subtitle("mov_text"),
+    ];
+    let other = vec![tracks[0].clone(), subtitle("subrip")];
+    observation.tracks = &with;
+    assert_eq!(
+        validate_output(&observation, &requirements),
+        Err("output carries an unselected subtitle")
+    );
+    let requirements = OutputRequirements {
+        subtitle: true,
+        ..requirements
+    };
+    assert!(validate_output(&observation, &requirements).is_ok());
+    for tracks in [&tracks, &twice, &other] {
+        observation.tracks = tracks;
+        assert_eq!(
+            validate_output(&observation, &requirements),
+            Err("output lost required track")
+        );
+    }
 }
 
 #[test]

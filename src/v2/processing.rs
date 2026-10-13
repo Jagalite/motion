@@ -290,6 +290,134 @@ pub(crate) async fn publication_facts(
     )))
 }
 
+/// Resolve a preparation's track selection on the exact source revision:
+/// components to their occurrence on that file and revision (never another
+/// file or language), positional pins checked against its streams, and the
+/// two agreeing when both are given. Returns the record the worker encodes
+/// and playback matches (`processing::carries`): `a{n}` and `s{n}` ordinals
+/// of the revision, with the requested components.
+async fn selection(
+    app: &App,
+    conn: &mut sqlx::SqliteConnection,
+    timeline: &str,
+    source: &FileRef,
+    streams: &[crate::db::Track],
+    requested: Tracks,
+) -> Result<Tracks, Problem> {
+    use playscale_core::components::{
+        Kind, SubtitleOccurrence, embedded_track, subtitle_occurrence,
+    };
+    let version: String = sqlx::query_scalar(
+        "SELECT v.id FROM version_files b JOIN media_versions v ON v.id=b.version_id \
+         WHERE v.timeline_id=? AND b.file_id=? AND b.file_revision=? AND v.origin='original' \
+         ORDER BY v.id LIMIT 1",
+    )
+    .bind(timeline)
+    .bind(&source.file_id)
+    .bind(&source.file_revision)
+    .fetch_one(&mut *conn)
+    .await?;
+    let components =
+        if requested.audio_component_id.is_some() || requested.subtitle_component_id.is_some() {
+            crate::components::timeline_components(&app.db, timeline)
+                .await
+                .map_err(Problem::internal)?
+        } else {
+            vec![]
+        };
+    let ordinal = |kind: &str, index: i64| -> Option<u32> {
+        streams
+            .iter()
+            .filter(|t| t.kind == kind)
+            .position(|t| t.index == index)
+            .map(|i| i as u32)
+    };
+    let unavailable = || {
+        Problem::invalid(
+            "component_unavailable",
+            "The component does not occur in this source revision",
+        )
+    };
+    let conflict = || {
+        Problem::invalid(
+            "track_component_conflict",
+            "The track and component pins disagree",
+        )
+    };
+    let count = |kind: &str| streams.iter().filter(|t| t.kind == kind).count();
+    let audio_track = super::playback::track_index(&requested.audio_track_id, 'a', count("audio"))?;
+    let audio_component = match &requested.audio_component_id {
+        None => None,
+        Some(id) => Some(
+            embedded_track(
+                &components,
+                id,
+                Kind::Audio,
+                &version,
+                &source.file_id,
+                &source.file_revision,
+            )
+            .and_then(|index| ordinal("audio", index))
+            .ok_or_else(unavailable)?,
+        ),
+    };
+    if audio_track
+        .zip(audio_component)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(conflict());
+    }
+    let subtitle_track =
+        super::playback::track_index(&requested.subtitle_track_id, 's', count("subtitle"))?;
+    let subtitle_component = match &requested.subtitle_component_id {
+        None => None,
+        Some(id) => match subtitle_occurrence(
+            &components,
+            id,
+            &version,
+            &source.file_id,
+            &source.file_revision,
+        ) {
+            Some(SubtitleOccurrence::Embedded(index)) => {
+                Some(ordinal("subtitle", index).ok_or_else(unavailable)?)
+            }
+            Some(SubtitleOccurrence::Sidecar(_)) => {
+                return Err(Problem::invalid(
+                    "preparation_subtitle_unsupported",
+                    "A preparation keeps only an embedded text subtitle",
+                ));
+            }
+            None => return Err(unavailable()),
+        },
+    };
+    if subtitle_track
+        .zip(subtitle_component)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(conflict());
+    }
+    let subtitle = subtitle_track.or(subtitle_component);
+    // Only text survives as an MP4 subtitle (mov_text) without changing its
+    // meaning; bitmap and styled subtitles would need burning in.
+    if let Some(n) = subtitle
+        && !streams
+            .iter()
+            .filter(|t| t.kind == "subtitle")
+            .nth(n as usize)
+            .is_some_and(|t| playscale_core::delivery::sidecar_subtitle(&t.codec))
+    {
+        return Err(Problem::invalid(
+            "preparation_subtitle_unsupported",
+            "A preparation keeps only an embedded text subtitle (SubRip, mov_text or WebVTT)",
+        ));
+    }
+    Ok(Tracks {
+        audio_track_id: audio_track.or(audio_component).map(|n| format!("a{n}")),
+        subtitle_track_id: subtitle.map(|n| format!("s{n}")),
+        ..requested
+    })
+}
+
 async fn prepare(
     State(app): State<App>,
     caller: Caller,
@@ -339,15 +467,25 @@ async fn prepare(
             "Unknown subtitle policy",
         ));
     }
-    if input.tracks.audio_component_id.is_some()
-        || input.tracks.subtitle_component_id.is_some()
-        || input.tracks.subtitle_track_id.is_some()
-        || input.tracks.subtitle_policy != "off"
-    {
-        return Err(Problem::invalid(
-            "preparation_tracks_unsupported",
-            "Preparation currently requires subtitle_policy off and no component or subtitle selection",
-        ));
+    // A preparation encodes streams of its exact source revision: the chosen
+    // audio and, with `require`, one explicitly chosen text subtitle.
+    // Automatic subtitle selection depends on a profile, not a rendition.
+    let explicit_subtitle =
+        input.tracks.subtitle_component_id.is_some() || input.tracks.subtitle_track_id.is_some();
+    match (input.tracks.subtitle_policy.as_str(), explicit_subtitle) {
+        ("off", false) | ("require", true) => {}
+        ("off", true) => {
+            return Err(Problem::invalid(
+                "subtitle_policy_conflict",
+                "Explicit subtitles conflict with off",
+            ));
+        }
+        _ => {
+            return Err(Problem::invalid(
+                "preparation_tracks_unsupported",
+                "A preparation keeps a subtitle only when one is chosen explicitly with require",
+            ));
+        }
     }
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
@@ -441,11 +579,15 @@ async fn prepare(
             "Source is shorter than half a requested frame interval",
         ));
     }
-    super::playback::track_index(
-        &input.tracks.audio_track_id,
-        'a',
-        tracks.iter().filter(|t| t.kind == "audio").count(),
-    )?;
+    let tracks_record = selection(
+        &app,
+        &mut tx,
+        &input.timeline_id,
+        &input.source,
+        &tracks,
+        input.tracks,
+    )
+    .await?;
     let queued: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM processing_jobs WHERE phase IN ('queued','running','cancelling')",
     )
@@ -460,7 +602,7 @@ async fn prepare(
     }
     let id = crate::new_id();
     sqlx::query("INSERT INTO processing_jobs(id,source_file_id,source_revision,recipe,backend,idempotency_key,phase,created_at,updated_at,requester_id,video_profile) VALUES (?,?,?,?,?,?,'queued',?,?,?,?)").bind(&id).bind(&input.source.file_id).bind(&input.source.file_revision).bind(&input.recipe_id).bind(&input.backend).bind(format!("v2-{id}")).bind(crate::now()).bind(crate::now()).bind(&principal.id).bind(input.video_profile.as_ref().map(sqlx::types::Json)).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&input.tracks).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO preparations(job_id,timeline_id,recipe_digest,tracks_json,credential_hash,ingress_id) VALUES (?,?,?,?,?,?)").bind(&id).bind(&input.timeline_id).bind(&digest).bind(serde_json::to_string(&tracks_record).map_err(Problem::internal)?).bind(caller.credential.as_ref().map(|(hash,_)|hash)).bind(&caller.ingress).execute(&mut *tx).await?;
     let value = super::jobs::row(&mut tx, &id, &principal).await?.wire();
     record
         .save(

@@ -735,20 +735,33 @@ async fn convert(
             .await?;
     let selected: Option<crate::v2::processing::Tracks> =
         selected.as_deref().map(serde_json::from_str).transpose()?;
-    let audio = selected
-        .and_then(|tracks| tracks.audio_track_id)
-        .map(|id| format!("0:a:{}", &id[1..]))
-        .unwrap_or_else(|| "0:a:0?".into());
-    cmd.args([
-        "-map",
-        "0:v:0?",
-        "-map",
-        &audio,
-        "-sn",
-        "-dn",
-        "-map_metadata",
-        "-1",
-    ]);
+    // The request recorded the selection resolved on this source revision
+    // (`v2::processing`): `a{n}` and `s{n}` stream ordinals.
+    let ordinal = |id: Option<&String>, prefix: char| -> anyhow::Result<Option<u32>> {
+        id.map(|id| {
+            id.strip_prefix(prefix)
+                .and_then(|n| n.parse().ok())
+                .context("unreadable track selection")
+        })
+        .transpose()
+    };
+    let audio = ordinal(
+        selected.as_ref().and_then(|t| t.audio_track_id.as_ref()),
+        'a',
+    )?
+    .map(|n| format!("0:a:{n}"))
+    .unwrap_or_else(|| "0:a:0?".into());
+    let subtitle = ordinal(
+        selected.as_ref().and_then(|t| t.subtitle_track_id.as_ref()),
+        's',
+    )?;
+    cmd.args(["-map", "0:v:0?", "-map", &audio]);
+    match subtitle {
+        // A selected text subtitle is kept as the output's only subtitle.
+        Some(n) => cmd.args(["-map", &format!("0:s:{n}")]),
+        None => cmd.arg("-sn"),
+    };
+    cmd.args(["-dn", "-map_metadata", "-1"]);
     match job.recipe.as_str() {
         "remux_mp4" => {
             cmd.args(["-c", "copy"]);
@@ -776,6 +789,10 @@ async fn convert(
             cmd.args(profile.arguments(job.backend == "videotoolbox"));
         }
         _ => anyhow::bail!("unknown recipe"),
+    }
+    if subtitle.is_some() {
+        // After the recipe's codecs: MP4 carries text subtitles as mov_text.
+        cmd.args(["-c:s", "mov_text"]);
     }
     cmd.args(["-movflags", "+faststart", "-fs"])
         .arg(app.processing.settings.max_output_bytes.to_string())
@@ -832,6 +849,7 @@ async fn convert(
                     frame_rate: p.frame_rate.as_ref().and_then(|r| r.value()),
                 }
             }),
+            subtitle: subtitle.is_some(),
         },
     )
     .map_err(anyhow::Error::msg)?;

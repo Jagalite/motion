@@ -89,6 +89,9 @@ pub struct OutputRequirements<'a> {
     pub source_tracks: &'a [Track],
     pub recipe: &'a str,
     pub video: Option<VideoRequirements>,
+    /// The preparation encodes one selected text subtitle (as `mov_text`);
+    /// otherwise the output carries no subtitle at all.
+    pub subtitle: bool,
 }
 pub fn validate_output(
     output: &OutputObservation<'_>,
@@ -130,6 +133,17 @@ pub fn validate_output(
             return Err("output frame rate mismatch");
         }
     }
+    let subtitles: Vec<&Track> = output
+        .tracks
+        .iter()
+        .filter(|t| t.kind == "subtitle")
+        .collect();
+    match (required.subtitle, subtitles.as_slice()) {
+        (true, [t]) if t.codec == "mov_text" => {}
+        (false, []) => {}
+        (true, _) => return Err("output lost required track"),
+        (false, _) => return Err("output carries an unselected subtitle"),
+    }
     if required.recipe == "h264720p"
         && output
             .tracks
@@ -147,6 +161,68 @@ pub fn validate_output(
         return Err("wrong audio codec");
     }
     Ok(())
+}
+
+/// What a playscale preparation encoded from its source revision, as
+/// recorded when it was requested: zero-based audio and subtitle stream
+/// ordinals of that revision. No audio selection means the recipe's default
+/// (the first audio stream, if any); no subtitle means none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Encoded {
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
+}
+
+/// What a rendition is known to carry of the bound source revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Carried {
+    /// Recorded by a playscale preparation of exactly that revision.
+    Encoded(Encoded),
+    /// Not recorded for that revision (another source or revision, or an
+    /// external rendition): only its own default streams are known.
+    Unrecorded,
+    /// A record that cannot be read describes nothing.
+    Unreadable,
+}
+
+/// The subtitle a playback plan selected from the bound source revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WantedSubtitle {
+    None,
+    /// Embedded text subtitle stream (zero-based ordinal).
+    Text(u32),
+    /// A sidecar or burned subtitle: never part of a rendition.
+    Other,
+}
+
+/// The streams a playback plan selected from the bound source revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wanted {
+    pub audio: Option<u32>,
+    /// The audio was chosen (a track or component pin, or not the default).
+    pub audio_chosen: bool,
+    /// The source's default audio: its first audio stream, if any.
+    pub default_audio: Option<u32>,
+    pub subtitle: WantedSubtitle,
+}
+
+/// Whether a rendition presents exactly the selected streams: the recorded
+/// audio and text subtitle of a preparation of the bound revision, never a
+/// substitute. An unrecorded rendition carries only an unchosen default
+/// audio and no subtitle.
+pub fn carries(carried: Carried, wanted: Wanted) -> bool {
+    let subtitle = match wanted.subtitle {
+        WantedSubtitle::None => None,
+        WantedSubtitle::Text(index) => Some(index),
+        WantedSubtitle::Other => return false,
+    };
+    match carried {
+        Carried::Encoded(encoded) => {
+            encoded.audio.or(wanted.default_audio) == wanted.audio && encoded.subtitle == subtitle
+        }
+        Carried::Unrecorded => !wanted.audio_chosen && subtitle.is_none(),
+        Carried::Unreadable => false,
+    }
 }
 
 pub struct SourceAdmission<'a> {
@@ -236,6 +312,70 @@ pub fn finish_preparation(
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
+    #[test]
+    fn renditions_carry_only_the_recorded_audio_and_subtitle() {
+        let wanted = |audio, subtitle| Wanted {
+            audio,
+            audio_chosen: audio != Some(0),
+            default_audio: Some(0),
+            subtitle,
+        };
+        let encoded = |audio, subtitle| Carried::Encoded(Encoded { audio, subtitle });
+        // No recorded audio is the recipe default (the first stream).
+        assert!(carries(
+            encoded(None, None),
+            wanted(Some(0), WantedSubtitle::None)
+        ));
+        assert!(!carries(
+            encoded(None, None),
+            wanted(Some(1), WantedSubtitle::None)
+        ));
+        assert!(carries(
+            encoded(Some(1), None),
+            wanted(Some(1), WantedSubtitle::None)
+        ));
+        // The recorded subtitle must be exactly the selected one, and a
+        // rendition with a subtitle does not serve a plan without one.
+        assert!(carries(
+            encoded(Some(1), Some(2)),
+            wanted(Some(1), WantedSubtitle::Text(2))
+        ));
+        assert!(!carries(
+            encoded(Some(1), Some(2)),
+            wanted(Some(1), WantedSubtitle::Text(0))
+        ));
+        assert!(!carries(
+            encoded(Some(1), Some(2)),
+            wanted(Some(1), WantedSubtitle::None)
+        ));
+        assert!(!carries(
+            encoded(Some(1), None),
+            wanted(Some(1), WantedSubtitle::Text(2))
+        ));
+        // Sidecars and burned subtitles are never in a rendition.
+        assert!(!carries(
+            encoded(Some(0), None),
+            wanted(Some(0), WantedSubtitle::Other)
+        ));
+        // Unrecorded renditions carry only unchosen defaults.
+        assert!(carries(
+            Carried::Unrecorded,
+            wanted(Some(0), WantedSubtitle::None)
+        ));
+        assert!(!carries(
+            Carried::Unrecorded,
+            wanted(Some(1), WantedSubtitle::None)
+        ));
+        assert!(!carries(
+            Carried::Unrecorded,
+            wanted(Some(0), WantedSubtitle::Text(0))
+        ));
+        assert!(!carries(
+            Carried::Unreadable,
+            wanted(Some(0), WantedSubtitle::None)
+        ));
+    }
+
     #[test]
     fn every_publication_fact_is_required_and_attempts_and_cancellation_are_fenced() {
         for mask in 0..32 {

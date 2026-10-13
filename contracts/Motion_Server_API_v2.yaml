@@ -11982,7 +11982,13 @@ components:
           - type: 'null'
           description: Required exactly when recipe_id is video_profile. All values are included in the immutable preparation digest.
         tracks:
-          $ref: '#/components/schemas/TrackSelection'
+          allOf:
+          - $ref: '#/components/schemas/TrackSelection'
+          description: Streams of the exact source revision the preparation keeps. Audio may be chosen by track
+            or component (they must agree). A subtitle is kept only when chosen explicitly with subtitle_policy
+            require, and only an embedded text subtitle (SubRip, mov_text or WebVTT), as the output's only subtitle;
+            subtitle_policy auto is refused because automatic selection depends on a profile. A rendition serves
+            playback only for exactly the selection it kept.
       required:
       - source
       - timeline_id

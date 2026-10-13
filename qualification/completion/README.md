@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; rest of 3C and 3D–3F not started | playback PR, part-subtitles PR | Merge by user; then 3D |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented (review pending); rest of 3C, 3E and 3F not started | playback, part-subtitles and preparation-tracks PRs | Merge by user; then 3E |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -397,12 +397,80 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   - Pinned clippy with CI's flags: clean.
 - **Review (GPT-6.1 Sol), round 1:** clean.
 
+### 3D. Preparation by audio component and with a text subtitle
+
+- **Source SHA:** branch `plan-completion/preparation-tracks`, stacked on 3C
+  text (`plan-completion/part-subtitles`).
+- **Implemented:** `createPreparation` now accepts an audio component and
+  an explicitly chosen embedded text subtitle. Previously it refused every
+  component and subtitle selection. Selections are resolved on the exact
+  source revision:
+  - a component to its occurrence on that file and revision, never another
+    file or language;
+  - positional pins checked against that revision's streams;
+  - a track pin and a component pin must agree
+    (`track_component_conflict`).
+- **What is recorded and encoded:** the record names the resolved `a{n}`
+  and `s{n}` streams. The worker maps them, keeps the subtitle as the
+  output's only `mov_text` stream, and otherwise strips subtitles.
+- **What is refused:**
+  - `subtitle_policy` `auto`, since automatic selection depends on a
+    profile;
+  - an explicit subtitle with `off`;
+  - sidecar, bitmap and styled subtitles
+    (`preparation_subtitle_unsupported`);
+  - components absent from the revision (`component_unavailable`).
+- **Playback:** a rendition serves a plan only for exactly the selection it
+  kept, decided by core `processing::carries`:
+  - audio and text subtitle must match the record;
+  - a rendition with a subtitle never serves a plan without one;
+  - sidecar and burned subtitles never come from a rendition.
+
+  A kept subtitle is delivered as a WebVTT sidecar from the rendition's own
+  bytes. `presents_subtitle` now takes whether the rendition carries the
+  subtitle, and the pin names the rendition's only subtitle stream.
+- **Core/adapter boundary:** the core holds these rules:
+  - which renditions carry a selection (`processing::carries`, moved out of
+    the playback adapter);
+  - which routes present a carried subtitle;
+  - whether a validated output must contain exactly one `mov_text`
+    subtitle or none (`validate_output`).
+
+  Component resolution uses the existing core `components` policies. The
+  adapter resolves against the probed streams, runs FFmpeg and records
+  the selection. Source revision fencing, the exact whole-file binding and
+  publication facts are unchanged.
+- **Evidence:**
+  - Core lib: 150 passed. New: `carries` covers defaults, exact subtitle,
+    no substitution, unrecorded and unreadable records; `presents_subtitle`
+    covers a carried subtitle on a prepared route.
+  - `state_policies`: 11 passed. New: output subtitle exactly once as
+    `mov_text`, or none.
+  - `v2_playback`: 30 passed. New:
+    `preparations_keep_the_selected_audio_component_and_text_subtitle`
+    covers:
+    - four refusals;
+    - the recorded `a1`/`s0`;
+    - an ffprobe check that the rendition holds the 22.05 kHz Japanese
+      audio and exactly one `mov_text` stream;
+    - a plan for exactly that selection is `prepared`, while plans without
+      the subtitle or with other audio are not;
+    - the sidecar served from the rendition contains the caption at its
+      time.
+  - `v2_metadata_processing` 18 passed.
+  - `m3_workflows` 2 passed.
+  - Contract 5 passed.
+  - Pinned clippy with CI's flags: clean.
+- **Not covered:**
+  - choosing the subtitle in a preparation UI (3F);
+  - downloads of renditions with subtitles (5E).
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
 | 3C bitmap cues before the 20 s lookback; burned and automatic subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph; automatic selection over components present in every part |
-| 3D subtitle-inclusive preparation and audio-component selection | Preparation pins by component with stale-source fencing |
 | 3E bitrate preference and UI control | Contract preference field, bridge and player control |
 | 3F custom video-profile preparation UI | Validated form over `video_profile` |
 
