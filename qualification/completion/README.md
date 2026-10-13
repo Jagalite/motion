@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented (review pending); rest of 3C, 3E and 3F not started | playback, part-subtitles and preparation-tracks PRs | Merge by user; then 3E |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; rest of 3C, 3E and 3F not started | playback, part-subtitles and preparation-tracks PRs | Merge by user; then 3E |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -470,6 +470,8 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
   |---|---|---|
   | P1 | A replan of a prepared delivery rebuilt its pin without the carried subtitle | Fixed: the prepared replan validates and keeps the selected text subtitle. The integration test replans the prepared delivery and requires the pending generation's `subtitles_url` |
   | P2 | A worker from before this change would strip the subtitle yet publish the job, because the recipe digest was unchanged | Fixed: a kept subtitle is part of the preparation's digest (`recipe_digest(..., subtitle)`), recomputed at publication from the stored selection. An older worker computes the historical digest and cannot publish. Preparations without a subtitle keep their digest. Unit test |
+
+  Round 2 at `6253482`: clean.
 
 ### Remaining item 3 slices (not started)
 
