@@ -210,11 +210,25 @@ pub(crate) fn validate_download(item: &CachedDownload) -> anyhow::Result<()> {
             "unsupported cache artwork"
         );
     }
+    if let Some(subtitles) = &item.subtitles {
+        ensure!(
+            subtitles.sha256.len() == 64
+                && subtitles
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && subtitles.size > 0
+                && subtitles.size <= MAX_SUBTITLES,
+            "unsupported cache subtitles"
+        );
+    }
     Ok(())
 }
 
 /// Largest poster saved with a download.
 pub const MAX_ARTWORK: u64 = 8 * 1024 * 1024;
+/// Largest saved subtitle file (the server's WebVTT conversion bound).
+pub const MAX_SUBTITLES: u64 = 16 * 1024 * 1024;
 
 pub struct Cache {
     directory: Dir,
@@ -545,6 +559,7 @@ impl Host {
             .route("/cache/events", post(record))
             .route("/cache/remove/{id}", post(remove))
             .route("/cache/artwork/{id}", get(artwork))
+            .route("/cache/subtitles/{id}", get(subtitles))
             .route("/ui/{file}", get(motion_ui::ui_asset))
             .route("/assets/demuxe/{*file}", get(player_asset))
             .fallback_service(
@@ -683,6 +698,46 @@ async fn open_media(State(host): State<Host>, AxumPath(id): AxumPath<String>) ->
     });
     Json(result).into_response()
 }
+/// A presented title's saved subtitles (WebVTT), verified against their
+/// digest again.
+async fn subtitles(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
+    let cache = host.cache.clone();
+    let read = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(subtitles) = cache.item(&id).and_then(|item| item.subtitles) else {
+            return Ok(None);
+        };
+        let bytes = bounded(
+            cache
+                .directory
+                .open(format!("blobs/{}", subtitles.sha256))?,
+            MAX_SUBTITLES,
+        )?;
+        ensure!(
+            bytes.len() as u64 == subtitles.size
+                && format!("{:x}", Sha256::digest(&bytes)) == subtitles.sha256,
+            "subtitles checksum mismatch"
+        );
+        Ok(Some(bytes))
+    })
+    .await;
+    match read {
+        Ok(Ok(Some(bytes))) => (
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8".to_owned()),
+                (header::CACHE_CONTROL, "private, no-store".to_owned()),
+                (
+                    header::HeaderName::from_static("x-content-type-options"),
+                    "nosniff".to_owned(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    }
+}
+
 /// A presented title's saved poster, verified against its digest again.
 async fn artwork(State(host): State<Host>, AxumPath(id): AxumPath<String>) -> Response {
     let cache = host.cache.clone();

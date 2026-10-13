@@ -30,6 +30,10 @@ pub struct CachedDownload {
     /// The title's poster, saved and verified with the download.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<CachedArtwork>,
+    /// The selected text subtitle, saved and verified with the download as
+    /// WebVTT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitles: Option<CachedSubtitles>,
     /// The title's descriptive metadata from the manifest
     /// (`offline::kept_metadata`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,6 +47,14 @@ pub struct CachedArtwork {
     pub sha256: String,
     pub size: u64,
     pub content_type: String,
+}
+
+/// Verified WebVTT saved with a download (its blob is named by SHA-256).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedSubtitles {
+    pub sha256: String,
+    pub size: u64,
 }
 
 pub trait OfflinePresentationReader: Send + Sync + 'static {
@@ -125,7 +137,8 @@ async fn player(cx: &Cx) -> Result<impl View> {
             }
             if let Some(description) = &metadata.description { <p class="overview">(description.as_str())</p> }
         }
-        <div id="motion-offline-player" class="player-host" data-download-id=(item.identity.download_id) data-demuxe-base=(assets::DEMUXE_BASE)>
+        <div id="motion-offline-player" class="player-host" data-download-id=(item.identity.download_id.as_str()) data-demuxe-base=(assets::DEMUXE_BASE)
+            data-subtitles-url=(item.subtitles.as_ref().map(|_| format!("/cache/subtitles/{}", item.identity.download_id)).unwrap_or_default())>
             <p class="status-panel" role="status">"Verifying saved media…"</p>
         </div>
         <p id="offline-progress" role="status">"Playback progress is saved locally."</p>

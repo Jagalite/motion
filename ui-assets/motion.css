@@ -413,3 +413,6 @@ form.command.stacked textarea { font: inherit; }
   .access-signin { margin: .5rem auto; }
   .access-page button { min-height: 2.75rem; }
 }
+
+/* Offline posters never size cards from untrusted intrinsic dimensions. */
+.card-art { width: 100%; aspect-ratio: 2 / 3; max-height: 24rem; object-fit: cover; }

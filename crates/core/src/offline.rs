@@ -278,7 +278,12 @@ pub struct Resolved {
 pub fn foreign_events(history: &[OfflineEvent], current: &str) -> usize {
     history
         .iter()
-        .take_while(|e| e.media.viewing_epoch.as_deref() != Some(current))
+        .take_while(|e| {
+            e.media
+                .viewing_epoch
+                .as_deref()
+                .is_some_and(|epoch| epoch != current)
+        })
         .count()
 }
 
@@ -333,9 +338,9 @@ pub fn reapply(
     let mut next = next_sequence(discarded.base, &events)?;
     let mut dropped = 0;
     // Downloads the device already observed in the current history.
-    let newer: Vec<String> = events.iter().map(|e| e.media.download_id.clone()).collect();
+    let newer: Vec<String> = events.iter().map(|e| e.media.timeline_id.clone()).collect();
     for event in foreign {
-        let superseded = newer.contains(&event.media.download_id);
+        let superseded = newer.contains(&event.media.timeline_id);
         let Some(pin) = pins.iter().filter(|_| !superseded).find(|p| {
             p.download_id == event.media.download_id
                 && p.timeline_id == event.media.timeline_id
@@ -556,6 +561,29 @@ mod tests {
             status: "paused".into(),
             device_time: Some(format!("t{sequence}")),
         }
+    }
+
+    #[test]
+    fn old_progress_cannot_follow_new_progress_from_another_download_of_the_same_timeline() {
+        let old = restored_event(3, "a", "s:old", 10);
+        let mut new = restored_event(4, "b", "s:new", 90);
+        new.media.timeline_id = old.media.timeline_id.clone();
+        let pin = DownloadIdentity {
+            viewing_epoch: Some("s:new".into()),
+            ..old.media.clone()
+        };
+        let result = reapply(2, Some("s:old"), &[old, new.clone()], &[pin], "s:new").unwrap();
+        assert_eq!(result.events, vec![new]);
+        assert_eq!(result.dropped, 1);
+    }
+
+    #[test]
+    fn unknown_history_is_not_compacted_by_restore_choices() {
+        let mut event = restored_event(3, "a", "s:old", 10);
+        event.media.viewing_epoch = None;
+        let result = discard(2, None, &[event.clone()], "s:new");
+        assert_eq!(result.base, 2);
+        assert_eq!(result.events, vec![event]);
     }
 
     #[test]

@@ -93,6 +93,9 @@ pub fn hdr(transfer: Option<&str>) -> Option<Transfer> {
 /// SDR source (no tone map needed).
 pub fn tone_map(facts: &ColorFacts<'_>, filters: Filters) -> Result<Option<ToneMap>, Refusal> {
     let Some(transfer) = hdr(facts.transfer) else {
+        if facts.dolby_vision.is_some() {
+            return Err(Refusal::DolbyVisionUnsupported);
+        }
         return Ok(None);
     };
     if let Some((profile, compatibility)) = facts.dolby_vision {
@@ -154,6 +157,21 @@ mod tests {
             matrix: Some("bt2020nc"),
             range: Some("tv"),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dolby_vision_without_valid_transfer_is_not_sdr() {
+        for transfer in [None, Some("bt709"), Some("unknown")] {
+            let facts = ColorFacts {
+                transfer,
+                dolby_vision: Some((8, 1)),
+                ..Default::default()
+            };
+            assert_eq!(
+                tone_map(&facts, TOOLS),
+                Err(Refusal::DolbyVisionUnsupported)
+            );
         }
     }
 

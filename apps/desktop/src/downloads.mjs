@@ -6,7 +6,7 @@
 // events (motion-ui-host cache, playscale_core::offline). This adapter only
 // sequences those effects and never publishes, renumbers or erases by itself.
 import {createHash, randomBytes} from 'node:crypto';
-import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
+import {closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync, createWriteStream} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {Readable, Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -24,6 +24,8 @@ const SNAPSHOT_RESERVE = 512 * 1024 ** 2;
 /** Posters saved with a download, by file extension. */
 const IMAGE_TYPES = {png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp'};
 const MAX_ARTWORK_BYTES = 8 * 1024 * 1024;
+// Largest subtitle file a download carries (the cache tool's bound).
+const MAX_SUBTITLE_BYTES = 16 * 1024 * 1024;
 /** Transfer progress is reported to the server at most this often. */
 const PROGRESS_INTERVAL_MS = 15_000;
 
@@ -55,6 +57,15 @@ export function cacheMetadata(metadata) {
   return Object.keys(kept).length ? kept : null;
 }
 
+/**
+ * Whether a manifest URL is one the agent may fetch from its server: media
+ * and artwork content, or exactly a download's subtitle file at a digest.
+ */
+export function transferLocation(url) {
+  return typeof url === 'string' && (url.startsWith('/api/v2/media/')
+    || /^\/api\/v2\/downloads\/[A-Za-z0-9_-]{1,128}\/subtitles\?digest=sha256:[0-9a-f]{64}$/.test(url));
+}
+
 export function cacheTitle(title) {
   const encoder = new TextEncoder();
   if (encoder.encode(title).length <= 1024) return title;
@@ -84,7 +95,7 @@ export function offlineRoots(base) {
     .map(([name, scope]) => ({name, scope, titles: readJson(join(base, name, 'manifest.json'), null)?.downloads?.length ?? 0}))
     .filter(root => root.titles > 0)
     .map(({name, scope, titles}) => ({name, titles, current: name === current,
-      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id}`}));
+      label: `${typeof labels[name]?.server === 'string' ? labels[name].server : scope.server_id} · profile ${scope.profile_id} · account ${scope.principal_id} · device ${scope.device_id}`}));
 }
 
 /**
@@ -250,15 +261,14 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
   }
 
   /** Fetch, verify and stage a poster; its cache description, or null. */
-  async function savePoster(id, poster, target) {
-    const sha256 = /^sha256:([0-9a-f]{64})$/.exec(poster.digest ?? '')?.[1];
-    const type = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(poster.relative_name ?? '')?.[1]];
-    const size = Number(poster.size_bytes);
-    if (!sha256 || !type || !(size > 0) || size > MAX_ARTWORK_BYTES) return null;
-    // Bounded whatever the connection does: an unavailable optional poster
-    // never holds up the title or the downloads after it.
+  /**
+   * Fetch a small file whole, verify its size and digest, and stage it as
+   * `<id>.<suffix>` for the cache tool to verify again and publish. Bounded
+   * whatever the connection does. Null when it cannot be saved.
+   */
+  async function saveWhole(id, url, sha256, size, suffix, target) {
     const deadline = AbortSignal.timeout(60000);
-    const response = await fetchMedia(poster.media_url, {range: null, signal: signal ? AbortSignal.any([signal, deadline]) : deadline});
+    const response = await fetchMedia(url, {range: null, signal: signal ? AbortSignal.any([signal, deadline]) : deadline});
     if (response.status !== 200) return null;
     const chunks = [];
     let received = 0;
@@ -269,22 +279,40 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     }
     const bytes = Buffer.concat(chunks);
     if (bytes.length !== size || createHash('sha256').update(bytes).digest('hex') !== sha256) return null;
-    const staged = join(target.path, 'staging', `${id}.artwork`);
     mkdirSync(join(target.path, 'staging'), {recursive: true, mode: 0o700});
-    writeFileSync(staged, bytes, {mode: 0o600});
-    return {sha256, size, content_type: type};
+    writeFileSync(join(target.path, 'staging', `${id}.${suffix}`), bytes, {mode: 0o600});
+    return true;
+  }
+
+  async function savePoster(id, poster, target) {
+    const sha256 = /^sha256:([0-9a-f]{64})$/.exec(poster.digest ?? '')?.[1];
+    const type = IMAGE_TYPES[/\.([a-z0-9]+)$/.exec(poster.relative_name ?? '')?.[1]];
+    const size = Number(poster.size_bytes);
+    if (!sha256 || !type || !(size > 0) || size > MAX_ARTWORK_BYTES) return null;
+    // An unavailable optional poster never holds up the title or the
+    // downloads after it.
+    return await saveWhole(id, poster.media_url, sha256, size, 'artwork', target) ? {sha256, size, content_type: type} : null;
   }
 
   async function transfer(download, target) {
     const manifest = await api(`/api/v2/downloads/${encodeURIComponent(download.id)}/manifest`);
-    // One media file and at most one poster; anything else is not saved yet.
+    // One media file, at most one poster and at most one subtitle file;
+    // anything else is not saved yet.
     const media = manifest.files.filter(f => f.role === 'media');
     const posters = manifest.files.filter(f => f.role === 'artwork');
+    const subtitleFiles = manifest.files.filter(f => f.role === 'subtitle');
     const [file] = media;
     const digest = /^sha256:([0-9a-f]{64})$/.exec(file?.digest ?? '')?.[1];
     const contentType = CONTENT_TYPES[/\.([a-z0-9]+)$/.exec(file?.relative_name ?? '')?.[1]];
-    if (media.length !== 1 || posters.length > 1 || media.length + posters.length !== manifest.files.length || !digest || !contentType) {
-      status(`"${manifest.title}" needs files this device cannot save yet (subtitles, artwork or multiple parts).`);
+    // The selected subtitles are required: the title is saved with them or
+    // not at all.
+    const subtitleSha = /^sha256:([0-9a-f]{64})$/.exec(subtitleFiles[0]?.digest ?? '')?.[1];
+    const subtitleBytes = Number(subtitleFiles[0]?.size_bytes);
+    const subtitles = subtitleFiles.length && subtitleSha && subtitleBytes > 0 && subtitleBytes <= MAX_SUBTITLE_BYTES
+      ? {sha256: subtitleSha, size: subtitleBytes} : null;
+    if (media.length !== 1 || posters.length > 1 || subtitleFiles.length > 1 || (subtitleFiles.length && !subtitles)
+        || media.length + posters.length + subtitleFiles.length !== manifest.files.length || !digest || !contentType) {
+      status(`"${manifest.title}" needs files this device cannot save yet (artwork, subtitles or multiple parts).`);
       return false;
     }
     const size = Number(file.size_bytes);
@@ -298,7 +326,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
         source_revision: digest, base_viewing_revision: manifest.viewing_revision, base_manual_epoch: manifest.manual_epoch,
         viewing_epoch: manifest.viewing_epoch},
       title: cacheTitle(manifest.title), duration_ms: manifest.duration_ms, sha256: digest, size, content_type: contentType,
-      ...(artwork ? {artwork} : {}), ...(metadata ? {metadata} : {})});
+      ...(artwork ? {artwork} : {}), ...(subtitles ? {subtitles} : {}), ...(metadata ? {metadata} : {})});
     const posterBytes = posters.length ? Math.max(0, Number(posters[0].size_bytes) || 0) : 0;
     // The poster as the cache would record it, when its description is valid.
     const posterSha = /^sha256:([0-9a-f]{64})$/.exec(posters[0]?.digest ?? '')?.[1];
@@ -329,11 +357,22 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
     const largest = Math.max(size, ...(await Promise.all(managedRoots().map(async other =>
       Math.max(0, ...(await cache(other.path, other.scope, ['status'])).manifest.downloads.map(d => d.size ?? 0))))));
     const reserve = Math.max(headroom, largest + SNAPSHOT_RESERVE);
-    // The poster counts against the same admission; without room for it the
-    // title is saved without one.
+    // Subtitles an interrupted pass already staged are reused when they
+    // verify (the cache counts them as used already); anything else staged
+    // beside the media is discarded before admission, never counted twice.
+    const stagedSubtitles = join(target.path, 'staging', `${download.id}.subtitles`);
+    const subtitlesStaged = Boolean(subtitles) && existsSync(stagedSubtitles) && (() => {
+      const bytes = readFileSync(stagedSubtitles);
+      return bytes.length === subtitles.size && createHash('sha256').update(bytes).digest('hex') === subtitles.sha256;
+    })();
+    if (!subtitlesStaged) rmSync(stagedSubtitles, {force: true});
+    rmSync(join(target.path, 'staging', `${download.id}.artwork`), {force: true});
+    // The poster and subtitles count against the same admission; without
+    // room for the optional poster the title is saved without one.
     const admit = incoming => cache(target.path, target.scope, ['admit', '--incoming', String(incoming), '--quota', String(remaining), '--headroom', String(reserve)]);
-    const withPoster = posterBytes > 0 && (await admit(size - have + posterBytes)).admitted;
-    const admitted = withPoster ? {admitted: true} : await admit(size - have);
+    const required = size - have + (subtitles && !subtitlesStaged ? subtitles.size : 0);
+    const withPoster = posterBytes > 0 && (await admit(required + posterBytes)).admitted;
+    const admitted = withPoster ? {admitted: true} : await admit(required);
     if (!admitted.admitted) {
       status(`Not enough space to save "${manifest.title}". Free space or remove downloads, then reconnect.`);
       return false;
@@ -393,6 +432,11 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       return null;
     }) : null;
     if (signal?.aborted) throw signal.reason ?? new Error('Downloads stopped');
+    // The selected subtitles, whole and verified; without them nothing is
+    // published and the next pass tries again.
+    if (subtitles && !subtitlesStaged && !await saveWhole(download.id, subtitleFiles[0].media_url, subtitles.sha256, subtitles.size, 'subtitles', target)) {
+      throw new Error(`The subtitles of "${manifest.title}" could not be saved`);
+    }
     // Verification and publication belong to the cache tool; a mismatch
     // discards the staged bytes and the next pass transfers again.
     await cache(target.path, target.scope, ['publish'], entryFor(artwork));
@@ -483,7 +527,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       const log = await cache(target.path, target.scope, ['events']);
       const earlier = [];
       for (const event of log.events) {
-        if (event.media.viewing_epoch === current) break;
+        if (!event.media.viewing_epoch || event.media.viewing_epoch === current) break;
         earlier.push(event);
       }
       if (earlier.length > 0) {
@@ -519,7 +563,7 @@ export function createDownloadAgent({base, identity, api, fetchMedia, cache, quo
       }
       // Restored again meanwhile: nothing changes, and the choice is offered again.
       if (pinned.viewing_epoch !== current) throw new Error('The server changed again. Choose again.');
-      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) continue;
+      if (pinned.restored_viewing_revision == null || pinned.restored_manual_epoch == null) throw new Error("Cannot keep progress: the restored server baseline is unknown. Your saved progress has been retained.");
       pins.push({...entry.identity, base_viewing_revision: pinned.restored_viewing_revision,
         base_manual_epoch: pinned.restored_manual_epoch, viewing_epoch: current});
     }

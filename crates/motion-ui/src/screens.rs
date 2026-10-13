@@ -196,15 +196,15 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
 // --- Profiles and preferences ---------------------------------------------
 
 /// Streaming limits offered to people, in bits per second (None: no limit),
-/// with what each is typically enough for.
+/// independent of resolution: a cap does not select an output height.
 const BITRATE_LIMITS: [(Option<u64>, &str); 8] = [
     (None, "No limit"),
-    (Some(40_000_000), "40 Mbps — 4K"),
-    (Some(20_000_000), "20 Mbps — 1080p, high"),
-    (Some(12_000_000), "12 Mbps — 1080p"),
-    (Some(8_000_000), "8 Mbps — 720p, high"),
-    (Some(4_000_000), "4 Mbps — 720p"),
-    (Some(2_000_000), "2 Mbps — 480p"),
+    (Some(40_000_000), "40 Mbps"),
+    (Some(20_000_000), "20 Mbps"),
+    (Some(12_000_000), "12 Mbps"),
+    (Some(8_000_000), "8 Mbps"),
+    (Some(4_000_000), "4 Mbps"),
+    (Some(2_000_000), "2 Mbps"),
     (Some(1_000_000), "1 Mbps — low bandwidth"),
 ];
 
@@ -729,7 +729,14 @@ pub(crate) async fn download_form(
     timeline_id: String,
     #[default] prepared: Vec<crate::facade::PreparedDownload>,
     #[default] incomplete: bool,
+    #[default] subtitled: Vec<crate::facade::SubtitleDownload>,
 ) -> Result<impl View> {
+    // The selected subtitle is required, from exactly that version's file.
+    let with_subtitle = |track: &str| {
+        serde_json::json!({"audio_component_id": null, "subtitle_component_id": null,
+            "subtitle_policy": "require", "audio_track_id": null, "subtitle_track_id": track})
+        .to_string()
+    };
     let tracks = r#"{"audio_component_id":null,"subtitle_component_id":null,"subtitle_policy":"auto","audio_track_id":null,"subtitle_track_id":null}"#;
     Ok(view! {
         <div class="download-action" data-desktop-only="true" hidden=(true)>
@@ -741,6 +748,24 @@ pub(crate) async fn download_form(
                 <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
                 <input type="hidden" name="tracks" data-type=(kind(Field::Json)) value=(tracks)>
             )
+            // An original saved with one of its text subtitles (as WebVTT).
+            for original in subtitled.iter() {
+                command_form(command: "POST /api/v2/downloads".to_string(), label: "Save with subtitles", idempotent: true, class: Some("command inline"),
+                    <span class="small">(original.label.as_str())</span>
+                    <input type="hidden" name="device_id" data-type=(kind(Field::Text)) value=(device_id.as_str())>
+                    <input type="hidden" name="profile_id" data-type=(kind(Field::Text)) value=(profile_id.as_str())>
+                    <input type="hidden" name="timeline_id" data-type=(kind(Field::Text)) value=(timeline_id.as_str())>
+                    <input type="hidden" name="version_id" data-type=(kind(Field::Text)) value=(original.version_id.as_str())>
+                    <input type="hidden" name="recipe_id" data-type=(kind(Field::Json)) value="null">
+                    <label>"Subtitles "
+                        <select name="tracks" data-type=(kind(Field::Json))>
+                            for (track, label) in original.tracks.iter() {
+                                <option value=(with_subtitle(track))>(label.as_str())</option>
+                            }
+                        </select>
+                    </label>
+                )
+            }
             if incomplete {
                 <p class="muted small">"Only the first prepared versions found are offered here."</p>
             }

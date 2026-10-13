@@ -62,3 +62,32 @@ The catalog migrations were renumbered when PR #4 merged (they had used 0018–0
 
 Adding a column to an existing table breaks positional `INSERT ... VALUES`
 statements; always name columns in inserts.
+
+## Parallel development history reconciliation
+
+The completion chain retains 0045–0052. The rewrite repair migrations are
+0053–0056; access management, legacy ownership, and sign-in are 0057–0059.
+Only their filenames/numbers changed; their SQL bytes remain unchanged.
+0060 adds preview layout identity, 0061 records issued viewing histories,
+0062 orders manual marker corrections, and 0063 records subtitle artifacts.
+
+Main databases through 0044 upgrade normally with the integrated server.
+Databases previously opened by the unmerged access/auth or rewrite branches
+have conflicting SQLx migration numbers. Do not delete their migration rows,
+change checksums, or start them with the integrated binary until reconciled.
+Stop Motion and create a separate database copy:
+
+```sh
+python3 scripts/reconcile_development_migrations.py /path/to/old.sqlite3 /path/to/new.sqlite3
+```
+
+The destination must not exist. The tool verifies every applied version and
+SHA-384 checksum against canonical SQL or the exact recorded branch mappings,
+rejects failed/unknown/ambiguous histories, and remaps only known version
+numbers in the copy. It preserves application rows and credentials and leaves
+the source unchanged. Start the copied database with the integrated server to
+apply missing migrations. This is an offline development-history repair, not
+an automatic startup rewrite or a restore: restoring a backup separately
+rotates viewing history and withdraws saved authority, including sign-in grants.
+Unknown earlier development snapshots need explicit investigation; they are
+not accepted by weakening SQLx checksum validation.

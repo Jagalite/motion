@@ -313,13 +313,23 @@ pub async fn put_preferences(
     // A limit is a positive decimal like a plan's (`bitrate`).
     let max_bitrate_bps = match input.max_bitrate_bps.as_deref() {
         None => None,
-        Some(b) => Some(bitrate(b).filter(|b| *b > 0).ok_or_else(|| {
-            Problem::invalid(
-                "invalid_preferences",
-                "max_bitrate_bps must be a positive decimal string",
-            )
-        })?),
+        Some(b) => Some(
+            bitrate(b)
+                .filter(|b| playscale_core::playback_session::rate_cap(*b, 3_000).is_some())
+                .ok_or_else(|| {
+                    Problem::invalid(
+                        "invalid_preferences",
+                        "max_bitrate_bps must be a supported positive streaming limit",
+                    )
+                })?,
+        ),
     };
+    if input.quality_mode == "original" && max_bitrate_bps.is_some() {
+        return Err(Problem::invalid(
+            "invalid_preferences",
+            "Original-only playback requires no streaming limit",
+        ));
+    }
     let mut languages = [input.audio_languages, input.subtitle_languages];
     for list in &mut languages {
         if list.len() > 16
@@ -912,7 +922,7 @@ fn client_support(
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
-    );
+    ) || video.dolby_vision.is_some();
     if hdr && (require_sdr || client.hdr != "supported") {
         return Support::Unsupported;
     }

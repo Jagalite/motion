@@ -101,6 +101,41 @@ pub fn artwork_staging_name(download_id: &str) -> anyhow::Result<String> {
     Ok(format!("{download_id}.artwork"))
 }
 
+/// The staging file name for a download's subtitles.
+pub fn subtitles_staging_name(download_id: &str) -> anyhow::Result<String> {
+    ensure!(
+        offline::identifier(download_id),
+        "invalid download identity"
+    );
+    Ok(format!("{download_id}.subtitles"))
+}
+
+/// The verified files an entry names beside its media (its poster and its
+/// subtitles): staging name, digest and size. Each is published into its own
+/// blob before the entry, and released with it.
+fn side_files(entry: &CachedDownload) -> anyhow::Result<Vec<(String, String, u64)>> {
+    let id = &entry.identity.download_id;
+    let mut files = Vec::new();
+    if let Some(art) = &entry.artwork {
+        files.push((artwork_staging_name(id)?, art.sha256.clone(), art.size));
+    }
+    if let Some(subtitles) = &entry.subtitles {
+        files.push((
+            subtitles_staging_name(id)?,
+            subtitles.sha256.clone(),
+            subtitles.size,
+        ));
+    }
+    Ok(files)
+}
+
+/// Every blob an entry names: its media and its side files.
+fn blobs_of(entry: &CachedDownload) -> impl Iterator<Item = String> + '_ {
+    std::iter::once(entry.sha256.clone())
+        .chain(entry.artwork.as_ref().map(|a| a.sha256.clone()))
+        .chain(entry.subtitles.as_ref().map(|s| s.sha256.clone()))
+}
+
 /// The staging file name for a download's transfer.
 pub fn staging_name(download_id: &str) -> anyhow::Result<String> {
     ensure!(
@@ -328,11 +363,12 @@ impl Store {
         for entry in self.staging.entries()? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
-            // A staged transfer or a staged poster: either belongs to the
+            // A staged transfer, poster or subtitles: each belongs to the
             // download's lifecycle (cancellation, expiry, withdrawal).
             if let Some(id) = name
                 .strip_suffix(".part")
                 .or_else(|| name.strip_suffix(".artwork"))
+                .or_else(|| name.strip_suffix(".subtitles"))
                 && offline::identifier(id)
             {
                 ids.push(id.to_owned());
@@ -423,38 +459,40 @@ impl Store {
             "this download was removed on this device"
         );
         let staged = staging_name(&id)?;
-        let staged_artwork = artwork_staging_name(&id)?;
+        let sides = side_files(&entry)?;
         if self.manifest.downloads.iter().any(|d| {
             d.identity.download_id == id
                 && d.sha256 == entry.sha256
                 && d.size == entry.size
                 && d.artwork == entry.artwork
+                && d.subtitles == entry.subtitles
         }) {
             let _ = self.staging.remove_file(&staged);
-            let _ = self.staging.remove_file(&staged_artwork);
+            for (name, _, _) in &sides {
+                let _ = self.staging.remove_file(name);
+            }
             return Ok(Publication::AlreadyPublished);
         }
-        // The poster first: verified into its blob before the media, so a
-        // published entry never names a missing or unverified image.
-        if let Some(art) = &entry.artwork {
-            match self.staging.open(&staged_artwork) {
+        // Side files first: each verified into its blob before the media,
+        // so a published entry never names a missing or unverified file.
+        for (name, sha256, size) in &sides {
+            match self.staging.open(name) {
                 Ok(mut file) => {
-                    if let Err(e) = Self::verify(&mut file, art.size, &art.sha256) {
+                    if let Err(e) = Self::verify(&mut file, *size, sha256) {
                         drop(file);
-                        self.staging.remove_file(&staged_artwork)?;
+                        self.staging.remove_file(name)?;
                         return Err(e);
                     }
                     file.sync_all()?;
-                    self.staging
-                        .rename(&staged_artwork, &self.blobs, &art.sha256)?;
+                    self.staging.rename(name, &self.blobs, sha256)?;
                     self.blobs_sync.sync_all()?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     let mut blob = self
                         .blobs
-                        .open(&art.sha256)
-                        .context("no staged artwork for this download")?;
-                    Self::verify(&mut blob, art.size, &art.sha256)?;
+                        .open(sha256)
+                        .context("no staged file for this download")?;
+                    Self::verify(&mut blob, *size, sha256)?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -485,10 +523,7 @@ impl Store {
             .downloads
             .iter()
             .filter(|d| d.identity.download_id == id)
-            .flat_map(|d| {
-                std::iter::once(d.sha256.clone())
-                    .chain(d.artwork.as_ref().map(|a| a.sha256.clone()))
-            })
+            .flat_map(blobs_of)
             .collect();
         next.downloads.retain(|d| d.identity.download_id != id);
         ensure!(
@@ -519,6 +554,7 @@ impl Store {
         for staged in [
             staging_name(download_id)?,
             artwork_staging_name(download_id)?,
+            subtitles_staging_name(download_id)?,
         ] {
             match self.staging.remove_file(&staged) {
                 Ok(()) => {}
@@ -531,10 +567,7 @@ impl Store {
             .downloads
             .iter()
             .filter(|d| d.identity.download_id == download_id)
-            .flat_map(|d| {
-                std::iter::once(d.sha256.clone())
-                    .chain(d.artwork.as_ref().map(|a| a.sha256.clone()))
-            })
+            .flat_map(blobs_of)
             .collect();
         next.downloads
             .retain(|d| d.identity.download_id != download_id);
@@ -548,12 +581,12 @@ impl Store {
         Ok(removed)
     }
 
-    /// Whether a published entry names this blob (its media or its poster).
+    /// Whether a published entry names this blob (its media or a side file).
     fn referenced(&self, sha256: &str) -> bool {
         self.manifest
             .downloads
             .iter()
-            .any(|d| d.sha256 == sha256 || d.artwork.as_ref().is_some_and(|a| a.sha256 == sha256))
+            .any(|d| blobs_of(d).any(|b| b == sha256))
     }
 
     /// Delete one blob a write just stopped referencing, unless another
@@ -780,17 +813,12 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        // A poster must be in place too (staged or verified as a blob).
-        let artwork_ready = match &entry.artwork {
-            None => true,
-            Some(art) => {
-                self.staging
-                    .metadata(artwork_staging_name(&entry.identity.download_id)?)
-                    .is_ok()
-                    || self.blobs.metadata(&art.sha256).is_ok()
-            }
-        };
-        if staged_exists || !blob_exists || !artwork_ready {
+        // Its side files must be in place too (staged or as blobs).
+        let sides = side_files(&entry)?;
+        let sides_ready = sides.iter().all(|(name, sha256, _)| {
+            self.staging.metadata(name).is_ok() || self.blobs.metadata(sha256).is_ok()
+        });
+        if staged_exists || !blob_exists || !sides_ready {
             return Ok(false);
         }
         let mut blob = self.blobs.open(&entry.sha256)?;
@@ -809,24 +837,31 @@ impl Store {
             }
             return Ok(false);
         }
-        // The optional poster is verified here as well: a corrupt one is
-        // discarded and recovery declines, so the caller recovers the
-        // verified media without it rather than failing every pass.
-        if let Some(art) = &entry.artwork {
-            let staged_artwork = artwork_staging_name(&entry.identity.download_id)?;
-            let (mut file, from_staging) = match self.staging.open(&staged_artwork) {
+        // Side files are verified here as well: a corrupt one is discarded
+        // and recovery declines, so the caller recovers without an optional
+        // poster, or transfers a required subtitle file again, rather than
+        // failing every pass.
+        for (name, sha256, size) in &sides {
+            let (mut file, from_staging) = match self.staging.open(name) {
                 Ok(file) => (file, true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    (self.blobs.open(&art.sha256)?, false)
+                    (self.blobs.open(sha256)?, false)
                 }
                 Err(e) => return Err(e.into()),
             };
-            if Self::verify(&mut file, art.size, &art.sha256).is_err() {
+            if Self::verify(&mut file, *size, sha256).is_err() {
                 drop(file);
                 if from_staging {
-                    self.staging.remove_file(&staged_artwork)?;
-                } else if !self.referenced(&art.sha256) {
-                    self.blobs.remove_file(&art.sha256)?;
+                    self.staging.remove_file(name)?;
+                    // A verified content-addressed copy may already be shared
+                    // by another title even when this staging attempt is bad.
+                    if let Ok(mut blob) = self.blobs.open(sha256) {
+                        if Self::verify(&mut blob, *size, sha256).is_ok() {
+                            continue;
+                        }
+                    }
+                } else if !self.referenced(sha256) {
+                    self.blobs.remove_file(sha256)?;
                     self.blobs_sync.sync_all()?;
                 }
                 return Ok(false);

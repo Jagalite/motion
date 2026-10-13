@@ -128,6 +128,18 @@ pub struct TimelineView {
     pub prepared_downloads: Vec<PreparedDownload>,
     /// More prepared versions exist than were read for the offer.
     pub prepared_incomplete: bool,
+    /// Originals a download may save with one of their text subtitles.
+    pub subtitle_downloads: Vec<SubtitleDownload>,
+}
+
+/// A whole single-file original whose text subtitles a download can carry
+/// (as WebVTT), pinned to exactly this version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtitleDownload {
+    pub version_id: String,
+    pub label: String,
+    /// (track ID `s{n}` of the file's revision, label).
+    pub tracks: Vec<(String, String)>,
 }
 
 /// A ready prepared version offered for download.

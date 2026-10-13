@@ -9,7 +9,7 @@ import {createOutboxStore} from './outbox.mjs';
 import {restoreViewing} from './recovery.mjs';
 import {closeGate, attachOwnedServer} from './lifecycle.mjs';
 import {connection, partitionFor, sameOrigin, verifyHealth, verifyCapabilities, boundedJson} from './policy.mjs';
-import {createDownloadAgent, currentRoot, offlineRoots} from './downloads.mjs';
+import {createDownloadAgent, currentRoot, offlineRoots, transferLocation} from './downloads.mjs';
 
 if (app.isPackaged) app.setName('Motion');
 const explicitUserData = app.commandLine.getSwitchValue('user-data-dir');
@@ -236,7 +236,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
         serverLabel: new URL(selected.origin).host,
         identity: {server_id: selected.serverId, principal_id: principal.id, device_id: principal.device_id},
         fetchMedia: (url, {range, signal}) => {
-          if (!url.startsWith('/api/v2/media/')) throw new Error('Unexpected transfer location');
+          if (!transferLocation(url)) throw new Error('Unexpected transfer location');
           return ses.fetch(`${selected.origin}${url}`, {redirect: 'error', cache: 'no-store', signal, headers: range ? {Range: range} : {}});
         },
         status: message => { if (current()) window.webContents.send('motion:status', message); }});
@@ -250,6 +250,7 @@ async function connectOwned(input, owner, locallyOwned = false) {
         if (!controller.signal.aborted) state.timer = setTimeout(run, 60000);
       };
       state.abort = () => { controller.abort(); clearTimeout(state.timer); };
+      state.resume = () => { clearTimeout(state.timer); state.timer = setTimeout(run, 60000); };
       downloads = state;
       // Passes run whatever the permission was at connect: a grant made later
       // starts transfers, and a refusal (403) withdraws local copies.
@@ -269,9 +270,22 @@ function openDownloads(choice = null) {
   return serialize(async owner => {
     // Only a saved root of this device can be chosen (currentRoot checks).
     if (choice !== null && (typeof choice !== 'string' || !/^[0-9a-f]{32}$/.test(choice))) throw new Error('Choose an offline library');
+    // Quiesce transfers before validating, while retaining the online view.
+    const state = downloads;
+    if (state) {
+      clearTimeout(state.timer);
+      await state.running?.catch(() => {});
+    }
+    if (owner !== epoch) throw new Error('Offline startup cancelled');
+    let dataDir;
+    try { dataDir = currentRoot(cacheBase(), choice); }
+    catch (error) {
+      // A failed choice leaves the connected library and its download loop alive.
+      if (state?.resume) state.resume();
+      throw error;
+    }
     await detach();
     if (owner !== epoch) throw new Error('Offline startup cancelled');
-    const dataDir = currentRoot(cacheBase(), choice);
     if (offlineHost && offlineHost.dataDir !== dataDir) { await offlineHost.stop(); offlineHost = null; }
     offlineHost ??= Object.assign(createOwnedServer({presentationOnly: true, executable: hostBinary(), dataDir,
       demuxeDir: app.isPackaged ? join(process.resourcesPath, 'assets', 'demuxe') : resolve(process.env.MOTION_DEMUXE_DIR || fileURLToPath(new URL('../../../web/vendor/demuxe', import.meta.url))),
@@ -341,7 +355,9 @@ else {
     ipcMain.handle('motion:layout', event => { authorize(event); resize(); });
     ipcMain.handle('motion:offline-restore', async event => {
       authorize(event);
-      return downloads?.agent ? downloads.agent.restoreChoices() : [];
+      const state = downloads;
+      await state?.running?.catch(() => {});
+      return state?.agent ? state.agent.restoreChoices() : [];
     });
     ipcMain.handle('motion:offline-restore-choose', async (event, root, choice) => {
       authorize(event);

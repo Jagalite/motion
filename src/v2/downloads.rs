@@ -10,7 +10,7 @@ use super::{
     Body, PageQuery, Problem, Scope,
     auth::Caller,
     content::file_facts,
-    etag, idempotency_key, page,
+    idempotency_key, page,
     playback::{readable_timeline, usable_profile},
     viewing,
 };
@@ -197,7 +197,7 @@ async fn observe(
     let rendition: Option<(bool, String, String, String, String)> = sqlx::query_as(
         "SELECT (f.available=1),f.revision,r.file_revision,s.revision,r.source_revision FROM renditions r \
          JOIN media_files f ON f.id=r.file_id JOIN media_files s ON s.id=r.source_file_id \
-         WHERE r.file_id=? AND f.generated=1",
+         WHERE r.file_id=? AND r.source='playscale' AND f.generated=1",
     )
     .bind(&row.file_id)
     .fetch_optional(&mut *conn)
@@ -292,11 +292,14 @@ async fn current_json(
     Ok(body)
 }
 
-fn tagged(status: StatusCode, body: Value, revision: i64) -> Response {
+fn tagged(status: StatusCode, body: Value, _revision: i64) -> Response {
+    let validator = HeaderValue::from_str(&format!(
+        "\"sha256-{}\"",
+        super::sha256(body.to_string().as_bytes())
+    ))
+    .expect("hex digest is a header");
     let mut response = (status, Json(body)).into_response();
-    response
-        .headers_mut()
-        .insert(header::ETAG, etag(revision.max(0) as u64));
+    response.headers_mut().insert(header::ETAG, validator);
     response
 }
 
@@ -1763,6 +1766,18 @@ pub async fn sync(
             )
         })?),
     };
+    if let Some((_, through)) = &reanchor {
+        if acknowledged != Some(*through)
+            || events
+                .first()
+                .is_some_and(|e| through.checked_add(1) != Some(e.sequence))
+        {
+            return Err(Problem::invalid(
+                "invalid_reanchor",
+                "The re-anchor must match the acknowledgement and the first retained sequence",
+            ));
+        }
+    }
     let mut tx = begin_write(&app.db).await?;
     let principal = caller
         .reauthorize(&mut tx, Some(Permission::ViewingWrite))
@@ -1911,7 +1926,7 @@ pub async fn sync(
                 "current_viewing": null,
             }),
             Decision::RetentionFull => json!({
-                "event_id": event.id, "outcome": "rejected", "code": "acknowledgement_required",
+                "event_id": event.id, "outcome": "rejected", "code": if acknowledged.is_some() { "acknowledgement_required" } else { "sequence_gap" },
                 "current_viewing": null,
             }),
             Decision::Consumed {

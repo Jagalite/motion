@@ -3590,7 +3590,7 @@ fn with_streams<R>(
     let hdr = matches!(
         video.color_transfer.as_deref(),
         Some("smpte2084" | "arib-std-b67")
-    );
+    ) || video.dolby_vision.is_some();
     // A tone map is considered only where the caller can deliver one (one
     // file, observed filters) and the core accepts the source's colour facts.
     let tone_map = filters.is_some_and(|f| {
@@ -5733,7 +5733,8 @@ async fn ensure_burn_text(
         .deliveries
         .subtitle_slots
         .clone()
-        .try_acquire_owned()
+        .acquire_owned()
+        .await
         .map_err(|_| subtitles_unavailable())?;
     let fonts = directory.join(format!("{BURN_FONTS}{index}"));
     // The pinned attachments were admitted by their probed sizes
