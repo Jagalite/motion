@@ -25,7 +25,7 @@ item below is the single completion agent unless stated otherwise.
 | 0 Plan reconciliation | Implemented (docs), reviewed | docs PR | Merge by user |
 | 1 Download correctness and retention | Implemented, tested, reviewed | downloads PR | Merge by user |
 | 2 Library query scaling | Implemented, tested, reviewed | library-queries PR | Merge by user |
-| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; rest of 3C, 3E and 3F not started | playback, part-subtitles and preparation-tracks PRs | Merge by user; then 3E |
+| 3 Production playback and preparation | 3A and 3B implemented, tested, reviewed; 3C text across parts implemented and reviewed; 3D implemented and reviewed; 3E implemented (review pending); rest of 3C and 3F not started | playback, part-subtitles, preparation-tracks and bitrate PRs | Merge by user; then 3F |
 | 4 Library-management UI | Implemented, tested, reviewed | library-ui PR | Merge by user |
 | 5 Offline breadth | 5A implemented; 5B–5F not started | offline-roots PR | Sol review |
 | 6 M5 convenience and receiver | 6A implemented, tested, reviewed; 6B–6E not started | markers PR | Re-review; merge by user |
@@ -473,12 +473,48 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 
   Round 2 at `6253482`: clean.
 
+### 3E. Streaming limit preference and player control
+
+- **Source SHA:** branch `plan-completion/bitrate`, stacked on 3D
+  (`plan-completion/preparation-tracks`).
+- **Implemented:** a profile can now hold a streaming limit, a new
+  optional `Preferences.max_bitrate_bps`. It is a positive decimal string,
+  and null or absent means no limit.
+  - **Profile page:** a "Streaming limit" select with presets from No
+    limit to 1 Mbps, labelled by what each is enough for. A limit saved
+    through the API outside the presets is shown as its own choice.
+  - **Player:** sends the profile's limit as the plan's
+    `quality.max_bitrate_bps`. It also gets a "Limit" control that replans
+    with another limit through the existing quality replan. The limit is
+    validated in the bridge before it is sent.
+  - The server's plan decision for a cap (byte delivery cannot promise a
+    peak; a capped conversion is VBV-limited and measured) is unchanged
+    from earlier work.
+- **Compatibility:**
+  - v2 `PUT` replaces the whole document, so an absent limit means none.
+  - The stored document omits the field when unset, so earlier documents
+    and v1 reads are unchanged.
+  - v1 `PUT` refuses a zero limit.
+- **Core/adapter boundary:** no new correctness rule. The limit is a
+  validated preference that the client sends; enforcement stays in the
+  existing core plan rules (`conversion_fits`, `rate_cap`). One parser
+  (`bitrate`) validates both preferences and plan input.
+- **Evidence:**
+  - `v2_playback`: 30 passed. The preferences test covers no limit by
+    default, four invalid limits refused, and a saved limit round trip.
+  - compose: 22 passed. New: the profile select with a nullable type, and
+    the player's limit control and `data-max-bitrate`.
+  - JS: 86 passed. New: `replanInput` replaces, keeps or clears the limit,
+    and refuses five malformed limits.
+  - `access_api` 39 passed, `m3_workflows` 2, `server` 46, contract 5.
+  - Pinned clippy with CI's flags: clean.
+- **Review:** pending (GPT-6.1 Sol).
+
 ### Remaining item 3 slices (not started)
 
 | Slice | Next step |
 |---|---|
 | 3C bitmap cues before the 20 s lookback; burned and automatic subtitles across parts | Second validated descriptor for early cues; per-part burn inputs in the concat graph; automatic selection over components present in every part |
-| 3E bitrate preference and UI control | Contract preference field, bridge and player control |
 | 3F custom video-profile preparation UI | Validated form over `video_profile` |
 
 ## 4. Library-management UI workflows

@@ -743,6 +743,9 @@ impl UiQueryFacade for Queries {
                         .unwrap_or(true),
                     autoplay: prefs["autoplay"].as_bool().unwrap_or(false),
                     completion_percent: prefs["completion_percent"].as_f64().unwrap_or(90.0),
+                    max_bitrate_bps: prefs["max_bitrate_bps"]
+                        .as_str()
+                        .and_then(|b| b.parse().ok()),
                     etag: etag.ok_or(UiError::Unavailable)?,
                 },
             })

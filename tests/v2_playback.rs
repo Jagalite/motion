@@ -1725,7 +1725,30 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
 
     // The profile's completion threshold drives automatic, sticky completion.
     let prefs = f.get("/api/v2/profiles/default/preferences", &auth).await;
+    assert_eq!(
+        prefs.body["max_bitrate_bps"],
+        Value::Null,
+        "no limit by default"
+    );
     let mut document = prefs.body.clone();
+    // A streaming limit is a positive decimal string.
+    for bad in [json!("0"), json!("08"), json!(8000000), json!("8e6")] {
+        let mut invalid = document.clone();
+        invalid["max_bitrate_bps"] = bad;
+        let refused = f
+            .call(
+                "PUT",
+                "/api/v2/profiles/default/preferences",
+                Some(invalid),
+                &[
+                    ("authorization", &auth),
+                    ("if-match", prefs.headers["etag"].to_str().unwrap()),
+                ],
+            )
+            .await;
+        assert!(refused.status.is_client_error(), "{:?}", refused.body);
+    }
+    document["max_bitrate_bps"] = json!("8000000");
     document["completion_percent"] = json!(50);
     let replaced = f
         .call(
@@ -1739,6 +1762,13 @@ async fn viewing_authority_rebinds_fences_overrides_and_resolves_release_order()
         )
         .await;
     assert_eq!(replaced.status, StatusCode::OK, "{:?}", replaced.body);
+    assert_eq!(replaced.body["max_bitrate_bps"], "8000000");
+    assert_eq!(
+        f.get("/api/v2/profiles/default/preferences", &auth)
+            .await
+            .body["max_bitrate_bps"],
+        "8000000"
+    );
     problem(
         &f.call(
             "PUT",

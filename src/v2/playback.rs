@@ -238,7 +238,16 @@ fn preferences_json(state: &legacy::PreferenceState) -> Value {
         "allow_client_software_decode": p.allow_client_software_decode,
         "autoplay": p.autoplay,
         "completion_percent": p.completion_percent,
+        "max_bitrate_bps": p.max_bitrate_bps.map(|b| b.to_string()),
     })
+}
+
+/// A canonical decimal bit rate: digits only, no leading zero, within u64.
+fn bitrate(b: &str) -> Option<u64> {
+    b.parse::<u64>()
+        .ok()
+        .filter(|_| b.len() <= 20 && (b == "0" || !b.starts_with('0')))
+        .filter(|_| b.bytes().all(|c| c.is_ascii_digit()))
 }
 
 fn tagged(status: StatusCode, body: Value, revision: i64) -> Response {
@@ -275,6 +284,9 @@ pub struct PreferencesInput {
     allow_client_software_decode: bool,
     autoplay: bool,
     completion_percent: f64,
+    /// Absent or null: no limit (the document is replaced as a whole).
+    #[serde(default)]
+    max_bitrate_bps: Option<String>,
 }
 
 pub async fn put_preferences(
@@ -298,6 +310,16 @@ pub async fn put_preferences(
             "Unknown subtitle or quality mode, or completion outside 50-100",
         ));
     }
+    // A limit is a positive decimal like a plan's (`bitrate`).
+    let max_bitrate_bps = match input.max_bitrate_bps.as_deref() {
+        None => None,
+        Some(b) => Some(bitrate(b).filter(|b| *b > 0).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_preferences",
+                "max_bitrate_bps must be a positive decimal string",
+            )
+        })?),
+    };
     let mut languages = [input.audio_languages, input.subtitle_languages];
     for list in &mut languages {
         if list.len() > 16
@@ -356,6 +378,7 @@ pub async fn put_preferences(
             allow_client_software_decode: input.allow_client_software_decode,
             autoplay: input.autoplay,
             completion_percent: input.completion_percent,
+            max_bitrate_bps,
         },
     };
     sqlx::query("INSERT INTO playback_preferences(profile_id,revision,document_json) VALUES (?,?,?) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,document_json=excluded.document_json")
@@ -1018,18 +1041,12 @@ pub async fn plan(
     }
     let max_bitrate = match input.quality.max_bitrate_bps.as_deref() {
         None => None,
-        Some(b) => Some(
-            b.parse::<u64>()
-                .ok()
-                .filter(|_| b.len() <= 20 && (b == "0" || !b.starts_with('0')))
-                .filter(|_| b.bytes().all(|c| c.is_ascii_digit()))
-                .ok_or_else(|| {
-                    Problem::invalid(
-                        "invalid_plan_input",
-                        "max_bitrate_bps must be a decimal string",
-                    )
-                })?,
-        ),
+        Some(b) => Some(bitrate(b).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_plan_input",
+                "max_bitrate_bps must be a decimal string",
+            )
+        })?),
     };
     let mode = match input.quality.mode.as_str() {
         "auto" => Mode::Auto,

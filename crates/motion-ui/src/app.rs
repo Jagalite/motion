@@ -817,6 +817,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-autoplay=(if preferences.autoplay { "true" } else { "false" })
             data-subtitle-policy=(preferences.subtitle_mode.as_str())
             data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
+            data-max-bitrate=(preferences.max_bitrate_bps.map(|b| b.to_string()).unwrap_or_default())
             data-resume-ms=(view_model.resume_ms)
             data-duration-ms=(view_model.duration_ms.unwrap_or(0))
             data-demuxe-base=(assets::DEMUXE_BASE)>
@@ -872,6 +873,11 @@ async fn play(cx: &Cx) -> Result<impl View> {
                         }
                     </select></label>
                     <label>"Quality "<select name="quality"><option value="auto" selected=(preferences.quality_mode == "auto")>"Automatic"</option><option value="original" selected=(preferences.quality_mode == "original")>"Original"</option><option value="convert" selected=(preferences.quality_mode == "convert")>"Convert"</option></select></label>
+                    <label>"Limit "<select name="limit">
+                        for (value, text, selected) in crate::screens::bitrate_options(preferences.max_bitrate_bps) {
+                            <option value=(value) selected=(selected)>(text)</option>
+                        }
+                    </select></label>
                     <button type="button" data-player-action="quality">"Apply quality"</button>
                 </div>
             </details>

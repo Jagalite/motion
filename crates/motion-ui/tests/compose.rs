@@ -285,6 +285,12 @@ async fn player_page_emits_a_stable_host_and_external_module() {
     );
     assert!(html.contains("Skip intro") && html.contains("(detected)"));
     assert!(html.contains(r#"data-player-seek="0""#) && html.contains("Departure"));
+    // The profile's streaming limit (none here) and a limit control.
+    assert!(html.contains(r#"data-max-bitrate="""#), "{html}");
+    assert!(
+        html.contains(r#"<select name="limit"><option value="" selected="">No limit</option>"#)
+    );
+    assert!(html.contains(r#"<option value="8000000">8 Mbps — 720p, high</option>"#));
     assert_strict_markup(&html);
 }
 
@@ -513,6 +519,10 @@ async fn command_bodies_satisfy_required_contract_fields() {
     let (_, _, profiles) = get_page(&admin, "/profiles").await;
     // Preferences.completion_percent is required (50..=100); the input cannot be left empty.
     assert!(profiles.contains(r#"name="completion_percent" data-type="number" required="""#));
+    // The streaming limit is null (no limit) or a decimal string.
+    assert!(profiles.contains(
+        r#"<select name="max_bitrate_bps" data-type="nullable"><option value="" selected="">No limit</option>"#
+    ));
     let (_, _, matches) = get_page(&admin, "/matches").await;
     // A match without candidates cannot be accepted, but can be rejected or deferred.
     let m2 = &matches

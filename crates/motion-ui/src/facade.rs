@@ -192,6 +192,8 @@ pub struct PreferencesView {
     pub allow_client_software_decode: bool,
     pub autoplay: bool,
     pub completion_percent: f64,
+    /// Streaming limit in bits per second; None means no limit.
+    pub max_bitrate_bps: Option<u64>,
     pub etag: String,
 }
 

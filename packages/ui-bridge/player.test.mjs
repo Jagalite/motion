@@ -54,6 +54,14 @@ test('audio, version and quality choices replan only the same timeline input', (
   assert.equal(back.source, null);
   assert.equal(back.quality.mode, 'convert');
   assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '../x', audioSource}), /Invalid audio/);
+  // A streaming limit replaces the plan's cap; none clears it; absent keeps it.
+  const limited = replanInput(input, {version: '', quality: 'auto', audio: '', audioSource, limit: '8000000'});
+  assert.equal(limited.quality.max_bitrate_bps, '8000000');
+  assert.equal(replanInput(limited, {version: '', quality: 'auto', audio: '', audioSource}).quality.max_bitrate_bps, '8000000');
+  assert.equal(replanInput(limited, {version: '', quality: 'auto', audio: '', audioSource, limit: ''}).quality.max_bitrate_bps, null);
+  for (const limit of ['0', '08', '1e6', '-1', '123456789012345678901']) {
+    assert.throws(() => replanInput(input, {version: '', quality: 'auto', audio: '', audioSource, limit}), /Invalid streaming limit/, limit);
+  }
 });
 
 test('only a plan for the same file revision replans in place', () => {

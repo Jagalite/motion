@@ -325,6 +325,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                     allow_client_software_decode: true,
                     autoplay: false,
                     completion_percent: 90.0,
+                    max_bitrate_bps: None,
                     etag: format!("\"prefs-{}-1\"", who.profile_id),
                 },
             })

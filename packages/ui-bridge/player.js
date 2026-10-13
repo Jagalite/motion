@@ -120,14 +120,17 @@ async function openGeneration(element, generation, position, origin) {
 // A version, quality or audio choice replans the same timeline. An audio
 // track other than the default asks the planner for a conversion that carries
 // exactly that stream; the server decides whether one is admissible.
-function replanInput(input, {version, quality, audio, audioSource}) {
+function replanInput(input, {version, quality, audio, audioSource, limit}) {
   if (audio && !/^a[0-9]{1,4}$/.test(audio)) throw new Error('Invalid audio track');
+  // A streaming limit in bits per second ('' for none); absent keeps the current one.
+  if (limit && !/^[1-9][0-9]{0,19}$/.test(limit)) throw new Error('Invalid streaming limit');
+  const maxBitrate = limit === undefined ? input.quality.max_bitrate_bps : limit || null;
   // Track IDs are ordinals of one file revision's streams. A chosen track pins
   // the exact version and file revision the options describe (the planner
   // rejects a changed revision); a different version drops the choice.
   const pinned = audio && audioSource?.version && audioSource.file_id && audioSource.file_revision;
   if (audio && (!pinned || (version && version !== audioSource.version))) audio = null;
-  return {...input, failed_candidate_ids: [], quality: {...input.quality, mode: quality},
+  return {...input, failed_candidate_ids: [], quality: {...input.quality, mode: quality, max_bitrate_bps: maxBitrate},
     version_id: audio ? audioSource.version : version || null,
     source: audio ? {file_id: audioSource.file_id, file_revision: audioSource.file_revision} : null,
     tracks: {...input.tracks, audio_track_id: audio || null}};
@@ -728,7 +731,7 @@ async function start() {
     state.planInput = {
       profile_id: data.profileId, timeline_id: data.timelineId, version_id: null, source: null,
       tracks: {audio_component_id: null, subtitle_component_id: null, subtitle_policy: subtitlePolicy(data.subtitlePolicy), audio_track_id: null, subtitle_track_id: null},
-      quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
+      quality: {mode: data.qualityMode || 'auto', max_bitrate_bps: /^[1-9][0-9]{0,19}$/.test(data.maxBitrate ?? '') ? data.maxBitrate : null, max_height: null, allow_client_software: data.softwareDecode !== 'false', hdr_policy: 'preserve_if_supported'},
       client: observedCapability(shared), failed_candidate_ids: [],
     };
     const opened = await openCandidates(state.planInput, {
@@ -901,7 +904,7 @@ controls?.addEventListener('click', event => {
     if (action === 'quality') {
       const epoch = state.epoch;
       const next = replanInput(state.planInput, {version: controls.elements.version.value,
-        quality: controls.elements.quality.value, audio: controls.elements.audio?.value,
+        quality: controls.elements.quality.value, audio: controls.elements.audio?.value, limit: controls.elements.limit?.value,
         audioSource: {version: controls.elements.audio?.dataset.version, file_id: controls.elements.audio?.dataset.fileId,
           file_revision: controls.elements.audio?.dataset.fileRevision}});
       const plan = await api('POST', '/api/v2/playback/plans', next, undefined, AbortSignal.timeout(10000));

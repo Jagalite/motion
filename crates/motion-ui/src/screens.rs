@@ -126,6 +126,39 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
 
 // --- Profiles and preferences ---------------------------------------------
 
+/// Streaming limits offered to people, in bits per second (None: no limit),
+/// with what each is typically enough for.
+const BITRATE_LIMITS: [(Option<u64>, &str); 8] = [
+    (None, "No limit"),
+    (Some(40_000_000), "40 Mbps — 4K"),
+    (Some(20_000_000), "20 Mbps — 1080p, high"),
+    (Some(12_000_000), "12 Mbps — 1080p"),
+    (Some(8_000_000), "8 Mbps — 720p, high"),
+    (Some(4_000_000), "4 Mbps — 720p"),
+    (Some(2_000_000), "2 Mbps — 480p"),
+    (Some(1_000_000), "1 Mbps — low bandwidth"),
+];
+
+/// The limit choices as (value, label, selected); a limit saved outside the
+/// list (through the API) is shown as its own choice rather than replaced.
+pub(crate) fn bitrate_options(current: Option<u64>) -> Vec<(String, String, bool)> {
+    let mut options: Vec<(String, String, bool)> = BITRATE_LIMITS
+        .iter()
+        .map(|(value, label)| {
+            (
+                value.map(|v| v.to_string()).unwrap_or_default(),
+                (*label).to_owned(),
+                *value == current,
+            )
+        })
+        .collect();
+    if let Some(custom) = current.filter(|c| !BITRATE_LIMITS.iter().any(|(v, _)| *v == Some(*c))) {
+        let mbps = custom as f64 / 1_000_000.0;
+        options.push((custom.to_string(), format!("{mbps} Mbps — custom"), true));
+    }
+    options
+}
+
 #[page("/profiles")]
 pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
@@ -165,6 +198,13 @@ pub(crate) async fn profiles(cx: &Cx) -> Result<impl View> {
                 <select name="quality_mode" data-type=(kind(Field::Text))>
                     for (value, text) in quality_modes {
                         <option value=(value) selected=(prefs.quality_mode == value)>(text)</option>
+                    }
+                </select>
+            </label>
+            <label>"Streaming limit "
+                <select name="max_bitrate_bps" data-type=(kind(Field::Nullable))>
+                    for (value, text, selected) in bitrate_options(prefs.max_bitrate_bps) {
+                        <option value=(value) selected=(selected)>(text)</option>
                     }
                 </select>
             </label>

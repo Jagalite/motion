@@ -407,6 +407,11 @@ pub struct Preferences {
     pub autoplay: bool,
     #[serde(default = "default_completion")]
     pub completion_percent: f64,
+    /// The profile's streaming limit in bits per second, sent by its players
+    /// as a plan's `max_bitrate_bps`; None means no limit. Omitted when
+    /// absent, so documents written before it are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bitrate_bps: Option<u64>,
 }
 fn enabled() -> bool {
     true
@@ -425,6 +430,7 @@ impl Default for Preferences {
             allow_client_software_decode: true,
             autoplay: false,
             completion_percent: default_completion(),
+            max_bitrate_bps: None,
         }
     }
 }
@@ -483,6 +489,7 @@ pub async fn put_preferences(
             "auto" | "original" | "convert"
         )
         || !crate::playback::valid_recipe(&body.preferences.conversion_recipe)
+        || body.preferences.max_bitrate_bps == Some(0)
     {
         return Err(ApiError::bad("Invalid preference revision or mode"));
     }

@@ -14988,6 +14988,18 @@
             "type": "number",
             "minimum": 50,
             "maximum": 100
+          },
+          "max_bitrate_bps": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[1-9][0-9]{0,19}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The profile's streaming limit in bits per second, which its players send as a plan's quality.max_bitrate_bps. Null or absent means no limit; the document is replaced as a whole."
           }
         },
         "required": [
