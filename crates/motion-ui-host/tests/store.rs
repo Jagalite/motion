@@ -563,6 +563,7 @@ fn a_removal_is_settled_only_once_its_copy_is_gone() {
     let mut store = Store::open(&root, &scope()).unwrap();
     assert!(store.settle_removal("d1", Deletion::Deleted).unwrap());
     assert!(store.manifest().downloads.is_empty() && store.removals().is_empty());
+}
 
 /// After a server restore the first batch under the new history carries a
 /// re-anchor from the history the log's compaction point belongs to.

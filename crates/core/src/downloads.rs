@@ -442,8 +442,9 @@ pub enum ReanchorRefusal {
 /// and never sends those sequences again; the restored server, which never
 /// consumed them, moves its next sequence past them and retains nothing at
 /// or below. Only the device's own sequence space moves, and only forward;
-/// when the server already is past `through` nothing changes (a retried
-/// request). Refused for the current history or another server's.
+/// when the server already is past `through` (a retried request, or a
+/// backup that already held later sequences) only the floor moves.
+/// Refused for the current history or another server's.
 pub fn reanchor(
     current: (&str, &str),
     from: &str,
@@ -461,16 +462,13 @@ pub fn reanchor(
     if restore == current.1 {
         return Err(ReanchorRefusal::SameHistory);
     }
-    if through < next_sequence {
-        return Ok((next_sequence, retention));
-    }
-    Ok((
-        through + 1,
-        Retention {
-            pruned_through: retention.pruned_through.max(through),
-            ..retention
-        },
-    ))
+    // The device never resends a sequence at or below `through`, so nothing
+    // there is retained, whether or not the sequence moves.
+    let retention = Retention {
+        pruned_through: retention.pruned_through.max(through),
+        ..retention
+    };
+    Ok((next_sequence.max(through + 1), retention))
 }
 
 /// Decide one offline event under the server's retention floor. A recorded
@@ -922,6 +920,11 @@ mod tests {
         assert_eq!(
             reanchor(current, "server:r1", 7, 8, Retention::server(7)),
             Ok((8, Retention::server(7)))
+        );
+        // A backup already past `through`: the sequence stays, the floor moves.
+        assert_eq!(
+            reanchor(current, "server:r1", 10_000, 10_001, retention),
+            Ok((10_001, Retention::server(10_000)))
         );
         assert_eq!(
             reanchor(current, "server:r2", 7, 3, retention),

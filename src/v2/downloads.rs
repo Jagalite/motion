@@ -1009,7 +1009,7 @@ pub async fn sync(
                 },
             )
         })?;
-        if moved as i64 != next {
+        if moved as i64 != next || retention.pruned_through as i64 != pruned {
             sqlx::query(
                 "DELETE FROM offline_events WHERE device_id=? AND profile_id=? AND sequence<=?",
             )

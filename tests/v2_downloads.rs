@@ -1207,4 +1207,23 @@ async fn offline_sync_reanchors_the_devices_sequence_after_a_restore() {
         retention_value(&f, &device, "next_sequence", "offline_sequences").await,
         4
     );
+    // A backup that already held later sequences: the sequence stays and the
+    // floor still moves to `through`, without an acknowledged_through.
+    sqlx::query("UPDATE offline_sequences SET next_sequence=10,pruned_through=0 WHERE device_id=?")
+        .bind(&device)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let later = sync(
+        after.clone(),
+        vec![event(10, &timeline, base, 50_000, "paused")],
+        Value::Null,
+        json!({"from_viewing_epoch": before, "through": "8"}),
+    )
+    .await;
+    assert_eq!(later.body["next_device_sequence"], "11", "{:?}", later.body);
+    assert_eq!(
+        retention_value(&f, &device, "pruned_through", "offline_sequences").await,
+        8
+    );
 }

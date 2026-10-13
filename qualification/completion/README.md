@@ -807,7 +807,15 @@ Round 4 at `a05d28e` (focused on that fix): no actionable regressions.
 - **Not covered (5C part 2):** progress retained from the earlier history
   (events pinned to it) still waits. The person's explicit choice to
   discard it or re-apply it onto the restored server is next.
-- **Review:** pending (GPT-6.1 Sol).
+- **Review (GPT-6.1 Sol), round 1:** one P2, fixed. When a restored
+  backup already held later sequences, a re-anchor returned early without
+  moving the retention floor. Without an `acknowledged_through`, all those
+  records stayed retained and the next event could be refused as
+  `acknowledgement_required`, despite the contract. The floor now always
+  moves to `through`, the sequence never moves backward, and the adapter
+  persists either change. Covered by a core case and an integration case
+  (`next_sequence` 10, `through` 8: the sequence stays and the floor is 8).
+  The model is unchanged and still passes: 4,166,162 states.
 
 ### Remaining item 5 work (not started)
 
