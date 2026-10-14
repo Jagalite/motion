@@ -51,7 +51,11 @@ one delivery mode explicitly; Motion never switches modes on its own.
 Send a test only after selecting its destination. "Accepted by mail server" is
 transport acceptance; entering the test code from the received message is the
 only receipt confirmation. Neither authenticates anyone. Enable email after a
-successful test of the current configuration revision. An already owned,
+successful test of the current configuration revision. Once email is enabled,
+it may be some user's only method and cannot be disabled; to change delivery
+settings, confirm applying them while email stays enabled, then send a test
+immediately. Any change resets the test, cancels queued mail and signs out
+email-authenticated browser sessions. An already owned,
 authenticated user enrolls an address from **My sign-in methods**, proves recent
 local authority, and enters the code delivered to that address. Ordinary login
 never enrolls an unknown address. Address matching is case-insensitive ASCII;
@@ -162,3 +166,6 @@ before migration; never edit an already applied migration.
 `qualification/auth-signin/mail.py` captures SMTP messages on loopback. Use only
 isolated databases, mail directories and fixture credentials. Current evidence
 and outstanding gates are recorded in `qualification/auth-signin/README.md`.
+Native delivery and registration evidence is in `qualification/native-email/README.md`;
+`tests/fixtures/mail` holds a fixture CA, MX certificate, DKIM key and an
+independent DKIM verifier used only by tests.

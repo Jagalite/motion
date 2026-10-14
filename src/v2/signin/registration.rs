@@ -321,16 +321,18 @@ pub(super) async fn complete(
         Some(row) => row.email.as_deref() == Some(address) && registrable(tx, app, row).await?,
         None => false,
     };
-    // Expire lapsed requests in this writer so a new one can replace them.
+    // Expire lapsed requests in this writer so a new one can replace them. One
+    // observed time keeps expiry, pending and capacity facts consistent.
+    let at = now();
     sqlx::query("UPDATE signin_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?")
-        .bind(now())
+        .bind(at)
         .execute(&mut *tx)
         .await?;
     let pending = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM signin_requests WHERE kind='email' AND status='pending' AND address=? AND expires_at>?",
     )
     .bind(address)
-    .bind(now())
+    .bind(at)
     .fetch_one(&mut *tx)
     .await?
         > 0;
@@ -345,7 +347,7 @@ pub(super) async fn complete(
     let capacity = match registration.policy {
         policy::Policy::Open => {
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM registration_activations WHERE at>?")
-                .bind(now() - 86_400)
+                .bind(at - 86_400)
                 .fetch_one(&mut *tx)
                 .await?
                 < DAILY_ACTIVATIONS
@@ -354,7 +356,7 @@ pub(super) async fn complete(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM signin_requests WHERE status='pending' AND expires_at>?",
             )
-            .bind(now())
+            .bind(at)
             .fetch_one(&mut *tx)
             .await?
                 < PENDING_REQUESTS

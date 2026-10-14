@@ -15,6 +15,14 @@ const assert = require('node:assert/strict');
 const {execFileSync} = require('node:child_process');
 
 const base = process.env.MOTION_BASE;
+// The harness sends the local operator token: refuse anything but a literal
+// loopback origin, and never follow redirects.
+{
+  const url = new URL(base);
+  if (url.origin !== base || url.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(url.hostname)) {
+    throw new Error('MOTION_BASE must be a literal loopback origin such as http://127.0.0.1:8960');
+  }
+}
 const operator = fs.readFileSync(path.join(process.env.MOTION_DATA, 'admin-token'), 'utf8').trim();
 const mailbox = process.env.MAILBOX;
 const sinkPort = Number(process.env.SINK_PORT);
@@ -33,7 +41,7 @@ async function api(method, route, body, extra = {}) {
   if (body !== undefined) headers['content-type'] = 'application/json';
   if (method !== 'GET') headers['idempotency-key'] = crypto.randomUUID();
   if (extra.revision) headers['if-match'] = `"r-${extra.revision}"`;
-  const response = await fetch(base + route, {method, headers, body: body === undefined ? undefined : JSON.stringify(body)});
+  const response = await fetch(base + route, {method, headers, redirect: 'error', body: body === undefined ? undefined : JSON.stringify(body)});
   const text = await response.text();
   const data = text ? JSON.parse(text) : null;
   if (!response.ok && !extra.allow) throw new Error(`${method} ${route}: ${response.status} ${text}`);
