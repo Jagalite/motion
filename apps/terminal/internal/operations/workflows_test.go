@@ -353,4 +353,16 @@ func TestFixtureAssignmentNarrowsRatingsAndRefusesLabelOverflow(t *testing.T) {
 	if after, _ := operations.InspectDevice(ctx, f, full); after.Value.UserID != nil || after.Value.Revision != before.Value.Revision {
 		t.Fatalf("refused assignment changed the device: %+v", after.Value)
 	}
+	// Repeated labels count once, as in the server's set.
+	repeated := make([]string, 200)
+	for i := range repeated {
+		repeated[i] = "a"
+	}
+	dup := device("dup", api.AccessPolicy{AllowUnrated: true, BlockedLabels: repeated, Permissions: []string{api.PermCatalogRead}})
+	if _, err := operations.AssignDevice(ctx, f, dup, extra.ID, extra.Revision, operations.Current()); err != nil {
+		t.Fatalf("duplicate labels counted: %v", err)
+	}
+	if p, _ := operations.InspectDevicePolicy(ctx, f, dup); len(p.Value.BlockedLabels) != 2 {
+		t.Fatalf("labels %v", p.Value.BlockedLabels)
+	}
 }

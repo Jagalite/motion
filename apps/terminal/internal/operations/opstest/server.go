@@ -418,8 +418,9 @@ func (s *Server) AssignDeviceUser(_ context.Context, id, user, userRevision, eta
 	default:
 		permissions, profiles = intersect(d.Permissions, u.Permissions), intersect(d.ProfileIDs, u.ProfileIDs)
 		p.LibraryIDs, p.AllowUnrated = intersect(p.LibraryIDs, u.Policy.LibraryIDs), p.AllowUnrated && u.Policy.AllowUnrated
-		labels := append([]string{}, p.BlockedLabels...)
-		for _, l := range u.Policy.BlockedLabels {
+		// Labels are a set, as in the server: count distinct ones.
+		labels := []string{}
+		for _, l := range append(append([]string{}, p.BlockedLabels...), u.Policy.BlockedLabels...) {
 			if !slices.Contains(labels, l) {
 				labels = append(labels, l)
 			}
