@@ -97,8 +97,8 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 		jobs, _ := data[[]api.Job](m, keyJobs)
 		for _, j := range sortedJobs(jobs) {
 			phase := phaseCell(j.Phase)
-			if m.cancelling[j.ID] {
-				phase = accentStyle.Render("◌ cancelling…")
+			if kind, ok := m.acting[j.ID]; ok {
+				phase = accentStyle.Render("◌ " + actingLabel(kind))
 			}
 			progress := ""
 			if j.Progress != nil {
@@ -308,6 +308,9 @@ func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 	if handled, cmd := m.accessAction(msg); handled {
 		return cmd
 	}
+	if handled, cmd := m.formAction(msg); handled {
+		return cmd
+	}
 	page := max(m.tvisible, 1) // as many rows as are on screen
 	m.tselID = ""              // moving by keys: the index leads
 	switch {
@@ -330,7 +333,16 @@ func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 	case m.route.page == pageProcessing && key.Matches(msg, keys.Cancel):
 		// The server decides per job kind who may cancel; a refusal is shown.
 		if id := m.selectedID(); id != "" {
-			m.confirm = id
+			m.askCancel(id)
+		}
+	case m.route.page == pageProcessing && key.Matches(msg, keys.Retry):
+		// Retry needs the reviewed revision; the server decides eligibility.
+		if id := m.selectedID(); id != "" {
+			return m.askRetry(id)
+		}
+	case m.route.page == pageProcessing && key.Matches(msg, keys.Inspect):
+		if id := m.selectedID(); id != "" {
+			return m.inspectJob(id, false)
 		}
 	case (m.route.page == pageNowPlaying || m.route.page == pageHistory) && key.Matches(msg, keys.History):
 		if m.filterHistory() {

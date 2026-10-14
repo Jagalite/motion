@@ -150,13 +150,22 @@ func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error
 		}
 	}
 	attempts := max(c.MaxAttempts, 1)
+	// reached records that an earlier attempt of a write may have been
+	// applied: a later refusal then does not settle the outcome.
+	reached := false
 	for attempt := 0; ; attempt++ {
 		header, err := c.once(ctx, r, body, out)
 		if err != nil && ctx.Err() != nil {
 			return header, ctx.Err()
 		}
+		if err != nil && reached {
+			err = &AfterUnknownAttemptError{Err: err}
+		}
 		if err == nil || attempt+1 >= attempts || !r.retrySafe() {
 			return header, err
+		}
+		if r.method != http.MethodGet && r.method != http.MethodHead && !refused(err) {
+			reached = true
 		}
 		wait, retry := retryAfter(err, attempt)
 		if !retry {
@@ -166,6 +175,21 @@ func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error
 			return nil, err
 		}
 	}
+}
+
+// AfterUnknownAttemptError wraps the final error of a write when an earlier
+// attempt with the same key failed without a definite answer, so the write
+// may have been applied even though the last attempt was refused.
+type AfterUnknownAttemptError struct{ Err error }
+
+func (e *AfterUnknownAttemptError) Error() string { return e.Err.Error() }
+func (e *AfterUnknownAttemptError) Unwrap() error { return e.Err }
+
+// refused reports a client-error answer: the server did not apply the
+// request.
+func refused(err error) bool {
+	var p *Problem
+	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500
 }
 
 func retryAfter(err error, attempt int) (time.Duration, bool) {
@@ -350,6 +374,15 @@ func (c *Client) GetDevice(ctx context.Context, id string) (Tagged[Device], erro
 func (c *Client) RevokeDevice(ctx context.Context, id, etag string) error {
 	_, err := c.do(ctx, request{method: http.MethodDelete, path: "/api/v2/devices/" + esc(id), auth: true, ifMatch: etag}, nil)
 	return err
+}
+
+// AssignDeviceUser assigns an unassigned device to a user at the device's
+// ETag and the reviewed user revision.
+func (c *Client) AssignDeviceUser(ctx context.Context, id, userID, userRevision, etag string) (Tagged[Device], error) {
+	var v Device
+	h, err := c.do(ctx, request{method: http.MethodPut, path: "/api/v2/devices/" + esc(id) + "/user",
+		body: map[string]string{"user_id": userID, "user_revision": userRevision}, auth: true, ifMatch: etag}, &v)
+	return Tagged[Device]{Value: v, ETag: h.Get("ETag")}, err
 }
 
 func (c *Client) GetDevicePolicy(ctx context.Context, id string) (Tagged[AccessPolicy], error) {

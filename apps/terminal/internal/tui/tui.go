@@ -28,7 +28,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/Jagalite/motion/apps/terminal/internal/cli"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
 const (
@@ -53,10 +53,9 @@ type streamMsg struct {
 	state string
 	err   error
 }
-type launchDone struct{ err error }
-type cancelDone struct {
-	job string
-	err error
+type launchDone struct {
+	epoch int
+	err   error
 }
 type searchDue struct{ seq int }
 type noticeDone struct{ seq int }
@@ -75,7 +74,7 @@ type Model struct {
 	backend     Backend
 	server      string
 	incoming    <-chan tea.Msg
-	openBrowser func(context.Context, string) error
+	openBrowser operations.Browser
 	// profile is the chosen viewing profile; "" uses the principal's first.
 	profile string
 
@@ -111,13 +110,35 @@ type Model struct {
 	vp        viewport.Model
 	table     table.Model
 
-	log        []logEntry
-	stream     string
-	streamErr  error
-	notice     notice
-	confirm    string
-	cancelling map[string]bool
-	launching  bool
+	log       []logEntry
+	stream    string
+	streamErr error
+	notice    notice
+	confirm   jobConfirm
+	launching bool
+	// acting is the job action in flight per job; jobs remembers actions
+	// whose outcome is unknown.
+	acting map[string]operations.JobActionKind
+	jobs   *operations.PendingJobActions
+	// epoch counts credential rejections: a reply to an action or review
+	// sent before the latest one is ignored.
+	epoch int
+	// review is the newest job inspection; an older reply is ignored.
+	review       int
+	reviewCancel context.CancelFunc
+	launchCancel context.CancelFunc
+	pairCancel   context.CancelFunc
+	pairing      *operations.PendingPairing
+	policyReq    int
+	// session is the verified session, for credential actions; nil when
+	// the interface runs over a test backend.
+	session *operations.Session
+	// events restarts the change-hint stream for the current credential
+	// (or only stops it), returning its channel; streamGen fences replies.
+	events    func(on bool) <-chan tea.Msg
+	streamGen int
+	// health is the server identity verified when the session opened.
+	health api.Health
 
 	// metrics is the console's history; bars animate job progress.
 	metrics *history
@@ -155,11 +176,11 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 		Selected: focusStyle.Background(colorRaised2),
 	})
 	return Model{
-		ctx: ctx, backend: backend, server: server, incoming: incoming, openBrowser: cli.OpenBrowser,
+		ctx: ctx, backend: backend, server: server, incoming: incoming,
 		cache:  &cache{slots: map[string]*slot{}},
 		search: search, help: h, table: tbl, vp: viewport.New(),
-		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
-		cancelling: map[string]bool{}, stream: "connecting",
+		spinner: spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
+		acting:  map[string]operations.JobActionKind{}, jobs: &operations.PendingJobActions{}, stream: "connecting",
 		metrics: newHistory(), bars: map[string]*progress.Model{}, anim: newSprings(), opened: time.Now(),
 		// The console opens with the sidebar focused; tab moves to the page.
 		focus: focusNav,
@@ -175,18 +196,41 @@ func (m Model) wait() tea.Cmd {
 	if m.incoming == nil {
 		return nil
 	}
-	ch, ctx := m.incoming, m.ctx
+	ch, ctx, gen := m.incoming, m.ctx, m.streamGen
 	return func() tea.Msg {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				return streamMsg{state: "closed"}
+				return fromStream{gen: gen, msg: streamMsg{state: "closed"}}
 			}
-			return msg
+			return fromStream{gen: gen, msg: msg}
 		case <-ctx.Done():
 			return nil
 		}
 	}
+}
+
+// fromStream is a message from the event stream opened for credential
+// generation gen; one from an earlier credential is dropped unanswered.
+type fromStream struct {
+	gen int
+	msg tea.Msg
+}
+
+// credentialChanged discards the previous principal's activity and stream,
+// and follows events again when a credential is in use.
+func (m *Model) credentialChanged(signedIn bool) tea.Cmd {
+	m.streamGen++
+	m.log, m.streamErr = nil, nil
+	m.stream, m.incoming = "stopped", nil
+	if m.events != nil {
+		m.incoming = m.events(signedIn)
+	}
+	if m.incoming == nil {
+		return nil
+	}
+	m.stream = "connecting"
+	return m.wait()
 }
 
 // reloadAll re-queries the shell and the current page.
@@ -272,7 +316,7 @@ func (m *Model) busy() bool {
 			return true
 		}
 	}
-	return m.launching || len(m.cancelling) > 0 || m.working()
+	return m.launching || len(m.acting) > 0 || m.working()
 }
 
 // working reports a running job without progress on the Overview, whose
@@ -313,8 +357,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case fromStream:
+		if msg.gen != m.streamGen {
+			return nil // a stream opened for a previous credential
+		}
+		return m.update(msg.msg)
 	case accessDone:
 		return m.accessFinished(msg)
+	case policyLoaded:
+		return m.policyForm(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case spinner.TickMsg:
@@ -441,25 +492,31 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		}
 		return m.wait()
 	case launchDone:
-		m.launching = false
+		if msg.epoch != m.epoch {
+			return nil // sent with a credential that has since been rejected
+		}
+		m.launching, m.launchCancel = false, nil
 		if unauthenticated(msg.err) {
 			m.signedOut(msg.err)
 			return nil
 		}
+		// The launch read current permissions and capabilities; refresh the
+		// cached ones that guide the interface when they disagree.
+		var refresh tea.Cmd
+		if denied := playbackDenied(msg.err); denied == m.canPlay() {
+			refresh = m.load(keySession)
+		}
+		if playbackDenied(msg.err) {
+			return tea.Batch(refresh, m.say("Playback isn't available on this server or for this device.", true))
+		}
 		if msg.err != nil {
-			return m.say("Couldn't open the player: "+refusal(msg.err), true)
+			return tea.Batch(refresh, m.say("Couldn't open the player: "+refusal(msg.err), true))
 		}
-		return m.say("Opened the player in your browser.", false)
-	case cancelDone:
-		delete(m.cancelling, msg.job)
-		if unauthenticated(msg.err) {
-			m.signedOut(msg.err)
-			return nil
-		}
-		if msg.err != nil {
-			return tea.Batch(m.say("Couldn't cancel the job: "+refusal(msg.err), true), m.load(keyJobs))
-		}
-		return tea.Batch(m.say("Cancellation requested.", false), m.load(keyJobs))
+		return tea.Batch(refresh, m.say("Opened the player in your browser.", false))
+	case jobReviewed:
+		return m.reviewed(msg)
+	case jobActionDone:
+		return m.jobActionFinished(msg)
 	case searchDue:
 		if msg.seq == m.searchSeq {
 			return m.runSearch()
@@ -593,12 +650,12 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	if m.access != nil {
 		return m.accessKey(msg)
 	}
-	if m.confirm != "" {
+	if m.confirm.open() {
 		switch {
 		case key.Matches(msg, keys.Confirm):
-			return m.cancelJob()
+			return m.confirmed()
 		case key.Matches(msg, keys.Keep):
-			m.confirm = ""
+			m.confirm = jobConfirm{}
 		}
 		return nil
 	}
@@ -641,6 +698,9 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 			m.focus, m.navSel = focusNav, m.navIndex()
 		}
 		return nil
+	}
+	if handled, cmd := m.accountAction(msg); handled {
+		return cmd
 	}
 	if m.focus == focusNav {
 		return m.navKey(msg)
@@ -753,53 +813,31 @@ func (m *Model) launch(timeline string) tea.Cmd {
 	if m.launching {
 		return nil
 	}
-	if !m.canPlay() {
-		return m.say("Playback isn't available on this server or for this device.", true)
-	}
+	// The cached session only guides the interface; the shared operation
+	// reads current permissions and capabilities.
 	m.launching = true
-	ctx, backend, server, profile, open := m.ctx, m.backend, m.server, m.viewer(), m.openBrowser
+	ctx, cancel := context.WithTimeout(m.ctx, loadTimeout)
+	m.launchCancel = cancel
+	backend, open, epoch := m.backend, m.openBrowser, m.epoch
+	in := operations.PlayInput{Server: m.server, TimelineID: timeline, ProfileID: m.viewer(), Open: true}
 	return tea.Batch(m.spin(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
-		t, err := backend.GetTimeline(ctx, timeline)
-		if err == nil && profile != "" {
-			_, err = backend.GetProfile(ctx, profile)
-		}
-		if err == nil {
-			var target string
-			if target, err = cli.PlayerURL(server, t.Value.ID, profile); err == nil {
-				err = open(ctx, target)
-			}
-		}
-		return launchDone{err: err}
+		_, err := operations.LaunchPlayer(ctx, backend, in, open)
+		return launchDone{epoch: epoch, err: err}
 	})
+}
+
+// playbackDenied reports the shared launch's refusal for permission or
+// capability.
+func playbackDenied(err error) bool {
+	return api.IsCode(err, "forbidden") || api.IsCode(err, "feature_unavailable")
 }
 
 // canPlay reports whether the server offers the player and the principal
 // may request playback; the server still decides each request.
 func (m Model) canPlay() bool {
 	caps, me := m.caps(), m.me()
-	if caps == nil || me == nil || !me.Allows(api.PermPlaybackRequest) {
-		return false
-	}
-	f, ok := caps.Feature("playback.v2")
-	return ok && f.Implemented && f.Enabled
-}
-
-func (m *Model) cancelJob() tea.Cmd {
-	id := m.confirm
-	m.confirm = ""
-	if m.cancelling[id] {
-		return nil
-	}
-	m.cancelling[id] = true
-	backend, ctx, idempotency := m.backend, m.ctx, api.NewIdempotencyKey()
-	return tea.Batch(m.spin(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
-		defer cancel()
-		_, err := backend.CancelJob(ctx, id, idempotency)
-		return cancelDone{job: id, err: err}
-	})
+	return caps != nil && me != nil && operations.PlaybackReady(*me, *caps) == nil
 }
 
 func unauthenticated(err error) bool {
@@ -812,6 +850,7 @@ func unauthenticated(err error) bool {
 // sidebar's libraries, until the user refreshes after pairing again.
 func (m *Model) signedOut(err error) {
 	m.forgetAccess()
+	m.log = nil // activity seen with the rejected credential
 	for key := range m.cache.slots {
 		m.drop(key)
 	}
@@ -820,7 +859,22 @@ func (m *Model) signedOut(err error) {
 	m.cache.viewer, m.cache.shape, m.cache.shelves = "", nil, nil
 	m.forgetMetrics()
 	m.bars = map[string]*progress.Model{}
-	m.focus, m.history, m.confirm = focusContent, nil, ""
+	m.focus, m.history, m.confirm = focusContent, nil, jobConfirm{}
+	// Keys are scoped to the principal: forget unresolved actions and ignore
+	// replies to requests sent with the rejected credential.
+	m.jobs.Forget()
+	m.acting = map[string]operations.JobActionKind{}
+	m.epoch++
+	if m.pairing != nil {
+		m.pairing.Abandon()
+		m.pairing = nil
+	}
+	for _, cancel := range []context.CancelFunc{m.reviewCancel, m.launchCancel, m.pairCancel} {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	m.reviewCancel, m.launchCancel, m.pairCancel, m.launching = nil, nil, nil, false
 }
 
 // refusal phrases a failed action for the status bar.
@@ -845,12 +899,14 @@ func describe(err error) problem {
 	var p *api.Problem
 	var u *api.UnavailableError
 	switch {
-	case errors.Is(err, errIncomplete):
+	case errors.Is(err, operations.ErrIncomplete):
 		return problem{title: "Too much to show", message: "This title has more editions or versions than the terminal shows at once."}
 	case errors.As(err, &p) && p.Status == 401:
-		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Pair it again with `motion auth pair`."}
+		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Press P to pair it again or I to redeem an invitation (or run `motion auth pair`)."}
 	case errors.As(err, &p) && p.Status == 403:
 		return problem{title: "You don't have access", message: "This profile or device is not allowed to view this. " + clean(p.Detail)}
+	case errors.As(err, &p) && (p.Status == 412 || p.Status == 428):
+		return problem{title: "Changed since you reviewed it", message: "This changed since you reviewed it. Close this, refresh and try again."}
 	case errors.As(err, &p) && p.Status == 404:
 		return problem{title: "Nothing here", message: "This no longer exists or is not visible to you."}
 	case errors.As(err, &u):
@@ -919,16 +975,29 @@ func Pump(ctx context.Context, follow func(context.Context, func(api.Event) erro
 	}
 }
 
-// Run starts the interface for a connected client.
-func Run(ctx context.Context, conn *cli.Conn) error {
+// Run starts the interface for a verified session; browser opens the player.
+func Run(ctx context.Context, conn *operations.Session, browser operations.Browser) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ch := make(chan tea.Msg, eventBuffer)
-	go Pump(ctx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
-		return conn.Follow(ctx, "", h, d)
-	}, ch)
-	model := New(ctx, conn, conn.URL, ch)
-	model.profile = conn.Profile
+	var stop context.CancelFunc
+	events := func(on bool) <-chan tea.Msg {
+		if stop != nil {
+			stop()
+			stop = nil
+		}
+		if !on {
+			return nil
+		}
+		var streamCtx context.Context
+		streamCtx, stop = context.WithCancel(ctx)
+		ch := make(chan tea.Msg, eventBuffer)
+		go Pump(streamCtx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
+			return operations.FollowEvents(ctx, conn, "", h, d)
+		}, ch)
+		return ch
+	}
+	model := New(ctx, conn, conn.URL, events(true))
+	model.profile, model.openBrowser, model.session, model.health, model.events = conn.Profile, browser, conn, conn.Health, events
 	program := tea.NewProgram(model, tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {

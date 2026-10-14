@@ -641,9 +641,10 @@ pub(crate) async fn processing(cx: &Cx) -> Result<impl View> {
                                 if !matches!(job.phase.as_str(), "completed" | "failed" | "cancelled" | "interrupted" | "cancelling") {
                                     command_form(command: format!("POST /api/v2/jobs/{}/cancel", job.id), label: "Cancel", idempotent: true, class: Some("command inline"))
                                 }
-                                // The server retries failed and cancelled jobs only.
+                                // The server retries failed and cancelled jobs only, and
+                                // only at the revision shown here.
                                 if matches!(job.phase.as_str(), "failed" | "cancelled") {
-                                    command_form(command: format!("POST /api/v2/jobs/{}/retry", job.id), label: "Retry", idempotent: true, class: Some("command inline"))
+                                    command_form(command: format!("POST /api/v2/jobs/{}/retry", job.id), label: "Retry", idempotent: true, if_match: Some(job.etag.clone()), class: Some("command inline"))
                                 }
                             </td>
                         </tr>

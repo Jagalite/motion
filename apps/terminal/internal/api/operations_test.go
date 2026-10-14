@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +15,7 @@ func TestRetryJobKeepsIdentityAcrossLostAcknowledgement(t *testing.T) {
 	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		body, _ := io.ReadAll(r.Body)
-		if r.Method != "POST" || r.URL.EscapedPath() != "/api/v2/jobs/job%2Fa%3F%23/retry" || len(body) != 0 || r.Header.Get("Idempotency-Key") != "retry-job-key" || r.Header.Get("Authorization") != "Bearer mdv_secret" {
+		if r.Method != "POST" || r.URL.EscapedPath() != "/api/v2/jobs/job%2Fa%3F%23/retry" || len(body) != 0 || r.Header.Get("Idempotency-Key") != "retry-job-key" || r.Header.Get("If-Match") != `"r-2"` || r.Header.Get("Authorization") != "Bearer mdv_secret" {
 			t.Errorf("unexpected request: %s %s key=%q body=%q", r.Method, r.URL, r.Header.Get("Idempotency-Key"), body)
 		}
 		if calls == 1 {
@@ -25,7 +26,7 @@ func TestRetryJobKeepsIdentityAcrossLostAcknowledgement(t *testing.T) {
 		w.Header().Set("ETag", `"r-3"`)
 		fmt.Fprint(w, `{"id":"job/a?#","revision":"3","kind":"scan","phase":"queued","attempt_generation":"1","result_ids":[],"requester_id":"device"}`)
 	}))
-	job, err := c.RetryJob(context.Background(), "job/a?#", "retry-job-key")
+	job, err := c.RetryJob(context.Background(), "job/a?#", "retry-job-key", `"r-2"`)
 	if err != nil || calls != 2 || job.Value.Phase != "queued" || job.Value.AttemptGeneration != "1" || job.ETag != `"r-3"` {
 		t.Fatalf("job=%+v calls=%d err=%v", job, calls, err)
 	}
@@ -37,7 +38,7 @@ func TestRetryJobDoesNotRetryDomainConflict(t *testing.T) {
 		calls++
 		writeProblem(w, 409, "not_retryable", "")
 	}))
-	_, err := c.RetryJob(context.Background(), "completed", "retry-job-key")
+	_, err := c.RetryJob(context.Background(), "completed", "retry-job-key", `"r-1"`)
 	if !IsCode(err, "not_retryable") || calls != 1 {
 		t.Fatalf("calls=%d err=%v", calls, err)
 	}
@@ -95,5 +96,34 @@ func TestPlaybackMonitoringUsesContractPathsAndFilters(t *testing.T) {
 	}
 	if _, err := c.PlaybackHistory(context.Background(), "", 50, HistoryFilter{DeviceID: "dev/1"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRefusalAfterAnUnansweredAttemptKeepsTheOutcomeOpen(t *testing.T) {
+	calls := 0
+	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// The first attempt may have committed before this answer.
+			writeProblem(w, 503, "database_busy", "")
+			return
+		}
+		writeProblem(w, 409, "not_retryable", "")
+	}))
+	_, err := c.RetryJob(context.Background(), "j", "retry-job-key-0001", `"r-1"`)
+	var after *AfterUnknownAttemptError
+	if calls != 2 || !errors.As(err, &after) || !IsCode(err, "not_retryable") {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+	// A refusal on the first attempt is definite, and reads never carry it.
+	calls = 1
+	_, err = c.RetryJob(context.Background(), "j", "retry-job-key-0002", `"r-1"`)
+	if errors.As(err, &after) || !IsCode(err, "not_retryable") {
+		t.Fatalf("first-attempt refusal wrapped: %v", err)
+	}
+	calls = 0
+	_, err = c.GetJob(context.Background(), "j")
+	if errors.As(err, &after) {
+		t.Fatalf("read wrapped: %v", err)
 	}
 }

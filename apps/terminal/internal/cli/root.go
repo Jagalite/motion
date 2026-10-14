@@ -16,12 +16,12 @@ import (
 	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/Jagalite/motion/apps/terminal/internal/store"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 	"github.com/spf13/cobra"
 )
 
-// TUI is set by main to avoid an import cycle with the tui package.
-var TUI func(ctx context.Context, conn *Conn) error
+// TUI is set by main, which composes the interfaces; cli does not import tui.
+var TUI func(ctx context.Context, session *operations.Session, browser operations.Browser) error
 
 func NewRoot(env *Env) *cobra.Command {
 	root := &cobra.Command{
@@ -40,8 +40,9 @@ func NewRoot(env *Env) *cobra.Command {
 	f.StringVar(&env.Profile, "profile", os.Getenv("MOTION_PROFILE"), "viewing profile ID")
 	f.StringVar(&env.OperatorTokenFile, "operator-token-file", "", "act as the server operator using its 0600 token file")
 	f.StringVar(&env.ConfigDir, "config-dir", "", "configuration directory (default: $MOTION_CONFIG_DIR or the user config dir)")
-	root.AddCommand(serverCmd(env), authCmd(env), devicesCmd(env), profilesCmd(env),
-		librariesCmd(env), sourcesCmd(env), catalogCmd(env), jobsCmd(env), diagnosticsCmd(env), playCmd(env), eventsCmd(env), tuiCmd(env), serveCmd())
+	root.AddCommand(serverCmd(env), authCmd(env), accessCmd(env), devicesCmd(env), profilesCmd(env),
+		librariesCmd(env), sourcesCmd(env), scansCmd(env), catalogCmd(env), jobsCmd(env), diagnosticsCmd(env),
+		playbackCmd(env), playCmd(env), eventsCmd(env), tuiCmd(env), serveCmd())
 	classifyArgs(root)
 	return root
 }
@@ -94,6 +95,32 @@ func run(env *Env, body func(ctx context.Context, c *Conn) error) func(*cobra.Co
 	}
 }
 
+// keyFlag adds --idempotency-key, which resubmits a keyed write whose
+// outcome was unknown.
+func keyFlag(cmd *cobra.Command, key *string) {
+	cmd.Flags().StringVar(key, "idempotency-key", "", "resubmit an earlier request whose outcome is unknown")
+}
+
+// pageFlags adds --cursor and --limit.
+func pageFlags(cmd *cobra.Command, cursor *string, limit *int) {
+	cmd.Flags().StringVar(cursor, "cursor", "", "continue from a previous page's next_cursor")
+	cmd.Flags().IntVar(limit, "limit", 50, "page size (1-200)")
+}
+
+// more prints the cursor of the next page.
+func more(w io.Writer, next *string) {
+	if next != nil {
+		fmt.Fprintf(w, "More: --cursor %s\n", sanitize(*next))
+	}
+}
+
+func yes(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
 func table(w io.Writer, header string, rows [][]string) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, header)
@@ -113,18 +140,13 @@ func serverCmd(env *Env) *cobra.Command {
 		Short: "Show liveness, identity and (when signed in) capabilities",
 		Args:  cobra.NoArgs,
 		RunE: run(env, func(ctx context.Context, c *Conn) error {
-			out := map[string]any{"url": c.URL, "health": c.Health}
-			var caps *api.Capabilities
-			if c.Operator || c.Credential != nil {
-				v, err := c.Capabilities(ctx)
-				if err != nil {
-					return err
-				}
-				caps = &v
-				out["capabilities"] = v
+			status, err := operations.ReadServerStatus(ctx, c, c.URL, c.Health, c.SignedIn())
+			if err != nil {
+				return err
 			}
-			return env.print(out, func(w io.Writer) {
+			return env.print(status, func(w io.Writer) {
 				fmt.Fprintf(w, "Server   %s\nStatus   %s\nID       %s\nEpoch    %s\n", c.URL, c.Health.Status, c.Health.ServerID, c.Health.ServerEpoch)
+				caps := status.Capabilities
 				if caps == nil {
 					fmt.Fprintln(w, "Not signed in: run `motion auth pair` to see capabilities.")
 					return
@@ -139,13 +161,6 @@ func serverCmd(env *Env) *cobra.Command {
 		}),
 	})
 	return cmd
-}
-
-func yes(b bool) string {
-	if b {
-		return "yes"
-	}
-	return "no"
 }
 
 func authCmd(env *Env) *cobra.Command {
@@ -163,25 +178,30 @@ func authCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			accepted := credentialStore
-			if accepted == "" {
-				accepted = conn.Config.CredentialStore
-			}
-			if accepted != store.FileStore {
-				return store.ErrNoStore
-			}
 			if name == "" {
 				name, _ = os.Hostname()
 			}
-			return pairDevice(ctx, env, conn, name, accepted)
+			pending, err := operations.StartPairing(ctx, conn, name, credentialStore)
+			if err != nil {
+				return err
+			}
+			env.notice(pending, fmt.Sprintf("Pairing requested. In an administrator’s Motion TUI, open Pairing requests and compare code %s.\nWaiting for approval (expires %s)...", pending.UserCode, pending.ExpiresAt))
+			signed, err := pending.Wait(ctx)
+			if err != nil {
+				return err
+			}
+			return env.print(signed, func(w io.Writer) {
+				fmt.Fprintf(w, "Paired as device %s with server %s (credential expires %s).\n", signed.DeviceID, signed.ServerID, signed.ExpiresAt)
+			})
 		},
 	}
 	pair.Flags().StringVar(&name, "name", "", "device name shown to the administrator (default: hostname)")
 	pair.Flags().StringVar(&credentialStore, "credential-store", "", "where to keep the credential; only \"file\" (0600) is supported")
 	pair.Flags().DurationVar(&wait, "wait", 10*time.Minute, "how long to wait for approval")
 
-	var code string
+	var code, approveKey, approveUser, approveRevision, approveResubmit string
 	var profiles, permissions []string
+	var policy api.GrantPolicy
 	approve := &cobra.Command{
 		Use:   "approve PAIRING_ID",
 		Short: "Approve a pairing with explicit profiles and permissions (administrator)",
@@ -190,16 +210,39 @@ func authCmd(env *Env) *cobra.Command {
 			if code == "" {
 				return usage("--code is required: use the code shown on the pairing device")
 			}
-			for _, p := range permissions {
-				if !contains(api.AllPermissions, p) {
-					return usage("unknown permission %q; valid: %s", p, strings.Join(api.AllPermissions, ", "))
-				}
+			if err := operations.CheckPermissions(permissions); err != nil {
+				return err
 			}
 			// One key for every retry of this approval.
-			key := api.NewIdempotencyKey()
+			intent, err := operations.ResumeIntent("approval of pairing "+args[0], approveKey)
+			if err != nil {
+				return err
+			}
+			var original *operations.GrantRequest
+			if approveUser != "" {
+				if original, err = resubmission(approveKey, approveResubmit); err != nil {
+					return err
+				}
+			}
 			return run(env, func(ctx context.Context, c *Conn) error {
-				d, err := c.ApprovePairing(ctx, args[0], api.PairingApproval{
-					UserCode: code, ProfileIDs: nonNil(profiles), Permissions: nonNil(permissions)}, key)
+				in := operations.Approval{PairingID: args[0], UserCode: code, ProfileIDs: profiles, Permissions: permissions}
+				if approveUser != "" {
+					// The device joins the user at the revision read now, with
+					// the grant given here.
+					user, err := operations.InspectUser(ctx, c, approveUser)
+					if err != nil {
+						return err
+					}
+					in.UserID, in.UserRevision, in.Policy = user.Value.ID, user.Value.Revision, &policy
+					if approveRevision != "" {
+						in.UserRevision = approveRevision
+					}
+					inheritGrant(cmd, user.Value, &in.ProfileIDs, &in.Permissions, &policy)
+					if original != nil {
+						in.UserRevision, in.ProfileIDs, in.Permissions, policy = original.UserRevision, original.ProfileIDs, original.Permissions, original.Policy
+					}
+				}
+				d, err := operations.ApprovePairing(ctx, c, in, intent)
 				if err != nil {
 					return err
 				}
@@ -210,21 +253,20 @@ func authCmd(env *Env) *cobra.Command {
 		},
 	}
 	approve.Flags().StringVar(&code, "code", "", "user code displayed by the pairing device")
-	approve.Flags().StringSliceVar(&profiles, "grant-profile", nil, "profile ID the device may use (repeatable)")
-	approve.Flags().StringSliceVar(&permissions, "permission", nil, "permission to grant (repeatable)")
+	grantFlags(approve, &profiles, &permissions, &policy)
+	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to (required by servers that manage access by user); its grant is the default")
+	approve.Flags().StringVar(&approveRevision, "user-revision", "", "user revision the approval is decided on (default: read it now)")
+	approve.Flags().StringVar(&approveResubmit, "resubmit-request", "", "with --idempotency-key and --user: the reported request, which replaces the grant flags")
+	keyFlag(approve, &approveKey)
 
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "Show the authenticated principal",
 		Args:  cobra.NoArgs,
 		RunE: run(env, func(ctx context.Context, c *Conn) error {
-			me, err := c.Me(ctx)
+			me, err := operations.WhoAmI(ctx, c, env.Profile)
 			if err != nil {
 				return err
-			}
-			if env.Profile != "" && !contains(me.ProfileIDs, env.Profile) {
-				return &api.Problem{Status: 403, Code: "profile_not_permitted", Title: "Forbidden",
-					Detail: fmt.Sprintf("profile %q is not available to this principal", env.Profile)}
 			}
 			return env.print(me, func(w io.Writer) {
 				device := "-"
@@ -241,341 +283,16 @@ func authCmd(env *Env) *cobra.Command {
 		Short: "Forget this server's stored credential (an administrator revokes it server-side)",
 		Args:  cobra.NoArgs,
 		RunE: run(env, func(_ context.Context, c *Conn) error {
-			if err := c.Store.DeleteCredential(c.Health.ServerID); err != nil {
+			serverID, err := operations.SignOut(c)
+			if err != nil {
 				return err
 			}
-			return env.print(map[string]string{"server_id": c.Health.ServerID}, func(w io.Writer) {
+			return env.print(map[string]string{"server_id": serverID}, func(w io.Writer) {
 				fmt.Fprintln(w, "Removed the local credential. Revoke the device with `motion devices revoke` to invalidate it.")
 			})
 		}),
 	}
 	cmd.AddCommand(pair, approve, status, logout, redeemCmd(env))
-	return cmd
-}
-
-func contains(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-func nonNil(v []string) []string {
-	if v == nil {
-		return []string{}
-	}
-	return v
-}
-
-func pairDevice(ctx context.Context, env *Env, c *Conn, name, accepted string) error {
-	p, err := c.CreatePairing(ctx, api.PairingRequest{DeviceName: name, ClientName: "motion-terminal"})
-	if err != nil {
-		return err
-	}
-	env.notice(map[string]string{"pairing_id": p.ID, "user_code": p.UserCode, "expires_at": p.ExpiresAt},
-		fmt.Sprintf("Pairing requested. In an administrator’s Motion TUI, open Pairing requests and compare code %s.\nWaiting for approval (expires %s)...", p.UserCode, p.ExpiresAt))
-	interval := time.Duration(max(p.PollIntervalSeconds, 1)) * time.Second
-	for attempt := 0; ; attempt++ {
-		if err := c.Sleep(ctx, interval); err != nil {
-			return err
-		}
-		cred, err := c.ClaimPairing(ctx, p.ID, p.DeviceCode)
-		var problem *api.Problem
-		var unavailable *api.UnavailableError
-		switch {
-		case err == nil:
-			if err := c.Store.PutCredential(store.Credential{
-				ServerID: c.Health.ServerID, DeviceID: cred.DeviceID,
-				AccessToken: cred.AccessToken, ExpiresAt: cred.ExpiresAt}, accepted); err != nil {
-				return err
-			}
-			c.Config.CredentialStore = accepted
-			if err := c.Remember(); err != nil {
-				return err
-			}
-			result := map[string]string{"server_id": c.Health.ServerID, "device_id": cred.DeviceID, "expires_at": cred.ExpiresAt}
-			return env.print(result, func(w io.Writer) {
-				fmt.Fprintf(w, "Paired as device %s with server %s (credential expires %s).\n", cred.DeviceID, c.Health.ServerID, cred.ExpiresAt)
-			})
-		case errors.As(err, &problem) && problem.Code == "pairing_pending":
-			if problem.RetryAfter > 0 {
-				interval = problem.RetryAfter
-			}
-		case errors.As(err, &problem) && problem.Status == 429:
-			if problem.RetryAfter > 0 {
-				interval = problem.RetryAfter
-			}
-		case errors.As(err, &unavailable):
-			interval = min(interval*2, 30*time.Second)
-		default:
-			return err
-		}
-	}
-}
-
-func pageFlags(cmd *cobra.Command, cursor *string, limit *int) {
-	cmd.Flags().StringVar(cursor, "cursor", "", "continue from a previous page's next_cursor")
-	cmd.Flags().IntVar(limit, "limit", 50, "page size (1-200)")
-}
-
-func devicesCmd(env *Env) *cobra.Command {
-	cmd := &cobra.Command{Use: "devices", Short: "Manage paired devices (administrator)"}
-	var cursor string
-	var limit int
-	list := &cobra.Command{
-		Use: "list", Short: "List devices", Args: cobra.NoArgs,
-		RunE: run(env, func(ctx context.Context, c *Conn) error {
-			page, err := c.ListDevices(ctx, cursor, limit)
-			if err != nil {
-				return err
-			}
-			return env.print(page, func(w io.Writer) {
-				rows := [][]string{}
-				for _, d := range page.Items {
-					state := "active"
-					if d.Revoked {
-						state = "revoked"
-					}
-					rows = append(rows, []string{d.ID, d.Name, state, strings.Join(d.Permissions, ",")})
-				}
-				table(w, "ID\tNAME\tSTATE\tPERMISSIONS", rows)
-				if page.NextCursor != nil {
-					fmt.Fprintf(w, "More: --cursor %s\n", *page.NextCursor)
-				}
-			})
-		}),
-	}
-	pageFlags(list, &cursor, &limit)
-	show := &cobra.Command{
-		Use: "show DEVICE_ID", Short: "Show a device", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				d, err := c.GetDevice(ctx, args[0])
-				if err != nil {
-					return err
-				}
-				return env.print(d.Value, func(w io.Writer) {
-					fmt.Fprintf(w, "Device %s (%s)\nRevision %s  Revoked %v\nProfiles %s\nPermissions %s\n",
-						sanitize(d.Value.Name), d.Value.ID, d.Value.Revision, d.Value.Revoked,
-						strings.Join(d.Value.ProfileIDs, ", "), strings.Join(d.Value.Permissions, ", "))
-				})
-			})(cmd, args)
-		},
-	}
-	var ifMatch string
-	revoke := &cobra.Command{
-		Use: "revoke DEVICE_ID", Short: "Revoke a device's credentials", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				etag := ifMatch
-				if etag == "" {
-					d, err := c.GetDevice(ctx, args[0])
-					if err != nil {
-						return err
-					}
-					etag = d.ETag
-				}
-				if err := c.RevokeDevice(ctx, args[0], etag); err != nil {
-					return err
-				}
-				return env.print(map[string]string{"device_id": args[0], "state": "revoked"}, func(w io.Writer) {
-					fmt.Fprintf(w, "Revoked device %s.\n", args[0])
-				})
-			})(cmd, args)
-		},
-	}
-	revoke.Flags().StringVar(&ifMatch, "if-match", "", "ETag the device must still have (default: read it first)")
-	cmd.AddCommand(list, show, revoke, policyCmd(env))
-	return cmd
-}
-
-func policyCmd(env *Env) *cobra.Command {
-	cmd := &cobra.Command{Use: "policy", Short: "Read or replace a device's access policy"}
-	show := &cobra.Command{
-		Use: "show DEVICE_ID", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				p, err := c.GetDevicePolicy(ctx, args[0])
-				if err != nil {
-					return err
-				}
-				return env.print(p.Value, func(w io.Writer) { printPolicy(w, p.Value) })
-			})(cmd, args)
-		},
-	}
-	var in api.AccessPolicy
-	var ifMatch string
-	set := &cobra.Command{
-		Use: "set DEVICE_ID", Short: "Replace the whole policy", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			for _, p := range in.Permissions {
-				if !contains(api.AllPermissions, p) {
-					return usage("unknown permission %q", p)
-				}
-			}
-			return run(env, func(ctx context.Context, c *Conn) error {
-				etag := ifMatch
-				if etag == "" {
-					current, err := c.GetDevicePolicy(ctx, args[0])
-					if err != nil {
-						return err
-					}
-					etag = current.ETag
-				}
-				in.LibraryIDs, in.AllowedRatings = nonNil(in.LibraryIDs), nonNil(in.AllowedRatings)
-				in.BlockedLabels, in.Permissions = nonNil(in.BlockedLabels), nonNil(in.Permissions)
-				p, err := c.ReplaceDevicePolicy(ctx, args[0], in, etag)
-				if err != nil {
-					return err
-				}
-				return env.print(p.Value, func(w io.Writer) { printPolicy(w, p.Value) })
-			})(cmd, args)
-		},
-	}
-	set.Flags().StringSliceVar(&in.LibraryIDs, "library", nil, "library the device may see (repeatable)")
-	set.Flags().BoolVar(&in.AllowUnrated, "allow-unrated", true, "allow unrated titles")
-	set.Flags().StringSliceVar(&in.AllowedRatings, "rating", nil, "allowed rating (repeatable; none means no rating filter)")
-	set.Flags().StringSliceVar(&in.BlockedLabels, "block-label", nil, "blocked label (repeatable)")
-	set.Flags().StringSliceVar(&in.Permissions, "permission", nil, "permission (repeatable; replaces the current set)")
-	set.Flags().StringVar(&ifMatch, "if-match", "", "ETag the policy must still have (default: read it first)")
-	cmd.AddCommand(show, set)
-	return cmd
-}
-
-// printPolicy writes through env.print, whose writer strips control characters.
-func printPolicy(w io.Writer, p api.AccessPolicy) {
-	fmt.Fprintf(w, "Revision %s\nLibraries %s\nAllow unrated %v\nRatings %s\nBlocked labels %s\nPermissions %s\n",
-		p.Revision, strings.Join(p.LibraryIDs, ", "), p.AllowUnrated, strings.Join(p.AllowedRatings, ", "),
-		strings.Join(p.BlockedLabels, ", "), strings.Join(p.Permissions, ", "))
-}
-
-func profilesCmd(env *Env) *cobra.Command {
-	cmd := &cobra.Command{Use: "profiles", Short: "List and manage viewing profiles"}
-	var cursor string
-	var limit int
-	list := &cobra.Command{
-		Use: "list", Args: cobra.NoArgs,
-		RunE: run(env, func(ctx context.Context, c *Conn) error {
-			page, err := c.ListProfiles(ctx, cursor, limit)
-			if err != nil {
-				return err
-			}
-			return env.print(page, func(w io.Writer) {
-				rows := [][]string{}
-				for _, p := range page.Items {
-					rows = append(rows, []string{p.ID, p.Name, p.Revision})
-				}
-				table(w, "ID\tNAME\tREVISION", rows)
-				if page.NextCursor != nil {
-					fmt.Fprintf(w, "More: --cursor %s\n", *page.NextCursor)
-				}
-			})
-		}),
-	}
-	pageFlags(list, &cursor, &limit)
-	show := &cobra.Command{
-		Use: "show PROFILE_ID", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				p, err := c.GetProfile(ctx, args[0])
-				if err != nil {
-					return err
-				}
-				return env.print(p.Value, func(w io.Writer) {
-					fmt.Fprintf(w, "%s  %s  (revision %s)\n", p.Value.ID, sanitize(p.Value.Name), p.Value.Revision)
-				})
-			})(cmd, args)
-		},
-	}
-	create := &cobra.Command{
-		Use: "create NAME", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			key := api.NewIdempotencyKey()
-			return run(env, func(ctx context.Context, c *Conn) error {
-				p, err := c.CreateProfile(ctx, args[0], key)
-				if err != nil {
-					return err
-				}
-				return env.print(p.Value, func(w io.Writer) { fmt.Fprintf(w, "Created profile %s (%s)\n", sanitize(p.Value.Name), p.Value.ID) })
-			})(cmd, args)
-		},
-	}
-	var ifMatch string
-	conditional := func(ctx context.Context, c *Conn, id string) (string, error) {
-		if ifMatch != "" {
-			return ifMatch, nil
-		}
-		p, err := c.GetProfile(ctx, id)
-		return p.ETag, err
-	}
-	rename := &cobra.Command{
-		Use: "rename PROFILE_ID NAME", Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				etag, err := conditional(ctx, c, args[0])
-				if err != nil {
-					return err
-				}
-				p, err := c.ReplaceProfile(ctx, args[0], args[1], etag)
-				if err != nil {
-					return err
-				}
-				return env.print(p.Value, func(w io.Writer) { fmt.Fprintf(w, "Renamed %s to %s\n", p.Value.ID, sanitize(p.Value.Name)) })
-			})(cmd, args)
-		},
-	}
-	remove := &cobra.Command{
-		Use: "delete PROFILE_ID", Short: "Remove a profile and its viewing state (media is untouched)", Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return run(env, func(ctx context.Context, c *Conn) error {
-				etag, err := conditional(ctx, c, args[0])
-				if err != nil {
-					return err
-				}
-				if err := c.DeleteProfile(ctx, args[0], etag); err != nil {
-					return err
-				}
-				return env.print(map[string]string{"profile_id": args[0], "state": "deleted"}, func(w io.Writer) {
-					fmt.Fprintf(w, "Deleted profile %s\n", args[0])
-				})
-			})(cmd, args)
-		},
-	}
-	for _, c := range []*cobra.Command{rename, remove} {
-		c.Flags().StringVar(&ifMatch, "if-match", "", "ETag the profile must still have (default: read it first)")
-	}
-	cmd.AddCommand(list, show, create, rename, remove)
-	return cmd
-}
-
-func librariesCmd(env *Env) *cobra.Command {
-	cmd := &cobra.Command{Use: "libraries", Short: "Browse libraries"}
-	var cursor string
-	var limit int
-	list := &cobra.Command{
-		Use: "list", Args: cobra.NoArgs,
-		RunE: run(env, func(ctx context.Context, c *Conn) error {
-			page, err := c.ListLibraries(ctx, cursor, limit)
-			if api.IsCode(err, "not_found") {
-				return &api.Problem{Status: 503, Code: "feature_unavailable", Title: "Unavailable",
-					Detail: "this server does not implement the v2 catalog yet (capability catalog.v2)"}
-			}
-			if err != nil {
-				return err
-			}
-			return env.print(page, func(w io.Writer) {
-				rows := [][]string{}
-				for _, l := range page.Items {
-					rows = append(rows, []string{l.ID, l.Name, l.Kind, l.Availability})
-				}
-				table(w, "ID\tNAME\tKIND\tAVAILABILITY", rows)
-			})
-		}),
-	}
-	pageFlags(list, &cursor, &limit)
-	cmd.AddCommand(list, libraryAddCmd(env))
 	return cmd
 }
 
@@ -594,7 +311,7 @@ func eventsCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return conn.Follow(cmd.Context(), after, func(e api.Event) error {
+			return operations.FollowEvents(cmd.Context(), conn, after, func(e api.Event) error {
 				if env.JSON {
 					return writeJSON(env.Out, envelope{Event: e})
 				}
@@ -634,7 +351,7 @@ func tuiCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return TUI(cmd.Context(), conn)
+			return TUI(cmd.Context(), conn, env.Browser)
 		},
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -621,11 +622,15 @@ func (m Model) serverPage(width int) []string {
 			kv("Principal", fgStyle.Render(clean(me.ID))),
 			kv("Profiles", fgStyle.Render(clean(strings.Join(me.ProfileIDs, ", ")))),
 		}, perms...), half)
-		server := panel("Motion server", fgStyle.Render(clean(caps.ServerVersion)), colorOK, []string{
+		identity := []string{
 			kv("Address", fgStyle.Render(clean(m.server))),
 			kv("API", fgStyle.Render(clean(caps.APIVersion))+faintStyle.Render(" · schema "+clean(caps.SchemaVersion))),
 			kv("Server ID", fgStyle.Render(clean(caps.ServerID))),
-		}, width-gap-half)
+		}
+		if st, ok := data[operations.ServerStatus](m, keyServer); ok && st.Health.ServerID != "" {
+			identity = append(identity, kv("Status", fgStyle.Render(clean(st.Health.Status))+faintStyle.Render(" · epoch "+clean(st.Health.ServerEpoch))))
+		}
+		server := panel("Motion server", fgStyle.Render(clean(caps.ServerVersion)), colorOK, identity, width-gap-half)
 		if width < 100 {
 			device = panel("This device", faintStyle.Render(clean(me.Mode)), colorOK, append([]string{kv("Principal", fgStyle.Render(clean(me.ID)))}, chipLines(me.Permissions, width-4)...), width)
 			server = panel("Motion server", fgStyle.Render(clean(caps.ServerVersion)), colorOK, []string{kv("Address", fgStyle.Render(clean(m.server))), kv("API", fgStyle.Render(clean(caps.APIVersion)))}, width)
