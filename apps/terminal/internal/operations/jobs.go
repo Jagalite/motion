@@ -109,20 +109,6 @@ func ResumeJobAction(kind JobActionKind, jobID, key, ifMatch string) (JobAction,
 	return JobAction{Kind: kind, JobID: jobID, Key: key, IfMatch: ifMatch, Resubmission: true}, nil
 }
 
-// CheckIdempotencyKey applies the contract's Idempotency-Key bounds and
-// keeps a supplied key a single visible-ASCII header token.
-func CheckIdempotencyKey(key string) error {
-	if len(key) < 16 || len(key) > 128 {
-		return Invalid("idempotency key must be 16 to 128 characters")
-	}
-	for _, r := range key {
-		if r <= 0x20 || r >= 0x7f {
-			return Invalid("idempotency key must be visible ASCII without spaces")
-		}
-	}
-	return nil
-}
-
 // SubmitJobAction sends the action once through the API adapter, which
 // already retries transport failures with the unchanged key. A failure that
 // leaves the outcome unknown is returned as *UncertainError.
@@ -139,7 +125,7 @@ func SubmitJobAction(ctx context.Context, c JobController, a JobAction) (api.Tag
 	default:
 		return api.Tagged[api.Job]{}, Invalid("unknown job action %q", a.Kind)
 	}
-	return job, uncertain(a, err)
+	return job, settle(a.Describe(), a.Key, a.IfMatch, a.Resubmission, err)
 }
 
 // PendingJobActions remembers actions whose outcome is unknown, so that an

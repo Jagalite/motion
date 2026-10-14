@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -39,6 +40,30 @@ type Session struct {
 	Operator   bool
 	Store      store.Store
 	Config     store.Config
+
+	mu    sync.Mutex
+	token string
+}
+
+// SignedIn reports whether requests carry a credential.
+func (s *Session) SignedIn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token != ""
+}
+
+// useCredential switches the bearer credential for later requests; nil
+// signs the session out. Operator sessions keep the operator token.
+func (s *Session) useCredential(c *store.Credential) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Operator {
+		return
+	}
+	s.Credential, s.token = c, ""
+	if c != nil {
+		s.token = c.AccessToken
+	}
 }
 
 func (s Settings) store() (store.Store, error) {
@@ -128,21 +153,24 @@ func Connect(ctx context.Context, s Settings) (*Session, error) {
 		}
 	}
 	session := &Session{Profile: s.Profile, Client: client, URL: url, Health: health, Store: st, Config: cfg}
-	var token string
 	if s.OperatorTokenFile != "" {
-		if token, err = readOperatorToken(s.OperatorTokenFile); err != nil {
+		token, err := readOperatorToken(s.OperatorTokenFile)
+		if err != nil {
 			return nil, Invalid("operator token: %v", err)
 		}
-		session.Operator = true
+		session.token, session.Operator = token, true
 	} else if registered {
-		if session.Credential, err = st.Credential(health.ServerID); err != nil {
+		credential, err := st.Credential(health.ServerID)
+		if err != nil {
 			return nil, err
 		}
-		if session.Credential != nil {
-			token = session.Credential.AccessToken
-		}
+		session.useCredential(credential)
 	}
-	client.Token = func() string { return token }
+	client.Token = func() string {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.token
+	}
 	return session, nil
 }
 

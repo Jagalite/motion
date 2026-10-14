@@ -3,99 +3,131 @@
 This is the readable matrix for [`operations.json`](operations.json), the
 machine-readable operation inventory described in the
 [shared operations plan](../../MOTION_CLI_TUI_SHARED_OPERATIONS_PLAN.md).
-`TestOperationInventoryIsCompleteAndTruthful` checks the inventory against
-the code: every runnable CLI command is listed, every named CLI entry point
-exists, every shared operation is declared in `internal/operations` and has
-operation, CLI and TUI tests, and every missing entry point has a recorded
-exception. `TestInterfacesDoNotBypassSharedOperations` fails when CLI or TUI
-code calls, or takes as a method value, an API method that a shared operation
-owns; when either interface refers to none of a shared operation's
-implementation; when interface code builds a player URL; or when it refers to
-the platform browser opener, which only `cmd/motion` injects. These are
-syntactic checks: the adapter tests listed in `operations.json` are what show
-that each entry point calls its operation with the right inputs.
-`playback.launch` owns no API method exclusively (its reads also serve other
-workflows), so its wiring is covered by the reference and URL checks.
+Every workflow is **shared**: the CLI and the TUI call the same function in
+`internal/operations`, with the same inputs, defaults, input rules,
+preconditions, idempotency keys and error classification. Interfaces differ
+only in how they collect input, confirm and present results. `motion serve`
+is the one interface-specific exception.
 
-**Shared** means both interfaces call the same operation in
-`internal/operations`. **Pending** means the workflow has not been migrated
-yet: interface code still composes API calls itself. A pending row is tracked
-migration work, not a claim of parity.
+## How this is enforced
 
-| Operation | Status | CLI | TUI | Shared implementation or remaining gap |
+- `TestOperationInventoryIsCompleteAndTruthful` checks the inventory against
+  the code. Every runnable CLI command is listed, and every CLI entry point
+  exists. Every shared function is declared in `internal/operations` and
+  has operation, CLI and TUI tests. Every row appears here. A pending,
+  half-migrated workflow is rejected.
+- `TestInterfacesDoNotBypassSharedOperations` type-checks `internal/cli`
+  and `internal/tui`. It fails when either calls a method of the API
+  client, on the client, on a session embedding it, or on an interface
+  carrying client methods (such as the TUI's `Backend`). It also fails
+  when either constructs a client or a player URL, refers to the browser
+  opener, or refers to none of a shared operation's functions. Shared
+  data types stay usable.
+- `TestSharedOperationsStayIndependentOfInterfaces` keeps
+  `internal/operations` free of Cobra, Bubble Tea, terminal I/O, process
+  launches and the interface packages, and keeps the CLI and TUI from
+  importing each other.
+- The adapter tests run against one fixture, `internal/operations/opstest`,
+  served in process to the TUI and over HTTP to the CLI. The management
+  scenario (`opstest.ApplyManagement`) must leave the same domain state,
+  compared without generated IDs, whether it runs directly, through CLI
+  commands or through TUI keystrokes.
+
+These checks prove the wiring and the shared decisions. They do not prove
+server behavior: the real-server E2E tests and the Rust tests do that.
+
+| Operation | Status | CLI | TUI | Shared implementation or exception |
 | --- | --- | --- | --- | --- |
 | `session.connect` | Shared | `motion server status` | motion tui receives the verified session from the same pathway | `Connect`, `Settings`, `Session` |
+| `server.status` | Shared | `motion server status` | Server page: identity, status and features | `ReadServerStatus` |
+| `auth.status` | Shared | `motion auth status` | Server page: this device | `WhoAmI`, `ReadSession` |
+| `auth.pair` | Shared | `motion auth pair` | P while signed out: pair, show the code, wait for approval | `StartPairing`, `PendingPairing` |
+| `auth.redeem` | Shared | `motion auth redeem` | I while signed out: redeem an invitation code | `RedeemInvitation` |
+| `auth.logout` | Shared | `motion auth logout` | Server page: O signs out | `SignOut` |
+| `access.pairings.list` | Shared | `motion access pairings list` | Pairing requests page | `ListPairings`, `CollectPairings` |
+| `access.pairings.approve` | Shared | `motion auth approve` | Pairing requests: a, choose the user, review | `ApprovePairing` |
+| `access.pairings.deny` | Shared | `motion access pairings deny` | Pairing requests: d, review | `DenyPairing` |
+| `access.users.list` | Shared | `motion access users list` | Users and access page | `ListUsers`, `CollectUsers` |
+| `access.users.show` | Shared | `motion access users show` | Users and access: detail of the listed user | `InspectUser`, `CollectUsers` |
+| `access.users.create` | Shared | `motion access users create` | Users and access: n | `CreateUser` |
+| `access.users.update` | Shared | `motion access users update` | Users and access: e, at the reviewed revision | `ReplaceUser` |
+| `access.invitations.list` | Shared | `motion access invitations list` | Access invitations page | `ListInvitations`, `CollectInvitations` |
+| `access.invitations.create` | Shared | `motion access invitations create` | Access invitations: n, choose the user; the code is shown once | `CreateInvitation` |
+| `access.invitations.revoke` | Shared | `motion access invitations revoke` | Access invitations: d, at the reviewed revision | `RevokeInvitation` |
+| `devices.list` | Shared | `motion devices list` | Devices page | `ListDevices`, `CollectDevices` |
+| `devices.show` | Shared | `motion devices show` | Devices: detail of the listed device | `InspectDevice`, `CollectDevices` |
+| `devices.revoke` | Shared | `motion devices revoke` | Devices: d, at the reviewed revision | `RevokeDevice` |
+| `devices.policy` | Shared | `motion devices policy show` | Devices: p reads the policy into the editor | `InspectDevicePolicy` |
+| `devices.policy.set` | Shared | `motion devices policy set` | Device policy editor, at the revision read | `ReplaceDevicePolicy` |
+| `profiles.list` | Shared | `motion profiles list` | Profiles page | `ListProfiles`, `CollectProfiles` |
+| `profiles.show` | Shared | `motion profiles show` | Profiles: detail of the listed profile | `InspectProfile`, `CollectProfiles` |
+| `profiles.create` | Shared | `motion profiles create` | Profiles: n | `CreateProfile` |
+| `profiles.rename` | Shared | `motion profiles rename` | Profiles: e, at the reviewed revision | `RenameProfile` |
+| `profiles.delete` | Shared | `motion profiles delete` | Profiles: x, at the reviewed revision | `DeleteProfile` |
+| `libraries.list` | Shared | `motion libraries list` | Sidebar libraries | `ListLibraries`, `CollectLibraries` |
+| `libraries.show` | Shared | `motion libraries show` | Library page | `ReadLibraryContents` |
+| `libraries.add` | Shared | `motion libraries add` | Sources: l | `CreateLibrary` |
+| `sources.list` | Shared | `motion sources list` | Sources page | `ListSources`, `CollectSources` |
+| `sources.show` | Shared | `motion sources show` | Sources: detail of the listed source | `InspectSource`, `CollectSources` |
+| `sources.add` | Shared | `motion sources add` | Sources: n | `CreateSource` |
+| `scans.request` | Shared | `motion libraries scan` | Scans: n, choose a library | `RequestScan` |
+| `scans.list` | Shared | `motion scans list` | Scans page | `ListScans`, `CollectScans` |
+| `scans.show` | Shared | `motion scans show` | Scans: detail of the listed scan | `InspectScan`, `CollectScans` |
+| `catalog.list` | Shared | `motion catalog list` | All titles | `ListCatalog`, `CollectCatalog` |
+| `catalog.search` | Shared | `motion catalog search` | Search | `SearchCatalog`, `CollectSearch` |
+| `catalog.show` | Shared | `motion catalog show` | Item page (catalog show --details shows the same aggregate) | `InspectItem`, `ReadItemDetails` |
+| `viewing.continue` | Shared | `motion catalog continue` | Home: continue watching | `ContinueWatching` |
+| `diagnostics.read` | Shared | `motion diagnostics` | Overview and Server pages | `ReadDiagnostics` |
+| `diagnostics.storage` | Shared | `motion diagnostics storage` | Overview and Server storage | `ReadStorage` |
+| `diagnostics.metrics` | Shared | `motion diagnostics metrics` | Overview charts | `ReadMetrics` |
+| `playback.sessions` | Shared | `motion playback sessions` | Now playing | `ReadPlaybackSessions` |
+| `playback.history` | Shared | `motion playback history` | Playback history (d filters to a device) | `ListPlaybackHistory`, `CollectPlaybackHistory` |
+| `events.follow` | Shared | `motion events tail` | Activity and refresh signals | `FollowEvents` |
 | `jobs.list` | Shared | `motion jobs list` | Processing page and Overview work list | `ListJobs`, `CollectJobs`, `Collect` |
 | `jobs.inspect` | Shared | `motion jobs show` | Processing page: enter on a job | `InspectJob` |
-| `jobs.cancel` | Shared | `motion jobs cancel` | Processing page: c, then confirm | `NewJobAction`, `ResumeJobAction`, `SubmitJobAction` |
-| `jobs.retry` | Shared | `motion jobs retry` | Processing page: R reviews the job, then confirm | `NewJobAction`, `ResumeJobAction`, `SubmitJobAction` |
-| `playback.launch` | Shared | `motion play` | p on a title or item | `LaunchPlayer`, `PlayerURL`, `PlaybackReady` |
-| `server.status` | Pending | `motion server status` | Server page | Both interfaces compose health, principal and capability reads separately. |
-| `auth.status` | Pending | `motion auth status` | Server page principal | Principal read is composed separately in each interface. |
-| `auth.pair` | Pending | `motion auth pair` | — | Pairing stores this device's credential before any session exists; the TUI starts only from a verified session. Disposition: pending: add a TUI pairing flow with the session slice |
-| `auth.redeem` | Pending | `motion auth redeem` | — | Invitation redemption reads a secret from standard input before a credential exists. Disposition: pending: decide with the TUI pairing flow |
-| `auth.logout` | Pending | `motion auth logout` | — | No TUI account action exists. Disposition: pending |
-| `access.pairings.approve` | Pending | `motion auth approve` | Pairing requests: approve | Approval forms and keys are composed separately in each interface. |
-| `access.pairings.deny` | Pending | — | Pairing requests: deny | No CLI command. Disposition: pending |
-| `access.users.manage` | Pending | — | Users and access: list, create, edit | No CLI commands. Disposition: pending |
-| `access.invitations.manage` | Pending | — | Access invitations: list, create, revoke | No CLI commands. Disposition: pending |
-| `devices.list` | Pending | `motion devices list` | Devices page | Direct API reads in each interface. |
-| `devices.show` | Pending | `motion devices show` | Devices page detail | Direct API reads in each interface. |
-| `devices.revoke` | Pending | `motion devices revoke` | Devices page: revoke | Each interface reads the ETag and revokes on its own. |
-| `devices.policy` | Pending | `motion devices policy show` | — | The TUI edits user policies, not device policies. Disposition: pending: decide whether device policy editing belongs in the TUI |
-| `devices.policy.set` | Pending | `motion devices policy set` | — | As devices.policy. Disposition: pending |
-| `profiles.list` | Pending | `motion profiles list` | Profiles page | Direct API reads in each interface. |
-| `profiles.show` | Pending | `motion profiles show` | Profiles page detail | Direct API reads in each interface. |
-| `profiles.create` | Pending | `motion profiles create` | — | No TUI form. Disposition: pending |
-| `profiles.rename` | Pending | `motion profiles rename` | — | No TUI form. Disposition: pending |
-| `profiles.delete` | Pending | `motion profiles delete` | — | No TUI action. Disposition: pending |
-| `libraries.list` | Pending | `motion libraries list` | Sidebar libraries and Library page | Direct API reads in each interface. |
-| `libraries.add` | Pending | `motion libraries add` | — | No TUI form. Disposition: pending |
-| `sources.list` | Pending | `motion sources list` | Sources page | Direct API reads in each interface. |
-| `sources.show` | Pending | `motion sources show` | Sources page detail | Direct API reads in each interface. |
-| `sources.add` | Pending | `motion sources add` | — | No TUI form. Disposition: pending |
-| `scans.request` | Pending | — | — | internal/cli defines a scan command that is not registered, so neither interface can request a scan. Disposition: pending: register it through a shared scan operation and add the TUI scan form |
-| `scans.list` | Pending | — | Scans page | No CLI command. Disposition: pending |
-| `catalog.list` | Pending | `motion catalog list` | All titles and Library pages | Direct API reads in each interface. |
-| `catalog.search` | Pending | `motion catalog search` | Search | Direct API reads in each interface. |
-| `catalog.show` | Pending | `motion catalog show` | Item page | The TUI composes the item aggregate (editions, timelines, versions, viewing state); the CLI shows only the item. |
-| `viewing.continue` | Pending | — | Home: continue watching | No CLI command. Disposition: pending |
-| `diagnostics.read` | Pending | `motion diagnostics` | Overview and Server pages | Direct API reads in each interface. |
-| `diagnostics.storage` | Pending | — | Overview storage | No CLI command. Disposition: pending |
-| `diagnostics.metrics` | Pending | — | Overview charts | No CLI command. Disposition: pending |
-| `playback.sessions` | Pending | — | Now playing | No CLI command. Disposition: pending |
-| `playback.history` | Pending | — | Playback history | No CLI command. Disposition: pending |
-| `events.follow` | Pending | `motion events tail` | Activity and refresh signals | Both use the API adapter's Follow directly; reconnect and cursor policy is in the adapter. |
-| `server.serve` | Pending | `motion serve` | — | Starting the bundled server is a local process operation. Disposition: permanent: CLI-only unless a TUI lifecycle workflow is added deliberately |
+| `jobs.cancel` | Shared | `motion jobs cancel` | Processing page: c, then confirm | `NewJobAction`, `ResumeJobAction`, `SubmitJobAction`, `PendingJobActions`, `UncertainError` |
+| `jobs.retry` | Shared | `motion jobs retry` | Processing page: R reviews the job, then confirm | `NewJobAction`, `ResumeJobAction`, `SubmitJobAction`, `PendingJobActions`, `InspectJob` |
+| `playback.launch` | Shared | `motion play` | p on a title or item | `LaunchPlayer`, `PlayerURL`, `PlaybackReady`, `Browser` |
+| `server.serve` | CLI only | `motion serve` | — | Starting the bundled server is a local process operation, not a server API workflow. Permanent: cli-only unless a tui lifecycle workflow is added deliberately. |
+
+## Shared rules
+
+- **Pages.** Single-page reads validate `limit` (1–200) and return the
+  next cursor. Aggregates use `operations.Collect`: it stops at a bound,
+  reports truncation and refuses a repeated cursor. A partial result is
+  never shown as complete.
+- **Keyed writes.** Creates, approvals, denials, scans and job actions carry
+  one idempotency key per intent. A resubmission reuses the key and the
+  request. CLI commands take `--idempotency-key` to resubmit. A TUI dialog
+  reuses its key and locks its fields after an unknown outcome.
+- **Conditional writes.** Renames, deletions, revocations, policy and user
+  replacements, and job retries name a precondition. The TUI uses the
+  revision the user reviewed and never substitutes a newer one. The CLI uses
+  `--if-match`, or by default deliberately reads the current revision. A
+  stale precondition is a conflict (exit 4) and never an overwrite.
+- **Unknown outcomes.** A write whose acknowledgement was lost is reported as
+  possibly applied. A later refusal from an answer given before the
+  server's receipt lookup (rate limit, authentication, visibility) does not
+  settle it. The CLI reports `outcome_unknown`, `idempotency_key` and
+  `if_match`. The TUI offers to resubmit the same request.
+- **Guidance.** Permissions and capabilities shown by the TUI only guide.
+  The server authorizes every request, and the player launch reads current
+  permissions and capabilities.
 
 ## Interface-specific behavior
 
 Shell completion, terminal layout, refresh schedules and navigation are
-interface concerns. `motion serve` stays CLI-only: it starts a local process.
-The TUI asks for confirmation before cancelling or retrying a job; the CLI
-treats the command itself as the confirmation.
-
-## Unknown outcomes
-
-When a job cancellation or retry may have reached the server but no
-acknowledgement arrived, both interfaces report that the outcome is unknown.
-They resubmit the same request with the same idempotency key, so the server
-replays its saved acknowledgement or applies the intent once. A refusal that
-follows an unanswered attempt inside the API adapter's own retries does not
-settle the outcome either. The CLI prints the key and, for a retry, the
-reviewed ETag (`idempotency_key`, `if_match` and `outcome_unknown` in
-`motion.cli.v1` error output); `--idempotency-key KEY` resubmits the
-request, and a retry also needs the original `--if-match ETAG` so the
-resubmission is the same request rather than a new review. The TUI remembers
-the action, with its reviewed ETag, while it stays open and offers to
-resubmit it on the next `c` or `R` for that job. It forgets these actions
-when the credential is rejected.
+interface concerns. The TUI asks for confirmation before every mutation; the
+CLI treats the command itself as the confirmation. Secrets are read
+privately: the CLI reads invitation codes from standard input, and the TUI
+masks the code field. Neither shows a device code or credential.
+`motion serve` stays CLI-only because it starts a local process.
 
 ## Reviewed revisions
 
 A job retry names the revision the user reviewed (`If-Match`). The server
 admits it only at that revision and only for a failed or cancelled job, using
-the production `playscale_core::jobs::admit_retry` policy: a stale review is
-refused with 412, a missing precondition with 428, and one review admits at
-most one retry. The Stateless model `playscale.jobs.reviewed_retry` explores
-that policy with the job reducer.
+the production `playscale_core::jobs::admit_retry` policy. A stale review
+is refused with 412 and a missing precondition with 428, and one review
+admits at most one retry. The Stateless model
+`playscale.jobs.reviewed_retry` explores that policy with the job reducer.

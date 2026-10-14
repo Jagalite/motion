@@ -11,14 +11,28 @@ motion auth pair --credential-store file          # device shows a code
 motion auth approve PAIRING_ID --code ABCD-EFGH \
   --permission catalog:read --permission events:read \
   --operator-token-file /path/to/data/admin-token   # on the server host
+motion auth redeem --credential-store file < code.txt   # one-use invitation
+motion access users create Sam --permission catalog:read --library LIB_ID
+motion access invitations create USER_ID --permission catalog:read
+motion access pairings list
 motion profiles list
+motion sources add Films --root /srv/films
+motion libraries add Movies --kind movies --source SOURCE_ID
+motion libraries scan LIBRARY_ID --verify
+motion scans list
 motion libraries list --json
 motion catalog search "Film"
+motion catalog show ITEM_ID --details --profile PROFILE_ID
+motion catalog continue --profile PROFILE_ID
 motion jobs list
 motion jobs show JOB_ID
 motion jobs cancel JOB_ID
 motion jobs retry JOB_ID                     # failed/cancelled jobs; requires processing:request
 motion diagnostics --operator-token-file /path/to/data/admin-token
+motion diagnostics storage
+motion diagnostics metrics --window 6h
+motion playback sessions
+motion playback history --device DEVICE_ID
 motion events tail --json
 motion tui
 motion serve --data-dir ... --access-mode restricted  # runs the bundled Rust server
@@ -72,11 +86,27 @@ the Marquee charcoal palette; `NO_COLOR` gets plain text.
 ## Shared operations
 
 The CLI and the TUI call the same typed workflows in `internal/operations`
-(session, jobs and playback so far); `internal/platform` holds the browser
-opener, which `cmd/motion` injects. [`operations.json`](operations.json) is
-the operation inventory and parity ledger, [`PARITY.md`](PARITY.md) its
-readable matrix. Tests keep both truthful and stop interface code from
-bypassing a migrated operation.
+for every server workflow: session and pairing, access management, devices,
+profiles, sources, libraries, scans, catalog and viewing reads, jobs,
+diagnostics, playback launch and monitoring, and events. `internal/platform`
+holds the browser opener, which `cmd/motion` injects. Every workflow has
+both entry points; `motion serve` is the one CLI-only exception. In the TUI,
+management pages take the same actions through confirmed forms:
+
+| Page | Keys |
+| --- | --- |
+| Profiles | `n` new · `e` rename · `x` delete · `enter` use |
+| Sources | `n` register a source · `l` create a library |
+| Scans | `n` request a scan |
+| Devices | `p` device policy · `d` revoke |
+| Users and access, Pairing requests, Invitations | `n`/`e`, `a`/`d`, `n`/`d` |
+| Processing | `enter` inspect · `c` cancel · `R` retry |
+| Server | `O` sign out · while signed out, `P` pairs this device and `I` redeems an invitation |
+
+[`operations.json`](operations.json) is the operation inventory and parity
+ledger, and [`PARITY.md`](PARITY.md) is its readable matrix and lists the
+rules every workflow shares. Tests keep both truthful, and a type-checked
+test stops CLI and TUI code from calling the API client directly.
 
 ## Credentials
 
@@ -93,12 +123,21 @@ store is refused on Windows, where a mode does not make a file private.
 
 ```sh
 go test -race ./...
-cargo build && MOTION_E2E_SERVER_BIN=$PWD/../../target/debug/playscale go test -run E2E .
+cargo build && MOTION_E2E_SERVER_BIN=$PWD/../../target/debug/playscale go test -run E2E . ./internal/tui
+go build -o /tmp/motion ./cmd/motion && \
+  python3 scripts/tui_pty_check.py $PWD/../../target/debug/playscale /tmp/motion
 ```
 
-The mock in `internal/cli` and the job fixture in `internal/operations/opstest`
-are contract-shaped fakes, not evidence of server behavior; the E2E test runs
-the real server in restricted mode.
+The adapter tests share one contract-shaped fixture,
+`internal/operations/opstest`. It is served in process to the TUI and over
+HTTP to the CLI, and a management scenario must leave the same state through
+either interface as when run directly. The mock in `internal/cli` and the
+fixture are not evidence of server behavior. The E2E tests run the real server in
+restricted mode: `TestE2ECLIReachesTheSharedRealServerState` and
+`TestE2ETUIReachesTheSharedRealServerState` run the same scenario through each
+interface on a fresh server and must leave the same observed state.
+`scripts/tui_pty_check.py` types into the real `motion tui` in a
+pseudo-terminal.
 
 ## A08/A10 implementation audit (2026-10-09)
 

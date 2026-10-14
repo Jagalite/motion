@@ -73,7 +73,7 @@ func TestLostAcknowledgementIsUncertainAndResubmissionAppliesOnce(t *testing.T) 
 	f.LoseAcks(1)
 	_, err = operations.SubmitJobAction(ctx, f, a)
 	var unknown *operations.UncertainError
-	if !errors.As(err, &unknown) || unknown.Action != a || operations.Definitive(err) {
+	if !errors.As(err, &unknown) || unknown.Key != a.Key || unknown.Operation != a.Describe() || operations.Definitive(err) {
 		t.Fatalf("lost acknowledgement: %v", err)
 	}
 	pending.Settle(a, err)
@@ -150,7 +150,7 @@ func TestOutcomeClassification(t *testing.T) {
 		}
 	}
 	pending := &operations.PendingJobActions{}
-	pending.Settle(a, &operations.UncertainError{Action: a, Err: context.Canceled})
+	pending.Settle(a, &operations.UncertainError{Operation: a.Describe(), Key: a.Key, Err: context.Canceled})
 	other, _ := operations.NewJobAction(operations.CancelJob, "j", "")
 	pending.Settle(other, nil) // an unrelated key does not resolve it
 	if held, ok := pending.Pending(operations.CancelJob, "j"); !ok || held.Key != a.Key {

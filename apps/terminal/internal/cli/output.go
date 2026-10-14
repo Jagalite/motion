@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 	"github.com/Jagalite/motion/apps/terminal/internal/operations"
@@ -125,7 +126,7 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 	}
 	var unknown *operations.UncertainError
 	if errors.As(err, &unknown) {
-		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch = true, unknown.Action.Key, unknown.Action.IfMatch
+		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch = true, unknown.Key, unknown.IfMatch
 	}
 	if jsonMode {
 		_ = writeJSON(w, envelope{Error: body})
@@ -139,11 +140,18 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 		msg += " (request " + body.RequestID + ")"
 	}
 	if unknown != nil {
-		repeat := "--idempotency-key " + unknown.Action.Key
-		if unknown.Action.IfMatch != "" {
-			repeat += " --if-match '" + unknown.Action.IfMatch + "'"
+		var repeat []string
+		if unknown.Key != "" {
+			repeat = append(repeat, "--idempotency-key "+unknown.Key)
 		}
-		msg += "\nmotion: the " + unknown.Action.Describe() + " may have been applied; repeat the command with " + repeat + " to resubmit the same request safely"
+		if unknown.IfMatch != "" {
+			repeat = append(repeat, "--if-match '"+unknown.IfMatch+"'")
+		}
+		if unknown.Key != "" {
+			msg += "\nmotion: the " + unknown.Operation + " may have been applied; repeat the command with " + strings.Join(repeat, " ") + " to resubmit the same request safely"
+		} else {
+			msg += "\nmotion: the " + unknown.Operation + " may have been applied; read the current state before trying again"
+		}
 	}
 	fmt.Fprintln(w, sanitize(msg))
 }

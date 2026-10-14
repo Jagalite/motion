@@ -24,17 +24,22 @@ func Invalid(format string, args ...any) error {
 
 // UncertainError reports a mutation whose request may have reached the
 // server although no acknowledgement arrived: the server may or may not have
-// applied it. Resubmitting the same Action, with the same idempotency key,
-// either replays the server's saved acknowledgement or applies it once; a
-// fresh action is not known to be safe. A local cancellation does not prove
-// the server cancelled or rolled back anything.
+// applied it. When Key is set, resubmitting the same request with that key
+// (and IfMatch, when set) either replays the server's saved acknowledgement
+// or applies it once; a fresh request is not known to be safe. Without a
+// key, the write was conditional on IfMatch: read the current state before
+// deciding again. A local cancellation does not prove the server cancelled
+// or rolled back anything.
 type UncertainError struct {
-	Action JobAction
-	Err    error
+	// Operation names the mutation for messages, such as "retry of job j1".
+	Operation string
+	Key       string
+	IfMatch   string
+	Err       error
 }
 
 func (e *UncertainError) Error() string {
-	return fmt.Sprintf("%s may have been applied: %v", e.Action.Describe(), e.Err)
+	return fmt.Sprintf("%s may have been applied: %v", e.Operation, e.Err)
 }
 
 func (e *UncertainError) Unwrap() error { return e.Err }
@@ -51,27 +56,87 @@ func Definitive(err error) bool {
 	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500 && !errors.As(err, &earlier)
 }
 
-// uncertain wraps err unless it proves the action was not applied. Once a
-// submission of the action may have been applied, a later refusal settles it
-// only if the server answers it after looking up the key's receipt: an
-// exact resubmission of an applied request replays that receipt, so a
-// domain conflict (409) or failed precondition (412) shows nothing was
-// applied. Refusals answered before the lookup (rate limits,
+// Intent identifies one intended keyed mutation. Every submission of the
+// same intent, including a resubmission after an unknown outcome, carries
+// the same key and the same request, so the server applies it at most once
+// and replays its acknowledgement.
+type Intent struct {
+	// Operation names the mutation for messages.
+	Operation string
+	Key       string
+	// Resubmission marks an intent an earlier submission of which may have
+	// been applied.
+	Resubmission bool
+}
+
+// NewIntent starts a new intended mutation with a fresh key.
+func NewIntent(operation string) Intent {
+	return Intent{Operation: operation, Key: api.NewIdempotencyKey()}
+}
+
+// ResumeIntent rebuilds an intent whose outcome was unknown from its key, or
+// starts a new one when key is empty.
+func ResumeIntent(operation, key string) (Intent, error) {
+	if key == "" {
+		return NewIntent(operation), nil
+	}
+	if err := CheckIdempotencyKey(key); err != nil {
+		return Intent{}, err
+	}
+	return Intent{Operation: operation, Key: key, Resubmission: true}, nil
+}
+
+// CheckIdempotencyKey applies the contract's Idempotency-Key bounds and
+// keeps a supplied key a single visible-ASCII header token.
+func CheckIdempotencyKey(key string) error {
+	if len(key) < 16 || len(key) > 128 {
+		return Invalid("idempotency key must be 16 to 128 characters")
+	}
+	for _, r := range key {
+		if r <= 0x20 || r >= 0x7f {
+			return Invalid("idempotency key must be visible ASCII without spaces")
+		}
+	}
+	return nil
+}
+
+// settle classifies a mutation's error. It returns err unchanged when err
+// proves the mutation was not applied, and wraps it in *UncertainError
+// otherwise.
+//
+// Once a submission may have been applied (a resubmission, or a refusal
+// that followed an unanswered attempt inside the adapter), a refusal settles
+// the outcome only if the server answers it after looking up the key's
+// receipt: an exact resubmission of an applied request replays that
+// receipt, so a domain conflict (409) or failed precondition (412) shows
+// nothing was applied. Refusals answered before the lookup (rate limits,
 // authentication, visibility) prove nothing about the earlier attempt.
-func uncertain(a JobAction, err error) error {
+func settle(operation, key, ifMatch string, resubmission bool, err error) error {
 	if err == nil {
 		return nil
 	}
+	unknown := &UncertainError{Operation: operation, Key: key, IfMatch: ifMatch, Err: err}
 	var earlier *api.AfterUnknownAttemptError
-	if a.Resubmission || errors.As(err, &earlier) {
+	if resubmission || errors.As(err, &earlier) {
 		var p *api.Problem
-		if errors.As(err, &p) && (p.Status == 409 || p.Status == 412) {
+		if key != "" && errors.As(err, &p) && (p.Status == 409 || p.Status == 412) {
 			return err
 		}
-		return &UncertainError{Action: a, Err: err}
+		return unknown
 	}
 	if Definitive(err) {
 		return err
 	}
-	return &UncertainError{Action: a, Err: err}
+	return unknown
+}
+
+// settle classifies the error of submitting the intent.
+func (i Intent) settle(err error) error {
+	return settle(i.Operation, i.Key, "", i.Resubmission, err)
+}
+
+// settleConditional classifies the error of an unkeyed write conditional
+// on etag.
+func settleConditional(operation, etag string, err error) error {
+	return settle(operation, "", etag, false, err)
 }

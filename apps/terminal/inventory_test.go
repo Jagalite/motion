@@ -2,10 +2,15 @@ package terminal_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -26,7 +31,6 @@ type inventoryEntry struct {
 	TUI          *string             `json:"tui"`
 	Capabilities []string            `json:"capabilities"`
 	Tests        map[string][]string `json:"tests"`
-	Gap          string              `json:"gap"`
 	Exception    *struct {
 		Reason      string `json:"reason"`
 		Disposition string `json:"disposition"`
@@ -106,8 +110,10 @@ func commands(root *cobra.Command) map[string]bool {
 	return out
 }
 
-// Every inventoried operation is either shared with tests at each layer or
-// a tracked gap; a missing entry point always has a recorded exception.
+// Every inventoried operation is shared, with tests at each layer, or a
+// recorded permanent interface-specific exception. Pending migration is no
+// longer accepted: a new workflow ships through internal/operations with
+// both entry points.
 func TestOperationInventoryIsCompleteAndTruthful(t *testing.T) {
 	entries := inventory(t)
 	matrix, err := os.ReadFile("PARITY.md")
@@ -164,12 +170,14 @@ func TestOperationInventoryIsCompleteAndTruthful(t *testing.T) {
 					}
 				}
 			}
-		case "pending":
-			if e.Gap == "" && e.Exception == nil {
-				t.Errorf("%s: a pending operation must record its gap", e.ID)
+		case "interface_specific":
+			// A deliberate, permanent exception: one interface only, no
+			// shared operation, and a recorded reason.
+			if e.Exception == nil || !strings.HasPrefix(e.Exception.Disposition, "permanent") || (e.CLI == nil) == (e.TUI == nil) {
+				t.Errorf("%s: an interface-specific entry needs one entry point and a permanent exception", e.ID)
 			}
 			if len(e.Shared) != 0 || len(e.API) != 0 {
-				t.Errorf("%s: a pending operation claims shared code", e.ID)
+				t.Errorf("%s: an interface-specific entry claims shared code", e.ID)
 			}
 		default:
 			t.Errorf("%s: unknown status %q", e.ID, e.Status)
@@ -206,38 +214,109 @@ func operationRefs(t *testing.T, dir string) map[string]bool {
 	return refs
 }
 
-// CLI and TUI code reaches migrated workflows only through internal/operations:
-// a method a shared operation owns is never called or taken as a method value
-// on the API client or a backend in interface code, and each interface really
-// refers to the shared implementation of every shared operation.
-func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
-	entries := inventory(t)
-	owned := map[string]string{}
-	for _, e := range entries {
-		for _, m := range e.API {
-			owned[m] = e.ID
+// clientMethods are the exported methods of *api.Client: the transport.
+func clientMethods(t *testing.T) map[string]bool {
+	t.Helper()
+	methods := map[string]bool{}
+	for _, f := range parsed(t, filepath.Join("internal", "api"), false) {
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || !fn.Name.IsExported() {
+				continue
+			}
+			if star, ok := fn.Recv.List[0].Type.(*ast.StarExpr); ok {
+				if id, ok := star.X.(*ast.Ident); ok && id.Name == "Client" {
+					methods[fn.Name.Name] = true
+				}
+			}
 		}
 	}
-	for _, dir := range []string{"cli", "tui"} {
-		for path, f := range parsed(t, filepath.Join("internal", dir), false) {
+	return methods
+}
+
+// typed type-checks a package's non-test files against the compiler's
+// export data for its dependencies.
+func typed(t *testing.T, dir string) (*types.Info, map[string]*ast.File, *token.FileSet) {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-export", "-deps", "-f", "{{.ImportPath}}={{.Export}}", "./"+dir).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exports := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if path, file, ok := strings.Cut(line, "="); ok && file != "" {
+			exports[path] = file
+		}
+	}
+	fset := token.NewFileSet()
+	files := map[string]*ast.File{}
+	var list []*ast.File
+	paths, _ := filepath.Glob(filepath.Join(dir, "*.go"))
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path] = f
+		list = append(list, f)
+	}
+	info := &types.Info{Selections: map[*ast.SelectorExpr]*types.Selection{}, Uses: map[*ast.Ident]types.Object{}}
+	conf := types.Config{Importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		file, ok := exports[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(file)
+	})}
+	if _, err := conf.Check("github.com/Jagalite/motion/apps/terminal/"+filepath.ToSlash(dir), fset, list, info); err != nil {
+		t.Fatal(err)
+	}
+	return info, files, fset
+}
+
+// CLI and TUI code reaches the server only through internal/operations: it
+// never calls a method of the API client, whether on the client itself, on
+// a session embedding it, or on an interface (such as the TUI's Backend)
+// that carries client methods. Shared data types remain usable. Each
+// interface also refers to the implementation of every shared operation.
+func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
+	transport := clientMethods(t)
+	for _, dir := range []string{filepath.Join("internal", "cli"), filepath.Join("internal", "tui")} {
+		info, files, fset := typed(t, dir)
+		for sel, selection := range info.Selections {
+			if selection.Kind() == types.FieldVal {
+				continue
+			}
+			obj := selection.Obj()
+			apiMethod := obj.Pkg() != nil && strings.HasSuffix(obj.Pkg().Path(), "/internal/api")
+			_, viaInterface := selection.Recv().Underlying().(*types.Interface)
+			if p, ok := selection.Recv().(*types.Pointer); ok {
+				_, viaInterface = p.Elem().Underlying().(*types.Interface)
+			}
+			if apiMethod && transport[obj.Name()] || viaInterface && transport[obj.Name()] {
+				t.Errorf("%s: %s reaches the API client directly; call the shared operation", fset.Position(sel.Pos()), obj.Name())
+			}
+		}
+		for _, f := range files {
+			for id, obj := range info.Uses {
+				if obj.Pkg() != nil && strings.HasSuffix(obj.Pkg().Path(), "/internal/api") && obj.Name() == "New" && fset.File(id.Pos()) == fset.File(f.Pos()) {
+					t.Errorf("%s: constructs an API client", fset.Position(id.Pos()))
+				}
+			}
 			ast.Inspect(f, func(n ast.Node) bool {
 				switch n := n.(type) {
-				case *ast.SelectorExpr:
-					if pkg, ok := n.X.(*ast.Ident); ok && pkg.Name == "operations" {
-						return true
-					}
-					if id, ok := owned[n.Sel.Name]; ok {
-						t.Errorf("%s refers to %s directly; use the shared %s operation", path, n.Sel.Name, id)
-					}
 				case *ast.BasicLit:
 					// Player URLs are built only by the shared launch.
 					if n.Kind == token.STRING && strings.Contains(n.Value, "/play/") {
-						t.Errorf("%s builds a player URL; use operations.PlayerURL", path)
+						t.Errorf("%s: builds a player URL; use operations.PlayerURL", fset.Position(n.Pos()))
 					}
 				case *ast.Ident:
 					// The browser opener is injected by the composition root.
 					if n.Name == "OpenBrowser" {
-						t.Errorf("%s refers to the platform browser opener", path)
+						t.Errorf("%s: refers to the platform browser opener", fset.Position(n.Pos()))
 					}
 				}
 				return true
@@ -248,17 +327,25 @@ func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
 		"cli": operationRefs(t, filepath.Join("internal", "cli")),
 		"tui": operationRefs(t, filepath.Join("internal", "tui")),
 	}
-	for _, e := range entries {
+	for _, e := range inventory(t) {
 		if e.Status != "shared" {
 			continue
 		}
 		for iface, used := range refs {
+			if (iface == "cli" && e.CLI == nil) || (iface == "tui" && e.TUI == nil) {
+				continue
+			}
 			wired := false
 			for _, name := range e.Shared {
 				wired = wired || used[name]
 			}
 			if !wired {
 				t.Errorf("%s: internal/%s refers to none of %v", e.ID, iface, e.Shared)
+			}
+		}
+		for _, m := range e.API {
+			if !transport[m] {
+				t.Errorf("%s: %s is not an API client method", e.ID, m)
 			}
 		}
 	}

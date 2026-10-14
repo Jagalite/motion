@@ -12,45 +12,30 @@ import (
 	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
-// Backend is the subset of the API the interface uses; tests substitute it.
-// Migrated workflows reach it only through shared operations, whose narrow
-// interfaces it embeds.
+// Backend is the API the interface uses; tests substitute it. Every
+// workflow reaches it only through shared operations, whose narrow
+// interfaces it is composed of.
 type Backend interface {
 	operations.PlaybackAPI
 	operations.JobLister
 	operations.JobReader
 	operations.JobController
-	ListProfiles(context.Context, string, int) (api.Page[api.Profile], error)
-	ListDevices(context.Context, string, int) (api.Page[api.Device], error)
-	ListLibraries(context.Context, string, int) (api.Page[api.Library], error)
-	GetLibrary(context.Context, string) (api.Tagged[api.Library], error)
-	ListCatalog(context.Context, string, int, string) (api.Page[api.CatalogItem], error)
-	ListCatalogChildren(context.Context, string, string, int) (api.Page[api.CatalogItem], error)
-	SearchCatalog(context.Context, string, string, int) (api.Page[api.CatalogItem], error)
-	GetCatalogItem(context.Context, string) (api.Tagged[api.CatalogItem], error)
-	ListItemEditions(context.Context, string, string, int) (api.Page[api.Edition], error)
-	ListItemTimelines(context.Context, string, string, int) (api.Page[api.Timeline], error)
-	ListVersions(context.Context, string, string, int) (api.Page[api.MediaVersion], error)
-	GetViewingState(context.Context, string, string) (api.ViewingState, error)
-	ListContinueWatching(context.Context, string, string, int) (api.Page[api.ContinueEntry], error)
-	ListScans(context.Context, string, int) (api.Page[api.Scan], error)
-	Diagnostics(context.Context) (api.Diagnostics, error)
-	Storage(context.Context) (api.StorageReport, error)
-	Metrics(context.Context, time.Time, int) (api.MetricsHistory, error)
-	ListSources(context.Context, string, int) (api.Page[api.Source], error)
-	PlaybackSessions(context.Context) (api.PlaybackSessionList, error)
-	PlaybackHistory(context.Context, string, int, api.HistoryFilter) (api.Page[api.PlaybackHistoryEntry], error)
+	operations.ProfileAPI
+	operations.DeviceAPI
+	operations.LibraryAPI
+	operations.SourceAPI
+	operations.ScanAPI
+	operations.CatalogReader
+	operations.ItemReader
+	operations.ContinueReader
+	operations.DiagnosticsAPI
+	operations.PlaybackMonitor
 }
 
 const (
 	// Lists load every page up to this many rows, then say so.
-	listCap = 2000
-	// Bounds on one item aggregate, as in the web item page.
-	itemTimelines = 20
-	itemRows      = 200
-	// Continue watching shows at most this many entries, as on the web.
-	continueLimit = 20
-	loadTimeout   = 30 * time.Second
+	listCap     = 2000
+	loadTimeout = 30 * time.Second
 )
 
 // Data keys. Dynamic pages append an ID: "library:<id>", "item:<id>".
@@ -70,14 +55,11 @@ const (
 	keySources     = "sources"
 	keyPlayback    = "playback"
 	keyHistory     = "history"
+	keyServer      = "server"
 )
 
 // baseKeys are loaded at start and after every resync: the shell needs them.
 var baseKeys = []string{keySession, keyProfiles, keyLibraries}
-
-// errIncomplete reports an aggregate that would need more than one bounded
-// page; it is never shown as if it were complete.
-var errIncomplete = errors.New("this title has more editions or versions than one page")
 
 // slot is the cached state of one query. A load replaces the request number
 // and cancels the previous request, so a late reply is always recognisable.
@@ -152,22 +134,6 @@ type itemPage struct {
 	timelines         []timelineView
 	children          []api.CatalogItem
 	childrenTruncated bool
-}
-
-// all reads every page up to listCap rows, with the shared completeness rule.
-func all[T any](ctx context.Context, list func(context.Context, string, int) (api.Page[T], error)) ([]T, bool, error) {
-	return operations.Collect(ctx, list, listCap)
-}
-
-// one reads a single bounded page and refuses to present a partial set.
-func one[T any](page api.Page[T], err error) ([]T, error) {
-	if err != nil {
-		return nil, err
-	}
-	if page.NextCursor != nil {
-		return nil, errIncomplete
-	}
-	return page.Items, nil
 }
 
 func (c *cache) slot(key string) *slot {
@@ -283,83 +249,90 @@ func data[T any](m Model, key string) (T, bool) {
 func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 	b, query, viewer := m.backend, strings.TrimSpace(m.search.Value()), m.viewer()
 	kind, id, _ := strings.Cut(key, ":")
+	whole := func(f func(context.Context) (any, error)) func(context.Context) (any, bool, error) {
+		return func(ctx context.Context) (any, bool, error) {
+			v, err := f(ctx)
+			return v, false, err
+		}
+	}
 	switch kind {
 	case keySession:
-		return func(ctx context.Context) (any, bool, error) {
-			me, err := b.Me(ctx)
-			if err != nil {
-				return nil, false, err
-			}
-			caps, err := b.Capabilities(ctx)
-			return session{me: me, caps: caps}, false, err
-		}
+		return whole(func(ctx context.Context) (any, error) {
+			s, err := operations.ReadSession(ctx, b)
+			return session{me: s.Me, caps: s.Capabilities}, err
+		})
+	case keyServer:
+		url, health := m.server, m.health
+		return whole(func(ctx context.Context) (any, error) {
+			return operations.ReadServerStatus(ctx, b, url, health, true)
+		})
 	case keyProfiles:
-		return list(b.ListProfiles)
+		return list(func(ctx context.Context) ([]api.Profile, bool, error) {
+			return operations.CollectProfiles(ctx, b, listCap)
+		})
 	case keyDevices:
-		return list(b.ListDevices)
+		return list(func(ctx context.Context) ([]api.Device, bool, error) {
+			return operations.CollectDevices(ctx, b, listCap)
+		})
 	case keyUsers, keyPairings, keyInvitations:
 		if a, ok := b.(accessBackend); ok {
 			switch kind {
 			case keyUsers:
-				return list(a.ListUsers)
+				return list(func(ctx context.Context) ([]api.User, bool, error) { return operations.CollectUsers(ctx, a, listCap) })
 			case keyPairings:
-				return list(a.ListPairings)
+				return list(func(ctx context.Context) ([]api.PairingSummary, bool, error) {
+					return operations.CollectPairings(ctx, a, listCap)
+				})
 			case keyInvitations:
-				return list(a.ListInvitations)
+				return list(func(ctx context.Context) ([]api.Invitation, bool, error) {
+					return operations.CollectInvitations(ctx, a, listCap)
+				})
 			}
 		}
 		return func(context.Context) (any, bool, error) {
 			return nil, false, fmt.Errorf("access management unavailable")
 		}
 	case keyLibraries:
-		return list(b.ListLibraries)
+		return list(func(ctx context.Context) ([]api.Library, bool, error) {
+			return operations.CollectLibraries(ctx, b, listCap)
+		})
 	case keyScans:
-		return list(b.ListScans)
+		return list(func(ctx context.Context) ([]api.Scan, bool, error) { return operations.CollectScans(ctx, b, listCap) })
 	case keyJobs:
-		return func(ctx context.Context) (any, bool, error) {
-			return operations.CollectJobs(ctx, b, listCap)
-		}
+		return list(func(ctx context.Context) ([]api.Job, bool, error) { return operations.CollectJobs(ctx, b, listCap) })
 	case keyDiagnostics:
-		return func(ctx context.Context) (any, bool, error) {
-			d, err := b.Diagnostics(ctx)
-			return d, false, err
-		}
+		return whole(func(ctx context.Context) (any, error) { return operations.ReadDiagnostics(ctx, b) })
 	case keyStorage:
-		return func(ctx context.Context) (any, bool, error) {
-			s, err := b.Storage(ctx)
-			return s, false, err
-		}
+		return whole(func(ctx context.Context) (any, error) { return operations.ReadStorage(ctx, b) })
 	case keySources:
-		return list(b.ListSources)
+		return list(func(ctx context.Context) ([]api.Source, bool, error) {
+			return operations.CollectSources(ctx, b, listCap)
+		})
 	case keyPlayback:
 		return func(ctx context.Context) (any, bool, error) {
-			s, err := b.PlaybackSessions(ctx)
+			s, err := operations.ReadPlaybackSessions(ctx, b)
 			return s, s.Truncated, err
 		}
 	case keyHistory:
 		filter := m.historyFilter
-		return list(func(ctx context.Context, cursor string, limit int) (api.Page[api.PlaybackHistoryEntry], error) {
-			return b.PlaybackHistory(ctx, cursor, limit, filter.HistoryFilter)
+		return list(func(ctx context.Context) ([]api.PlaybackHistoryEntry, bool, error) {
+			return operations.CollectPlaybackHistory(ctx, b, filter.HistoryFilter, listCap)
 		})
 	case keyMetrics:
 		window := m.windowSpan()
-		return func(ctx context.Context) (any, bool, error) {
-			step := max(10, int(window.Seconds()/240))
-			h, err := b.Metrics(ctx, time.Now().Add(-window), step)
-			return h, false, err
-		}
+		return whole(func(ctx context.Context) (any, error) {
+			return operations.ReadMetrics(ctx, b, operations.MetricsWindow{Window: window, Now: time.Now()})
+		})
 	case keyCatalog:
-		return list(func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-			return b.ListCatalog(ctx, cursor, limit, "")
+		return list(func(ctx context.Context) ([]api.CatalogItem, bool, error) {
+			return operations.CollectCatalog(ctx, b, "", listCap)
 		})
 	case keySearch:
 		return func(ctx context.Context) (any, bool, error) {
 			if query == "" {
 				return searchPage{}, false, nil
 			}
-			items, truncated, err := all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-				return b.SearchCatalog(ctx, query, cursor, limit)
-			})
+			items, truncated, err := operations.CollectSearch(ctx, b, query, listCap)
 			return searchPage{query: query, items: items}, truncated, err
 		}
 	case keyContinue:
@@ -367,81 +340,40 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 			if viewer == "" {
 				return continuePage{}, false, nil
 			}
-			page, err := b.ListContinueWatching(ctx, viewer, "", continueLimit)
+			entries, truncated, err := operations.ContinueWatching(ctx, b, viewer)
 			if err != nil {
 				return nil, false, err
 			}
-			return continuePage{profile: viewer, entries: page.Items}, page.NextCursor != nil, nil
+			return continuePage{profile: viewer, entries: entries}, truncated, nil
 		}
 	case "library":
 		return func(ctx context.Context) (any, bool, error) {
-			lib, err := b.GetLibrary(ctx, id)
-			if err != nil {
-				return nil, false, err
-			}
-			items, truncated, err := all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-				return b.ListCatalog(ctx, cursor, limit, id)
-			})
-			return libraryPage{library: lib.Value, items: items}, truncated, err
+			contents, truncated, err := operations.ReadLibraryContents(ctx, b, id, listCap)
+			return libraryPage{library: contents.Library, items: contents.Items}, truncated, err
 		}
 	case "item":
-		return func(ctx context.Context) (any, bool, error) {
-			v, err := fetchItem(ctx, b, id, viewer)
-			return v, false, err
-		}
+		return whole(func(ctx context.Context) (any, error) { return fetchItem(ctx, b, id, viewer) })
 	}
 	return func(context.Context) (any, bool, error) { return nil, false, fmt.Errorf("unknown view %q", key) }
 }
 
-func list[T any](page func(context.Context, string, int) (api.Page[T], error)) func(context.Context) (any, bool, error) {
+// list adapts a shared collecting read to a cache fetcher.
+func list[T any](collect func(context.Context) ([]T, bool, error)) func(context.Context) (any, bool, error) {
 	return func(ctx context.Context) (any, bool, error) {
-		items, truncated, err := all(ctx, page)
+		items, truncated, err := collect(ctx)
 		return items, truncated, err
 	}
 }
 
-// fetchItem composes the item page from authorized v2 reads, with the same
-// bounds as the web item page. Viewing state is optional per timeline.
+// fetchItem reads the shared item aggregate for the item page.
 func fetchItem(ctx context.Context, b Backend, id, viewer string) (itemPage, error) {
-	item, err := b.GetCatalogItem(ctx, id)
+	d, err := operations.ReadItemDetails(ctx, b, id, viewer, listCap)
 	if err != nil {
 		return itemPage{}, err
 	}
-	out := itemPage{item: item.Value}
-	out.children, out.childrenTruncated, err = all(ctx, func(ctx context.Context, cursor string, limit int) (api.Page[api.CatalogItem], error) {
-		return b.ListCatalogChildren(ctx, id, cursor, limit)
-	})
-	if err != nil {
-		return itemPage{}, err
-	}
-	editions, err := one(b.ListItemEditions(ctx, id, "", itemRows))
-	if err != nil {
-		return itemPage{}, err
-	}
-	timelines, err := one(b.ListItemTimelines(ctx, id, "", itemTimelines))
-	if err != nil {
-		return itemPage{}, err
-	}
-	for _, t := range timelines {
-		view := timelineView{timeline: t}
-		for _, e := range editions {
-			if e.ID == t.EditionID {
-				view.edition = e.Label
-			}
-		}
-		if view.versions, err = one(b.ListVersions(ctx, t.ID, "", itemRows)); err != nil {
-			return itemPage{}, err
-		}
-		if viewer != "" {
-			if v, err := b.GetViewingState(ctx, viewer, t.ID); err == nil {
-				view.viewing = &v
-			} else if ctx.Err() != nil {
-				return itemPage{}, ctx.Err()
-			} else if unauthenticated(err) {
-				return itemPage{}, err // history is optional; the credential is not
-			}
-		}
-		out.timelines = append(out.timelines, view)
+	out := itemPage{item: d.Item, children: d.Children, childrenTruncated: d.ChildrenTruncated}
+	for _, t := range d.Timelines {
+		out.timelines = append(out.timelines, timelineView{timeline: t.Timeline, edition: t.Edition, versions: t.Versions, viewing: t.Viewing})
 	}
 	return out, nil
 }

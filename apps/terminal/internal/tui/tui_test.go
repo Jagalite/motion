@@ -292,6 +292,10 @@ func press(t *testing.T, m Model, keys ...string) Model {
 	return m
 }
 
+// drainWait bounds how long drain waits for one command; the real-server
+// test raises it.
+var drainWait = 100 * time.Millisecond
+
 // drain runs a command tree and feeds load and action results back into the
 // model. Timers (debounce, notices, spinner) are not waited for.
 func drain(t *testing.T, m Model, cmd tea.Cmd) Model {
@@ -304,7 +308,7 @@ func drain(t *testing.T, m Model, cmd tea.Cmd) Model {
 	var msg tea.Msg
 	select {
 	case msg = <-done:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(drainWait):
 		return m // a timer or a blocked fetch
 	}
 	switch msg := msg.(type) {
@@ -312,7 +316,7 @@ func drain(t *testing.T, m Model, cmd tea.Cmd) Model {
 		for _, c := range msg {
 			m = drain(t, m, c)
 		}
-	case loaded, launchDone, jobReviewed, jobActionDone:
+	case loaded, launchDone, jobReviewed, jobActionDone, accessDone, policyLoaded:
 		var next tea.Cmd
 		m, next = update(t, m, msg)
 		m = drain(t, m, next)
@@ -622,11 +626,11 @@ func TestSearchFocusUnicodeDebounceAndStaleReply(t *testing.T) {
 
 func TestRepeatedEmptyPageFailsBoundedly(t *testing.T) {
 	calls := 0
-	_, _, err := all(context.Background(), func(context.Context, string, int) (api.Page[api.Profile], error) {
+	_, _, err := operations.Collect(context.Background(), func(context.Context, string, int) (api.Page[api.Profile], error) {
 		calls++
 		cursor := "repeat"
 		return api.Page[api.Profile]{NextCursor: &cursor}, nil
-	})
+	}, listCap)
 	if err == nil || calls != 2 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
@@ -1575,4 +1579,41 @@ func TestFitNeverExceedsTinyTables(t *testing.T) {
 			t.Fatalf("width %d: columns use %d cells: %v", width, total, cols)
 		}
 	}
+}
+
+// Management methods the base fake does not model; the shared fixture in
+// opstest covers them (forms_test.go).
+var errNotModelled = &api.Problem{Status: 404, Code: "not_found"}
+
+func (f *fake) CreateProfile(context.Context, string, string) (api.Tagged[api.Profile], error) {
+	return api.Tagged[api.Profile]{}, errNotModelled
+}
+func (f *fake) ReplaceProfile(context.Context, string, string, string) (api.Tagged[api.Profile], error) {
+	return api.Tagged[api.Profile]{}, errNotModelled
+}
+func (f *fake) DeleteProfile(context.Context, string, string) error { return errNotModelled }
+func (f *fake) GetDevice(context.Context, string) (api.Tagged[api.Device], error) {
+	return api.Tagged[api.Device]{}, errNotModelled
+}
+func (f *fake) RevokeDevice(context.Context, string, string) error { return errNotModelled }
+func (f *fake) GetDevicePolicy(context.Context, string) (api.Tagged[api.AccessPolicy], error) {
+	return api.Tagged[api.AccessPolicy]{}, errNotModelled
+}
+func (f *fake) ReplaceDevicePolicy(context.Context, string, api.AccessPolicy, string) (api.Tagged[api.AccessPolicy], error) {
+	return api.Tagged[api.AccessPolicy]{}, errNotModelled
+}
+func (f *fake) CreateLibrary(context.Context, api.LibraryInput, string) (api.Tagged[api.Library], error) {
+	return api.Tagged[api.Library]{}, errNotModelled
+}
+func (f *fake) GetSource(context.Context, string) (api.Tagged[api.Source], error) {
+	return api.Tagged[api.Source]{}, errNotModelled
+}
+func (f *fake) CreateSource(context.Context, api.SourceInput, string) (api.Tagged[api.Source], error) {
+	return api.Tagged[api.Source]{}, errNotModelled
+}
+func (f *fake) CreateScan(context.Context, string, api.ScanInput, string) (api.Tagged[api.Scan], error) {
+	return api.Tagged[api.Scan]{}, errNotModelled
+}
+func (f *fake) GetScan(context.Context, string) (api.Tagged[api.Scan], error) {
+	return api.Tagged[api.Scan]{}, errNotModelled
 }

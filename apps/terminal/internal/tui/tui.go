@@ -127,6 +127,12 @@ type Model struct {
 	review       int
 	reviewCancel context.CancelFunc
 	launchCancel context.CancelFunc
+	pairCancel   context.CancelFunc
+	// session is the verified session, for credential actions; nil when
+	// the interface runs over a test backend.
+	session *operations.Session
+	// health is the server identity verified when the session opened.
+	health api.Health
 
 	// metrics is the console's history; bars animate job progress.
 	metrics *history
@@ -324,6 +330,8 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case accessDone:
 		return m.accessFinished(msg)
+	case policyLoaded:
+		return m.policyForm(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case spinner.TickMsg:
@@ -657,6 +665,9 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 		}
 		return nil
 	}
+	if handled, cmd := m.accountAction(msg); handled {
+		return cmd
+	}
 	if m.focus == focusNav {
 		return m.navKey(msg)
 	}
@@ -819,12 +830,12 @@ func (m *Model) signedOut(err error) {
 	m.jobs.Forget()
 	m.acting = map[string]operations.JobActionKind{}
 	m.epoch++
-	for _, cancel := range []context.CancelFunc{m.reviewCancel, m.launchCancel} {
+	for _, cancel := range []context.CancelFunc{m.reviewCancel, m.launchCancel, m.pairCancel} {
 		if cancel != nil {
 			cancel()
 		}
 	}
-	m.reviewCancel, m.launchCancel, m.launching = nil, nil, false
+	m.reviewCancel, m.launchCancel, m.pairCancel, m.launching = nil, nil, nil, false
 }
 
 // refusal phrases a failed action for the status bar.
@@ -849,10 +860,10 @@ func describe(err error) problem {
 	var p *api.Problem
 	var u *api.UnavailableError
 	switch {
-	case errors.Is(err, errIncomplete):
+	case errors.Is(err, operations.ErrIncomplete):
 		return problem{title: "Too much to show", message: "This title has more editions or versions than the terminal shows at once."}
 	case errors.As(err, &p) && p.Status == 401:
-		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Pair it again with `motion auth pair`."}
+		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Press P to pair it again or I to redeem an invitation (or run `motion auth pair`)."}
 	case errors.As(err, &p) && p.Status == 403:
 		return problem{title: "You don't have access", message: "This profile or device is not allowed to view this. " + clean(p.Detail)}
 	case errors.As(err, &p) && p.Status == 404:
@@ -929,10 +940,10 @@ func Run(ctx context.Context, conn *operations.Session, browser operations.Brows
 	defer cancel()
 	ch := make(chan tea.Msg, eventBuffer)
 	go Pump(ctx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
-		return conn.Follow(ctx, "", h, d)
+		return operations.FollowEvents(ctx, conn, "", h, d)
 	}, ch)
 	model := New(ctx, conn, conn.URL, ch)
-	model.profile, model.openBrowser = conn.Profile, browser
+	model.profile, model.openBrowser, model.session, model.health = conn.Profile, browser, conn, conn.Health
 	program := tea.NewProgram(model, tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {

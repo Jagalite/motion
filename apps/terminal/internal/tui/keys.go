@@ -10,6 +10,9 @@ type keyMap struct {
 	Search, Play, Layout  key.Binding
 	Cancel, Choose        key.Binding
 	Inspect, Retry        key.Binding
+	New, Rename, Delete   key.Binding
+	NewLibrary, Policy    key.Binding
+	Pair, Redeem, SignOut key.Binding
 	Refresh, Help, Quit   key.Binding
 	Confirm, Keep         key.Binding
 	Submit, Leave         key.Binding
@@ -35,6 +38,14 @@ var keys = keyMap{
 	Cancel:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "cancel job")),
 	Inspect:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "inspect job")),
 	Retry:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "retry job")),
+	New:         key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new")),
+	Rename:      key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "rename")),
+	Delete:      key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "delete")),
+	NewLibrary:  key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "new library")),
+	Policy:      key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "device policy")),
+	Pair:        key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "pair this device")),
+	Redeem:      key.NewBinding(key.WithKeys("I"), key.WithHelp("I", "redeem invitation")),
+	SignOut:     key.NewBinding(key.WithKeys("O"), key.WithHelp("O", "sign out")),
 	Choose:      key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "use profile")),
 	Refresh:     key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 	Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
@@ -68,5 +79,6 @@ func fullHelp() [][]key.Binding {
 		{keys.Up, keys.Down, keys.Left, keys.Right, keys.PageUp, keys.PageDown, keys.Top, keys.Bottom},
 		{keys.Open, keys.Back, keys.Focus, keys.Search, keys.Refresh, keys.Help, keys.Quit},
 		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Inspect, keys.Cancel, keys.Retry, keys.History, keys.ClearFilter},
+		{keys.New, keys.Rename, keys.Delete, keys.NewLibrary, keys.Policy, keys.Pair, keys.Redeem, keys.SignOut},
 	}
 }

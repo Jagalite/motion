@@ -308,6 +308,9 @@ func (m *Model) tableKeyMsg(msg tea.KeyPressMsg) tea.Cmd {
 	if handled, cmd := m.accessAction(msg); handled {
 		return cmd
 	}
+	if handled, cmd := m.formAction(msg); handled {
+		return cmd
+	}
 	page := max(m.tvisible, 1) // as many rows as are on screen
 	m.tselID = ""              // moving by keys: the index leads
 	switch {

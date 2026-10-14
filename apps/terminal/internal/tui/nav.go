@@ -67,7 +67,7 @@ func (r route) keys() []string {
 	case pageProfiles:
 		return []string{keyProfiles}
 	case pageServer:
-		return []string{keySession}
+		return []string{keySession, keyServer}
 	}
 	return nil
 }

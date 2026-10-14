@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,23 +12,15 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
 // Optional extension keeps older/test backends useful; capability-gated pages
 // only appear when both the API and server advertise administrator access.
 type accessBackend interface {
-	ListUsers(context.Context, string, int) (api.Page[api.User], error)
-	GetUser(context.Context, string) (api.Tagged[api.User], error)
-	CreateUser(context.Context, api.UserInput, string) (api.Tagged[api.User], error)
-	ReplaceUser(context.Context, string, api.UserInput, string) (api.Tagged[api.User], error)
-	ListPairings(context.Context, string, int) (api.Page[api.PairingSummary], error)
-	ApprovePairing(context.Context, string, api.PairingApproval, string) (api.Tagged[api.Device], error)
-	DenyPairing(context.Context, string, string) error
-	GetDevice(context.Context, string) (api.Tagged[api.Device], error)
-	RevokeDevice(context.Context, string, string) error
-	ListInvitations(context.Context, string, int) (api.Page[api.Invitation], error)
-	CreateInvitation(context.Context, api.InvitationInput, string) (api.Tagged[api.Invitation], error)
-	RevokeInvitation(context.Context, string, string) error
+	operations.UserAPI
+	operations.PairingAPI
+	operations.InvitationAPI
 }
 
 const (
@@ -190,11 +183,25 @@ type accessDialog struct {
 	review, busy                       bool
 	message, secret                    string
 	epoch                              int
+	// resubmit marks a dialog whose last submission had an unknown
+	// outcome: applying again resubmits the same request and key.
+	resubmit bool
 }
 type accessDone struct {
 	epoch      int
 	invitation *api.Invitation
 	err        error
+	// Form results: a pairing awaiting approval, a credential change and
+	// the confirmation to show.
+	pairing   *operations.PendingPairing
+	signedIn  bool
+	signedOut bool
+	note      string
+}
+
+// intent is the dialog's logical mutation: one key for every submission.
+func (d *accessDialog) intent(operation string) operations.Intent {
+	return operations.Intent{Operation: operation, Key: d.key, Resubmission: d.resubmit}
 }
 
 func textField(label, id, value string) accessField {
@@ -377,6 +384,12 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 	d := m.access
 	if msg.String() == "esc" {
+		if d.busy && d.kind == formPair && m.pairCancel != nil {
+			m.pairCancel() // stop waiting; the request expires on its own
+			m.access, m.pairCancel = nil, nil
+			m.accessEpoch++
+			return nil
+		}
 		if d.busy {
 			return nil
 		}
@@ -394,7 +407,9 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 		if msg.String() == "y" {
 			return m.submitAccess()
 		}
-		if msg.String() == "n" {
+		// After an unknown outcome the request is fixed: only the same
+		// request may be resubmitted.
+		if msg.String() == "n" && !d.resubmit {
 			d.review = false
 		}
 		return nil
@@ -509,23 +524,26 @@ func (d *accessDialog) input() (api.UserInput, int64, error) {
 			}
 		}
 	}
-	if in.Policy.DenyRated && len(in.Policy.AllowedRatings) != 0 {
-		return in, 0, fmt.Errorf("clear the rating allowlist when denying all rated content")
+	if err := operations.CheckGrantPolicy(in.Policy); err != nil {
+		return in, 0, err
 	}
 	return in, ttl, nil
 }
 func (m *Model) submitAccess() tea.Cmd {
 	d := m.access
+	if formKind(d.kind) {
+		return m.submitForm()
+	}
 	in, ttl, err := d.input()
 	if err != nil {
 		d.message = err.Error()
 		d.review = false
 		return nil
 	}
-	b := m.backend.(accessBackend)
+	b, devices := m.backend.(accessBackend), m.backend
 	ctx := m.ctx
 	// Capture immutable intent and revisions before launching any asynchronous work.
-	kind, id, rev, key, epoch := d.kind, d.target, d.revision, d.key, d.epoch
+	kind, id, rev, epoch := d.kind, d.target, d.revision, d.epoch
 	var user api.User
 	if d.user >= 0 && d.user < len(d.users) {
 		user = d.users[d.user]
@@ -535,44 +553,30 @@ func (m *Model) submitAccess() tea.Cmd {
 		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
 		result := accessDone{epoch: epoch}
-		stale := func() error { return fmt.Errorf("access changed; close this dialog and refresh before trying again") }
 		switch kind {
 		case "user":
 			if id == "" {
-				_, result.err = b.CreateUser(ctx, in, key)
+				_, result.err = operations.CreateUser(ctx, b, in, d.intent("creation of user "+in.Name))
 			} else {
-				var current api.Tagged[api.User]
-				current, result.err = b.GetUser(ctx, id)
-				if result.err == nil {
-					if current.Value.Revision != rev {
-						result.err = stale()
-					} else {
-						_, result.err = b.ReplaceUser(ctx, id, in, current.ETag)
-					}
-				}
+				_, result.err = operations.ReplaceUser(ctx, b, id, in, operations.Reviewed(rev))
 			}
 		case "approve":
-			_, result.err = b.ApprovePairing(ctx, id, api.PairingApproval{UserCode: rev, UserID: user.ID, UserRevision: user.Revision, ProfileIDs: in.ProfileIDs, Permissions: in.Permissions, Policy: &in.Policy}, key)
+			policy := in.Policy
+			_, result.err = operations.ApprovePairing(ctx, b, operations.Approval{PairingID: id, UserCode: rev, UserID: user.ID, UserRevision: user.Revision,
+				ProfileIDs: in.ProfileIDs, Permissions: in.Permissions, Policy: &policy}, d.intent("approval of pairing "+id))
 		case "deny":
-			result.err = b.DenyPairing(ctx, id, key)
+			result.err = operations.DenyPairing(ctx, b, id, d.intent("denial of pairing "+id))
 		case "device":
-			var current api.Tagged[api.Device]
-			current, result.err = b.GetDevice(ctx, id)
-			if result.err == nil {
-				if current.Value.Revision != rev {
-					result.err = stale()
-				} else {
-					result.err = b.RevokeDevice(ctx, id, current.ETag)
-				}
-			}
+			result.err = operations.RevokeDevice(ctx, devices, id, operations.Reviewed(rev))
 		case "invite":
 			var invitation api.Tagged[api.Invitation]
-			invitation, result.err = b.CreateInvitation(ctx, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision, ProfileIDs: in.ProfileIDs, Permissions: in.Permissions, Policy: in.Policy, TTLSeconds: ttl}, key)
+			invitation, result.err = operations.CreateInvitation(ctx, b, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision,
+				ProfileIDs: in.ProfileIDs, Permissions: in.Permissions, Policy: in.Policy, TTLSeconds: ttl}, d.intent("invitation for user "+user.ID))
 			if result.err == nil {
 				result.invitation = &invitation.Value
 			}
 		case "revoke-invite":
-			result.err = b.RevokeInvitation(ctx, id, `"r-`+rev+`"`)
+			result.err = operations.RevokeInvitation(ctx, b, id, operations.Reviewed(rev))
 		}
 		return result
 	}
@@ -593,17 +597,26 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	}
 	d := m.access
 	d.busy = false
-	if unauthenticated(result.err) {
+	if unauthenticated(result.err) && !formKind(d.kind) {
 		m.signedOut(result.err)
 		return nil
 	}
-	if revoked(result.err) {
+	if revoked(result.err) && !formKind(d.kind) {
 		m.forgetAccess()
 		return m.load(keySession)
 	}
+	var unknown *operations.UncertainError
+	d.resubmit = d.resubmit || errors.As(result.err, &unknown) && unknown.Key != ""
 	if result.err != nil {
-		d.message = clean(result.err.Error())
+		d.review = d.resubmit
+		d.message = clean(refusal(result.err))
+		if unknown != nil {
+			d.message = clean(unknown.Error()) + " Apply again to resubmit the same request."
+		}
 		return nil
+	}
+	if formKind(d.kind) {
+		return m.formFinished(result)
 	}
 	if result.invitation != nil {
 		d.secret = result.invitation.Code
@@ -625,6 +638,12 @@ func (m Model) accessView() string {
 			lines = append(lines, d.secret[start:min(start+inner, len(d.secret))])
 		}
 		lines = append(lines, "", "The code grants only the selected access, once.")
+	} else if d.review && formKind(d.kind) {
+		lines = append(lines, "", "Confirm? y apply · n edit · Esc cancel")
+		if d.resubmit {
+			lines[len(lines)-1] = "Resubmit the same request? y apply · Esc cancel"
+		}
+		lines = append(lines, m.formSummary(d)...)
 	} else if d.review {
 		lines = append(lines, "", "Confirm this access change? y apply · n edit · Esc cancel")
 		if in, _, err := d.input(); err == nil && len(d.fields) > 0 {
