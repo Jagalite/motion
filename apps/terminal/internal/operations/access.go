@@ -3,6 +3,7 @@ package operations
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -16,6 +17,29 @@ func CheckPermissions(permissions []string) error {
 		}
 	}
 	return nil
+}
+
+// canonicalPermissions orders permissions as the contract lists them and
+// drops duplicates, so every interface sends the same request for the same
+// grant.
+func canonicalPermissions(permissions []string) []string {
+	out := []string{}
+	for _, p := range api.AllPermissions {
+		if slices.Contains(permissions, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// grantRequest is what a resubmission of a user-bound grant must repeat.
+func grantRequest(userRevision string, profiles, permissions []string, policy api.GrantPolicy) map[string]string {
+	return map[string]string{
+		"user_revision": userRevision, "profile_ids": strings.Join(profiles, ","), "permissions": strings.Join(permissions, ","),
+		"library_ids": strings.Join(policy.LibraryIDs, ","), "allow_unrated": strconv.FormatBool(policy.AllowUnrated),
+		"deny_rated": strconv.FormatBool(policy.DenyRated), "allowed_ratings": strings.Join(policy.AllowedRatings, ","),
+		"blocked_labels": strings.Join(policy.BlockedLabels, ","),
+	}
 }
 
 // nonNil sends an empty JSON list rather than null.
@@ -38,6 +62,36 @@ func CheckGrantPolicy(p api.GrantPolicy) error {
 		return Invalid("clear the rating allowlist when denying all rated content")
 	}
 	return nil
+}
+
+// DefaultUserPermissions are what a new access user is granted unless the
+// administrator chooses otherwise, in either interface.
+var DefaultUserPermissions = canonicalPermissions([]string{api.PermCatalogRead, api.PermEventsRead, api.PermPlaybackRequest, api.PermViewingWrite})
+
+// DefaultGrantPolicy is the grant policy a new user starts with.
+func DefaultGrantPolicy() api.GrantPolicy {
+	return api.GrantPolicy{LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}}
+}
+
+// Grant is the access a device or invitation receives.
+type Grant struct {
+	ProfileIDs  []string
+	Permissions []string
+	Policy      api.GrantPolicy
+}
+
+// InheritedGrant is the default grant for a device or invitation bound to
+// a user: the user's grant, without system:admin, which is never granted
+// implicitly.
+func InheritedGrant(u api.User) Grant {
+	g := Grant{ProfileIDs: append([]string{}, u.ProfileIDs...), Policy: grant(u.Policy)}
+	for _, p := range u.Permissions {
+		if p != api.PermSystemAdmin {
+			g.Permissions = append(g.Permissions, p)
+		}
+	}
+	g.Permissions = canonicalPermissions(g.Permissions)
+	return g
 }
 
 // Pairings ------------------------------------------------------------------
@@ -83,7 +137,7 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 		return api.Tagged[api.Device]{}, err
 	}
 	approval := api.PairingApproval{UserCode: in.UserCode, UserID: in.UserID, UserRevision: in.UserRevision,
-		ProfileIDs: nonNil(in.ProfileIDs), Permissions: nonNil(in.Permissions)}
+		ProfileIDs: nonNil(in.ProfileIDs), Permissions: canonicalPermissions(in.Permissions)}
 	if in.Policy != nil {
 		if err := CheckGrantPolicy(*in.Policy); err != nil {
 			return api.Tagged[api.Device]{}, err
@@ -92,7 +146,11 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 		approval.Policy = &p
 	}
 	v, err := a.ApprovePairing(ctx, in.PairingID, approval, i.Key)
-	return v, i.settle(err)
+	var request map[string]string
+	if in.UserID != "" && approval.Policy != nil {
+		request = grantRequest(in.UserRevision, approval.ProfileIDs, approval.Permissions, *approval.Policy)
+	}
+	return v, i.settleRequest(request, err)
 }
 
 // DenyPairing refuses a pairing request.
@@ -144,7 +202,7 @@ func checkUser(in api.UserInput) (api.UserInput, error) {
 	if err := CheckGrantPolicy(in.Policy); err != nil {
 		return in, err
 	}
-	in.ProfileIDs, in.Permissions, in.Policy = nonNil(in.ProfileIDs), nonNil(in.Permissions), grant(in.Policy)
+	in.ProfileIDs, in.Permissions, in.Policy = nonNil(in.ProfileIDs), canonicalPermissions(in.Permissions), grant(in.Policy)
 	return in, nil
 }
 
@@ -211,10 +269,16 @@ func CreateInvitation(ctx context.Context, a InvitationAPI, in api.InvitationInp
 	if err := CheckGrantPolicy(in.Policy); err != nil {
 		return api.Tagged[api.Invitation]{}, err
 	}
-	in.ProfileIDs, in.Permissions, in.Policy = nonNil(in.ProfileIDs), nonNil(in.Permissions), grant(in.Policy)
+	in.ProfileIDs, in.Permissions, in.Policy = nonNil(in.ProfileIDs), canonicalPermissions(in.Permissions), grant(in.Policy)
 	v, err := a.CreateInvitation(ctx, in, i.Key)
-	return v, i.settle(err)
+	request := grantRequest(in.UserRevision, in.ProfileIDs, in.Permissions, in.Policy)
+	request["ttl_seconds"] = strconv.FormatInt(in.TTLSeconds, 10)
+	return v, i.settleRequest(request, err)
 }
+
+// maxInvitationScan bounds the list read that resolves an invitation's
+// revision.
+var maxInvitationScan = 10000
 
 // revisionETag is the server's strong ETag for a revision. It is used only
 // for invitations, which the contract lists but offers no single read for.
@@ -227,7 +291,7 @@ func RevokeInvitation(ctx context.Context, a InvitationAPI, id string, pre Preco
 		return Invalid("an invitation ID is required")
 	}
 	etag, err := pre.resolve(ctx, "the invitation", func(ctx context.Context) (string, string, error) {
-		all, _, err := CollectInvitations(ctx, a, 10000)
+		all, truncated, err := CollectInvitations(ctx, a, maxInvitationScan)
 		if err != nil {
 			return "", "", err
 		}
@@ -235,6 +299,10 @@ func RevokeInvitation(ctx context.Context, a InvitationAPI, id string, pre Preco
 			if v.ID == id {
 				return revisionETag(v.Revision), v.Revision, nil
 			}
+		}
+		if truncated {
+			// A partial list is not evidence of absence.
+			return "", "", Invalid("the invitation is not among the first %d listed; pass its ETag explicitly", len(all))
 		}
 		return "", "", &api.Problem{Status: 404, Code: "not_found", Title: "Not Found", Detail: "no such invitation"}
 	})
@@ -313,7 +381,7 @@ func ReplaceDevicePolicy(ctx context.Context, a DeviceAPI, id string, in api.Acc
 		return api.Tagged[api.AccessPolicy]{}, Invalid("clear the rating allowlist when denying all rated content")
 	}
 	in.LibraryIDs, in.AllowedRatings = nonNil(in.LibraryIDs), nonNil(in.AllowedRatings)
-	in.BlockedLabels, in.Permissions = nonNil(in.BlockedLabels), nonNil(in.Permissions)
+	in.BlockedLabels, in.Permissions = nonNil(in.BlockedLabels), canonicalPermissions(in.Permissions)
 	etag, err := pre.resolve(ctx, "the device policy", tagged(func(ctx context.Context) (api.Tagged[api.AccessPolicy], error) {
 		return InspectDevicePolicy(ctx, a, id)
 	}, func(p api.AccessPolicy) string { return p.Revision }))

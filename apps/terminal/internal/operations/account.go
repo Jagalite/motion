@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -123,6 +124,23 @@ type PendingPairing struct {
 	accepted   string
 	deviceCode string
 	interval   time.Duration
+
+	mu        sync.Mutex
+	abandoned bool
+	installed bool
+}
+
+// ErrPairingAbandoned is returned by Wait after Abandon.
+var ErrPairingAbandoned = errors.New("pairing abandoned")
+
+// Abandon stops the pairing from installing a credential. It reports
+// whether the credential had already been installed, in which case the
+// session is signed in.
+func (p *PendingPairing) Abandon() (installed bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.abandoned = true
+	return p.installed
 }
 
 // StartPairing asks the server to pair this device. The administrator
@@ -152,12 +170,26 @@ func (p *PendingPairing) Wait(ctx context.Context) (Signed, error) {
 		if err := p.session.Sleep(ctx, interval); err != nil {
 			return Signed{}, err
 		}
+		p.mu.Lock()
+		abandoned := p.abandoned
+		p.mu.Unlock()
+		if abandoned {
+			return Signed{}, ErrPairingAbandoned
+		}
 		credential, err := p.session.ClaimPairing(ctx, p.ID, p.deviceCode)
 		var problem *api.Problem
 		var unavailable *api.UnavailableError
 		switch {
 		case err == nil:
-			return keep(p.session, credential, p.accepted)
+			// Installation and abandonment exclude each other.
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			if p.abandoned {
+				return Signed{}, ErrPairingAbandoned
+			}
+			signed, err := keep(p.session, credential, p.accepted)
+			p.installed = err == nil
+			return signed, err
 		case errors.As(err, &problem) && (problem.Code == "pairing_pending" || problem.Status == 429):
 			if problem.RetryAfter > 0 {
 				interval = problem.RetryAfter

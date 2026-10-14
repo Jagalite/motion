@@ -302,3 +302,99 @@ func TestTUIFormReviewShowsWhatWillBeApplied(t *testing.T) {
 		t.Fatalf("scan review:\n%s", v)
 	}
 }
+
+func TestTUIDefaultsMatchTheSharedDefaults(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	m := startOn(t, f)
+	m = goTo(t, m, route{page: pageUsers})
+	m = press(t, m, "n")
+	setText(t, m, "name", opstest.ScenarioDefaultUser)
+	m = apply(t, m)
+	m = goTo(t, m, route{page: pageInvitations})
+	m = press(t, m, "n")
+	m = chooseUser(t, m, opstest.ScenarioDefaultUser)
+	m = apply(t, m)
+	want, err := opstest.ExpectedDefaults(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("TUI defaults differ:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestTUIPolicyFormOpensOnlyForTheNewestReadOnDevices(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	seed := opstest.SeedManagement(f)
+	m := startOn(t, f)
+	m = goTo(t, m, route{page: pageDevices})
+	m = selectRow(t, m, seed.TV.ID)
+	_, older := m.formAction(keyPress("p"))
+	m = selectRow(t, m, seed.OldPhone.ID)
+	_, newer := m.formAction(keyPress("p"))
+	m, _ = update(t, m, newer())
+	if m.access == nil || m.access.target != seed.OldPhone.ID {
+		t.Fatalf("newest read did not open: %+v", m.access)
+	}
+	m = press(t, m, "esc")
+	m, _ = update(t, m, older())
+	if m.access != nil {
+		t.Fatalf("superseded read opened %s", m.access.target)
+	}
+	// A read answered after leaving Devices opens nothing.
+	_, late := m.formAction(keyPress("p"))
+	m = goTo(t, m, route{page: pageProfiles})
+	m, _ = update(t, m, late())
+	if m.access != nil {
+		t.Fatal("policy editor opened on another page")
+	}
+}
+
+func TestTUIScanFormOffersSourcesOnFirstVisit(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	seed := opstest.SeedManagement(f)
+	m := startOn(t, f)
+	m = goTo(t, m, route{page: pageScans}) // Sources never visited
+	m = press(t, m, "n")
+	if m.access == nil {
+		t.Fatal("scan form not offered")
+	}
+	setToggle(t, m, "source", seed.Archive.ID, true)
+	m = press(t, m, "esc")
+	m.cache.slots[keySources].loading = true
+	m = press(t, m, "n")
+	if m.access != nil || !strings.Contains(m.notice.text, "Loading libraries and sources") {
+		t.Fatalf("form opened before its choices loaded: %+v", m.notice)
+	}
+}
+
+func TestCredentialChangeRestartsTheEventStreamAndForgetsActivity(t *testing.T) {
+	m := start(t, &fake{}, 100, 30)
+	var started []bool
+	next := make(chan tea.Msg, 1)
+	m.events = func(on bool) <-chan tea.Msg {
+		started = append(started, on)
+		if on {
+			return next
+		}
+		return nil
+	}
+	id := "p1"
+	hint := eventMsg(api.Event{Cursor: "c1", Kind: "changed", ResourceType: "profile", ResourceID: &id})
+	m, _ = update(t, m, fromStream{gen: m.streamGen, msg: hint})
+	if len(m.log) != 1 {
+		t.Fatalf("hint not recorded: %d", len(m.log))
+	}
+	stale := fromStream{gen: m.streamGen, msg: hint}
+	if cmd := m.credentialChanged(true); cmd == nil || len(m.log) != 0 || m.incoming != (<-chan tea.Msg)(next) {
+		t.Fatalf("stream not restarted: log=%d", len(m.log))
+	}
+	m, _ = update(t, m, stale)
+	if len(m.log) != 0 {
+		t.Fatal("a hint from the previous credential was shown")
+	}
+	m.credentialChanged(false)
+	if fmt.Sprint(started) != "[true false]" || m.incoming != nil || m.stream != "stopped" {
+		t.Fatalf("sign-out kept the stream: %v %s", started, m.stream)
+	}
+}

@@ -177,3 +177,69 @@ func TestCredentialOperationsSwitchTheSession(t *testing.T) {
 		t.Fatalf("profile check: %v", err)
 	}
 }
+
+func TestAbandonedPairingNeverInstallsItsCredential(t *testing.T) {
+	f := opstest.NewServer("fixture", "operator-token-0123456789abcdef012345")
+	srv := httptest.NewServer(f.Handler())
+	defer srv.Close()
+	ctx := context.Background()
+	s, err := operations.Connect(ctx, operations.Settings{Server: srv.URL, ConfigDir: t.TempDir(), HTTP: srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approve := func(p *operations.PendingPairing) {
+		if _, err := f.ApprovePairing(ctx, p.ID, api.PairingApproval{UserCode: p.UserCode, ProfileIDs: []string{}, Permissions: []string{}}, "approve-"+p.ID+"-0123456789"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Abandoned before approval: the approval later installs nothing.
+	first, err := operations.StartPairing(ctx, s, "Den", store.FileStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Abandon() {
+		t.Fatal("nothing was installed yet")
+	}
+	approve(first)
+	if _, err := first.Wait(ctx); !errors.Is(err, operations.ErrPairingAbandoned) || s.SignedIn() {
+		t.Fatalf("abandoned pairing: %v signed in=%v", err, s.SignedIn())
+	}
+	// Completed before abandonment: Abandon reports the installed credential.
+	second, err := operations.StartPairing(ctx, s, "Den", store.FileStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approve(second)
+	if _, err := second.Wait(ctx); err != nil || !s.SignedIn() {
+		t.Fatalf("approved pairing: %v", err)
+	}
+	if !second.Abandon() {
+		t.Fatal("Abandon hid an installed credential")
+	}
+}
+
+func TestSettlementKeepsRequestValuesToRepeat(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	user := f.AddUser("Sam")
+	intent := operations.NewIntent("invitation for Sam")
+	f.LoseAcks(1)
+	_, err := operations.CreateInvitation(ctx, f, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision, TTLSeconds: 600}, intent)
+	var unknown *operations.UncertainError
+	if !errors.As(err, &unknown) || unknown.Request["user_revision"] != user.Revision {
+		t.Fatalf("%v %+v", err, unknown)
+	}
+	// The same key with a different request is a receipt conflict, which
+	// leaves the earlier outcome unknown.
+	again, _ := operations.ResumeIntent(intent.Operation, intent.Key)
+	_, err = operations.CreateInvitation(ctx, f, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision, TTLSeconds: 900}, again)
+	if !errors.As(err, &unknown) || !api.IsCode(err, "idempotency_key_reused") {
+		t.Fatalf("changed resubmission: %v", err)
+	}
+	if _, err := operations.CreateInvitation(ctx, f, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision, TTLSeconds: 600}, again); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.Snapshot().Invitations); n != 1 {
+		t.Fatalf("%d invitations", n)
+	}
+}

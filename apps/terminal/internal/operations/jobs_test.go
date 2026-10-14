@@ -142,6 +142,8 @@ func TestOutcomeClassification(t *testing.T) {
 		{&api.Problem{Status: 404, Code: "not_found"}, true},
 		{&api.Problem{Status: 409, Code: "not_cancellable"}, false},
 		{&api.Problem{Status: 412, Code: "precondition_failed"}, false},
+		{&api.Problem{Status: 409, Code: "idempotency_key_reused"}, true},
+		{&api.Problem{Status: 409, Code: "idempotent_replay_unavailable"}, true},
 	} {
 		_, err := operations.SubmitJobAction(context.Background(), failing{c.err}, again)
 		var unknown *operations.UncertainError

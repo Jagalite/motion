@@ -20,7 +20,7 @@ import (
 //  2. register source Films (a temporary directory named "films") and
 //     create library Movies (movies) over it; request a scan of Movies
 //  3. create access user Sam (catalog:read); issue Sam an invitation and
-//     revoke it
+//     revoke it; issue another and redeem it as device Redeemer
 const (
 	RealProfile        = "Kids"
 	RealRenamed        = "Children"
@@ -32,6 +32,7 @@ const (
 	RealUser           = "Sam"
 	RealInvitationTTL  = 600
 	RealUserPermission = api.PermCatalogRead
+	RealDevice         = "Redeemer"
 )
 
 // Observation is the scenario's resulting domain state, read through the
@@ -44,6 +45,7 @@ type Observation struct {
 	Scans       []string
 	Users       []string
 	Invitations []string
+	Devices     []string
 }
 
 // ExpectedObservation is what both interfaces must leave behind.
@@ -53,8 +55,12 @@ var ExpectedObservation = Observation{
 	Libraries:   []string{RealLibrary + " " + RealLibraryKind + " sources=" + RealSource},
 	Scans:       []string{RealLibrary},
 	Users:       []string{RealUser + " enabled perms=" + RealUserPermission},
-	Invitations: []string{RealUser + " revoked"},
+	Invitations: []string{RealUser + " " + RedeemedStatus, RealUser + " revoked"}, // sorted
+	Devices:     []string{RealDevice + " owner=" + RealUser + " permissions=" + RealUserPermission},
 }
+
+// RedeemedStatus is how the server lists a redeemed invitation.
+const RedeemedStatus = "claimed"
 
 // Observe reads the scenario's state from a server.
 func Observe(ctx context.Context, s *operations.Session) (Observation, error) {
@@ -127,6 +133,20 @@ func Observe(ctx context.Context, s *operations.Session) (Observation, error) {
 	for _, i := range invitations {
 		if userName[i.UserID] == RealUser {
 			o.Invitations = append(o.Invitations, RealUser+" "+i.Status)
+		}
+	}
+	sort.Strings(o.Invitations)
+	devices, _, err := operations.CollectDevices(ctx, s, 10000)
+	if err != nil {
+		return o, err
+	}
+	for _, d := range devices {
+		if d.Name == RealDevice {
+			owner := "-"
+			if d.UserID != nil {
+				owner = userName[*d.UserID]
+			}
+			o.Devices = append(o.Devices, fmt.Sprintf("%s owner=%s permissions=%s", d.Name, owner, strings.Join(d.Permissions, "+")))
 		}
 	}
 	return o, nil

@@ -35,7 +35,10 @@ type UncertainError struct {
 	Operation string
 	Key       string
 	IfMatch   string
-	Err       error
+	// Request holds other values the resubmission must repeat exactly,
+	// such as the user revision an approval or invitation was decided on.
+	Request map[string]string
+	Err     error
 }
 
 func (e *UncertainError) Error() string {
@@ -100,6 +103,14 @@ func CheckIdempotencyKey(key string) error {
 	return nil
 }
 
+// receiptConflict reports the server's conflicts about the key's receipt
+// rather than the resource: a reused key with a different request, or a
+// receipt that can no longer be replayed. Neither shows that the earlier
+// request was not applied.
+func receiptConflict(code string) bool {
+	return code == "idempotency_key_reused" || code == "idempotent_replay_unavailable"
+}
+
 // settle classifies a mutation's error. It returns err unchanged when err
 // proves the mutation was not applied, and wraps it in *UncertainError
 // otherwise.
@@ -109,8 +120,9 @@ func CheckIdempotencyKey(key string) error {
 // the outcome only if the server answers it after looking up the key's
 // receipt: an exact resubmission of an applied request replays that
 // receipt, so a domain conflict (409) or failed precondition (412) shows
-// nothing was applied. Refusals answered before the lookup (rate limits,
-// authentication, visibility) prove nothing about the earlier attempt.
+// nothing was applied, unless the conflict is about the receipt itself.
+// Refusals answered before the lookup (rate limits, authentication,
+// visibility) prove nothing about the earlier attempt.
 func settle(operation, key, ifMatch string, resubmission bool, err error) error {
 	if err == nil {
 		return nil
@@ -119,7 +131,7 @@ func settle(operation, key, ifMatch string, resubmission bool, err error) error 
 	var earlier *api.AfterUnknownAttemptError
 	if resubmission || errors.As(err, &earlier) {
 		var p *api.Problem
-		if key != "" && errors.As(err, &p) && (p.Status == 409 || p.Status == 412) {
+		if key != "" && errors.As(err, &p) && (p.Status == 409 || p.Status == 412) && !receiptConflict(p.Code) {
 			return err
 		}
 		return unknown
@@ -133,6 +145,17 @@ func settle(operation, key, ifMatch string, resubmission bool, err error) error 
 // settle classifies the error of submitting the intent.
 func (i Intent) settle(err error) error {
 	return settle(i.Operation, i.Key, "", i.Resubmission, err)
+}
+
+// settleRequest is settle for an intent whose request includes values a
+// resubmission must repeat.
+func (i Intent) settleRequest(request map[string]string, err error) error {
+	err = i.settle(err)
+	var unknown *UncertainError
+	if errors.As(err, &unknown) {
+		unknown.Request = request
+	}
+	return err
 }
 
 // settleConditional classifies the error of an unkeyed write conditional

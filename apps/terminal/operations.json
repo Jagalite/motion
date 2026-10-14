@@ -1,6 +1,6 @@
 {
   "schema": "motion.terminal.operations.v1",
-  "note": "Operation inventory and parity ledger. Every workflow is shared: both interfaces call the named functions in internal/operations, and neither calls the API client directly. server.serve is the one interface-specific exception. See PARITY.md.",
+  "note": "Operation inventory and parity ledger. Every workflow is shared: both interfaces call the named functions in internal/operations, and neither calls the API client directly. server.serve is the one interface-specific exception. Notes record remaining interface differences. See PARITY.md.",
   "operations": [
     {
       "id": "session.connect",
@@ -98,14 +98,16 @@
       "capabilities": [],
       "tests": {
         "operations": [
-          "internal/operations:TestCredentialOperationsSwitchTheSession"
+          "internal/operations:TestCredentialOperationsSwitchTheSession",
+          "internal/operations:TestAbandonedPairingNeverInstallsItsCredential"
         ],
         "cli": [
           "internal/cli:TestCLIAccountFlowsUseTheSharedOperations",
           "internal/cli:TestPairingRequiresExplicitCredentialStoreBeforeContactingPairing"
         ],
         "tui": [
-          "internal/tui:TestTUIPairsWithTheSharedPairingFlow"
+          "internal/tui:TestTUIPairsWithTheSharedPairingFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
         ]
       }
     },
@@ -131,7 +133,8 @@
           "internal/cli:TestInvitationRecoversAcrossCommandRestartAfterPersistenceFailure"
         ],
         "tui": [
-          "internal/tui:TestTUIRedeemsAnInvitationWithTheSharedFlow"
+          "internal/tui:TestTUIRedeemsAnInvitationWithTheSharedFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
         ]
       }
     },
@@ -154,7 +157,8 @@
           "internal/cli:TestCLIAccountFlowsUseTheSharedOperations"
         ],
         "tui": [
-          "internal/tui:TestTUIPairsWithTheSharedPairingFlow"
+          "internal/tui:TestTUIPairsWithTheSharedPairingFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
         ]
       }
     },
@@ -212,7 +216,8 @@
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
         ]
-      }
+      },
+      "note": "The CLI also approves a device without an access user (omit --user), as the server allows; the TUI always binds the device to a chosen user. With --user, both pre-fill the user's grant (operations.InheritedGrant)."
     },
     {
       "id": "access.pairings.deny",
@@ -319,10 +324,12 @@
           "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
         ],
         "cli": [
-          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIDefaultsMatchTheSharedDefaults"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIDefaultsMatchTheSharedDefaults"
         ]
       }
     },
@@ -401,13 +408,17 @@
       "tests": {
         "operations": [
           "internal/operations:TestManagementScenarioReachesTheIntendedState",
-          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest",
+          "internal/operations:TestSettlementKeepsRequestValuesToRepeat"
         ],
         "cli": [
-          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIDefaultsMatchTheSharedDefaults",
+          "internal/cli:TestCLIResubmissionRepeatsTheReviewedUserRevision"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIDefaultsMatchTheSharedDefaults"
         ]
       }
     },
@@ -430,7 +441,8 @@
       "tests": {
         "operations": [
           "internal/operations:TestManagementScenarioReachesTheIntendedState",
-          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision"
+          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision",
+          "internal/operations:TestATruncatedInvitationListIsNotEvidenceOfAbsence"
         ],
         "cli": [
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
@@ -550,7 +562,8 @@
           "internal/cli:TestCLIReadCommandsUseTheSharedReads"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIPolicyFormOpensOnlyForTheNewestReadOnDevices"
         ]
       }
     },
@@ -579,7 +592,8 @@
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIPolicyFormOpensOnlyForTheNewestReadOnDevices"
         ]
       }
     },
@@ -662,7 +676,8 @@
         ],
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
-          "internal/tui:TestTUIFormResubmitsTheSameRequestAfterAnUnknownOutcome"
+          "internal/tui:TestTUIFormResubmitsTheSameRequestAfterAnUnknownOutcome",
+          "internal/tui:TestTUIFormReviewShowsWhatWillBeApplied"
         ]
       }
     },
@@ -915,7 +930,8 @@
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIScanFormOffersSourcesOnFirstVisit"
         ]
       }
     },
@@ -1244,7 +1260,8 @@
           "internal/cli:TestEventsTailWritesVersionedEvents"
         ],
         "tui": [
-          "internal/tui:TestPumpNeverBlocksAndResyncsEvenIfTheStreamGoesQuiet"
+          "internal/tui:TestPumpNeverBlocksAndResyncsEvenIfTheStreamGoesQuiet",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
         ]
       }
     },

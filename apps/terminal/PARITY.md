@@ -11,30 +11,55 @@ is the one interface-specific exception.
 
 ## How this is enforced
 
-- `TestOperationInventoryIsCompleteAndTruthful` checks the inventory against
-  the code. Every runnable CLI command is listed, and every CLI entry point
-  exists. Every shared function is declared in `internal/operations` and
-  has operation, CLI and TUI tests. Every row appears here. A pending,
-  half-migrated workflow is rejected.
-- `TestInterfacesDoNotBypassSharedOperations` type-checks `internal/cli`
-  and `internal/tui`. It fails when either calls a method of the API
-  client, on the client, on a session embedding it, or on an interface
-  carrying client methods (such as the TUI's `Backend`). It also fails
-  when either constructs a client or a player URL, refers to the browser
-  opener, or refers to none of a shared operation's functions. Shared
-  data types stay usable.
+- `TestOperationInventoryIsCompleteAndTruthful` keeps the inventory
+  consistent with the code. It checks that:
+  - every runnable CLI command, including groups that also run, is listed;
+  - every named CLI entry point and shared function exists;
+  - every row names operation, CLI and TUI tests that exist;
+  - every row appears here;
+  - no pending, half-migrated workflow remains.
+
+  It checks names, not behavior: the named tests are what exercise each row.
+- `TestCLIEntryPointsRunTheirSharedOperation` resolves each CLI entry point
+  to its Cobra command. What that command runs must call one of the row's
+  shared functions.
+- `TestInterfacesDoNotBypassSharedOperations` type-checks `internal/cli` and
+  `internal/tui`. It fails when either of them:
+  - calls an API client method, whether on the client, on a session
+    embedding it, or on an interface carrying client methods (such as the
+    TUI's `Backend`);
+  - constructs a client;
+  - builds or sends a raw HTTP request;
+  - builds a player URL;
+  - refers to the browser opener;
+  - refers to none of a shared row's functions.
+
+  TUI entry points are free text. For the TUI, this reference check and
+  the adapter tests show the wiring.
 - `TestSharedOperationsStayIndependentOfInterfaces` keeps
   `internal/operations` free of Cobra, Bubble Tea, terminal I/O, process
-  launches and the interface packages, and keeps the CLI and TUI from
-  importing each other.
-- The adapter tests run against one fixture, `internal/operations/opstest`,
-  served in process to the TUI and over HTTP to the CLI. The management
-  scenario (`opstest.ApplyManagement`) must leave the same domain state,
-  compared without generated IDs, whether it runs directly, through CLI
-  commands or through TUI keystrokes.
+  launches and the interface packages. It also keeps the CLI and the TUI
+  from importing each other.
+- The adapter tests share one fixture, `internal/operations/opstest`. It is
+  served in process to the TUI and over HTTP to the CLI. It replays keyed
+  writes only for an identical request body, records device owners and
+  policies, and issues per-device credentials. Two scenarios must leave the
+  same domain state, compared without generated IDs, whether run directly,
+  through CLI commands or through TUI keystrokes:
+  - management (`opstest.ApplyManagement`);
+  - defaults (`opstest.ApplyDefaults`).
+- `TestE2ECLIReachesTheSharedRealServerState` and
+  `TestE2ETUIReachesTheSharedRealServerState` run one scenario through each
+  interface on a fresh real server and must observe the same state:
+  profiles, sources, libraries, a scan, an access user, a revoked
+  invitation and a redemption. `scripts/tui_pty_check.py` types into the
+  real `motion tui` in a pseudo-terminal.
 
 These checks prove the wiring and the shared decisions. They do not prove
 server behavior: the real-server E2E tests and the Rust tests do that.
+Pairing approval runs against the real server only in
+`TestE2EPairApproveUseAndRevokeAgainstRealServer` (CLI). The TUI's pairing
+flow is exercised against the fixture.
 
 | Operation | Status | CLI | TUI | Shared implementation or exception |
 | --- | --- | --- | --- | --- |
@@ -45,7 +70,7 @@ server behavior: the real-server E2E tests and the Rust tests do that.
 | `auth.redeem` | Shared | `motion auth redeem` | I while signed out: redeem an invitation code | `RedeemInvitation` |
 | `auth.logout` | Shared | `motion auth logout` | Server page: O signs out | `SignOut` |
 | `access.pairings.list` | Shared | `motion access pairings list` | Pairing requests page | `ListPairings`, `CollectPairings` |
-| `access.pairings.approve` | Shared | `motion auth approve` | Pairing requests: a, choose the user, review | `ApprovePairing` |
+| `access.pairings.approve` | Shared | `motion auth approve` | Pairing requests: a, choose the user, review | `ApprovePairing` Note: The CLI also approves a device without an access user (omit --user), as the server allows; the TUI always binds the device to a chosen user. With --user, both pre-fill the user's grant (operations.InheritedGrant). |
 | `access.pairings.deny` | Shared | `motion access pairings deny` | Pairing requests: d, review | `DenyPairing` |
 | `access.users.list` | Shared | `motion access users list` | Users and access page | `ListUsers`, `CollectUsers` |
 | `access.users.show` | Shared | `motion access users show` | Users and access: detail of the listed user | `InspectUser`, `CollectUsers` |
@@ -106,10 +131,18 @@ server behavior: the real-server E2E tests and the Rust tests do that.
   `--if-match`, or by default deliberately reads the current revision. A
   stale precondition is a conflict (exit 4) and never an overwrite.
 - **Unknown outcomes.** A write whose acknowledgement was lost is reported as
-  possibly applied. A later refusal from an answer given before the
-  server's receipt lookup (rate limit, authentication, visibility) does not
-  settle it. The CLI reports `outcome_unknown`, `idempotency_key` and
-  `if_match`. The TUI offers to resubmit the same request.
+  possibly applied. These later answers do not settle it: a refusal given
+  before the server's receipt lookup (rate limit, authentication,
+  visibility), or a conflict about the receipt itself
+  (`idempotency_key_reused`, `idempotent_replay_unavailable`). The CLI
+  reports `outcome_unknown`, `idempotency_key`, `if_match` and the other
+  request values to repeat, such as an approval's or invitation's user
+  revision and grant, together with the flags that repeat them. The TUI
+  locks the dialog and offers to resubmit the same request.
+- **Defaults.** A new user gets `operations.DefaultUserPermissions` and
+  `DefaultGrantPolicy`. An invitation or user-bound approval starts from
+  the user's grant without `system:admin` (`operations.InheritedGrant`).
+  Permissions are sent in the contract's order.
 - **Guidance.** Permissions and capabilities shown by the TUI only guide.
   The server authorizes every request, and the player launch reads current
   permissions and capabilities.
@@ -117,7 +150,11 @@ server behavior: the real-server E2E tests and the Rust tests do that.
 ## Interface-specific behavior
 
 Shell completion, terminal layout, refresh schedules and navigation are
-interface concerns. The TUI asks for confirmation before every mutation; the
+interface concerns. A credential change in the TUI (pairing, redemption or
+sign-out) restarts the change-hint stream for the new principal and
+discards the previous principal's activity. Abandoning a pairing never
+installs its credential; if the credential was already installed, the TUI
+says so. The TUI asks for confirmation before every mutation; the
 CLI treats the command itself as the confirmation. Secrets are read
 privately: the CLI reads invitation codes from standard input, and the TUI
 masks the code field. Neither shows a device code or credential.

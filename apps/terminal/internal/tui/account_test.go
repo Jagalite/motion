@@ -109,8 +109,11 @@ func TestTUIPairsWithTheSharedPairingFlow(t *testing.T) {
 	if m.access != nil || !s.SignedIn() || m.me() == nil || m.notice.text != "Paired; this device is signed in." {
 		t.Fatalf("not signed in: %+v %+v", m.access, m.notice)
 	}
-	if c := storedCredential(t, dir); c == nil || c.AccessToken != accountToken {
+	if c := storedCredential(t, dir); c == nil || !strings.HasPrefix(c.AccessToken, "device-token-") {
 		t.Fatal("credential not stored")
+	}
+	if me := m.me(); me == nil || me.Mode != "paired" {
+		t.Fatalf("signed in as %+v, not the paired device", me)
 	}
 
 	// Signing out forgets the credential and everything shown.
@@ -134,8 +137,11 @@ func TestTUIRedeemsAnInvitationWithTheSharedFlow(t *testing.T) {
 	m = press(t, m, "I")
 	setText(t, m, "code", inv.Value.Code)
 	setToggle(t, m, "consent", "", true)
-	if v := m.View().Content; strings.Contains(v, inv.Value.Code) {
-		t.Fatal("invitation code shown")
+	for i := 0; i < 3; i++ { // focused, then each other field focused
+		if v := m.View().Content; strings.Contains(v, inv.Value.Code) || strings.Contains(v, inv.Value.Code[:12]) {
+			t.Fatal("invitation code shown")
+		}
+		m = press(t, m, "tab")
 	}
 	m, next := confirm(t, m)
 	m = drain(t, m, next)

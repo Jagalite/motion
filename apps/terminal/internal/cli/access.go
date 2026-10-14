@@ -179,6 +179,33 @@ func grantFlags(cmd *cobra.Command, profiles, permissions *[]string, policy *api
 	cmd.Flags().StringSliceVar(&policy.BlockedLabels, "block-label", nil, "blocked label (repeatable)")
 }
 
+// inheritGrant fills grant flags the command line left unset from the
+// user's grant, as the TUI pre-fills its form.
+func inheritGrant(cmd *cobra.Command, u api.User, profiles, permissions *[]string, policy *api.GrantPolicy) {
+	g, f := operations.InheritedGrant(u), cmd.Flags()
+	if !f.Changed("grant-profile") {
+		*profiles = g.ProfileIDs
+	}
+	if !f.Changed("permission") {
+		*permissions = g.Permissions
+	}
+	if !f.Changed("library") {
+		policy.LibraryIDs = g.Policy.LibraryIDs
+	}
+	if !f.Changed("allow-unrated") {
+		policy.AllowUnrated = g.Policy.AllowUnrated
+	}
+	if !f.Changed("deny-rated") {
+		policy.DenyRated = g.Policy.DenyRated
+	}
+	if !f.Changed("rating") {
+		policy.AllowedRatings = g.Policy.AllowedRatings
+	}
+	if !f.Changed("block-label") {
+		policy.BlockedLabels = g.Policy.BlockedLabels
+	}
+}
+
 func printUser(w io.Writer, u api.User) {
 	state := "enabled"
 	if u.Disabled {
@@ -227,6 +254,9 @@ func usersCmd(env *Env) *cobra.Command {
 	var disabled bool
 	create := &cobra.Command{Use: "create NAME", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		in.Name, in.Disabled = args[0], disabled
+		if !cmd.Flags().Changed("permission") {
+			in.Permissions = operations.DefaultUserPermissions
+		}
 		intent, err := operations.ResumeIntent("creation of user "+args[0], key)
 		if err != nil {
 			return err
@@ -284,20 +314,27 @@ func invitationsCmd(env *Env) *cobra.Command {
 	})}
 	pageFlags(list, &cursor, &limit)
 	var in api.InvitationInput
-	var key string
+	var key, userRevision string
 	create := &cobra.Command{Use: "create USER_ID", Short: "Issue an invitation; the code is printed once", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		intent, err := operations.ResumeIntent("invitation for user "+args[0], key)
 		if err != nil {
 			return err
 		}
+		if key != "" && userRevision == "" {
+			return usage("--idempotency-key needs the original request's --user-revision")
+		}
 		return run(env, func(ctx context.Context, c *Conn) error {
-			// The invitation grants what the administrator reviewed: the
-			// user's current revision, read now.
+			// The invitation grants what the administrator decided on: the
+			// given user revision, or the current one, read now.
 			user, err := operations.InspectUser(ctx, c, args[0])
 			if err != nil {
 				return err
 			}
 			in.UserID, in.UserRevision = user.Value.ID, user.Value.Revision
+			if userRevision != "" {
+				in.UserRevision = userRevision
+			}
+			inheritGrant(cmd, user.Value, &in.ProfileIDs, &in.Permissions, &in.Policy)
 			v, err := operations.CreateInvitation(ctx, c, in, intent)
 			if err != nil {
 				return err
@@ -309,6 +346,7 @@ func invitationsCmd(env *Env) *cobra.Command {
 	}}
 	grantFlags(create, &in.ProfileIDs, &in.Permissions, &in.Policy)
 	create.Flags().Int64Var(&in.TTLSeconds, "ttl", 600, "lifetime in seconds (60-86400)")
+	create.Flags().StringVar(&userRevision, "user-revision", "", "user revision the invitation is decided on (default: read it now)")
 	keyFlag(create, &key)
 	var ifMatch string
 	revoke := &cobra.Command{Use: "revoke INVITATION_ID", Short: "Revoke an unused invitation", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {

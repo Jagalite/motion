@@ -44,6 +44,8 @@ type Server struct {
 	pairings    []*pairing
 	invitations []*api.Invitation
 	redeemed    map[string]api.Credential
+	// credentials maps issued device tokens to their devices.
+	credentials map[string]string
 	sources     []*api.Source
 	libraries   []*api.Library
 	scans       []*api.Scan
@@ -64,7 +66,7 @@ func NewServer(serverID, token string) *Server {
 		serverID: serverID, token: token,
 		me:       api.Principal{ID: "operator", ProfileIDs: []string{}, Permissions: []string{api.PermSystemAdmin}, Mode: "operator"},
 		features: []api.Feature{{ID: "identity.access_management", Implemented: true, Enabled: true}},
-		acks:     map[string]any{}, policies: map[string]*api.AccessPolicy{}, redeemed: map[string]api.Credential{},
+		acks:     map[string]any{}, policies: map[string]*api.AccessPolicy{}, redeemed: map[string]api.Credential{}, credentials: map[string]string{},
 	}
 }
 
@@ -143,21 +145,33 @@ func precondition(ifMatch, revision string) error {
 
 // replay answers a keyed write from its receipt, or runs apply once and
 // records the receipt. Lost acknowledgements apply but fail.
-func replay[T any](s *Server, op, key string, apply func() (T, error)) (T, error) {
+func replay[T any](s *Server, op, key string, request any, apply func() (T, error)) (T, error) {
 	var zero T
 	if key == "" {
 		return zero, problem(400, "idempotency_key_required")
 	}
-	v, ok := s.acks[op+"\x00"+key].(T)
+	body, _ := json.Marshal(request)
+	r, ok := s.acks[op+"\x00"+key].(receipt)
+	if ok && r.body != string(body) {
+		// The contract: a different request under the same key is 409.
+		return zero, problem(409, "idempotency_key_reused")
+	}
 	if !ok {
-		var err error
-		if v, err = apply(); err != nil {
+		v, err := apply()
+		if err != nil {
 			return zero, err
 		}
-		s.acks[op+"\x00"+key] = v
+		r = receipt{body: string(body), ack: v}
+		s.acks[op+"\x00"+key] = r
 	}
-	_, err := s.deliver(v)
-	return v, err
+	_, err := s.deliver(r.ack)
+	return r.ack.(T), err
+}
+
+// receipt is a saved acknowledgement and the request it answered.
+type receipt struct {
+	body string
+	ack  any
 }
 
 func (s *Server) deliver(v any) (_ any, err error) {
@@ -198,6 +212,31 @@ func find[T any](rows []*T, id func(*T) string, want string) *T {
 		}
 	}
 	return nil
+}
+
+// issue returns a new credential for a device.
+func (s *Server) issue(device string) api.Credential {
+	token := "device-token-" + device + "-0123456789abcdef0123456789"
+	s.credentials[token] = device
+	return api.Credential{DeviceID: device, AccessToken: token, ExpiresAt: "2027-01-01T00:00:00Z"}
+}
+
+// principal is who a bearer token authenticates, if anyone.
+func (s *Server) principal(token string) (api.Principal, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token == s.token {
+		return s.me, true
+	}
+	id, ok := s.credentials[token]
+	if !ok {
+		return api.Principal{}, false
+	}
+	d := find(s.devices, deviceID, id)
+	if d == nil || d.Revoked {
+		return api.Principal{}, false
+	}
+	return api.Principal{ID: d.ID, DeviceID: &d.ID, ProfileIDs: d.ProfileIDs, Permissions: d.Permissions, PolicyRevision: s.policies[d.ID].Revision, Mode: "paired"}, true
 }
 
 // Principal and capabilities ------------------------------------------------
@@ -248,7 +287,7 @@ func (s *Server) CreateProfile(_ context.Context, name, key string) (api.Tagged[
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createProfile", "", key, "")
-	return replay(s, "createProfile", key, func() (api.Tagged[api.Profile], error) {
+	return replay(s, "createProfile", key, name, func() (api.Tagged[api.Profile], error) {
 		p := &api.Profile{ID: s.id("p"), Name: name, Revision: "1"}
 		s.profiles = append(s.profiles, p)
 		return api.Tagged[api.Profile]{Value: *p, ETag: tag(p.Revision)}, nil
@@ -402,7 +441,7 @@ func (s *Server) CreateUser(_ context.Context, in api.UserInput, key string) (ap
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createUser", "", key, "")
-	return replay(s, "createUser", key, func() (api.Tagged[api.User], error) {
+	return replay(s, "createUser", key, in, func() (api.Tagged[api.User], error) {
 		u := &api.User{ID: s.id("u"), Name: in.Name, Revision: "1", Disabled: in.Disabled, ProfileIDs: in.ProfileIDs, Permissions: in.Permissions, Policy: in.Policy}
 		s.users = append(s.users, u)
 		return api.Tagged[api.User]{Value: *u, ETag: tag(u.Revision)}, nil
@@ -447,7 +486,7 @@ func (s *Server) ClaimPairing(_ context.Context, id, deviceCode string) (api.Cre
 		}
 		switch p.Status {
 		case "approved":
-			return api.Credential{DeviceID: p.deviceID, AccessToken: s.token, ExpiresAt: "2027-01-01T00:00:00Z"}, nil
+			return s.issue(p.deviceID), nil
 		case "pending":
 			return api.Credential{}, &api.Problem{Status: 409, Code: "pairing_pending", Title: "Conflict", RetryAfter: time.Millisecond}
 		}
@@ -471,7 +510,7 @@ func (s *Server) ApprovePairing(_ context.Context, id string, in api.PairingAppr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("approvePairing", id, key, "")
-	return replay(s, "approvePairing", key, func() (api.Tagged[api.Device], error) {
+	return replay(s, "approvePairing", key, []any{id, in}, func() (api.Tagged[api.Device], error) {
 		for _, p := range s.pairings {
 			if p.ID != id {
 				continue
@@ -483,8 +522,24 @@ func (s *Server) ApprovePairing(_ context.Context, id string, in api.PairingAppr
 				return api.Tagged[api.Device]{}, problem(409, "pairing_code_mismatch")
 			}
 			d := &api.Device{ID: s.id("d"), Name: p.DeviceName, ClientName: p.ClientName, Revision: "1", ProfileIDs: in.ProfileIDs, Permissions: in.Permissions}
+			if in.UserID != "" {
+				u := find(s.users, userID, in.UserID)
+				if u == nil {
+					return api.Tagged[api.Device]{}, problem(404, "not_found")
+				}
+				if u.Revision != in.UserRevision {
+					return api.Tagged[api.Device]{}, problem(409, "user_changed")
+				}
+				owner := in.UserID
+				d.UserID = &owner
+			}
+			policy := &api.AccessPolicy{Revision: "1", LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}, Permissions: in.Permissions}
+			if in.Policy != nil {
+				policy.LibraryIDs, policy.AllowUnrated, policy.DenyRated = in.Policy.LibraryIDs, in.Policy.AllowUnrated, in.Policy.DenyRated
+				policy.AllowedRatings, policy.BlockedLabels = in.Policy.AllowedRatings, in.Policy.BlockedLabels
+			}
 			s.devices = append(s.devices, d)
-			s.policies[d.ID] = &api.AccessPolicy{Revision: "1", LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}, Permissions: in.Permissions}
+			s.policies[d.ID] = policy
 			p.Status, p.deviceID = "approved", d.ID
 			return api.Tagged[api.Device]{Value: *d, ETag: tag(d.Revision)}, nil
 		}
@@ -496,7 +551,7 @@ func (s *Server) DenyPairing(_ context.Context, id, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("denyPairing", id, key, "")
-	_, err := replay(s, "denyPairing", key, func() (struct{}, error) {
+	_, err := replay(s, "denyPairing", key, id, func() (struct{}, error) {
 		for _, p := range s.pairings {
 			if p.ID == id && p.Status == "pending" {
 				p.Status = "denied"
@@ -525,7 +580,7 @@ func (s *Server) CreateInvitation(_ context.Context, in api.InvitationInput, key
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createInvitation", in.UserID, key, "")
-	return replay(s, "createInvitation", key, func() (api.Tagged[api.Invitation], error) {
+	return replay(s, "createInvitation", key, in, func() (api.Tagged[api.Invitation], error) {
 		u := find(s.users, userID, in.UserID)
 		if u == nil {
 			return api.Tagged[api.Invitation]{}, problem(404, "not_found")
@@ -572,7 +627,7 @@ func (s *Server) RedeemInvitation(_ context.Context, in api.RedemptionInput) (ap
 			d := &api.Device{ID: s.id("d"), Name: in.DeviceName, ClientName: in.ClientName, Revision: "1", UserID: &i.UserID, ProfileIDs: i.ProfileIDs, Permissions: i.Permissions}
 			s.devices = append(s.devices, d)
 			s.policies[d.ID] = &api.AccessPolicy{Revision: "1", LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}, Permissions: i.Permissions}
-			c := api.Credential{DeviceID: d.ID, AccessToken: s.token, ExpiresAt: "2027-01-01T00:00:00Z"}
+			c := s.issue(d.ID)
 			s.redeemed[in.Code+"\x00"+in.ClaimID] = c
 			return c, nil
 		}
@@ -625,7 +680,7 @@ func (s *Server) CreateSource(_ context.Context, in api.SourceInput, key string)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createSource", "", key, "")
-	return replay(s, "createSource", key, func() (api.Tagged[api.Source], error) {
+	return replay(s, "createSource", key, in, func() (api.Tagged[api.Source], error) {
 		if !strings.HasPrefix(in.RootPath, "/") {
 			return api.Tagged[api.Source]{}, problem(422, "invalid_root")
 		}
@@ -656,7 +711,7 @@ func (s *Server) CreateLibrary(_ context.Context, in api.LibraryInput, key strin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createLibrary", "", key, "")
-	return replay(s, "createLibrary", key, func() (api.Tagged[api.Library], error) {
+	return replay(s, "createLibrary", key, in, func() (api.Tagged[api.Library], error) {
 		for _, id := range in.SourceIDs {
 			if find(s.sources, sourceID, id) == nil {
 				return api.Tagged[api.Library]{}, problem(422, "unknown_source")
@@ -672,7 +727,7 @@ func (s *Server) CreateScan(_ context.Context, library string, in api.ScanInput,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("createScan", library, key, "")
-	return replay(s, "createScan", key, func() (api.Tagged[api.Scan], error) {
+	return replay(s, "createScan", key, []any{library, in}, func() (api.Tagged[api.Scan], error) {
 		l := find(s.libraries, libraryID, library)
 		if l == nil {
 			return api.Tagged[api.Scan]{}, problem(404, "not_found")
@@ -755,7 +810,11 @@ func (s *Server) Snapshot() Snapshot {
 	}
 	for _, d := range s.devices {
 		pol := s.policies[d.ID]
-		snap.Devices = append(snap.Devices, fmt.Sprintf("%s revoked=%v@%s policy=%s/%s/unrated=%v/denyrated=%v/ratings=%s/labels=%s@%s", d.Name, d.Revoked, d.Revision,
+		owner := "-"
+		if d.UserID != nil {
+			owner = name(*d.UserID)
+		}
+		snap.Devices = append(snap.Devices, fmt.Sprintf("%s owner=%s revoked=%v@%s policy=%s/%s/unrated=%v/denyrated=%v/ratings=%s/labels=%s@%s", d.Name, owner, d.Revoked, d.Revision,
 			names(pol.LibraryIDs), strings.Join(pol.Permissions, "+"), pol.AllowUnrated, pol.DenyRated, strings.Join(pol.AllowedRatings, "+"), strings.Join(pol.BlockedLabels, "+"), pol.Revision))
 	}
 	for _, u := range s.users {
@@ -806,7 +865,8 @@ func (s *Server) Handler() http.Handler {
 		}
 		route := r.Method + " " + strings.Join(pattern(seg), "/")
 		public := route == "POST auth/pairings" || route == "POST auth/pairings/*/claim" || route == "POST auth/invitations/redeem"
-		if !public && r.Header.Get("Authorization") != "Bearer "+s.token {
+		me, authenticated := s.principal(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if !public && !authenticated {
 			write(w, nil, "", problem(401, "authentication_required"))
 			return
 		}
@@ -818,7 +878,7 @@ func (s *Server) Handler() http.Handler {
 		tagged := func(t any, e string, er error) { v, etag, err = t, e, er }
 		switch route {
 		case "GET me":
-			v, err = s.Me(ctx)
+			v = me
 		case "GET system/capabilities":
 			v, err = s.Capabilities(ctx)
 		case "GET profiles":

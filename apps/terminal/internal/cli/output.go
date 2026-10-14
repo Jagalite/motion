@@ -94,6 +94,8 @@ type errorBody struct {
 	OutcomeUnknown bool   `json:"outcome_unknown,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 	IfMatch        string `json:"if_match,omitempty"`
+	// Request holds other values to repeat, such as user_revision.
+	Request map[string]string `json:"request,omitempty"`
 }
 
 func writeJSON(w io.Writer, v envelope) error {
@@ -126,7 +128,7 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 	}
 	var unknown *operations.UncertainError
 	if errors.As(err, &unknown) {
-		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch = true, unknown.Key, unknown.IfMatch
+		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch, body.Request = true, unknown.Key, unknown.IfMatch, unknown.Request
 	}
 	if jsonMode {
 		_ = writeJSON(w, envelope{Error: body})
@@ -147,6 +149,7 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 		if unknown.IfMatch != "" {
 			repeat = append(repeat, "--if-match '"+unknown.IfMatch+"'")
 		}
+		repeat = append(repeat, requestFlags(unknown.Request)...)
 		if unknown.Key != "" {
 			msg += "\nmotion: the " + unknown.Operation + " may have been applied; repeat the command with " + strings.Join(repeat, " ") + " to resubmit the same request safely"
 		} else {
@@ -154,6 +157,23 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 		}
 	}
 	fmt.Fprintln(w, sanitize(msg))
+}
+
+// requestFlags turns the request values an unknown outcome reports into the
+// flags that repeat them.
+func requestFlags(request map[string]string) []string {
+	flags := []struct{ key, flag string }{
+		{"user_revision", "--user-revision"}, {"profile_ids", "--grant-profile"}, {"permissions", "--permission"},
+		{"library_ids", "--library"}, {"allow_unrated", "--allow-unrated"}, {"deny_rated", "--deny-rated"},
+		{"allowed_ratings", "--rating"}, {"blocked_labels", "--block-label"}, {"ttl_seconds", "--ttl"},
+	}
+	var out []string
+	for _, f := range flags {
+		if v, ok := request[f.key]; ok {
+			out = append(out, f.flag+"='"+v+"'")
+		}
+	}
+	return out
 }
 
 // sanitize strips control characters from server-supplied text so a

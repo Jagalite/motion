@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,6 +32,7 @@ type inventoryEntry struct {
 	TUI          *string             `json:"tui"`
 	Capabilities []string            `json:"capabilities"`
 	Tests        map[string][]string `json:"tests"`
+	Note         string              `json:"note"`
 	Exception    *struct {
 		Reason      string `json:"reason"`
 		Disposition string `json:"disposition"`
@@ -96,13 +98,14 @@ func declared(files map[string]*ast.File) map[string]bool {
 	return names
 }
 
+// commands maps every command path to whether it runs (a group may too).
 func commands(root *cobra.Command) map[string]bool {
 	out := map[string]bool{}
 	var walk func(*cobra.Command, string)
 	walk = func(c *cobra.Command, prefix string) {
 		for _, child := range c.Commands() {
 			path := strings.TrimSpace(prefix + " " + child.Name())
-			out[path] = true
+			out[path] = child.Runnable()
 			walk(child, path)
 		}
 	}
@@ -141,7 +144,7 @@ func TestOperationInventoryIsCompleteAndTruthful(t *testing.T) {
 			t.Errorf("%s: missing from PARITY.md", e.ID)
 		}
 		if e.CLI != nil {
-			if !cmds[*e.CLI] {
+			if _, ok := cmds[*e.CLI]; !ok {
 				t.Errorf("%s: CLI entry %q is not a command", e.ID, *e.CLI)
 			}
 			covered[*e.CLI] = true
@@ -183,15 +186,176 @@ func TestOperationInventoryIsCompleteAndTruthful(t *testing.T) {
 			t.Errorf("%s: unknown status %q", e.ID, e.Status)
 		}
 	}
-	// Every runnable command is inventoried; grouping commands, the TUI
-	// launcher and Cobra's own commands are not operations.
-	for path := range cmds {
-		group := false
-		for other := range cmds {
-			group = group || strings.HasPrefix(other, path+" ")
-		}
-		if !covered[path] && !group && path != "tui" && path != "help" && !strings.HasPrefix(path, "completion") {
+	// Every runnable command is inventoried, including groups that also
+	// run; the TUI launcher and Cobra's own commands are not operations.
+	for path, runnable := range cmds {
+		if runnable && !covered[path] && path != "tui" && path != "help" && !strings.HasPrefix(path, "completion") {
 			t.Errorf("command %q is not in operations.json", path)
+		}
+	}
+}
+
+// cobraCommand is a &cobra.Command{...} literal in internal/cli.
+type cobraCommand struct {
+	leaf string
+	fn   *ast.FuncDecl
+	run  []ast.Node // its RunE: the field value and any later assignments
+}
+
+// cliCommands finds the command literals of internal/cli and what runs them.
+func cliCommands(t *testing.T) []cobraCommand {
+	t.Helper()
+	var out []cobraCommand
+	for _, f := range parsed(t, filepath.Join("internal", "cli"), false) {
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			vars := map[string]*cobraCommand{}
+			var found []*cobraCommand
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				lit, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
+				sel, ok := lit.Type.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "Command" {
+					return true
+				}
+				c := &cobraCommand{fn: fn}
+				for _, el := range lit.Elts {
+					kv, ok := el.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					switch kv.Key.(*ast.Ident).Name {
+					case "Use":
+						if b, ok := kv.Value.(*ast.BasicLit); ok {
+							use, _ := strconv.Unquote(b.Value)
+							c.leaf = strings.Fields(use)[0]
+						}
+					case "RunE", "Run":
+						c.run = append(c.run, kv.Value)
+					}
+				}
+				found = append(found, c)
+				return true
+			})
+			// Bind "x := &cobra.Command{...}" names, then "x.RunE = ...".
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+					return true
+				}
+				if id, ok := as.Lhs[0].(*ast.Ident); ok {
+					if u, ok := as.Rhs[0].(*ast.UnaryExpr); ok {
+						if lit, ok := u.X.(*ast.CompositeLit); ok {
+							for _, c := range found {
+								for _, el := range lit.Elts {
+									if kv, ok := el.(*ast.KeyValueExpr); ok && kv.Key.(*ast.Ident).Name == "Use" {
+										if b, ok := kv.Value.(*ast.BasicLit); ok {
+											use, _ := strconv.Unquote(b.Value)
+											if strings.Fields(use)[0] == c.leaf {
+												vars[id.Name] = c
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				if sel, ok := as.Lhs[0].(*ast.SelectorExpr); ok && (sel.Sel.Name == "RunE" || sel.Sel.Name == "Run") {
+					if id, ok := sel.X.(*ast.Ident); ok && vars[id.Name] != nil {
+						vars[id.Name].run = append(vars[id.Name].run, as.Rhs[0])
+					}
+				}
+				return true
+			})
+			for _, c := range found {
+				out = append(out, *c)
+			}
+		}
+	}
+	return out
+}
+
+// runner finds the command literal for a CLI path: a literal for the leaf
+// in a function that also declares the parent, or that the parent's
+// function calls.
+func runner(commands []cobraCommand, path string) *cobraCommand {
+	segs := strings.Fields(path)
+	leaf := segs[len(segs)-1]
+	declares := func(fn *ast.FuncDecl, use string) bool {
+		for _, c := range commands {
+			if c.fn == fn && c.leaf == use {
+				return true
+			}
+		}
+		return false
+	}
+	calls := func(caller *ast.FuncDecl, callee string) bool {
+		found := false
+		ast.Inspect(caller.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == callee {
+					found = true
+				}
+			}
+			return !found
+		})
+		return found
+	}
+	for i := range commands {
+		c := &commands[i]
+		if c.leaf != leaf {
+			continue
+		}
+		if len(segs) == 1 {
+			return c
+		}
+		parent := segs[len(segs)-2]
+		if c.leaf != parent && declares(c.fn, parent) {
+			return c
+		}
+		for _, p := range commands {
+			if p.leaf == parent && calls(p.fn, c.fn.Name.Name) {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+// TestCLIEntryPointsRunTheirSharedOperation ties each ledger CLI entry
+// point to its command: what that command runs must call one of the
+// entry's shared operations. The session entry is exempt: every command
+// connects through Env.Connect, which calls operations.Connect.
+func TestCLIEntryPointsRunTheirSharedOperation(t *testing.T) {
+	commands := cliCommands(t)
+	for _, e := range inventory(t) {
+		if e.Status != "shared" || e.CLI == nil || e.ID == "session.connect" {
+			continue
+		}
+		c := runner(commands, *e.CLI)
+		if c == nil || len(c.run) == 0 {
+			t.Errorf("%s: no command literal runs %q", e.ID, *e.CLI)
+			continue
+		}
+		wired := false
+		for _, node := range c.run {
+			ast.Inspect(node, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok {
+					if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "operations" && slices.Contains(e.Shared, sel.Sel.Name) {
+						wired = true
+					}
+				}
+				return !wired
+			})
+		}
+		if !wired {
+			t.Errorf("%s: `motion %s` does not run any of %v", e.ID, *e.CLI, e.Shared)
 		}
 	}
 }
@@ -213,6 +377,11 @@ func operationRefs(t *testing.T, dir string) map[string]bool {
 	}
 	return refs
 }
+
+// rawHTTP are the net/http functions and *http.Client methods that build or
+// send requests; interface code reaches the server only through operations.
+var rawHTTP = map[string]bool{"NewRequest": true, "NewRequestWithContext": true, "Do": true, "Get": true,
+	"Post": true, "PostForm": true, "Head": true, "DefaultClient": true, "RoundTrip": true}
 
 // clientMethods are the exported methods of *api.Client: the transport.
 func clientMethods(t *testing.T) map[string]bool {
@@ -299,11 +468,17 @@ func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
 			if apiMethod && transport[obj.Name()] || viaInterface && transport[obj.Name()] {
 				t.Errorf("%s: %s reaches the API client directly; call the shared operation", fset.Position(sel.Pos()), obj.Name())
 			}
+			if obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && rawHTTP[obj.Name()] {
+				t.Errorf("%s: sends HTTP directly (%s); call the shared operation", fset.Position(sel.Pos()), obj.Name())
+			}
 		}
 		for _, f := range files {
 			for id, obj := range info.Uses {
 				if obj.Pkg() != nil && strings.HasSuffix(obj.Pkg().Path(), "/internal/api") && obj.Name() == "New" && fset.File(id.Pos()) == fset.File(f.Pos()) {
 					t.Errorf("%s: constructs an API client", fset.Position(id.Pos()))
+				}
+				if obj.Pkg() != nil && obj.Pkg().Path() == "net/http" && rawHTTP[obj.Name()] && fset.File(id.Pos()) == fset.File(f.Pos()) {
+					t.Errorf("%s: builds or sends an HTTP request (%s)", fset.Position(id.Pos()), obj.Name())
 				}
 			}
 			ast.Inspect(f, func(n ast.Node) bool {

@@ -141,3 +141,30 @@ func ExpectedManagement(ctx context.Context) (Snapshot, error) {
 	}
 	return s.Snapshot(), nil
 }
+
+// ScenarioDefaultUser is created with only a name, then invited with the
+// grant it inherits: both interfaces must apply the same defaults.
+const ScenarioDefaultUser = "Dee"
+
+// ApplyDefaults creates ScenarioDefaultUser with the shared default grant
+// and invites it with the inherited grant.
+func ApplyDefaults(ctx context.Context, s *Server) error {
+	dee, err := operations.CreateUser(ctx, s, api.UserInput{Name: ScenarioDefaultUser, Permissions: operations.DefaultUserPermissions,
+		Policy: operations.DefaultGrantPolicy()}, operations.NewIntent("user"))
+	if err != nil {
+		return err
+	}
+	g := operations.InheritedGrant(dee.Value)
+	_, err = operations.CreateInvitation(ctx, s, api.InvitationInput{UserID: dee.Value.ID, UserRevision: dee.Value.Revision,
+		ProfileIDs: g.ProfileIDs, Permissions: g.Permissions, Policy: g.Policy, TTLSeconds: ScenarioInvitationTTL}, operations.NewIntent("invite"))
+	return err
+}
+
+// ExpectedDefaults is the state ApplyDefaults reaches on a fresh fixture.
+func ExpectedDefaults(ctx context.Context) (Snapshot, error) {
+	s := NewServer("expected", "expected-token-0123456789abcdef01234")
+	if err := ApplyDefaults(ctx, s); err != nil {
+		return Snapshot{}, err
+	}
+	return s.Snapshot(), nil
+}

@@ -235,3 +235,54 @@ func TestCLIAccountFlowsUseTheSharedOperations(t *testing.T) {
 		t.Fatalf("state %+v", snap)
 	}
 }
+
+func TestCLIDefaultsMatchTheSharedDefaults(t *testing.T) {
+	c := newManaged(t)
+	dee := c.ok("access", "users", "create", opstest.ScenarioDefaultUser)
+	c.ok("access", "invitations", "create", dee["id"].(string))
+	want, err := opstest.ExpectedDefaults(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.fixture.Snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("CLI defaults differ:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestCLIResubmissionRepeatsTheReviewedUserRevision(t *testing.T) {
+	c := newManaged(t)
+	sam := c.fixture.AddUser("Sam")
+	c.fixture.LoseAcks(1 << 20)
+	_, stderr, code := c.run("--json", "access", "invitations", "create", sam.ID)
+	var report struct {
+		Error struct {
+			IdempotencyKey string            `json:"idempotency_key"`
+			Request        map[string]string `json:"request"`
+		}
+	}
+	if err := json.Unmarshal([]byte(stderr), &report); err != nil || code != ExitUnavailable || report.Error.Request["user_revision"] != "1" {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	c.fixture.LoseAcks(0)
+	// The user changes meanwhile; a resubmission must repeat revision 1.
+	if _, err := c.fixture.ReplaceUser(context.Background(), sam.ID, api.UserInput{Name: "Sam", ProfileIDs: []string{}, Permissions: []string{}}, `"r-1"`); err != nil {
+		t.Fatal(err)
+	}
+	key := report.Error.IdempotencyKey
+	if _, _, code := c.run("access", "invitations", "create", sam.ID, "--idempotency-key", key); code != ExitInvalid {
+		t.Fatalf("resubmission without --user-revision: exit %d", code)
+	}
+	if _, _, code := c.run("access", "invitations", "create", sam.ID, "--idempotency-key", key, "--user-revision", "1"); code != ExitConflict {
+		t.Fatalf("resubmission re-inherited the changed grant: exit %d", code)
+	}
+	// The reported request repeats the original grant exactly.
+	args := []string{"access", "invitations", "create", sam.ID, "--idempotency-key", key}
+	for _, flag := range requestFlags(report.Error.Request) {
+		name, value, _ := strings.Cut(flag, "=")
+		args = append(args, name+"="+strings.Trim(value, "'"))
+	}
+	c.ok(args...)
+	if n := len(c.fixture.Snapshot().Invitations); n != 1 {
+		t.Fatalf("%d invitations", n)
+	}
+}

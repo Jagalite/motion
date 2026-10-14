@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textinput"
@@ -255,8 +256,12 @@ func (m *Model) grantFields(d *accessDialog, u api.User) {
 	for _, l := range libraries {
 		d.fields = append(d.fields, toggle("Library: "+clean(l.Name), "library", l.ID, has(u.Policy.LibraryIDs, l.ID)))
 	}
+	granted := u.Permissions
+	if d.kind != "user" {
+		granted = operations.InheritedGrant(u).Permissions
+	}
 	for _, p := range api.AllPermissions {
-		d.fields = append(d.fields, toggle("Permission: "+p, "permission", p, has(u.Permissions, p) && (d.kind == "user" || p != api.PermSystemAdmin)))
+		d.fields = append(d.fields, toggle("Permission: "+p, "permission", p, has(granted, p)))
 	}
 }
 func (m *Model) beginAccess(kind string) tea.Cmd {
@@ -267,7 +272,7 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 	d := &accessDialog{kind: kind, target: m.selectedID(), key: api.NewIdempotencyKey(), epoch: m.accessEpoch, user: -1}
 	switch kind {
 	case "user":
-		u := api.User{Policy: api.GrantPolicy{AllowUnrated: true}, Permissions: []string{api.PermCatalogRead, api.PermEventsRead, api.PermPlaybackRequest, api.PermViewingWrite}}
+		u := api.User{Policy: operations.DefaultGrantPolicy(), Permissions: operations.DefaultUserPermissions}
 		if d.target != "" {
 			values, _ := data[[]api.User](*m, keyUsers)
 			for _, v := range values {
@@ -362,7 +367,7 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 				m.access.revision = ""
 				m.access.title = "Create access user"
 				m.access.fields = nil
-				m.grantFields(m.access, api.User{Policy: api.GrantPolicy{AllowUnrated: true}, Permissions: []string{api.PermCatalogRead, api.PermPlaybackRequest, api.PermViewingWrite, api.PermEventsRead}})
+				m.grantFields(m.access, api.User{Policy: operations.DefaultGrantPolicy(), Permissions: operations.DefaultUserPermissions})
 				cmd = m.access.fields[0].focusInput()
 			}
 			return true, cmd
@@ -385,10 +390,16 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 	d := m.access
 	if msg.String() == "esc" {
 		if d.busy && d.kind == formPair && m.pairCancel != nil {
-			m.pairCancel() // stop waiting; the request expires on its own
-			m.access, m.pairCancel = nil, nil
+			// Stop waiting; an unclaimed request expires on its own. A
+			// credential installed just before is kept and shown.
+			installed := m.pairing != nil && m.pairing.Abandon()
+			m.pairCancel()
+			m.access, m.pairCancel, m.pairing = nil, nil, nil
 			m.accessEpoch++
-			return nil
+			if installed {
+				return tea.Batch(m.resync(), m.credentialChanged(true), m.say("The pairing completed before it was stopped; this device is signed in.", false))
+			}
+			return m.say("Stopped waiting for approval.", false)
 		}
 		if d.busy {
 			return nil
@@ -674,6 +685,10 @@ func (m Model) accessView() string {
 			}
 			if f.kind == "text" {
 				value = clean(f.input.Value())
+				if f.input.EchoMode != textinput.EchoNormal {
+					// A secret is never rendered, focused or not.
+					value = strings.Repeat("•", min(utf8.RuneCountInString(f.input.Value()), 12))
+				}
 				if i == d.focus {
 					value = f.input.View()
 				}

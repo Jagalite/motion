@@ -199,7 +199,7 @@ func authCmd(env *Env) *cobra.Command {
 	pair.Flags().StringVar(&credentialStore, "credential-store", "", "where to keep the credential; only \"file\" (0600) is supported")
 	pair.Flags().DurationVar(&wait, "wait", 10*time.Minute, "how long to wait for approval")
 
-	var code, approveKey, approveUser string
+	var code, approveKey, approveUser, approveRevision string
 	var profiles, permissions []string
 	var policy api.GrantPolicy
 	approve := &cobra.Command{
@@ -218,6 +218,9 @@ func authCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if approveKey != "" && approveUser != "" && approveRevision == "" {
+				return usage("--idempotency-key with --user needs the original request's --user-revision")
+			}
 			return run(env, func(ctx context.Context, c *Conn) error {
 				in := operations.Approval{PairingID: args[0], UserCode: code, ProfileIDs: profiles, Permissions: permissions}
 				if approveUser != "" {
@@ -228,6 +231,10 @@ func authCmd(env *Env) *cobra.Command {
 						return err
 					}
 					in.UserID, in.UserRevision, in.Policy = user.Value.ID, user.Value.Revision, &policy
+					if approveRevision != "" {
+						in.UserRevision = approveRevision
+					}
+					inheritGrant(cmd, user.Value, &in.ProfileIDs, &in.Permissions, &policy)
 				}
 				d, err := operations.ApprovePairing(ctx, c, in, intent)
 				if err != nil {
@@ -242,6 +249,7 @@ func authCmd(env *Env) *cobra.Command {
 	approve.Flags().StringVar(&code, "code", "", "user code displayed by the pairing device")
 	grantFlags(approve, &profiles, &permissions, &policy)
 	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to; the library and rating flags then set its grant")
+	approve.Flags().StringVar(&approveRevision, "user-revision", "", "user revision the approval is decided on (default: read it now)")
 	keyFlag(approve, &approveKey)
 
 	status := &cobra.Command{

@@ -1,11 +1,13 @@
 package terminal_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/cli"
@@ -45,6 +47,14 @@ func TestE2ECLIReachesTheSharedRealServerState(t *testing.T) {
 	sam := op("access", "users", "create", opstest.RealUser, "--permission", opstest.RealUserPermission)
 	invitation := op("access", "invitations", "create", sam["id"].(string), "--permission", opstest.RealUserPermission, "--ttl", fmt.Sprint(opstest.RealInvitationTTL))
 	op("access", "invitations", "revoke", invitation["id"].(string))
+	second := op("access", "invitations", "create", sam["id"].(string), "--permission", opstest.RealUserPermission, "--ttl", fmt.Sprint(opstest.RealInvitationTTL))
+	var out bytes.Buffer
+	redeemer := cli.NewRoot(&cli.Env{Out: &out, Err: &out})
+	redeemer.SetIn(strings.NewReader(second["code"].(string) + "\n"))
+	redeemer.SetArgs([]string{"--server", srv.url, "--config-dir", t.TempDir(), "auth", "redeem", "--name", opstest.RealDevice, "--credential-store", "file"})
+	if err := redeemer.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("redeem: %v %s", err, out.String())
+	}
 
 	session, err := operations.Connect(context.Background(), operations.Settings{Server: srv.url, OperatorTokenFile: srv.operator, ConfigDir: admin})
 	if err != nil {

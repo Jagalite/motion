@@ -46,6 +46,7 @@ type pairWait struct {
 // policyLoaded answers the read that opens the device policy form.
 type policyLoaded struct {
 	epoch  int
+	req    int
 	device string
 	policy api.Tagged[api.AccessPolicy]
 	err    error
@@ -109,6 +110,8 @@ func (m *Model) formAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			d.fields = append(d.fields, toggle("Source: "+clean(s.Name), "source", s.ID, false))
 		}
 		return true, d.focusFirst()
+	case m.route.page == pageScans && msg.String() == "n" && m.allows(api.PermSourcesManage) && !m.ready(keySources, keyLibraries):
+		return true, tea.Batch(m.ensure(keySources, keyLibraries), m.say("Loading libraries and sources; press n again in a moment.", false))
 	case m.route.page == pageScans && msg.String() == "n" && m.allows(api.PermSourcesManage):
 		d := m.openForm(formScan, "", "", "Request a scan")
 		d.message = "Choose one library. With no source chosen, every source of the library is observed."
@@ -125,17 +128,29 @@ func (m *Model) formAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			m.access = nil
 			return true, m.say("Create a library first.", true)
 		}
-		return true, tea.Batch(d.focusFirst(), m.ensure(keySources))
+		return true, d.focusFirst()
 	case m.route.page == pageDevices && msg.String() == "p" && id != "" && m.admin():
-		backend, ctx, epoch := m.backend, m.ctx, m.accessEpoch
+		// Each read supersedes the previous one.
+		m.policyReq++
+		backend, ctx, epoch, req := m.backend, m.ctx, m.accessEpoch, m.policyReq
 		return true, func() tea.Msg {
 			ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 			defer cancel()
 			p, err := operations.InspectDevicePolicy(ctx, backend, id)
-			return policyLoaded{epoch: epoch, device: id, policy: p, err: err}
+			return policyLoaded{epoch: epoch, req: req, device: id, policy: p, err: err}
 		}
 	}
 	return false, nil
+}
+
+// ready reports that every key has data from a completed load.
+func (m Model) ready(keys ...string) bool {
+	for _, key := range keys {
+		if s := m.cache.slots[key]; s == nil || s.loading || s.data == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (m Model) profileRow(id string) (api.Profile, bool) {
@@ -150,7 +165,9 @@ func (m Model) profileRow(id string) (api.Profile, bool) {
 
 // policyForm opens the device policy editor on the policy just read.
 func (m *Model) policyForm(msg policyLoaded) tea.Cmd {
-	if msg.epoch != m.accessEpoch || m.access != nil {
+	// Only the newest read opens the editor, and only on the Devices page
+	// with nothing else open.
+	if msg.epoch != m.accessEpoch || msg.req != m.policyReq || m.route.page != pageDevices || m.access != nil {
 		return nil
 	}
 	if unauthenticated(msg.err) {
@@ -372,7 +389,7 @@ func (m *Model) formFinished(result accessDone) tea.Cmd {
 		d.message = "In an administrator’s Motion TUI or `motion access pairings list`, compare code " + clean(result.pairing.UserCode) +
 			". Expires " + clean(result.pairing.ExpiresAt) + ". Esc stops waiting."
 		ctx, cancel := context.WithTimeout(m.ctx, 30*time.Minute)
-		m.pairCancel = cancel
+		m.pairCancel, m.pairing = cancel, result.pairing
 		pending, epoch := result.pairing, d.epoch
 		return func() tea.Msg {
 			defer cancel()
@@ -380,12 +397,12 @@ func (m *Model) formFinished(result accessDone) tea.Cmd {
 			return accessDone{epoch: epoch, err: err, signedIn: err == nil, note: "Paired; this device is signed in."}
 		}
 	case result.signedIn:
-		m.access, m.pairCancel = nil, nil
-		return tea.Batch(m.resync(), m.say(result.note, false))
+		m.access, m.pairCancel, m.pairing = nil, nil, nil
+		return tea.Batch(m.resync(), m.credentialChanged(true), m.say(result.note, false))
 	case result.signedOut:
 		m.access = nil
 		m.signedOut(&api.Problem{Status: 401, Code: "not_signed_in", Title: "Unauthorized", Detail: "signed out of this server"})
-		return m.say(result.note, false)
+		return tea.Batch(m.credentialChanged(false), m.say(result.note, false))
 	}
 	m.access = nil
 	return tea.Batch(m.reloadAll(), m.reload(func(key string) bool {

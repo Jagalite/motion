@@ -151,6 +151,30 @@ func TestE2ETUIReachesTheSharedRealServerState(t *testing.T) {
 	m = selectRow(t, m, invitations[0].ID)
 	m = press(t, m, "d")
 	m = apply(t, m)
+	// Issue a second invitation and redeem it from a signed-out session.
+	m = press(t, m, "n")
+	m = chooseUser(t, m, opstest.RealUser)
+	setText(t, m, "ttl", fmt.Sprint(opstest.RealInvitationTTL))
+	m = apply(t, m)
+	code := m.access.secret
+	m = press(t, m, "esc")
+	guest, err := operations.Connect(ctx, operations.Settings{Server: url, ConfigDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(ctx, guest, guest.URL, nil)
+	r.session = guest
+	r, _ = update(t, r, tea.WindowSizeMsg{Width: 140, Height: 45})
+	r = drain(t, r, r.reloadAll())
+	r.focus = focusContent
+	r = press(t, r, "I")
+	setText(t, r, "code", code)
+	setText(t, r, "name", opstest.RealDevice)
+	setToggle(t, r, "consent", "", true)
+	r = apply(t, r)
+	if !guest.SignedIn() || r.me() == nil {
+		t.Fatal("redemption did not sign the guest session in")
+	}
 
 	got, err := opstest.Observe(ctx, s)
 	if err != nil {

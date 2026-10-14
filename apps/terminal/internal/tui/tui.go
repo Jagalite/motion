@@ -128,9 +128,15 @@ type Model struct {
 	reviewCancel context.CancelFunc
 	launchCancel context.CancelFunc
 	pairCancel   context.CancelFunc
+	pairing      *operations.PendingPairing
+	policyReq    int
 	// session is the verified session, for credential actions; nil when
 	// the interface runs over a test backend.
 	session *operations.Session
+	// events restarts the change-hint stream for the current credential
+	// (or only stops it), returning its channel; streamGen fences replies.
+	events    func(on bool) <-chan tea.Msg
+	streamGen int
 	// health is the server identity verified when the session opened.
 	health api.Health
 
@@ -190,18 +196,41 @@ func (m Model) wait() tea.Cmd {
 	if m.incoming == nil {
 		return nil
 	}
-	ch, ctx := m.incoming, m.ctx
+	ch, ctx, gen := m.incoming, m.ctx, m.streamGen
 	return func() tea.Msg {
 		select {
 		case msg, ok := <-ch:
 			if !ok {
-				return streamMsg{state: "closed"}
+				return fromStream{gen: gen, msg: streamMsg{state: "closed"}}
 			}
-			return msg
+			return fromStream{gen: gen, msg: msg}
 		case <-ctx.Done():
 			return nil
 		}
 	}
+}
+
+// fromStream is a message from the event stream opened for credential
+// generation gen; one from an earlier credential is dropped unanswered.
+type fromStream struct {
+	gen int
+	msg tea.Msg
+}
+
+// credentialChanged discards the previous principal's activity and stream,
+// and follows events again when a credential is in use.
+func (m *Model) credentialChanged(signedIn bool) tea.Cmd {
+	m.streamGen++
+	m.log, m.streamErr = nil, nil
+	m.stream, m.incoming = "stopped", nil
+	if m.events != nil {
+		m.incoming = m.events(signedIn)
+	}
+	if m.incoming == nil {
+		return nil
+	}
+	m.stream = "connecting"
+	return m.wait()
 }
 
 // reloadAll re-queries the shell and the current page.
@@ -328,6 +357,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
+	case fromStream:
+		if msg.gen != m.streamGen {
+			return nil // a stream opened for a previous credential
+		}
+		return m.update(msg.msg)
 	case accessDone:
 		return m.accessFinished(msg)
 	case policyLoaded:
@@ -816,6 +850,7 @@ func unauthenticated(err error) bool {
 // sidebar's libraries, until the user refreshes after pairing again.
 func (m *Model) signedOut(err error) {
 	m.forgetAccess()
+	m.log = nil // activity seen with the rejected credential
 	for key := range m.cache.slots {
 		m.drop(key)
 	}
@@ -830,6 +865,10 @@ func (m *Model) signedOut(err error) {
 	m.jobs.Forget()
 	m.acting = map[string]operations.JobActionKind{}
 	m.epoch++
+	if m.pairing != nil {
+		m.pairing.Abandon()
+		m.pairing = nil
+	}
 	for _, cancel := range []context.CancelFunc{m.reviewCancel, m.launchCancel, m.pairCancel} {
 		if cancel != nil {
 			cancel()
@@ -938,12 +977,25 @@ func Pump(ctx context.Context, follow func(context.Context, func(api.Event) erro
 func Run(ctx context.Context, conn *operations.Session, browser operations.Browser) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ch := make(chan tea.Msg, eventBuffer)
-	go Pump(ctx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
-		return operations.FollowEvents(ctx, conn, "", h, d)
-	}, ch)
-	model := New(ctx, conn, conn.URL, ch)
-	model.profile, model.openBrowser, model.session, model.health = conn.Profile, browser, conn, conn.Health
+	var stop context.CancelFunc
+	events := func(on bool) <-chan tea.Msg {
+		if stop != nil {
+			stop()
+			stop = nil
+		}
+		if !on {
+			return nil
+		}
+		var streamCtx context.Context
+		streamCtx, stop = context.WithCancel(ctx)
+		ch := make(chan tea.Msg, eventBuffer)
+		go Pump(streamCtx, func(ctx context.Context, h func(api.Event) error, d func(error, time.Duration)) error {
+			return operations.FollowEvents(ctx, conn, "", h, d)
+		}, ch)
+		return ch
+	}
+	model := New(ctx, conn, conn.URL, events(true))
+	model.profile, model.openBrowser, model.session, model.health, model.events = conn.Profile, browser, conn, conn.Health, events
 	program := tea.NewProgram(model, tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
