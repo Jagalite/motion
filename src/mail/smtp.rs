@@ -230,7 +230,10 @@ fn policy_failure(error: &std::io::Error) -> bool {
                 rustls::Error::InvalidCertificate(_)
                     | rustls::Error::NoCertificatesPresented
                     | rustls::Error::PeerIncompatible(_)
-                    | rustls::Error::AlertReceived(_)
+                    | rustls::Error::AlertReceived(
+                        rustls::AlertDescription::ProtocolVersion
+                            | rustls::AlertDescription::InsufficientSecurity
+                    )
             )
         })
 }
@@ -543,6 +546,27 @@ mod tests {
         assert_eq!(parse(long.as_bytes()).await, Err(ReadError::TooLarge));
         let many = "250-a\r\n".repeat(MAX_REPLY_LINES) + "250 a\r\n";
         assert_eq!(parse(many.as_bytes()).await, Err(ReadError::TooLarge));
+    }
+
+    #[test]
+    fn only_certificate_and_protocol_incompatibility_is_policy() {
+        let wrap =
+            |error: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+        assert!(policy_failure(&wrap(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidForName
+        ))));
+        assert!(policy_failure(&wrap(rustls::Error::AlertReceived(
+            rustls::AlertDescription::ProtocolVersion
+        ))));
+        for transient in [
+            rustls::Error::AlertReceived(rustls::AlertDescription::InternalError),
+            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
+        ] {
+            assert!(!policy_failure(&wrap(transient)));
+        }
+        assert!(!policy_failure(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
     }
 
     #[test]

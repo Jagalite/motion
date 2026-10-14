@@ -1625,10 +1625,32 @@ async fn approval_registration_waits_for_an_explicit_grant() {
             .await,
         0
     );
+    // A lapsed pending request is replaced inside the completion transaction.
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "Requester").await;
+    sqlx::query("UPDATE signin_requests SET expires_at=0 WHERE kind='email'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let renewed = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(
+        renewed.body["status"], "pending_approval",
+        "{}",
+        renewed.body
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM signin_requests WHERE status='expired'")
+            .await,
+        1
+    );
     let requests = f
         .operator("GET", "/api/v2/admin/auth/requests", None, None)
         .await;
-    let items = requests.body["items"].as_array().unwrap();
+    let items: Vec<&Value> = requests.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["status"] == "pending")
+        .collect();
     assert_eq!(items.len(), 1, "one pending request per address");
     assert_eq!(items[0]["kind"], "email");
     assert_eq!(items[0]["address"], NEWCOMER);
@@ -2065,7 +2087,7 @@ async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
         .operator(
             "PUT",
             "/api/v2/admin/auth/email",
-            Some(enable),
+            Some(enable.clone()),
             Some(&enabled.body["revision"]),
         )
         .await;
@@ -2073,5 +2095,22 @@ async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
         rotated.body["code"], "email_test_required",
         "{}",
         rotated.body
+    );
+    // An explicitly confirmed change applies while email stays enabled.
+    enable["apply_untested"] = json!(true);
+    let applied = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(enable),
+            Some(&enabled.body["revision"]),
+        )
+        .await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.body);
+    assert_eq!(applied.body["enabled"], true);
+    assert_eq!(applied.body["last_test_ok"], Value::Null);
+    assert_ne!(
+        applied.body["dkim"]["key_id"],
+        enabled.body["dkim"]["key_id"]
     );
 }

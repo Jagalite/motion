@@ -160,7 +160,7 @@ pub fn compose(input: Compose<'_>) -> Result<Message> {
     ensure!(
         input.message_id.starts_with('<')
             && input.message_id.ends_with('>')
-            && input.message_id.len() <= 250
+            && input.message_id.len() <= 300
             && input.message_id[1..input.message_id.len() - 1]
                 .split_once('@')
                 .is_some_and(|(left, right)| {

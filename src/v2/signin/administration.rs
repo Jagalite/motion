@@ -722,6 +722,12 @@ pub struct EmailInput {
     direct: DirectInput,
     #[serde(default)]
     dkim_key: KeyUpdate,
+    /// Explicitly apply changed delivery settings while email sign-in stays
+    /// enabled. Disabling first may be impossible: removing the method is
+    /// refused while it is someone's last one. The change still resets the
+    /// test, cancels queued mail and ends email-authenticated sessions.
+    #[serde(default)]
+    apply_untested: bool,
 }
 
 fn invalid_email(detail: &'static str) -> Problem {
@@ -859,10 +865,11 @@ pub async fn replace_email(
             "Generate or import a DKIM key before enabling direct delivery",
         ));
     }
+    let held = hold(&mut tx).await?;
+    let confirmed_change = old.enabled && changed && input.apply_untested && !held;
     if config.enabled
-        && (changed
-            || row.get::<Option<bool>, _>("email_test_ok") != Some(true)
-            || hold(&mut tx).await?)
+        && !confirmed_change
+        && (changed || row.get::<Option<bool>, _>("email_test_ok") != Some(true) || held)
     {
         return Err(Problem::invalid(
             "email_test_required",
@@ -1235,7 +1242,7 @@ pub async fn overview(State(app): State<App>, caller: Caller) -> Result<Json<Val
         errors.push("Public sign-in origin must match the configured server origin");
     }
     let mail = mail(&mut tx, &app).await?;
-    if mail.cfg.enabled && !mail.deliverable() {
+    if mail.cfg.enabled && !super::outbox::rehearse(&mail) {
         errors.push("Email delivery cannot compose messages: use an ASCII sender address and display name, and for direct delivery a hostname, envelope sender and DKIM key. Re-save Email delivery settings");
     }
     Ok(Json(

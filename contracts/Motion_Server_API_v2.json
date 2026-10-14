@@ -26877,6 +26877,10 @@
           },
           "dkim_key": {
             "$ref": "#/components/schemas/DkimKeyUpdate"
+          },
+          "apply_untested": {
+            "type": "boolean",
+            "description": "Apply changed settings while email sign-in stays enabled; resets the test and ends email-authenticated sessions."
           }
         },
         "required": [

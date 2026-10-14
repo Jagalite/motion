@@ -1,0 +1,150 @@
+{
+  "started": "2026-10-14T18:19:28.950Z",
+  "steps": [
+    {
+      "name": "bootstrap",
+      "at": "2026-10-14T18:19:28.993Z",
+      "admin": "3d534274-e3e5-49ae-ae5a-0af0335771fd",
+      "member": "8f9be44e-f418-46fb-a82f-a940330a802f",
+      "invitee": "f741ef5a-4eea-4ad0-bc0a-f5796898a667"
+    },
+    {
+      "name": "admin browser session from paired credential",
+      "at": "2026-10-14T18:19:29.360Z"
+    },
+    {
+      "name": "closed policy offers no registration",
+      "at": "2026-10-14T18:19:29.486Z"
+    },
+    {
+      "name": "open registration via relay activates usable access",
+      "at": "2026-10-14T18:19:30.247Z"
+    },
+    {
+      "name": "direct delivery configured with generated DKIM key",
+      "at": "2026-10-14T18:19:37.888Z",
+      "record_name": "motion1._domainkey.example.test",
+      "key_id": "1e10da9142046bba"
+    },
+    {
+      "name": "direct test accepted, DKIM independently verified, receipt confirmed in UI",
+      "at": "2026-10-14T18:19:38.343Z",
+      "dkim": {
+        "ok": true,
+        "reason": "verified",
+        "d": "example.test",
+        "s": "motion1"
+      }
+    },
+    {
+      "name": "approval-required registration pending until UI approval, then email login works",
+      "at": "2026-10-14T18:19:40.042Z"
+    },
+    {
+      "name": "invite-only registration completes the emailed invitation",
+      "at": "2026-10-14T18:19:43.343Z",
+      "invitation": "659624e8-9f1a-4b94-b434-676bc1f11b07"
+    },
+    {
+      "name": "delivery activity and admin sections audited",
+      "at": "2026-10-14T18:19:46.834Z",
+      "activity": 7
+    },
+    {
+      "name": "relay restored from the UI while enabled; open registration over relay again",
+      "at": "2026-10-14T18:19:48.325Z"
+    }
+  ],
+  "audits": [
+    {
+      "name": "signin-registration-open",
+      "width": 1440,
+      "axe": [],
+      "geometry": {
+        "viewport": 1440,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "signin-registration-open",
+      "width": 390,
+      "axe": [],
+      "geometry": {
+        "viewport": 390,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "signin-registration-open",
+      "width": 320,
+      "axe": [],
+      "geometry": {
+        "viewport": 320,
+        "scroll": 320
+      }
+    },
+    {
+      "name": "admin-email",
+      "width": 1440,
+      "axe": [],
+      "geometry": {
+        "viewport": 1440,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "admin-email",
+      "width": 390,
+      "axe": [],
+      "geometry": {
+        "viewport": 390,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "admin-email",
+      "width": 320,
+      "axe": [],
+      "geometry": {
+        "viewport": 320,
+        "scroll": 320
+      }
+    },
+    {
+      "name": "admin-registration",
+      "width": 1440,
+      "axe": [],
+      "geometry": {
+        "viewport": 1440,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "admin-registration",
+      "width": 390,
+      "axe": [],
+      "geometry": {
+        "viewport": 390,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "admin-registration",
+      "width": 320,
+      "axe": [],
+      "geometry": {
+        "viewport": 320,
+        "scroll": 320
+      }
+    }
+  ],
+  "consoleErrors": [],
+  "limits": [
+    "Loopback mail sink only; no real mailbox, provider, DNS or port-25 delivery.",
+    "Chromium only; fixed CSS viewports do not emulate touch hardware or screen readers."
+  ],
+  "browser": "149.0.7827.55",
+  "playwright": "1.61.1",
+  "status": "passed",
+  "finished": "2026-10-14T18:19:48.325Z"
+}

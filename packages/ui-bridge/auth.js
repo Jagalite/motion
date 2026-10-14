@@ -502,7 +502,7 @@ async function emailSection(parent) {
     const input = form(edit, 'Save email settings', async () => {
       if (email.enabled && !enabled.checked && !disableConfirmed.checked) throw Object.assign(new Error('Confirm disabling email sign-in and its sessions.'), {status: 400});
       const direct = mode.value === 'direct';
-      const payload = {enabled: enabled.checked, mode: mode.value, from: from.value.trim()};
+      const payload = {enabled: enabled.checked, mode: mode.value, from: from.value.trim(), apply_untested: applyUntested.checked};
       if (direct) {
         payload.direct = {hostname: hostname.value.trim(), envelope_from: envelope.value.trim(), selector: selector.value.trim(), loopback_port: loopbackPort.value ? Number(loopbackPort.value) : null};
         payload.dkim_key = key.read();
@@ -533,6 +533,8 @@ async function emailSection(parent) {
     mode.addEventListener('change', showMode); showMode();
     const enabled = checkbox(input.fields, 'Enable email sign-in', email.enabled);
     const disableConfirmed = checkbox(input.fields, 'If disabling email, I confirm cancellation of pending email sign-ins and revocation of email-authenticated sessions.');
+    const applyUntested = checkbox(input.fields, 'Apply changed delivery settings while email sign-in stays enabled. I will send a test immediately afterwards.');
+    applyUntested.disabled = !email.enabled;
     input.fields.append(node('p', 'Saving changed delivery settings invalidates previous tests, cancels queued mail and signs out email-authenticated browser sessions.', {class: 'muted small'}));
 
     const testArea = panel(area, 'Send a test message', 'Choose a mailbox you control. The message carries a test code that cannot sign anyone in.');

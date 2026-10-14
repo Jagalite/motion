@@ -149,7 +149,7 @@ pub async fn register_start(
     let mut tx = begin_write(&app.db).await?;
     trim(&mut tx).await?;
     let mail = mail(&mut tx, &app).await?;
-    if !mail.cfg.enabled || !mail.deliverable() || hold(&mut tx).await? {
+    if !mail.cfg.enabled || !outbox::rehearse(&mail) || hold(&mut tx).await? {
         return Err(unavailable());
     }
     let (registration, revision) = settings(&mut tx).await?;
@@ -261,7 +261,9 @@ pub async fn register_start(
             )
             .await?;
         }
-        Admission::Silent => {}
+        Admission::Silent => {
+            outbox::rehearse(&mail);
+        }
     }
     audit(
         &mut tx,
@@ -319,6 +321,11 @@ pub(super) async fn complete(
         Some(row) => row.email.as_deref() == Some(address) && registrable(tx, app, row).await?,
         None => false,
     };
+    // Expire lapsed requests in this writer so a new one can replace them.
+    sqlx::query("UPDATE signin_requests SET status='expired',revision=revision+1 WHERE status='pending' AND expires_at<=?")
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
     let pending = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM signin_requests WHERE kind='email' AND status='pending' AND address=? AND expires_at>?",
     )

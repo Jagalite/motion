@@ -729,7 +729,7 @@ pub async fn email_start(
     trim(&mut tx).await?;
     let mail = mail(&mut tx, &app).await?;
     let revision = mail.revision;
-    if !mail.cfg.enabled || !mail.deliverable() || hold(&mut tx).await? {
+    if !mail.cfg.enabled || !super::outbox::rehearse(&mail) || hold(&mut tx).await? {
         return Err(unavailable());
     }
     let mut evidence_until = now() + core::TRANSACTION_TTL;
@@ -835,7 +835,9 @@ pub async fn email_start(
         if eligible { &code } else { "ineligible" },
     );
     sqlx::query("INSERT INTO signin_transactions(id,state_json,address,code_hash,return_to,actor_id,actor_credential_hash,identity_id,created_at,expires_at,ceiling_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(jsonstr(&state)).bind(&address).bind(hash).bind("/").bind(actor.map(|c|c.principal.id.as_str())).bind(actor.and_then(|c|c.credential().map(|x|x.0))).bind(identity.as_ref().filter(|_|eligible).map(|v|v.0.as_str())).bind(now()).bind(state.expires_at).bind(ceiling.as_ref().map(jsonstr)).execute(&mut *tx).await?;
-    if eligible {
+    if !eligible {
+        super::outbox::rehearse(&mail);
+    } else {
         super::outbox::enqueue(
             &mut tx,
             &app,

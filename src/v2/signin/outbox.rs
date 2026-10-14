@@ -19,6 +19,53 @@ struct Payload {
     bytes: String,
 }
 
+fn outgoing(
+    mail: &Mail,
+    id: &str,
+    recipient: &str,
+    content: &Content<'_>,
+) -> Option<(adapter::Outgoing, String)> {
+    let from = adapter::message::parse_mailbox(&mail.cfg.from)?;
+    let direct = mail.cfg.mode == Mode::Direct;
+    let (id_domain, envelope_from) = if direct {
+        (
+            mail.cfg.direct.hostname.clone(),
+            mail.cfg.direct.envelope_from.clone(),
+        )
+    } else {
+        (from.domain().to_owned(), from.address.clone())
+    };
+    let signing = if direct {
+        let (pkcs8, _) = mail.dkim.as_ref()?;
+        Some(adapter::Signing {
+            selector: &mail.cfg.direct.selector,
+            pkcs8,
+        })
+    } else {
+        None
+    };
+    let rendered =
+        adapter::render(content, &from, recipient, id, &id_domain, now(), signing).ok()?;
+    Some((rendered, envelope_from))
+}
+
+/// Compose (and sign) a throwaway message exactly as a real one would be.
+/// Callers run it before evaluating recipient eligibility, and once more for
+/// recipients that receive nothing, so an unusable configuration is uniformly
+/// unavailable and the response path does equal work for every address.
+pub(super) fn rehearse(mail: &Mail) -> bool {
+    outgoing(
+        mail,
+        &new_id(),
+        "rehearsal@motion.invalid",
+        &Content::RegistrationCode {
+            code: "00000000",
+            origin: "https://motion.invalid",
+        },
+    )
+    .is_some()
+}
+
 /// Compose, sign, seal and insert one message. Runs inside the caller's
 /// reserved writer so the message commits with the state that requires it.
 #[allow(clippy::too_many_arguments)]
@@ -33,28 +80,9 @@ pub(super) async fn enqueue(
     content: Content<'_>,
     expires_at: i64,
 ) -> Result<String, Problem> {
-    let from = adapter::message::parse_mailbox(&mail.cfg.from).ok_or_else(unavailable)?;
     let id = new_id();
-    let direct = mail.cfg.mode == Mode::Direct;
-    let (id_domain, envelope_from) = if direct {
-        (
-            mail.cfg.direct.hostname.clone(),
-            mail.cfg.direct.envelope_from.clone(),
-        )
-    } else {
-        (from.domain().to_owned(), from.address.clone())
-    };
-    let signing = if direct {
-        let (pkcs8, _) = mail.dkim.as_ref().ok_or_else(unavailable)?;
-        Some(adapter::Signing {
-            selector: &mail.cfg.direct.selector,
-            pkcs8,
-        })
-    } else {
-        None
-    };
-    let outgoing = adapter::render(&content, &from, recipient, &id, &id_domain, now(), signing)
-        .map_err(|_| unavailable())?;
+    let (outgoing, envelope_from) =
+        outgoing(mail, &id, recipient, &content).ok_or_else(unavailable)?;
     let payload = seal(
         app,
         &format!("mail:{id}"),

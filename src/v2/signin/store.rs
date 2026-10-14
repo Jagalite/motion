@@ -290,15 +290,6 @@ pub(super) struct Mail {
     pub dkim: Option<(Vec<u8>, String)>,
 }
 impl Mail {
-    /// Whether messages can be composed at all. Checked before any recipient
-    /// eligibility so an unusable configuration is uniformly unavailable.
-    pub fn deliverable(&self) -> bool {
-        crate::mail::message::parse_mailbox(&self.cfg.from).is_some()
-            && (self.cfg.mode == playscale_core::mail::Mode::Relay
-                || (self.dkim.is_some()
-                    && !self.cfg.direct.hostname.is_empty()
-                    && !self.cfg.direct.envelope_from.is_empty()))
-    }
     /// The signing-key identity fenced into each direct-mode message.
     pub fn key_id(&self) -> Option<String> {
         (self.cfg.mode == playscale_core::mail::Mode::Direct)
