@@ -115,6 +115,23 @@ func (m *Model) replaceJob(job api.Job) {
 	s.data = next
 }
 
+// keepNewer returns the listed jobs, except that a job shown at a newer
+// revision than listed keeps the shown version.
+func keepNewer(shown, listed []api.Job) []api.Job {
+	newer := map[string]api.Job{}
+	for _, j := range shown {
+		newer[j.ID] = j
+	}
+	out := make([]api.Job, len(listed))
+	for i, j := range listed {
+		if had, ok := newer[j.ID]; ok && newerRevision(had.Revision, j.Revision) {
+			j = had
+		}
+		out[i] = j
+	}
+	return out
+}
+
 // newerRevision reports whether revision a is later than b; revisions are
 // decimal strings, and an unreadable one is not treated as newer.
 func newerRevision(a, b string) bool {

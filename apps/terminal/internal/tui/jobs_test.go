@@ -237,3 +237,18 @@ func TestLaunchConsultsCurrentCapabilitiesNotTheCache(t *testing.T) {
 		t.Fatalf("opened=%d notice=%+v canPlay=%v", opened, m.notice, m.canPlay())
 	}
 }
+
+func TestDelayedListKeepsANewerInspection(t *testing.T) {
+	m, f := processing(t, api.Job{ID: "j1", Kind: "scan", Phase: "running"})
+	m = selectJob(t, m, "j1")
+	listing := messages(t, m.load(keyJobs)) // reads revision 1
+	f.SetPhase("j1", "failed")
+	m = press(t, m, "enter") // inspects revision 2
+	for _, msg := range listing {
+		m, _ = update(t, m, msg)
+	}
+	jobs, _ := data[[]api.Job](m, keyJobs)
+	if len(jobs) != 1 || jobs[0].Revision != "2" || jobs[0].Phase != "failed" {
+		t.Fatalf("delayed list replaced a newer row: %+v", jobs)
+	}
+}

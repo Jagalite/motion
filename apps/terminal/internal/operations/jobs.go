@@ -65,6 +65,9 @@ type JobAction struct {
 	// IfMatch is the ETag of the job revision the user reviewed. Retry
 	// carries it; cancellation has no conditional form.
 	IfMatch string
+	// Resubmission marks an action an earlier submission of which may have
+	// been applied.
+	Resubmission bool
 }
 
 // Describe names the action for messages.
@@ -79,11 +82,14 @@ func (a JobAction) Describe() string {
 // requires the ETag the user reviewed: the client never substitutes a newer
 // revision on its own.
 func NewJobAction(kind JobActionKind, jobID, ifMatch string) (JobAction, error) {
-	return ResumeJobAction(kind, jobID, api.NewIdempotencyKey(), ifMatch)
+	a, err := ResumeJobAction(kind, jobID, api.NewIdempotencyKey(), ifMatch)
+	a.Resubmission = false
+	return a, err
 }
 
 // ResumeJobAction rebuilds an action whose outcome was uncertain from its
-// recorded key, so it can be resubmitted without risking a second effect.
+// recorded key and request, so it can be resubmitted without risking a
+// second effect.
 func ResumeJobAction(kind JobActionKind, jobID, key, ifMatch string) (JobAction, error) {
 	if kind != CancelJob && kind != RetryJob {
 		return JobAction{}, Invalid("unknown job action %q", kind)
@@ -100,7 +106,7 @@ func ResumeJobAction(kind JobActionKind, jobID, key, ifMatch string) (JobAction,
 	if kind == CancelJob {
 		ifMatch = ""
 	}
-	return JobAction{Kind: kind, JobID: jobID, Key: key, IfMatch: ifMatch}, nil
+	return JobAction{Kind: kind, JobID: jobID, Key: key, IfMatch: ifMatch, Resubmission: true}, nil
 }
 
 // CheckIdempotencyKey applies the contract's Idempotency-Key bounds and
@@ -153,6 +159,7 @@ type pendingKey struct {
 // a new action is created.
 func (p *PendingJobActions) Begin(kind JobActionKind, jobID, ifMatch string) (a JobAction, resumed bool, err error) {
 	if a, ok := p.actions[pendingKey{kind, jobID}]; ok {
+		a.Resubmission = true
 		return a, true, nil
 	}
 	a, err = NewJobAction(kind, jobID, ifMatch)

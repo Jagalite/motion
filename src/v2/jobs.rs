@@ -108,12 +108,6 @@ async fn control(
 ) -> Result<Response, Problem> {
     // Permission is selected after loading the durable job kind.
     let key = idempotency_key(&headers)?;
-    // A retry is conditional on the revision the caller reviewed.
-    let reviewed = if retry {
-        Some(if_match(&headers)?)
-    } else {
-        None
-    };
     let _guard = app.jobs.lock().await;
     let mut tx = begin_write(&app.db).await?;
     let principal = caller.reauthorize(&mut tx, None).await?;
@@ -128,6 +122,14 @@ async fn control(
     if !principal.allows(permission) {
         return Err(access::AccessError::Forbidden(permission).into());
     }
+    // A retry is conditional on the revision the caller reviewed. The
+    // precondition is read after authorization and visibility, and compared
+    // only after an exact replay has had its chance to answer.
+    let reviewed = if retry {
+        Some(if_match(&headers)?)
+    } else {
+        None
+    };
     let record = Scope {
         principal: &principal.id,
         operation: if retry { "retryJob" } else { "cancelJob" },

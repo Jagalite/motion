@@ -2,7 +2,7 @@
 
 Date: October 13, 2026
 
-Status: In progress. Steps 1–3 are implemented in `apps/terminal`: the operation inventory ([operations.json](apps/terminal/operations.json), [PARITY.md](apps/terminal/PARITY.md)), the shared session and platform extraction, and the jobs and playback-launch slices in `internal/operations`. Step 5's enforcement covers the migrated operations. Steps 4 and 6 remain: every other workflow is recorded as pending in the ledger.
+Status: In progress. Steps 1–3 are implemented in `apps/terminal`: the operation inventory ([operations.json](apps/terminal/operations.json), [PARITY.md](apps/terminal/PARITY.md)), the shared session and platform extraction, and the jobs and playback-launch slices in `internal/operations`. Step 5's enforcement covers the migrated operations. The jobs slice exposed a missing server rule: retry now requires the reviewed revision, decided by `playscale_core::jobs::admit_retry` and explored by the Stateless model `playscale.jobs.reviewed_retry`. Steps 4 and 6 remain: every other workflow is recorded as pending in the ledger.
 
 ## Decision
 

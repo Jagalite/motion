@@ -238,6 +238,12 @@ func (m *Model) accept(msg loaded) bool {
 	s.loading, s.cancel, s.at = false, nil, time.Now()
 	s.err = msg.err
 	switch {
+	case msg.err == nil && msg.key == keyJobs:
+		// A list read before an inspection may arrive after it; keep the
+		// newer revision of each job.
+		old, _ := s.data.([]api.Job)
+		jobs, _ := msg.data.([]api.Job)
+		s.data, s.truncated, s.ok = keepNewer(old, jobs), msg.truncated, s.at
 	case msg.err == nil:
 		s.data, s.truncated, s.ok = msg.data, msg.truncated, s.at
 	case revoked(msg.err), msg.key == keySearch:

@@ -377,7 +377,8 @@ mod reviewed {
 
     impl Enumerate for ReviewedJobs {
         fn inputs(&self, s: &State) -> Result<Vec<Event>, ModelError> {
-            // Bounded: revisions up to MAX_REVISION, attempts up to 2,
+            // Bounded: job changes up to MAX_REVISION (an admitted retry can
+            // reach one more), attempts up to 2,
             // current and stale completion identities.
             let mut inputs = vec![Event::Review, Event::RetryReviewed];
             if s.revision < MAX_REVISION {
@@ -428,7 +429,7 @@ fn bounded_reviewed_retry_graph_admits_one_retry_per_review() {
     );
     assert!(report.transitions > 1000);
     println!(
-        "Stateless reviewed retry: {} states, {} edges; revisions <=9, attempts <=2, completion identities 0..2",
+        "Stateless reviewed retry: {} states, {} edges; revisions <=10 (job changes stop at 9), attempts <=2, completion identities 0..2",
         report.states, report.transitions
     );
 }

@@ -3295,10 +3295,10 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
             &[
                 ("authorization", &bearer(&other)),
                 ("idempotency-key", "other-retry-job-key"),
-                ("if-match", "\"r-3\""),
             ],
         )
         .await;
+    // Visibility is decided before the precondition: no 428 leaks the job.
     assert_eq!(hidden.status, StatusCode::NOT_FOUND);
     // Revocation defeats even an otherwise valid replay.
     sqlx::query("UPDATE devices SET revoked=1 WHERE id=?")

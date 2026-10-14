@@ -51,9 +51,26 @@ func Definitive(err error) bool {
 	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500 && !errors.As(err, &earlier)
 }
 
-// uncertain wraps err unless it is definitive.
+// uncertain wraps err unless it proves the action was not applied. Once a
+// submission of the action may have been applied, a later refusal settles it
+// only if the server answers it after looking up the key's receipt: an
+// exact resubmission of an applied request replays that receipt, so a
+// domain conflict (409) or failed precondition (412) shows nothing was
+// applied. Refusals answered before the lookup (rate limits,
+// authentication, visibility) prove nothing about the earlier attempt.
 func uncertain(a JobAction, err error) error {
-	if err == nil || Definitive(err) {
+	if err == nil {
+		return nil
+	}
+	var earlier *api.AfterUnknownAttemptError
+	if a.Resubmission || errors.As(err, &earlier) {
+		var p *api.Problem
+		if errors.As(err, &p) && (p.Status == 409 || p.Status == 412) {
+			return err
+		}
+		return &UncertainError{Action: a, Err: err}
+	}
+	if Definitive(err) {
 		return err
 	}
 	return &UncertainError{Action: a, Err: err}

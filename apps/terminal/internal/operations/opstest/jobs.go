@@ -55,7 +55,8 @@ func (f *Jobs) LoseAcks(n int) {
 	f.lost = n
 }
 
-// Refuse answers the next mutation with p, unapplied.
+// Refuse answers the next mutation with p, unapplied and before any receipt
+// replay, as a rate limit or authentication failure would.
 func (f *Jobs) Refuse(p *api.Problem) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -170,24 +171,28 @@ func (f *Jobs) mutate(c Call) (api.Tagged[api.Job], error) {
 	if c.Key == "" {
 		return api.Tagged[api.Job]{}, &api.Problem{Status: 400, Code: "idempotency_key_required"}
 	}
-	ackKey := c.Op + "\x00" + c.JobID + "\x00" + c.Key
-	if job, ok := f.acks[ackKey]; ok {
-		return f.ack(job)
-	}
+	// A scripted refusal stands for answers given before the receipt
+	// lookup, such as rate limiting.
 	if f.refuse != nil {
 		p := f.refuse
 		f.refuse = nil
 		return api.Tagged[api.Job]{}, p
 	}
+	// Visibility and the presence of a precondition are checked before
+	// the receipt; the revision comparison and domain rules after it.
 	i := f.index(c.JobID)
 	if i < 0 {
 		return api.Tagged[api.Job]{}, notFound()
 	}
+	if c.Op == "retry" && c.IfMatch == "" {
+		return api.Tagged[api.Job]{}, &api.Problem{Status: 428, Code: "precondition_required"}
+	}
+	ackKey := c.Op + "\x00" + c.JobID + "\x00" + c.Key
+	if job, ok := f.acks[ackKey]; ok {
+		return f.ack(job)
+	}
 	switch c.Op {
 	case "retry":
-		if c.IfMatch == "" {
-			return api.Tagged[api.Job]{}, &api.Problem{Status: 428, Code: "precondition_required"}
-		}
 		if c.IfMatch != etag(f.jobs[i]) {
 			return api.Tagged[api.Job]{}, &api.Problem{Status: 412, Code: "precondition_failed"}
 		}

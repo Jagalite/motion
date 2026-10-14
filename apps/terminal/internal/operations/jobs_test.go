@@ -78,7 +78,7 @@ func TestLostAcknowledgementIsUncertainAndResubmissionAppliesOnce(t *testing.T) 
 	}
 	pending.Settle(a, err)
 	again, resumed, err := pending.Begin(operations.CancelJob, "j1", "")
-	if err != nil || !resumed || again != a {
+	if err != nil || !resumed || again.Key != a.Key || !again.Resubmission {
 		t.Fatalf("resubmission is a new intent: %+v %v", again, err)
 	}
 	job, err := operations.SubmitJobAction(ctx, f, again)
@@ -118,7 +118,11 @@ func TestOutcomeClassification(t *testing.T) {
 		{context.DeadlineExceeded, true},
 		{errors.New("invalid response from server"), true},
 		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 429, Code: "rate_limited"}}, true},
-		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 409, Code: "not_retryable"}}, true},
+		// After an unanswered attempt, only answers given after the receipt
+		// lookup settle the action.
+		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 409, Code: "not_retryable"}}, false},
+		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 412, Code: "precondition_failed"}}, false},
+		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 403, Code: "forbidden"}}, true},
 	} {
 		_, err := operations.SubmitJobAction(context.Background(), failing{c.err}, a)
 		var unknown *operations.UncertainError
@@ -126,11 +130,30 @@ func TestOutcomeClassification(t *testing.T) {
 			t.Errorf("%v: got %v", c.err, err)
 		}
 	}
+	// A resubmission keeps the outcome open on any refusal the server gives
+	// before it looks up the key's receipt.
+	again, _ := operations.ResumeJobAction(operations.CancelJob, "j", a.Key, "")
+	for _, c := range []struct {
+		err       error
+		uncertain bool
+	}{
+		{&api.Problem{Status: 429, Code: "rate_limited"}, true},
+		{&api.Problem{Status: 401, Code: "authentication_required"}, true},
+		{&api.Problem{Status: 404, Code: "not_found"}, true},
+		{&api.Problem{Status: 409, Code: "not_cancellable"}, false},
+		{&api.Problem{Status: 412, Code: "precondition_failed"}, false},
+	} {
+		_, err := operations.SubmitJobAction(context.Background(), failing{c.err}, again)
+		var unknown *operations.UncertainError
+		if errors.As(err, &unknown) != c.uncertain {
+			t.Errorf("resubmission %v: got %v", c.err, err)
+		}
+	}
 	pending := &operations.PendingJobActions{}
 	pending.Settle(a, &operations.UncertainError{Action: a, Err: context.Canceled})
 	other, _ := operations.NewJobAction(operations.CancelJob, "j", "")
 	pending.Settle(other, nil) // an unrelated key does not resolve it
-	if held, ok := pending.Pending(operations.CancelJob, "j"); !ok || held != a {
+	if held, ok := pending.Pending(operations.CancelJob, "j"); !ok || held.Key != a.Key {
 		t.Fatal("pending action lost")
 	}
 	pending.Forget()
@@ -218,4 +241,36 @@ func TestCollectRejectsARepeatedCursor(t *testing.T) {
 func isInvalid(err error) bool {
 	var invalid *operations.InvalidInputError
 	return errors.As(err, &invalid)
+}
+
+func TestUncertaintySurvivesARefusedResubmission(t *testing.T) {
+	f := opstest.NewJobs(api.Job{ID: "j1", Phase: "failed"})
+	ctx := context.Background()
+	reviewed, _ := operations.InspectJob(ctx, f, "j1")
+	pending := &operations.PendingJobActions{}
+	a, _, _ := pending.Begin(operations.RetryJob, "j1", reviewed.ETag)
+	f.LoseAcks(1) // the retry is applied; its acknowledgement is lost
+	_, err := operations.SubmitJobAction(ctx, f, a)
+	pending.Settle(a, err)
+	again, resumed, _ := pending.Begin(operations.RetryJob, "j1", "")
+	f.Refuse(&api.Problem{Status: 429, Code: "rate_limited"})
+	_, err = operations.SubmitJobAction(ctx, f, again)
+	pending.Settle(again, err)
+	held, ok := pending.Pending(operations.RetryJob, "j1")
+	if !resumed || !ok || held.Key != a.Key || held.IfMatch != reviewed.ETag {
+		t.Fatalf("rate-limited resubmission resolved the action: %v", err)
+	}
+	// The next resubmission replays the original acknowledgement.
+	third, _, _ := pending.Begin(operations.RetryJob, "j1", "")
+	job, err := operations.SubmitJobAction(ctx, f, third)
+	pending.Settle(third, err)
+	if err != nil || job.Value.Phase != "queued" {
+		t.Fatalf("%+v %v", job, err)
+	}
+	if _, ok := pending.Pending(operations.RetryJob, "j1"); ok {
+		t.Fatal("replayed action still pending")
+	}
+	if j, _ := f.Job("j1"); j.Revision != "2" {
+		t.Fatalf("retried more than once: %+v", j)
+	}
 }
