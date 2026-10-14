@@ -254,7 +254,7 @@ func authCmd(env *Env) *cobra.Command {
 	}
 	approve.Flags().StringVar(&code, "code", "", "user code displayed by the pairing device")
 	grantFlags(approve, &profiles, &permissions, &policy)
-	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to; the library and rating flags then set its grant")
+	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to (required by servers that manage access by user); its grant is the default")
 	approve.Flags().StringVar(&approveRevision, "user-revision", "", "user revision the approval is decided on (default: read it now)")
 	approve.Flags().StringVar(&approveResubmit, "resubmit-request", "", "with --idempotency-key and --user: the reported request, which replaces the grant flags")
 	keyFlag(approve, &approveKey)

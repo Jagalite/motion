@@ -198,7 +198,8 @@
         "ApprovePairing"
       ],
       "api": [
-        "ApprovePairing"
+        "ApprovePairing",
+        "Capabilities"
       ],
       "cli": "auth approve",
       "tui": "Pairing requests: a, choose the user, review",
@@ -208,17 +209,19 @@
       "tests": {
         "operations": [
           "internal/operations:TestManagementScenarioReachesTheIntendedState",
-          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest",
+          "internal/operations:TestApprovalNamesAUserWhenTheServerManagesAccessByUser"
         ],
         "cli": [
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
-          "internal/cli:TestSuggestedRetryWordsSurviveTheShell"
+          "internal/cli:TestSuggestedRetryWordsSurviveTheShell",
+          "internal/cli:TestCLIApprovalNamesAUser"
         ],
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
         ]
       },
-      "note": "The CLI also approves a device without an access user (omit --user), as the server allows; the TUI always binds the device to a chosen user. With --user, both pre-fill the user's grant (operations.InheritedGrant)."
+      "note": "Both interfaces name the access user the device belongs to, and pre-fill its grant (operations.InheritedGrant). A device-only approval is accepted only by servers that do not advertise identity.access_management; existing unassigned devices are assigned with devices.assign."
     },
     {
       "id": "access.pairings.deny",
@@ -534,6 +537,37 @@
         ],
         "cli": [
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "devices.assign",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "AssignDevice"
+      ],
+      "api": [
+        "AssignDeviceUser",
+        "GetDevice"
+      ],
+      "cli": "devices assign",
+      "tui": "Devices: u on an unassigned device, choose the user, review",
+      "capabilities": [
+        "system:admin",
+        "feature identity.access_management"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestDeviceAssignmentIsConditionalAndNeverTransfers",
+          "internal/operations:TestManagementScenarioReachesTheIntendedState"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIApprovalNamesAUser"
         ],
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState"

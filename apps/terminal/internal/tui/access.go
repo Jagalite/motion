@@ -448,6 +448,11 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 	case "enter", "space":
 		if f.kind == "user" {
 			d.user = d.focus
+			if d.kind == formDeviceAssign {
+				d.title = "Assign to “" + clean(d.users[d.user].Name) + "”?"
+				d.fields, d.focus, d.review = nil, 0, true
+				return nil
+			}
 			u := d.users[d.user]
 			d.fields = nil
 			d.focus = 0

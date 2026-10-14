@@ -376,6 +376,15 @@ func (c *Client) RevokeDevice(ctx context.Context, id, etag string) error {
 	return err
 }
 
+// AssignDeviceUser assigns an unassigned device to a user at the device's
+// ETag and the reviewed user revision.
+func (c *Client) AssignDeviceUser(ctx context.Context, id, userID, userRevision, etag string) (Tagged[Device], error) {
+	var v Device
+	h, err := c.do(ctx, request{method: http.MethodPut, path: "/api/v2/devices/" + esc(id) + "/user",
+		body: map[string]string{"user_id": userID, "user_revision": userRevision}, auth: true, ifMatch: etag}, &v)
+	return Tagged[Device]{Value: v, ETag: h.Get("ETag")}, err
+}
+
 func (c *Client) GetDevicePolicy(ctx context.Context, id string) (Tagged[AccessPolicy], error) {
 	var v AccessPolicy
 	h, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/devices/" + esc(id) + "/policy", auth: true}, &v)

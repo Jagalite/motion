@@ -25,12 +25,13 @@ const (
 	formPair          = "pair"
 	formRedeem        = "redeem"
 	formSignOut       = "sign-out"
+	formDeviceAssign  = "device-assign"
 )
 
 func formKind(kind string) bool {
 	switch kind {
 	case formProfileNew, formProfileRename, formProfileDelete, formSourceNew, formLibraryNew,
-		formScan, formDevicePolicy, formPair, formRedeem, formSignOut:
+		formScan, formDevicePolicy, formPair, formRedeem, formSignOut, formDeviceAssign:
 		return true
 	}
 	return false
@@ -127,6 +128,36 @@ func (m *Model) formAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 		if len(libraries) == 0 {
 			m.access = nil
 			return true, m.say("Create a library first.", true)
+		}
+		return true, d.focusFirst()
+	case m.route.page == pageDevices && msg.String() == "u" && id != "" && m.admin() && m.accessFeature():
+		var device api.Device
+		devices, _ := data[[]api.Device](*m, keyDevices)
+		for _, d := range devices {
+			if d.ID == id {
+				device = d
+			}
+		}
+		switch {
+		case device.ID == "":
+			return true, nil
+		case device.UserID != nil:
+			return true, m.say("This device already belongs to "+m.userName(*device.UserID)+"; ownership is not transferred.", true)
+		case device.Revoked:
+			return true, m.say("A revoked device cannot be assigned.", true)
+		}
+		d := m.openForm(formDeviceAssign, device.ID, device.Revision, "Assign “"+clean(device.Name)+"” to a user")
+		d.message = "Its grant narrows to the user's. Choose the person this device belongs to."
+		users, _ := data[[]api.User](*m, keyUsers)
+		for _, u := range users {
+			if !u.Disabled {
+				d.users = append(d.users, u)
+				d.fields = append(d.fields, accessField{label: clean(u.Name) + " · " + shortID(u.ID), kind: "user", id: u.ID})
+			}
+		}
+		if len(d.users) == 0 {
+			m.access = nil
+			return true, m.say("Create an enabled user on Users and access first.", true)
 		}
 		return true, d.focusFirst()
 	case m.route.page == pageDevices && msg.String() == "p" && id != "" && m.admin():
@@ -356,6 +387,15 @@ func (m *Model) submitForm() tea.Cmd {
 			_, err := operations.RedeemInvitation(ctx, s, code, name, accepted)
 			return accessDone{err: err, signedIn: err == nil, note: "Invitation redeemed; this device is signed in."}
 		}
+	case formDeviceAssign:
+		if d.user < 0 || d.user >= len(d.users) {
+			return m.formRefused(operations.Invalid("choose the user the device belongs to"))
+		}
+		user := d.users[d.user]
+		run = func(ctx context.Context) accessDone {
+			_, err := operations.AssignDevice(ctx, b, id, user.ID, user.Revision, operations.Reviewed(rev))
+			return accessDone{err: err, note: "Device assigned to " + clean(user.Name) + "."}
+		}
 	case formSignOut:
 		run = func(context.Context) accessDone {
 			_, err := operations.SignOut(s)
@@ -442,6 +482,11 @@ func (m Model) formSummary(d *accessDialog) []string {
 			return []string{err.Error()}
 		}
 		return append(m.grantSummary(nil, in.LibraryIDs)[1:], "Permissions: "+strings.Join(in.Permissions, ", "))
+	case formDeviceAssign:
+		if d.user >= 0 && d.user < len(d.users) {
+			return []string{"User: " + clean(d.users[d.user].Name), "The device's grant narrows to this user's; it cannot be reassigned later."}
+		}
+		return nil
 	case formPair, formRedeem:
 		if !d.on("consent") {
 			return []string{"The credential needs a store: tick the private file option."}

@@ -1596,6 +1596,9 @@ func (f *fake) GetDevice(context.Context, string) (api.Tagged[api.Device], error
 	return api.Tagged[api.Device]{}, errNotModelled
 }
 func (f *fake) RevokeDevice(context.Context, string, string) error { return errNotModelled }
+func (f *fake) AssignDeviceUser(context.Context, string, string, string, string) (api.Tagged[api.Device], error) {
+	return api.Tagged[api.Device]{}, errNotModelled
+}
 func (f *fake) GetDevicePolicy(context.Context, string) (api.Tagged[api.AccessPolicy], error) {
 	return api.Tagged[api.AccessPolicy]{}, errNotModelled
 }

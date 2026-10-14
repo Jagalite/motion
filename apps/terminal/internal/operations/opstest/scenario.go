@@ -12,6 +12,7 @@ import (
 type ManagementSeed struct {
 	Everyone, Guests api.Profile
 	TV, OldPhone     api.Device
+	DenTV            api.Device // unassigned
 	Ana              api.User
 	Tablet, Laptop   api.PairingSummary
 	Archive          api.Source
@@ -35,7 +36,7 @@ func (s *Server) SeedPairing(deviceName string) api.PairingSummary {
 func SeedManagement(s *Server) ManagementSeed {
 	var m ManagementSeed
 	m.Everyone, m.Guests = s.AddProfile("Everyone"), s.AddProfile("Guests")
-	m.TV, m.OldPhone = s.AddDevice("TV"), s.AddDevice("Old phone")
+	m.TV, m.OldPhone, m.DenTV = s.AddDevice("TV"), s.AddDevice("Old phone"), s.AddDevice("Den TV")
 	m.Ana = s.AddUser("Ana")
 	m.Tablet, m.Laptop = s.SeedPairing("Tablet"), s.SeedPairing("Laptop")
 	m.Archive = s.AddSource("Archive", "/srv/archive")
@@ -65,7 +66,8 @@ const (
 //  2. register source Films (/srv/films, excluding tmp) and create library
 //     Movies (movies) over it; request a verifying scan of Movies
 //  3. replace TV's policy: library Archive, catalog:read and
-//     playback:request, no unrated content, rating PG; revoke Old phone
+//     playback:request, no unrated content, rating PG; revoke Old phone;
+//     assign the unassigned Den TV to Ana
 //  4. create user Sam (catalog:read, library Archive); deny Tablet; approve
 //     Laptop for Ana with catalog:read; invite Sam (catalog:read, library
 //     Archive, 600 s), then revoke the invitation
@@ -101,6 +103,10 @@ func ApplyManagement(ctx context.Context, s *Server, m ManagementSeed) error {
 		},
 		func() error {
 			return operations.RevokeDevice(ctx, s, m.OldPhone.ID, operations.Reviewed(m.OldPhone.Revision))
+		},
+		func() error {
+			_, err := operations.AssignDevice(ctx, s, m.DenTV.ID, m.Ana.ID, m.Ana.Revision, operations.Reviewed(m.DenTV.Revision))
+			return err
 		},
 		func() error {
 			sam, err := operations.CreateUser(ctx, s, api.UserInput{Name: ScenarioUser, Permissions: []string{api.PermCatalogRead},

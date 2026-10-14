@@ -246,3 +246,40 @@ func TestSettlementKeepsRequestValuesToRepeat(t *testing.T) {
 		t.Fatalf("%d invitations", n)
 	}
 }
+
+func TestApprovalNamesAUserWhenTheServerManagesAccessByUser(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	seed := opstest.SeedManagement(f)
+	deviceOnly := operations.Approval{PairingID: seed.Laptop.ID, UserCode: seed.Laptop.UserCode, Permissions: []string{api.PermCatalogRead}}
+	before := len(f.Writes())
+	if _, err := operations.ApprovePairing(ctx, f, deviceOnly, operations.NewIntent("approve")); !isInvalid(err) || len(f.Writes()) != before {
+		t.Fatalf("device-only approval on a user-managed server: %v", err)
+	}
+	// An older server without user-based access still takes device-only
+	// approvals.
+	f.DisableFeature(operations.AccessFeature)
+	if _, err := operations.ApprovePairing(ctx, f, deviceOnly, operations.NewIntent("approve")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeviceAssignmentIsConditionalAndNeverTransfers(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	seed := opstest.SeedManagement(f)
+	if _, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, seed.Ana.ID, "", operations.Current()); !isInvalid(err) {
+		t.Fatalf("missing user revision: %v", err)
+	}
+	if _, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, seed.Ana.ID, seed.Ana.Revision, operations.Reviewed("9")); !api.IsCode(err, "precondition_failed") {
+		t.Fatalf("stale device review: %v", err)
+	}
+	d, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, seed.Ana.ID, seed.Ana.Revision, operations.Reviewed(seed.DenTV.Revision))
+	if err != nil || d.Value.UserID == nil || *d.Value.UserID != seed.Ana.ID {
+		t.Fatalf("%+v %v", d, err)
+	}
+	sam := f.AddUser("Sam")
+	if _, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, sam.ID, sam.Revision, operations.Current()); !api.IsCode(err, "device_owned") {
+		t.Fatalf("owned device transferred: %v", err)
+	}
+}

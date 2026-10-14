@@ -12,6 +12,7 @@ type keyMap struct {
 	Inspect, Retry        key.Binding
 	New, Rename, Delete   key.Binding
 	NewLibrary, Policy    key.Binding
+	Assign                key.Binding
 	Pair, Redeem, SignOut key.Binding
 	Refresh, Help, Quit   key.Binding
 	Confirm, Keep         key.Binding
@@ -43,6 +44,7 @@ var keys = keyMap{
 	Delete:      key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "delete")),
 	NewLibrary:  key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "new library")),
 	Policy:      key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "device policy")),
+	Assign:      key.NewBinding(key.WithKeys("u"), key.WithHelp("u", "assign to user")),
 	Pair:        key.NewBinding(key.WithKeys("P"), key.WithHelp("P", "pair this device")),
 	Redeem:      key.NewBinding(key.WithKeys("I"), key.WithHelp("I", "redeem invitation")),
 	SignOut:     key.NewBinding(key.WithKeys("O"), key.WithHelp("O", "sign out")),
@@ -79,6 +81,6 @@ func fullHelp() [][]key.Binding {
 		{keys.Up, keys.Down, keys.Left, keys.Right, keys.PageUp, keys.PageDown, keys.Top, keys.Bottom},
 		{keys.Open, keys.Back, keys.Focus, keys.Search, keys.Refresh, keys.Help, keys.Quit},
 		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Inspect, keys.Cancel, keys.Retry, keys.History, keys.ClearFilter},
-		{keys.New, keys.Rename, keys.Delete, keys.NewLibrary, keys.Policy, keys.Pair, keys.Redeem, keys.SignOut},
+		{keys.New, keys.Rename, keys.Delete, keys.NewLibrary, keys.Policy, keys.Assign, keys.Pair, keys.Redeem, keys.SignOut},
 	}
 }

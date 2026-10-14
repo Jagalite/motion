@@ -68,7 +68,7 @@ func TestSharedReadsComposeTheSameResults(t *testing.T) {
 			return len(v), err
 		},
 	} {
-		want := map[string]int{"profiles": 2, "devices": 2, "users": 1, "pairings": 2, "invitations": 0, "sources": 1, "libraries": 1, "scans": 1, "history": 1}[name]
+		want := map[string]int{"profiles": 2, "devices": 3, "users": 1, "pairings": 2, "invitations": 0, "sources": 1, "libraries": 1, "scans": 1, "history": 1}[name]
 		if got, err := n(); err != nil || got != want {
 			t.Errorf("%s: %d %v", name, got, err)
 		}

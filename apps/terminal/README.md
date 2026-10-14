@@ -8,9 +8,10 @@ provider or FFmpeg dependency; `boundary_test.go` enforces that.
 go build -o motion ./cmd/motion
 motion --server http://127.0.0.1:8787 server status
 motion auth pair --credential-store file          # device shows a code
-motion auth approve PAIRING_ID --code ABCD-EFGH \
-  --permission catalog:read --permission events:read \
-  --operator-token-file /path/to/data/admin-token   # on the server host
+motion access users create Sam --operator-token-file /path/to/data/admin-token
+motion auth approve PAIRING_ID --code ABCD-EFGH --user USER_ID \
+  --operator-token-file /path/to/data/admin-token   # on the server host; the device joins Sam
+motion devices assign DEVICE_ID --user USER_ID     # an older, unassigned device
 motion auth redeem --credential-store file < code.txt   # one-use invitation
 motion access users create Sam --permission catalog:read --library LIB_ID
 motion access invitations create USER_ID --permission catalog:read
@@ -101,7 +102,7 @@ management pages take the same actions through confirmed forms:
 | Profiles | `n` new · `e` rename · `x` delete · `enter` use |
 | Sources | `n` register a source · `l` create a library |
 | Scans | `n` request a scan |
-| Devices | `p` device policy · `d` revoke |
+| Devices | `p` device policy · `u` assign an unassigned device to a user · `d` revoke |
 | Users and access, Pairing requests, Invitations | `n`/`e`, `a`/`d`, `n`/`d` |
 | Processing | `enter` inspect · `c` cancel · `R` retry |
 | Server | `O` sign out · while signed out, `P` pairs this device and `I` redeems an invitation |

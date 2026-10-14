@@ -86,6 +86,13 @@ func (s *Server) EnableFeatures(ids ...string) {
 	}
 }
 
+// DisableFeature removes a capability, as an older server would lack it.
+func (s *Server) DisableFeature(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.features = slices.DeleteFunc(s.features, func(f api.Feature) bool { return f.ID == id })
+}
+
 // LoseAcks applies the next n keyed or conditional writes but loses their
 // acknowledgements.
 func (s *Server) LoseAcks(n int) {
@@ -373,6 +380,42 @@ func (s *Server) RevokeDevice(_ context.Context, id, etag string) error {
 	bump(&d.Revision)
 	_, err := s.deliver(nil)
 	return err
+}
+
+func (s *Server) AssignDeviceUser(_ context.Context, id, user, userRevision, etag string) (api.Tagged[api.Device], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("assignDeviceUser", id, "", etag)
+	d := find(s.devices, deviceID, id)
+	if d == nil {
+		return api.Tagged[api.Device]{}, problem(404, "not_found")
+	}
+	if err := precondition(etag, d.Revision); err != nil {
+		return api.Tagged[api.Device]{}, err
+	}
+	u := find(s.users, userID, user)
+	switch {
+	case u == nil:
+		return api.Tagged[api.Device]{}, problem(404, "not_found")
+	case d.UserID != nil:
+		return api.Tagged[api.Device]{}, problem(409, "device_owned")
+	case d.Revoked:
+		return api.Tagged[api.Device]{}, problem(409, "device_revoked")
+	case u.Revision != userRevision:
+		return api.Tagged[api.Device]{}, problem(409, "user_changed")
+	}
+	// The device's grant narrows to the user's ceiling.
+	owner, kept := user, []string{}
+	for _, p := range d.Permissions {
+		if slices.Contains(u.Permissions, p) || slices.Contains(u.Permissions, api.PermSystemAdmin) {
+			kept = append(kept, p)
+		}
+	}
+	d.UserID, d.Permissions = &owner, kept
+	s.policies[d.ID].Permissions = kept
+	bump(&d.Revision)
+	v, err := s.deliver(api.Tagged[api.Device]{Value: *d, ETag: tag(d.Revision)})
+	return v.(api.Tagged[api.Device]), err
 }
 
 func (s *Server) GetDevicePolicy(_ context.Context, id string) (api.Tagged[api.AccessPolicy], error) {
@@ -905,6 +948,14 @@ func (s *Server) Handler() http.Handler {
 			tagged(t.Value, t.ETag, e)
 		case "DELETE devices/*":
 			err = s.RevokeDevice(ctx, seg[1], ifMatch)
+		case "PUT devices/*/user":
+			var in struct {
+				UserID       string `json:"user_id"`
+				UserRevision string `json:"user_revision"`
+			}
+			_ = decode(&in)
+			t, e := s.AssignDeviceUser(ctx, seg[1], in.UserID, in.UserRevision, ifMatch)
+			tagged(t.Value, t.ETag, e)
 		case "GET devices/*/policy":
 			t, e := s.GetDevicePolicy(ctx, seg[1])
 			tagged(t.Value, t.ETag, e)

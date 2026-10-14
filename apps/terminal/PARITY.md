@@ -53,7 +53,9 @@ is the one interface-specific exception.
   interface on a fresh real server and must observe the same state:
   profiles, sources, libraries, a scan, an access user, a revoked
   invitation and a redemption. `scripts/tui_pty_check.py` types into the
-  real `motion tui` in a pseudo-terminal.
+  real `motion tui` in a pseudo-terminal. The real-server scenario also
+  assigns a device that was approved without a user, as an older client
+  could, through each interface.
 
 These checks prove the wiring and the shared decisions. They do not prove
 server behavior: the real-server E2E tests and the Rust tests do that.
@@ -70,7 +72,7 @@ flow is exercised against the fixture.
 | `auth.redeem` | Shared | `motion auth redeem` | I while signed out: redeem an invitation code | `RedeemInvitation` |
 | `auth.logout` | Shared | `motion auth logout` | Server page: O signs out | `SignOut` |
 | `access.pairings.list` | Shared | `motion access pairings list` | Pairing requests page | `ListPairings`, `CollectPairings` |
-| `access.pairings.approve` | Shared | `motion auth approve` | Pairing requests: a, choose the user, review | `ApprovePairing` Note: The CLI also approves a device without an access user (omit --user), as the server allows; the TUI always binds the device to a chosen user. With --user, both pre-fill the user's grant (operations.InheritedGrant). |
+| `access.pairings.approve` | Shared | `motion auth approve` | Pairing requests: a, choose the user, review | `ApprovePairing` Note: Both interfaces name the access user the device belongs to, and pre-fill its grant (operations.InheritedGrant). A device-only approval is accepted only by servers that do not advertise identity.access_management; existing unassigned devices are assigned with devices.assign. |
 | `access.pairings.deny` | Shared | `motion access pairings deny` | Pairing requests: d, review | `DenyPairing` |
 | `access.users.list` | Shared | `motion access users list` | Users and access page | `ListUsers`, `CollectUsers` |
 | `access.users.show` | Shared | `motion access users show` | Users and access: detail of the listed user | `InspectUser`, `CollectUsers` |
@@ -82,6 +84,7 @@ flow is exercised against the fixture.
 | `devices.list` | Shared | `motion devices list` | Devices page | `ListDevices`, `CollectDevices` |
 | `devices.show` | Shared | `motion devices show` | Devices: detail of the listed device | `InspectDevice`, `CollectDevices` |
 | `devices.revoke` | Shared | `motion devices revoke` | Devices: d, at the reviewed revision | `RevokeDevice` |
+| `devices.assign` | Shared | `motion devices assign` | Devices: u on an unassigned device, choose the user, review | `AssignDevice` |
 | `devices.policy` | Shared | `motion devices policy show` | Devices: p reads the policy into the editor | `InspectDevicePolicy` |
 | `devices.policy.set` | Shared | `motion devices policy set` | Device policy editor, at the revision read | `ReplaceDevicePolicy` |
 | `profiles.list` | Shared | `motion profiles list` | Profiles page | `ListProfiles`, `CollectProfiles` |
@@ -144,6 +147,11 @@ flow is exercised against the fixture.
   `DefaultGrantPolicy`. An invitation or user-bound approval starts from
   the user's grant without `system:admin` (`operations.InheritedGrant`).
   Permissions are sent in the contract's order.
+- **Device ownership.** A server that advertises
+  `identity.access_management` manages access by user. Both interfaces
+  then approve a pairing only for a named access user, whose grant caps
+  the device. A device approved without a user, by an older client, is
+  assigned with `devices.assign`; it is never transferred once owned.
 - **Guidance.** Permissions and capabilities shown by the TUI only guide.
   The server authorizes every request, and the player launch reads current
   permissions and capabilities.

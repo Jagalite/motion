@@ -176,6 +176,21 @@ func TestE2ETUIReachesTheSharedRealServerState(t *testing.T) {
 		t.Fatal("redemption did not sign the guest session in")
 	}
 
+	operator, err := os.ReadFile(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	den, err := opstest.SeedUnassignedDevice(ctx, url, strings.TrimSpace(string(operator)), opstest.RealUnassigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m = goTo(t, m, route{page: pageDevices})
+	m = drain(t, m, m.load(keyDevices))
+	m = selectRow(t, m, den)
+	m = press(t, m, "u")
+	m = chooseUser(t, m, opstest.RealUser)
+	m = apply(t, m)
+
 	got, err := opstest.Observe(ctx, s)
 	if err != nil {
 		t.Fatal(err)

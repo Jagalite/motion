@@ -56,6 +56,16 @@ func TestE2ECLIReachesTheSharedRealServerState(t *testing.T) {
 		t.Fatalf("redeem: %v %s", err, out.String())
 	}
 
+	token, err := os.ReadFile(srv.operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	den, err := opstest.SeedUnassignedDevice(context.Background(), srv.url, strings.TrimSpace(string(token)), opstest.RealUnassigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op("devices", "assign", den, "--user", sam["id"].(string))
+
 	session, err := operations.Connect(context.Background(), operations.Settings{Server: srv.url, OperatorTokenFile: srv.operator, ConfigDir: admin})
 	if err != nil {
 		t.Fatal(err)

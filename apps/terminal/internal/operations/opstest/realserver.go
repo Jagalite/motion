@@ -1,8 +1,12 @@
 package opstest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -21,6 +25,8 @@ import (
 //     create library Movies (movies) over it; request a scan of Movies
 //  3. create access user Sam (catalog:read); issue Sam an invitation and
 //     revoke it; issue another and redeem it as device Redeemer
+//  4. assign the unassigned device Den TV (approved without a user, as an
+//     older client could; see SeedUnassignedDevice) to Sam
 const (
 	RealProfile        = "Kids"
 	RealRenamed        = "Children"
@@ -33,6 +39,7 @@ const (
 	RealInvitationTTL  = 600
 	RealUserPermission = api.PermCatalogRead
 	RealDevice         = "Redeemer"
+	RealUnassigned     = "Den TV"
 )
 
 // Observation is the scenario's resulting domain state, read through the
@@ -56,7 +63,8 @@ var ExpectedObservation = Observation{
 	Scans:       []string{RealLibrary},
 	Users:       []string{RealUser + " enabled perms=" + RealUserPermission},
 	Invitations: []string{RealUser + " " + RedeemedStatus, RealUser + " revoked"}, // sorted
-	Devices:     []string{RealDevice + " owner=" + RealUser + " permissions=" + RealUserPermission},
+	Devices: []string{RealUnassigned + " owner=" + RealUser + " permissions=" + RealUserPermission,
+		RealDevice + " owner=" + RealUser + " permissions=" + RealUserPermission}, // sorted
 }
 
 // RedeemedStatus is how the server lists a redeemed invitation.
@@ -141,7 +149,7 @@ func Observe(ctx context.Context, s *operations.Session) (Observation, error) {
 		return o, err
 	}
 	for _, d := range devices {
-		if d.Name == RealDevice {
+		if d.Name == RealDevice || d.Name == RealUnassigned {
 			owner := "-"
 			if d.UserID != nil {
 				owner = userName[*d.UserID]
@@ -149,5 +157,42 @@ func Observe(ctx context.Context, s *operations.Session) (Observation, error) {
 			o.Devices = append(o.Devices, fmt.Sprintf("%s owner=%s permissions=%s", d.Name, owner, strings.Join(d.Permissions, "+")))
 		}
 	}
+	sort.Strings(o.Devices)
 	return o, nil
+}
+
+// SeedUnassignedDevice creates a device without an access user on a real
+// server, as an older pairing client's approval would, using the API
+// directly: neither interface approves without a user any more.
+func SeedUnassignedDevice(ctx context.Context, url, operatorToken, name string) (string, error) {
+	call := func(path, auth, key string, body any, out any) error {
+		data, _ := json.Marshal(body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+path, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", "Bearer "+auth)
+			req.Header.Set("Idempotency-Key", key)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			msg, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("%s: %d %s", path, resp.StatusCode, msg)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	var pairing api.Pairing
+	if err := call("/api/v2/auth/pairings", "", "", api.PairingRequest{DeviceName: name, ClientName: "legacy"}, &pairing); err != nil {
+		return "", err
+	}
+	var device api.Device
+	err := call("/api/v2/auth/pairings/"+pairing.ID+"/approve", operatorToken, "seed-unassigned-device-01",
+		api.PairingApproval{UserCode: pairing.UserCode, ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead}}, &device)
+	return device.ID, err
 }

@@ -617,7 +617,7 @@ func (m Model) shortHelp() []key.Binding {
 		case m.route.page == pageScans && m.allows(api.PermSourcesManage):
 			b = append(b, keyHelp("n", "request scan"))
 		case m.route.page == pageDevices && m.admin():
-			b = append(b, keys.Policy)
+			b = append(b, keys.Policy, keys.Assign)
 		case m.route.page == pageNowPlaying:
 			b = append(b, keys.History)
 		case m.route.page == pageHistory && m.historyFilter.DeviceID != "":

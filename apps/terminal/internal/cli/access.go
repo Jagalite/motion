@@ -69,7 +69,35 @@ func devicesCmd(env *Env) *cobra.Command {
 		},
 	}
 	revoke.Flags().StringVar(&ifMatch, "if-match", "", "ETag the device must still have (default: read it first)")
-	cmd.AddCommand(list, show, revoke, policyCmd(env))
+	var assignUser, assignRevision, assignIfMatch string
+	assign := &cobra.Command{
+		Use: "assign DEVICE_ID", Short: "Assign an unassigned device to an access user", Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return run(env, func(ctx context.Context, c *Conn) error {
+				revision := assignRevision
+				if revision == "" {
+					// The assignment is decided on the user as read now.
+					user, err := operations.InspectUser(ctx, c, assignUser)
+					if err != nil {
+						return err
+					}
+					revision = user.Value.Revision
+				}
+				d, err := operations.AssignDevice(ctx, c, args[0], assignUser, revision, operations.ETagOrCurrent(assignIfMatch))
+				if err != nil {
+					return err
+				}
+				return env.print(d.Value, func(w io.Writer) {
+					fmt.Fprintf(w, "Assigned device %s (%s) to user %s.\nPermissions %s\n", sanitize(d.Value.Name), d.Value.ID, sanitize(assignUser), strings.Join(d.Value.Permissions, ", "))
+				})
+			})(cmd, args)
+		},
+	}
+	assign.Flags().StringVar(&assignUser, "user", "", "access user the device belongs to")
+	assign.Flags().StringVar(&assignRevision, "user-revision", "", "user revision the assignment is decided on (default: read it now)")
+	assign.Flags().StringVar(&assignIfMatch, "if-match", "", "ETag the device must still have (default: read it first)")
+	_ = assign.MarkFlagRequired("user")
+	cmd.AddCommand(list, show, revoke, assign, policyCmd(env))
 	return cmd
 }
 

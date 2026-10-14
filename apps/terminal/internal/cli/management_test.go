@@ -78,6 +78,7 @@ func TestCLIManagementReachesTheSharedScenarioState(t *testing.T) {
 	c.ok("devices", "policy", "set", seed.TV.ID, "--library", seed.ArchiveLibrary.ID, "--permission", "catalog:read",
 		"--permission", "playback:request", "--allow-unrated=false", "--rating", opstest.ScenarioRating)
 	c.ok("devices", "revoke", seed.OldPhone.ID)
+	c.ok("devices", "assign", seed.DenTV.ID, "--user", seed.Ana.ID)
 	sam := c.ok("access", "users", "create", opstest.ScenarioUser, "--permission", "catalog:read", "--library", seed.ArchiveLibrary.ID)
 	c.ok("access", "pairings", "deny", seed.Tablet.ID)
 	c.ok("auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode, "--user", seed.Ana.ID, "--permission", "catalog:read")
@@ -298,5 +299,23 @@ func TestSuggestedRetryWordsSurviveTheShell(t *testing.T) {
 		if err != nil || string(out) != v {
 			t.Fatalf("%q came back as %q (%v)", v, out, err)
 		}
+	}
+}
+
+func TestCLIApprovalNamesAUser(t *testing.T) {
+	c := newManaged(t)
+	seed := opstest.SeedManagement(c.fixture)
+	before := len(c.fixture.Writes())
+	if _, stderr, code := c.run("auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode, "--permission", "catalog:read"); code != ExitInvalid || !strings.Contains(stderr, "access user") {
+		t.Fatalf("device-only approval: exit %d %s", code, stderr)
+	}
+	if len(c.fixture.Writes()) != before {
+		t.Fatal("a device-only approval was sent")
+	}
+	if _, _, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitOK {
+		t.Fatalf("assign: exit %d", code)
+	}
+	if _, stderr, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitConflict || !strings.Contains(stderr, "device_owned") {
+		t.Fatalf("reassignment: exit %d %s", code, stderr)
 	}
 }

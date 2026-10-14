@@ -137,6 +137,14 @@ func TestTUIManagementReachesTheSharedScenarioState(t *testing.T) {
 	m = selectRow(t, m, seed.OldPhone.ID)
 	m = press(t, m, "d")
 	m = apply(t, m)
+	m = selectRow(t, m, seed.DenTV.ID)
+	m = press(t, m, "u")
+	m = chooseUser(t, m, "Ana")
+	m = apply(t, m)
+	m = press(t, m, "u") // already owned: refused before any request
+	if m.access != nil || !strings.Contains(m.notice.text, "already belongs to Ana") {
+		t.Fatalf("owned device offered for assignment: %+v", m.notice)
+	}
 
 	m = goTo(t, m, route{page: pageUsers})
 	m = press(t, m, "n")

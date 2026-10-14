@@ -95,8 +95,20 @@ func InheritedGrant(u api.User) Grant {
 
 // Pairings ------------------------------------------------------------------
 
+// AccessFeature is the capability of servers that manage access by user.
+const AccessFeature = "identity.access_management"
+
+// ManagesAccessByUser reports whether the server binds devices to access
+// users. Such servers accept a device without a user only from older
+// clients; this client always names the user.
+func ManagesAccessByUser(caps api.Capabilities) bool {
+	f, ok := caps.Feature(AccessFeature)
+	return ok && f.Enabled
+}
+
 // PairingAPI administers pairing requests.
 type PairingAPI interface {
+	CapabilityReader
 	ListPairings(context.Context, string, int) (api.Page[api.PairingSummary], error)
 	ApprovePairing(context.Context, string, api.PairingApproval, string) (api.Tagged[api.Device], error)
 	DenyPairing(context.Context, string, string) error
@@ -134,6 +146,17 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 	}
 	if err := CheckPermissions(in.Permissions); err != nil {
 		return api.Tagged[api.Device]{}, err
+	}
+	if in.UserID == "" {
+		// A device approved without a user escapes user-level control
+		// (disabling the user, the user's grant ceiling).
+		caps, err := a.Capabilities(ctx)
+		if err != nil {
+			return api.Tagged[api.Device]{}, err
+		}
+		if ManagesAccessByUser(caps) {
+			return api.Tagged[api.Device]{}, Invalid("choose the access user the device belongs to; this server manages access by user")
+		}
 	}
 	approval := api.PairingApproval{UserCode: in.UserCode, UserID: in.UserID, UserRevision: in.UserRevision,
 		ProfileIDs: nonNil(in.ProfileIDs), Permissions: canonicalPermissions(in.Permissions)}
@@ -319,6 +342,7 @@ type DeviceAPI interface {
 	RevokeDevice(context.Context, string, string) error
 	GetDevicePolicy(context.Context, string) (api.Tagged[api.AccessPolicy], error)
 	ReplaceDevicePolicy(context.Context, string, api.AccessPolicy, string) (api.Tagged[api.AccessPolicy], error)
+	AssignDeviceUser(context.Context, string, string, string, string) (api.Tagged[api.Device], error)
 }
 
 // DeviceReader lists and reads devices.
@@ -360,6 +384,23 @@ func RevokeDevice(ctx context.Context, a interface {
 		return err
 	}
 	return settleConditional("revocation of device "+id, etag, a.RevokeDevice(ctx, id, etag))
+}
+
+// AssignDevice assigns an unassigned device to an access user at the user
+// revision that was reviewed. The server narrows the device's grant to the
+// user's ceiling and refuses an owned or revoked device.
+func AssignDevice(ctx context.Context, a DeviceAPI, id, userID, userRevision string, pre Precondition) (api.Tagged[api.Device], error) {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(userID) == "" || strings.TrimSpace(userRevision) == "" {
+		return api.Tagged[api.Device]{}, Invalid("a device, a user and the reviewed user revision are required")
+	}
+	etag, err := pre.resolve(ctx, "the device", tagged(func(ctx context.Context) (api.Tagged[api.Device], error) {
+		return InspectDevice(ctx, a, id)
+	}, func(d api.Device) string { return d.Revision }))
+	if err != nil {
+		return api.Tagged[api.Device]{}, err
+	}
+	v, err := a.AssignDeviceUser(ctx, id, userID, userRevision, etag)
+	return v, settleConditional("assignment of device "+id, etag, err)
 }
 
 // InspectDevicePolicy reads a device's access policy.

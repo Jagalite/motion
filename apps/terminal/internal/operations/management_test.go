@@ -37,6 +37,7 @@ func TestManagementScenarioReachesTheIntendedState(t *testing.T) {
 		"TV owner=- revoked=false@1 policy=Archive/catalog:read+playback:request/unrated=false/denyrated=false/ratings=PG/labels=@2",
 		"Old phone owner=- revoked=true@2",
 		"Laptop owner=Ana revoked=false@1 policy=/catalog:read/unrated=true/",
+		"Den TV owner=Ana revoked=false@2",
 	} {
 		if !strings.Contains(devices, fact) {
 			t.Errorf("devices lack %q:\n%s", fact, devices)
