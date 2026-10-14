@@ -406,34 +406,58 @@ func (s *Server) AssignDeviceUser(_ context.Context, id, user, userRevision, eta
 	case u.Disabled:
 		return api.Tagged[api.Device]{}, problem(409, "user_disabled")
 	}
-	p := s.policies[d.ID]
+	// Compute the narrowed grant first; refuse it without any change.
+	p := *s.policies[d.ID]
+	permissions, profiles := d.Permissions, d.ProfileIDs
 	switch {
 	case slices.Contains(u.Permissions, api.PermSystemAdmin):
 	case slices.Contains(d.Permissions, api.PermSystemAdmin):
-		d.Permissions, d.ProfileIDs = append([]string{}, u.Permissions...), append([]string{}, u.ProfileIDs...)
+		permissions, profiles = append([]string{}, u.Permissions...), append([]string{}, u.ProfileIDs...)
 		p.LibraryIDs, p.AllowUnrated, p.DenyRated = u.Policy.LibraryIDs, u.Policy.AllowUnrated, u.Policy.DenyRated
 		p.AllowedRatings, p.BlockedLabels = u.Policy.AllowedRatings, u.Policy.BlockedLabels
 	default:
-		d.Permissions, d.ProfileIDs = intersect(d.Permissions, u.Permissions), intersect(d.ProfileIDs, u.ProfileIDs)
+		permissions, profiles = intersect(d.Permissions, u.Permissions), intersect(d.ProfileIDs, u.ProfileIDs)
 		p.LibraryIDs, p.AllowUnrated = intersect(p.LibraryIDs, u.Policy.LibraryIDs), p.AllowUnrated && u.Policy.AllowUnrated
+		labels := append([]string{}, p.BlockedLabels...)
 		for _, l := range u.Policy.BlockedLabels {
-			if !slices.Contains(p.BlockedLabels, l) {
-				p.BlockedLabels = append(p.BlockedLabels, l)
+			if !slices.Contains(labels, l) {
+				labels = append(labels, l)
 			}
 		}
-		// An empty rating list allows any rating; otherwise ratings narrow.
-		if len(p.AllowedRatings) == 0 {
-			p.AllowedRatings = append([]string{}, u.Policy.AllowedRatings...)
-		} else if len(u.Policy.AllowedRatings) > 0 {
-			p.AllowedRatings = intersect(p.AllowedRatings, u.Policy.AllowedRatings)
-		}
+		p.BlockedLabels = labels
+		p.DenyRated, p.AllowedRatings = ratingIntersection(p.DenyRated, p.AllowedRatings, u.Policy.DenyRated, u.Policy.AllowedRatings)
 	}
+	if len(p.BlockedLabels) > maxBlockedLabels {
+		return api.Tagged[api.Device]{}, problem(422, "policy_limit_exceeded")
+	}
+	d.Permissions, d.ProfileIDs = permissions, profiles
+	p.Permissions = permissions
+	*s.policies[d.ID] = p
 	owner := user
-	d.UserID, p.Permissions = &owner, d.Permissions
+	d.UserID = &owner
 	bump(&d.Revision)
-	bump(&p.Revision)
+	bump(&s.policies[d.ID].Revision)
 	v, err := s.deliver(api.Tagged[api.Device]{Value: *d, ETag: tag(d.Revision)})
 	return v.(api.Tagged[api.Device]), err
+}
+
+// maxBlockedLabels is the server's MAX_BLOCKED_LABELS.
+const maxBlockedLabels = 200
+
+// ratingIntersection follows the server's RatingEligibility: deny-rated is
+// none, an empty list is any rating, and two lists intersect; an empty
+// intersection denies rated content.
+func ratingIntersection(denyA bool, a []string, denyB bool, b []string) (bool, []string) {
+	switch {
+	case denyA || denyB:
+		return true, []string{}
+	case len(a) == 0:
+		return false, append([]string{}, b...)
+	case len(b) == 0:
+		return false, append([]string{}, a...)
+	}
+	both := intersect(a, b)
+	return len(both) == 0, both
 }
 
 func intersect(a, b []string) []string {

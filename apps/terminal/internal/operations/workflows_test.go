@@ -3,6 +3,7 @@ package operations_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -309,5 +310,47 @@ func TestDeviceAssignmentIsConditionalAndNeverTransfers(t *testing.T) {
 	policy, _ := operations.InspectDevicePolicy(ctx, f, other.ID)
 	if err != nil || len(d.Value.Permissions) != 0 || policy.Value.AllowUnrated || len(policy.Value.BlockedLabels) != 1 {
 		t.Fatalf("grant not narrowed: %+v %+v %v", d.Value, policy.Value, err)
+	}
+}
+
+func TestFixtureAssignmentNarrowsRatingsAndRefusesLabelOverflow(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	user := func(name string, policy api.GrantPolicy) api.User {
+		u, err := f.CreateUser(ctx, api.UserInput{Name: name, ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead}, Policy: policy}, "seed-"+name+"-0123456789abcdef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.Value
+	}
+	device := func(name string, policy api.AccessPolicy) string {
+		d := f.AddDevice(name)
+		if _, err := operations.ReplaceDevicePolicy(ctx, f, d.ID, policy, operations.Current()); err != nil {
+			t.Fatal(err)
+		}
+		return d.ID
+	}
+	// Disjoint rating lists leave no rating eligible: rated content is denied.
+	g := user("g", api.GrantPolicy{AllowUnrated: true, AllowedRatings: []string{"G"}})
+	r := device("r", api.AccessPolicy{AllowUnrated: true, AllowedRatings: []string{"R"}, Permissions: []string{api.PermCatalogRead}})
+	if _, err := operations.AssignDevice(ctx, f, r, g.ID, g.Revision, operations.Current()); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := operations.InspectDevicePolicy(ctx, f, r); !p.Value.DenyRated || len(p.Value.AllowedRatings) != 0 {
+		t.Fatalf("disjoint ratings widened: %+v", p.Value)
+	}
+	// A blocked-label union over the server's limit is refused unchanged.
+	labels := make([]string, 200)
+	for i := range labels {
+		labels[i] = fmt.Sprint("l", i)
+	}
+	extra := user("extra", api.GrantPolicy{AllowUnrated: true, BlockedLabels: []string{"one more"}})
+	full := device("full", api.AccessPolicy{AllowUnrated: true, BlockedLabels: labels, Permissions: []string{api.PermCatalogRead}})
+	before, _ := operations.InspectDevice(ctx, f, full)
+	if _, err := operations.AssignDevice(ctx, f, full, extra.ID, extra.Revision, operations.Current()); !api.IsCode(err, "policy_limit_exceeded") {
+		t.Fatalf("label overflow: %v", err)
+	}
+	if after, _ := operations.InspectDevice(ctx, f, full); after.Value.UserID != nil || after.Value.Revision != before.Value.Revision {
+		t.Fatalf("refused assignment changed the device: %+v", after.Value)
 	}
 }
