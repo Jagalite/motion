@@ -988,7 +988,7 @@ async fn mail_outage_retries_the_same_challenge_and_erases_delivered_payload() {
                     .fetch_one(&f.app.db)
                     .await
                     .unwrap();
-            if phase == "pending" {
+            if phase == "queued" {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1031,7 +1031,7 @@ async fn mail_outage_retries_the_same_challenge_and_erases_delivered_payload() {
                     .fetch_one(&f.app.db)
                     .await
                     .unwrap();
-            if phase == "sent" {
+            if phase == "accepted" {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1045,7 +1045,7 @@ async fn mail_outage_retries_the_same_challenge_and_erases_delivered_payload() {
         "retry must retain the original challenge"
     );
     assert_eq!(after.1, None);
-    assert_eq!(after.2, "sent");
+    assert_eq!(after.2, "accepted");
     assert!(after.3 >= 2);
     assert_eq!(
         f.email_finish(id, &cookie, &code).await.status,
@@ -1381,4 +1381,736 @@ async fn oidc_callback_reservation_fences_concurrent_exchange_and_duplicate_effe
 #[tokio::test]
 async fn oidc_callback_cancellation_and_restart_preserve_the_reservation() {
     oidc_reservation_case(true).await;
+}
+
+const NEWCOMER: &str = "newcomer@example.invalid";
+
+fn code_in(message: &str) -> Option<String> {
+    let code: String = message
+        .split(" code is ")
+        .nth(1)
+        .or_else(|| message.split("Test code: ").nth(1))?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (code.len() == 8).then_some(code)
+}
+
+impl Fixture {
+    async fn set_registration(&self, policy: &str, permissions: &[&str]) -> Reply {
+        let current = self
+            .operator("GET", "/api/v2/admin/auth/registration", None, None)
+            .await;
+        assert_eq!(current.status, StatusCode::OK, "{}", current.body);
+        self.operator(
+            "PUT",
+            "/api/v2/admin/auth/registration",
+            Some(json!({"policy":policy,"default_access":{
+                "profile_ids":["default"],"permissions":permissions,
+                "policy":{"library_ids":[self.library],"allow_unrated":true,"allowed_ratings":[],"deny_rated":false,"blocked_labels":[]}}})),
+            Some(&current.body["revision"]),
+        )
+        .await
+    }
+    async fn register(&self, address: &str, name: &str) -> Reply {
+        self.call(
+            "POST",
+            "/api/v2/auth/register/start",
+            Some(json!({"address":address,"name":name})),
+            &[],
+        )
+        .await
+    }
+    /// Drain the outbox and return the messages delivered after `previous`.
+    async fn drain(&self, previous: usize) -> Vec<String> {
+        while playscale::v2::signin::deliver_mail_once(&self.app)
+            .await
+            .unwrap()
+        {}
+        // A concurrently spawned worker may still be finishing its attempt.
+        for _ in 0..50 {
+            let sending: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM signin_outbox WHERE phase='sending'")
+                    .fetch_one(&self.app.db)
+                    .await
+                    .unwrap();
+            if sending == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.mail.messages.lock().await[previous..].to_vec()
+    }
+    async fn registered_code(&self, address: &str, name: &str) -> (String, String, String) {
+        let previous = self.mail.messages.lock().await.len();
+        let started = self.register(address, name).await;
+        assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+        let delivered = self.drain(previous).await;
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(delivered[0].contains("verification code"));
+        (
+            started.body["transaction_id"].as_str().unwrap().into(),
+            started.cookie("motion_signin").unwrap(),
+            code_in(&delivered[0]).unwrap(),
+        )
+    }
+    async fn count(&self, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(&self.app.db)
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn registration_is_closed_by_default_and_never_grants_administrator() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    let methods = f.call("GET", "/api/v2/auth/methods", None, &[]).await;
+    assert_eq!(methods.body["registration"], "closed");
+    let closed = f.register(NEWCOMER, "Newcomer").await;
+    assert_eq!(closed.status, StatusCode::FORBIDDEN, "{}", closed.body);
+    assert_eq!(closed.body["code"], "registration_closed");
+    let admin = f
+        .set_registration("open", &["catalog:read", "system:admin"])
+        .await;
+    assert_eq!(
+        admin.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        admin.body
+    );
+    assert_eq!(admin.body["code"], "registration_admin_forbidden");
+    let open = f.set_registration("open", &["catalog:read"]).await;
+    assert_eq!(open.status, StatusCode::OK, "{}", open.body);
+    assert_eq!(open.body["policy"], "open");
+    let methods = f.call("GET", "/api/v2/auth/methods", None, &[]).await;
+    assert_eq!(methods.body["registration"], "open");
+    // Unauthenticated callers cannot read or change the policy.
+    let anonymous = f
+        .call("GET", "/api/v2/admin/auth/registration", None, &[])
+        .await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn open_registration_activates_once_with_default_grant_and_replays_stably() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("open", &["catalog:read"]).await.status,
+        StatusCode::OK
+    );
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "New Person").await;
+    let finished = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(finished.status, StatusCode::OK, "{}", finished.body);
+    assert_eq!(finished.body["status"], "account_active");
+    assert_eq!(finished.body["session_issued"], true);
+    let session = finished.cookie("motion_session").expect("usable access");
+    let me = f
+        .call("GET", "/api/v2/me", None, &[("cookie", &session)])
+        .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    let user: (String, String) =
+        sqlx::query_as("SELECT id,permissions FROM access_users WHERE name='New Person'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(user.1, "[\"catalog:read\"]");
+    assert_eq!(f.families().await, 1);
+    // A retry after a lost response is stable and issues nothing new.
+    let replay = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(replay.status, StatusCode::OK, "{}", replay.body);
+    assert_eq!(replay.body["status"], "account_active");
+    assert_eq!(replay.body["session_issued"], false);
+    assert!(replay.cookie("motion_session").is_none());
+    assert_eq!(f.families().await, 1);
+    // The replay is browser-bound.
+    let other = f
+        .email_finish(&id, "motion_signin=".to_owned().as_str(), &code)
+        .await;
+    assert_ne!(other.status, StatusCode::OK);
+    // Registering an owned address sends a notice without a code and changes nothing.
+    let previous = f.mail.messages.lock().await.len();
+    let again = f.register(NEWCOMER, "Impostor").await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(
+        again.body["message"],
+        f.register("unused@example.invalid", "x").await.body["message"]
+    );
+    let delivered = f.drain(previous).await;
+    let notice = delivered
+        .iter()
+        .find(|m| m.contains("already has a sign-in method"))
+        .expect("account notice");
+    assert_eq!(code_in(notice), None);
+    let guessed = f
+        .email_finish(
+            again.body["transaction_id"].as_str().unwrap(),
+            &again.cookie("motion_signin").unwrap(),
+            "12345678",
+        )
+        .await;
+    assert_eq!(guessed.body["code"], "invalid_code");
+    assert_eq!(
+        f.count("SELECT count(*) FROM access_users WHERE name='Impostor'")
+            .await,
+        0
+    );
+    // The new identity signs in through ordinary email login.
+    let previous = f.mail.messages.lock().await.len();
+    let login = f.email_start(NEWCOMER, "login", &[]).await;
+    let code = code_in(&f.drain(previous).await[0]).unwrap();
+    let signed = f
+        .email_finish(
+            login.body["transaction_id"].as_str().unwrap(),
+            &login.cookie("motion_signin").unwrap(),
+            &code,
+        )
+        .await;
+    assert_eq!(signed.body["status"], "signed_in", "{}", signed.body);
+}
+
+#[tokio::test]
+async fn concurrent_registrations_for_one_address_create_one_account() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("open", &["catalog:read"]).await.status,
+        StatusCode::OK
+    );
+    let first = f.registered_code(NEWCOMER, "Racer").await;
+    let second = f.registered_code(NEWCOMER, "Racer").await;
+    assert_ne!(first.1, second.1, "independent browsers");
+    let won = f.email_finish(&second.0, &second.1, &second.2).await;
+    assert_eq!(won.body["status"], "account_active", "{}", won.body);
+    let lost = f.email_finish(&first.0, &first.1, &first.2).await;
+    assert_eq!(lost.status, StatusCode::CONFLICT, "{}", lost.body);
+    assert_eq!(lost.body["code"], "registration_unavailable");
+    assert_eq!(
+        f.count("SELECT count(*) FROM access_users WHERE name='Racer'")
+            .await,
+        1
+    );
+    assert_eq!(f.families().await, 1);
+    assert_eq!(f.transaction_state(&first.0).await["phase"], "failed");
+    // The consumed losing proof cannot be retried into a different outcome.
+    let retry = f.email_finish(&first.0, &first.1, &first.2).await;
+    assert_ne!(retry.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn approval_registration_waits_for_an_explicit_grant() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("approval_required", &["catalog:read"])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    for _ in 0..2 {
+        let (id, cookie, code) = f.registered_code(NEWCOMER, "Requester").await;
+        let finished = f.email_finish(&id, &cookie, &code).await;
+        assert_eq!(
+            finished.body["status"], "pending_approval",
+            "{}",
+            finished.body
+        );
+        assert!(finished.cookie("motion_session").is_none());
+    }
+    assert_eq!(f.families().await, 0);
+    assert_eq!(
+        f.count("SELECT count(*) FROM access_users WHERE name='Requester'")
+            .await,
+        0
+    );
+    // A lapsed pending request is replaced inside the completion transaction.
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "Requester").await;
+    sqlx::query("UPDATE signin_requests SET expires_at=0 WHERE kind='email'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let renewed = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(
+        renewed.body["status"], "pending_approval",
+        "{}",
+        renewed.body
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM signin_requests WHERE status='expired'")
+            .await,
+        1
+    );
+    let requests = f
+        .operator("GET", "/api/v2/admin/auth/requests", None, None)
+        .await;
+    let items: Vec<&Value> = requests.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["status"] == "pending")
+        .collect();
+    assert_eq!(items.len(), 1, "one pending request per address");
+    assert_eq!(items[0]["kind"], "email");
+    assert_eq!(items[0]["address"], NEWCOMER);
+    let user = f.user(&["catalog:read"]).await;
+    let approved = f
+        .operator(
+            "POST",
+            &format!(
+                "/api/v2/admin/auth/requests/{}/approve",
+                items[0]["id"].as_str().unwrap()
+            ),
+            Some(json!({"user_id":user["id"],"user_revision":user["revision"],"recovery":true})),
+            Some(&items[0]["revision"]),
+        )
+        .await;
+    assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+    let previous = f.mail.messages.lock().await.len();
+    let login = f.email_start(NEWCOMER, "login", &[]).await;
+    let code = code_in(&f.drain(previous).await[0]).unwrap();
+    let signed = f
+        .email_finish(
+            login.body["transaction_id"].as_str().unwrap(),
+            &login.cookie("motion_signin").unwrap(),
+            &code,
+        )
+        .await;
+    assert_eq!(signed.body["status"], "signed_in", "{}", signed.body);
+}
+
+#[tokio::test]
+async fn invite_only_registration_completes_exactly_the_bound_invitation() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("invite_only", &["catalog:read"])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // Without an invitation nothing is sent and the response is unchanged.
+    let previous = f.mail.messages.lock().await.len();
+    let silent = f.register(NEWCOMER, "Invitee").await;
+    assert_eq!(silent.status, StatusCode::OK);
+    assert!(f.drain(previous).await.is_empty());
+    let user = f.user(&["catalog:read", "playback:request"]).await;
+    let previous = f.mail.messages.lock().await.len();
+    let invitation = f
+        .operator(
+            "POST",
+            "/api/v2/auth/invitations",
+            Some(json!({"user_id":user["id"],"user_revision":user["revision"],"ttl_seconds":3600,
+                "profile_ids":["default"],"permissions":["catalog:read"],"policy":user["policy"],"email":NEWCOMER})),
+            None,
+        )
+        .await;
+    assert_eq!(
+        invitation.status,
+        StatusCode::CREATED,
+        "{}",
+        invitation.body
+    );
+    let delivered = f.drain(previous).await;
+    assert_eq!(delivered.len(), 1);
+    assert!(delivered[0].contains("invited this address"));
+    assert!(!delivered[0].contains(invitation.body["code"].as_str().unwrap()));
+    assert_eq!(
+        code_in(&delivered[0]),
+        None,
+        "the invitation email carries no secret"
+    );
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "Ignored name").await;
+    let finished = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(
+        finished.body["status"], "invitation_accepted",
+        "{}",
+        finished.body
+    );
+    assert!(finished.cookie("motion_session").is_some());
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM signin_identities WHERE address=?")
+        .bind(NEWCOMER)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, user["id"].as_str().unwrap());
+    let permissions: String =
+        sqlx::query_scalar("SELECT permissions FROM signin_identities WHERE address=?")
+            .bind(NEWCOMER)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        permissions, "[\"catalog:read\"]",
+        "bounded by the invitation grant"
+    );
+    let listed = f
+        .operator("GET", "/api/v2/auth/invitations", None, None)
+        .await;
+    assert_eq!(listed.body["items"][0]["status"], "registered");
+    // Device redemption of the same invitation is a competing, refused claim.
+    let redeemed = f
+        .call(
+            "POST",
+            "/api/v2/auth/invitations/redeem",
+            Some(json!({"code":invitation.body["code"],"claim_id":"0123456789abcdef0123456789abcdef","device_name":"x","client_name":"y"})),
+            &[],
+        )
+        .await;
+    assert_eq!(redeemed.status, StatusCode::CONFLICT, "{}", redeemed.body);
+}
+
+#[tokio::test]
+async fn revoked_invitations_and_policy_changes_fail_pending_registrations() {
+    let f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("invite_only", &["catalog:read"])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let user = f.user(&["catalog:read"]).await;
+    let invitation = f
+        .operator(
+            "POST",
+            "/api/v2/auth/invitations",
+            Some(json!({"user_id":user["id"],"user_revision":user["revision"],"ttl_seconds":3600,
+                "profile_ids":["default"],"permissions":["catalog:read"],"policy":user["policy"],"email":NEWCOMER})),
+            None,
+        )
+        .await;
+    assert_eq!(
+        invitation.status,
+        StatusCode::CREATED,
+        "{}",
+        invitation.body
+    );
+    f.drain(0).await;
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "x").await;
+    let revoked = f
+        .operator(
+            "DELETE",
+            &format!(
+                "/api/v2/auth/invitations/{}",
+                invitation.body["id"].as_str().unwrap()
+            ),
+            None,
+            Some(&invitation.body["revision"]),
+        )
+        .await;
+    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "{}", revoked.body);
+    let refused = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert_eq!(refused.body["code"], "registration_unavailable");
+    assert_eq!(f.families().await, 0);
+    // A policy change ends challenges issued under the old policy revision.
+    assert_eq!(
+        f.set_registration("open", &["catalog:read"]).await.status,
+        StatusCode::OK
+    );
+    let (id, cookie, code) = f.registered_code(NEWCOMER, "Changed").await;
+    assert_eq!(
+        f.set_registration("approval_required", &["catalog:read"])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let stale = f.email_finish(&id, &cookie, &code).await;
+    assert_eq!(stale.status, StatusCode::CONFLICT, "{}", stale.body);
+    assert_eq!(
+        f.count("SELECT count(*) FROM access_users WHERE name='Changed'")
+            .await,
+        0
+    );
+    assert_eq!(f.count("SELECT count(*) FROM signin_requests").await, 0);
+}
+
+#[tokio::test]
+async fn interrupted_attempts_recover_as_ambiguous_and_activity_is_redacted() {
+    let mut f = Fixture::new().await;
+    f.configure_mail().await;
+    assert_eq!(
+        f.set_registration("open", &["catalog:read"]).await.status,
+        StatusCode::OK
+    );
+    let port = f.mail.port;
+    f.mail.task.abort();
+    while !f.mail.task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let started = f.register(NEWCOMER, "Recovered").await;
+    let id = started.body["transaction_id"].as_str().unwrap().to_owned();
+    while playscale::v2::signin::deliver_mail_once(&f.app)
+        .await
+        .unwrap()
+    {}
+    let hash_before: String =
+        sqlx::query_scalar("SELECT message_hash FROM signin_outbox WHERE owner_id=?")
+            .bind(&id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    // Simulate a crash after the attempt reservation: an expired lease.
+    sqlx::query("UPDATE signin_outbox SET phase='sending',lease_token='crashed',lease_attempt=attempts,lease_until=0,next_attempt=0 WHERE owner_id=?")
+        .bind(&id)
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    f.mail = MailSink::bind(port).await;
+    let previous = f.mail.messages.lock().await.len();
+    let delivered = f.drain(previous).await;
+    assert_eq!(delivered.len(), 1);
+    let row: (String, bool, i64, String) = sqlx::query_as(
+        "SELECT phase,ambiguous,attempts,message_hash FROM signin_outbox WHERE owner_id=?",
+    )
+    .bind(&id)
+    .fetch_one(&f.app.db)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "accepted");
+    assert!(row.1, "possible duplicate is recorded");
+    assert!(row.2 >= 2);
+    assert_eq!(
+        row.3, hash_before,
+        "retries transmit the same message bytes"
+    );
+    let payload: Option<String> =
+        sqlx::query_scalar("SELECT payload FROM signin_outbox WHERE owner_id=?")
+            .bind(&id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(payload, None, "terminal state erases the sealed payload");
+    let activity = f
+        .operator(
+            "GET",
+            "/api/v2/admin/auth/email/activity?limit=50",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(activity.status, StatusCode::OK, "{}", activity.body);
+    let text = activity.body.to_string();
+    assert!(!text.contains(NEWCOMER) && !text.contains("newcomer@"));
+    let item = activity.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["purpose"] == "registration_code")
+        .unwrap();
+    assert_eq!(item["status"], "accepted");
+    assert_eq!(item["possible_duplicate"], true);
+    assert_eq!(item["recipient_domain"], "example.invalid");
+    // A configuration change cancels queued mail before any further attempt.
+    f.mail.task.abort();
+    while !f.mail.task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let queued = f.register("later@example.invalid", "Later").await;
+    let queued_id = queued.body["transaction_id"].as_str().unwrap().to_owned();
+    while playscale::v2::signin::deliver_mail_once(&f.app)
+        .await
+        .unwrap()
+    {}
+    let email = f
+        .operator("GET", "/api/v2/admin/auth/email", None, None)
+        .await;
+    let changed = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(json!({"enabled":false,"host":"127.0.0.1","port":port,"username":"","from":"Motion <motion@example.invalid>","loopback_test":true})),
+            Some(&email.body["revision"]),
+        )
+        .await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.body);
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT phase,payload FROM signin_outbox WHERE owner_id=?")
+            .bind(&queued_id)
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(state, ("cancelled".into(), None));
+}
+
+#[tokio::test]
+async fn direct_delivery_signs_tests_confirms_receipt_and_diagnoses_dns() {
+    let f = Fixture::new().await;
+    let origin = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/settings",
+            Some(json!({"public_origin":ORIGIN})),
+            Some(&json!("1")),
+        )
+        .await;
+    assert_eq!(origin.status, StatusCode::OK);
+    let key = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mail/dkim.pem"
+    ))
+    .unwrap();
+    let config = json!({"enabled":false,"mode":"direct","from":"Motion <motion@example.invalid>",
+        "direct":{"hostname":"mail.example.invalid","envelope_from":"bounces@example.invalid","selector":"motion1","loopback_port":f.mail.port},
+        "dkim_key":{"action":"import","value":key}});
+    let draft = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(config),
+            Some(&json!("1")),
+        )
+        .await;
+    assert_eq!(draft.status, StatusCode::OK, "{}", draft.body);
+    assert_eq!(draft.body["mode"], "direct");
+    let record = draft.body["dkim"]["record"].as_str().unwrap().to_owned();
+    assert_eq!(
+        draft.body["dkim"]["record_name"],
+        "motion1._domainkey.example.invalid"
+    );
+    assert!(!draft.body.to_string().contains("PRIVATE KEY"));
+    let previous = f.mail.messages.lock().await.len();
+    let tested = f
+        .operator(
+            "POST",
+            "/api/v2/admin/auth/email/test",
+            Some(json!({"address":"sink@example.invalid"})),
+            None,
+        )
+        .await;
+    assert_eq!(tested.status, StatusCode::OK, "{}", tested.body);
+    assert_eq!(tested.body["status"], "accepted");
+    let message = f.mail.messages.lock().await[previous].clone();
+    assert!(message.starts_with(
+        "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.invalid; s=motion1;"
+    ));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.eml");
+    std::fs::write(&path, &message).unwrap();
+    let verified = std::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mail/dkim_verify.mjs"
+        ))
+        .arg(&path)
+        .arg(&record)
+        .output()
+        .unwrap();
+    let verified: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
+    // Acceptance alone is not receipt; entering the emailed code is.
+    let email = f
+        .operator("GET", "/api/v2/admin/auth/email", None, None)
+        .await;
+    assert_eq!(email.body["last_test_ok"], true);
+    assert_eq!(email.body["last_receipt_at"], Value::Null);
+    let test = tested.body["test_id"].as_str().unwrap();
+    let wrong = f
+        .operator(
+            "POST",
+            &format!("/api/v2/admin/auth/email/tests/{test}/confirm"),
+            Some(json!({"code":"00000000"})),
+            None,
+        )
+        .await;
+    assert_eq!(wrong.body["code"], "invalid_code");
+    let confirmed = f
+        .operator(
+            "POST",
+            &format!("/api/v2/admin/auth/email/tests/{test}/confirm"),
+            Some(json!({"code":code_in(&message).unwrap()})),
+            None,
+        )
+        .await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+    let email = f
+        .operator("GET", "/api/v2/admin/auth/email", None, None)
+        .await;
+    assert!(email.body["last_receipt_at"].is_i64());
+    // The test code is never an authentication challenge.
+    assert_eq!(f.families().await, 0);
+    // Diagnostics against explicit fixture DNS: published key matches.
+    let public = record.split("p=").nth(1).unwrap().to_owned();
+    let mut dns = playscale::mail::dns::Fixture::default();
+    dns.txt.insert(
+        "motion1._domainkey.example.invalid".into(),
+        playscale::mail::dns::Answer::Records(vec![format!("v=DKIM1; k=rsa; p={public}")]),
+    );
+    dns.txt.insert(
+        "example.invalid".into(),
+        playscale::mail::dns::Answer::Records(vec!["v=spf1 -all".into()]),
+    );
+    f.app.access.mail.use_fixture(playscale::mail::Fixture {
+        dns,
+        roots: tokio_rustls::rustls::RootCertStore::empty(),
+        ports: Default::default(),
+    });
+    let diagnostics = f
+        .operator(
+            "POST",
+            "/api/v2/admin/auth/email/diagnostics",
+            Some(json!({})),
+            None,
+        )
+        .await;
+    assert_eq!(diagnostics.status, StatusCode::OK, "{}", diagnostics.body);
+    let findings = diagnostics.body["findings"].as_array().unwrap();
+    let status =
+        |check: &str| findings.iter().find(|f| f["check"] == check).unwrap()["status"].clone();
+    assert_eq!(status("dkim"), "ok");
+    assert_eq!(status("spf"), "ok");
+    assert_eq!(status("dmarc"), "warning");
+    assert_eq!(status("alignment"), "ok");
+    assert!(
+        !diagnostics.body["cannot_prove"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Enabling requires the test for the current revision; it passed.
+    let mut enable = json!({"enabled":true,"mode":"direct","from":"Motion <motion@example.invalid>",
+        "direct":{"hostname":"mail.example.invalid","envelope_from":"bounces@example.invalid","selector":"motion1","loopback_port":f.mail.port}});
+    let enabled = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(enable.clone()),
+            Some(&email.body["revision"]),
+        )
+        .await;
+    assert_eq!(enabled.status, StatusCode::OK, "{}", enabled.body);
+    // Rotating the key changes the configuration and requires a new test.
+    enable["dkim_key"] = json!({"action":"generate"});
+    let rotated = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(enable.clone()),
+            Some(&enabled.body["revision"]),
+        )
+        .await;
+    assert_eq!(
+        rotated.body["code"], "email_test_required",
+        "{}",
+        rotated.body
+    );
+    // An explicitly confirmed change applies while email stays enabled.
+    enable["apply_untested"] = json!(true);
+    let applied = f
+        .operator(
+            "PUT",
+            "/api/v2/admin/auth/email",
+            Some(enable),
+            Some(&enabled.body["revision"]),
+        )
+        .await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.body);
+    assert_eq!(applied.body["enabled"], true);
+    assert_eq!(applied.body["last_test_ok"], Value::Null);
+    assert_ne!(
+        applied.body["dkim"]["key_id"],
+        enabled.body["dkim"]["key_id"]
+    );
 }

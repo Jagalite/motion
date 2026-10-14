@@ -30,6 +30,7 @@ fn transaction(purpose: Purpose) -> Transaction {
         expires_at: EXPIRY,
         phase: Phase::Pending,
         attempts: 0,
+        registration: None,
     }
 }
 

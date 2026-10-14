@@ -2,6 +2,8 @@
 //! revocation commits with the production core decision in a reserved writer.
 mod administration;
 mod flows;
+mod outbox;
+mod registration;
 mod store;
 use super::{
     Body, Problem, access_management,
@@ -17,11 +19,16 @@ use axum::{
     response::{IntoResponse, Response},
 };
 pub use flows::*;
+pub use outbox::deliver_mail_once;
 use playscale_core::{
     access::{AccessError, Credential, CredentialKind, Device, Grant, Permission},
     access_admin::{self, User},
     signin as core,
 };
+pub use registration::{
+    RegisterStart, RegistrationInput, get_registration, register_start, replace_registration,
+};
+pub(crate) use registration::{cancel_invitation_mail, email_invitation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;

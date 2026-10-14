@@ -132,6 +132,12 @@ function errorMessage(error) {
   if (error.code === 'invalid_code') return 'That code did not match. Check the email and enter the code in the browser that requested it.';
   if (error.code === 'code_attempts_exhausted') return 'This code has reached its attempt limit. Start a new email request.';
   if (['signin_expired', 'signin_already_used'].includes(error.code)) return 'This sign-in request expired or was already used. Start a new request.';
+  if (error.code === 'registration_closed') return 'This server does not accept new account registrations.';
+  if (error.code === 'registration_changed') return 'Registration settings changed. Start a new registration.';
+  if (error.code === 'registration_unavailable') return 'This registration cannot be completed. If you already have an account, sign in by email instead.';
+  if (error.code === 'registration_capacity') return 'Registration is temporarily unavailable. Try again later.';
+  if (error.code === 'registration_admin_forbidden') return 'Open registration can never grant administrator access. Remove that permission.';
+  if (error.code === 'email_test_required') return 'Save the settings disabled, send a successful test, then enable.';
   if (error.code === 'last_signin_method') return 'Keep another usable sign-in method before removing this one, or arrange recovery with the local operator.';
   if (error.code === 'last_administrator') return 'Keep another usable administrator before disabling or removing this access. Set up and verify another administrator first.';
   if ([409, 412, 428].includes(error.status)) return 'This information changed or the request expired. Refresh this section, review the current values, and submit a new request.';
@@ -269,9 +275,9 @@ async function selectionRows(path) {
   } while (cursor);
   return result;
 }
-function grantFields(parent, current = {}, lookups = {}) {
+function grantFields(parent, current = {}, lookups = {}, permissionOptions = permissions) {
   const profile_ids = choices(parent, 'Allowed viewing profiles', (lookups.profiles ?? []).map(v => [v.id, v.name]), current.profile_ids ?? []);
-  const permission_ids = choices(parent, 'Permissions', permissions, current.permissions ?? []);
+  const permission_ids = choices(parent, 'Permissions', permissionOptions, current.permissions ?? []);
   const policy = current.policy ?? {};
   const library_ids = choices(parent, 'Allowed libraries', (lookups.libraries ?? []).map(v => [v.id, v.name]), policy.library_ids ?? []);
   parent.append(node('p', 'No libraries selected means no library access. Administrator grants remain subject to the user and device ceilings.', {class: 'muted small'}));
@@ -316,6 +322,39 @@ function emailFlow(parent, purpose = 'login') {
   });
   const address = field(send.fields, 'Email address', '', 'email', {autocomplete: 'email', required: true, maxlength: 320});
 }
+const registrationText = {
+  open: 'Verify your email address to create an account. Your account becomes active immediately with the access this server grants new members.',
+  approval_required: 'Verify your email address to request an account. An administrator reviews each request before any access is granted.',
+  invite_only: 'Accounts on this server require an invitation sent to your email address. Use the address that received the invitation.',
+};
+const registrationOutcome = {
+  account_active: 'Your account is active.',
+  invitation_accepted: 'Invitation accepted. Your account is active.',
+  pending_approval: 'Email verified. Your request is waiting for administrator approval. No access has been granted yet; you will be able to sign in by email once it is approved.',
+};
+function registrationFlow(parent, policy) {
+  const area = panel(parent, 'Create an account', registrationText[policy] ?? '');
+  area.setAttribute('data-registration', policy);
+  const send = form(area, 'Send verification code', async () => {
+    const response = await api('POST', '/auth/register/start', {address: address.value.trim(), name: name.value.trim() || undefined});
+    address.value = ''; send.element.remove();
+    area.append(node('p', response.message || 'If this address can register, a verification code has been sent.', {role: 'status'}));
+    const verify = form(area, 'Verify email', async () => {
+      const result = await api('POST', `/auth/email/${idPath(response.transaction_id)}/finish`, {code: code.value.trim()});
+      code.value = ''; verify.element.remove();
+      const outcome = node('p', registrationOutcome[result.status] ?? 'Verification finished.', {class: 'notice', role: 'status'});
+      outcome.setAttribute('data-registration-outcome', result.status);
+      area.append(outcome);
+      if (result.redirect_to) area.append(node('a', 'Continue to Motion', {href: safeRedirect(result.redirect_to), class: 'button primary'}));
+      else if (result.status !== 'pending_approval') area.append(node('a', 'Sign in by email', {href: '/signin', class: 'button'}));
+    });
+    const code = field(verify.fields, 'Verification code', '', 'text', {autocomplete: 'one-time-code', inputmode: 'numeric', required: true, maxlength: 12});
+    code.focus();
+    button('Start again', () => { area.remove(); registrationFlow(parent, policy); }, area);
+  });
+  const address = field(send.fields, 'Email address', '', 'email', {autocomplete: 'email', required: true, maxlength: 320});
+  const name = policy === 'open' || policy === 'approval_required' ? field(send.fields, 'Your name (shown to the administrator)', '', 'text', {autocomplete: 'name', maxlength: 100}) : {value: ''};
+}
 async function signInPage(content, output) {
   const data = await api('GET', '/auth/methods');
   const params = new URLSearchParams(location.search);
@@ -326,6 +365,7 @@ async function signInPage(content, output) {
       return;
     }
     const descriptions = {
+      ...registrationOutcome,
       pending_approval: 'An administrator must approve this identity. No application access has been granted. Sign in again after approval.',
       tested: 'Provider sign-in verified. Return to Authentication & Access to explicitly enable this provider.',
       linked: 'Sign-in method linked to your account.',
@@ -340,6 +380,7 @@ async function signInPage(content, output) {
   }
   for (const provider of data.providers ?? []) await startOidc(content, provider, 'login');
   if (data.email_enabled) emailFlow(content);
+  if (data.email_enabled && data.registration && data.registration !== 'closed') registrationFlow(content, data.registration);
   announce(output, data.providers?.length || data.email_enabled ? 'Use one of these methods or pair this browser below.' : 'Pair this browser to request access.');
 }
 
@@ -402,31 +443,172 @@ async function methodsSection(parent) {
       });
     }
     providerForm(body, null, reload);
-    const area = panel(body, 'Passwordless email', email.enabled ? 'Enabled' : 'Disabled');
-    detail(area, 'Last delivery test', email.last_test_at ? `${email.last_test_ok ? 'Accepted by mail server' : 'Failed'} · ${when(email.last_test_at)}` : 'Not tested');
-    area.append(node('p', 'Mail server acceptance is not proof of mailbox delivery or authentication.', {class: 'muted'}));
-    const edit = disclosure(area, 'Configure email delivery');
-    const input = form(edit, 'Save email settings', async () => {
-      if (email.enabled && !enabled.checked && !disableConfirmed.checked) throw Object.assign(new Error('Confirm disabling email sign-in and its sessions.'), {status: 400});
-      await mutation(edit, 'PUT', '/admin/auth/email', {enabled: enabled.checked, host: host.value.trim(), port: Number(port.value), username: username.value, from: from.value.trim(), loopback_test: loopback.checked, password: secret.read()}, {revision: email.revision, action: 'email.write', target: 'email', done: async () => { secret.clear(); await reload(); }});
-    });
-    const host = field(input.fields, 'Mail server hostname', email.host, 'text', {required: true});
-    const port = field(input.fields, 'Port', email.port ?? 587, 'number', {required: true, min: 1, max: 65535});
-    const username = field(input.fields, 'Username', email.username, 'text', {autocomplete: 'off'});
-    const from = field(input.fields, 'Sender address', email.from, 'email', {required: true});
-    const secret = secretField(input.fields, 'Mail password', email.has_password);
-    const loopback = checkbox(input.fields, 'Use an isolated local mail sink (loopback only)', email.loopback_test);
-    const enabled = checkbox(input.fields, 'Enable email sign-in', email.enabled);
-    const disableConfirmed = checkbox(input.fields, 'If disabling email, I confirm cancellation of pending email sign-ins and revocation of email-authenticated sessions.');
-    const testForm = form(area, 'Send test email to this address', async () => {
-      const address = destination.value.trim();
-      await mutation(area, 'POST', '/admin/auth/email/test', {address}, {action: 'email.test', target: 'email', done: async () => { await reload(); announce(status(body), `The test email to ${address} was accepted by the configured server. Check that destination mailbox.`); }});
-    });
-    const destination = field(testForm.fields, 'Explicit test email destination', '', 'email', {required: true, autocomplete: 'off'});
+    body.append(node('p', 'Passwordless email sign-in and its delivery are configured under Email delivery.', {class: 'muted'}));
   };
   await reload();
 }
 
+const deliveryStatus = {
+  queued: 'Queued', retry_pending: 'Retry pending', sending: 'Sending', accepted: 'Accepted by mail server',
+  failed: 'Failed', acceptance_unknown: 'Acceptance unknown (may have been delivered)', expired: 'Expired', cancelled: 'Cancelled',
+};
+const purposeLabel = {
+  signin_code: 'Sign-in code', registration_code: 'Registration code', invitation: 'Invitation',
+  account_notice: 'Existing-account notice', test: 'Delivery test',
+};
+function keyField(parent, dkim) {
+  const group = node('fieldset'); group.append(node('legend', 'DKIM signing key'));
+  group.append(node('p', dkim?.has_key ? `A key is stored (identity ${dkim.key_id}). The private key is never returned to this browser.` : 'No signing key is stored. Direct delivery requires one.', {class: 'muted'}));
+  const action = select(group, 'DKIM key action', [['retain', 'Retain current key'], ['generate', 'Generate a new 2048-bit key'], ['import', 'Import a PEM private key'], ['clear', 'Remove the key']], 'retain');
+  const wrapper = node('div', undefined, {class: 'access-field'});
+  const id = `access-field-${++fieldSequence}`;
+  wrapper.append(node('label', 'PEM private key to import (unencrypted RSA, 2048–4096 bits)', {for: id}));
+  const pem = node('textarea', undefined, {id, rows: 4, spellcheck: false, autocomplete: 'off'});
+  pem.disabled = true; wrapper.append(pem); group.append(wrapper);
+  action.addEventListener('change', () => { pem.disabled = action.value !== 'import'; if (pem.disabled) pem.value = ''; });
+  parent.append(group);
+  return {
+    read: () => {
+      if (action.value === 'import' && !pem.value.trim()) throw Object.assign(new Error('Paste the PEM private key to import.'), {status: 400});
+      return action.value === 'import' ? {action: 'import', value: pem.value} : {action: action.value};
+    },
+    clear: () => { pem.value = ''; },
+  };
+}
+function recordList(parent, records) {
+  const list = node('dl', undefined, {class: 'access-records'});
+  for (const record of records) {
+    list.append(node('dt', `${record.type} ${record.name}`));
+    list.append(node('dd', record.value));
+  }
+  parent.append(list);
+}
+async function emailSection(parent) {
+  const sectionRoot = section(parent, 'email', 'Email delivery', 'Delivery serves email sign-in, registration and invitations. Pairing and local recovery keep working during mail outages.');
+  const body = node('div'); sectionRoot.append(body);
+  const reload = async () => {
+    const email = await api('GET', '/admin/auth/email');
+    body.replaceChildren();
+    const area = panel(body, 'Email sign-in and delivery', `${email.enabled ? 'Enabled' : 'Disabled'} · ${email.mode === 'direct' ? 'Native direct delivery' : 'SMTP relay'}`);
+    detail(area, 'Configuration revision', email.revision);
+    detail(area, 'Last delivery test', email.last_test_at ? `${email.last_test_ok ? 'Accepted by mail server' : 'Not accepted'} · ${when(email.last_test_at)}` : 'Not tested since the last change');
+    detail(area, 'Confirmed receipt', email.last_receipt_at ? `Code entered · ${when(email.last_receipt_at)}` : 'Not confirmed for this configuration');
+    area.append(node('p', 'Mail server acceptance is not proof of inbox delivery. Only entering the emailed test code confirms receipt, and no delivery result authenticates anyone.', {class: 'muted'}));
+    if (email.mode === 'direct' && email.dkim?.record) {
+      const records = panel(area, 'DNS records to publish', 'Publish these at your DNS provider. Motion cannot publish DNS records or set reverse DNS (PTR) for you.');
+      recordList(records, [{type: 'TXT', name: email.dkim.record_name ?? 'selector._domainkey', value: email.dkim.record}]);
+    }
+    const edit = disclosure(area, 'Configure email delivery');
+    const input = form(edit, 'Save email settings', async () => {
+      if (email.enabled && !enabled.checked && !disableConfirmed.checked) throw Object.assign(new Error('Confirm disabling email sign-in and its sessions.'), {status: 400});
+      const direct = mode.value === 'direct';
+      const payload = {enabled: enabled.checked, mode: mode.value, from: from.value.trim(), apply_untested: applyUntested.checked};
+      if (direct) {
+        payload.direct = {hostname: hostname.value.trim(), envelope_from: envelope.value.trim(), selector: selector.value.trim(), loopback_port: loopbackPort.value ? Number(loopbackPort.value) : null};
+        payload.dkim_key = key.read();
+      } else {
+        Object.assign(payload, {host: host.value.trim(), port: Number(port.value), username: username.value, loopback_test: loopback.checked, password: secret.read()});
+      }
+      await mutation(edit, 'PUT', '/admin/auth/email', payload, {revision: email.revision, action: 'email.write', target: 'email', done: async () => { secret.clear(); key.clear(); await reload(); }});
+    });
+    const mode = select(input.fields, 'Delivery mode', [['relay', 'SMTP relay (send through an existing mail server)'], ['direct', 'Native direct delivery (Motion connects to recipient mail servers)']], email.mode ?? 'relay');
+    const from = field(input.fields, 'Sender (From)', email.from, 'text', {required: true, placeholder: 'Motion <motion@example.com>'});
+    const relayGroup = node('fieldset'); relayGroup.append(node('legend', 'SMTP relay'));
+    const host = field(relayGroup, 'Mail server hostname', email.host, 'text');
+    const port = field(relayGroup, 'Port', email.port ?? 587, 'number', {min: 1, max: 65535});
+    const username = field(relayGroup, 'Username', email.username, 'text', {autocomplete: 'off'});
+    const secret = secretField(relayGroup, 'Mail password', email.has_password);
+    const loopback = checkbox(relayGroup, 'Use an isolated local mail sink (loopback only)', email.loopback_test);
+    input.fields.append(relayGroup);
+    const directGroup = node('fieldset'); directGroup.append(node('legend', 'Native direct delivery'));
+    directGroup.append(node('p', email.direct?.network_requirement ?? 'Direct delivery needs outbound TCP port 25.', {class: 'notice'}));
+    const hostname = field(directGroup, 'Sending hostname (EHLO name; should match reverse DNS)', email.direct?.hostname, 'text', {placeholder: 'mail.example.com'});
+    const envelope = field(directGroup, 'Envelope sender for bounces (an external mailbox you read)', email.direct?.envelope_from, 'email', {placeholder: 'bounces@example.com'});
+    const selector = field(directGroup, 'DKIM selector', email.direct?.selector, 'text', {placeholder: 'motion1'});
+    const key = keyField(directGroup, email.dkim);
+    const loopbackPort = field(directGroup, 'Isolated loopback qualification port (testing only; plaintext to 127.0.0.1)', email.direct?.loopback_port ?? '', 'number', {min: 1, max: 65535});
+    directGroup.append(node('p', 'TLS is required for every recipient server and never downgraded to plaintext. This is not MTA-STS or DANE.', {class: 'muted small'}));
+    input.fields.append(directGroup);
+    const showMode = () => { relayGroup.hidden = mode.value !== 'relay'; directGroup.hidden = mode.value !== 'direct'; };
+    mode.addEventListener('change', showMode); showMode();
+    const enabled = checkbox(input.fields, 'Enable email sign-in', email.enabled);
+    const disableConfirmed = checkbox(input.fields, 'If disabling email, I confirm cancellation of pending email sign-ins and revocation of email-authenticated sessions.');
+    const applyUntested = checkbox(input.fields, 'Apply changed delivery settings while email sign-in stays enabled. I will send a test immediately afterwards.');
+    applyUntested.disabled = !email.enabled;
+    input.fields.append(node('p', 'Saving changed delivery settings invalidates previous tests, cancels queued mail and signs out email-authenticated browser sessions.', {class: 'muted small'}));
+
+    const testArea = panel(area, 'Send a test message', 'Choose a mailbox you control. The message carries a test code that cannot sign anyone in.');
+    const testForm = form(testArea, 'Send test email', async () => {
+      const address = destination.value.trim();
+      await mutation(testArea, 'POST', '/admin/auth/email/test', {address}, {action: 'email.test', target: 'email', done: async result => {
+        announce(testForm.output, `${deliveryStatus[result.status] ?? result.status}. ${result.detail ?? ''}`);
+        const confirm = form(testArea, 'Confirm receipt', async () => {
+          await mutation(testArea, 'POST', `/admin/auth/email/tests/${idPath(result.test_id)}/confirm`, {code: code.value.trim()}, {done: async () => { await reload(); }});
+        });
+        const code = field(confirm.fields, 'Test code from the received message', '', 'text', {inputmode: 'numeric', maxlength: 12, autocomplete: 'off', required: true});
+      }});
+    });
+    const destination = field(testForm.fields, 'Explicit test email destination', '', 'email', {required: true, autocomplete: 'off'});
+
+    if (email.mode === 'direct') {
+      const diag = panel(area, 'Diagnostics', 'Checks published DNS records and, optionally, an outbound connection. Results are observations at one time, not guarantees.');
+      const results = node('div');
+      const run = form(diag, 'Run diagnostics', async () => {
+        const report = await api('POST', '/admin/auth/email/diagnostics', {probe_domain: probe.value.trim() || null});
+        results.replaceChildren();
+        detail(results, 'Configuration revision', report.revision);
+        detail(results, 'Observed', when(report.observed_at));
+        const list = node('ul', undefined, {class: 'access-findings'});
+        for (const finding of report.findings ?? []) {
+          const item = node('li', undefined, {'data-status': finding.status});
+          item.append(node('strong', `${finding.check}: ${finding.status}. `), node('span', finding.detail));
+          list.append(item);
+        }
+        results.append(list);
+        if (report.publish?.length) { results.append(node('h4', 'Records to publish')); recordList(results, report.publish); }
+        results.append(node('h4', 'What Motion cannot prove'));
+        const unknown = node('ul'); for (const text of report.cannot_prove ?? []) unknown.append(node('li', text));
+        results.append(unknown);
+        announce(run.output, 'Diagnostics complete.');
+      });
+      const probe = field(run.fields, 'Recipient domain to probe (optional, connects on port 25)', '', 'text', {placeholder: 'gmail.com', autocomplete: 'off'});
+      diag.append(results);
+    }
+    const activity = panel(area, 'Delivery activity', 'Recent messages without addresses or codes. Retries reuse the same message; an unknown acceptance may produce a duplicate.');
+    await paged(activity, '/admin/auth/email/activity', (host, item) => {
+      const card = panel(host, `${purposeLabel[item.purpose] ?? item.purpose} · ${item.recipient_domain}`, deliveryStatus[item.status] ?? item.status);
+      card.setAttribute('data-delivery-status', item.status);
+      detail(card, 'Attempts', `${item.attempts} of ${item.max_attempts}`);
+      detail(card, 'Created', when(item.created_at));
+      if (item.next_attempt_at) detail(card, 'Next attempt', when(item.next_attempt_at));
+      if (item.accepted_at) detail(card, 'Accepted', when(item.accepted_at));
+      if (item.possible_duplicate) card.append(node('p', 'An earlier attempt may already have been delivered.', {class: 'muted'}));
+      if (item.detail) detail(card, 'Last result', item.detail);
+      detail(card, 'Mode and revision', `${item.mode} · revision ${item.configuration_revision}`);
+    }, 'No messages yet.');
+  };
+  await reload();
+}
+async function registrationSection(parent, lookups) {
+  const area = section(parent, 'registration', 'Registration', 'Choose what verifying an email address does for someone without an account. Verification proves control of an address; it never links an existing account or grants administration.');
+  const current = await api('GET', '/admin/auth/registration');
+  const descriptions = {
+    closed: 'Closed: nobody can create an account. Use pairing, invitations redeemed on a device, or approve SSO requests.',
+    approval_required: 'Approval required: verifying creates a pending access request. No access until you approve it for a user.',
+    invite_only: 'Invite-only: only addresses with an unexpired emailed invitation can register; they receive the invitation grant.',
+    open: 'Open: verifying creates an active account with the default access below, without manual approval.',
+  };
+  detail(area, 'Current policy', descriptions[current.policy] ?? current.policy);
+  const edit = disclosure(area, 'Change registration policy');
+  const input = form(edit, 'Save registration policy', async () => {
+    await mutation(edit, 'PUT', '/admin/auth/registration', {policy: policy.value, default_access: grant()}, {revision: current.revision, action: 'registration.write', target: 'registration', done: () => location.reload()});
+  });
+  const policy = select(input.fields, 'Registration policy', Object.entries(descriptions).map(([value, text]) => [value, text.split(':')[0]]), current.policy);
+  input.fields.append(node('p', 'Changing the policy ends registrations already in progress; they must start again.', {class: 'muted small'}));
+  const defaults = node('fieldset'); defaults.append(node('legend', 'Default access for open registration'));
+  const grant = grantFields(defaults, current.default_access ?? {}, lookups, permissions.filter(([id]) => id !== 'system:admin'));
+  input.fields.append(defaults);
+}
 async function usersSection(parent, lookups) {
   const area = section(parent, 'users', 'Users', 'A local user is an access identity. Disabling access does not delete profiles or viewing history.');
   function userForm(host, user) {
@@ -468,10 +650,12 @@ async function usersSection(parent, lookups) {
   userForm(area);
 }
 async function requestsSection(parent, lookups) {
-  const area = section(parent, 'requests', 'Sign-in access requests', 'These identities passed provider verification but have no application access. Email matches never link accounts. Approval requires the identity to sign in again.');
+  const area = section(parent, 'requests', 'Sign-in access requests', 'These identities passed provider or email verification but have no application access. Email matches never link existing accounts. After approval the person signs in again.');
   await paged(area, '/admin/auth/requests', (host, request) => {
-    const item = panel(host, request.subject, request.status);
-    detail(item, 'Issuer', request.issuer); detail(item, 'Subject', request.subject);
+    const email = request.kind === 'email';
+    const item = panel(host, email ? request.address : request.subject, `${email ? 'Verified email' : 'SSO identity'} · ${request.status}`);
+    if (email) { detail(item, 'Verified address', request.address); detail(item, 'Name given', request.name ?? 'Not provided'); }
+    else { detail(item, 'Issuer', request.issuer); detail(item, 'Subject', request.subject); }
     detail(item, 'Received', when(request.created_at)); detail(item, 'Expires', when(request.expires_at));
     if (request.status !== 'pending') return;
     const input = form(item, 'Approve verified identity', async () => {
@@ -481,8 +665,8 @@ async function requestsSection(parent, lookups) {
     });
     const owner = select(input.fields, 'Local user receiving this identity', [['', 'Choose a user'], ...lookups.users.filter(user => !user.disabled).map(user => [user.id, user.name])]);
     input.fields.append(node('p', 'The identity receives no more than the selected user’s current grant and restrictions. Associating an existing user is an audited recovery action, not email matching.', {class: 'notice'}));
-    const recovery = checkbox(input.fields, 'I authorize this exact issuer and subject to link to the selected local user.');
-    confirmChange(item, 'Deny request', `Deny the access request from ${request.subject} at ${request.issuer}.`, async () => {
+    const recovery = checkbox(input.fields, email ? 'I authorize this verified email address to sign in as the selected local user.' : 'I authorize this exact issuer and subject to link to the selected local user.');
+    confirmChange(item, 'Deny request', email ? `Deny the access request from ${request.address}.` : `Deny the access request from ${request.subject} at ${request.issuer}.`, async () => {
       await mutation(item, 'POST', `/admin/auth/requests/${idPath(request.id)}/deny`, {}, {revision: request.revision, done: () => location.reload()});
     });
   }, 'No sign-in access requests.');
@@ -509,13 +693,14 @@ async function enrollmentSection(parent, lookups) {
   await paged(invites, '/auth/invitations', (host, invite) => {
     const item = panel(host, `Invitation for ${lookups.users.find(user => user.id === invite.user_id)?.name ?? invite.user_id}`, invite.status);
     detail(item, 'Expires', when(invite.expires_at)); detail(item, 'Permissions', invite.permissions.join(', ') || 'None');
+    if (invite.email) detail(item, 'Emailed to', invite.email);
     if (invite.status === 'unused') confirmChange(item, 'Revoke invitation', `Invalidate this unused invitation for user ${invite.user_id}.`, async () => mutation(item, 'DELETE', `/auth/invitations/${idPath(invite.id)}`, undefined, {revision: invite.revision, done: () => location.reload()}));
   }, 'No invitations.');
   const create = disclosure(invites, 'Create an invitation');
   const input = form(create, 'Generate single-use invitation', async () => {
     const chosen = lookups.users.find(user => user.id === owner.value);
     if (!chosen) throw Object.assign(new Error('Choose an explicit local user.'), {status: 400});
-    await mutation(create, 'POST', '/auth/invitations', {user_id: chosen.id, user_revision: chosen.revision, ttl_seconds: Number(ttl.value) * 60, ...grant()}, {action: 'invitation.create', target: chosen.id, done: result => {
+    await mutation(create, 'POST', '/auth/invitations', {user_id: chosen.id, user_revision: chosen.revision, ttl_seconds: Number(ttl.value) * 60, email: recipient.value.trim() || null, ...grant()}, {action: 'invitation.create', target: chosen.id, done: result => {
       const created = panel(create, 'Invitation created', 'Copy this code now. It will not be displayed again.');
       detail(created, 'Invitation code', result.code); detail(created, 'Expires', when(result.expires_at));
       announce(input.output, 'Invitation created.');
@@ -523,6 +708,7 @@ async function enrollmentSection(parent, lookups) {
   });
   const owner = select(input.fields, 'Invitation owner', [['', 'Choose a user'], ...lookups.users.filter(user => !user.disabled).map(user => [user.id, user.name])]);
   const ttl = field(input.fields, 'Expires in minutes', 60, 'number', {required: true, min: 1, max: 1440});
+  const recipient = field(input.fields, 'Email the invitation to (optional; they register with this address)', '', 'email', {autocomplete: 'off', maxlength: 320});
   const grant = grantFields(input.fields, {}, lookups);
 }
 function identityCard(parent, identity, admin = false) {
@@ -572,7 +758,7 @@ async function activitySection(parent) {
   }, 'No security events.');
 }
 async function overviewSection(parent) {
-  const area = section(parent, 'overview', 'Overview', 'New arrivals need an invitation or explicit administrator approval. Verified email does not grant administrator access.');
+  const area = section(parent, 'overview', 'Overview', 'New arrivals follow the registration policy. Verified email never links an existing account or grants administrator access.');
   const overview = await api('GET', '/admin/auth/overview');
   detail(area, 'Usable administrator devices', overview.usable_administrators);
   area.append(node('p', 'Several administrator devices can belong to one user. This count does not represent independent recovery accounts.', {class: 'muted'}));
@@ -595,7 +781,7 @@ async function overviewSection(parent) {
 async function adminPage(content, output) {
   const [users, profiles, libraries] = await Promise.all([selectionRows('/users'), selectionRows('/profiles'), selectionRows('/libraries')]);
   const lookups = {users, profiles, libraries};
-  const sections = [() => overviewSection(content), () => methodsSection(content), () => usersSection(content, lookups), () => requestsSection(content, lookups), () => enrollmentSection(content, lookups), async () => {
+  const sections = [() => overviewSection(content), () => methodsSection(content), () => emailSection(content), () => registrationSection(content, lookups), () => usersSection(content, lookups), () => requestsSection(content, lookups), () => enrollmentSection(content, lookups), async () => {
     const area = section(content, 'identities', 'Linked identities', 'To add a method, the account owner uses My sign-in methods and completes fresh proof. Access requests can be explicitly approved as audited recovery; provider subjects are never reassigned by editing text.');
     area.append(node('a', 'Open My sign-in methods', {href: '/settings/signin', class: 'button'}));
     await paged(area, '/admin/auth/identities', (host, identity) => identityCard(host, identity, true), 'No linked identities.');

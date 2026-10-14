@@ -2,8 +2,8 @@ use super::*;
 const BINDING_COOKIE: &str = "motion_signin";
 // Use only the transport peer supplied by axum. Forwarded headers cannot choose
 // a rate-limit identity. Reverse proxies share their transport peer's bucket.
-type Peer = Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>;
-async fn network_limit(
+pub(super) type Peer = Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>;
+pub(super) async fn network_limit(
     app: &App,
     peer: &Peer,
     lane: &str,
@@ -18,7 +18,7 @@ async fn network_limit(
     limit(app, &format!("{lane}:network:{key}"), count, seconds).await
 }
 
-fn binding(headers: &HeaderMap) -> Option<&str> {
+pub(super) fn binding(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -30,7 +30,7 @@ fn binding(headers: &HeaderMap) -> Option<&str> {
         })
         .map(|(_, v)| v)
 }
-fn binding_header(app: &App, value: &str) -> HeaderValue {
+pub(super) fn binding_header(app: &App, value: &str) -> HeaderValue {
     HeaderValue::from_str(&format!(
         "{BINDING_COOKIE}={value}; Path=/api/v2/auth; HttpOnly; SameSite=Lax; Max-Age={};{}",
         core::TRANSACTION_TTL,
@@ -42,7 +42,7 @@ fn binding_header(app: &App, value: &str) -> HeaderValue {
     ))
     .unwrap()
 }
-fn origin(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
+pub(super) fn origin(app: &App, headers: &HeaderMap) -> Result<(), Problem> {
     if headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) != Some(app.origin.as_str()) {
         return Err(Problem::new(
             StatusCode::FORBIDDEN,
@@ -72,18 +72,18 @@ async fn initiating_caller(
     }
 }
 #[derive(sqlx::FromRow)]
-struct TxRow {
-    provider_id: Option<String>,
-    state_json: String,
+pub(super) struct TxRow {
+    pub(super) provider_id: Option<String>,
+    pub(super) state_json: String,
     nonce: Option<String>,
     verifier: Option<String>,
-    address: Option<String>,
+    pub(super) address: Option<String>,
     code_hash: Option<String>,
     return_to: String,
     actor_id: Option<String>,
     actor_credential_hash: Option<String>,
     identity_id: Option<String>,
-    result: Option<String>,
+    pub(super) result: Option<String>,
     ceiling_json: Option<String>,
 }
 impl TxRow {
@@ -123,8 +123,8 @@ async fn current(
             r.get::<bool, _>("enabled") || state.purpose == core::Purpose::Test,
         )
     } else {
-        let (cfg, rev, _) = mail(c, app).await?;
-        (rev, cfg.enabled)
+        let mail = mail(c, app).await?;
+        (mail.revision, mail.cfg.enabled)
     };
     let user = match &state.user_id {
         Some(id) => access_management::load_user(c, id).await?,
@@ -178,7 +178,7 @@ async fn save_state(
     sqlx::query("UPDATE signin_transactions SET state_json=?,result=?,verifier=CASE WHEN ? IN ('consumed','failed') THEN NULL ELSE verifier END,code_hash=CASE WHEN ? IN ('consumed','failed') THEN NULL ELSE code_hash END WHERE id=?").bind(jsonstr(state)).bind(result).bind(jsonstr(&state.phase).trim_matches('"')).bind(jsonstr(&state.phase).trim_matches('"')).bind(&state.id).execute(c).await?;
     Ok(())
 }
-async fn trim(c: &mut sqlx::SqliteConnection) -> Result<(), Problem> {
+pub(super) async fn trim(c: &mut sqlx::SqliteConnection) -> Result<(), Problem> {
     sqlx::query("DELETE FROM signin_transactions WHERE expires_at<?")
         .bind(now() - 3600)
         .execute(&mut *c)
@@ -205,8 +205,9 @@ pub async fn methods(State(app): State<App>) -> Result<Response, Problem> {
         sqlx::query("SELECT id,name FROM signin_providers WHERE enabled=1 ORDER BY name LIMIT 32")
             .fetch_all(&mut *c)
             .await?;
-    let (email, _, _) = mail(&mut c, &app).await?;
-    Ok(Json(json!({"providers":if ready{rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"name":r.get::<String,_>("name")})).collect::<Vec<_>>()}else{vec![]},"email_enabled":ready&&email.enabled,"pairing_enabled":true})).into_response())
+    let email = mail(&mut c, &app).await?.cfg.enabled && ready;
+    let registration = super::registration::public_policy(&mut c, email).await?;
+    Ok(Json(json!({"providers":if ready{rows.iter().map(|r|json!({"id":r.get::<String,_>("id"),"name":r.get::<String,_>("name")})).collect::<Vec<_>>()}else{vec![]},"email_enabled":email,"registration":registration,"pairing_enabled":true})).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -324,6 +325,7 @@ pub async fn oidc_start(
         expires_at: evidence_until,
         phase: core::Phase::Pending,
         attempts: 0,
+        registration: None,
     };
     let actor = if body.value.purpose == core::Purpose::Login {
         None
@@ -551,7 +553,7 @@ pub async fn transaction(
     } else {
         row.result.as_deref().unwrap_or("pending")
     };
-    Ok(Json(json!({"status":status,"detail":match status{"pending_approval"=>"An administrator must approve access. Sign in again after approval.","tested"=>"Provider sign-in verified. Return to Authentication & Access to enable it.","linked"=>"Sign-in method linked.","failed"|"denied"=>"Sign-in did not complete. Start again.",_=>""},"redirect_to":if status=="signed_in"{Some(row.return_to)}else{None}})).into_response())
+    Ok(Json(json!({"status":status,"detail":match status{"pending_approval"=>"An administrator must approve access. Sign in again after approval.","tested"=>"Provider sign-in verified. Return to Authentication & Access to enable it.","linked"=>"Sign-in method linked.","failed"|"denied"=>"Sign-in did not complete. Start again.","invitation_accepted"=>"Invitation accepted. Your account is active.","account_active"=>"Your account is active.","registration_changed"=>"Registration settings changed. Start a new registration.",_=>""},"redirect_to":if status=="signed_in"{Some(row.return_to)}else{None}})).into_response())
 }
 pub(super) async fn link_identity(
     c: &mut sqlx::SqliteConnection,
@@ -613,7 +615,7 @@ pub(super) async fn link_identity(
     audit(c, &user.id, &id, "identity.link", "ok").await?;
     Ok(id)
 }
-async fn issue(
+pub(super) async fn issue(
     c: &mut sqlx::SqliteConnection,
     app: &App,
     identity: &str,
@@ -725,8 +727,9 @@ pub async fn email_start(
     let caller = initiating_caller(&app, &headers, body.value.purpose).await?;
     let mut tx = begin_write(&app.db).await?;
     trim(&mut tx).await?;
-    let (cfg, revision, _) = mail(&mut tx, &app).await?;
-    if !cfg.enabled || hold(&mut tx).await? {
+    let mail = mail(&mut tx, &app).await?;
+    let revision = mail.revision;
+    if !mail.cfg.enabled || !super::outbox::rehearse(&mail) || hold(&mut tx).await? {
         return Err(unavailable());
     }
     let mut evidence_until = now() + core::TRANSACTION_TTL;
@@ -818,6 +821,7 @@ pub async fn email_start(
         expires_at: evidence_until,
         phase: core::Phase::Pending,
         attempts: 0,
+        registration: None,
     };
     let actor = if body.value.purpose == core::Purpose::Login {
         None
@@ -831,14 +835,21 @@ pub async fn email_start(
         if eligible { &code } else { "ineligible" },
     );
     sqlx::query("INSERT INTO signin_transactions(id,state_json,address,code_hash,return_to,actor_id,actor_credential_hash,identity_id,created_at,expires_at,ceiling_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(jsonstr(&state)).bind(&address).bind(hash).bind("/").bind(actor.map(|c|c.principal.id.as_str())).bind(actor.and_then(|c|c.credential().map(|x|x.0))).bind(identity.as_ref().filter(|_|eligible).map(|v|v.0.as_str())).bind(now()).bind(state.expires_at).bind(ceiling.as_ref().map(jsonstr)).execute(&mut *tx).await?;
-    if eligible {
-        let outbox = new_id();
-        let payload = seal(
+    if !eligible {
+        super::outbox::rehearse(&mail);
+    } else {
+        super::outbox::enqueue(
+            &mut tx,
             &app,
-            &format!("mail:{outbox}"),
-            &jsonstr(&json!({"address":address,"code":code})),
-        )?;
-        sqlx::query("INSERT INTO signin_outbox(id,transaction_id,payload,next_attempt,expires_at,config_revision,destination_hash,created_at) VALUES(?,?,?,?,?,?,?,?)").bind(outbox).bind(&id).bind(payload).bind(now()).bind(state.expires_at).bind(revision).bind(keyed(&app,"email-address",&address)).bind(now()).execute(&mut *tx).await?;
+            &mail,
+            playscale_core::mail::Purpose::SigninCode,
+            &id,
+            Some(&id),
+            &address,
+            crate::mail::Content::SigninCode { code: &code },
+            state.expires_at,
+        )
+        .await?;
     }
     audit(
         &mut tx,
@@ -878,6 +889,21 @@ pub async fn email_finish(
     if row.provider_id.is_some() {
         return Err(Problem::not_found());
     }
+    // A retried registration (for example after a lost response) returns its
+    // stable recorded outcome without issuing another user or session family.
+    let recorded = row.state()?;
+    if recorded.purpose == core::Purpose::Register
+        && recorded.phase == core::Phase::Consumed
+        && binding(&headers)
+            .map(|b| keyed(&app, "browser", b))
+            .as_deref()
+            == Some(recorded.browser_hash.as_str())
+    {
+        return Ok(
+            Json(json!({"status":row.result,"session_issued":false,"redirect_to":null}))
+                .into_response(),
+        );
+    }
     let matches = body.value.code.len() == 8
         && body.value.code.bytes().all(|b| b.is_ascii_digit())
         && row.code_hash.as_deref().is_some_and(|expected| {
@@ -899,7 +925,46 @@ pub async fn email_finish(
     updated.state_json = jsonstr(&state);
     let state = current(&mut tx, &app, &updated, &headers, Step::Complete).await?;
     let mut token = None;
-    let result = if state.purpose == core::Purpose::Enroll {
+    let result = if state.purpose == core::Purpose::Register {
+        match super::registration::complete(&mut tx, &app, &updated, &state).await? {
+            Ok(super::registration::Completed::Session(result, issued)) => {
+                token = Some(issued);
+                static_result(result)
+            }
+            Ok(super::registration::Completed::NoSession(result)) => static_result(result),
+            Err(error) => {
+                // Verified proof is single-use even when policy refuses it.
+                let mut failed = state.clone();
+                failed.phase = core::Phase::Failed;
+                save_state(&mut tx, &failed, Some(error.code())).await?;
+                super::outbox::cancel_owner(&mut tx, &id).await?;
+                audit(
+                    &mut tx,
+                    "anonymous",
+                    &id,
+                    "registration.verify",
+                    error.code(),
+                )
+                .await?;
+                tx.commit().await?;
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    error.code(),
+                    match error {
+                        playscale_core::registration::Error::PolicyChanged => {
+                            "Registration settings changed. Start a new registration."
+                        }
+                        playscale_core::registration::Error::Closed => {
+                            "This server no longer accepts new registrations."
+                        }
+                        _ => {
+                            "This registration cannot be completed. Sign in instead, or contact the administrator."
+                        }
+                    },
+                ));
+            }
+        }
+    } else if state.purpose == core::Purpose::Enroll {
         let user = access_management::load_user(
             &mut tx,
             state.user_id.as_deref().ok_or_else(unavailable)?,
@@ -933,10 +998,7 @@ pub async fn email_finish(
         "signed_in"
     };
     save_state(&mut tx, &state, Some(result)).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='finished' WHERE transaction_id=?")
-        .bind(&id)
-        .execute(&mut *tx)
-        .await?;
+    super::outbox::cancel_owner(&mut tx, &id).await?;
     audit(
         &mut tx,
         updated.actor_id.as_deref().unwrap_or("anonymous"),
@@ -946,9 +1008,17 @@ pub async fn email_finish(
     )
     .await?;
     tx.commit().await?;
-    let mut response = Json(
-        json!({"status":result,"redirect_to":if result=="linked"{"/settings/signin"}else{"/"}}),
-    )
+    let mut response = Json(json!({
+        "status": result,
+        "session_issued": token.is_some(),
+        "redirect_to": if result == "linked" {
+            Some("/settings/signin")
+        } else if token.is_some() {
+            Some("/")
+        } else {
+            None
+        },
+    }))
     .into_response();
     if let Some(token) = token {
         response
@@ -962,7 +1032,7 @@ pub async fn email_finish(
 pub fn start_outbox(app: App) {
     tokio::spawn(async move {
         for _ in 0..42 {
-            match deliver_mail_once(&app).await {
+            match super::outbox::deliver_mail_once(&app).await {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(_) => {
@@ -979,71 +1049,16 @@ pub async fn mail_worker(
 ) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
     loop {
-        tokio::select! {_ = stop.cancelled()=>return Ok(()),_ = interval.tick()=>{for _ in 0..60{match deliver_mail_once(&app).await{Ok(true)=>continue,Ok(false)=>break,Err(_)=>{tracing::warn!("sign-in mail delivery deferred");break}}}}}
+        tokio::select! {_ = stop.cancelled()=>return Ok(()),_ = interval.tick()=>{for _ in 0..60{match super::outbox::deliver_mail_once(&app).await{Ok(true)=>continue,Ok(false)=>break,Err(_)=>{tracing::warn!("sign-in mail delivery deferred");break}}}}}
     }
 }
-pub async fn deliver_mail_once(app: &App) -> Result<bool, Problem> {
-    let mut tx = begin_write(&app.db).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='expired' WHERE expires_at<=? AND payload IS NOT NULL").bind(now()).execute(&mut *tx).await?;
-    let row=sqlx::query("SELECT * FROM signin_outbox WHERE payload IS NOT NULL AND expires_at>? AND next_attempt<=? AND phase IN ('pending','sending') ORDER BY created_at LIMIT 1").bind(now()).bind(now()).fetch_optional(&mut *tx).await?;
-    let Some(row) = row else {
-        tx.commit().await?;
-        return Ok(false);
-    };
-    let id: String = row.get("id");
-    let transaction: String = row.get("transaction_id");
-    let revision: i64 = row.get("config_revision");
-    let (cfg, current, wire) = mail(&mut tx, app).await?;
-    let challenge = txrow(&mut tx, &transaction).await?.state()?;
-    if !cfg.enabled
-        || hold(&mut tx).await?
-        || revision != current
-        || challenge.epoch != epoch(&mut tx).await?
-        || challenge.server_epoch != app.access.server_epoch
-        || challenge.phase != core::Phase::Pending
-    {
-        sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE id=?")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        return Ok(true);
+
+/// Results are a small fixed vocabulary; keep them `'static` for `save_state`.
+fn static_result(result: String) -> &'static str {
+    match result.as_str() {
+        "pending_approval" => "pending_approval",
+        "invitation_accepted" => "invitation_accepted",
+        "account_active" => "account_active",
+        _ => "failed",
     }
-    let payload: Value =
-        serde_json::from_str(&open(app, &format!("mail:{id}"), row.get("payload"))?)
-            .map_err(|_| unavailable())?;
-    sqlx::query(
-        "UPDATE signin_outbox SET phase='sending',attempts=attempts+1,next_attempt=? WHERE id=?",
-    )
-    .bind(now() + 30)
-    .bind(&id)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    let sent = crate::signin_protocol::send_code(
-        &wire,
-        payload["address"].as_str().ok_or_else(unavailable)?,
-        payload["code"].as_str().ok_or_else(unavailable)?,
-    )
-    .await
-    .is_ok();
-    let mut tx = begin_write(&app.db).await?;
-    sqlx::query(if sent {
-        "UPDATE signin_outbox SET payload=NULL,phase='sent' WHERE id=?"
-    } else {
-        "UPDATE signin_outbox SET phase='pending' WHERE id=? AND payload IS NOT NULL"
-    })
-    .bind(&id)
-    .execute(&mut *tx)
-    .await?;
-    audit(
-        &mut tx,
-        "mail-worker",
-        &transaction,
-        "email.delivery",
-        if sent { "sent" } else { "deferred" },
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(true)
 }

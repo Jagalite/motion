@@ -10239,6 +10239,54 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/SigninEmailStart'
+  /api/v2/auth/register/start:
+    post:
+      operationId: startEmailRegistration
+      summary: Start email registration
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: 'Public when the registration policy is not closed and email sign-in is enabled. Generic response for every address: a verification code (purpose-bound, browser-bound), a notice to an address that already has a method, or nothing. Verification proves control of the address; the policy decides the outcome.'
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailStarted'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationStart'
   /api/v2/auth/email/{transaction_id}/finish:
     post:
       operationId: finishEmailSignin
@@ -11320,7 +11368,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SigninTestResult'
+                $ref: '#/components/schemas/SigninEmailTestResult'
+        '202':
+          description: Queued; not yet accepted. Delivery retries in the background.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailTestResult'
         '400':
           $ref: '#/components/responses/E400'
         '401':
@@ -11358,6 +11412,240 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/SigninEmailTest'
+  /api/v2/admin/auth/email/tests/{id}/confirm:
+    post:
+      operationId: confirmSigninEmailTest
+      summary: Confirm signin email test receipt
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: 'Requires current SystemAdmin authority. Entering the emailed test code proves receipt for the tested configuration revision only; it never authenticates anyone.'
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailTestReceipt'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Id'
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailFinish'
+  /api/v2/admin/auth/email/diagnostics:
+    post:
+      operationId: diagnoseSigninEmail
+      summary: Diagnose signin email delivery
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: 'Requires current SystemAdmin authority. Reports DKIM/SPF/DMARC/alignment/hostname observations and, for an explicit probe domain, outbound SMTP/STARTTLS connectivity and reverse DNS. Separates facts Motion cannot prove.'
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailDiagnostics'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigninEmailDiagnosticsInput'
+  /api/v2/admin/auth/email/activity:
+    get:
+      operationId: listSigninEmailActivity
+      summary: List signin email delivery activity
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: 'Requires current SystemAdmin authority. Bounded, newest first; recipient domain only, no addresses, codes or payloads.'
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigninEmailActivityPage'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+  /api/v2/admin/auth/registration:
+    get:
+      operationId: getRegistrationSettings
+      summary: Get registration settings
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: Requires current SystemAdmin authority.
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationSettings'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+    put:
+      operationId: replaceRegistrationSettings
+      summary: Replace registration settings
+      tags:
+      - identity
+      x-owner: A01
+      x-milestone: M1
+      x-status: implementation_target
+      description: 'Requires current SystemAdmin authority and fresh proof. The open-registration default access can never include system:admin. A change ends registrations in progress.'
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationSettings'
+        '400':
+          $ref: '#/components/responses/E400'
+        '401':
+          $ref: '#/components/responses/E401'
+        '403':
+          $ref: '#/components/responses/E403'
+        '404':
+          $ref: '#/components/responses/E404'
+        '409':
+          $ref: '#/components/responses/E409'
+        '412':
+          $ref: '#/components/responses/E412'
+        '422':
+          $ref: '#/components/responses/E422'
+        '428':
+          $ref: '#/components/responses/E428'
+        '429':
+          $ref: '#/components/responses/E429'
+        '500':
+          $ref: '#/components/responses/E500'
+        '503':
+          $ref: '#/components/responses/E503'
+      parameters:
+      - $ref: '#/components/parameters/Csrf'
+      - $ref: '#/components/parameters/IfMatch'
+      - name: X-Motion-Action-Proof
+        in: header
+        required: false
+        schema:
+          $ref: '#/components/schemas/Id'
+        description: Single-use proof bound to this action, actor and target, required without recent authentication.
+          Local operator recovery is separately authenticated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationSettingsInput'
   /api/v2/admin/auth/requests:
     get:
       operationId: listSigninRequests
@@ -12212,6 +12500,13 @@ components:
           type: integer
           minimum: 60
           maximum: 86400
+        email:
+          description: Optionally email a secret-free invitation notice. The recipient completes it by registering
+            and verifying this address; requires enabled email and a non-closed registration policy.
+          anyOf:
+          - type: string
+            maxLength: 320
+          - type: 'null'
       required:
       - user_id
       - user_revision
@@ -12253,6 +12548,11 @@ components:
           - revoked
           - expired
           - invalidated
+          - registered
+        email:
+          anyOf:
+          - type: string
+          - type: 'null'
         code:
           type: string
           minLength: 1
@@ -17181,11 +17481,14 @@ components:
           maxItems: 200
         email_enabled:
           type: boolean
+        registration:
+          $ref: '#/components/schemas/RegistrationPolicy'
         pairing_enabled:
           type: boolean
       required:
       - providers
       - email_enabled
+      - registration
       - pairing_enabled
     SigninStart:
       type: object
@@ -17276,8 +17579,12 @@ components:
       properties:
         status:
           type: string
+        session_issued:
+          type: boolean
         redirect_to:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
       required:
       - status
       - redirect_to
@@ -17287,11 +17594,13 @@ components:
       properties:
         enabled:
           type: boolean
+        mode:
+          $ref: '#/components/schemas/MailDeliveryMode'
         host:
           type: string
         port:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 65535
         username:
           anyOf:
@@ -17303,19 +17612,25 @@ components:
           type: boolean
         password:
           $ref: '#/components/schemas/SigninSecretUpdate'
+        direct:
+          $ref: '#/components/schemas/MailDirectSettings'
+        dkim_key:
+          $ref: '#/components/schemas/DkimKeyUpdate'
+        apply_untested:
+          type: boolean
+          description: Apply changed settings while email sign-in stays enabled; resets the test and ends
+            email-authenticated sessions.
       required:
       - enabled
-      - host
-      - port
-      - username
       - from
-      - loopback_test
     SigninEmailSettings:
       type: object
       additionalProperties: false
       properties:
         enabled:
           type: boolean
+        mode:
+          $ref: '#/components/schemas/MailDeliveryMode'
         host:
           type: string
         port:
@@ -17334,6 +17649,40 @@ components:
           $ref: '#/components/schemas/Revision'
         has_password:
           type: boolean
+        direct:
+          type: object
+          additionalProperties: false
+          properties:
+            hostname:
+              type: string
+            envelope_from:
+              type: string
+            selector:
+              type: string
+            loopback_port:
+              anyOf:
+              - type: integer
+              - type: 'null'
+            network_requirement:
+              type: string
+        dkim:
+          type: object
+          additionalProperties: false
+          properties:
+            has_key:
+              type: boolean
+            key_id:
+              anyOf:
+              - type: string
+              - type: 'null'
+            record_name:
+              anyOf:
+              - type: string
+              - type: 'null'
+            record:
+              anyOf:
+              - type: string
+              - type: 'null'
         last_test_at:
           anyOf:
           - type: integer
@@ -17343,8 +17692,14 @@ components:
           anyOf:
           - type: boolean
           - type: 'null'
+        last_receipt_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
       required:
       - enabled
+      - mode
       - host
       - port
       - username
@@ -17352,8 +17707,313 @@ components:
       - loopback_test
       - revision
       - has_password
+      - direct
+      - dkim
       - last_test_at
       - last_test_ok
+      - last_receipt_at
+    MailDeliveryMode:
+      type: string
+      enum:
+      - relay
+      - direct
+    MailDeliveryStatus:
+      type: string
+      enum:
+      - queued
+      - retry_pending
+      - sending
+      - accepted
+      - failed
+      - acceptance_unknown
+      - expired
+      - cancelled
+    MailDirectSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        hostname:
+          type: string
+          maxLength: 253
+        envelope_from:
+          type: string
+          maxLength: 254
+        selector:
+          type: string
+          maxLength: 63
+        loopback_port:
+          description: Explicit isolated qualification route (plaintext to 127.0.0.1). Never for production.
+          anyOf:
+          - type: integer
+            minimum: 1
+            maximum: 65535
+          - type: 'null'
+    DkimKeyUpdate:
+      oneOf:
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: retain
+        required:
+        - action
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: generate
+        required:
+        - action
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: clear
+        required:
+        - action
+      - type: object
+        additionalProperties: false
+        properties:
+          action:
+            const: import
+          value:
+            type: string
+            maxLength: 16384
+            writeOnly: true
+        required:
+        - action
+        - value
+    SigninEmailTestReceipt:
+      type: object
+      additionalProperties: false
+      properties:
+        confirmed:
+          type: boolean
+        confirmed_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+      required:
+      - confirmed
+    SigninEmailDiagnosticsInput:
+      type: object
+      additionalProperties: false
+      properties:
+        probe_domain:
+          anyOf:
+          - type: string
+            maxLength: 253
+          - type: 'null'
+    SigninEmailDiagnostics:
+      type: object
+      additionalProperties: false
+      properties:
+        mode:
+          $ref: '#/components/schemas/MailDeliveryMode'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        observed_at:
+          type: integer
+          format: int64
+        last_test_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        last_test_ok:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+        last_receipt_at:
+          anyOf:
+          - type: integer
+            format: int64
+          - type: 'null'
+        findings:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              check:
+                type: string
+              status:
+                type: string
+                enum:
+                - ok
+                - warning
+                - error
+                - unknown
+              detail:
+                type: string
+            required:
+            - check
+            - status
+            - detail
+        publish:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              type:
+                type: string
+              name:
+                type: string
+              value:
+                type: string
+            required:
+            - type
+            - name
+            - value
+        cannot_prove:
+          type: array
+          items:
+            type: string
+      required:
+      - mode
+      - revision
+      - observed_at
+      - findings
+      - publish
+      - cannot_prove
+    SigninEmailActivityPage:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              id:
+                $ref: '#/components/schemas/Id'
+              cursor:
+                type: string
+              purpose:
+                type: string
+                enum:
+                - signin_code
+                - registration_code
+                - invitation
+                - account_notice
+                - test
+              status:
+                $ref: '#/components/schemas/MailDeliveryStatus'
+              attempts:
+                type: integer
+              max_attempts:
+                type: integer
+              possible_duplicate:
+                type: boolean
+              mode:
+                $ref: '#/components/schemas/MailDeliveryMode'
+              configuration_revision:
+                $ref: '#/components/schemas/Revision'
+              recipient_domain:
+                type: string
+              created_at:
+                type: integer
+                format: int64
+              last_attempt_at:
+                anyOf:
+                - type: integer
+                  format: int64
+                - type: 'null'
+              next_attempt_at:
+                anyOf:
+                - type: integer
+                  format: int64
+                - type: 'null'
+              accepted_at:
+                anyOf:
+                - type: integer
+                  format: int64
+                - type: 'null'
+              expires_at:
+                type: integer
+                format: int64
+              detail:
+                anyOf:
+                - type: string
+                - type: 'null'
+            required:
+            - id
+            - purpose
+            - status
+            - attempts
+            - possible_duplicate
+            - recipient_domain
+            - created_at
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+      required:
+      - items
+      - next_cursor
+    RegistrationPolicy:
+      type: string
+      enum:
+      - closed
+      - approval_required
+      - invite_only
+      - open
+    RegistrationDefaultAccess:
+      type: object
+      additionalProperties: false
+      properties:
+        profile_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        permissions:
+          $ref: '#/components/schemas/Permissions'
+        policy:
+          $ref: '#/components/schemas/GrantPolicy'
+      description: Open-registration user ceiling. Never includes system:admin.
+    RegistrationSettingsInput:
+      type: object
+      additionalProperties: false
+      properties:
+        policy:
+          $ref: '#/components/schemas/RegistrationPolicy'
+        default_access:
+          $ref: '#/components/schemas/RegistrationDefaultAccess'
+      required:
+      - policy
+      - default_access
+    RegistrationSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        policy:
+          $ref: '#/components/schemas/RegistrationPolicy'
+        revision:
+          $ref: '#/components/schemas/Revision'
+        default_access:
+          $ref: '#/components/schemas/RegistrationDefaultAccess'
+      required:
+      - policy
+      - revision
+      - default_access
+    RegistrationStart:
+      type: object
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+          maxLength: 320
+        name:
+          anyOf:
+          - type: string
+            maxLength: 100
+          - type: 'null'
+      required:
+      - address
     SigninEmailTest:
       type: object
       additionalProperties: false
@@ -17377,6 +18037,27 @@ components:
         revision:
           $ref: '#/components/schemas/Revision'
       required:
+      - revision
+    SigninEmailTestResult:
+      type: object
+      additionalProperties: false
+      properties:
+        test_id:
+          $ref: '#/components/schemas/Id'
+        message_id:
+          $ref: '#/components/schemas/Id'
+        status:
+          $ref: '#/components/schemas/MailDeliveryStatus'
+        accepted:
+          type: boolean
+        detail:
+          type: string
+        revision:
+          $ref: '#/components/schemas/Revision'
+      required:
+      - test_id
+      - status
+      - accepted
       - revision
     SigninSettingsInput:
       type: object
@@ -17445,12 +18126,27 @@ components:
           $ref: '#/components/schemas/Id'
         revision:
           $ref: '#/components/schemas/Revision'
+        kind:
+          type: string
+          enum:
+          - oidc
+          - email
         provider_id:
-          $ref: '#/components/schemas/Id'
+          anyOf:
+          - $ref: '#/components/schemas/Id'
+          - type: 'null'
         issuer:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
         subject:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
+        address:
+          anyOf:
+          - type: string
+          - type: 'null'
         email:
           anyOf:
           - type: string
@@ -17474,15 +18170,8 @@ components:
       required:
       - id
       - revision
-      - provider_id
-      - issuer
-      - subject
-      - email
-      - name
+      - kind
       - status
-      - created_at
-      - expires_at
-      - user_id
     SigninRequestPage:
       type: object
       additionalProperties: false

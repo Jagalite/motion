@@ -31,7 +31,7 @@ class Element {
 function harness(fetch = async () => ({ok: true, status: 204}), extra = {}) {
   const document = {createElement: tag => new Element(tag), querySelector: selector => selector === 'meta[name="motion-csrf"]' ? {content: 'csrf-token'} : null};
   const location = {origin: 'https://motion.test', search: '', reload() {}, assign() {}};
-  return runInNewContext(`${source}\n({api, mutation, secretUpdate, secretField, safeRedirect, errorMessage, revision, node, proofFlow, selectionRows, grantFields, confirmChange, signInPage, selfPage, pending, emailFlow})`, {
+  return runInNewContext(`${source}\n({api, mutation, secretUpdate, secretField, safeRedirect, errorMessage, revision, node, proofFlow, selectionRows, grantFields, confirmChange, signInPage, selfPage, pending, emailFlow, registrationFlow, emailSection, registrationSection})`, {
     document, location, fetch, crypto: webcrypto, URL, URLSearchParams, TextEncoder,
     navigator: {}, ...extra,
   });
@@ -266,4 +266,123 @@ test('OIDC callback transaction query shows terminal status and follows signed-i
     if (phase === 'linked') assert.ok(content.byText('Manage my sign-in methods'));
     if (phase === 'pending_approval') assert.ok([...content.descendants()].some(element => element.textContent.includes('No application access has been granted')));
   }
+});
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+async function submit(form) { form.events.submit({preventDefault() {}}); for (let i = 0; i < 5; i++) await settle(); }
+const forms = root => root.ofTag('form');
+const inputs = root => root.ofTag('input');
+
+test('registration is offered only for a non-closed policy and states what verification does', async () => {
+  for (const [registration, offered] of [['closed', false], ['open', true], ['approval_required', true], ['invite_only', true]]) {
+    const client = harness(async () => response(200, {providers: [], email_enabled: true, registration}));
+    const content = new Element('div');
+    await client.signInPage(content, new Element('p'));
+    const panelTitle = content.byText('Create an account');
+    assert.equal(Boolean(panelTitle), offered, registration);
+    if (registration === 'invite_only') assert.ok([...content.descendants()].some(e => e.textContent.includes('require an invitation')));
+    if (registration === 'approval_required') assert.ok([...content.descendants()].some(e => e.textContent.includes('reviews each request before any access')));
+  }
+  const disabled = harness(async () => response(200, {providers: [], email_enabled: false, registration: 'open'}));
+  const content = new Element('div');
+  await disabled.signInPage(content, new Element('p'));
+  assert.equal(content.byText('Create an account'), undefined);
+});
+
+test('registration verifies by code in this browser and distinguishes pending approval from an active account', async () => {
+  for (const [status, redirect, expectContinue] of [['account_active', '/', true], ['invitation_accepted', '/', true], ['pending_approval', null, false]]) {
+    const calls = [];
+    const client = harness(async (path, options) => {
+      calls.push({path, body: options.body && JSON.parse(options.body)});
+      if (path.endsWith('/auth/register/start')) return response(200, {transaction_id: 'tx-9', message: 'If this address can register, a verification code has been sent.'});
+      return response(200, {status, session_issued: Boolean(redirect), redirect_to: redirect});
+    });
+    const parent = new Element('div');
+    client.registrationFlow(parent, 'approval_required');
+    const [address, name] = inputs(parent);
+    address.value = ' person@example.com '; name.value = 'Person';
+    await submit(forms(parent)[0]);
+    assert.deepEqual(calls[0], {path: '/api/v2/auth/register/start', body: {address: 'person@example.com', name: 'Person'}});
+    assert.equal(address.value, '');
+    const code = inputs(parent).find(input => input.attributes.autocomplete === 'one-time-code');
+    code.value = '12345678';
+    await submit(forms(parent)[0]);
+    assert.deepEqual(calls[1], {path: '/api/v2/auth/email/tx-9/finish', body: {code: '12345678'}});
+    assert.equal(code.value, '', 'the code is not retained');
+    const outcome = [...parent.descendants()].find(e => e.attributes['data-registration-outcome']);
+    assert.equal(outcome.attributes['data-registration-outcome'], status);
+    assert.equal(Boolean(parent.byText('Continue to Motion')), expectContinue, status);
+    if (status === 'pending_approval') assert.match(outcome.textContent, /No access has been granted/);
+  }
+});
+
+function emailHarness(email, calls) {
+  return harness(async (path, options) => {
+    calls.push({path, method: options.method, body: options.body && JSON.parse(options.body)});
+    if (path === '/api/v2/admin/auth/email') return response(200, email);
+    return response(200, {items: [], next_cursor: null});
+  });
+}
+
+test('direct delivery settings submit DKIM key handling but never relay secrets', async () => {
+  const calls = [];
+  const email = {revision: '4', enabled: false, mode: 'direct', from: 'Motion <motion@example.com>', host: '', port: 587, has_password: true,
+    direct: {hostname: 'mail.example.com', envelope_from: 'bounces@example.com', selector: 'motion1', loopback_port: null, network_requirement: 'port 25'},
+    dkim: {has_key: true, key_id: 'abcd', record_name: 'motion1._domainkey.example.com', record: 'v=DKIM1; k=rsa; p=AAA'}};
+  const client = emailHarness(email, calls);
+  const content = new Element('div');
+  await client.emailSection(content);
+  assert.ok(content.byText('TXT motion1._domainkey.example.com'));
+  assert.ok(content.byText('v=DKIM1; k=rsa; p=AAA'));
+  const save = forms(content).find(f => f.byText('Save email settings'));
+  await submit(save);
+  const put = calls.find(call => call.method === 'PUT');
+  assert.equal(put.path, '/api/v2/admin/auth/email');
+  assert.equal(put.body.mode, 'direct');
+  assert.deepEqual(put.body.dkim_key, {action: 'retain'});
+  assert.deepEqual(put.body.direct, {hostname: 'mail.example.com', envelope_from: 'bounces@example.com', selector: 'motion1', loopback_port: null});
+  assert.equal(put.body.password, undefined);
+  assert.equal(put.body.host, undefined);
+  assert.ok(calls.some(call => call.path.startsWith('/api/v2/admin/auth/email/activity')));
+});
+
+test('relay settings keep secret retain semantics and send no DKIM fields', async () => {
+  const calls = [];
+  const email = {revision: '2', enabled: false, mode: 'relay', from: 'motion@example.com', host: 'smtp.example.com', port: 587, username: 'u', has_password: true, direct: {}, dkim: {has_key: false}};
+  const client = emailHarness(email, calls);
+  const content = new Element('div');
+  await client.emailSection(content);
+  await submit(forms(content).find(f => f.byText('Save email settings')));
+  const put = calls.find(call => call.method === 'PUT');
+  assert.deepEqual(put.body.password, {action: 'retain'});
+  assert.equal(put.body.dkim_key, undefined);
+  assert.equal(put.body.direct, undefined);
+  assert.equal(content.byText('Diagnostics'), undefined, 'diagnostics are for direct delivery');
+});
+
+test('delivery activity shows status words, domains and possible duplicates without addresses', async () => {
+  const client = harness(async path => path === '/api/v2/admin/auth/email'
+    ? response(200, {revision: '1', enabled: true, mode: 'relay', from: 'm@example.com', direct: {}, dkim: {}})
+    : response(200, {items: [{id: 'm1', purpose: 'registration_code', status: 'acceptance_unknown', attempts: 6, max_attempts: 6, possible_duplicate: true, recipient_domain: 'example.org', created_at: 1, mode: 'relay', configuration_revision: '1', detail: 'final reply timeout'}], next_cursor: null}));
+  const content = new Element('div');
+  await client.emailSection(content);
+  assert.ok(content.byText('Registration code · example.org'));
+  assert.ok(content.byText('Acceptance unknown (may have been delivered)'));
+  assert.ok(content.byText('An earlier attempt may already have been delivered.'));
+});
+
+test('registration policy editor never offers administrator authority as a default', async () => {
+  const calls = [];
+  const client = harness(async (path, options) => {
+    calls.push({path, method: options.method, body: options.body && JSON.parse(options.body)});
+    return response(200, {policy: 'open', revision: '3', default_access: {profile_ids: [], permissions: ['catalog:read'], policy: {library_ids: []}}});
+  }, {location: {origin: 'https://motion.test', search: '', reload() {}, assign() {}}});
+  const content = new Element('div');
+  await client.registrationSection(content, {profiles: [], libraries: [], users: []});
+  assert.equal(content.byText('Administer this server'), undefined);
+  assert.ok(content.byText('Browse catalog'));
+  await submit(forms(content)[0]);
+  const put = calls.find(call => call.method === 'PUT');
+  assert.equal(put.body.policy, 'open');
+  assert.deepEqual(put.body.default_access.permissions, ['catalog:read']);
 });
