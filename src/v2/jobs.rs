@@ -1,6 +1,6 @@
 //! Durable job transport. Ownership and phase changes use production core
 //! policies; current authorization, transition and replay receipt are atomic.
-use super::{PageQuery, Problem, Scope, auth::Caller, etag, idempotency_key, page};
+use super::{PageQuery, Problem, Scope, auth::Caller, etag, idempotency_key, if_match, page};
 use crate::{App, db::begin_write};
 use axum::{
     Json, Router,
@@ -11,7 +11,7 @@ use axum::{
 };
 use playscale_core::{
     access::{self, Idempotent, Permission},
-    jobs::{Input, Job, transition},
+    jobs::{self, Input, Job, transition},
 };
 use serde_json::{Value, json};
 
@@ -122,6 +122,14 @@ async fn control(
     if !principal.allows(permission) {
         return Err(access::AccessError::Forbidden(permission).into());
     }
+    // A retry is conditional on the revision the caller reviewed. The
+    // precondition is read after authorization and visibility, and compared
+    // only after an exact replay has had its chance to answer.
+    let reviewed = if retry {
+        Some(if_match(&headers)?)
+    } else {
+        None
+    };
     let record = Scope {
         principal: &principal.id,
         operation: if retry { "retryJob" } else { "cancelJob" },
@@ -147,12 +155,21 @@ async fn control(
         phase: serde_json::from_value(json!(old.phase)).map_err(Problem::internal)?,
         attempt: old.attempt.try_into().map_err(Problem::internal)?,
     };
-    if retry && !state.retryable() {
-        return Err(Problem::new(
-            StatusCode::CONFLICT,
-            "not_retryable",
-            "Only failed or cancelled jobs can retry",
-        ));
+    if let Some(reviewed) = reviewed {
+        let current = u64::try_from(old.revision).map_err(Problem::internal)?;
+        match jobs::admit_retry(&state, current, reviewed) {
+            Ok(()) => {}
+            Err(jobs::RetryRefusal::StaleRevision) => {
+                return Err(access::AccessError::StaleRevision.into());
+            }
+            Err(jobs::RetryRefusal::NotRetryable) => {
+                return Err(Problem::new(
+                    StatusCode::CONFLICT,
+                    "not_retryable",
+                    "Only failed or cancelled jobs can retry",
+                ));
+            }
+        }
     }
     if retry && old.kind == "scan" {
         let active:i64=sqlx::query_scalar("SELECT count(*) FROM jobs WHERE library_id=(SELECT library_id FROM jobs WHERE id=?) AND phase IN ('queued','running','cancelling')")

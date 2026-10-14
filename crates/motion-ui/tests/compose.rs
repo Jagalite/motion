@@ -657,10 +657,11 @@ async fn library_administration_offers_edit_relocation_and_schedules() {
     assert!(sources.contains(r#"<option value="preview">"#));
     assert!(!sources.contains(r#"<option value="optimize">"#));
     let (_, _, processing) = get_page(&admin, "/processing").await;
-    // The server retries failed and cancelled jobs; it takes no precondition.
+    // The server retries failed and cancelled jobs at the revision shown.
     assert!(
-        processing
-            .contains(r#"data-command="POST /api/v2/jobs/job3/retry" data-idempotent="true">"#),
+        processing.contains(
+            r#"data-command="POST /api/v2/jobs/job3/retry" data-idempotent="true" data-if-match="&quot;r-5&quot;">"#
+        ),
         "{processing}"
     );
     assert!(

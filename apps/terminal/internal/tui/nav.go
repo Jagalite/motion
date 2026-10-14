@@ -47,7 +47,7 @@ func (r route) keys() []string {
 	case pageProcessing:
 		return []string{keyJobs}
 	case pageScans:
-		return []string{keyScans, keyLibraries}
+		return []string{keyScans, keyLibraries, keySources}
 	case pageOverview:
 		return []string{keyJobs}
 	case pageDevices:
@@ -67,7 +67,7 @@ func (r route) keys() []string {
 	case pageProfiles:
 		return []string{keyProfiles}
 	case pageServer:
-		return []string{keySession}
+		return []string{keySession, keyServer}
 	}
 	return nil
 }

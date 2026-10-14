@@ -552,8 +552,8 @@ func (m Model) connection() string {
 func (m Model) statusbar(width int) string {
 	left := " " + m.connection() + faintStyle.Render(" · "+host(m.server))
 	switch {
-	case m.confirm != "":
-		left = " " + accentStyle.Render("Cancel this job?") + "  " + keyStyle.Render("y") + faintStyle.Render(" confirm  ") + keyStyle.Render("n") + faintStyle.Render(" keep")
+	case m.confirm.open():
+		left = " " + accentStyle.Render(m.confirm.prompt()) + "  " + keyStyle.Render("y") + faintStyle.Render(" confirm  ") + keyStyle.Render("n") + faintStyle.Render(" keep")
 	case m.notice.text != "" && m.notice.err:
 		left += "   " + dangerStyle.Render(m.notice.text)
 	case m.notice.text != "":
@@ -561,7 +561,7 @@ func (m Model) statusbar(width int) string {
 	case m.launching:
 		left += "   " + m.spinner.View() + mutedStyle.Render(" Opening the player…")
 	}
-	if width < 70 && m.confirm == "" && m.notice.text == "" {
+	if width < 70 && !m.confirm.open() && m.notice.text == "" {
 		left = " " + m.connection() // the host is on the Server page
 	}
 	h := m.help
@@ -582,10 +582,14 @@ func (m Model) statusbar(width int) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
+func keyHelp(k, label string) key.Binding {
+	return key.NewBinding(key.WithKeys(k), key.WithHelp(k, label))
+}
+
 // shortHelp lists the shortcuts that apply to what has focus.
 func (m Model) shortHelp() []key.Binding {
 	switch {
-	case m.confirm != "":
+	case m.confirm.open():
 		return nil
 	case m.focus == focusSearch:
 		return []key.Binding{keys.Submit, keys.Leave, keys.Focus}
@@ -603,9 +607,17 @@ func (m Model) shortHelp() []key.Binding {
 		b := []key.Binding{move("select")}
 		switch {
 		case m.route.page == pageProcessing && len(m.table.Rows()) > 0:
-			b = append(b, keys.Cancel)
+			b = append(b, keys.Inspect, keys.Cancel, keys.Retry)
+		case m.route.page == pageProfiles && m.allows(api.PermProfilesManage):
+			b = append(b, keys.Choose, keys.New, keys.Rename, keys.Delete)
 		case m.route.page == pageProfiles:
 			b = append(b, keys.Choose)
+		case m.route.page == pageSources && m.allows(api.PermSourcesManage):
+			b = append(b, keyHelp("n", "new source"), keys.NewLibrary)
+		case m.route.page == pageScans && m.allows(api.PermSourcesManage):
+			b = append(b, keyHelp("n", "request scan"))
+		case m.route.page == pageDevices && m.admin():
+			b = append(b, keys.Policy, keys.Assign)
 		case m.route.page == pageNowPlaying:
 			b = append(b, keys.History)
 		case m.route.page == pageHistory && m.historyFilter.DeviceID != "":
@@ -616,6 +628,14 @@ func (m Model) shortHelp() []key.Binding {
 		return append(b, back, keys.Refresh, keys.Help)
 	case kindText:
 		return []key.Binding{move("scroll"), keys.PageDown, back, keys.Refresh, keys.Help}
+	}
+	if m.session != nil && !m.session.Operator {
+		if m.me() == nil {
+			return []key.Binding{keys.Pair, keys.Redeem, keys.Refresh, keys.Help}
+		}
+		if m.route.page == pageServer {
+			return []key.Binding{keys.SignOut, back, keys.Refresh, keys.Help}
+		}
 	}
 	b := []key.Binding{move("move")}
 	focusedPage := m

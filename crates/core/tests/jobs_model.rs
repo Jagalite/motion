@@ -224,3 +224,251 @@ fn seeded_job_sequences_check_order_dependent_properties() {
         report.cases, report.transitions, report.termination
     );
 }
+
+/// Reviewed retries: a client reviews the job at its current revision and
+/// later submits a retry conditional on that revision, while workers and
+/// other clients keep changing the job. The adapter bumps the revision on
+/// every change; admission is the production `admit_retry` followed by the
+/// production reducer.
+mod reviewed {
+    use super::*;
+    use playscale_core::jobs::{RetryRefusal, admit_retry};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct State {
+        pub job: Job,
+        pub revision: u64,
+        /// The revision the client last reviewed.
+        pub reviewed: Option<u64>,
+        /// Retries admitted since that review.
+        pub admitted: u8,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub enum Event {
+        Review,
+        /// A worker or another client drives the job.
+        Job(Input),
+        RetryReviewed,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Outcome {
+        Admitted,
+        Refused(RetryRefusal),
+    }
+
+    pub struct ReviewedJobs;
+
+    const MAX_REVISION: u64 = 9;
+
+    impl stateless::Generate for ReviewedJobs {
+        fn generate(
+            &self,
+            state: &State,
+            rng: &mut stateless::Rng,
+        ) -> Result<Option<Event>, ModelError> {
+            let inputs = self.inputs(state)?;
+            Ok(rng.index(inputs.len()).map(|i| inputs[i]))
+        }
+    }
+
+    impl Model for ReviewedJobs {
+        type State = State;
+        type Input = Event;
+        type Output = Outcome;
+        fn metadata(&self) -> ModelMetadata {
+            ModelMetadata {
+                name: "playscale.jobs.reviewed_retry".into(),
+                model_version: 1,
+                properties_version: 1,
+                codec_version: 1,
+                build: format!(
+                    "{}:{}",
+                    env!("CARGO_PKG_VERSION"),
+                    include_str!("../src/jobs.rs")
+                ),
+            }
+        }
+        fn initial_state(&self) -> Result<State, ModelError> {
+            Ok(State {
+                job: Job::default(),
+                revision: 1,
+                reviewed: None,
+                admitted: 0,
+            })
+        }
+        fn step(&self, s: &State, e: &Event) -> Result<Transition<State, Outcome>, ModelError> {
+            let mut next = s.clone();
+            let mut outputs = vec![];
+            match *e {
+                Event::Review => {
+                    next.reviewed = Some(s.revision);
+                    next.admitted = 0;
+                }
+                Event::Job(input) => {
+                    let (job, _) = transition(&s.job, input);
+                    if job != s.job {
+                        next.revision += 1;
+                    }
+                    next.job = job;
+                }
+                Event::RetryReviewed => {
+                    let Some(reviewed) = s.reviewed else {
+                        return Ok(Transition::accepted(next, outputs));
+                    };
+                    match admit_retry(&s.job, s.revision, reviewed) {
+                        Ok(()) => {
+                            let (job, _) = transition(&s.job, Input::Retry);
+                            if job != s.job {
+                                next.revision += 1;
+                            }
+                            next.job = job;
+                            next.admitted += 1;
+                            outputs.push(Outcome::Admitted);
+                        }
+                        Err(refusal) => outputs.push(Outcome::Refused(refusal)),
+                    }
+                }
+            }
+            Ok(Transition::accepted(next, outputs))
+        }
+        fn check_state(&self, s: &State) -> Result<Vec<Check>, ModelError> {
+            Ok(vec![check("one_retry_per_review", s.admitted <= 1)])
+        }
+        fn check_transition(
+            &self,
+            before: &State,
+            event: &Event,
+            next: &TransitionRef<'_, State, Outcome>,
+        ) -> Result<Vec<Check>, ModelError> {
+            let admitted = next.outputs.contains(&Outcome::Admitted);
+            let at_review = before.reviewed == Some(before.revision);
+            Ok(vec![
+                check(
+                    "retry_admitted_only_at_reviewed_revision",
+                    !admitted || at_review,
+                ),
+                check(
+                    "admission_exactly_when_current_and_retryable",
+                    *event != Event::RetryReviewed
+                        || before.reviewed.is_none()
+                        || admitted == (at_review && before.job.retryable()),
+                ),
+                check(
+                    "stale_review_is_refused_without_change",
+                    *event != Event::RetryReviewed
+                        || at_review
+                        || before.reviewed.is_none()
+                        || (next.state.job == before.job
+                            && next.outputs == [Outcome::Refused(RetryRefusal::StaleRevision)]),
+                ),
+                check(
+                    "admitted_retry_queues_and_advances_revision",
+                    !admitted
+                        || (next.state.job.phase == Phase::Queued
+                            && next.state.revision == before.revision + 1
+                            && next.state.job.attempt == before.job.attempt),
+                ),
+            ])
+        }
+    }
+
+    impl Enumerate for ReviewedJobs {
+        fn inputs(&self, s: &State) -> Result<Vec<Event>, ModelError> {
+            // Bounded: job changes up to MAX_REVISION (an admitted retry can
+            // reach one more), attempts up to 2,
+            // current and stale completion identities.
+            let mut inputs = vec![Event::Review, Event::RetryReviewed];
+            if s.revision < MAX_REVISION {
+                inputs.push(Event::Job(Input::Cancel));
+                inputs.push(Event::Job(Input::Recover));
+                inputs.push(Event::Job(Input::Retry));
+                if s.job.attempt < 2 {
+                    inputs.push(Event::Job(Input::Start));
+                }
+                for attempt in 0..=2 {
+                    for success in [false, true] {
+                        inputs.push(Event::Job(Input::Finished { attempt, success }));
+                    }
+                }
+            }
+            Ok(inputs)
+        }
+    }
+
+    impl ModelCodec for ReviewedJobs {
+        fn encode_state(&self, v: &State) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+        fn decode_state(&self, b: &[u8]) -> Result<State, ModelError> {
+            decode(b)
+        }
+        fn encode_input(&self, v: &Event) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+        fn decode_input(&self, b: &[u8]) -> Result<Event, ModelError> {
+            decode(b)
+        }
+        fn encode_output(&self, v: &Outcome) -> Result<Vec<u8>, ModelError> {
+            encode(v)
+        }
+    }
+}
+
+#[test]
+fn bounded_reviewed_retry_graph_admits_one_retry_per_review() {
+    let report =
+        stateless::explore::enumerate(&reviewed::ReviewedJobs, Default::default()).unwrap();
+    assert!(report.failure.is_none(), "{:?}", report.failure);
+    assert_eq!(report.skipped_checks, 0);
+    assert_eq!(
+        report.termination,
+        stateless::explore::SearchTermination::GraphExhausted
+    );
+    assert!(report.transitions > 1000);
+    println!(
+        "Stateless reviewed retry: {} states, {} edges; revisions <=10 (job changes stop at 9), attempts <=2, completion identities 0..2",
+        report.states, report.transitions
+    );
+}
+
+#[test]
+fn stale_review_after_another_clients_retry_is_refused() {
+    use reviewed::Event;
+    // Fail, review, another client retries and the attempt fails again; the
+    // old review must not admit a second retry.
+    let inputs = vec![
+        Event::Job(Input::Start),
+        Event::Job(Input::Finished {
+            attempt: 1,
+            success: false,
+        }),
+        Event::Review,
+        Event::Job(Input::Retry),
+        Event::Job(Input::Start),
+        Event::Job(Input::Finished {
+            attempt: 2,
+            success: false,
+        }),
+        Event::RetryReviewed,
+    ];
+    let trace =
+        stateless::execution::record(&reviewed::ReviewedJobs, inputs, Default::default(), 100)
+            .unwrap();
+    let replay =
+        stateless::execution::replay(&reviewed::ReviewedJobs, &trace, Default::default()).unwrap();
+    assert_eq!(replay.outcome, stateless::execution::ReplayOutcome::Exact);
+    assert_eq!(
+        playscale_core::jobs::admit_retry(
+            &Job {
+                phase: Phase::Failed,
+                attempt: 2
+            },
+            5,
+            3
+        ),
+        Err(playscale_core::jobs::RetryRefusal::StaleRevision)
+    );
+}

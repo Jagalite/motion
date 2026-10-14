@@ -7,9 +7,8 @@ import (
 	"io"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 	"github.com/Jagalite/motion/apps/terminal/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -28,10 +27,8 @@ func redeemCmd(env *Env) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if accepted == "" {
-			accepted = c.Config.CredentialStore
-		}
-		if accepted != store.FileStore {
+		// Refuse before reading the secret when no credential store is accepted.
+		if accepted == "" && c.Config.CredentialStore != store.FileStore || accepted != "" && accepted != store.FileStore {
 			return store.ErrNoStore
 		}
 		fmt.Fprintln(env.Err, "Paste the invitation code, then Enter (keep it private):")
@@ -48,41 +45,13 @@ func redeemCmd(env *Env) *cobra.Command {
 			return err
 		}
 		code = strings.TrimSpace(code)
-		claim, err := c.Store.BeginRedemption(c.Health.ServerID, code, accepted, store.RedemptionClaim{ClaimID: api.NewIdempotencyKey(), DeviceName: name})
-		if err != nil {
-			return err
-		}
 		ctx, cancel := env.context(cmd.Context())
 		defer cancel()
-		input := api.RedemptionInput{Code: code, ClaimID: claim.ClaimID, DeviceName: claim.DeviceName, ClientName: "motion-terminal"}
-		var credential api.Credential
-		for attempt := 0; attempt < 3; attempt++ {
-			credential, err = c.RedeemInvitation(ctx, input)
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			// Retain the exact claim identity for an ambiguous transport failure.
-			if _, ok := err.(*api.UnavailableError); !ok {
-				return err
-			}
-			if sleepErr := c.Sleep(ctx, time.Second); sleepErr != nil {
-				return sleepErr
-			}
-		}
+		signed, err := operations.RedeemInvitation(ctx, c, code, name, accepted)
 		if err != nil {
 			return err
 		}
-		if err = c.Store.PutCredential(store.Credential{ServerID: c.Health.ServerID, DeviceID: credential.DeviceID, AccessToken: credential.AccessToken, ExpiresAt: credential.ExpiresAt}, accepted); err != nil {
-			return err
-		}
-		c.Config.CredentialStore = accepted
-		if err = c.Remember(); err != nil {
-			return err
-		}
-		return env.print(map[string]string{"device_id": credential.DeviceID, "server_id": c.Health.ServerID}, func(w io.Writer) { fmt.Fprintln(w, "Invitation redeemed. This device is paired.") })
+		return env.print(map[string]string{"device_id": signed.DeviceID, "server_id": signed.ServerID}, func(w io.Writer) { fmt.Fprintln(w, "Invitation redeemed. This device is paired.") })
 	}
 	return cmd
 }

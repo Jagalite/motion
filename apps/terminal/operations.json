@@ -1,0 +1,1472 @@
+{
+  "schema": "motion.terminal.operations.v1",
+  "note": "Operation inventory and parity ledger. Every workflow is shared: both interfaces call the named functions in internal/operations, and neither calls the API client directly. server.serve is the one interface-specific exception. Notes record remaining interface differences. See PARITY.md.",
+  "operations": [
+    {
+      "id": "session.connect",
+      "workflow": "session",
+      "status": "shared",
+      "shared": [
+        "Connect",
+        "Settings",
+        "Session"
+      ],
+      "api": [],
+      "cli": "server status",
+      "tui": "motion tui receives the verified session from the same pathway",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestConnectBindsCredentialsToTheVerifiedIdentity"
+        ],
+        "cli": [
+          "internal/cli:TestChangedServerIdentityNeverReceivesTheCredential",
+          "internal/cli:TestKnownServerIDAtANewURLGetsNoCredential"
+        ],
+        "tui": [
+          "internal/cli:TestTUIReceivesTheVerifiedSharedSessionAndBrowser"
+        ]
+      }
+    },
+    {
+      "id": "server.status",
+      "workflow": "session",
+      "status": "shared",
+      "shared": [
+        "ReadServerStatus"
+      ],
+      "api": [
+        "Capabilities"
+      ],
+      "cli": "server status",
+      "tui": "Server page: identity, status and features",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "auth.status",
+      "workflow": "session",
+      "status": "shared",
+      "shared": [
+        "WhoAmI",
+        "ReadSession"
+      ],
+      "api": [
+        "Capabilities",
+        "Me"
+      ],
+      "cli": "auth status",
+      "tui": "Server page: this device",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults",
+          "internal/operations:TestCredentialOperationsSwitchTheSession"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "auth.pair",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "StartPairing",
+        "PendingPairing"
+      ],
+      "api": [
+        "ClaimPairing",
+        "CreatePairing"
+      ],
+      "cli": "auth pair",
+      "tui": "P while signed out: pair, show the code, wait for approval",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestCredentialOperationsSwitchTheSession",
+          "internal/operations:TestAbandonedPairingNeverInstallsItsCredential"
+        ],
+        "cli": [
+          "internal/cli:TestCLIAccountFlowsUseTheSharedOperations",
+          "internal/cli:TestPairingRequiresExplicitCredentialStoreBeforeContactingPairing"
+        ],
+        "tui": [
+          "internal/tui:TestTUIPairsWithTheSharedPairingFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
+        ]
+      }
+    },
+    {
+      "id": "auth.redeem",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "RedeemInvitation"
+      ],
+      "api": [
+        "RedeemInvitation"
+      ],
+      "cli": "auth redeem",
+      "tui": "I while signed out: redeem an invitation code",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestCredentialOperationsSwitchTheSession"
+        ],
+        "cli": [
+          "internal/cli:TestCLIAccountFlowsUseTheSharedOperations",
+          "internal/cli:TestInvitationRecoversAcrossCommandRestartAfterPersistenceFailure"
+        ],
+        "tui": [
+          "internal/tui:TestTUIRedeemsAnInvitationWithTheSharedFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
+        ]
+      }
+    },
+    {
+      "id": "auth.logout",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "SignOut"
+      ],
+      "api": [],
+      "cli": "auth logout",
+      "tui": "Server page: O signs out",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestCredentialOperationsSwitchTheSession"
+        ],
+        "cli": [
+          "internal/cli:TestCLIAccountFlowsUseTheSharedOperations"
+        ],
+        "tui": [
+          "internal/tui:TestTUIPairsWithTheSharedPairingFlow",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
+        ]
+      }
+    },
+    {
+      "id": "access.pairings.list",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "ListPairings",
+        "CollectPairings"
+      ],
+      "api": [
+        "ListPairings"
+      ],
+      "cli": "access pairings list",
+      "tui": "Pairing requests page",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "access.pairings.approve",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "ApprovePairing"
+      ],
+      "api": [
+        "ApprovePairing",
+        "Capabilities"
+      ],
+      "cli": "auth approve",
+      "tui": "Pairing requests: a, choose the user, review",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest",
+          "internal/operations:TestApprovalNamesAUserWhenTheServerManagesAccessByUser"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestSuggestedRetryWordsSurviveTheShell",
+          "internal/cli:TestCLIApprovalNamesAUser"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      },
+      "note": "Both interfaces name the access user the device belongs to, and pre-fill its grant (operations.InheritedGrant). A device-only approval is accepted only by servers that do not advertise identity.access_management; existing unassigned devices are assigned with devices.assign."
+    },
+    {
+      "id": "access.pairings.deny",
+      "workflow": "pairing",
+      "status": "shared",
+      "shared": [
+        "DenyPairing"
+      ],
+      "api": [
+        "DenyPairing"
+      ],
+      "cli": "access pairings deny",
+      "tui": "Pairing requests: d, review",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "access.users.list",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "ListUsers",
+        "CollectUsers"
+      ],
+      "api": [
+        "ListUsers"
+      ],
+      "cli": "access users list",
+      "tui": "Users and access page",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "access.users.show",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "InspectUser",
+        "CollectUsers"
+      ],
+      "api": [
+        "GetUser",
+        "ListUsers"
+      ],
+      "cli": "access users show",
+      "tui": "Users and access: detail of the listed user",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "access.users.create",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "CreateUser"
+      ],
+      "api": [
+        "CreateUser"
+      ],
+      "cli": "access users create",
+      "tui": "Users and access: n",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIDefaultsMatchTheSharedDefaults"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIDefaultsMatchTheSharedDefaults"
+        ]
+      }
+    },
+    {
+      "id": "access.users.update",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "ReplaceUser"
+      ],
+      "api": [
+        "GetUser",
+        "ReplaceUser"
+      ],
+      "cli": "access users update",
+      "tui": "Users and access: e, at the reviewed revision",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision"
+        ],
+        "cli": [
+          "internal/cli:TestCLIConditionalWritesUseTheGivenOrCurrentRevision"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReviewedRevisionIsNotReplacedByANewerOne"
+        ]
+      }
+    },
+    {
+      "id": "access.invitations.list",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "ListInvitations",
+        "CollectInvitations"
+      ],
+      "api": [
+        "ListInvitations"
+      ],
+      "cli": "access invitations list",
+      "tui": "Access invitations page",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "access.invitations.create",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "CreateInvitation"
+      ],
+      "api": [
+        "CreateInvitation"
+      ],
+      "cli": "access invitations create",
+      "tui": "Access invitations: n, choose the user; the code is shown once",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest",
+          "internal/operations:TestSettlementKeepsRequestValuesToRepeat"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIDefaultsMatchTheSharedDefaults",
+          "internal/cli:TestCLIResubmissionRepeatsTheOriginalRequestExactly"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIDefaultsMatchTheSharedDefaults"
+        ]
+      }
+    },
+    {
+      "id": "access.invitations.revoke",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "RevokeInvitation"
+      ],
+      "api": [
+        "ListInvitations",
+        "RevokeInvitation"
+      ],
+      "cli": "access invitations revoke",
+      "tui": "Access invitations: d, at the reviewed revision",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision",
+          "internal/operations:TestATruncatedInvitationListIsNotEvidenceOfAbsence"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestInvitationRevokeUsesStrongRevision"
+        ]
+      }
+    },
+    {
+      "id": "devices.list",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "ListDevices",
+        "CollectDevices"
+      ],
+      "api": [
+        "ListDevices"
+      ],
+      "cli": "devices list",
+      "tui": "Devices page",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "devices.show",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "InspectDevice",
+        "CollectDevices"
+      ],
+      "api": [
+        "GetDevice",
+        "ListDevices"
+      ],
+      "cli": "devices show",
+      "tui": "Devices: detail of the listed device",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "devices.revoke",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "RevokeDevice"
+      ],
+      "api": [
+        "GetDevice",
+        "RevokeDevice"
+      ],
+      "cli": "devices revoke",
+      "tui": "Devices: d, at the reviewed revision",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "devices.assign",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "AssignDevice"
+      ],
+      "api": [
+        "AssignDeviceUser",
+        "GetDevice"
+      ],
+      "cli": "devices assign",
+      "tui": "Devices: u on an unassigned device, choose the user, review",
+      "capabilities": [
+        "system:admin",
+        "feature identity.access_management"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestDeviceAssignmentIsConditionalAndNeverTransfers",
+          "internal/operations:TestManagementScenarioReachesTheIntendedState"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIApprovalNamesAUser"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIAssignmentRecoversAndEndsWithWithdrawnAccess"
+        ]
+      }
+    },
+    {
+      "id": "devices.policy",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "InspectDevicePolicy"
+      ],
+      "api": [
+        "GetDevicePolicy"
+      ],
+      "cli": "devices policy show",
+      "tui": "Devices: p reads the policy into the editor",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIPolicyFormOpensOnlyForTheNewestReadOnDevices"
+        ]
+      }
+    },
+    {
+      "id": "devices.policy.set",
+      "workflow": "devices",
+      "status": "shared",
+      "shared": [
+        "ReplaceDevicePolicy"
+      ],
+      "api": [
+        "GetDevicePolicy",
+        "ReplaceDevicePolicy"
+      ],
+      "cli": "devices policy set",
+      "tui": "Device policy editor, at the revision read",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIPolicyFormOpensOnlyForTheNewestReadOnDevices"
+        ]
+      }
+    },
+    {
+      "id": "profiles.list",
+      "workflow": "profiles",
+      "status": "shared",
+      "shared": [
+        "ListProfiles",
+        "CollectProfiles"
+      ],
+      "api": [
+        "ListProfiles"
+      ],
+      "cli": "profiles list",
+      "tui": "Profiles page",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "profiles.show",
+      "workflow": "profiles",
+      "status": "shared",
+      "shared": [
+        "InspectProfile",
+        "CollectProfiles"
+      ],
+      "api": [
+        "GetProfile",
+        "ListProfiles"
+      ],
+      "cli": "profiles show",
+      "tui": "Profiles: detail of the listed profile",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "profiles.create",
+      "workflow": "profiles",
+      "status": "shared",
+      "shared": [
+        "CreateProfile"
+      ],
+      "api": [
+        "CreateProfile"
+      ],
+      "cli": "profiles create",
+      "tui": "Profiles: n",
+      "capabilities": [
+        "profiles:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestIntentsSettleLikeJobActions"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLICreateWithLostAcknowledgementResubmitsTheSameKey"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIFormResubmitsTheSameRequestAfterAnUnknownOutcome",
+          "internal/tui:TestTUIFormReviewShowsWhatWillBeApplied"
+        ]
+      }
+    },
+    {
+      "id": "profiles.rename",
+      "workflow": "profiles",
+      "status": "shared",
+      "shared": [
+        "RenameProfile"
+      ],
+      "api": [
+        "GetProfile",
+        "ReplaceProfile"
+      ],
+      "cli": "profiles rename",
+      "tui": "Profiles: e, at the reviewed revision",
+      "capabilities": [
+        "profiles:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestPreconditionsNeverSubstituteANewerRevision"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestCLIConditionalWritesUseTheGivenOrCurrentRevision"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIReviewedRevisionIsNotReplacedByANewerOne"
+        ]
+      }
+    },
+    {
+      "id": "profiles.delete",
+      "workflow": "profiles",
+      "status": "shared",
+      "shared": [
+        "DeleteProfile"
+      ],
+      "api": [
+        "DeleteProfile",
+        "GetProfile"
+      ],
+      "cli": "profiles delete",
+      "tui": "Profiles: x, at the reviewed revision",
+      "capabilities": [
+        "profiles:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestIntentsSettleLikeJobActions"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "libraries.list",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "ListLibraries",
+        "CollectLibraries"
+      ],
+      "api": [
+        "ListLibraries"
+      ],
+      "cli": "libraries list",
+      "tui": "Sidebar libraries",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "libraries.show",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "ReadLibraryContents"
+      ],
+      "api": [
+        "GetLibrary",
+        "ListCatalog"
+      ],
+      "cli": "libraries show",
+      "tui": "Library page",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "libraries.add",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "CreateLibrary"
+      ],
+      "api": [
+        "CreateLibrary"
+      ],
+      "cli": "libraries add",
+      "tui": "Sources: l",
+      "capabilities": [
+        "sources:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "sources.list",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "ListSources",
+        "CollectSources"
+      ],
+      "api": [
+        "ListSources"
+      ],
+      "cli": "sources list",
+      "tui": "Sources page",
+      "capabilities": [
+        "sources:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "sources.show",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "InspectSource",
+        "CollectSources"
+      ],
+      "api": [
+        "GetSource",
+        "ListSources"
+      ],
+      "cli": "sources show",
+      "tui": "Sources: detail of the listed source",
+      "capabilities": [
+        "sources:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "sources.add",
+      "workflow": "libraries",
+      "status": "shared",
+      "shared": [
+        "CreateSource"
+      ],
+      "api": [
+        "CreateSource"
+      ],
+      "cli": "sources add",
+      "tui": "Sources: n",
+      "capabilities": [
+        "sources:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+        ]
+      }
+    },
+    {
+      "id": "scans.request",
+      "workflow": "scans",
+      "status": "shared",
+      "shared": [
+        "RequestScan"
+      ],
+      "api": [
+        "CreateScan"
+      ],
+      "cli": "libraries scan",
+      "tui": "Scans: n, choose a library",
+      "capabilities": [
+        "sources:manage"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestManagementScenarioReachesTheIntendedState",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+        ],
+        "tui": [
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIScanFormOffersSourcesOnFirstVisit"
+        ]
+      }
+    },
+    {
+      "id": "scans.list",
+      "workflow": "scans",
+      "status": "shared",
+      "shared": [
+        "ListScans",
+        "CollectScans"
+      ],
+      "api": [
+        "ListScans"
+      ],
+      "cli": "scans list",
+      "tui": "Scans page",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "scans.show",
+      "workflow": "scans",
+      "status": "shared",
+      "shared": [
+        "InspectScan",
+        "CollectScans"
+      ],
+      "api": [
+        "GetScan",
+        "ListScans"
+      ],
+      "cli": "scans show",
+      "tui": "Scans: detail of the listed scan",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "catalog.list",
+      "workflow": "catalog",
+      "status": "shared",
+      "shared": [
+        "ListCatalog",
+        "CollectCatalog"
+      ],
+      "api": [
+        "ListCatalog"
+      ],
+      "cli": "catalog list",
+      "tui": "All titles",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "catalog.search",
+      "workflow": "catalog",
+      "status": "shared",
+      "shared": [
+        "SearchCatalog",
+        "CollectSearch"
+      ],
+      "api": [
+        "SearchCatalog"
+      ],
+      "cli": "catalog search",
+      "tui": "Search",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "catalog.show",
+      "workflow": "catalog",
+      "status": "shared",
+      "shared": [
+        "InspectItem",
+        "ReadItemDetails"
+      ],
+      "api": [
+        "GetCatalogItem",
+        "GetViewingState",
+        "ListCatalogChildren",
+        "ListItemEditions",
+        "ListItemTimelines",
+        "ListVersions"
+      ],
+      "cli": "catalog show",
+      "tui": "Item page (catalog show --details shows the same aggregate)",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "viewing.continue",
+      "workflow": "catalog",
+      "status": "shared",
+      "shared": [
+        "ContinueWatching"
+      ],
+      "api": [
+        "ListContinueWatching"
+      ],
+      "cli": "catalog continue",
+      "tui": "Home: continue watching",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults",
+          "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "diagnostics.read",
+      "workflow": "diagnostics",
+      "status": "shared",
+      "shared": [
+        "ReadDiagnostics"
+      ],
+      "api": [
+        "Diagnostics"
+      ],
+      "cli": "diagnostics",
+      "tui": "Overview and Server pages",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "diagnostics.storage",
+      "workflow": "diagnostics",
+      "status": "shared",
+      "shared": [
+        "ReadStorage"
+      ],
+      "api": [
+        "Storage"
+      ],
+      "cli": "diagnostics storage",
+      "tui": "Overview and Server storage",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "diagnostics.metrics",
+      "workflow": "diagnostics",
+      "status": "shared",
+      "shared": [
+        "ReadMetrics"
+      ],
+      "api": [
+        "Metrics"
+      ],
+      "cli": "diagnostics metrics",
+      "tui": "Overview charts",
+      "capabilities": [
+        "system:admin",
+        "feature admin.metrics"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestMetricsWindowIsDownsampledTheSameForEveryInterface"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestServerHistoryIsUsedWhenOffered"
+        ]
+      }
+    },
+    {
+      "id": "playback.sessions",
+      "workflow": "playback",
+      "status": "shared",
+      "shared": [
+        "ReadPlaybackSessions"
+      ],
+      "api": [
+        "PlaybackSessions"
+      ],
+      "cli": "playback sessions",
+      "tui": "Now playing",
+      "capabilities": [
+        "system:admin",
+        "feature admin.playback_sessions"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "playback.history",
+      "workflow": "playback",
+      "status": "shared",
+      "shared": [
+        "ListPlaybackHistory",
+        "CollectPlaybackHistory"
+      ],
+      "api": [
+        "PlaybackHistory"
+      ],
+      "cli": "playback history",
+      "tui": "Playback history (d filters to a device)",
+      "capabilities": [
+        "system:admin",
+        "feature admin.playback_sessions"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestSharedReadsComposeTheSameResults"
+        ],
+        "cli": [
+          "internal/cli:TestCLIReadCommandsUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestTUIReadsComeFromTheSharedOperations"
+        ]
+      }
+    },
+    {
+      "id": "events.follow",
+      "workflow": "events",
+      "status": "shared",
+      "shared": [
+        "FollowEvents"
+      ],
+      "api": [
+        "Follow"
+      ],
+      "cli": "events tail",
+      "tui": "Activity and refresh signals",
+      "capabilities": [
+        "events:read"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestFollowEventsResumesAfterTheGivenCursor"
+        ],
+        "cli": [
+          "internal/cli:TestEventsTailWritesVersionedEvents"
+        ],
+        "tui": [
+          "internal/tui:TestPumpNeverBlocksAndResyncsEvenIfTheStreamGoesQuiet",
+          "internal/tui:TestCredentialChangeRestartsTheEventStreamAndForgetsActivity"
+        ]
+      }
+    },
+    {
+      "id": "jobs.list",
+      "workflow": "jobs",
+      "status": "shared",
+      "shared": [
+        "ListJobs",
+        "CollectJobs",
+        "Collect"
+      ],
+      "api": [
+        "ListJobs"
+      ],
+      "cli": "jobs list",
+      "tui": "Processing page and Overview work list",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestJobListsKeepPaginationAndTruncationExplicit",
+          "internal/operations:TestCollectRejectsARepeatedCursor"
+        ],
+        "cli": [
+          "internal/cli:TestJobsListAndShowUseTheSharedReads",
+          "internal/cli:TestInvalidJobInputIsRejectedBeforeAnyRequest"
+        ],
+        "tui": [
+          "internal/tui:TestRetryReviewsTheJobAndSendsThatRevision",
+          "internal/tui:TestJobCancellationAsksFirstAndSendsOneKeyedRequest"
+        ]
+      }
+    },
+    {
+      "id": "jobs.inspect",
+      "workflow": "jobs",
+      "status": "shared",
+      "shared": [
+        "InspectJob"
+      ],
+      "api": [
+        "GetJob"
+      ],
+      "cli": "jobs show",
+      "tui": "Processing page: enter on a job",
+      "capabilities": [],
+      "tests": {
+        "operations": [
+          "internal/operations:TestJobActionsCarryOneKeyPerIntentAndTheReviewedRevision"
+        ],
+        "cli": [
+          "internal/cli:TestJobsListAndShowUseTheSharedReads"
+        ],
+        "tui": [
+          "internal/tui:TestInspectShowsTheJobsCurrentState"
+        ]
+      }
+    },
+    {
+      "id": "jobs.cancel",
+      "workflow": "jobs",
+      "status": "shared",
+      "shared": [
+        "NewJobAction",
+        "ResumeJobAction",
+        "SubmitJobAction",
+        "PendingJobActions",
+        "UncertainError"
+      ],
+      "api": [
+        "CancelJob"
+      ],
+      "cli": "jobs cancel",
+      "tui": "Processing page: c, then confirm",
+      "capabilities": [
+        "processing:request (server selects per job kind)"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestLostAcknowledgementIsUncertainAndResubmissionAppliesOnce",
+          "internal/operations:TestOutcomeClassification",
+          "internal/operations:TestResumedKeysAndInputsAreValidated"
+        ],
+        "cli": [
+          "internal/cli:TestCancelWithLostAcknowledgementReportsTheKeyAndResubmitsOnce",
+          "internal/cli:TestInvalidJobInputIsRejectedBeforeAnyRequest"
+        ],
+        "tui": [
+          "internal/tui:TestUnconfirmedCancellationIsResubmittedWithItsKey",
+          "internal/tui:TestJobReplyAfterSignOutIsIgnored",
+          "internal/tui:TestCancellationIsLeftToTheServer"
+        ]
+      }
+    },
+    {
+      "id": "jobs.retry",
+      "workflow": "jobs",
+      "status": "shared",
+      "shared": [
+        "NewJobAction",
+        "ResumeJobAction",
+        "SubmitJobAction",
+        "PendingJobActions",
+        "InspectJob"
+      ],
+      "api": [
+        "RetryJob"
+      ],
+      "cli": "jobs retry",
+      "tui": "Processing page: R reviews the job, then confirm",
+      "capabilities": [
+        "processing:request (server selects per job kind)"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestJobActionsCarryOneKeyPerIntentAndTheReviewedRevision",
+          "internal/operations:TestStaleReviewIsAConflictNotASilentOverwrite"
+        ],
+        "cli": [
+          "internal/cli:TestJobsRetryCommandUsesFreshOperationIdentityAndReportsConflicts",
+          "internal/cli:TestRetryCarriesTheGivenRevisionAndReportsAStaleOne",
+          "internal/cli:TestUncertainOutcomeIsExplainedInHumanOutput"
+        ],
+        "tui": [
+          "internal/tui:TestRetryReviewsTheJobAndSendsThatRevision",
+          "internal/tui:TestRetryOfAChangedJobIsRefusedNotRefetched"
+        ]
+      }
+    },
+    {
+      "id": "playback.launch",
+      "workflow": "playback",
+      "status": "shared",
+      "shared": [
+        "LaunchPlayer",
+        "PlayerURL",
+        "PlaybackReady",
+        "Browser"
+      ],
+      "api": [],
+      "cli": "play",
+      "tui": "p on a title or item",
+      "capabilities": [
+        "playback:request",
+        "feature playback.v2"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestLaunchPlayerChecksCapabilityAndOpensOneTokenFreeURL",
+          "internal/operations:TestPlayerURLHasOnlyEscapedSelection"
+        ],
+        "cli": [
+          "internal/cli:TestPlayUsesTheSharedLaunchAndTheInjectedBrowser"
+        ],
+        "tui": [
+          "internal/tui:TestPlaybackLaunchUsesNoCredentialAndRequiresCapability"
+        ]
+      }
+    },
+    {
+      "id": "server.serve",
+      "workflow": "server",
+      "status": "interface_specific",
+      "cli": "serve",
+      "tui": null,
+      "exception": {
+        "reason": "Starting the bundled server is a local process operation, not a server API workflow.",
+        "disposition": "permanent: CLI-only unless a TUI lifecycle workflow is added deliberately"
+      }
+    }
+  ]
+}

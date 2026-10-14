@@ -326,6 +326,18 @@ impl Fixture {
         self.call("GET", path, None, &[("authorization", auth)])
             .await
     }
+    /// Retries a job at the revision a fresh read reports.
+    async fn retry_job(&self, id: &str, auth: &str, key: &str) -> Reply {
+        let reviewed = self.get(&format!("/api/v2/jobs/{id}"), auth).await;
+        let etag = reviewed.headers["etag"].to_str().unwrap().to_owned();
+        let headers = [
+            ("authorization", auth),
+            ("idempotency-key", key),
+            ("if-match", etag.as_str()),
+        ];
+        self.call("POST", &format!("/api/v2/jobs/{id}/retry"), None, &headers)
+            .await
+    }
     async fn post(&self, path: &str, auth: &str, key: Option<&str>, body: Value) -> Reply {
         let mut headers = vec![("authorization", auth)];
         if let Some(key) = key {
@@ -8475,12 +8487,7 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
     assert_eq!(queued.body["status"], "pending");
     // Retrying the cancelled job alongside the active one is refused.
     let retried = f
-        .post(
-            &format!("/api/v2/jobs/{cancelled_id}/retry"),
-            &operator,
-            Some("preview-retry-00001"),
-            json!(null),
-        )
+        .retry_job(&cancelled_id, &operator, "preview-retry-00001")
         .await;
     assert_eq!(retried.status, StatusCode::CONFLICT, "{}", retried.body);
     assert_eq!(retried.body["code"], "preview_duplicate");
@@ -8609,12 +8616,7 @@ async fn previews_are_rendered_once_served_by_revision_and_retired() {
         StatusCode::NOT_FOUND
     );
     let stale_retry = f
-        .post(
-            &format!("/api/v2/jobs/{cancelled_id}/retry"),
-            &operator,
-            Some("preview-stale-retry-01"),
-            json!(null),
-        )
+        .retry_job(&cancelled_id, &operator, "preview-stale-retry-01")
         .await;
     assert_eq!(stale_retry.status, StatusCode::NOT_FOUND);
     sqlx::query("UPDATE media_files SET duration_seconds=25 WHERE id=?")

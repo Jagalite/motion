@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
+	"github.com/Jagalite/motion/apps/terminal/internal/platform"
 	"github.com/Jagalite/motion/apps/terminal/internal/store"
 )
 
@@ -27,12 +30,11 @@ const (
 	ExitInterrupted = 130
 )
 
-// UsageError marks invalid command-line input.
-type UsageError struct{ Msg string }
+// UsageError marks invalid command-line input. It is the shared invalid-input
+// error, so operations and argument parsing classify alike.
+type UsageError = operations.InvalidInputError
 
-func (e *UsageError) Error() string { return e.Msg }
-
-func usage(format string, args ...any) error { return &UsageError{Msg: fmt.Sprintf(format, args...)} }
+func usage(format string, args ...any) error { return operations.Invalid(format, args...) }
 
 // ExitCode classifies an error for the process exit status.
 func ExitCode(err error) int {
@@ -47,7 +49,8 @@ func ExitCode(err error) int {
 		return ExitInterrupted
 	case errors.Is(err, context.DeadlineExceeded):
 		return ExitUnavailable
-	case errors.As(err, &usageErr), errors.Is(err, store.ErrNoStore), errors.Is(err, store.ErrUnsupportedPlatform):
+	case errors.As(err, &usageErr), errors.Is(err, store.ErrNoStore), errors.Is(err, store.ErrUnsupportedPlatform),
+		errors.Is(err, platform.ErrBrowserUnsupported):
 		return ExitInvalid
 	case errors.As(err, &u):
 		return ExitUnavailable
@@ -65,7 +68,7 @@ func ExitCode(err error) int {
 		default:
 			return ExitInvalid
 		}
-	case errors.Is(err, errServerIdentity):
+	case errors.Is(err, operations.ErrServerIdentity):
 		return ExitAuth
 	}
 	return ExitInternal
@@ -86,6 +89,14 @@ type errorBody struct {
 	RequestID string `json:"request_id,omitempty"`
 	Retryable bool   `json:"retryable"`
 	ExitCode  int    `json:"exit_code"`
+	// OutcomeUnknown marks a mutation that may have been applied although
+	// no acknowledgement arrived; IdempotencyKey resubmits the same intent.
+	OutcomeUnknown bool   `json:"outcome_unknown,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	IfMatch        string `json:"if_match,omitempty"`
+	// Request holds other values to repeat, such as the user revision and
+	// grant; --resubmit-request takes it back verbatim.
+	Request any `json:"request,omitempty"`
 }
 
 func writeJSON(w io.Writer, v envelope) error {
@@ -116,6 +127,10 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 	case code == ExitAuth:
 		body.Code = "server_identity_changed"
 	}
+	var unknown *operations.UncertainError
+	if errors.As(err, &unknown) {
+		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch, body.Request = true, unknown.Key, unknown.IfMatch, unknown.Request
+	}
 	if jsonMode {
 		_ = writeJSON(w, envelope{Error: body})
 		return
@@ -127,7 +142,31 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 	if body.RequestID != "" {
 		msg += " (request " + body.RequestID + ")"
 	}
+	if unknown != nil {
+		var repeat []string
+		if unknown.Key != "" {
+			repeat = append(repeat, "--idempotency-key "+shellQuote(unknown.Key))
+		}
+		if unknown.IfMatch != "" {
+			repeat = append(repeat, "--if-match "+shellQuote(unknown.IfMatch))
+		}
+		if unknown.Request != nil {
+			request, _ := json.Marshal(unknown.Request)
+			repeat = append(repeat, "--resubmit-request "+shellQuote(string(request)))
+		}
+		if unknown.Key != "" {
+			msg += "\nmotion: the " + unknown.Operation + " may have been applied; repeat the command with " + strings.Join(repeat, " ") + " to resubmit the same request safely"
+		} else {
+			msg += "\nmotion: the " + unknown.Operation + " may have been applied; read the current state before trying again"
+		}
+	}
 	fmt.Fprintln(w, sanitize(msg))
+}
+
+// shellQuote quotes s as one POSIX shell word, so a suggested command can be
+// pasted without anything in s being interpreted.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // sanitize strips control characters from server-supplied text so a

@@ -178,7 +178,8 @@ def main():
             wait_for(lambda:job_row(job)['phase']=='running')
             api('POST',f"/jobs/{job['id']}/cancel")
             assert terminal(job)['phase']=='cancelled';gate.unlink()
-            api('POST',f"/jobs/{job['id']}/retry")
+            reviewed=Client(port,auth['Authorization'][7:]).etag(f"/api/v2/jobs/{job['id']}")
+            api('POST',f"/jobs/{job['id']}/retry",headers={'If-Match':reviewed})
             assert terminal(job)['phase']=='completed';checks.append('cancel_reap_retry_new_attempt')
             # SIGTERM leaves the active attempt recoverable, while its child is reaped.
             gate.touch();job=submit();wait_for(lambda:job_row(job)['phase']=='running');time.sleep(.4)

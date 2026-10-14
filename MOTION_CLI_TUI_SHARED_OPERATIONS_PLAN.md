@@ -2,7 +2,7 @@
 
 Date: October 13, 2026
 
-Status: Design and implementation plan. The shared operations layer described below is not yet implemented.
+Status: Implemented in `apps/terminal`; steps 1–6 are complete. Every inventoried workflow runs through `internal/operations` from both interfaces, with `motion serve` as the one recorded CLI-only exception ([operations.json](apps/terminal/operations.json), [PARITY.md](apps/terminal/PARITY.md)). A type-checked test stops CLI and TUI code from calling the API client directly. Real-server qualification runs the same scenario through each interface and compares the resulting state, and a PTY check drives the real TUI. The jobs slice exposed a missing server rule: retry now requires the reviewed revision, decided by `playscale_core::jobs::admit_retry` and explored by the Stateless model `playscale.jobs.reviewed_retry`.
 
 ## Decision
 

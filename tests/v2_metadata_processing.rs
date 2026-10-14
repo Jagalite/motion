@@ -1464,7 +1464,8 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
             None,
             &[
                 ("authorization", &op),
-                ("idempotency-key", "metadata-retry-00001")
+                ("idempotency-key", "metadata-retry-00001"),
+                ("if-match", state.headers["etag"].to_str().unwrap()),
             ]
         )
         .await
@@ -1475,12 +1476,10 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
         playscale::metadata_jobs::run_one(&f.app).await.unwrap(),
         "publication failure is a job failure, not a worker failure"
     );
-    assert_eq!(
-        f.call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
-            .await
-            .body["phase"],
-        "failed"
-    );
+    let failed = f
+        .call("GET", &format!("/api/v2/jobs/{id}"), None, &auth(&op))
+        .await;
+    assert_eq!(failed.body["phase"], "failed");
     sqlx::query("DROP TRIGGER fail_metadata")
         .execute(&f.app.db)
         .await
@@ -1492,7 +1491,8 @@ async fn metadata_refresh_failures_are_retryable_and_do_not_escape_worker() {
             None,
             &[
                 ("authorization", &op),
-                ("idempotency-key", "metadata-retry-00002")
+                ("idempotency-key", "metadata-retry-00002"),
+                ("if-match", failed.headers["etag"].to_str().unwrap()),
             ]
         )
         .await

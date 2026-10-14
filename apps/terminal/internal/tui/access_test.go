@@ -12,6 +12,7 @@ import (
 
 type accessFake struct {
 	*fake
+	invitations     []api.Invitation
 	revokedETag     string
 	edited          bool
 	currentRevision string
@@ -43,7 +44,7 @@ func (f *accessFake) GetDevice(context.Context, string) (api.Tagged[api.Device],
 }
 func (f *accessFake) RevokeDevice(context.Context, string, string) error { return nil }
 func (f *accessFake) ListInvitations(context.Context, string, int) (api.Page[api.Invitation], error) {
-	return api.Page[api.Invitation]{}, nil
+	return api.Page[api.Invitation]{Items: f.invitations}, nil
 }
 func (f *accessFake) CreateInvitation(context.Context, api.InvitationInput, string) (api.Tagged[api.Invitation], error) {
 	return api.Tagged[api.Invitation]{}, nil
@@ -201,7 +202,7 @@ func TestAccessMutationsFenceStaleDialogs(t *testing.T) {
 	}
 }
 func TestInvitationRevokeUsesStrongRevision(t *testing.T) {
-	f := &accessFake{fake: &fake{}}
+	f := &accessFake{fake: &fake{}, invitations: []api.Invitation{{ID: "inv", Revision: "7"}}}
 	m := New(context.Background(), f, "", nil)
 	m.access = &accessDialog{kind: "revoke-invite", target: "inv", revision: "7"}
 	result := m.submitAccess()().(accessDone)
@@ -210,6 +211,13 @@ func TestInvitationRevokeUsesStrongRevision(t *testing.T) {
 	}
 	if f.revokedETag != `"r-7"` {
 		t.Fatalf("wrong ETag: %q", f.revokedETag)
+	}
+	// A revision that changed after review is refused without a write.
+	f.revokedETag, f.invitations[0].Revision = "", "8"
+	m.access = &accessDialog{kind: "revoke-invite", target: "inv", revision: "7"}
+	result = m.submitAccess()().(accessDone)
+	if !api.IsCode(result.err, "precondition_failed") || f.revokedETag != "" {
+		t.Fatalf("stale revocation: %v %q", result.err, f.revokedETag)
 	}
 }
 

@@ -175,8 +175,14 @@ func TestE2EPairApproveUseAndRevokeAgainstRealServer(t *testing.T) {
 	if pending == nil {
 		t.Fatalf("no pairing notice: %s", pairErr.String())
 	}
+	// The server manages access by user: the device joins an access user.
+	member := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "access", "users", "create", "Household member",
+		"--grant-profile", "default", "--permission", "catalog:read", "--permission", "events:read", "--permission", "profiles:manage")
+	if member.code != cli.ExitOK {
+		t.Fatalf("user: %+v", member)
+	}
 	approve := run(t, srv, admin, "--operator-token-file", srv.operator, "--json", "auth", "approve", pending["pairing_id"],
-		"--code", strings.ToLower(pending["user_code"]), "--grant-profile", "default",
+		"--code", strings.ToLower(pending["user_code"]), "--user", data(t, member.stdout)["id"].(string), "--grant-profile", "default",
 		"--permission", "catalog:read", "--permission", "events:read", "--permission", "profiles:manage")
 	if approve.code != cli.ExitOK {
 		t.Fatalf("approve: %+v", approve)
