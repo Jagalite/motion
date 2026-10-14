@@ -32,10 +32,10 @@ fn cipher(app: &App) -> XChaCha20Poly1305 {
     let key = keyed(app, "encryption-key", "");
     XChaCha20Poly1305::new_from_slice(&unhex(&key).unwrap()).unwrap()
 }
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn unhex(s: &str) -> Option<Vec<u8>> {
+pub(super) fn unhex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
@@ -257,35 +257,95 @@ pub(crate) async fn require_fresh(
     .await?;
     Ok(row.get("expires_at"))
 }
-#[derive(Clone, Deserialize, Serialize, Default)]
+#[derive(Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct EmailConfig {
     pub enabled: bool,
+    /// Relay delivery (the existing default) or native direct delivery.
+    pub mode: playscale_core::mail::Mode,
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
     pub from: String,
     pub loopback_test: bool,
+    pub direct: DirectConfig,
 }
-pub(super) async fn mail(
-    c: &mut sqlx::SqliteConnection,
-    app: &App,
-) -> Result<(EmailConfig, i64, crate::signin_protocol::MailConfig), Problem> {
-    let (json, secret, revision): (String, Option<String>, i64) =
-        sqlx::query_as("SELECT email_json,email_secret,email_revision FROM signin_settings")
-            .fetch_one(c)
-            .await?;
+#[derive(Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct DirectConfig {
+    /// EHLO name and Message-ID domain.
+    pub hostname: String,
+    /// Envelope sender (return path) for bounces, managed outside Motion.
+    pub envelope_from: String,
+    pub selector: String,
+    /// Explicit isolated qualification route: plaintext to 127.0.0.1:port.
+    pub loopback_port: Option<u16>,
+}
+/// Loaded delivery configuration, with secrets opened only in memory.
+pub(super) struct Mail {
+    pub cfg: EmailConfig,
+    pub revision: i64,
+    pub password: Option<String>,
+    /// PKCS#8 DER and base64 SPKI of the DKIM key, if configured.
+    pub dkim: Option<(Vec<u8>, String)>,
+}
+impl Mail {
+    /// Whether messages can be composed at all. Checked before any recipient
+    /// eligibility so an unusable configuration is uniformly unavailable.
+    pub fn deliverable(&self) -> bool {
+        crate::mail::message::parse_mailbox(&self.cfg.from).is_some()
+            && (self.cfg.mode == playscale_core::mail::Mode::Relay
+                || (self.dkim.is_some()
+                    && !self.cfg.direct.hostname.is_empty()
+                    && !self.cfg.direct.envelope_from.is_empty()))
+    }
+    /// The signing-key identity fenced into each direct-mode message.
+    pub fn key_id(&self) -> Option<String> {
+        (self.cfg.mode == playscale_core::mail::Mode::Direct)
+            .then(|| {
+                self.dkim
+                    .as_ref()
+                    .map(|(_, public)| crate::mail::dkim::key_id(public))
+            })
+            .flatten()
+    }
+    pub fn relay(&self) -> crate::mail::Relay {
+        crate::mail::Relay {
+            host: self.cfg.host.clone(),
+            port: self.cfg.port,
+            username: self.cfg.username.clone(),
+            password: self.password.clone(),
+            loopback_test: self.cfg.loopback_test,
+        }
+    }
+}
+pub(super) async fn mail(c: &mut sqlx::SqliteConnection, app: &App) -> Result<Mail, Problem> {
+    let (json, secret, revision, dkim, public): (
+        String,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT email_json,email_secret,email_revision,dkim_secret,dkim_public FROM signin_settings",
+    )
+    .fetch_one(c)
+    .await?;
     let cfg: EmailConfig = serde_json::from_str(&json).map_err(Problem::internal)?;
     let password = secret.map(|s| open(app, "mail-secret", &s)).transpose()?;
-    let wire = crate::signin_protocol::MailConfig {
-        host: cfg.host.clone(),
-        port: cfg.port,
-        username: cfg.username.clone(),
-        password,
-        from: cfg.from.clone(),
-        loopback_test: cfg.loopback_test,
+    let dkim = match (dkim, public) {
+        (Some(sealed), Some(public)) => {
+            let der = unhex(&open(app, "dkim-key", &sealed)?).ok_or_else(unavailable)?;
+            Some((der, public))
+        }
+        _ => None,
     };
-    Ok((cfg, revision, wire))
+    Ok(Mail {
+        cfg,
+        revision,
+        password,
+        dkim,
+    })
 }
 pub(super) async fn provider(
     c: &mut sqlx::SqliteConnection,

@@ -356,7 +356,7 @@ async fn cancel_transactions(
     email: bool,
 ) -> Result<(), Problem> {
     sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),verifier=NULL,nonce=NULL,code_hash=NULL,result='method_changed' WHERE (? IS NOT NULL AND provider_id=?) OR (? IS NOT NULL AND identity_id=?) OR (? AND address IS NOT NULL)").bind(provider_id).bind(provider_id).bind(identity_id).bind(identity_id).bind(email).execute(&mut *c).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE transaction_id IN (SELECT id FROM signin_transactions WHERE result='method_changed')").execute(c).await?;
+    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE phase='queued' AND transaction_id IN (SELECT id FROM signin_transactions WHERE result='method_changed')").execute(c).await?;
     Ok(())
 }
 
@@ -573,11 +573,7 @@ pub async fn replace_settings(
         revoke_families(&mut tx, &families, &caller.principal.id).await?;
         sqlx::query("UPDATE signin_providers SET revision=revision+1,enabled=0,test_at=NULL,test_ok=NULL,login_test_at=NULL").execute(&mut *tx).await?;
         sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),verifier=NULL,nonce=NULL,code_hash=NULL,result='origin_changed'").execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE phase='pending'",
-        )
-        .execute(&mut *tx)
-        .await?;
+        super::outbox::cancel_all(&mut tx).await?;
         let next = next_revision(revision)?;
         sqlx::query("UPDATE signin_settings SET public_origin=?,revision=?")
             .bind(&value)
@@ -619,9 +615,7 @@ pub async fn review_restore(
         .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),nonce=NULL,verifier=NULL,code_hash=NULL,result='restore_reviewed'").execute(&mut *tx).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE phase='pending'")
-        .execute(&mut *tx)
-        .await?;
+    super::outbox::cancel_all(&mut tx).await?;
     audit(
         &mut tx,
         &caller.principal.id,
@@ -637,9 +631,38 @@ pub async fn review_restore(
 fn email_value(row: &SqliteRow) -> Result<Value, Problem> {
     let config: EmailConfig =
         serde_json::from_str(row.get("email_json")).map_err(Problem::internal)?;
-    Ok(
-        json!({"revision":row.get::<i64,_>("email_revision").to_string(),"enabled":config.enabled,"host":config.host,"port":if config.port==0{587}else{config.port},"username":config.username,"from":config.from,"loopback_test":config.loopback_test,"has_password":row.get::<Option<String>,_>("email_secret").is_some(),"last_test_at":row.get::<Option<i64>,_>("email_test_at"),"last_test_ok":row.get::<Option<bool>,_>("email_test_ok")}),
-    )
+    let public: Option<String> = row.get("dkim_public");
+    let from_domain = crate::mail::message::parse_mailbox(&config.from)
+        .map(|m| m.domain().to_owned())
+        .unwrap_or_default();
+    Ok(json!({
+        "revision": row.get::<i64,_>("email_revision").to_string(),
+        "enabled": config.enabled,
+        "mode": config.mode,
+        "host": config.host,
+        "port": if config.port == 0 { 587 } else { config.port },
+        "username": config.username,
+        "from": config.from,
+        "loopback_test": config.loopback_test,
+        "has_password": row.get::<Option<String>,_>("email_secret").is_some(),
+        "direct": {
+            "hostname": config.direct.hostname,
+            "envelope_from": config.direct.envelope_from,
+            "selector": config.direct.selector,
+            "loopback_port": config.direct.loopback_port,
+            "network_requirement": "Direct delivery connects from this server to recipient mail servers on TCP port 25. Many residential and cloud networks block it; confirm with your provider.",
+        },
+        "dkim": {
+            "has_key": public.is_some(),
+            "key_id": public.as_deref().map(crate::mail::dkim::key_id),
+            "record_name": (!config.direct.selector.is_empty() && !from_domain.is_empty())
+                .then(|| format!("{}._domainkey.{from_domain}", config.direct.selector)),
+            "record": public.as_deref().map(crate::mail::dkim::dns_record),
+        },
+        "last_test_at": row.get::<Option<i64>,_>("email_test_at"),
+        "last_test_ok": row.get::<Option<bool>,_>("email_test_ok"),
+        "last_receipt_at": row.get::<Option<i64>,_>("email_receipt_at"),
+    }))
 }
 
 pub async fn get_email(State(app): State<App>, caller: Caller) -> Result<Response, Problem> {
@@ -657,11 +680,37 @@ pub async fn get_email(State(app): State<App>, caller: Caller) -> Result<Respons
     ))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct DirectInput {
+    hostname: String,
+    envelope_from: String,
+    selector: String,
+    loopback_port: Option<u16>,
+}
+
+/// DKIM key handling keeps the retain/replace/clear semantics of secrets.
+#[derive(Deserialize, Default)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KeyUpdate {
+    #[default]
+    Retain,
+    Generate,
+    Import {
+        value: String,
+    },
+    Clear,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmailInput {
     enabled: bool,
+    #[serde(default)]
+    mode: playscale_core::mail::Mode,
+    #[serde(default)]
     host: String,
+    #[serde(default)]
     port: u16,
     username: Option<String>,
     from: String,
@@ -669,6 +718,14 @@ pub struct EmailInput {
     loopback_test: bool,
     #[serde(default)]
     password: SecretUpdate,
+    #[serde(default)]
+    direct: DirectInput,
+    #[serde(default)]
+    dkim_key: KeyUpdate,
+}
+
+fn invalid_email(detail: &'static str) -> Problem {
+    Problem::invalid("invalid_email_configuration", detail)
 }
 
 pub async fn replace_email(
@@ -677,35 +734,93 @@ pub async fn replace_email(
     headers: HeaderMap,
     body: Body<EmailInput>,
 ) -> Result<Response, Problem> {
+    use playscale_core::mail::Mode;
     let expected = if_match(&headers)?;
     let input = body.value;
-    bounded(&input.host, 1, 253)?;
     bounded(&input.from, 1, 320)?;
-    if input.port == 0
-        || input.host.contains(['/', '@', '?', '#', '\\'])
-        || input.from.parse::<lettre::message::Mailbox>().is_err()
-        || (input.loopback_test
-            && !input
-                .host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback()))
+    let from = crate::mail::message::parse_mailbox(&input.from).ok_or_else(|| {
+        invalid_email("Use a sender such as Motion <motion@example.com> with an ASCII address")
+    })?;
+    let relay = input.mode == Mode::Relay;
+    if relay
+        && (input.port == 0
+            || input.host.is_empty()
+            || input.host.len() > 253
+            || input.host.contains(['/', '@', '?', '#', '\\'])
+            || input.host.chars().any(char::is_whitespace)
+            || (input.loopback_test
+                && !input
+                    .host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())))
     {
-        return Err(Problem::invalid(
-            "invalid_email_configuration",
+        return Err(invalid_email(
             "Use a valid SMTP host, port, sender and TLS configuration",
+        ));
+    }
+    let direct = DirectConfig {
+        hostname: input.direct.hostname.trim().to_ascii_lowercase(),
+        envelope_from: input.direct.envelope_from.trim().to_ascii_lowercase(),
+        selector: input.direct.selector.trim().to_ascii_lowercase(),
+        loopback_port: input.direct.loopback_port.filter(|port| *port != 0),
+    };
+    if !relay
+        && (crate::mail::dns::host_name(&direct.hostname).as_deref()
+            != Some(direct.hostname.as_str())
+            || !direct.hostname.contains('.')
+            || core::canonical_email(&direct.envelope_from).as_deref()
+                != Some(direct.envelope_from.as_str())
+            || !crate::mail::dkim::selector_ok(&direct.selector))
+    {
+        return Err(invalid_email(
+            "Direct delivery needs a sending hostname, an envelope sender address and a DKIM selector",
         ));
     }
     let config = EmailConfig {
         enabled: input.enabled,
+        mode: input.mode,
         host: input.host,
         port: input.port,
         username: input.username.filter(|value| !value.is_empty()),
         from: input.from,
         loopback_test: input.loopback_test,
+        direct: if relay {
+            DirectConfig::default()
+        } else {
+            direct
+        },
     };
     if let Some(username) = &config.username {
         bounded(username, 1, 512)?;
     }
+    // Key generation is CPU-bound; finish it before reserving the writer, but
+    // only for a currently authorized administrator and within a bound.
+    if matches!(
+        input.dkim_key,
+        KeyUpdate::Generate | KeyUpdate::Import { .. }
+    ) {
+        let mut read = app.db.acquire().await?;
+        caller
+            .reauthorize(&mut read, Some(Permission::SystemAdmin))
+            .await?;
+        drop(read);
+        limit(&app, &format!("dkim-key:{}", caller.principal.id), 5, 600).await?;
+    }
+    let new_key = match &input.dkim_key {
+        KeyUpdate::Generate => Some(
+            tokio::task::spawn_blocking(crate::mail::dkim::generate)
+                .await
+                .map_err(Problem::internal)?
+                .map_err(|_| unavailable())?,
+        ),
+        KeyUpdate::Import { value } => Some(crate::mail::dkim::import(value).map_err(|_| {
+            Problem::invalid(
+                "invalid_dkim_key",
+                "Enter an unencrypted 2048–4096-bit RSA private key in PEM form",
+            )
+        })?),
+        KeyUpdate::Retain | KeyUpdate::Clear => None,
+    };
     let mut tx = begin_write(&app.db).await?;
     caller
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
@@ -718,19 +833,30 @@ pub async fn replace_email(
     require_fresh(&mut tx, &caller, &headers, "email.write", "email").await?;
     let old: EmailConfig =
         serde_json::from_str(row.get("email_json")).map_err(Problem::internal)?;
-    let changed = config.host != old.host
-        || config.port != old.port
-        || config.username != old.username
-        || config.from != old.from
-        || config.loopback_test != old.loopback_test
-        || input.password.changed();
+    let key_changed = !matches!(input.dkim_key, KeyUpdate::Retain);
+    let (dkim_secret, dkim_public): (Option<String>, Option<String>) =
+        match (&input.dkim_key, new_key) {
+            (_, Some(material)) => (
+                Some(seal(&app, "dkim-key", &hex(&material.pkcs8))?),
+                Some(material.public),
+            ),
+            (KeyUpdate::Clear, None) => (None, None),
+            _ => (row.get("dkim_secret"), row.get("dkim_public")),
+        };
+    let mut comparable = config.clone();
+    comparable.enabled = old.enabled;
+    let changed = comparable != old || input.password.changed() || key_changed;
     let secret = input
         .password
         .apply(&app, "mail-secret", row.get("email_secret"))?;
-    if config.username.is_some() != secret.is_some() {
-        return Err(Problem::invalid(
-            "invalid_email_configuration",
+    if relay && config.username.is_some() != secret.is_some() {
+        return Err(invalid_email(
             "Configure SMTP username and password together",
+        ));
+    }
+    if !relay && dkim_public.is_none() && config.enabled {
+        return Err(invalid_email(
+            "Generate or import a DKIM key before enabling direct delivery",
         ));
     }
     if config.enabled
@@ -743,6 +869,7 @@ pub async fn replace_email(
             "Save disabled delivery settings and successfully send an explicit test before enabling email sign-in",
         ));
     }
+    let _ = from;
     if changed || config.enabled != old.enabled {
         if old.enabled && !config.enabled {
             preserve_methods(&mut tx, &caller, None, None, true).await?;
@@ -750,7 +877,18 @@ pub async fn replace_email(
         let families = method_families(&mut tx, None, None, true).await?;
         revoke_families(&mut tx, &families, &caller.principal.id).await?;
         cancel_transactions(&mut tx, None, None, true).await?;
-        sqlx::query("UPDATE signin_settings SET email_json=?,email_secret=?,email_revision=?,revision=revision+1,email_test_at=CASE WHEN ? THEN NULL ELSE email_test_at END,email_test_ok=CASE WHEN ? THEN NULL ELSE email_test_ok END").bind(jsonstr(&config)).bind(secret).bind(next_revision(revision)?).bind(changed).bind(changed).execute(&mut *tx).await?;
+        super::outbox::cancel_all(&mut tx).await?;
+        sqlx::query("UPDATE signin_settings SET email_json=?,email_secret=?,dkim_secret=?,dkim_public=?,email_revision=?,revision=revision+1,email_test_at=CASE WHEN ? THEN NULL ELSE email_test_at END,email_test_ok=CASE WHEN ? THEN NULL ELSE email_test_ok END,email_receipt_at=CASE WHEN ? THEN NULL ELSE email_receipt_at END")
+            .bind(jsonstr(&config))
+            .bind(secret)
+            .bind(dkim_secret)
+            .bind(dkim_public)
+            .bind(next_revision(revision)?)
+            .bind(changed)
+            .bind(changed)
+            .bind(changed)
+            .execute(&mut *tx)
+            .await?;
         audit(&mut tx, &caller.principal.id, "email", "email.write", "ok").await?;
     }
     let row = sqlx::query("SELECT * FROM signin_settings")
@@ -768,12 +906,15 @@ pub struct EmailTestInput {
     address: String,
 }
 
+/// Queue an identifiable test through the real outbox and attempt it now.
+/// Transport acceptance is reported as such; entering the emailed code
+/// (`confirm_email_test`) is the only proof of receipt.
 pub async fn test_email(
     State(app): State<App>,
     caller: Caller,
     headers: HeaderMap,
     body: Body<EmailTestInput>,
-) -> Result<Json<Value>, Problem> {
+) -> Result<Response, Problem> {
     let address = core::canonical_email(&body.value.address)
         .ok_or_else(|| Problem::invalid("invalid_email", "Enter the explicit test destination"))?;
     limit(&app, &format!("email-test:{}", caller.principal.id), 5, 600).await?;
@@ -782,58 +923,286 @@ pub async fn test_email(
         .reauthorize(&mut tx, Some(Permission::SystemAdmin))
         .await?;
     require_fresh(&mut tx, &caller, &headers, "email.test", "email").await?;
-    let (_, revision, config) = mail(&mut tx, &app).await?;
-    let tested_epoch = epoch(&mut tx).await?;
-    audit(
-        &mut tx,
-        &caller.principal.id,
-        "email",
-        "email.test",
-        "started",
-    )
-    .await?;
-    tx.commit().await?;
-    // This static demonstration code is never installed as an authentication
-    // challenge and therefore cannot authorize a session even if copied.
-    let success = signin_protocol::send_code(&config, &address, "00000000")
-        .await
-        .is_ok();
-    let mut tx = begin_write(&app.db).await?;
-    caller
-        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
-        .await?;
-    let current: i64 = sqlx::query_scalar("SELECT email_revision FROM signin_settings")
-        .fetch_one(&mut *tx)
-        .await?;
-    check_revision(current, revision as u64)?;
-    if tested_epoch != epoch(&mut tx).await? {
-        return Err(problem(core::Error::Stale));
+    if hold(&mut tx).await? {
+        return Err(unavailable());
     }
-    let at = now();
-    sqlx::query("UPDATE signin_settings SET email_test_at=?,email_test_ok=?")
-        .bind(at)
-        .bind(success)
+    let mail = mail(&mut tx, &app).await?;
+    if mail.cfg.mode == playscale_core::mail::Mode::Direct && mail.dkim.is_none() {
+        return Err(invalid_email(
+            "Generate or import a DKIM key before testing direct delivery",
+        ));
+    }
+    let test = new_id();
+    let random = auth::random_key();
+    let code = format!(
+        "{:08}",
+        u32::from_be_bytes(random[..4].try_into().unwrap()) % 100_000_000
+    );
+    let domain = address.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
+    sqlx::query("INSERT INTO signin_mail_tests(id,actor_id,config_revision,mode,recipient_domain,code_hash,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)")
+        .bind(&test)
+        .bind(&caller.principal.id)
+        .bind(mail.revision)
+        .bind(mail.cfg.mode.as_str())
+        .bind(domain)
+        .bind(keyed(&app, &format!("mail-test:{test}"), &code))
+        .bind(now())
+        .bind(now() + 3600)
         .execute(&mut *tx)
         .await?;
-    audit(
+    let message = super::outbox::enqueue(
         &mut tx,
-        &caller.principal.id,
-        "email",
-        "email.test",
-        if success { "accepted" } else { "failed" },
+        &app,
+        &mail,
+        playscale_core::mail::Purpose::Test,
+        &test,
+        None,
+        &address,
+        crate::mail::Content::Test {
+            code: &code,
+            origin: &app.origin,
+        },
+        now() + core::TRANSACTION_TTL,
     )
     .await?;
+    audit(&mut tx, &caller.principal.id, &test, "email.test", "queued").await?;
     tx.commit().await?;
-    if !success {
+    let phase = super::outbox::process(&app, &message).await?;
+    let status = super::outbox::status(phase.as_str(), 1);
+    let body = json!({
+        "test_id": test,
+        "message_id": message,
+        "status": status,
+        "accepted": phase == playscale_core::mail::Phase::Accepted,
+        "revision": mail.revision.to_string(),
+        "detail": match status {
+            "accepted" => "Accepted by the mail server. This does not prove inbox delivery; enter the emailed test code to confirm receipt.",
+            "retry_pending" => "Not accepted yet. Motion will retry; check Delivery activity.",
+            "acceptance_unknown" => "The connection ended after the message was sent; acceptance is unknown.",
+            _ => "The test message was not accepted; check the delivery configuration and Delivery activity.",
+        },
+    });
+    if matches!(
+        status,
+        "failed" | "expired" | "cancelled" | "acceptance_unknown"
+    ) {
         return Err(Problem::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "email_delivery_failed",
             "The test message was not accepted; check the delivery configuration",
         ));
     }
-    Ok(Json(
-        json!({"accepted":true,"tested_at":at,"revision":revision.to_string()}),
-    ))
+    Ok((
+        if status == "accepted" {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(body),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestConfirmation {
+    code: String,
+}
+
+pub async fn confirm_email_test(
+    State(app): State<App>,
+    caller: Caller,
+    Path(id): Path<String>,
+    body: Body<TestConfirmation>,
+) -> Result<Json<Value>, Problem> {
+    let mut tx = begin_write(&app.db).await?;
+    caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let row = sqlx::query("SELECT * FROM signin_mail_tests WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(Problem::not_found)?;
+    let attempts: i64 = row.get("attempts");
+    let hash: Option<String> = row.get("code_hash");
+    if row.get::<i64, _>("expires_at") <= now() || attempts >= i64::from(core::CODE_ATTEMPTS) {
+        return Err(problem(core::Error::Expired));
+    }
+    let Some(hash) = hash else {
+        return Ok(Json(
+            json!({"confirmed": true, "confirmed_at": row.get::<Option<i64>,_>("confirmed_at")}),
+        ));
+    };
+    let matches = body.value.code.len() == 8
+        && body.value.code.bytes().all(|b| b.is_ascii_digit())
+        && verify_keyed(&app, &format!("mail-test:{id}"), &body.value.code, &hash);
+    sqlx::query("UPDATE signin_mail_tests SET attempts=attempts+1,code_hash=CASE WHEN ? THEN NULL ELSE code_hash END,confirmed_at=CASE WHEN ? THEN ? ELSE confirmed_at END WHERE id=?")
+        .bind(matches)
+        .bind(matches)
+        .bind(now())
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    if !matches {
+        tx.commit().await?;
+        return Err(problem(core::Error::InvalidCode));
+    }
+    // Receipt proves only this configuration revision.
+    sqlx::query("UPDATE signin_settings SET email_receipt_at=? WHERE email_revision=?")
+        .bind(now())
+        .bind(row.get::<i64, _>("config_revision"))
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        &caller.principal.id,
+        &id,
+        "email.test",
+        "receipt_confirmed",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"confirmed": true, "confirmed_at": now()})))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiagnosticsInput {
+    /// Optional recipient domain for an outbound connectivity/TLS probe.
+    probe_domain: Option<String>,
+}
+
+pub async fn email_diagnostics(
+    State(app): State<App>,
+    caller: Caller,
+    body: Body<DiagnosticsInput>,
+) -> Result<Json<Value>, Problem> {
+    limit(
+        &app,
+        &format!("email-diagnostics:{}", caller.principal.id),
+        6,
+        600,
+    )
+    .await?;
+    let mut tx = app.db.begin().await?;
+    caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let mail = mail(&mut tx, &app).await?;
+    let row =
+        sqlx::query("SELECT email_test_at,email_test_ok,email_receipt_at FROM signin_settings")
+            .fetch_one(&mut *tx)
+            .await?;
+    drop(tx);
+    let probe = match body
+        .value
+        .probe_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(domain) => Some(crate::mail::dns::host_name(domain).ok_or_else(|| {
+            Problem::invalid(
+                "invalid_domain",
+                "Enter a recipient domain such as example.com",
+            )
+        })?),
+        None => None,
+    };
+    let from = crate::mail::message::parse_mailbox(&mail.cfg.from);
+    let from_domain = from
+        .as_ref()
+        .map(|m| m.domain().to_owned())
+        .unwrap_or_default();
+    let direct = &mail.cfg.direct;
+    let envelope_domain = direct
+        .envelope_from
+        .rsplit_once('@')
+        .map(|(_, d)| d.to_owned())
+        .unwrap_or_else(|| from_domain.clone());
+    let setup = crate::mail::diagnostics::Setup {
+        from_domain: &from_domain,
+        envelope_domain: &envelope_domain,
+        hostname: &direct.hostname,
+        selector: &direct.selector,
+        public_key: mail.dkim.as_ref().map(|(_, public)| public.as_str()),
+    };
+    let routing = app.access.mail.routing();
+    let mut findings = Vec::new();
+    if mail.cfg.mode == playscale_core::mail::Mode::Direct {
+        findings.extend(crate::mail::diagnostics::records(&routing, &setup).await);
+        if let Some(domain) = &probe {
+            findings.extend(
+                crate::mail::diagnostics::connectivity(&routing, domain, &direct.hostname).await,
+            );
+        }
+    }
+    Ok(Json(json!({
+        "mode": mail.cfg.mode,
+        "revision": mail.revision.to_string(),
+        "observed_at": now(),
+        "last_test_at": row.get::<Option<i64>,_>("email_test_at"),
+        "last_test_ok": row.get::<Option<bool>,_>("email_test_ok"),
+        "last_receipt_at": row.get::<Option<i64>,_>("email_receipt_at"),
+        "findings": findings,
+        "publish": if mail.cfg.mode == playscale_core::mail::Mode::Direct {
+            crate::mail::diagnostics::publish(&setup)
+                .into_iter()
+                .map(|(kind, name, value)| json!({"type": kind, "name": name, "value": value}))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
+        "cannot_prove": crate::mail::diagnostics::UNPROVABLE,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct ActivityQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+pub async fn email_activity(
+    State(app): State<App>,
+    caller: Caller,
+    Query(query): Query<ActivityQuery>,
+) -> Result<Json<Value>, Problem> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let (before_at, before_id) = match query.cursor.as_deref() {
+        None => (i64::MAX, String::new()),
+        Some(cursor) => {
+            let (at, id) = cursor
+                .split_once(':')
+                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_owned())))
+                .filter(|(_, id)| id.len() <= 64)
+                .ok_or_else(|| Problem::invalid("invalid_cursor", "Use the returned cursor"))?;
+            (at, id)
+        }
+    };
+    let mut tx = app.db.begin().await?;
+    caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let rows = sqlx::query("SELECT * FROM signin_outbox WHERE created_at<? OR (created_at=? AND id<?) ORDER BY created_at DESC,id DESC LIMIT ?")
+        .bind(before_at)
+        .bind(before_at)
+        .bind(if query.cursor.is_some() { before_id } else { "\u{10ffff}".into() })
+        .bind(i64::from(limit) + 1)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut items: Vec<Value> = rows.iter().map(super::outbox::activity_value).collect();
+    let more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next = more
+        .then(|| {
+            items
+                .last()
+                .and_then(|v| v["cursor"].as_str().map(str::to_owned))
+        })
+        .flatten();
+    Ok(Json(json!({"items": items, "next_cursor": next})))
 }
 
 pub async fn overview(State(app): State<App>, caller: Caller) -> Result<Json<Value>, Problem> {
@@ -865,13 +1234,24 @@ pub async fn overview(State(app): State<App>, caller: Caller) -> Result<Json<Val
     if origin.as_deref() != Some(app.origin.as_str()) {
         errors.push("Public sign-in origin must match the configured server origin");
     }
+    let mail = mail(&mut tx, &app).await?;
+    if mail.cfg.enabled && !mail.deliverable() {
+        errors.push("Email delivery cannot compose messages: use an ASCII sender address and display name, and for direct delivery a hostname, envelope sender and DKIM key. Re-save Email delivery settings");
+    }
     Ok(Json(
         json!({"revision":row.get::<i64,_>("revision").to_string(),"public_origin":origin,"usable_administrators":admins,"pending_requests":pending,"restored_hold":hold(&mut tx).await?,"configuration_errors":errors}),
     ))
 }
 
 fn request_value(row: &SqliteRow) -> Value {
-    json!({"id":row.get::<String,_>("id"),"revision":row.get::<i64,_>("revision").to_string(),"provider_id":row.get::<String,_>("provider_id"),"issuer":row.get::<String,_>("issuer"),"subject":row.get::<String,_>("subject"),"email":row.get::<Option<String>,_>("email"),"name":row.get::<Option<String>,_>("name"),"status":if row.get::<String,_>("status")=="pending" && row.get::<i64,_>("expires_at")<=now(){"expired".to_owned()}else{row.get("status")},"created_at":row.get::<i64,_>("created_at"),"expires_at":row.get::<i64,_>("expires_at"),"user_id":row.get::<Option<String>,_>("user_id")})
+    let status = if row.get::<String, _>("status") == "pending"
+        && row.get::<i64, _>("expires_at") <= now()
+    {
+        "expired".to_owned()
+    } else {
+        row.get("status")
+    };
+    json!({"id":row.get::<String,_>("id"),"revision":row.get::<i64,_>("revision").to_string(),"kind":row.get::<String,_>("kind"),"provider_id":row.get::<Option<String>,_>("provider_id"),"issuer":row.get::<Option<String>,_>("issuer"),"subject":row.get::<Option<String>,_>("subject"),"address":row.get::<Option<String>,_>("address"),"email":row.get::<Option<String>,_>("email"),"name":row.get::<Option<String>,_>("name"),"status":status,"created_at":row.get::<i64,_>("created_at"),"expires_at":row.get::<i64,_>("expires_at"),"user_id":row.get::<Option<String>,_>("user_id")})
 }
 
 pub async fn list_requests(
@@ -938,38 +1318,66 @@ pub async fn approve_request(
     {
         return Err(problem(core::Error::Expired));
     }
-    let provider_id: String = request.get("provider_id");
-    let provider = sqlx::query("SELECT issuer,revision,enabled FROM signin_providers WHERE id=?")
-        .bind(&provider_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if !provider.get::<bool, _>("enabled")
-        || provider.get::<i64, _>("revision") != request.get::<i64, _>("provider_revision")
-        || provider.get::<String, _>("issuer") != request.get::<String, _>("issuer")
-    {
-        return Err(problem(core::Error::Stale));
+    let email = request.get::<String, _>("kind") == "email";
+    if email {
+        // The email method must still be enabled under the same restore epoch.
+        if !mail(&mut tx, &app).await?.cfg.enabled {
+            return Err(problem(core::Error::Stale));
+        }
+    } else {
+        let provider_id: String = request.get("provider_id");
+        let provider =
+            sqlx::query("SELECT issuer,revision,enabled FROM signin_providers WHERE id=?")
+                .bind(&provider_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !provider.get::<bool, _>("enabled")
+            || provider.get::<i64, _>("revision") != request.get::<i64, _>("provider_revision")
+            || provider.get::<String, _>("issuer") != request.get::<String, _>("issuer")
+        {
+            return Err(problem(core::Error::Stale));
+        }
     }
     let user = access_management::load_user(&mut tx, &input.user_id)
         .await?
         .ok_or_else(Problem::not_found)?;
     access_admin::authorize_grant(&user, user_revision, &user.grant, &user.policy)?;
     require_fresh(&mut tx, &caller, &headers, "request.approve", &id).await?;
-    let issuer: String = request.get("issuer");
-    let subject: String = request.get("subject");
-    let identity = super::flows::link_identity(
-        &mut tx,
-        &user,
-        &Device {
-            policy: user.policy.clone(),
-            ..Device::approved("reviewed-recovery".into(), user.grant.clone())
-        },
-        "oidc",
-        Some(&provider_id),
-        Some(&issuer),
-        Some(&subject),
-        None,
-    )
-    .await?;
+    let ceiling = Device {
+        policy: user.policy.clone(),
+        ..Device::approved("reviewed-recovery".into(), user.grant.clone())
+    };
+    let identity = if email {
+        // Approval links only the verified address to the explicitly selected
+        // user; an existing owner of the address is an identity conflict.
+        let address: String = request.get("address");
+        super::flows::link_identity(
+            &mut tx,
+            &user,
+            &ceiling,
+            "email",
+            None,
+            None,
+            None,
+            Some(&address),
+        )
+        .await?
+    } else {
+        let provider_id: String = request.get("provider_id");
+        let issuer: String = request.get("issuer");
+        let subject: String = request.get("subject");
+        super::flows::link_identity(
+            &mut tx,
+            &user,
+            &ceiling,
+            "oidc",
+            Some(&provider_id),
+            Some(&issuer),
+            Some(&subject),
+            None,
+        )
+        .await?
+    };
     let next = next_revision(revision)?;
     sqlx::query("UPDATE signin_requests SET status='approved',user_id=?,revision=? WHERE id=?")
         .bind(&user.id)
@@ -1051,6 +1459,7 @@ const PROOF_ACTIONS: &[&str] = &[
     "identity.link",
     "pairing.approve",
     "invitation.create",
+    "registration.write",
 ];
 
 #[derive(Deserialize)]
@@ -1523,7 +1932,7 @@ pub async fn revoke_user(
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE signin_transactions SET state_json=json_set(state_json,'$.phase','failed'),nonce=NULL,verifier=NULL,code_hash=NULL,result='user_revoked' WHERE json_extract(state_json,'$.user_id')=?").bind(&id).execute(&mut *tx).await?;
-    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE transaction_id IN (SELECT id FROM signin_transactions WHERE result='user_revoked')").execute(&mut *tx).await?;
+    sqlx::query("UPDATE signin_outbox SET payload=NULL,phase='cancelled' WHERE phase='queued' AND transaction_id IN (SELECT id FROM signin_transactions WHERE result='user_revoked')").execute(&mut *tx).await?;
     sqlx::query("UPDATE access_users SET revision=revision+1 WHERE id=?")
         .bind(&id)
         .execute(&mut *tx)

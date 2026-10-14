@@ -1,8 +1,9 @@
 # Motion native email delivery and account registration
 
-Status: proposed extension, 2026-10-14. This document records the product direction
-and implementation considerations discussed after the SSO/email work. It does not
-claim that native delivery, public registration or verification links are implemented.
+Status: implemented on branch `feat/native-email-registration` (2026-10-14), except
+the items listed under [Remaining limits](#remaining-limits). The original direction
+is kept below; the [N1 decisions](#n1-decisions) record what was chosen. Verification
+links are still not implemented; registration uses the existing code-entry flow.
 
 ## Outcome
 
@@ -290,12 +291,101 @@ Required verification includes:
   delivery to one provider is not a universal deliverability claim.
 
 Implementation work should use a clean isolated worktree, preserve unrelated
-changes and live data, and use `/Volumes/seed1/Projects/kyoto/kyoto.py` for Rust build
+changes and live data, and use the shared Kyoto build queue (`kyoto.py`) for Rust build
 work following the current Kyoto skill. Compile/test the smallest affected scope;
 build the full app only when packaging or interactive validation needs it. Use
 GPT-6.1 Sol as an independent reviewer of implementation commits and PRs, and
 address findings before integration. This document itself changes no runtime
 settings, installs no dependencies and sends no email.
+
+## N1 decisions
+
+- **Dependencies.** `hickory-resolver` 0.26 (system resolver configuration) for MX,
+  A/AAAA, TXT and PTR; `tokio-rustls` with the `ring` provider and `webpki-roots`
+  for STARTTLS; `ring` for RSA PKCS#1 v1.5 SHA-256 DKIM signatures; `rsa` only to
+  generate keys and decode imported PKCS#1/PKCS#8 PEM (it performs no private-key
+  operation on message data, so RUSTSEC-2023-0071 timing exposure does not apply to
+  signing). `lettre` stays for relay submission (`send_raw` of Motion-built bytes).
+  The SMTP client and DKIM signer are small Motion code; `mail-send`/`mail-auth`
+  were used only as references. Licenses are recorded in `THIRD_PARTY_NOTICES.txt`.
+- **TLS policy.** Direct delivery requires STARTTLS and a WebPKI certificate valid
+  for the exchanger host name from DNS, on every route, with no plaintext fallback.
+  Plaintext bytes buffered after `220` to STARTTLS are rejected. When every route
+  fails only on TLS policy the message fails permanently. This is not MTA-STS or
+  DANE, and the MX name itself is not DNSSEC-authenticated. Recipients without
+  valid STARTTLS cannot receive Motion mail in direct mode; use relay mode for them.
+- **Routing.** RFC 5321 MX preference order, at most 10 exchangers, 4 addresses each
+  (IPv4 first) and 8 routes; implicit MX for domains without MX; Null MX and
+  NXDOMAIN are permanent; temporary DNS failures retry. Only public unicast
+  destinations on port 25 (the existing OIDC destination policy, rejecting private,
+  loopback, link-local, mapped, NAT64, documentation and special-use ranges for
+  IPv4 and IPv6); resolved addresses are pinned to the socket actually opened.
+  A 4xx/transport/TLS failure tries the next route; a 5xx reply is authoritative;
+  a missing reply after the final terminator is *ambiguous*. A 554 greeting tries
+  the next route. Explicit isolated exceptions: an injected test fixture (DNS,
+  trust anchors, loopback ports) and an administrator-visible loopback qualification
+  port that sends plaintext to `127.0.0.1` only.
+- **Address forms.** ASCII dot-atom only (the existing `canonical_email` policy),
+  lower-cased; optional printable-ASCII display name for the sender; fixed ASCII
+  subjects; 7-bit text bodies with lines ≤ 998 octets. No SMTPUTF8, IDN or encoded
+  words; such input is rejected, never encoded.
+- **Return path.** Direct mode uses an administrator-configured envelope sender
+  mailbox managed outside Motion; relay mode uses the From address. No inbound
+  bounce processing.
+- **DKIM.** rsa-sha256, relaxed/relaxed, `d=` is the From domain, signed headers
+  From (over-signed), To, Subject, Date, Message-ID, MIME-Version, Content-Type,
+  Content-Transfer-Encoding and Auto-Submitted. Keys are 2048–4096-bit RSA,
+  generated or imported, sealed with the existing secret encryption, identified by
+  a SHA-256 SPKI prefix that is part of each message's configuration fence.
+- **Outbox contract.** Messages are composed and signed once; retries send identical
+  bytes (`message_hash`). Each attempt is reserved (lease token, attempt number)
+  in a committed write before any network work, eligibility is rechecked
+  immediately before DATA (relay: before submission), and the observation is
+  applied by `playscale_core::mail`. Six attempts, back-off 30 s–10 min, 600 s
+  lease (longer than the 240 s route cutoff plus per-route deadlines). A crash
+  leaves an expired lease that is recovered as ambiguous. Terminal states erase the
+  sealed payload. Configuration, key, restore-epoch, enablement or owner changes
+  cancel queued messages; in-flight attempts resolve through their own observation.
+- **Registration semantics.** `Closed` (default, existing behavior), `ApprovalRequired`,
+  `InviteOnly`, `Open`. An email-bound invitation takes precedence under any
+  non-closed policy. Admission and completion decisions are
+  `playscale_core::registration::{admit, decide}`; the challenge captures the policy
+  revision and invitation revision, and completion rechecks them together with
+  address ownership, capacity and the default grant (never `system:admin`). An
+  owned address receives a code-free notice. All outcomes share one public response.
+  The invitation email carries no secret.
+- **API and schema.** Migration 0064 (next free number on every branch at the time).
+  New operations: `startEmailRegistration`, `getRegistrationSettings`,
+  `replaceRegistrationSettings`, `confirmSigninEmailTest`, `diagnoseSigninEmail`,
+  `listSigninEmailActivity`; extended email settings, test result, request and
+  invitation schemas. Proof action `registration.write` was added.
+
+## Correctness boundary (implemented)
+
+Core state and transitions: `mail::{claim, may_transmit, observe, cancel,
+combine_routes}` decide attempt reservation, recovery, retry, terminal state and
+route failover from explicit observations; `registration::{admit, decide,
+invitation_registrable, default_grant_allowed}` decide admission and the outcome
+of verified proof; `signin::validate` rejects a registration transaction that
+carries a bound user or a non-registration transaction that carries registration
+facts. Adapters (`src/mail`, `src/v2/signin/{outbox,registration}.rs`) perform DNS,
+sockets, TLS, signing, time reads and SQLite effects; every decision and its
+effects commit in one reserved SQLite writer (challenge consumption, identity and
+user creation, invitation claim, request insertion, session issue).
+
+## Remaining limits
+
+- Real-mailbox interoperability (Gmail or any provider) was **not** exercised: it
+  needs a domain with published DKIM/SPF/DMARC/PTR records and an explicitly
+  authorized send. Fixture acceptance is not inbox qualification.
+- Verification links, inbound bounce processing, MTA-STS/DANE, SMTPUTF8/IDN and
+  fallback between transports are not implemented.
+- Terminal (TUI/CLI) screens for delivery settings and registration policy are not
+  implemented; they use the same administrative API and can follow the shared
+  CLI/TUI operations plan. The terminal invitation list tolerates the new
+  `registered` status and `email` field but does not display them.
+- Open-registration capacity is a fixed bound (100 activations per rolling day,
+  1000 pending requests); it is not administrator-configurable yet.
 
 ## Reference implementations and standards
 

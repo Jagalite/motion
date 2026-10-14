@@ -14,6 +14,7 @@ pub mod execution;
 pub mod fmp4;
 pub mod interchange;
 pub mod libraries;
+pub mod mail;
 pub mod maintenance;
 pub mod markers;
 pub mod matching;

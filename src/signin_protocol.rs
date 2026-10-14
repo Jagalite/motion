@@ -1,4 +1,4 @@
-//! OIDC and mail adapters. These functions verify protocol observations and perform
+//! OIDC adapters. These functions verify protocol observations and perform
 //! bounded I/O; they never decide local membership, consume transactions or issue
 //! Motion credentials. The caller must durably reserve an exchange attempt before
 //! calling `exchange` and pass the resulting facts through the production core.
@@ -17,7 +17,6 @@ use std::{
 
 use anyhow::{Result, anyhow, ensure};
 use axum::http;
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use openidconnect::{
     AccessTokenHash, AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     EndpointMaybeSet, EndpointNotSet, EndpointSet, HttpRequest, HttpResponse, IssuerUrl, Nonce,
@@ -64,18 +63,6 @@ pub struct VerifiedIdentity {
     pub email: Option<String>,
     pub display_name: Option<String>,
     pub authenticated_at: i64,
-}
-
-#[derive(Clone)]
-pub struct MailConfig {
-    pub host: String,
-    pub port: u16,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub from: String,
-    /// Plain SMTP is allowed only to a literal loopback address, never a name
-    /// that could resolve differently after this configuration is validated.
-    pub loopback_test: bool,
 }
 
 type DiscoveredClient = CoreClient<
@@ -126,7 +113,7 @@ fn usable_pin(address: IpAddr) -> bool {
 
 /// Conservative public-unicast policy. Explicit pins permit private IdPs without
 /// making arbitrary local-network, metadata or transition addresses reachable.
-fn is_public_address(address: IpAddr) -> bool {
+pub(crate) fn is_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [a, b, c, _] = address.octets();
@@ -568,77 +555,6 @@ pub async fn exchange(
     })
 }
 
-fn validate_mail_config(config: &MailConfig) -> Result<()> {
-    ensure!(
-        !config.host.is_empty()
-            && config.host.len() <= 253
-            && !config
-                .host
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || b"/@?#\\".contains(&byte))
-            && config.port != 0,
-        "invalid SMTP destination"
-    );
-    ensure!(
-        config.username.is_some() == config.password.is_some(),
-        "SMTP username and password must be configured together"
-    );
-    if config.loopback_test {
-        ensure!(
-            config
-                .host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback()),
-            "plain SMTP requires a literal loopback test address"
-        );
-    }
-    ensure!(
-        config.from.parse::<lettre::message::Mailbox>().is_ok(),
-        "invalid SMTP sender"
-    );
-    Ok(())
-}
-
-/// Delivery only, never authentication. The caller owns the encrypted outbox,
-/// bounded retries, cancellation and delivery acknowledgments in durable state.
-pub async fn send_code(config: &MailConfig, to: &str, code: &str) -> Result<()> {
-    validate_mail_config(config)?;
-    ensure!(
-        (6..=16).contains(&code.len()) && code.bytes().all(|byte| byte.is_ascii_digit()),
-        "invalid email sign-in code"
-    );
-    let to = to
-        .parse::<lettre::Address>()
-        .map_err(|_| anyhow!("invalid email destination"))?;
-    let message = Message::builder()
-        .from(config.from.parse().map_err(|_| anyhow!("invalid SMTP sender"))?)
-        .to(lettre::message::Mailbox::new(None, to))
-        .subject("Your Motion sign-in code")
-        .header(lettre::message::header::ContentType::TEXT_PLAIN)
-        .body(format!("Your Motion sign-in code is {code}.\n\nEnter it only in the Motion browser that requested it. If you did not request this code, ignore this email.\n"))
-        .map_err(|_| anyhow!("email message could not be created"))?;
-    let mut builder = if config.loopback_test {
-        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)
-            .map_err(|_| anyhow!("SMTP TLS could not be configured"))?
-    }
-    .port(config.port)
-    .timeout(Some(Duration::from_secs(10)));
-    if let (Some(username), Some(password)) = (&config.username, &config.password) {
-        builder = builder.credentials(lettre::transport::smtp::authentication::Credentials::new(
-            username.clone(),
-            password.clone(),
-        ));
-    }
-    let transport = builder.build();
-    tokio::time::timeout(Duration::from_secs(15), transport.send(message))
-        .await
-        .map_err(|_| anyhow!("SMTP delivery timed out"))?
-        .map_err(|_| anyhow!("SMTP delivery failed"))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,32 +733,6 @@ mod tests {
         assert!(validate_transaction_secrets(&binding, &binding, &"v".repeat(42)).is_err());
         assert!(validate_transaction_secrets(&binding, &binding, &"v".repeat(129)).is_err());
         assert!(validate_transaction_secrets(&binding, &binding, &"+".repeat(43)).is_err());
-    }
-
-    #[test]
-    fn plaintext_mail_is_only_available_to_a_literal_loopback_fixture() {
-        let mut config = MailConfig {
-            host: "127.0.0.1".into(),
-            port: 2525,
-            username: None,
-            password: None,
-            from: "Motion <motion@example.test>".into(),
-            loopback_test: true,
-        };
-        assert!(validate_mail_config(&config).is_ok());
-        for host in [
-            "localhost",
-            "127.0.0.1.evil.test",
-            "192.168.1.1",
-            "smtp.example.test",
-        ] {
-            config.host = host.into();
-            assert!(validate_mail_config(&config).is_err());
-        }
-        config.loopback_test = false;
-        assert!(validate_mail_config(&config).is_ok());
-        config.username = Some("user".into());
-        assert!(validate_mail_config(&config).is_err());
     }
 
     #[tokio::test]

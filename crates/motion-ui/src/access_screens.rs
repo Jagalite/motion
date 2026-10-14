@@ -22,6 +22,8 @@ pub(crate) async fn access(cx: &Cx) -> Result<impl View> {
             <nav class="access-tabs" aria-label="Authentication and access sections">
                 <a href="#overview">"Overview"</a>
                 <a href="#methods">"Sign-in methods"</a>
+                <a href="#email">"Email delivery"</a>
+                <a href="#registration">"Registration"</a>
                 <a href="#users">"Users"</a>
                 <a href="#requests">"Access requests"</a>
                 <a href="#enrollment">"Pairing & invitations"</a>
@@ -155,6 +157,8 @@ mod tests {
         for section in [
             "overview",
             "methods",
+            "email",
+            "registration",
             "users",
             "requests",
             "enrollment",

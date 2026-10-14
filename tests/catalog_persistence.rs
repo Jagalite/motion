@@ -912,7 +912,8 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         "INSERT INTO signin_identities(id,user_id,kind,address,profile_ids,permissions,policy,created_at) VALUES ('identity','u','email','person@example.test','[]','[]','{}',0)",
         "INSERT INTO signin_families(id,device_id,user_id,identity_id,identity_revision,method_revision,epoch,issued_at,authenticated_at,expires_at,parent_hash,session_hash) SELECT 'family','d','u','identity',1,1,restore_epoch,0,0,9223372036854775807,'secret','cookie' FROM server_identity",
         "INSERT INTO signin_transactions(id,state_json,return_to,created_at,expires_at) VALUES ('transaction','{}','/',0,9223372036854775807)",
-        "INSERT INTO signin_outbox(id,transaction_id,payload,next_attempt,expires_at,config_revision,destination_hash,created_at) VALUES ('mail','transaction','secret-email',0,9223372036854775807,1,'destination',0)",
+        "INSERT INTO signin_outbox(id,purpose,transaction_id,owner_id,payload,phase,next_attempt,expires_at,mode,config_revision,epoch,recipient_domain,destination_hash,created_at,updated_at) VALUES ('mail','signin_code','transaction','transaction','secret-email','queued',0,9223372036854775807,'relay',1,'epoch','example.test','destination',0,0)",
+        "INSERT INTO signin_mail_tests(id,actor_id,config_revision,mode,recipient_domain,code_hash,created_at,expires_at) VALUES ('test','d',1,'relay','example.test','secret-test',0,9223372036854775807)",
         "INSERT INTO signin_proofs(id,actor_id,action,target,epoch,code_hash,expires_at,created_at) VALUES ('proof','d','grant','u','old','code',9223372036854775807,0)",
         "INSERT INTO signin_audit(actor,target,action,outcome,at) VALUES ('d','u','grant','ok',0)",
     ] {
@@ -930,6 +931,7 @@ async fn restore_withdraws_saved_authority_without_changing_the_backup() {
         "access_invitations",
         "signin_transactions",
         "signin_outbox",
+        "signin_mail_tests",
         "signin_proofs",
     ] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))

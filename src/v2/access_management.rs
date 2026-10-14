@@ -53,6 +53,13 @@ impl UserRow {
         })
     }
 }
+pub(super) async fn insert_user(
+    conn: &mut sqlx::SqliteConnection,
+    user: &User,
+) -> Result<(), Problem> {
+    sqlx::query("INSERT INTO access_users(id,name,revision,disabled,profile_ids,permissions,policy,created_at) VALUES (?,?,?,?,?,?,?,?)").bind(&user.id).bind(&user.name).bind(user.revision as i64).bind(user.disabled).bind(json(&user.grant.profile_ids)).bind(json(&user.grant.permissions)).bind(json(&user.policy)).bind(now()).execute(conn).await?;
+    Ok(())
+}
 pub(super) async fn load_user(
     conn: &mut sqlx::SqliteConnection,
     id: &str,
@@ -504,8 +511,8 @@ pub async fn deny_pairing(
 }
 
 #[derive(sqlx::FromRow)]
-struct InviteRow {
-    id: String,
+pub(super) struct InviteRow {
+    pub(super) id: String,
     user_id: String,
     user_revision: i64,
     issuer_id: String,
@@ -522,9 +529,14 @@ struct InviteRow {
     device_id: Option<String>,
     generation: Option<i64>,
     credential_nonce: Option<String>,
+    pub(super) email: Option<String>,
+    identity_id: Option<String>,
 }
 impl InviteRow {
-    fn invitation(&self) -> Result<Invitation, Problem> {
+    pub(super) fn revision_value(&self) -> u64 {
+        self.revision as u64
+    }
+    pub(super) fn invitation(&self) -> Result<Invitation, Problem> {
         Ok(Invitation {
             expires_at: self.expires_at,
             user_id: self.user_id.clone(),
@@ -536,6 +548,10 @@ impl InviteRow {
             policy: serde_json::from_str(&self.policy).map_err(Problem::internal)?,
             phase: if self.revoked {
                 InvitationPhase::Revoked
+            } else if let Some(identity_id) = &self.identity_id {
+                InvitationPhase::Registered {
+                    identity_id: identity_id.clone(),
+                }
             } else if let Some(device_id) = &self.device_id {
                 InvitationPhase::Claimed {
                     device_id: device_id.clone(),
@@ -559,6 +575,8 @@ pub struct InvitationBody {
     profile_ids: BTreeSet<String>,
     permissions: BTreeSet<Permission>,
     policy: Policy,
+    /// Recipient of an emailed invitation; completion requires verifying it.
+    email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
 }
@@ -576,6 +594,8 @@ fn invite_body(
         expires_at: timestamp(row.expires_at),
         status: if row.revoked {
             "revoked"
+        } else if row.identity_id.is_some() {
+            "registered"
         } else if row.device_id.is_some() {
             "claimed"
         } else if now() >= row.expires_at {
@@ -588,10 +608,11 @@ fn invite_body(
         profile_ids: inv.grant.profile_ids,
         permissions: inv.grant.permissions,
         policy: inv.policy,
+        email: row.email.clone(),
         code,
     })
 }
-async fn issuer_current(
+pub(super) async fn issuer_current(
     app: &App,
     conn: &mut sqlx::SqliteConnection,
     row: &InviteRow,
@@ -660,6 +681,10 @@ pub struct InvitationInput {
     permissions: Vec<Permission>,
     policy: Policy,
     ttl_seconds: i64,
+    /// Optionally email the invitation to this address. The message carries
+    /// no secret; the recipient registers with this address and verifies it.
+    #[serde(default)]
+    email: Option<String>,
 }
 pub async fn create_invitation(
     State(app): State<App>,
@@ -742,6 +767,13 @@ pub async fn create_invitation(
     };
     validate_grant(&mut tx, &grant, &input.policy).await?;
     admin::authorize_grant(&user, expected, &grant, &input.policy)?;
+    let email =
+        match input.email.as_deref().filter(|v| !v.trim().is_empty()) {
+            Some(value) => Some(playscale_core::signin::canonical_email(value).ok_or_else(
+                || Problem::invalid("invalid_email", "Enter a valid recipient email address"),
+            )?),
+            None => None,
+        };
     let id = new_id();
     let nonce = auth::nonce();
     let code = auth::derive_secret(&app.access.key, Purpose::Invitation, &nonce);
@@ -750,7 +782,11 @@ pub async fn create_invitation(
     } else {
         caller.credential().map(|(hash, _)| hash.to_owned())
     };
-    sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(auth::token_hash(&code)).bind(&user.id).bind(expected as i64).bind(&principal.id).bind(principal.policy_revision as i64).bind(issuer_hash).bind(json(&grant.profile_ids)).bind(json(&grant.permissions)).bind(json(&input.policy)).bind(now()).bind(now()+input.ttl_seconds).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO access_invitations(id,code_hash,user_id,user_revision,issuer_id,issuer_revision,issuer_credential_hash,profile_ids,permissions,policy,created_at,expires_at,email) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(auth::token_hash(&code)).bind(&user.id).bind(expected as i64).bind(&principal.id).bind(principal.policy_revision as i64).bind(issuer_hash).bind(json(&grant.profile_ids)).bind(json(&grant.permissions)).bind(json(&input.policy)).bind(now()).bind(now()+input.ttl_seconds).bind(email.as_deref()).execute(&mut *tx).await?;
+    if let Some(email) = &email {
+        super::signin::email_invitation(&mut tx, &app, &id, email, now() + input.ttl_seconds)
+            .await?;
+    }
     let row: InviteRow = sqlx::query_as("SELECT * FROM access_invitations WHERE id=?")
         .bind(&id)
         .fetch_one(&mut *tx)
@@ -799,6 +835,7 @@ pub async fn revoke_invitation(
             .bind(&id)
             .execute(&mut *tx)
             .await?;
+        super::signin::cancel_invitation_mail(&mut tx, &id).await?;
     }
     super::signin::audit(
         &mut tx,
@@ -936,7 +973,7 @@ pub async fn redeem_invitation(
                 None,
             )
             .await?;
-            sqlx::query("UPDATE access_invitations SET claim_hash=?,device_id=?,generation=1,credential_nonce=?,revision=revision+1 WHERE id=? AND revoked=0 AND device_id IS NULL").bind(&claim_hash).bind(&issue.device_id).bind(&nonce).bind(&row.id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE access_invitations SET claim_hash=?,device_id=?,generation=1,credential_nonce=?,revision=revision+1 WHERE id=? AND revoked=0 AND device_id IS NULL AND identity_id IS NULL").bind(&claim_hash).bind(&issue.device_id).bind(&nonce).bind(&row.id).execute(&mut *tx).await?;
             (issue.device_id, nonce, issue.expires_at)
         }
     };

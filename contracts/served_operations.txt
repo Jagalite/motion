@@ -13,6 +13,7 @@ claimPairing
 closeDelivery
 commitReconciliation
 commitSourceRelocation
+confirmSigninEmailTest
 createAccessInvitation
 createAccessUser
 createBackup
@@ -55,6 +56,7 @@ deleteSchedule
 deleteSource
 denyPairing
 denySigninRequest
+diagnoseSigninEmail
 finishEmailSignin
 finishOidcSignin
 getAccessUser
@@ -92,6 +94,7 @@ getPrincipal
 getProcessingCapabilities
 getProfile
 getQueue
+getRegistrationSettings
 getRelationship
 getSavedFilter
 getScan
@@ -154,6 +157,7 @@ listSavedFilters
 listScans
 listSchedules
 listSigninAudit
+listSigninEmailActivity
 listSigninProofs
 listSigninProviders
 listSigninRequests
@@ -177,6 +181,7 @@ replacePlaylist
 replacePreferences
 replaceProfile
 replaceQueue
+replaceRegistrationSettings
 replaceSavedFilter
 replaceSchedule
 replaceSigninEmailSettings
@@ -194,6 +199,7 @@ revokeSigninUser
 searchCatalog
 selectArtwork
 setWatchedState
+startEmailRegistration
 startEmailSignin
 startOidcSignin
 subscribeEvents

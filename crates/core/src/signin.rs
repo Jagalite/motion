@@ -16,6 +16,8 @@ pub enum Purpose {
     Test,
     Reauth,
     Enroll,
+    /// Anonymous email registration; the outcome is decided by `registration`.
+    Register,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +42,9 @@ pub struct Transaction {
     pub expires_at: i64,
     pub phase: Phase,
     pub attempts: u32,
+    /// Registration facts captured at issue; absent for every other purpose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<crate::registration::Intent>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -87,6 +92,13 @@ pub struct Current<'a> {
     pub now: i64,
 }
 pub fn validate(tx: &Transaction, current: &Current<'_>) -> Result<(), Error> {
+    // A registration carries its policy intent and never a pre-bound user;
+    // any other purpose carrying registration facts is malformed state.
+    if (tx.purpose == Purpose::Register)
+        != (tx.registration.is_some() && tx.user_id.is_none() && tx.identity_revision.is_none())
+    {
+        return Err(Error::Stale);
+    }
     if current.restore_hold
         || !current.method_enabled
         || !current.user_enabled

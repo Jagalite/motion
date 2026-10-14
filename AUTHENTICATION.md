@@ -29,15 +29,48 @@ Approval is an audited recovery/admission decision, never an email-name match.
 The applicant must sign in again after approval. Provider email and display name
 are display metadata, not account-linking keys.
 
-Direct email setup is independent and opt-in. Configure the SMTP host, port,
-sender and credentials. Production delivery uses TLS. Plain SMTP requires the
-explicit loopback-test setting and a literal loopback address. Send a test only
-after selecting its destination; successful delivery does not authenticate the
-recipient. Enable email after a successful configuration test. An already owned,
+Direct email setup is independent and opt-in (**Email delivery** section). Choose
+one delivery mode explicitly; Motion never switches modes on its own.
+
+- **SMTP relay:** configure the relay host, port, sender and credentials.
+  Production delivery uses TLS. Plain SMTP requires the explicit loopback-test
+  setting and a literal loopback address.
+- **Native direct delivery:** Motion resolves the recipient domain's MX records
+  (Null MX and nonexistent domains fail permanently; a domain without MX uses
+  its own address), connects on TCP port 25 to public unicast addresses only,
+  requires STARTTLS with a certificate valid for the exchanger name (no
+  plaintext downgrade; this is not MTA-STS or DANE) and DKIM-signs every
+  message (rsa-sha256, relaxed/relaxed). Configure the sending hostname, an
+  envelope sender mailbox you read for bounces, a DKIM selector, and generate or
+  import a 2048–4096-bit RSA key. Publish the displayed DKIM TXT record, an SPF
+  record for your public sending address, a DMARC record, and a PTR record with
+  your network provider. **Diagnostics** reports what Motion can observe and
+  lists what it cannot prove (inbox placement, reputation, later bounces).
+  Many residential and cloud networks block outbound port 25.
+
+Send a test only after selecting its destination. "Accepted by mail server" is
+transport acceptance; entering the test code from the received message is the
+only receipt confirmation. Neither authenticates anyone. Enable email after a
+successful test of the current configuration revision. An already owned,
 authenticated user enrolls an address from **My sign-in methods**, proves recent
 local authority, and enters the code delivered to that address. Ordinary login
 never enrolls an unknown address. Address matching is case-insensitive ASCII;
 Motion does not remove dots or plus tags.
+
+**Registration** (default **Closed**) decides what verifying an email address
+does for someone without an account. *Approval required* creates one pending
+access request per address; an administrator approves it for an explicit user.
+*Invite-only* admits only an address with an unexpired, unrevoked invitation
+emailed from **Pairing & invitations**; completion links the address to the
+invitation's user with the invitation grant. *Open* creates an active user with
+the configured default access, which can never include administration. An
+emailed invitation takes precedence under any non-closed policy. The invitation
+email contains no secret; the recipient registers with that address and enters
+a separate verification code. Registering an address that already has a method
+sends a notice instead of a code and never attaches to the existing account; all
+outcomes share one public response. Changing the policy ends registrations in
+progress. A repeated completion returns its recorded outcome without another
+user or session.
 
 Secret edits have retain, replace and clear operations. Saved values are never
 returned to the browser. Changing provider or mail configuration invalidates its
@@ -98,8 +131,15 @@ key and purpose/entity-bound authenticated associated data. Challenge HMACs use
 separate purpose domains. Keep that protected key file separate from database-only backups; losing it
 prevents decrypting saved authentication configuration. Preserve its restricted
 filesystem permissions. Codes are keyed hashes in transaction rows; encrypted
-outbox plaintext is erased after delivery, cancellation or expiry. Delivery uses
-bounded attempts and durable leases. Audit records contain identifiers and
+outbox plaintext is erased at every terminal state. Delivery reserves each
+attempt durably before network work, rechecks eligibility before sending the
+message content, and retries the same signed bytes at most six times. A lost
+reply after the message was sent is recorded as *acceptance unknown*: a retry
+may produce a duplicate email, and cancellation cannot recall sent mail. Old
+messages may still arrive, but their codes fail. **Delivery activity** lists
+bounded status per message (queued, retry pending, accepted by mail server,
+failed, acceptance unknown, expired, cancelled) with the recipient domain only.
+DKIM private keys are sealed like other secrets and never returned. Audit records contain identifiers and
 outcomes, never codes, tokens or provider secrets, and retain at most 10,000 rows.
 
 A database restore rotates the restore epoch. Pre-restore browser families and

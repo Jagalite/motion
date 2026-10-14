@@ -129,6 +129,8 @@ pub struct Runtime {
     pub(crate) server_hash: tokio::sync::OnceCell<Option<String>>,
     /// Credential-derivation key; see `auth`.
     pub(crate) key: [u8; 32],
+    /// Mail routing: system DNS/WebPKI, or an explicit isolated fixture.
+    pub mail: crate::mail::Runtime,
 }
 
 impl Runtime {
@@ -144,6 +146,7 @@ impl Runtime {
             pairing_window: Mutex::new(VecDeque::new()),
             changes: events::Notifier::default(),
             server_hash: tokio::sync::OnceCell::new(),
+            mail: crate::mail::Runtime::default(),
         }
     }
     /// Accept a desktop bootstrap secret for `BOOTSTRAP_SECONDS`, once.
@@ -780,6 +783,7 @@ pub fn router() -> Router<App> {
         .route("/auth/oidc/{provider_id}/start", post(signin::oidc_start))
         .route("/auth/oidc/callback", get(signin::oidc_callback))
         .route("/auth/email/start", post(signin::email_start))
+        .route("/auth/register/start", post(signin::register_start))
         .route(
             "/auth/email/{transaction_id}/finish",
             post(signin::email_finish),
@@ -828,6 +832,19 @@ pub fn router() -> Router<App> {
             get(signin::get_email).put(signin::replace_email),
         )
         .route("/admin/auth/email/test", post(signin::test_email))
+        .route(
+            "/admin/auth/email/tests/{id}/confirm",
+            post(signin::confirm_email_test),
+        )
+        .route(
+            "/admin/auth/email/diagnostics",
+            post(signin::email_diagnostics),
+        )
+        .route("/admin/auth/email/activity", get(signin::email_activity))
+        .route(
+            "/admin/auth/registration",
+            get(signin::get_registration).put(signin::replace_registration),
+        )
         .route("/admin/auth/requests", get(signin::list_requests))
         .route(
             "/admin/auth/requests/{id}/approve",

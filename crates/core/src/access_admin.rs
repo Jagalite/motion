@@ -220,6 +220,10 @@ pub enum InvitationPhase {
         device_id: String,
         generation: u64,
     },
+    /// Completed by verified email registration; the identity is the claim.
+    Registered {
+        identity_id: String,
+    },
     Revoked,
 }
 
@@ -291,13 +295,17 @@ pub fn redemption_attempt(start: i64, count: u32, now: i64) -> Result<(i64, u32)
 }
 
 /// Claim and revoke compete on the same durable phase. Once claimed, an
-/// administrator must revoke the issued device, not relabel its invitation.
+/// administrator must revoke the issued device or identity, not relabel its
+/// invitation.
 pub fn revoke_invitation(
     invitation: &Invitation,
     revision: u64,
     expected: u64,
 ) -> Result<access::Revised, AccessError> {
-    if matches!(invitation.phase, InvitationPhase::Claimed { .. }) {
+    if matches!(
+        invitation.phase,
+        InvitationPhase::Claimed { .. } | InvitationPhase::Registered { .. }
+    ) {
         return Err(AccessError::InvitationUnavailable);
     }
     access::revise(

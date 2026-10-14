@@ -761,6 +761,7 @@ pub async fn restore_into(backup: &Path, destination: &Path) -> anyhow::Result<R
         for statement in [
             "DELETE FROM access_invitations",
             "DELETE FROM signin_outbox",
+            "DELETE FROM signin_mail_tests",
             "DELETE FROM signin_transactions",
             "DELETE FROM signin_requests",
             "DELETE FROM signin_proofs",
