@@ -3,7 +3,6 @@ package operations
 import (
 	"context"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -32,14 +31,14 @@ func canonicalPermissions(permissions []string) []string {
 	return out
 }
 
-// grantRequest is what a resubmission of a user-bound grant must repeat.
-func grantRequest(userRevision string, profiles, permissions []string, policy api.GrantPolicy) map[string]string {
-	return map[string]string{
-		"user_revision": userRevision, "profile_ids": strings.Join(profiles, ","), "permissions": strings.Join(permissions, ","),
-		"library_ids": strings.Join(policy.LibraryIDs, ","), "allow_unrated": strconv.FormatBool(policy.AllowUnrated),
-		"deny_rated": strconv.FormatBool(policy.DenyRated), "allowed_ratings": strings.Join(policy.AllowedRatings, ","),
-		"blocked_labels": strings.Join(policy.BlockedLabels, ","),
-	}
+// GrantRequest is what a resubmission of a user-bound approval or an
+// invitation must repeat exactly: the user revision and the grant.
+type GrantRequest struct {
+	UserRevision string          `json:"user_revision"`
+	ProfileIDs   []string        `json:"profile_ids"`
+	Permissions  []string        `json:"permissions"`
+	Policy       api.GrantPolicy `json:"policy"`
+	TTLSeconds   int64           `json:"ttl_seconds,omitempty"`
 }
 
 // nonNil sends an empty JSON list rather than null.
@@ -146,11 +145,11 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 		approval.Policy = &p
 	}
 	v, err := a.ApprovePairing(ctx, in.PairingID, approval, i.Key)
-	var request map[string]string
 	if in.UserID != "" && approval.Policy != nil {
-		request = grantRequest(in.UserRevision, approval.ProfileIDs, approval.Permissions, *approval.Policy)
+		return v, i.settleRequest(&GrantRequest{UserRevision: in.UserRevision, ProfileIDs: approval.ProfileIDs,
+			Permissions: approval.Permissions, Policy: *approval.Policy}, err)
 	}
-	return v, i.settleRequest(request, err)
+	return v, i.settle(err)
 }
 
 // DenyPairing refuses a pairing request.
@@ -271,9 +270,8 @@ func CreateInvitation(ctx context.Context, a InvitationAPI, in api.InvitationInp
 	}
 	in.ProfileIDs, in.Permissions, in.Policy = nonNil(in.ProfileIDs), canonicalPermissions(in.Permissions), grant(in.Policy)
 	v, err := a.CreateInvitation(ctx, in, i.Key)
-	request := grantRequest(in.UserRevision, in.ProfileIDs, in.Permissions, in.Policy)
-	request["ttl_seconds"] = strconv.FormatInt(in.TTLSeconds, 10)
-	return v, i.settleRequest(request, err)
+	return v, i.settleRequest(&GrantRequest{UserRevision: in.UserRevision, ProfileIDs: in.ProfileIDs, Permissions: in.Permissions,
+		Policy: in.Policy, TTLSeconds: in.TTLSeconds}, err)
 }
 
 // maxInvitationScan bounds the list read that resolves an invitation's

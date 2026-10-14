@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -249,40 +250,53 @@ func TestCLIDefaultsMatchTheSharedDefaults(t *testing.T) {
 	}
 }
 
-func TestCLIResubmissionRepeatsTheReviewedUserRevision(t *testing.T) {
+func TestCLIResubmissionRepeatsTheOriginalRequestExactly(t *testing.T) {
 	c := newManaged(t)
-	sam := c.fixture.AddUser("Sam")
+	// Labels a comma-separated or shell-pasted form would corrupt.
+	hostile := []string{"kids,teen", "kid'$(printf SHELL_PROBE)'"}
+	sam, err := c.fixture.CreateUser(context.Background(), api.UserInput{Name: "Sam", ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead},
+		Policy: api.GrantPolicy{LibraryIDs: []string{}, AllowedRatings: []string{}, BlockedLabels: hostile}}, "seed-sam-0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
 	c.fixture.LoseAcks(1 << 20)
-	_, stderr, code := c.run("--json", "access", "invitations", "create", sam.ID)
+	_, stderr, code := c.run("--json", "access", "invitations", "create", sam.Value.ID)
 	var report struct {
 		Error struct {
-			IdempotencyKey string            `json:"idempotency_key"`
-			Request        map[string]string `json:"request"`
+			IdempotencyKey string          `json:"idempotency_key"`
+			Request        json.RawMessage `json:"request"`
 		}
 	}
-	if err := json.Unmarshal([]byte(stderr), &report); err != nil || code != ExitUnavailable || report.Error.Request["user_revision"] != "1" {
+	if err := json.Unmarshal([]byte(stderr), &report); err != nil || code != ExitUnavailable || len(report.Error.Request) == 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	c.fixture.LoseAcks(0)
-	// The user changes meanwhile; a resubmission must repeat revision 1.
-	if _, err := c.fixture.ReplaceUser(context.Background(), sam.ID, api.UserInput{Name: "Sam", ProfileIDs: []string{}, Permissions: []string{}}, `"r-1"`); err != nil {
+	// The user changes meanwhile; inheriting again would change the request.
+	if _, err := c.fixture.ReplaceUser(context.Background(), sam.Value.ID, api.UserInput{Name: "Sam", ProfileIDs: []string{}, Permissions: []string{}}, `"r-1"`); err != nil {
 		t.Fatal(err)
 	}
 	key := report.Error.IdempotencyKey
-	if _, _, code := c.run("access", "invitations", "create", sam.ID, "--idempotency-key", key); code != ExitInvalid {
-		t.Fatalf("resubmission without --user-revision: exit %d", code)
+	if _, _, code := c.run("access", "invitations", "create", sam.Value.ID, "--idempotency-key", key); code != ExitInvalid {
+		t.Fatalf("resubmission without the original request: exit %d", code)
 	}
-	if _, _, code := c.run("access", "invitations", "create", sam.ID, "--idempotency-key", key, "--user-revision", "1"); code != ExitConflict {
-		t.Fatalf("resubmission re-inherited the changed grant: exit %d", code)
+	// Repeating the command with an extra grant flag: the reported request
+	// replaces the grant flags, so nothing is duplicated.
+	c.ok("access", "invitations", "create", sam.Value.ID, "--block-label", hostile[0], "--idempotency-key", key, "--resubmit-request", string(report.Error.Request))
+	snap := c.fixture.Snapshot()
+	if len(snap.Invitations) != 1 {
+		t.Fatalf("%d invitations", len(snap.Invitations))
 	}
-	// The reported request repeats the original grant exactly.
-	args := []string{"access", "invitations", "create", sam.ID, "--idempotency-key", key}
-	for _, flag := range requestFlags(report.Error.Request) {
-		name, value, _ := strings.Cut(flag, "=")
-		args = append(args, name+"="+strings.Trim(value, "'"))
+	invitations, _ := c.fixture.ListInvitations(context.Background(), "", 10)
+	if got := invitations.Items[0].Policy.BlockedLabels; !reflect.DeepEqual(got, hostile) {
+		t.Fatalf("labels %q", got)
 	}
-	c.ok(args...)
-	if n := len(c.fixture.Snapshot().Invitations); n != 1 {
-		t.Fatalf("%d invitations", n)
+}
+
+func TestSuggestedRetryWordsSurviveTheShell(t *testing.T) {
+	for _, v := range []string{"kid'$(printf SHELL_PROBE)'", `{"policy":{"blocked_labels":["a'b","c,d"]}}`, `"r-1"`, "plain"} {
+		out, err := exec.Command("sh", "-c", "printf %s "+shellQuote(v)).Output()
+		if err != nil || string(out) != v {
+			t.Fatalf("%q came back as %q (%v)", v, out, err)
+		}
 	}
 }

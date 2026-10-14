@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -179,6 +180,27 @@ func grantFlags(cmd *cobra.Command, profiles, permissions *[]string, policy *api
 	cmd.Flags().StringSliceVar(&policy.BlockedLabels, "block-label", nil, "blocked label (repeatable)")
 }
 
+// resubmission decodes --resubmit-request. A resubmitted grant must repeat
+// the original request exactly, so --idempotency-key requires it.
+func resubmission(key, request string) (*operations.GrantRequest, error) {
+	if request == "" {
+		if key != "" {
+			return nil, usage("--idempotency-key needs the original request: pass the reported --resubmit-request")
+		}
+		return nil, nil
+	}
+	if key == "" {
+		return nil, usage("--resubmit-request is only for resubmitting with --idempotency-key")
+	}
+	var r operations.GrantRequest
+	dec := json.NewDecoder(strings.NewReader(request))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil || r.UserRevision == "" {
+		return nil, usage("--resubmit-request is not a reported request: %v", err)
+	}
+	return &r, nil
+}
+
 // inheritGrant fills grant flags the command line left unset from the
 // user's grant, as the TUI pre-fills its form.
 func inheritGrant(cmd *cobra.Command, u api.User, profiles, permissions *[]string, policy *api.GrantPolicy) {
@@ -314,14 +336,15 @@ func invitationsCmd(env *Env) *cobra.Command {
 	})}
 	pageFlags(list, &cursor, &limit)
 	var in api.InvitationInput
-	var key, userRevision string
+	var key, userRevision, resubmit string
 	create := &cobra.Command{Use: "create USER_ID", Short: "Issue an invitation; the code is printed once", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		intent, err := operations.ResumeIntent("invitation for user "+args[0], key)
 		if err != nil {
 			return err
 		}
-		if key != "" && userRevision == "" {
-			return usage("--idempotency-key needs the original request's --user-revision")
+		original, err := resubmission(key, resubmit)
+		if err != nil {
+			return err
 		}
 		return run(env, func(ctx context.Context, c *Conn) error {
 			// The invitation grants what the administrator decided on: the
@@ -335,6 +358,10 @@ func invitationsCmd(env *Env) *cobra.Command {
 				in.UserRevision = userRevision
 			}
 			inheritGrant(cmd, user.Value, &in.ProfileIDs, &in.Permissions, &in.Policy)
+			if original != nil {
+				// The original request, verbatim, replaces the grant flags.
+				in.UserRevision, in.ProfileIDs, in.Permissions, in.Policy, in.TTLSeconds = original.UserRevision, original.ProfileIDs, original.Permissions, original.Policy, original.TTLSeconds
+			}
 			v, err := operations.CreateInvitation(ctx, c, in, intent)
 			if err != nil {
 				return err
@@ -347,6 +374,7 @@ func invitationsCmd(env *Env) *cobra.Command {
 	grantFlags(create, &in.ProfileIDs, &in.Permissions, &in.Policy)
 	create.Flags().Int64Var(&in.TTLSeconds, "ttl", 600, "lifetime in seconds (60-86400)")
 	create.Flags().StringVar(&userRevision, "user-revision", "", "user revision the invitation is decided on (default: read it now)")
+	create.Flags().StringVar(&resubmit, "resubmit-request", "", "with --idempotency-key: the reported request, which replaces the grant flags")
 	keyFlag(create, &key)
 	var ifMatch string
 	revoke := &cobra.Command{Use: "revoke INVITATION_ID", Short: "Revoke an unused invitation", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {

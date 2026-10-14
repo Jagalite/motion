@@ -211,7 +211,8 @@
           "internal/operations:TestSharedInputRulesRejectBeforeAnyRequest"
         ],
         "cli": [
-          "internal/cli:TestCLIManagementReachesTheSharedScenarioState"
+          "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
+          "internal/cli:TestSuggestedRetryWordsSurviveTheShell"
         ],
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
@@ -414,7 +415,7 @@
         "cli": [
           "internal/cli:TestCLIManagementReachesTheSharedScenarioState",
           "internal/cli:TestCLIDefaultsMatchTheSharedDefaults",
-          "internal/cli:TestCLIResubmissionRepeatsTheReviewedUserRevision"
+          "internal/cli:TestCLIResubmissionRepeatsTheOriginalRequestExactly"
         ],
         "tui": [
           "internal/tui:TestTUIManagementReachesTheSharedScenarioState",

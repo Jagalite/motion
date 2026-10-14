@@ -93,7 +93,7 @@ func TestUncertainOutcomeIsExplainedInHumanOutput(t *testing.T) {
 	_, stderr, code := c.run("jobs", "retry", "j1")
 	key := c.fixture.Mutations()[0].Key
 	if code != ExitUnavailable || !strings.Contains(stderr, "retry of job j1 may have been applied") ||
-		!strings.Contains(stderr, "--idempotency-key "+key+` --if-match '"r-1"'`) {
+		!strings.Contains(stderr, "--idempotency-key '"+key+`' --if-match '"r-1"'`) {
 		t.Fatalf("code=%d stderr=%s", code, stderr)
 	}
 	// The resubmission repeats the reviewed revision even though the job

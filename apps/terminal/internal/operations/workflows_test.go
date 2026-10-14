@@ -226,8 +226,11 @@ func TestSettlementKeepsRequestValuesToRepeat(t *testing.T) {
 	f.LoseAcks(1)
 	_, err := operations.CreateInvitation(ctx, f, api.InvitationInput{UserID: user.ID, UserRevision: user.Revision, TTLSeconds: 600}, intent)
 	var unknown *operations.UncertainError
-	if !errors.As(err, &unknown) || unknown.Request["user_revision"] != user.Revision {
-		t.Fatalf("%v %+v", err, unknown)
+	if !errors.As(err, &unknown) {
+		t.Fatalf("lost acknowledgement: %v", err)
+	}
+	if r, ok := unknown.Request.(*operations.GrantRequest); !ok || r.UserRevision != user.Revision || r.TTLSeconds != 600 {
+		t.Fatalf("request to repeat %+v", unknown.Request)
 	}
 	// The same key with a different request is a receipt conflict, which
 	// leaves the earlier outcome unknown.

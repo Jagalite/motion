@@ -78,10 +78,13 @@ the Marquee charcoal palette; `NO_COLOR` gets plain text.
   server refuses a retry of a job that changed since (exit 4).
 * A job cancellation or retry whose acknowledgement was lost may have been
   applied. The error says so and carries `"outcome_unknown":true`, the
-  request's `"idempotency_key"` and, for a retry, its `"if_match"`; rerunning
-  the command with `--idempotency-key KEY` (and the original `--if-match`
-  for a retry) resubmits the same request, which the server replays or
-  applies once. A new invocation without the key is a new request.
+  request's `"idempotency_key"` and, when they apply, its `"if_match"` and
+  `"request"` (the user revision and grant of an invitation or user-bound
+  approval). Rerun the command with `--idempotency-key KEY`, plus
+  `--if-match` for a retry or `--resubmit-request JSON` for an invitation
+  or approval. That resubmits the same request, which the server replays or
+  applies once. The human-readable error prints these flags shell-quoted.
+  A new invocation without the key is a new request.
 
 ## Shared operations
 

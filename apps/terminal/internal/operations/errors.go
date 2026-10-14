@@ -36,8 +36,9 @@ type UncertainError struct {
 	Key       string
 	IfMatch   string
 	// Request holds other values the resubmission must repeat exactly,
-	// such as the user revision an approval or invitation was decided on.
-	Request map[string]string
+	// such as the user revision and grant an approval or invitation was
+	// decided on; it marshals as a JSON object.
+	Request any
 	Err     error
 }
 
@@ -149,7 +150,7 @@ func (i Intent) settle(err error) error {
 
 // settleRequest is settle for an intent whose request includes values a
 // resubmission must repeat.
-func (i Intent) settleRequest(request map[string]string, err error) error {
+func (i Intent) settleRequest(request any, err error) error {
 	err = i.settle(err)
 	var unknown *UncertainError
 	if errors.As(err, &unknown) {

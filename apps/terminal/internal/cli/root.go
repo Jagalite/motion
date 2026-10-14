@@ -199,7 +199,7 @@ func authCmd(env *Env) *cobra.Command {
 	pair.Flags().StringVar(&credentialStore, "credential-store", "", "where to keep the credential; only \"file\" (0600) is supported")
 	pair.Flags().DurationVar(&wait, "wait", 10*time.Minute, "how long to wait for approval")
 
-	var code, approveKey, approveUser, approveRevision string
+	var code, approveKey, approveUser, approveRevision, approveResubmit string
 	var profiles, permissions []string
 	var policy api.GrantPolicy
 	approve := &cobra.Command{
@@ -218,8 +218,11 @@ func authCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if approveKey != "" && approveUser != "" && approveRevision == "" {
-				return usage("--idempotency-key with --user needs the original request's --user-revision")
+			var original *operations.GrantRequest
+			if approveUser != "" {
+				if original, err = resubmission(approveKey, approveResubmit); err != nil {
+					return err
+				}
 			}
 			return run(env, func(ctx context.Context, c *Conn) error {
 				in := operations.Approval{PairingID: args[0], UserCode: code, ProfileIDs: profiles, Permissions: permissions}
@@ -235,6 +238,9 @@ func authCmd(env *Env) *cobra.Command {
 						in.UserRevision = approveRevision
 					}
 					inheritGrant(cmd, user.Value, &in.ProfileIDs, &in.Permissions, &policy)
+					if original != nil {
+						in.UserRevision, in.ProfileIDs, in.Permissions, policy = original.UserRevision, original.ProfileIDs, original.Permissions, original.Policy
+					}
 				}
 				d, err := operations.ApprovePairing(ctx, c, in, intent)
 				if err != nil {
@@ -250,6 +256,7 @@ func authCmd(env *Env) *cobra.Command {
 	grantFlags(approve, &profiles, &permissions, &policy)
 	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to; the library and rating flags then set its grant")
 	approve.Flags().StringVar(&approveRevision, "user-revision", "", "user revision the approval is decided on (default: read it now)")
+	approve.Flags().StringVar(&approveResubmit, "resubmit-request", "", "with --idempotency-key and --user: the reported request, which replaces the grant flags")
 	keyFlag(approve, &approveKey)
 
 	status := &cobra.Command{

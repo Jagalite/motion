@@ -135,9 +135,10 @@ flow is exercised against the fixture.
   before the server's receipt lookup (rate limit, authentication,
   visibility), or a conflict about the receipt itself
   (`idempotency_key_reused`, `idempotent_replay_unavailable`). The CLI
-  reports `outcome_unknown`, `idempotency_key`, `if_match` and the other
-  request values to repeat, such as an approval's or invitation's user
-  revision and grant, together with the flags that repeat them. The TUI
+  reports `outcome_unknown`, `idempotency_key`, `if_match` and, for an
+  invitation or user-bound approval, the exact `request` (user revision and
+  grant). `--resubmit-request` takes that request back verbatim and
+  replaces the grant flags. Suggested commands are shell-quoted. The TUI
   locks the dialog and offers to resubmit the same request.
 - **Defaults.** A new user gets `operations.DefaultUserPermissions` and
   `DefaultGrantPolicy`. An invitation or user-bound approval starts from
