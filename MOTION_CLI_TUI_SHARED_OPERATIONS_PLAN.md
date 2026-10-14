@@ -2,7 +2,7 @@
 
 Date: October 13, 2026
 
-Status: Design and implementation plan. The shared operations layer described below is not yet implemented.
+Status: In progress. Steps 1–3 are implemented in `apps/terminal`: the operation inventory ([operations.json](apps/terminal/operations.json), [PARITY.md](apps/terminal/PARITY.md)), the shared session and platform extraction, and the jobs and playback-launch slices in `internal/operations`. Step 5's enforcement covers the migrated operations. Steps 4 and 6 remain: every other workflow is recorded as pending in the ledger.
 
 ## Decision
 

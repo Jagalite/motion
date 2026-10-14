@@ -15,6 +15,8 @@ motion profiles list
 motion libraries list --json
 motion catalog search "Film"
 motion jobs list
+motion jobs show JOB_ID
+motion jobs cancel JOB_ID
 motion jobs retry JOB_ID                     # failed/cancelled jobs; requires processing:request
 motion diagnostics --operator-token-file /path/to/data/admin-token
 motion events tail --json
@@ -34,7 +36,8 @@ history comes from `/admin/metrics` when the server offers the `admin.metrics`
 feature, and is otherwise sampled while the console is open, which it says.
 `[` and `]` change the chart window.
 
-The sidebar also has Processing (jobs, with confirmed cancellation), Scans,
+The sidebar also has Processing (jobs: `enter` inspects one, `c` cancels and
+`R` reviews the job and then retries it, each after confirmation), Scans,
 Activity and Server (process, storage, identity and features); the library
 (browse, per-library grids, all titles, item details, search); and Sources,
 Devices and Profiles. Wide terminals show the full sidebar, medium ones an
@@ -57,6 +60,21 @@ the Marquee charcoal palette; `NO_COLOR` gets plain text.
 * Retries: reads and keyed writes are retried with the same
   `Idempotency-Key` and body, honoring `Retry-After`. Unkeyed writes are not.
 * Conditional updates read the current ETag unless `--if-match` is given.
+  `jobs retry` does the same: it carries the reviewed job revision.
+* A job cancellation or retry whose acknowledgement was lost may have been
+  applied. The error says so and carries `"outcome_unknown":true` and the
+  request's `"idempotency_key"`; rerunning the command with
+  `--idempotency-key KEY` resubmits the same request, which the server
+  replays or applies once. A new invocation without the key is a new request.
+
+## Shared operations
+
+The CLI and the TUI call the same typed workflows in `internal/operations`
+(session, jobs and playback so far); `internal/platform` holds the browser
+opener, which `cmd/motion` injects. [`operations.json`](operations.json) is
+the operation inventory and parity ledger, [`PARITY.md`](PARITY.md) its
+readable matrix. Tests keep both truthful and stop interface code from
+bypassing a migrated operation.
 
 ## Credentials
 
@@ -76,8 +94,9 @@ go test -race ./...
 cargo build && MOTION_E2E_SERVER_BIN=$PWD/../../target/debug/playscale go test -run E2E .
 ```
 
-The mock in `internal/cli` is a contract-shaped fake, not evidence of server
-behavior; the E2E test runs the real server in restricted mode.
+The mock in `internal/cli` and the job fixture in `internal/operations/opstest`
+are contract-shaped fakes, not evidence of server behavior; the E2E test runs
+the real server in restricted mode.
 
 ## A08/A10 implementation audit (2026-10-09)
 

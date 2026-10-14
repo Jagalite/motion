@@ -9,6 +9,7 @@ type keyMap struct {
 	Open, Back, Focus     key.Binding
 	Search, Play, Layout  key.Binding
 	Cancel, Choose        key.Binding
+	Inspect, Retry        key.Binding
 	Refresh, Help, Quit   key.Binding
 	Confirm, Keep         key.Binding
 	Submit, Leave         key.Binding
@@ -32,6 +33,8 @@ var keys = keyMap{
 	Play:        key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "play")),
 	Layout:      key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "grid/list")),
 	Cancel:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "cancel job")),
+	Inspect:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "inspect job")),
+	Retry:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "retry job")),
 	Choose:      key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "use profile")),
 	Refresh:     key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 	Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
@@ -64,6 +67,6 @@ func fullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{keys.Up, keys.Down, keys.Left, keys.Right, keys.PageUp, keys.PageDown, keys.Top, keys.Bottom},
 		{keys.Open, keys.Back, keys.Focus, keys.Search, keys.Refresh, keys.Help, keys.Quit},
-		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Cancel, keys.History, keys.ClearFilter},
+		{keys.Shorter, keys.Longer, keys.Play, keys.Layout, keys.Choose, keys.Inspect, keys.Cancel, keys.Retry, keys.History, keys.ClearFilter},
 	}
 }

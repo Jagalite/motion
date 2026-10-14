@@ -28,7 +28,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/Jagalite/motion/apps/terminal/internal/cli"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
 const (
@@ -54,10 +54,6 @@ type streamMsg struct {
 	err   error
 }
 type launchDone struct{ err error }
-type cancelDone struct {
-	job string
-	err error
-}
 type searchDue struct{ seq int }
 type noticeDone struct{ seq int }
 
@@ -75,7 +71,7 @@ type Model struct {
 	backend     Backend
 	server      string
 	incoming    <-chan tea.Msg
-	openBrowser func(context.Context, string) error
+	openBrowser operations.Browser
 	// profile is the chosen viewing profile; "" uses the principal's first.
 	profile string
 
@@ -111,13 +107,17 @@ type Model struct {
 	vp        viewport.Model
 	table     table.Model
 
-	log        []logEntry
-	stream     string
-	streamErr  error
-	notice     notice
-	confirm    string
-	cancelling map[string]bool
-	launching  bool
+	log       []logEntry
+	stream    string
+	streamErr error
+	notice    notice
+	confirm   jobConfirm
+	launching bool
+	// acting is the job action in flight per job; jobs remembers actions
+	// whose outcome is unknown; jobEpoch retires replies across sign-out.
+	acting   map[string]operations.JobActionKind
+	jobs     *operations.PendingJobActions
+	jobEpoch int
 
 	// metrics is the console's history; bars animate job progress.
 	metrics *history
@@ -155,11 +155,11 @@ func New(ctx context.Context, backend Backend, server string, incoming <-chan te
 		Selected: focusStyle.Background(colorRaised2),
 	})
 	return Model{
-		ctx: ctx, backend: backend, server: server, incoming: incoming, openBrowser: cli.OpenBrowser,
+		ctx: ctx, backend: backend, server: server, incoming: incoming,
 		cache:  &cache{slots: map[string]*slot{}},
 		search: search, help: h, table: tbl, vp: viewport.New(),
-		spinner:    spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
-		cancelling: map[string]bool{}, stream: "connecting",
+		spinner: spinner.New(spinner.WithSpinner(spinner.MiniDot), spinner.WithStyle(accentStyle)),
+		acting:  map[string]operations.JobActionKind{}, jobs: &operations.PendingJobActions{}, stream: "connecting",
 		metrics: newHistory(), bars: map[string]*progress.Model{}, anim: newSprings(), opened: time.Now(),
 		// The console opens with the sidebar focused; tab moves to the page.
 		focus: focusNav,
@@ -272,7 +272,7 @@ func (m *Model) busy() bool {
 			return true
 		}
 	}
-	return m.launching || len(m.cancelling) > 0 || m.working()
+	return m.launching || len(m.acting) > 0 || m.working()
 }
 
 // working reports a running job without progress on the Overview, whose
@@ -450,16 +450,10 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			return m.say("Couldn't open the player: "+refusal(msg.err), true)
 		}
 		return m.say("Opened the player in your browser.", false)
-	case cancelDone:
-		delete(m.cancelling, msg.job)
-		if unauthenticated(msg.err) {
-			m.signedOut(msg.err)
-			return nil
-		}
-		if msg.err != nil {
-			return tea.Batch(m.say("Couldn't cancel the job: "+refusal(msg.err), true), m.load(keyJobs))
-		}
-		return tea.Batch(m.say("Cancellation requested.", false), m.load(keyJobs))
+	case jobReviewed:
+		return m.reviewed(msg)
+	case jobActionDone:
+		return m.jobActionFinished(msg)
 	case searchDue:
 		if msg.seq == m.searchSeq {
 			return m.runSearch()
@@ -593,12 +587,12 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	if m.access != nil {
 		return m.accessKey(msg)
 	}
-	if m.confirm != "" {
+	if m.confirm.open() {
 		switch {
 		case key.Matches(msg, keys.Confirm):
-			return m.cancelJob()
+			return m.confirmed()
 		case key.Matches(msg, keys.Keep):
-			m.confirm = ""
+			m.confirm = jobConfirm{}
 		}
 		return nil
 	}
@@ -757,20 +751,12 @@ func (m *Model) launch(timeline string) tea.Cmd {
 		return m.say("Playback isn't available on this server or for this device.", true)
 	}
 	m.launching = true
-	ctx, backend, server, profile, open := m.ctx, m.backend, m.server, m.viewer(), m.openBrowser
+	ctx, backend, open := m.ctx, m.backend, m.openBrowser
+	in := operations.PlayInput{Server: m.server, TimelineID: timeline, ProfileID: m.viewer(), Open: true}
 	return tea.Batch(m.spin(), func() tea.Msg {
 		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
-		t, err := backend.GetTimeline(ctx, timeline)
-		if err == nil && profile != "" {
-			_, err = backend.GetProfile(ctx, profile)
-		}
-		if err == nil {
-			var target string
-			if target, err = cli.PlayerURL(server, t.Value.ID, profile); err == nil {
-				err = open(ctx, target)
-			}
-		}
+		_, err := operations.LaunchPlayer(ctx, backend, in, open)
 		return launchDone{err: err}
 	})
 }
@@ -779,27 +765,7 @@ func (m *Model) launch(timeline string) tea.Cmd {
 // may request playback; the server still decides each request.
 func (m Model) canPlay() bool {
 	caps, me := m.caps(), m.me()
-	if caps == nil || me == nil || !me.Allows(api.PermPlaybackRequest) {
-		return false
-	}
-	f, ok := caps.Feature("playback.v2")
-	return ok && f.Implemented && f.Enabled
-}
-
-func (m *Model) cancelJob() tea.Cmd {
-	id := m.confirm
-	m.confirm = ""
-	if m.cancelling[id] {
-		return nil
-	}
-	m.cancelling[id] = true
-	backend, ctx, idempotency := m.backend, m.ctx, api.NewIdempotencyKey()
-	return tea.Batch(m.spin(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
-		defer cancel()
-		_, err := backend.CancelJob(ctx, id, idempotency)
-		return cancelDone{job: id, err: err}
-	})
+	return caps != nil && me != nil && operations.PlaybackReady(*me, *caps) == nil
 }
 
 func unauthenticated(err error) bool {
@@ -820,7 +786,12 @@ func (m *Model) signedOut(err error) {
 	m.cache.viewer, m.cache.shape, m.cache.shelves = "", nil, nil
 	m.forgetMetrics()
 	m.bars = map[string]*progress.Model{}
-	m.focus, m.history, m.confirm = focusContent, nil, ""
+	m.focus, m.history, m.confirm = focusContent, nil, jobConfirm{}
+	// Keys are scoped to the principal: forget unresolved actions and ignore
+	// replies to requests sent with the rejected credential.
+	m.jobs.Forget()
+	m.acting = map[string]operations.JobActionKind{}
+	m.jobEpoch++
 }
 
 // refusal phrases a failed action for the status bar.
@@ -919,8 +890,8 @@ func Pump(ctx context.Context, follow func(context.Context, func(api.Event) erro
 	}
 }
 
-// Run starts the interface for a connected client.
-func Run(ctx context.Context, conn *cli.Conn) error {
+// Run starts the interface for a verified session; browser opens the player.
+func Run(ctx context.Context, conn *operations.Session, browser operations.Browser) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ch := make(chan tea.Msg, eventBuffer)
@@ -928,7 +899,7 @@ func Run(ctx context.Context, conn *cli.Conn) error {
 		return conn.Follow(ctx, "", h, d)
 	}, ch)
 	model := New(ctx, conn, conn.URL, ch)
-	model.profile = conn.Profile
+	model.profile, model.openBrowser = conn.Profile, browser
 	program := tea.NewProgram(model, tea.WithContext(ctx))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {

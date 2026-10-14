@@ -63,7 +63,7 @@ func TestOnlyServerDelegationAndBrowserOpenerStartProcesses(t *testing.T) {
 				case *ast.SelectorExpr:
 					if id, ok := n.X.(*ast.Ident); ok && launch[imports[id.Name]+"."+n.Sel.Name] {
 						serve := fn != nil && fn.Name.Name == "serveCmd" && path == filepath.Join("internal", "cli", "root.go")
-						browser := fn != nil && fn.Name.Name == "OpenBrowser" && path == filepath.Join("internal", "cli", "play.go")
+						browser := fn != nil && fn.Name.Name == "OpenBrowser" && path == filepath.Join("internal", "platform", "browser.go")
 						if !serve && !browser {
 							t.Errorf("%s: process launch outside server/browser delegation", fset.Position(n.Pos()))
 						}

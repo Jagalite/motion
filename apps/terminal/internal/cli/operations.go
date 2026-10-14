@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
-	"github.com/Jagalite/motion/apps/terminal/internal/api"
-	"github.com/spf13/cobra"
 	"io"
+
+	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
+	"github.com/spf13/cobra"
 )
 
 func scanCmd(env *Env) *cobra.Command {
@@ -47,7 +49,7 @@ func jobsCmd(env *Env) *cobra.Command {
 		})
 	}
 	list := &cobra.Command{Use: "list", Args: cobra.NoArgs, RunE: run(env, func(ctx context.Context, c *Conn) error {
-		result, err := c.ListJobs(ctx, cursor, limit)
+		result, err := operations.ListJobs(ctx, c, operations.PageRequest{Cursor: cursor, Limit: limit})
 		if err != nil {
 			return err
 		}
@@ -65,33 +67,66 @@ func jobsCmd(env *Env) *cobra.Command {
 	pageFlags(list, &cursor, &limit)
 	show := &cobra.Command{Use: "show JOB_ID", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		return run(env, func(ctx context.Context, c *Conn) error {
-			r, err := c.GetJob(ctx, args[0])
+			r, err := operations.InspectJob(ctx, c, args[0])
 			if err != nil {
 				return err
 			}
 			return printJob(r.Value)
 		})(cmd, args)
 	}}
-	cancel := &cobra.Command{Use: "cancel JOB_ID", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		key := api.NewIdempotencyKey()
+	// action resolves the intent before connecting: one key per invocation,
+	// or the recorded key of an earlier attempt whose outcome is unknown.
+	action := func(kind operations.JobActionKind, job, key, ifMatch string) (operations.JobAction, error) {
+		if key != "" {
+			return operations.ResumeJobAction(kind, job, key, ifMatch)
+		}
+		return operations.NewJobAction(kind, job, ifMatch)
+	}
+	var cancelKey string
+	cancel := &cobra.Command{Use: "cancel JOB_ID", Short: "Request cancellation of a job", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		a, err := action(operations.CancelJob, args[0], cancelKey, "")
+		if err != nil {
+			return err
+		}
 		return run(env, func(ctx context.Context, c *Conn) error {
-			r, err := c.CancelJob(ctx, args[0], key)
+			r, err := operations.SubmitJobAction(ctx, c, a)
 			if err != nil {
 				return err
 			}
 			return printJob(r.Value)
 		})(cmd, args)
 	}}
+	cancel.Flags().StringVar(&cancelKey, "idempotency-key", "", "resubmit an earlier request whose outcome is unknown")
+	var retryKey, ifMatch string
 	retry := &cobra.Command{Use: "retry JOB_ID", Short: "Retry a failed or cancelled job", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		key := api.NewIdempotencyKey()
+		if retryKey != "" {
+			if err := operations.CheckIdempotencyKey(retryKey); err != nil {
+				return err
+			}
+		}
 		return run(env, func(ctx context.Context, c *Conn) error {
-			r, err := c.RetryJob(ctx, args[0], key)
+			etag := ifMatch
+			if etag == "" {
+				// Without --if-match the command reviews the current revision.
+				current, err := operations.InspectJob(ctx, c, args[0])
+				if err != nil {
+					return err
+				}
+				etag = current.ETag
+			}
+			a, err := action(operations.RetryJob, args[0], retryKey, etag)
+			if err != nil {
+				return err
+			}
+			r, err := operations.SubmitJobAction(ctx, c, a)
 			if err != nil {
 				return err
 			}
 			return printJob(r.Value)
 		})(cmd, args)
 	}}
+	retry.Flags().StringVar(&retryKey, "idempotency-key", "", "resubmit an earlier request whose outcome is unknown")
+	retry.Flags().StringVar(&ifMatch, "if-match", "", "ETag the job must still have (default: read it first)")
 	cmd.AddCommand(list, show, cancel, retry)
 	return cmd
 }

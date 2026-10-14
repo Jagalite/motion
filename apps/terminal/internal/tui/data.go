@@ -9,14 +9,18 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
 // Backend is the subset of the API the interface uses; tests substitute it.
+// Migrated workflows reach it only through shared operations, whose narrow
+// interfaces it embeds.
 type Backend interface {
-	Me(context.Context) (api.Principal, error)
-	Capabilities(context.Context) (api.Capabilities, error)
+	operations.PlaybackAPI
+	operations.JobLister
+	operations.JobReader
+	operations.JobController
 	ListProfiles(context.Context, string, int) (api.Page[api.Profile], error)
-	GetProfile(context.Context, string) (api.Tagged[api.Profile], error)
 	ListDevices(context.Context, string, int) (api.Page[api.Device], error)
 	ListLibraries(context.Context, string, int) (api.Page[api.Library], error)
 	GetLibrary(context.Context, string) (api.Tagged[api.Library], error)
@@ -27,12 +31,9 @@ type Backend interface {
 	ListItemEditions(context.Context, string, string, int) (api.Page[api.Edition], error)
 	ListItemTimelines(context.Context, string, string, int) (api.Page[api.Timeline], error)
 	ListVersions(context.Context, string, string, int) (api.Page[api.MediaVersion], error)
-	GetTimeline(context.Context, string) (api.Tagged[api.Timeline], error)
 	GetViewingState(context.Context, string, string) (api.ViewingState, error)
 	ListContinueWatching(context.Context, string, string, int) (api.Page[api.ContinueEntry], error)
 	ListScans(context.Context, string, int) (api.Page[api.Scan], error)
-	ListJobs(context.Context, string, int) (api.Page[api.Job], error)
-	CancelJob(context.Context, string, string) (api.Tagged[api.Job], error)
 	Diagnostics(context.Context) (api.Diagnostics, error)
 	Storage(context.Context) (api.StorageReport, error)
 	Metrics(context.Context, time.Time, int) (api.MetricsHistory, error)
@@ -153,31 +154,9 @@ type itemPage struct {
 	childrenTruncated bool
 }
 
+// all reads every page up to listCap rows, with the shared completeness rule.
 func all[T any](ctx context.Context, list func(context.Context, string, int) (api.Page[T], error)) ([]T, bool, error) {
-	var items []T
-	cursor := ""
-	seen := map[string]bool{}
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, false, err
-		}
-		if seen[cursor] {
-			return nil, false, fmt.Errorf("server returned a repeated pagination cursor")
-		}
-		seen[cursor] = true
-		page, err := list(ctx, cursor, 200)
-		if err != nil {
-			return nil, false, err
-		}
-		items = append(items, page.Items...)
-		if page.NextCursor == nil {
-			return items, false, nil
-		}
-		if len(items) >= listCap {
-			return items, true, nil
-		}
-		cursor = *page.NextCursor
-	}
+	return operations.Collect(ctx, list, listCap)
 }
 
 // one reads a single bounded page and refuses to present a partial set.
@@ -331,7 +310,9 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 	case keyScans:
 		return list(b.ListScans)
 	case keyJobs:
-		return list(b.ListJobs)
+		return func(ctx context.Context) (any, bool, error) {
+			return operations.CollectJobs(ctx, b, listCap)
+		}
 	case keyDiagnostics:
 		return func(ctx context.Context) (any, bool, error) {
 			d, err := b.Diagnostics(ctx)

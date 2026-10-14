@@ -552,8 +552,8 @@ func (m Model) connection() string {
 func (m Model) statusbar(width int) string {
 	left := " " + m.connection() + faintStyle.Render(" · "+host(m.server))
 	switch {
-	case m.confirm != "":
-		left = " " + accentStyle.Render("Cancel this job?") + "  " + keyStyle.Render("y") + faintStyle.Render(" confirm  ") + keyStyle.Render("n") + faintStyle.Render(" keep")
+	case m.confirm.open():
+		left = " " + accentStyle.Render(m.confirm.prompt()) + "  " + keyStyle.Render("y") + faintStyle.Render(" confirm  ") + keyStyle.Render("n") + faintStyle.Render(" keep")
 	case m.notice.text != "" && m.notice.err:
 		left += "   " + dangerStyle.Render(m.notice.text)
 	case m.notice.text != "":
@@ -561,7 +561,7 @@ func (m Model) statusbar(width int) string {
 	case m.launching:
 		left += "   " + m.spinner.View() + mutedStyle.Render(" Opening the player…")
 	}
-	if width < 70 && m.confirm == "" && m.notice.text == "" {
+	if width < 70 && !m.confirm.open() && m.notice.text == "" {
 		left = " " + m.connection() // the host is on the Server page
 	}
 	h := m.help
@@ -585,7 +585,7 @@ func (m Model) statusbar(width int) string {
 // shortHelp lists the shortcuts that apply to what has focus.
 func (m Model) shortHelp() []key.Binding {
 	switch {
-	case m.confirm != "":
+	case m.confirm.open():
 		return nil
 	case m.focus == focusSearch:
 		return []key.Binding{keys.Submit, keys.Leave, keys.Focus}
@@ -603,7 +603,7 @@ func (m Model) shortHelp() []key.Binding {
 		b := []key.Binding{move("select")}
 		switch {
 		case m.route.page == pageProcessing && len(m.table.Rows()) > 0:
-			b = append(b, keys.Cancel)
+			b = append(b, keys.Inspect, keys.Cancel, keys.Retry)
 		case m.route.page == pageProfiles:
 			b = append(b, keys.Choose)
 		case m.route.page == pageNowPlaying:

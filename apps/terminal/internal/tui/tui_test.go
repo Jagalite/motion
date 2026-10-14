@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 )
 
 // fake is a contract-shaped backend. Server-supplied text carries control
@@ -166,6 +167,14 @@ func (f *fake) ListJobs(_ context.Context, cursor string, limit int) (api.Page[a
 	}
 	return api.Page[api.Job]{Items: []api.Job{{ID: "job1", Kind: "scan", Phase: "running"}, {ID: "job2", Kind: "convert", Phase: "queued"}}}, nil
 }
+
+// Job inspection and retry are exercised against opstest.Jobs (jobs_test.go).
+func (f *fake) GetJob(context.Context, string) (api.Tagged[api.Job], error) {
+	return api.Tagged[api.Job]{}, &api.Problem{Status: 404, Code: "not_found"}
+}
+func (f *fake) RetryJob(context.Context, string, string, string) (api.Tagged[api.Job], error) {
+	return api.Tagged[api.Job]{}, &api.Problem{Status: 409, Code: "not_retryable"}
+}
 func (f *fake) CancelJob(_ context.Context, id, key string) (api.Tagged[api.Job], error) {
 	f.mu.Lock()
 	f.cancelled = append(f.cancelled, id+"/"+key)
@@ -303,7 +312,7 @@ func drain(t *testing.T, m Model, cmd tea.Cmd) Model {
 		for _, c := range msg {
 			m = drain(t, m, c)
 		}
-	case loaded, launchDone, cancelDone:
+	case loaded, launchDone, jobReviewed, jobActionDone:
 		var next tea.Cmd
 		m, next = update(t, m, msg)
 		m = drain(t, m, next)
@@ -673,8 +682,8 @@ func TestJobCancellationAsksFirstAndSendsOneKeyedRequest(t *testing.T) {
 	m := start(t, f, 100, 30)
 	m = goTo(t, m, route{page: pageProcessing})
 	m = press(t, m, "down", "c")
-	if m.confirm != "job2" || len(f.cancelled) != 0 {
-		t.Fatalf("cancel did not ask first: %q %v", m.confirm, f.cancelled)
+	if m.confirm.job != "job2" || m.confirm.kind != operations.CancelJob || len(f.cancelled) != 0 {
+		t.Fatalf("cancel did not ask first: %+v %v", m.confirm, f.cancelled)
 	}
 	if !strings.Contains(screen(m), "Cancel this job?") {
 		t.Fatal("confirmation not shown")

@@ -16,12 +16,13 @@ import (
 	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 	"github.com/Jagalite/motion/apps/terminal/internal/store"
 	"github.com/spf13/cobra"
 )
 
-// TUI is set by main to avoid an import cycle with the tui package.
-var TUI func(ctx context.Context, conn *Conn) error
+// TUI is set by main, which composes the interfaces; cli does not import tui.
+var TUI func(ctx context.Context, session *operations.Session, browser operations.Browser) error
 
 func NewRoot(env *Env) *cobra.Command {
 	root := &cobra.Command{
@@ -634,7 +635,7 @@ func tuiCmd(env *Env) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return TUI(cmd.Context(), conn)
+			return TUI(cmd.Context(), conn, env.Browser)
 		},
 	}
 }

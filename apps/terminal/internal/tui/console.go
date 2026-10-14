@@ -547,8 +547,8 @@ func (m Model) workLines(now time.Time) ([]string, string) {
 		shown++
 		name := fmt.Sprintf("%-10s", kindLabel(clean(j.Kind)))
 		state := mutedStyle.Render(clean(j.Phase))
-		if m.cancelling[j.ID] {
-			state = accentStyle.Render("cancelling…")
+		if kind, ok := m.acting[j.ID]; ok {
+			state = accentStyle.Render(actingLabel(kind))
 		}
 		bar := faintStyle.Render(strings.Repeat("━", 20))
 		if b, ok := m.bars[j.ID]; ok {

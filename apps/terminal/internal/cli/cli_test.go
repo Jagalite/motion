@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
+	"github.com/Jagalite/motion/apps/terminal/internal/operations"
 	"github.com/Jagalite/motion/apps/terminal/internal/store"
 )
 
@@ -165,7 +166,7 @@ func TestChangedServerIdentityNeverReceivesTheCredential(t *testing.T) {
 	h.fake.auth = nil
 	h.fake.mu.Unlock()
 	code, err := h.run("profiles", "list")
-	if code != ExitAuth || !errors.Is(err, errServerIdentity) {
+	if code != ExitAuth || !errors.Is(err, operations.ErrServerIdentity) {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
 	for _, a := range h.fake.auth {

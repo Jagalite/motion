@@ -13,14 +13,19 @@ import (
 )
 
 func TestJobsRetryCommandUsesFreshOperationIdentityAndReportsConflicts(t *testing.T) {
-	keys := []string{}
+	keys, reads := []string{}, 0
 	conflict := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/system/health":
 			fmt.Fprint(w, `{"status":"ok","server_id":"mock","server_epoch":"e"}`)
+		case "/api/v2/jobs/failed":
+			// Without --if-match the command reviews the current revision.
+			reads++
+			w.Header().Set("ETag", `"r-1"`)
+			fmt.Fprint(w, `{"id":"failed","revision":"1","kind":"scan","phase":"failed","attempt_generation":"0","result_ids":[],"requester_id":"operator"}`)
 		case "/api/v2/jobs/failed/retry":
-			if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer 01234567890123456789012345678901" {
+			if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer 01234567890123456789012345678901" || r.Header.Get("If-Match") != `"r-1"` {
 				t.Error("incorrect job retry request")
 			}
 			keys = append(keys, r.Header.Get("Idempotency-Key"))
@@ -64,7 +69,7 @@ func TestJobsRetryCommandUsesFreshOperationIdentityAndReportsConflicts(t *testin
 	if ExitCode(err) != ExitConflict || out != "" {
 		t.Fatalf("output=%s err=%v", out, err)
 	}
-	if len(keys) != 2 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] {
-		t.Fatalf("keys=%v", keys)
+	if len(keys) != 2 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] || reads != 2 {
+		t.Fatalf("keys=%v reads=%d", keys, reads)
 	}
 }
