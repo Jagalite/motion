@@ -117,6 +117,8 @@ func TestOutcomeClassification(t *testing.T) {
 		{context.Canceled, true},
 		{context.DeadlineExceeded, true},
 		{errors.New("invalid response from server"), true},
+		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 429, Code: "rate_limited"}}, true},
+		{&api.AfterUnknownAttemptError{Err: &api.Problem{Status: 409, Code: "not_retryable"}}, true},
 	} {
 		_, err := operations.SubmitJobAction(context.Background(), failing{c.err}, a)
 		var unknown *operations.UncertainError

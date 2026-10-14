@@ -8,7 +8,14 @@ the code: every runnable CLI command is listed, every named CLI entry point
 exists, every shared operation is declared in `internal/operations` and has
 operation, CLI and TUI tests, and every missing entry point has a recorded
 exception. `TestInterfacesDoNotBypassSharedOperations` fails when CLI or TUI
-code calls an API method that a shared operation owns.
+code calls, or takes as a method value, an API method that a shared operation
+owns; when either interface refers to none of a shared operation's
+implementation; when interface code builds a player URL; or when it refers to
+the platform browser opener, which only `cmd/motion` injects. These are
+syntactic checks: the adapter tests listed in `operations.json` are what show
+that each entry point calls its operation with the right inputs.
+`playback.launch` owns no API method exclusively (its reads also serve other
+workflows), so its wiring is covered by the reference and URL checks.
 
 **Shared** means both interfaces call the same operation in
 `internal/operations`. **Pending** means the workflow has not been migrated
@@ -73,8 +80,22 @@ treats the command itself as the confirmation.
 When a job cancellation or retry may have reached the server but no
 acknowledgement arrived, both interfaces report that the outcome is unknown.
 They resubmit the same request with the same idempotency key, so the server
-replays its saved acknowledgement or applies the intent once. The CLI prints
-the key (and `idempotency_key` with `outcome_unknown` in `motion.cli.v1`
-error output); `--idempotency-key KEY` resubmits it. The TUI remembers the
-action while it stays open and offers to resubmit it on the next `c` or `R`
-for that job. It forgets these actions when the credential is rejected.
+replays its saved acknowledgement or applies the intent once. A refusal that
+follows an unanswered attempt inside the API adapter's own retries does not
+settle the outcome either. The CLI prints the key and, for a retry, the
+reviewed ETag (`idempotency_key`, `if_match` and `outcome_unknown` in
+`motion.cli.v1` error output); `--idempotency-key KEY` resubmits the
+request, and a retry also needs the original `--if-match ETAG` so the
+resubmission is the same request rather than a new review. The TUI remembers
+the action, with its reviewed ETag, while it stays open and offers to
+resubmit it on the next `c` or `R` for that job. It forgets these actions
+when the credential is rejected.
+
+## Reviewed revisions
+
+A job retry names the revision the user reviewed (`If-Match`). The server
+admits it only at that revision and only for a failed or cancelled job, using
+the production `playscale_core::jobs::admit_retry` policy: a stale review is
+refused with 412, a missing precondition with 428, and one review admits at
+most one retry. The Stateless model `playscale.jobs.reviewed_retry` explores
+that policy with the job reducer.

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -25,10 +26,11 @@ func (c jobConfirm) open() bool { return c.job != "" }
 // jobReviewed answers an inspection. A retry asks for one first, so that
 // the confirmation shows, and the request carries, the reviewed revision.
 type jobReviewed struct {
-	epoch int
-	job   api.Tagged[api.Job]
-	retry bool
-	err   error
+	epoch  int
+	review int
+	job    api.Tagged[api.Job]
+	retry  bool
+	err    error
 }
 
 type jobActionDone struct {
@@ -37,14 +39,20 @@ type jobActionDone struct {
 	err    error
 }
 
-// inspectJob reads the job's current state and revision.
+// inspectJob reads the job's current state and revision, superseding any
+// inspection still in flight.
 func (m *Model) inspectJob(id string, retry bool) tea.Cmd {
-	backend, ctx, epoch := m.backend, m.ctx, m.jobEpoch
+	if m.reviewCancel != nil {
+		m.reviewCancel()
+	}
+	m.review++
+	ctx, cancel := context.WithTimeout(m.ctx, loadTimeout)
+	m.reviewCancel = cancel
+	backend, epoch, review := m.backend, m.epoch, m.review
 	return tea.Batch(m.spin(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
 		job, err := operations.InspectJob(ctx, backend, id)
-		return jobReviewed{epoch: epoch, job: job, retry: retry, err: err}
+		return jobReviewed{epoch: epoch, review: review, job: job, retry: retry, err: err}
 	})
 }
 
@@ -64,9 +72,10 @@ func (m *Model) askCancel(id string) {
 }
 
 func (m *Model) reviewed(msg jobReviewed) tea.Cmd {
-	if msg.epoch != m.jobEpoch {
-		return nil // answered for a credential that is no longer in use
+	if msg.epoch != m.epoch || msg.review != m.review {
+		return nil // superseded, or answered for a rejected credential
 	}
+	m.reviewCancel = nil
 	if unauthenticated(msg.err) {
 		m.signedOut(msg.err)
 		return nil
@@ -98,11 +107,20 @@ func (m *Model) replaceJob(job api.Job) {
 	next := make([]api.Job, len(jobs))
 	copy(next, jobs)
 	for i := range next {
-		if next[i].ID == job.ID {
+		// A list reply newer than this read already shows a later revision.
+		if next[i].ID == job.ID && !newerRevision(next[i].Revision, job.Revision) {
 			next[i] = job
 		}
 	}
 	s.data = next
+}
+
+// newerRevision reports whether revision a is later than b; revisions are
+// decimal strings, and an unreadable one is not treated as newer.
+func newerRevision(a, b string) bool {
+	x, errA := strconv.ParseUint(a, 10, 64)
+	y, errB := strconv.ParseUint(b, 10, 64)
+	return errA == nil && errB == nil && x > y
 }
 
 // confirmed submits the confirmed action once. The key is the action's: a
@@ -119,7 +137,7 @@ func (m *Model) confirmed() tea.Cmd {
 		return m.say(refusal(err), true)
 	}
 	m.acting[c.job] = c.kind
-	backend, ctx, epoch := m.backend, m.ctx, m.jobEpoch
+	backend, ctx, epoch := m.backend, m.ctx, m.epoch
 	return tea.Batch(m.spin(), func() tea.Msg {
 		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
@@ -129,7 +147,7 @@ func (m *Model) confirmed() tea.Cmd {
 }
 
 func (m *Model) jobActionFinished(msg jobActionDone) tea.Cmd {
-	if msg.epoch != m.jobEpoch {
+	if msg.epoch != m.epoch {
 		return nil
 	}
 	delete(m.acting, msg.action.JobID)

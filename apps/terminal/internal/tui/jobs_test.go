@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
@@ -148,5 +149,91 @@ func TestInspectShowsTheJobsCurrentState(t *testing.T) {
 	jobs, _ := data[[]api.Job](m, keyJobs)
 	if len(jobs) != 1 || jobs[0].Phase != "failed" || m.confirm.open() {
 		t.Fatalf("%+v %+v", jobs, m.confirm)
+	}
+}
+
+// messages runs a command tree and returns its results, without timers.
+func messages(t *testing.T, cmd tea.Cmd) []tea.Msg {
+	t.Helper()
+	if cmd == nil {
+		return nil
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+	select {
+	case msg := <-done:
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			var out []tea.Msg
+			for _, c := range batch {
+				out = append(out, messages(t, c)...)
+			}
+			return out
+		}
+		return []tea.Msg{msg}
+	case <-time.After(100 * time.Millisecond):
+		return nil
+	}
+}
+
+func reviewOf(t *testing.T, msgs []tea.Msg) jobReviewed {
+	t.Helper()
+	for _, msg := range msgs {
+		if r, ok := msg.(jobReviewed); ok {
+			return r
+		}
+	}
+	t.Fatal("no review reply")
+	return jobReviewed{}
+}
+
+func TestOverlappingReviewsAcceptOnlyTheNewest(t *testing.T) {
+	m, f := processing(t, api.Job{ID: "j1", Kind: "scan", Phase: "failed"})
+	m = selectJob(t, m, "j1")
+	older := m.inspectJob("j1", true)
+	first := reviewOf(t, messages(t, older)) // revision 1
+	f.SetPhase("j1", "cancelled")
+	newer := m.inspectJob("j1", true)
+	second := reviewOf(t, messages(t, newer)) // revision 2
+	m, _ = update(t, m, second)
+	if m.confirm.etag != `"r-2"` {
+		t.Fatalf("%+v", m.confirm)
+	}
+	m = press(t, m, "n")
+	m, _ = update(t, m, first)
+	jobs, _ := data[[]api.Job](m, keyJobs)
+	if m.confirm.open() || jobs[0].Revision != "2" {
+		t.Fatalf("superseded review applied: %+v %+v", m.confirm, jobs)
+	}
+}
+
+func TestLaunchAfterSignOutIsCancelledAndIgnored(t *testing.T) {
+	f := &fake{permissions: []string{api.PermPlaybackRequest}, features: []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}}
+	m := start(t, f, 100, 30)
+	opened := 0
+	m.openBrowser = func(context.Context, string) error { opened++; return nil }
+	cmd := m.launch("t1")
+	m.signedOut(&api.Problem{Status: 401, Code: "authentication_required"})
+	for _, msg := range messages(t, cmd) {
+		m, _ = update(t, m, msg)
+	}
+	if opened != 0 || m.launching || strings.Contains(m.notice.text, "player") {
+		t.Fatalf("launch survived sign-out: opened=%d notice=%+v", opened, m.notice)
+	}
+}
+
+func TestLaunchConsultsCurrentCapabilitiesNotTheCache(t *testing.T) {
+	f := &fake{permissions: []string{api.PermPlaybackRequest}}
+	m := start(t, f, 100, 30)
+	if m.canPlay() {
+		t.Fatal("cache should deny playback")
+	}
+	opened := 0
+	m.openBrowser = func(context.Context, string) error { opened++; return nil }
+	f.mu.Lock()
+	f.features = []api.Feature{{ID: "playback.v2", Implemented: true, Enabled: true}}
+	f.mu.Unlock()
+	m = drain(t, m, m.launch("t1"))
+	if opened != 1 || m.notice.err || !m.canPlay() {
+		t.Fatalf("opened=%d notice=%+v canPlay=%v", opened, m.notice, m.canPlay())
 	}
 }

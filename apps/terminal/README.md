@@ -60,12 +60,14 @@ the Marquee charcoal palette; `NO_COLOR` gets plain text.
 * Retries: reads and keyed writes are retried with the same
   `Idempotency-Key` and body, honoring `Retry-After`. Unkeyed writes are not.
 * Conditional updates read the current ETag unless `--if-match` is given.
-  `jobs retry` does the same: it carries the reviewed job revision.
+  `jobs retry` does the same: it carries the reviewed job revision, and the
+  server refuses a retry of a job that changed since (exit 4).
 * A job cancellation or retry whose acknowledgement was lost may have been
-  applied. The error says so and carries `"outcome_unknown":true` and the
-  request's `"idempotency_key"`; rerunning the command with
-  `--idempotency-key KEY` resubmits the same request, which the server
-  replays or applies once. A new invocation without the key is a new request.
+  applied. The error says so and carries `"outcome_unknown":true`, the
+  request's `"idempotency_key"` and, for a retry, its `"if_match"`; rerunning
+  the command with `--idempotency-key KEY` (and the original `--if-match`
+  for a retry) resubmits the same request, which the server replays or
+  applies once. A new invocation without the key is a new request.
 
 ## Shared operations
 

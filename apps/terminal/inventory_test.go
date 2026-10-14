@@ -188,12 +188,32 @@ func TestOperationInventoryIsCompleteAndTruthful(t *testing.T) {
 	}
 }
 
+// operationRefs lists the internal/operations names a package's non-test
+// code refers to.
+func operationRefs(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	refs := map[string]bool{}
+	for _, f := range parsed(t, dir, false) {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok {
+				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "operations" {
+					refs[sel.Sel.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return refs
+}
+
 // CLI and TUI code reaches migrated workflows only through internal/operations:
-// a method a shared operation owns is never called on the API client or on a
-// backend from interface code.
+// a method a shared operation owns is never called or taken as a method value
+// on the API client or a backend in interface code, and each interface really
+// refers to the shared implementation of every shared operation.
 func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
+	entries := inventory(t)
 	owned := map[string]string{}
-	for _, e := range inventory(t) {
+	for _, e := range entries {
 		for _, m := range e.API {
 			owned[m] = e.ID
 		}
@@ -201,22 +221,45 @@ func TestInterfacesDoNotBypassSharedOperations(t *testing.T) {
 	for _, dir := range []string{"cli", "tui"} {
 		for path, f := range parsed(t, filepath.Join("internal", dir), false) {
 			ast.Inspect(f, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok {
-					return true
-				}
-				if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "operations" {
-					return true
-				}
-				if id, ok := owned[sel.Sel.Name]; ok {
-					t.Errorf("%s calls %s directly; use the shared %s operation", path, sel.Sel.Name, id)
+				switch n := n.(type) {
+				case *ast.SelectorExpr:
+					if pkg, ok := n.X.(*ast.Ident); ok && pkg.Name == "operations" {
+						return true
+					}
+					if id, ok := owned[n.Sel.Name]; ok {
+						t.Errorf("%s refers to %s directly; use the shared %s operation", path, n.Sel.Name, id)
+					}
+				case *ast.BasicLit:
+					// Player URLs are built only by the shared launch.
+					if n.Kind == token.STRING && strings.Contains(n.Value, "/play/") {
+						t.Errorf("%s builds a player URL; use operations.PlayerURL", path)
+					}
+				case *ast.Ident:
+					// The browser opener is injected by the composition root.
+					if n.Name == "OpenBrowser" {
+						t.Errorf("%s refers to the platform browser opener", path)
+					}
 				}
 				return true
 			})
+		}
+	}
+	refs := map[string]map[string]bool{
+		"cli": operationRefs(t, filepath.Join("internal", "cli")),
+		"tui": operationRefs(t, filepath.Join("internal", "tui")),
+	}
+	for _, e := range entries {
+		if e.Status != "shared" {
+			continue
+		}
+		for iface, used := range refs {
+			wired := false
+			for _, name := range e.Shared {
+				wired = wired || used[name]
+			}
+			if !wired {
+				t.Errorf("%s: internal/%s refers to none of %v", e.ID, iface, e.Shared)
+			}
 		}
 	}
 }

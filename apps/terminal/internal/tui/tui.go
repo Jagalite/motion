@@ -53,7 +53,10 @@ type streamMsg struct {
 	state string
 	err   error
 }
-type launchDone struct{ err error }
+type launchDone struct {
+	epoch int
+	err   error
+}
 type searchDue struct{ seq int }
 type noticeDone struct{ seq int }
 
@@ -114,10 +117,16 @@ type Model struct {
 	confirm   jobConfirm
 	launching bool
 	// acting is the job action in flight per job; jobs remembers actions
-	// whose outcome is unknown; jobEpoch retires replies across sign-out.
-	acting   map[string]operations.JobActionKind
-	jobs     *operations.PendingJobActions
-	jobEpoch int
+	// whose outcome is unknown.
+	acting map[string]operations.JobActionKind
+	jobs   *operations.PendingJobActions
+	// epoch counts credential rejections: a reply to an action or review
+	// sent before the latest one is ignored.
+	epoch int
+	// review is the newest job inspection; an older reply is ignored.
+	review       int
+	reviewCancel context.CancelFunc
+	launchCancel context.CancelFunc
 
 	// metrics is the console's history; bars animate job progress.
 	metrics *history
@@ -441,15 +450,27 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 		}
 		return m.wait()
 	case launchDone:
-		m.launching = false
+		if msg.epoch != m.epoch {
+			return nil // sent with a credential that has since been rejected
+		}
+		m.launching, m.launchCancel = false, nil
 		if unauthenticated(msg.err) {
 			m.signedOut(msg.err)
 			return nil
 		}
-		if msg.err != nil {
-			return m.say("Couldn't open the player: "+refusal(msg.err), true)
+		// The launch read current permissions and capabilities; refresh the
+		// cached ones that guide the interface when they disagree.
+		var refresh tea.Cmd
+		if denied := playbackDenied(msg.err); denied == m.canPlay() {
+			refresh = m.load(keySession)
 		}
-		return m.say("Opened the player in your browser.", false)
+		if playbackDenied(msg.err) {
+			return tea.Batch(refresh, m.say("Playback isn't available on this server or for this device.", true))
+		}
+		if msg.err != nil {
+			return tea.Batch(refresh, m.say("Couldn't open the player: "+refusal(msg.err), true))
+		}
+		return tea.Batch(refresh, m.say("Opened the player in your browser.", false))
 	case jobReviewed:
 		return m.reviewed(msg)
 	case jobActionDone:
@@ -747,18 +768,24 @@ func (m *Model) launch(timeline string) tea.Cmd {
 	if m.launching {
 		return nil
 	}
-	if !m.canPlay() {
-		return m.say("Playback isn't available on this server or for this device.", true)
-	}
+	// The cached session only guides the interface; the shared operation
+	// reads current permissions and capabilities.
 	m.launching = true
-	ctx, backend, open := m.ctx, m.backend, m.openBrowser
+	ctx, cancel := context.WithTimeout(m.ctx, loadTimeout)
+	m.launchCancel = cancel
+	backend, open, epoch := m.backend, m.openBrowser, m.epoch
 	in := operations.PlayInput{Server: m.server, TimelineID: timeline, ProfileID: m.viewer(), Open: true}
 	return tea.Batch(m.spin(), func() tea.Msg {
-		ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 		defer cancel()
 		_, err := operations.LaunchPlayer(ctx, backend, in, open)
-		return launchDone{err: err}
+		return launchDone{epoch: epoch, err: err}
 	})
+}
+
+// playbackDenied reports the shared launch's refusal for permission or
+// capability.
+func playbackDenied(err error) bool {
+	return api.IsCode(err, "forbidden") || api.IsCode(err, "feature_unavailable")
 }
 
 // canPlay reports whether the server offers the player and the principal
@@ -791,7 +818,13 @@ func (m *Model) signedOut(err error) {
 	// replies to requests sent with the rejected credential.
 	m.jobs.Forget()
 	m.acting = map[string]operations.JobActionKind{}
-	m.jobEpoch++
+	m.epoch++
+	for _, cancel := range []context.CancelFunc{m.reviewCancel, m.launchCancel} {
+		if cancel != nil {
+			cancel()
+		}
+	}
+	m.reviewCancel, m.launchCancel, m.launching = nil, nil, false
 }
 
 // refusal phrases a failed action for the status bar.

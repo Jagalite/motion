@@ -43,10 +43,12 @@ func (e *UncertainError) Unwrap() error { return e.Err }
 // applied: the server answered with a client-error problem, or the request
 // was refused before it was sent (for example, no credential). Transport
 // failures, timeouts, cancellations, server errors and undecodable
-// acknowledgements leave the outcome unknown.
+// acknowledgements leave the outcome unknown, and so does any refusal that
+// followed such a failure among the adapter's attempts.
 func Definitive(err error) bool {
 	var p *api.Problem
-	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500
+	var earlier *api.AfterUnknownAttemptError
+	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500 && !errors.As(err, &earlier)
 }
 
 // uncertain wraps err unless it is definitive.

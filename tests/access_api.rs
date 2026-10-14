@@ -3183,6 +3183,14 @@ async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition()
         .await;
     assert_eq!(page.body["items"].as_array().unwrap().len(), 1);
     assert!(page.body["next_cursor"].is_null());
+    let reviewed = f
+        .call(
+            "GET",
+            "/api/v2/jobs/owned",
+            None,
+            &[("authorization", &operator)],
+        )
+        .await;
     let busy = f
         .call(
             "POST",
@@ -3191,6 +3199,7 @@ async fn jobs_filter_ownership_and_cancel_replays_without_repeating_transition()
             &[
                 ("authorization", &operator),
                 ("idempotency-key", "retry-busy-job-key"),
+                ("if-match", reviewed.headers["etag"].to_str().unwrap()),
             ],
         )
         .await;
@@ -3208,7 +3217,21 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
     let headers = [
         ("authorization", auth.as_str()),
         ("idempotency-key", "retry-owned-job-key"),
+        ("if-match", "\"r-1\""),
     ];
+    // A retry names the revision the caller reviewed.
+    let unconditional = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", auth.as_str()),
+                ("idempotency-key", "retry-unconditional-key"),
+            ],
+        )
+        .await;
+    assert_eq!(unconditional.status, StatusCode::PRECONDITION_REQUIRED);
     let admitted = f.call("POST", path, None, &headers).await;
     assert_eq!(admitted.status, StatusCode::OK, "{:?}", admitted.body);
     assert_eq!(admitted.body["phase"], "queued");
@@ -3237,6 +3260,32 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
     let receipts: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_records WHERE operation='retryJob' AND target='retry-owned'")
         .fetch_one(&f.app.db).await.unwrap();
     assert_eq!(receipts, 1);
+    // The attempt that failed after the retry was admitted is a newer
+    // revision: the old review cannot admit a second retry.
+    let stale = f
+        .call(
+            "POST",
+            path,
+            None,
+            &[
+                ("authorization", auth.as_str()),
+                ("idempotency-key", "retry-stale-review-key"),
+                ("if-match", "\"r-1\""),
+            ],
+        )
+        .await;
+    assert_eq!(
+        stale.status,
+        StatusCode::PRECONDITION_FAILED,
+        "{:?}",
+        stale.body
+    );
+    let unchanged: (String, i64) =
+        sqlx::query_as("SELECT phase,revision FROM jobs WHERE id='retry-owned'")
+            .fetch_one(&f.app.db)
+            .await
+            .unwrap();
+    assert_eq!(unchanged, ("failed".into(), 3));
     let (_, other) = f.pair(&["default"], &["processing:request"]).await;
     let hidden = f
         .call(
@@ -3246,6 +3295,7 @@ async fn job_retry_replays_original_ack_after_attempt_advances_and_rechecks_auth
             &[
                 ("authorization", &bearer(&other)),
                 ("idempotency-key", "other-retry-job-key"),
+                ("if-match", "\"r-3\""),
             ],
         )
         .await;

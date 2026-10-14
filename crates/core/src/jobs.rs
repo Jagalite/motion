@@ -101,6 +101,33 @@ pub fn transition(before: &Job, input: Input) -> (Job, Vec<Effect>) {
     (next, effects)
 }
 
+/// Why a reviewed retry is not admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetryRefusal {
+    /// The job changed after the caller reviewed it (412).
+    StaleRevision,
+    /// The job is not failed or cancelled, or has no attempts left (409).
+    NotRetryable,
+}
+
+/// Admits a retry the caller reviewed at `reviewed_revision`. The job must
+/// still be at that revision, then retryable. An admitted retry changes the
+/// job, so one review admits at most one retry; an exact replay of an
+/// admitted request is answered from its receipt before this check.
+pub fn admit_retry(
+    job: &Job,
+    current_revision: u64,
+    reviewed_revision: u64,
+) -> Result<(), RetryRefusal> {
+    if current_revision != reviewed_revision {
+        return Err(RetryRefusal::StaleRevision);
+    }
+    if !job.retryable() {
+        return Err(RetryRefusal::NotRetryable);
+    }
+    Ok(())
+}
+
 impl Job {
     pub fn executing(&self, attempt: u32) -> bool {
         self.phase == Phase::Running && self.attempt == attempt

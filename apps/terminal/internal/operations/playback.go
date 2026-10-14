@@ -108,6 +108,10 @@ func LaunchPlayer(ctx context.Context, a PlaybackAPI, in PlayInput, open Browser
 		if open == nil {
 			return PlayResult{}, Invalid("no browser is available; print the URL instead")
 		}
+		// A launch cancelled meanwhile (for example by sign-out) opens nothing.
+		if err := ctx.Err(); err != nil {
+			return PlayResult{}, err
+		}
 		if err := open(ctx, target); err != nil {
 			return PlayResult{}, err
 		}

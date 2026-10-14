@@ -150,13 +150,22 @@ func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error
 		}
 	}
 	attempts := max(c.MaxAttempts, 1)
+	// reached records that an earlier attempt of a write may have been
+	// applied: a later refusal then does not settle the outcome.
+	reached := false
 	for attempt := 0; ; attempt++ {
 		header, err := c.once(ctx, r, body, out)
 		if err != nil && ctx.Err() != nil {
 			return header, ctx.Err()
 		}
+		if err != nil && reached {
+			err = &AfterUnknownAttemptError{Err: err}
+		}
 		if err == nil || attempt+1 >= attempts || !r.retrySafe() {
 			return header, err
+		}
+		if r.method != http.MethodGet && r.method != http.MethodHead && !refused(err) {
+			reached = true
 		}
 		wait, retry := retryAfter(err, attempt)
 		if !retry {
@@ -166,6 +175,21 @@ func (c *Client) do(ctx context.Context, r request, out any) (http.Header, error
 			return nil, err
 		}
 	}
+}
+
+// AfterUnknownAttemptError wraps the final error of a write when an earlier
+// attempt with the same key failed without a definite answer, so the write
+// may have been applied even though the last attempt was refused.
+type AfterUnknownAttemptError struct{ Err error }
+
+func (e *AfterUnknownAttemptError) Error() string { return e.Err.Error() }
+func (e *AfterUnknownAttemptError) Unwrap() error { return e.Err }
+
+// refused reports a client-error answer: the server did not apply the
+// request.
+func refused(err error) bool {
+	var p *Problem
+	return errors.As(err, &p) && p.Status >= 400 && p.Status < 500
 }
 
 func retryAfter(err error, attempt int) (time.Duration, bool) {

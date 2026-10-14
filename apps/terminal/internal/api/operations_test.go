@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -95,5 +96,34 @@ func TestPlaybackMonitoringUsesContractPathsAndFilters(t *testing.T) {
 	}
 	if _, err := c.PlaybackHistory(context.Background(), "", 50, HistoryFilter{DeviceID: "dev/1"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRefusalAfterAnUnansweredAttemptKeepsTheOutcomeOpen(t *testing.T) {
+	calls := 0
+	c, _ := client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			// The first attempt may have committed before this answer.
+			writeProblem(w, 503, "database_busy", "")
+			return
+		}
+		writeProblem(w, 409, "not_retryable", "")
+	}))
+	_, err := c.RetryJob(context.Background(), "j", "retry-job-key-0001", `"r-1"`)
+	var after *AfterUnknownAttemptError
+	if calls != 2 || !errors.As(err, &after) || !IsCode(err, "not_retryable") {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+	// A refusal on the first attempt is definite, and reads never carry it.
+	calls = 1
+	_, err = c.RetryJob(context.Background(), "j", "retry-job-key-0002", `"r-1"`)
+	if errors.As(err, &after) || !IsCode(err, "not_retryable") {
+		t.Fatalf("first-attempt refusal wrapped: %v", err)
+	}
+	calls = 0
+	_, err = c.GetJob(context.Background(), "j")
+	if errors.As(err, &after) {
+		t.Fatalf("read wrapped: %v", err)
 	}
 }

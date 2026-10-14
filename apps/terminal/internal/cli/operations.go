@@ -103,6 +103,11 @@ func jobsCmd(env *Env) *cobra.Command {
 			if err := operations.CheckIdempotencyKey(retryKey); err != nil {
 				return err
 			}
+			// A resubmission repeats the original request exactly; it never
+			// reviews the job again.
+			if ifMatch == "" {
+				return usage("--idempotency-key needs the original request's --if-match")
+			}
 		}
 		return run(env, func(ctx context.Context, c *Conn) error {
 			etag := ifMatch

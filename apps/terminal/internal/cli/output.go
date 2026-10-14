@@ -92,6 +92,7 @@ type errorBody struct {
 	// no acknowledgement arrived; IdempotencyKey resubmits the same intent.
 	OutcomeUnknown bool   `json:"outcome_unknown,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
+	IfMatch        string `json:"if_match,omitempty"`
 }
 
 func writeJSON(w io.Writer, v envelope) error {
@@ -124,7 +125,7 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 	}
 	var unknown *operations.UncertainError
 	if errors.As(err, &unknown) {
-		body.OutcomeUnknown, body.IdempotencyKey = true, unknown.Action.Key
+		body.OutcomeUnknown, body.IdempotencyKey, body.IfMatch = true, unknown.Action.Key, unknown.Action.IfMatch
 	}
 	if jsonMode {
 		_ = writeJSON(w, envelope{Error: body})
@@ -138,7 +139,11 @@ func ReportError(w io.Writer, jsonMode bool, err error) {
 		msg += " (request " + body.RequestID + ")"
 	}
 	if unknown != nil {
-		msg += "\nmotion: the " + unknown.Action.Describe() + " may have been applied; repeat the command with --idempotency-key " + unknown.Action.Key + " to resubmit the same request safely"
+		repeat := "--idempotency-key " + unknown.Action.Key
+		if unknown.Action.IfMatch != "" {
+			repeat += " --if-match '" + unknown.Action.IfMatch + "'"
+		}
+		msg += "\nmotion: the " + unknown.Action.Describe() + " may have been applied; repeat the command with " + repeat + " to resubmit the same request safely"
 	}
 	fmt.Fprintln(w, sanitize(msg))
 }
