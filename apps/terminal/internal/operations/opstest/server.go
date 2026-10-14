@@ -382,40 +382,68 @@ func (s *Server) RevokeDevice(_ context.Context, id, etag string) error {
 	return err
 }
 
+// AssignDeviceUser follows the server's assign_owner policy: the device
+// revision first, then an owned device or a changed user revision is a
+// failed precondition, a revoked device or disabled user a conflict; the
+// device's grant then narrows to the user's ceiling.
 func (s *Server) AssignDeviceUser(_ context.Context, id, user, userRevision, etag string) (api.Tagged[api.Device], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("assignDeviceUser", id, "", etag)
 	d := find(s.devices, deviceID, id)
-	if d == nil {
+	u := find(s.users, userID, user)
+	if d == nil || u == nil {
 		return api.Tagged[api.Device]{}, problem(404, "not_found")
 	}
 	if err := precondition(etag, d.Revision); err != nil {
 		return api.Tagged[api.Device]{}, err
 	}
-	u := find(s.users, userID, user)
 	switch {
-	case u == nil:
-		return api.Tagged[api.Device]{}, problem(404, "not_found")
-	case d.UserID != nil:
-		return api.Tagged[api.Device]{}, problem(409, "device_owned")
+	case d.UserID != nil || u.Revision != userRevision:
+		return api.Tagged[api.Device]{}, problem(412, "precondition_failed")
 	case d.Revoked:
 		return api.Tagged[api.Device]{}, problem(409, "device_revoked")
-	case u.Revision != userRevision:
-		return api.Tagged[api.Device]{}, problem(409, "user_changed")
+	case u.Disabled:
+		return api.Tagged[api.Device]{}, problem(409, "user_disabled")
 	}
-	// The device's grant narrows to the user's ceiling.
-	owner, kept := user, []string{}
-	for _, p := range d.Permissions {
-		if slices.Contains(u.Permissions, p) || slices.Contains(u.Permissions, api.PermSystemAdmin) {
-			kept = append(kept, p)
+	p := s.policies[d.ID]
+	switch {
+	case slices.Contains(u.Permissions, api.PermSystemAdmin):
+	case slices.Contains(d.Permissions, api.PermSystemAdmin):
+		d.Permissions, d.ProfileIDs = append([]string{}, u.Permissions...), append([]string{}, u.ProfileIDs...)
+		p.LibraryIDs, p.AllowUnrated, p.DenyRated = u.Policy.LibraryIDs, u.Policy.AllowUnrated, u.Policy.DenyRated
+		p.AllowedRatings, p.BlockedLabels = u.Policy.AllowedRatings, u.Policy.BlockedLabels
+	default:
+		d.Permissions, d.ProfileIDs = intersect(d.Permissions, u.Permissions), intersect(d.ProfileIDs, u.ProfileIDs)
+		p.LibraryIDs, p.AllowUnrated = intersect(p.LibraryIDs, u.Policy.LibraryIDs), p.AllowUnrated && u.Policy.AllowUnrated
+		for _, l := range u.Policy.BlockedLabels {
+			if !slices.Contains(p.BlockedLabels, l) {
+				p.BlockedLabels = append(p.BlockedLabels, l)
+			}
+		}
+		// An empty rating list allows any rating; otherwise ratings narrow.
+		if len(p.AllowedRatings) == 0 {
+			p.AllowedRatings = append([]string{}, u.Policy.AllowedRatings...)
+		} else if len(u.Policy.AllowedRatings) > 0 {
+			p.AllowedRatings = intersect(p.AllowedRatings, u.Policy.AllowedRatings)
 		}
 	}
-	d.UserID, d.Permissions = &owner, kept
-	s.policies[d.ID].Permissions = kept
+	owner := user
+	d.UserID, p.Permissions = &owner, d.Permissions
 	bump(&d.Revision)
+	bump(&p.Revision)
 	v, err := s.deliver(api.Tagged[api.Device]{Value: *d, ETag: tag(d.Revision)})
 	return v.(api.Tagged[api.Device]), err
+}
+
+func intersect(a, b []string) []string {
+	out := []string{}
+	for _, v := range a {
+		if slices.Contains(b, v) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (s *Server) GetDevicePolicy(_ context.Context, id string) (api.Tagged[api.AccessPolicy], error) {

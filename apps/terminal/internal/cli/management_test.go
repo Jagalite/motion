@@ -315,7 +315,7 @@ func TestCLIApprovalNamesAUser(t *testing.T) {
 	if _, _, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitOK {
 		t.Fatalf("assign: exit %d", code)
 	}
-	if _, stderr, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitConflict || !strings.Contains(stderr, "device_owned") {
+	if _, stderr, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitConflict || !strings.Contains(stderr, "precondition_failed") {
 		t.Fatalf("reassignment: exit %d %s", code, stderr)
 	}
 }

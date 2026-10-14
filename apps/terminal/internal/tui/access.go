@@ -449,8 +449,8 @@ func (m *Model) accessKey(msg tea.KeyPressMsg) tea.Cmd {
 		if f.kind == "user" {
 			d.user = d.focus
 			if d.kind == formDeviceAssign {
-				d.title = "Assign to “" + clean(d.users[d.user].Name) + "”?"
-				d.fields, d.focus, d.review = nil, 0, true
+				// The chooser stays: n returns to it, as does a refusal.
+				d.review = true
 				return nil
 			}
 			u := d.users[d.user]
@@ -613,11 +613,13 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	}
 	d := m.access
 	d.busy = false
-	if unauthenticated(result.err) && !formKind(d.kind) {
+	// A rejected credential ends every form except those that sign in;
+	// withdrawn administrator access ends the administrator dialogs.
+	if unauthenticated(result.err) && d.kind != formPair && d.kind != formRedeem {
 		m.signedOut(result.err)
 		return nil
 	}
-	if revoked(result.err) && !formKind(d.kind) {
+	if revoked(result.err) && (!formKind(d.kind) || d.kind == formDeviceAssign || d.kind == formDevicePolicy) {
 		m.forgetAccess()
 		return m.load(keySession)
 	}
@@ -626,8 +628,11 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	if result.err != nil {
 		d.review = d.resubmit
 		d.message = clean(refusal(result.err))
-		if unknown != nil {
+		switch {
+		case unknown != nil && unknown.Key != "":
 			d.message = clean(unknown.Error()) + " Apply again to resubmit the same request."
+		case unknown != nil:
+			d.message = clean(unknown.Error()) + " Close this and refresh to see the current state before trying again."
 		}
 		return nil
 	}

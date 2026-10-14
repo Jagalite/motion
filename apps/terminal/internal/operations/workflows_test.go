@@ -279,7 +279,35 @@ func TestDeviceAssignmentIsConditionalAndNeverTransfers(t *testing.T) {
 		t.Fatalf("%+v %v", d, err)
 	}
 	sam := f.AddUser("Sam")
-	if _, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, sam.ID, sam.Revision, operations.Current()); !api.IsCode(err, "device_owned") {
+	if _, err := operations.AssignDevice(ctx, f, seed.DenTV.ID, sam.ID, sam.Revision, operations.Current()); !api.IsCode(err, "precondition_failed") {
 		t.Fatalf("owned device transferred: %v", err)
+	}
+	// A user revision that changed after review, a revoked device and a
+	// disabled user are each refused.
+	spare := f.AddDevice("Spare")
+	if _, err := operations.AssignDevice(ctx, f, spare.ID, sam.ID, "9", operations.Current()); !api.IsCode(err, "precondition_failed") {
+		t.Fatalf("stale user revision: %v", err)
+	}
+	if _, err := operations.AssignDevice(ctx, f, seed.OldPhone.ID, sam.ID, sam.Revision, operations.Current()); err != nil {
+		t.Fatalf("unassigned device: %v", err)
+	}
+	if err := operations.RevokeDevice(ctx, f, spare.ID, operations.Current()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := operations.AssignDevice(ctx, f, spare.ID, sam.ID, sam.Revision, operations.Current()); !api.IsCode(err, "device_revoked") {
+		t.Fatalf("revoked device: %v", err)
+	}
+	off, _ := f.CreateUser(ctx, api.UserInput{Name: "Off", Disabled: true, ProfileIDs: []string{}, Permissions: []string{}}, "seed-off-0123456789abcdef")
+	other := f.AddDevice("Other")
+	if _, err := operations.AssignDevice(ctx, f, other.ID, off.Value.ID, off.Value.Revision, operations.Current()); !api.IsCode(err, "user_disabled") {
+		t.Fatalf("disabled user: %v", err)
+	}
+	// The grant narrows to the user's ceiling.
+	narrow, _ := f.CreateUser(ctx, api.UserInput{Name: "Narrow", ProfileIDs: []string{}, Permissions: []string{api.PermEventsRead},
+		Policy: api.GrantPolicy{LibraryIDs: []string{}, BlockedLabels: []string{"x"}}}, "seed-narrow-0123456789abc")
+	d, err = operations.AssignDevice(ctx, f, other.ID, narrow.Value.ID, narrow.Value.Revision, operations.Current())
+	policy, _ := operations.InspectDevicePolicy(ctx, f, other.ID)
+	if err != nil || len(d.Value.Permissions) != 0 || policy.Value.AllowUnrated || len(policy.Value.BlockedLabels) != 1 {
+		t.Fatalf("grant not narrowed: %+v %+v %v", d.Value, policy.Value, err)
 	}
 }

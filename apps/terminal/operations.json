@@ -570,7 +570,8 @@
           "internal/cli:TestCLIApprovalNamesAUser"
         ],
         "tui": [
-          "internal/tui:TestTUIManagementReachesTheSharedScenarioState"
+          "internal/tui:TestTUIManagementReachesTheSharedScenarioState",
+          "internal/tui:TestTUIAssignmentRecoversAndEndsWithWithdrawnAccess"
         ]
       }
     },

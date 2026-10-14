@@ -406,3 +406,48 @@ func TestCredentialChangeRestartsTheEventStreamAndForgetsActivity(t *testing.T) 
 		t.Fatalf("sign-out kept the stream: %v %s", started, m.stream)
 	}
 }
+
+func TestTUIAssignmentRecoversAndEndsWithWithdrawnAccess(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	seed := opstest.SeedManagement(f)
+	sam := f.AddUser("Sam")
+	m := startOn(t, f)
+	m = goTo(t, m, route{page: pageDevices})
+	m = drain(t, m, m.load(keyUsers))
+	m = selectRow(t, m, seed.DenTV.ID)
+	m = press(t, m, "u")
+	m = chooseUser(t, m, "Ana")
+	m = press(t, m, "n") // back to the chooser
+	if m.access.review || len(m.access.fields) == 0 {
+		t.Fatalf("edit did not return to the chooser: %+v", m.access)
+	}
+	// A refusal leaves the chooser usable: Ana changes after review.
+	if _, err := f.ReplaceUser(context.Background(), seed.Ana.ID, api.UserInput{Name: "Ana", ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead}}, `"r-1"`); err != nil {
+		t.Fatal(err)
+	}
+	m = chooseUser(t, m, "Ana")
+	m = press(t, m, "y")
+	if m.access == nil || m.access.review || !strings.Contains(m.access.message, "changed") {
+		t.Fatalf("stale assignment: %+v", m.access)
+	}
+	m = chooseUser(t, m, "Sam")
+	m = press(t, m, "y")
+	if m.access != nil {
+		t.Fatalf("assignment to %s failed: %s", sam.Name, m.access.message)
+	}
+	// A lost acknowledgement of this unkeyed write asks for a refresh.
+	m = selectRow(t, m, seed.TV.ID)
+	m = press(t, m, "u")
+	m = chooseUser(t, m, "Sam")
+	f.LoseAcks(1)
+	m = press(t, m, "y")
+	if m.access == nil || m.access.resubmit || !strings.Contains(m.access.message, "refresh to see the current state") {
+		t.Fatalf("unkeyed unknown outcome: %+v", m.access)
+	}
+	// Withdrawn administrator access ends the dialog and its data.
+	m.access.busy = true
+	m.accessFinished(accessDone{epoch: m.access.epoch, err: &api.Problem{Status: 403, Code: "forbidden"}})
+	if m.access != nil || m.cache.slots[keyUsers] != nil {
+		t.Fatal("withdrawn access left the assignment dialog or users cached")
+	}
+}

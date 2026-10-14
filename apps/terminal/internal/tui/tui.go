@@ -905,6 +905,8 @@ func describe(err error) problem {
 		return problem{title: "Sign in to Motion", message: "This device's credential was not accepted. Press P to pair it again or I to redeem an invitation (or run `motion auth pair`)."}
 	case errors.As(err, &p) && p.Status == 403:
 		return problem{title: "You don't have access", message: "This profile or device is not allowed to view this. " + clean(p.Detail)}
+	case errors.As(err, &p) && (p.Status == 412 || p.Status == 428):
+		return problem{title: "Changed since you reviewed it", message: "This changed since you reviewed it. Close this, refresh and try again."}
 	case errors.As(err, &p) && p.Status == 404:
 		return problem{title: "Nothing here", message: "This no longer exists or is not visible to you."}
 	case errors.As(err, &u):
