@@ -552,7 +552,7 @@ func TestGridFocusMovesSpatiallyAndStaysVisible(t *testing.T) {
 
 func TestOpeningATitleAndGoingBackRestoresFocus(t *testing.T) {
 	f := &fake{titles: 12, viewing: map[string]api.ViewingState{"p0000/t1": {PositionMS: 3_600_000}}}
-	m := start(t, f, 120, 40)
+	m := start(t, f, 122, 40) // the content column the episode card's meta needs
 	m = goTo(t, m, route{page: pageCatalog})
 	m = press(t, m, "right", "right", "enter")
 	if m.route != (route{page: pageItem, id: "film002"}) {
@@ -1294,14 +1294,15 @@ func TestSpringsGlideAndSettleOnTheTarget(t *testing.T) {
 
 func TestMouseClicksTheSidebarAndWheelScrolls(t *testing.T) {
 	m := start(t, &fake{titles: 40, permissions: []string{api.PermSystemAdmin}}, 120, 30)
-	_, index := m.sidebarRows(navWidth, 29, false)
+	// The sidebar sits inside its focus border: one cell in from each edge.
+	_, index := m.sidebarRows(navWidth-2, 27, false)
 	row := -1
 	for y, i := range index {
 		if i >= 0 && m.navEntries()[i].route.page == pageCatalog {
 			row = y
 		}
 	}
-	m, cmd := update(t, m, tea.MouseClickMsg{X: 4, Y: row, Button: tea.MouseLeft})
+	m, cmd := update(t, m, tea.MouseClickMsg{X: 4, Y: row + 1, Button: tea.MouseLeft})
 	m = drain(t, m, cmd)
 	if m.route.page != pageCatalog || m.focus != focusNav {
 		t.Fatalf("click opened %+v focus %v", m.route, m.focus)
@@ -1619,4 +1620,40 @@ func (f *fake) CreateScan(context.Context, string, api.ScanInput, string) (api.T
 }
 func (f *fake) GetScan(context.Context, string) (api.Tagged[api.Scan], error) {
 	return api.Tagged[api.Scan]{}, errNotModelled
+}
+
+func TestFocusBorderMovesBetweenSidebarAndPage(t *testing.T) {
+	m := start(t, &fake{titles: 4}, 120, 30)
+	// gold reports which pane's top-left corner is drawn in the accent.
+	gold := func(m Model) (nav, page bool) {
+		top, _, _ := strings.Cut(m.View().Content, "\n")
+		corners := strings.Split(top, "╭")
+		if len(corners) != 3 {
+			t.Fatalf("expected two framed panes, got top line %q", ansi.Strip(top))
+		}
+		accent := "38;2;229;160;13"
+		return strings.Contains(corners[0], accent), strings.Contains(corners[1][strings.LastIndex(corners[1], "╮"):], accent)
+	}
+	if nav, page := gold(m); nav || !page {
+		t.Fatalf("page focused: gold nav=%v page=%v", nav, page)
+	}
+	m = press(t, m, "tab")
+	if m.focus != focusNav {
+		t.Fatalf("tab focused %v", m.focus)
+	}
+	if nav, page := gold(m); !nav || page {
+		t.Fatalf("sidebar focused: gold nav=%v page=%v", nav, page)
+	}
+	m = press(t, m, "tab")
+	if nav, page := gold(m); nav || !page {
+		t.Fatalf("back on the page: gold nav=%v page=%v", nav, page)
+	}
+	// Narrow terminals show one pane at a time and draw no border.
+	m = start(t, &fake{titles: 4}, 36, 30)
+	if strings.HasPrefix(screen(m), "╭") {
+		t.Fatal("single-pane layout was framed")
+	}
+	if m = press(t, m, "tab"); m.focus != focusNav || strings.HasPrefix(screen(m), "╭") {
+		t.Fatalf("single-pane sidebar (focus %v) was framed", m.focus)
+	}
 }
