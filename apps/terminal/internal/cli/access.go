@@ -280,9 +280,9 @@ func approvalsCmd(env *Env) *cobra.Command {
 		return env.print(page, func(w io.Writer) {
 			rows := [][]string{}
 			for _, a := range page.Items {
-				rows = append(rows, []string{a.ID, a.Action, a.Target, a.Actor, unixTime(a.ExpiresAt)})
+				rows = append(rows, []string{a.ID, a.Status, a.Action, a.Target, a.Actor, unixTime(a.ExpiresAt)})
 			}
-			table(w, "ID\tACTION\tTARGET\tREQUESTED BY\tEXPIRES", rows)
+			table(w, "ID\tSTATUS\tACTION\tTARGET\tREQUESTED BY\tEXPIRES", rows)
 			more(w, page.NextCursor)
 		})
 	})}

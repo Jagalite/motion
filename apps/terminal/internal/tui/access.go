@@ -172,9 +172,9 @@ func (m Model) accessRows(width int) ([]table.Column, []table.Row, []string) {
 		values, _ := data[[]api.ActionApproval](m, keyApprovals)
 		for _, a := range values {
 			ids = append(ids, a.ID)
-			rows = append(rows, table.Row{clean(a.Action), clean(a.Target), m.deviceName(a.Actor), unixTime(a.ExpiresAt)})
+			rows = append(rows, table.Row{clean(a.Status), clean(a.Action), clean(a.Target), m.deviceName(a.Actor), unixTime(a.ExpiresAt)})
 		}
-		return project(width, []column{{"Action", 22, false}, {"Target", 28, true}, {"Requested by", 24, false}, {"Expires", 22, true}}, rows, ids)
+		return project(width, []column{{"Status", 10, false}, {"Action", 22, false}, {"Target", 28, true}, {"Requested by", 24, false}, {"Expires", 22, true}}, rows, ids)
 	case pageInvitations:
 		values, _ := data[[]api.Invitation](m, keyInvitations)
 		for _, i := range values {
@@ -216,7 +216,7 @@ func (m Model) accessDetail(width int) []string {
 			}
 		}
 	case pageApprovals:
-		lines = []string{"a approve the selected request after comparing its code · r refresh", "Approving lets that device make exactly this change once. Approve only requests you expect."}
+		lines = []string{"a approve the selected pending request after comparing its code · r refresh", "Approving lets that device make exactly this change once. Approve only requests you expect.", "Approved requests stay listed until that device submits its change or the request expires."}
 	case pageInvitations:
 		lines = []string{"n create invitation · d revoke unused invitation · r refresh", "Codes are shown only after issuance. Send them privately.", "Claimed invitations: revoke the device on Devices."}
 	}
@@ -406,7 +406,7 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 			}
 		}
 		if !found {
-			return m.say("Select a pending request and refresh.", true)
+			return m.say("Select a pending request; approved requests wait for their device. Refresh to see changes.", true)
 		}
 		d.fields = []accessField{textField("Code shown on the requesting device", "code", "")}
 	case "deny":

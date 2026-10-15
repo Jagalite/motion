@@ -422,7 +422,7 @@ func TestCLIApprovesActionRequestsByCode(t *testing.T) {
 		t.Fatal("wrong code approved")
 	}
 	c.ok("access", "approvals", "approve", req.ID, "--code", code)
-	if stdout, _, _ := c.run("access", "approvals", "list"); strings.Contains(stdout, req.ID) {
-		t.Fatalf("approved request still listed: %s", stdout)
+	if stdout, _, _ := c.run("access", "approvals", "list"); !strings.Contains(stdout, req.ID) || !strings.Contains(stdout, "approved") {
+		t.Fatalf("approved request must show its status: %s", stdout)
 	}
 }

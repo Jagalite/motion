@@ -426,7 +426,11 @@ func TestActionApprovalNeedsTheRequestersCodeOnce(t *testing.T) {
 	if err := operations.ApproveAction(ctx, f, req.ID, code); err == nil {
 		t.Fatal("a request was approved twice")
 	}
-	if pending, _, _ := operations.CollectActionApprovals(ctx, f, 10); len(pending) != 0 {
-		t.Fatalf("still pending: %v", pending)
+	if listed, _, _ := operations.CollectActionApprovals(ctx, f, 10); len(listed) != 1 || listed[0].Status != "approved" {
+		t.Fatalf("approved request must stay listed as approved until used: %v", listed)
+	}
+	f.ConsumeActionApproval(req.ID)
+	if listed, _, _ := operations.CollectActionApprovals(ctx, f, 10); len(listed) != 0 {
+		t.Fatalf("consumed request still listed: %v", listed)
 	}
 }

@@ -102,6 +102,10 @@ func TestE2EOwnerSetupAndActionApprovalAgainstRealServer(t *testing.T) {
 	if ok := op("access", "approvals", "approve", proof["id"].(string), "--code", strings.ToLower(proof["code"].(string))); ok.code != cli.ExitOK {
 		t.Fatalf("approve request: %+v", ok)
 	}
+	// Until the device uses it, the approved request stays listed as approved.
+	if after := op("access", "approvals", "list"); !strings.Contains(after.stdout, `"status": "approved"`) && !strings.Contains(after.stdout, `"status":"approved"`) {
+		t.Fatalf("approved request status: %+v", after)
+	}
 	status, created := call(t, srv, "POST", "/api/v2/users", device, user, map[string]string{"Idempotency-Key": "e2e-owner-create-sam-0002", "X-Motion-Action-Proof": proof["id"].(string)})
 	if status != http.StatusCreated || created["name"] != "Sam" {
 		t.Fatalf("approved admin change: %d %v", status, created)

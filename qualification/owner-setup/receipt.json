@@ -22,13 +22,26 @@
     "restart_same_origin": true,
     "restart_same_owner": true,
     "browser_session_survives_restart": true,
+    "tui_approves_browser_change": true,
+    "browser_admin_change_applied": true,
     "two_users_no_suggestion": true,
     "cli_requires_user_with_two": true,
     "tui_chooser_with_two": true,
-    "explicit_user_approval": true
+    "explicit_user_approval": true,
+    "desktop_tui_approves_owner_setup": true,
+    "desktop_owner_created_from_browser": true,
+    "desktop_tui_approves_pairing_approval": true,
+    "desktop_setup_offered": true,
+    "desktop_owner_preselected": true,
+    "desktop_admin_needs_confirmation": true,
+    "desktop_pairing_approved": true,
+    "desktop_second_device_owner_admin": true,
+    "crash_leaves_no_partial_owner": true,
+    "crash_retry_converges": true,
+    "axe_wcag21aa_no_violations": true
   },
   "notes": {
-    "browser_code": "3DEH-GBQB",
+    "browser_code": "SG4E-PGPM",
     "admin_toggle_screen_has_check": false,
     "browser_pair": {
       "before": 401,
@@ -39,9 +52,9 @@
       "failure": null
     },
     "me": {
-      "id": "45f1c6b6-9071-4795-95df-a925c52049d8",
-      "device_id": "45f1c6b6-9071-4795-95df-a925c52049d8",
-      "user_id": "281780f0-5858-4ce0-939d-583b3f049f8f",
+      "id": "024bfe05-fe54-4c89-9e93-1e83c54ee8d6",
+      "device_id": "024bfe05-fe54-4c89-9e93-1e83c54ee8d6",
+      "user_id": "b02c1e6d-5dd9-48f3-9461-79e93cf7a0fa",
       "profile_ids": [
         "default"
       ],
@@ -66,7 +79,44 @@
       "settings_access": true,
       "errors": [],
       "failure": null
-    }
+    },
+    "browser_change": {
+      "created": true,
+      "errors": [],
+      "failure": null
+    },
+    "desktop": {
+      "browser": {
+        "session": 200,
+        "owner_setup_offered": 1,
+        "preselected": "76cffc9b-199f-47ce-ba75-b27d238d09fe",
+        "admin_refused_without_confirmation": true,
+        "second_status": "approved",
+        "errors": [],
+        "failure": null
+      }
+    },
+    "crash": {
+      "before_commit": 3,
+      "after_commit": 21
+    },
+    "audits": [
+      {
+        "name": "signin",
+        "violations": [],
+        "overflow": false
+      },
+      {
+        "name": "access-first-run",
+        "violations": [],
+        "overflow": false
+      },
+      {
+        "name": "access-pairing-preselected",
+        "violations": [],
+        "overflow": false
+      }
+    ]
   },
   "passed": true
 }

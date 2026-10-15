@@ -565,13 +565,25 @@ func (s *Server) ListActionApprovals(_ context.Context, cursor string, limit int
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.record("listActionApprovals", "", "", "")
-	var pending []api.ActionApproval
+	// Like the server: approved requests stay listed until consumed.
+	var live []api.ActionApproval
 	for _, a := range s.approvals {
-		if a.Status == "pending" {
-			pending = append(pending, a.ActionApproval)
+		if a.Status != "consumed" {
+			live = append(live, a.ActionApproval)
 		}
 	}
-	return page(pending, cursor, limit), nil
+	return page(live, cursor, limit), nil
+}
+
+// ConsumeActionApproval mirrors the requester submitting its approved change.
+func (s *Server) ConsumeActionApproval(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.approvals {
+		if a.ID == id {
+			a.Status = "consumed"
+		}
+	}
 }
 
 // ApproveAction mirrors the server: the exact code, once.

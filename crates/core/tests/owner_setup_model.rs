@@ -395,7 +395,7 @@ fn mutant_policies_are_detected() {
         (
             "replaces the recorded owner",
             Setup {
-                setup: |p, _, users, id, name| admin::setup_owner(p, false, users.min(0), id, name),
+                setup: |p, _, _, id, name| admin::setup_owner(p, false, 0, id, name),
                 ..PRODUCTION
             },
         ),

@@ -172,7 +172,18 @@ func TestTUIApprovesActionRequestsAfterTheCodeIsReviewed(t *testing.T) {
 	m = press(t, m, "a")
 	setText(t, m, "code", code)
 	m = apply(t, m)
-	if pending, _ := f.ListActionApprovals(context.Background(), "", 10); len(pending.Items) != 0 {
-		t.Fatalf("still pending: %+v", pending.Items)
+	listed, _ := f.ListActionApprovals(context.Background(), "", 10)
+	if len(listed.Items) != 1 || listed.Items[0].Status != "approved" {
+		t.Fatalf("approval not recorded: %+v", listed.Items)
+	}
+	// An approved request is visibly approved and cannot be approved again.
+	m = drain(t, m, m.reloadAll())
+	m = selectRow(t, m, req.ID)
+	if rows := m.table.Rows(); len(rows) != 1 || rows[0][0] != "approved" {
+		t.Fatalf("status not shown: %v", rows)
+	}
+	m = press(t, m, "a")
+	if m.access != nil {
+		t.Fatalf("an approved request reopened: %+v", m.access)
 	}
 }
