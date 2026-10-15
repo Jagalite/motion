@@ -28,7 +28,7 @@
     "explicit_user_approval": true
   },
   "notes": {
-    "browser_code": "DYDT-BUGJ",
+    "browser_code": "3DEH-GBQB",
     "admin_toggle_screen_has_check": false,
     "browser_pair": {
       "before": 401,
@@ -39,9 +39,9 @@
       "failure": null
     },
     "me": {
-      "id": "2be5c6b5-145b-4423-8596-f09b29d16906",
-      "device_id": "2be5c6b5-145b-4423-8596-f09b29d16906",
-      "user_id": "a404b0b5-63cb-40c0-abd6-6be10d443bf8",
+      "id": "45f1c6b6-9071-4795-95df-a925c52049d8",
+      "device_id": "45f1c6b6-9071-4795-95df-a925c52049d8",
+      "user_id": "281780f0-5858-4ce0-939d-583b3f049f8f",
       "profile_ids": [
         "default"
       ],

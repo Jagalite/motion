@@ -221,8 +221,14 @@ def main(server_bin, motion, out):
         tui = TUI(motion, url, conf, token_path)
         tui.page("Compare code")
         tui.press(b"\t", 1.0)
-        chooser = tui.press(b"a", 1.2)
-        checks["tui_chooser_with_two"] = "Choose the intended user" in chooser and "Owner" in chooser and "Sam" in chooser
+        # Rows are ordered by ID; the claimed browser request may come first.
+        for _ in range(3):
+            tui.all = b""
+            tui.press(b"a", 1.5)
+            if not tui.seen("Select a pending request"):
+                break
+            tui.press(b"\x1b[B", 0.6)
+        checks["tui_chooser_with_two"] = all(tui.seen(m) for m in ("Choose the intended user", "Owner ·", "Sam ·"))
         tui.press(b"\x1b", 0.5)
         rc, device, _ = cli("auth", "approve", pairing["id"], "--code", pairing["user_code"], "--user", sam["id"])
         checks["explicit_user_approval"] = rc == 0 and device["user_id"] == sam["id"] and "system:admin" not in device["permissions"]
