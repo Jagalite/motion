@@ -22,6 +22,7 @@ const (
 	wideScreen = 100
 	railScreen = 70
 	minRail    = 40
+	boxHeight  = 10
 )
 
 var (
@@ -34,6 +35,7 @@ var (
 // breadcrumb, with the sidebar replacing the content while it has focus.
 type frame struct {
 	nav     int
+	edge    int // 1 when each pane is framed, so the focused one can be marked
 	rail    bool
 	overlay bool
 	content int
@@ -70,7 +72,10 @@ func (m Model) frame() frame {
 	default:
 		f.overlay = m.focus == focusNav
 	}
-	f.content = w - f.nav
+	if f.nav > 0 && h >= boxHeight {
+		f.edge = 1
+	}
+	f.content = w - f.nav - 2*f.edge
 	f.pad = 1
 	if f.content >= 60 {
 		f.pad = 3
@@ -85,8 +90,25 @@ func (m Model) frame() frame {
 		f.top = 1
 	}
 	f.header = len(m.header(f.inner))
-	f.body = max(h-1-f.top-f.header, 1)
+	f.body = max(h-1-2*f.edge-f.top-f.header, 1)
 	return f
+}
+
+// boxed frames a pane's lines in a rounded border on bg: gold while the pane
+// has focus, a quiet line otherwise, so focus visibly moves between panes.
+func boxed(lines []string, width int, focused bool, bg color.Color) []string {
+	edge := colorLine
+	if focused {
+		edge = colorAccent
+	}
+	style := lipgloss.NewStyle().Foreground(edge).Background(bg)
+	inner := max(width-2, 0)
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, style.Render("╭"+strings.Repeat("─", inner)+"╮"))
+	for _, l := range lines {
+		out = append(out, style.Render("│")+l+style.Render("│"))
+	}
+	return append(out, style.Render("╰"+strings.Repeat("─", inner)+"╯"))
 }
 
 // sync lays out the current page after every update, so key handling and
@@ -329,15 +351,23 @@ func (m Model) render() string {
 	}
 	f := m.frame()
 	rows := h - 1
+	inside := rows - 2*f.edge
 	var nav []string
 	if f.nav > 0 {
-		nav = block(m.sidebar(f.nav, rows, f.rail), f.nav, rows, colorSidebar)
+		navInner := f.nav - 2*f.edge
+		nav = block(m.sidebar(navInner, inside, f.rail), navInner, inside, colorSidebar)
+		if f.edge > 0 {
+			nav = boxed(nav, f.nav, m.focus == focusNav, colorSidebar)
+		}
 	}
 	var content []string
 	if f.overlay {
 		content = block(m.sidebar(f.content, rows, false), f.content, rows, colorSidebar)
 	} else {
-		content = block(m.contentColumn(f), f.content, rows, colorBG)
+		content = block(m.contentColumn(f), f.content, inside, colorBG)
+		if f.edge > 0 {
+			content = boxed(content, f.content+2, m.focus != focusNav, colorBG)
+		}
 	}
 	lines := make([]string, 0, h)
 	for i := 0; i < rows; i++ {
