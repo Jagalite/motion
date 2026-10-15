@@ -115,3 +115,35 @@ func TestTUIOwnerSetupNeverAdoptsUsersAndSeveralUsersAreChosen(t *testing.T) {
 		t.Fatalf("existing users were adopted: %+v", s)
 	}
 }
+
+// olderServer predates owner setup: the endpoint does not exist.
+type olderServer struct{ *opstest.Server }
+
+func (olderServer) GetAccessSetup(context.Context) (api.AccessSetup, error) {
+	return api.AccessSetup{}, &api.Problem{Status: 404, Code: "not_found", Title: "Not Found"}
+}
+
+func TestTUIServersWithoutOwnerSetupKeepAccessState(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	seed := opstest.SeedManagement(f)
+	f.AddUser("Sam")
+	m := startOn(t, olderServer{f})
+	m = goTo(t, m, route{page: pagePairings})
+	m = selectRow(t, m, seed.Laptop.ID)
+	m = press(t, m, "a")
+	if m.access == nil || m.access.title != "Choose the intended user" {
+		t.Fatalf("approval did not open: %+v", m.access)
+	}
+	for i := 0; i < 3; i++ {
+		m = drain(t, m, m.reloadAll())
+	}
+	if m.access == nil {
+		t.Fatal("a missing setup endpoint withdrew the open dialog")
+	}
+	if pairings, ok := data[[]api.PairingSummary](m, keyPairings); !ok || len(pairings) == 0 {
+		t.Fatal("a missing setup endpoint dropped the access lists")
+	}
+	if m.setupRequired() {
+		t.Fatal("setup offered by a server without it")
+	}
+}

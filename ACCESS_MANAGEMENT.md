@@ -25,7 +25,10 @@ The CLI equivalent is `motion access setup`, then
 add `--permission system:admin` deliberately). An administrator browser, such as
 the desktop app's, offers **First run: create the Owner** under **Users** and
 preselects the only enabled user under **Pairing & invitations**, where
-granting administration needs a separate confirmation.
+granting administration needs a separate confirmation. From a browser these
+are sensitive changes like creating a user: they need recent sign-in or an
+approval from another authorized device. A paired-only browser on a new server
+has neither, so use the TUI with the operator token for the first run.
 
 Setup runs only while no user exists, and only for the local operator or an
 administrator. Repeating it, retrying after a lost reply, or running it

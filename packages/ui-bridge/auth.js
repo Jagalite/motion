@@ -618,7 +618,7 @@ async function registrationSection(parent, lookups) {
 function ownerSetup(parent, lookups) {
   if (lookups.setup?.owner_setup !== 'required') return;
   const item = panel(parent, 'First run: create the Owner', 'This server has no users yet. The Owner is one enabled user whose access includes administration of this server.');
-  item.append(node('p', 'Creating the Owner approves no device and does not change existing devices; unassigned devices stay unassigned. Approve each device, including a browser, under Pairing & invitations after comparing its code. Repeating this step returns the same Owner.', {class: 'notice'}));
+  item.append(node('p', 'Creating the Owner approves no device and does not change existing devices; unassigned devices stay unassigned. Approve each device, including a browser, under Pairing & invitations after comparing its code. Repeating this step returns the same Owner. Like creating a user, it needs recent sign-in or approval from another authorized device; on a new server, Motion terminal with the operator token needs neither.', {class: 'notice'}));
   const input = form(item, 'Create the Owner', async () => {
     await mutation(item, 'POST', '/access/setup', {name: name.value.trim() || 'Owner'}, {action: 'user.admin', target: 'owner', done: () => location.reload()});
   });
@@ -694,9 +694,12 @@ async function enrollmentSection(parent, lookups) {
     detail(item, 'Expires', when(pairing.expires_at));
     if (pairing.status !== 'pending') return;
     detail(item, 'Requesting device code', pairing.user_code);
+    // Denial never depends on an eligible owner.
+    const deny = () => confirmChange(item, 'Deny pairing', `Deny the pending pairing from ${pairing.device_name}.`, async () => mutation(item, 'POST', `/auth/pairings/${idPath(pairing.id)}/deny`, undefined, {done: () => location.reload()}));
     const eligible = lookups.users.filter(user => !user.disabled);
     if (!eligible.length) {
       item.append(node('p', lookups.setup?.owner_setup === 'required' ? 'No user exists yet. Create the Owner under Users first, then approve this device for it.' : 'No enabled user. Create or enable a user before approving this device.', {class: 'notice'}));
+      deny();
       return;
     }
     const input = form(item, 'Approve this device', async () => {
@@ -721,7 +724,7 @@ async function enrollmentSection(parent, lookups) {
     });
     input.fields.append(node('p', 'Administer this server is never preselected. It permits every operation, including managing users and devices.', {class: 'notice'}));
     const adminConfirm = checkbox(input.fields, 'If Administer this server is selected: I deliberately grant administration to this device.');
-    confirmChange(item, 'Deny pairing', `Deny the pending pairing from ${pairing.device_name}.`, async () => mutation(item, 'POST', `/auth/pairings/${idPath(pairing.id)}/deny`, undefined, {done: () => location.reload()}));
+    deny();
   }, 'No pairing requests.');
   const invites = panel(area, 'Single-use invitations', 'Invitation codes appear only when created. Share them only with the intended recipient.');
   await paged(invites, '/auth/invitations', (host, invite) => {

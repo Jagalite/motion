@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"slices"
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
@@ -11,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"

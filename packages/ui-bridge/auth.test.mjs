@@ -435,6 +435,7 @@ test('several users are chosen explicitly and no users point to owner setup', as
   await enrollmentHarness([]).enrollmentSection(empty, {users: [], profiles: [], libraries: [], setup: {owner_setup: 'required', pairing_user: null}});
   assert.equal(empty.byText('Approve this device'), undefined);
   assert.ok(empty.byText('No user exists yet. Create the Owner under Users first, then approve this device for it.'));
+  assert.ok(empty.byText('Deny pairing'), 'denial stays available without an eligible user');
 });
 
 test('owner setup is offered only on a server without users and approves no device', async () => {
