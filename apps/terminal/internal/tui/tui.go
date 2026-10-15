@@ -1021,15 +1021,16 @@ func (m *Model) click(mouse tea.Mouse) tea.Cmd {
 		m.focus = focusContent
 		return nil
 	}
-	width, rail := f.nav, f.rail
+	width, rail := f.nav-2*f.edge, f.rail
 	if f.overlay {
 		width, rail = f.content, false
 	}
-	_, index := m.sidebarRows(width, h-1, rail)
-	if mouse.Y >= len(index) || index[mouse.Y] < 0 {
+	_, index := m.sidebarRows(width, h-1-2*f.edge, rail)
+	row := mouse.Y - f.edge
+	if row < 0 || row >= len(index) || index[row] < 0 {
 		return nil
 	}
-	m.focus, m.navSel = focusNav, index[mouse.Y]
+	m.focus, m.navSel = focusNav, index[row]
 	if r := m.navEntries()[m.navSel].route; r != m.section() {
 		return m.navigate(r)
 	}
