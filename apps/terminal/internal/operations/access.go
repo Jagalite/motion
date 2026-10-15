@@ -35,6 +35,9 @@ func canonicalPermissions(permissions []string) []string {
 // GrantRequest is what a resubmission of a user-bound approval or an
 // invitation must repeat exactly: the user revision and the grant.
 type GrantRequest struct {
+	// UserID is recorded for approvals, so a resubmission repeats the user
+	// even when it was preselected rather than named.
+	UserID       string          `json:"user_id,omitempty"`
 	UserRevision string          `json:"user_revision"`
 	ProfileIDs   []string        `json:"profile_ids"`
 	Permissions  []string        `json:"permissions"`
@@ -170,7 +173,7 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 	}
 	v, err := a.ApprovePairing(ctx, in.PairingID, approval, i.Key)
 	if in.UserID != "" && approval.Policy != nil {
-		return v, i.settleRequest(&GrantRequest{UserRevision: in.UserRevision, ProfileIDs: approval.ProfileIDs,
+		return v, i.settleRequest(&GrantRequest{UserID: in.UserID, UserRevision: in.UserRevision, ProfileIDs: approval.ProfileIDs,
 			Permissions: approval.Permissions, Policy: *approval.Policy}, err)
 	}
 	return v, i.settle(err)

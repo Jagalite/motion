@@ -219,14 +219,21 @@ func authCmd(env *Env) *cobra.Command {
 				return err
 			}
 			var original *operations.GrantRequest
-			if approveUser != "" {
+			if approveUser != "" || approveResubmit != "" {
 				if original, err = resubmission(approveKey, approveResubmit); err != nil {
 					return err
 				}
 			}
+			userID := approveUser
+			if original != nil && original.UserID != "" {
+				// A resubmission repeats the recorded user, never a new suggestion.
+				if userID != "" && userID != original.UserID {
+					return usage("--user differs from the user in --resubmit-request")
+				}
+				userID = original.UserID
+			}
 			return run(env, func(ctx context.Context, c *Conn) error {
 				in := operations.Approval{PairingID: args[0], UserCode: code, ProfileIDs: profiles, Permissions: permissions}
-				userID := approveUser
 				if userID == "" {
 					// A server with exactly one enabled user preselects it;
 					// otherwise the administrator must name the user.
@@ -234,9 +241,17 @@ func authCmd(env *Env) *cobra.Command {
 					if err != nil {
 						return err
 					}
+					if only != nil && approveKey != "" {
+						// A keyed retry must repeat its recorded request.
+						return usage("--idempotency-key needs the original request: pass the reported --resubmit-request")
+					}
 					if only != nil {
 						userID = only.ID
-						fmt.Fprintf(env.Err, "Approving for %s (%s), the only enabled user.\n", sanitize(only.Name), only.ID)
+						// JSON stderr stays one decodable error document; the
+						// approved device reports its user_id.
+						if !env.JSON {
+							fmt.Fprintf(env.Err, "Approving for %s (%s), the only enabled user.\n", sanitize(only.Name), only.ID)
+						}
 					}
 				}
 				if userID != "" {

@@ -369,3 +369,41 @@ func TestCLIOwnerSetupIsRepeatableAndNeverAdoptsUsers(t *testing.T) {
 		t.Fatalf("existing users were adopted: %+v", s)
 	}
 }
+
+func TestCLIPreselectedApprovalResubmitsTheRecordedUserAndKeepsJSONClean(t *testing.T) {
+	c := newManaged(t)
+	seed := opstest.SeedManagement(c.fixture)
+	c.fixture.LoseAcks(1 << 20)
+	_, stderr, code := c.run("--json", "auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode)
+	var report struct {
+		Error struct {
+			IdempotencyKey string          `json:"idempotency_key"`
+			Request        json.RawMessage `json:"request"`
+		}
+	}
+	if err := json.Unmarshal([]byte(stderr), &report); err != nil || code != ExitUnavailable || !strings.Contains(string(report.Error.Request), seed.Ana.ID) {
+		t.Fatalf("JSON stderr must be one error document recording the user: exit %d %s", code, stderr)
+	}
+	c.fixture.LoseAcks(0)
+	// The user changes and another enabled user appears; the retry must
+	// still repeat the recorded user, revision and grant.
+	if _, err := c.fixture.ReplaceUser(context.Background(), seed.Ana.ID, api.UserInput{Name: "Ana", ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead, api.PermEventsRead}}, `"r-1"`); err != nil {
+		t.Fatal(err)
+	}
+	c.fixture.AddUser("Sam")
+	key := report.Error.IdempotencyKey
+	c.ok("auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode, "--idempotency-key", key, "--resubmit-request", string(report.Error.Request))
+	devices, _ := c.fixture.ListDevices(context.Background(), "", 100)
+	laptops := 0
+	for _, d := range devices.Items {
+		if d.Name == "Laptop" {
+			laptops++
+			if d.UserID == nil || *d.UserID != seed.Ana.ID {
+				t.Fatalf("resubmitted for another user: %+v", d)
+			}
+		}
+	}
+	if laptops != 1 {
+		t.Fatalf("%d laptop devices", laptops)
+	}
+}
