@@ -36,7 +36,20 @@ enum Input {
     /// Approve a pairing for the suggested user when exactly one is eligible.
     ApproveSuggested,
 }
-struct Setup;
+type SetupFn =
+    fn(&Principal, bool, usize, String, Option<String>) -> Result<OwnerSetup, AccessError>;
+type PickFn = for<'a> fn(&'a [User]) -> PairingUser<'a>;
+
+/// The model executes these policies; production uses the real ones and
+/// `mutant_policies_are_detected` checks that broken rules are caught.
+struct Setup {
+    setup: SetupFn,
+    pick: PickFn,
+}
+const PRODUCTION: Setup = Setup {
+    setup: admin::setup_owner,
+    pick: admin::pairing_user,
+};
 
 fn principal(admin: bool) -> Principal {
     if admin {
@@ -82,13 +95,7 @@ impl Model for Setup {
         let output: String = match input {
             Input::Setup(request) => {
                 let id = format!("owner-{request}-{}", s.users.len());
-                match admin::setup_owner(
-                    &principal(true),
-                    s.owner.is_some(),
-                    s.users.len(),
-                    id,
-                    None,
-                ) {
+                match (self.setup)(&principal(true), s.owner.is_some(), s.users.len(), id, None) {
                     Ok(OwnerSetup::Create(user)) => {
                         n.owner = Some(user.id.clone());
                         n.returned.push(user.id.clone());
@@ -103,7 +110,7 @@ impl Model for Setup {
                     Err(e) => e.code().into(),
                 }
             }
-            Input::SetupWithoutAdmin => match admin::setup_owner(
+            Input::SetupWithoutAdmin => match (self.setup)(
                 &principal(false),
                 s.owner.is_some(),
                 s.users.len(),
@@ -138,7 +145,7 @@ impl Model for Setup {
                 n.users[*i].revision += 1;
                 "enabled".into()
             }
-            Input::ApproveSuggested => match admin::pairing_user(&s.users) {
+            Input::ApproveSuggested => match (self.pick)(&s.users) {
                 PairingUser::Only(user) => {
                     n.suggested.push(user.id.clone());
                     "approved".into()
@@ -279,7 +286,7 @@ impl Enumerate for Setup {
 #[test]
 fn bounded_owner_setup_interleavings() {
     let report = stateless::explore::enumerate(
-        &Setup,
+        &PRODUCTION,
         stateless::explore::SearchConfig {
             max_states: 200_000,
             max_transitions: 3_000_000,
@@ -360,4 +367,86 @@ fn encode<T: Serialize>(v: &T) -> Result<Vec<u8>, ModelError> {
 }
 fn decode<T: serde::de::DeserializeOwned>(v: &[u8]) -> Result<T, ModelError> {
     serde_json::from_slice(v).map_err(|e| ModelError::new(e.to_string()))
+}
+
+fn explore(model: &Setup) -> stateless::explore::SearchReport<Input> {
+    stateless::explore::enumerate(
+        model,
+        stateless::explore::SearchConfig {
+            max_states: 200_000,
+            max_transitions: 3_000_000,
+            max_depth: 40,
+        },
+    )
+    .unwrap()
+}
+
+/// Each mutant breaks one rule the model claims to check; all must fail.
+#[test]
+fn mutant_policies_are_detected() {
+    let mutants: [(&str, Setup); 6] = [
+        (
+            "adopts existing users",
+            Setup {
+                setup: |p, recorded, _, id, name| admin::setup_owner(p, recorded, 0, id, name),
+                ..PRODUCTION
+            },
+        ),
+        (
+            "replaces the recorded owner",
+            Setup {
+                setup: |p, _, users, id, name| admin::setup_owner(p, false, users.min(0), id, name),
+                ..PRODUCTION
+            },
+        ),
+        (
+            "owner without administration",
+            Setup {
+                setup: |p, recorded, users, id, name| {
+                    admin::setup_owner(p, recorded, users, id, name).map(|d| match d {
+                        OwnerSetup::Create(mut u) => {
+                            u.grant.permissions.remove(&Permission::SystemAdmin);
+                            OwnerSetup::Create(u)
+                        }
+                        other => other,
+                    })
+                },
+                ..PRODUCTION
+            },
+        ),
+        (
+            "skips authority",
+            Setup {
+                setup: |_, recorded, users, id, name| {
+                    admin::setup_owner(&Principal::operator(), recorded, users, id, name)
+                },
+                ..PRODUCTION
+            },
+        ),
+        (
+            "suggests among several users",
+            Setup {
+                pick: |users| match users.iter().find(|u| !u.disabled) {
+                    Some(u) => PairingUser::Only(u),
+                    None => PairingUser::NoEligibleUser,
+                },
+                ..PRODUCTION
+            },
+        ),
+        (
+            "suggests a disabled user",
+            Setup {
+                pick: |users| match users {
+                    [only] => PairingUser::Only(only),
+                    [] => PairingUser::NoEligibleUser,
+                    _ => admin::pairing_user(users),
+                },
+                ..PRODUCTION
+            },
+        ),
+    ];
+    for (name, mutant) in &mutants {
+        let report = explore(mutant);
+        assert!(report.failure.is_some(), "mutant not detected: {name}");
+    }
 }

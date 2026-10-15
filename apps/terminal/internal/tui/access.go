@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/table"
@@ -29,7 +30,14 @@ const (
 	keyPairings    = "pairings"
 	keyInvitations = "invitations"
 	keySetup       = "access-setup"
+	keyApprovals   = "action-approvals"
 )
+
+// approvalBackend is optional: it lists and approves other devices'
+// requests to make one sensitive change without recent sign-in.
+type approvalBackend interface {
+	operations.ApprovalAPI
+}
 
 // setupBackend is optional: without it the TUI never offers owner setup
 // or preselects an approval user.
@@ -70,6 +78,20 @@ func (m Model) userName(id string) string {
 		}
 	}
 	return "Unassigned"
+}
+
+// deviceName names a requesting device; its name is untrusted display text.
+func (m Model) deviceName(id string) string {
+	devices, _ := data[[]api.Device](m, keyDevices)
+	for _, d := range devices {
+		if d.ID == id {
+			return "“" + clean(d.Name) + "” (" + shortID(id) + ")"
+		}
+	}
+	return shortID(id)
+}
+func unixTime(seconds int64) string {
+	return time.Unix(seconds, 0).UTC().Format("2006-01-02 15:04 UTC")
 }
 func (m Model) grantSummary(profiles, libraries []string) []string {
 	ps, _ := data[[]api.Profile](m, keyProfiles)
@@ -146,6 +168,13 @@ func (m Model) accessRows(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{clean(u.Name), state, fmt.Sprintf("%d profiles · %d libraries", len(u.ProfileIDs), len(u.Policy.LibraryIDs)), clean(strings.Join(u.Permissions, ", "))})
 		}
 		return project(width, []column{{"User", 24, false}, {"Status", 10, false}, {"Scope", 26, true}, {"Permissions", 32, true}}, rows, ids)
+	case pageApprovals:
+		values, _ := data[[]api.ActionApproval](m, keyApprovals)
+		for _, a := range values {
+			ids = append(ids, a.ID)
+			rows = append(rows, table.Row{clean(a.Action), clean(a.Target), m.deviceName(a.Actor), unixTime(a.ExpiresAt)})
+		}
+		return project(width, []column{{"Action", 22, false}, {"Target", 28, true}, {"Requested by", 24, false}, {"Expires", 22, true}}, rows, ids)
 	case pageInvitations:
 		values, _ := data[[]api.Invitation](m, keyInvitations)
 		for _, i := range values {
@@ -186,6 +215,8 @@ func (m Model) accessDetail(width int) []string {
 				lines = append(lines, m.ownedDevices(u.ID)...)
 			}
 		}
+	case pageApprovals:
+		lines = []string{"a approve the selected request after comparing its code · r refresh", "Approving lets that device make exactly this change once. Approve only requests you expect."}
 	case pageInvitations:
 		lines = []string{"n create invitation · d revoke unused invitation · r refresh", "Codes are shown only after issuance. Send them privately.", "Claimed invitations: revoke the device on Devices."}
 	}
@@ -364,6 +395,20 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 				m.grantFields(d, d.users[0])
 			}
 		}
+	case "proof":
+		values, _ := data[[]api.ActionApproval](*m, keyApprovals)
+		found := false
+		for _, a := range values {
+			if a.ID == d.target && a.Status == "pending" {
+				found = true
+				d.title = "Approve “" + clean(a.Action) + "” for " + m.deviceName(a.Actor) + "?"
+				d.message = "Target: " + clean(a.Target) + ". Enter the code shown on the requesting device. That device then submits its reviewed change once."
+			}
+		}
+		if !found {
+			return m.say("Select a pending request and refresh.", true)
+		}
+		d.fields = []accessField{textField("Code shown on the requesting device", "code", "")}
 	case "deny":
 		d.title = "Deny pairing request?"
 		d.review = true
@@ -426,6 +471,10 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 				cmd = m.access.fields[0].focusInput()
 			}
 			return true, cmd
+		}
+	case pageApprovals:
+		if msg.String() == "a" && m.selectedID() != "" {
+			return true, m.beginAccess("proof")
 		}
 	case pageInvitations:
 		if msg.String() == "n" {
@@ -613,6 +662,13 @@ func (m *Model) submitAccess() tea.Cmd {
 	}
 	b, devices := m.backend.(accessBackend), m.backend
 	setup, _ := m.backend.(setupBackend)
+	approvals, _ := m.backend.(approvalBackend)
+	var code string
+	for _, f := range d.fields {
+		if f.kind == "text" && f.id == "code" {
+			code = f.input.Value()
+		}
+	}
 	ctx := m.ctx
 	// Capture immutable intent and revisions before launching any asynchronous work.
 	kind, id, rev, epoch := d.kind, d.target, d.revision, d.epoch
@@ -626,6 +682,8 @@ func (m *Model) submitAccess() tea.Cmd {
 		defer cancel()
 		result := accessDone{epoch: epoch}
 		switch kind {
+		case "proof":
+			result.err = operations.ApproveAction(ctx, approvals, id, code)
 		case "setup":
 			var s api.AccessSetup
 			s, result.err = operations.SetupOwner(ctx, setup, in.Name)
@@ -665,7 +723,7 @@ func (m *Model) submitAccess() tea.Cmd {
 func (m *Model) forgetAccess() {
 	m.access = nil
 	m.accessEpoch++
-	for _, key := range []string{keyUsers, keyPairings, keyInvitations, keyDevices, keySetup} {
+	for _, key := range []string{keyUsers, keyPairings, keyInvitations, keyDevices, keySetup, keyApprovals} {
 		m.drop(key)
 	}
 }
@@ -708,6 +766,9 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 		return m.formFinished(result)
 	}
 	done := "Access updated."
+	if d.kind == "proof" {
+		done = "Request approved. The requesting device can now submit its change."
+	}
 	if d.kind == "setup" {
 		done = "Owner “" + clean(result.owner) + "” is ready. On Pairing requests select the browser's request and press a: compare its code, review the grant, then confirm."
 	}
@@ -737,6 +798,16 @@ func (m Model) accessView() string {
 			lines[len(lines)-1] = "Resubmit the same request? y apply · Esc cancel"
 		}
 		lines = append(lines, m.formSummary(d)...)
+	} else if d.review && d.kind == "proof" {
+		code := ""
+		for _, f := range d.fields {
+			if f.id == "code" {
+				code = f.input.Value()
+			}
+		}
+		lines = append(lines, "", "Approve this request? y apply · n edit · Esc cancel",
+			"Code entered: "+clean(code)+" — it must match the requesting device.",
+			"Only this action on this target, once, for that device.")
 	} else if d.review && d.kind == "setup" {
 		in, _, _ := d.input()
 		name := strings.TrimSpace(in.Name)

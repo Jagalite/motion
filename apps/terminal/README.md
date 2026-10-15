@@ -12,6 +12,8 @@ motion access setup --operator-token-file /path/to/data/admin-token   # first ru
 motion auth approve PAIRING_ID --code ABCD-EFGH \
   --operator-token-file /path/to/data/admin-token   # the only enabled user is selected
 motion access users create Sam --operator-token-file /path/to/data/admin-token
+motion access approvals list --operator-token-file /path/to/data/admin-token   # browser requests
+motion access approvals approve APPROVAL_ID --code CODE --operator-token-file /path/to/data/admin-token
 motion auth approve PAIRING_ID --code ABCD-EFGH --user USER_ID \
   --operator-token-file /path/to/data/admin-token   # on the server host; the device joins Sam
 motion devices assign DEVICE_ID --user USER_ID     # an older, unassigned device

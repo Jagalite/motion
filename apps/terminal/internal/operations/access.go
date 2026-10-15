@@ -487,3 +487,36 @@ func SuggestedApprovalUser(ctx context.Context, a SuggestionAPI) (*api.User, err
 	}
 	return s.PairingUser, nil
 }
+
+// Action approvals --------------------------------------------------------------
+
+// ApprovalAPI lists and approves other devices' sensitive-change requests.
+type ApprovalAPI interface {
+	ListActionApprovals(context.Context, string, int) (api.Page[api.ActionApproval], error)
+	ApproveAction(context.Context, string, string) error
+}
+
+// ListActionApprovals reads one page of pending requests.
+func ListActionApprovals(ctx context.Context, a ApprovalAPI, page PageRequest) (api.Page[api.ActionApproval], error) {
+	if err := page.validate(); err != nil {
+		return api.Page[api.ActionApproval]{}, err
+	}
+	return a.ListActionApprovals(ctx, page.Cursor, page.Limit)
+}
+
+// CollectActionApprovals reads pending requests until the list ends or max arrive.
+func CollectActionApprovals(ctx context.Context, a ApprovalAPI, max int) ([]api.ActionApproval, bool, error) {
+	return Collect(ctx, a.ListActionApprovals, max)
+}
+
+// ApproveAction approves one request after the administrator compared the
+// code shown on the requesting device. The server binds the approval to that
+// device, action and target, and to this approver; the requester then submits
+// its reviewed change itself.
+func ApproveAction(ctx context.Context, a ApprovalAPI, id, code string) error {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if strings.TrimSpace(id) == "" || code == "" {
+		return Invalid("an approval request and the code shown on the requesting device are required")
+	}
+	return settle("approval of request "+id, "", "", false, a.ApproveAction(ctx, id, code))
+}

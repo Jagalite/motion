@@ -407,3 +407,22 @@ func TestCLIPreselectedApprovalResubmitsTheRecordedUserAndKeepsJSONClean(t *test
 		t.Fatalf("%d laptop devices", laptops)
 	}
 }
+
+func TestCLIApprovesActionRequestsByCode(t *testing.T) {
+	c := newManaged(t)
+	req, code := c.fixture.SeedActionApproval("browser", "pairing.approve", "p1")
+	stdout, _, exit := c.run("access", "approvals", "list")
+	if exit != ExitOK || !strings.Contains(stdout, req.ID) || !strings.Contains(stdout, "pairing.approve") {
+		t.Fatalf("list: exit %d %s", exit, stdout)
+	}
+	if _, stderr, exit := c.run("access", "approvals", "approve", req.ID); exit != ExitInvalid || !strings.Contains(stderr, "--code") {
+		t.Fatalf("missing code: exit %d %s", exit, stderr)
+	}
+	if _, _, exit := c.run("access", "approvals", "approve", req.ID, "--code", "WRONG"); exit == ExitOK {
+		t.Fatal("wrong code approved")
+	}
+	c.ok("access", "approvals", "approve", req.ID, "--code", code)
+	if stdout, _, _ := c.run("access", "approvals", "list"); strings.Contains(stdout, req.ID) {
+		t.Fatalf("approved request still listed: %s", stdout)
+	}
+}

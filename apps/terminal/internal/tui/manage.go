@@ -22,7 +22,7 @@ const (
 
 func (m Model) kind() pageKind {
 	switch m.route.page {
-	case pagePairings, pageUsers, pageInvitations, pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
+	case pagePairings, pageUsers, pageInvitations, pageApprovals, pageProcessing, pageScans, pageDevices, pageSources, pageProfiles, pageNowPlaying, pageHistory:
 		return kindTable
 	case pageOverview, pageActivity, pageServer:
 		return kindText
@@ -89,7 +89,7 @@ func (m Model) tabular(width int) ([]table.Column, []table.Row, []string) {
 	var rows []table.Row
 	var ids []string
 	switch m.route.page {
-	case pagePairings, pageUsers, pageInvitations:
+	case pagePairings, pageUsers, pageInvitations, pageApprovals:
 		return m.accessRows(width)
 	case pageNowPlaying, pageHistory:
 		return m.playbackRows(width)
@@ -196,6 +196,8 @@ func (m Model) tableKey() string {
 		return keyPairings
 	case pageInvitations:
 		return keyInvitations
+	case pageApprovals:
+		return keyApprovals
 	case pageProcessing:
 		return keyJobs
 	case pageScans:
@@ -223,6 +225,8 @@ func (m Model) tableEmpty() string {
 		return "No pending pairing requests."
 	case pageInvitations:
 		return "No invitations."
+	case pageApprovals:
+		return "No pending action approvals. A device that lacks recent sign-in shows a code here when it requests one sensitive change."
 	case pageProcessing:
 		return "No jobs. Scans, matching and conversions appear here while they run."
 	case pageScans:

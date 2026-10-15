@@ -20,6 +20,9 @@ A new server has no users. Pairing a browser needs no email, password or SSO:
    review states whether administration is granted.
 5. The browser signs in on its own once approved.
 
+For a paired-only Owner browser, later administrator changes (such as
+creating another user) follow the same approval flow.
+
 The CLI equivalent is `motion access setup`, then
 `motion auth approve PAIRING_ID --code CODE` (the only enabled user is selected;
 add `--permission system:admin` deliberately). An administrator browser, such as
@@ -27,8 +30,14 @@ the desktop app's, offers **First run: create the Owner** under **Users** and
 preselects the only enabled user under **Pairing & invitations**, where
 granting administration needs a separate confirmation. From a browser these
 are sensitive changes like creating a user: they need recent sign-in or an
-approval from another authorized device. A paired-only browser on a new server
-has neither, so use the TUI with the operator token for the first run.
+approval from another authorized device. A paired-only administrator browser
+(including the desktop app's own session) chooses **Request approval for this
+change** and shows a code; on the server computer approve it in `motion tui`
+with the operator token under **Action approvals** (press **a**, enter the code,
+review, **y**), or with `motion access approvals list` and
+`motion access approvals approve ID --code CODE`. The browser then submits its
+reviewed change. An approval covers exactly one action on one target for that
+device. Approve only requests you just made or expected.
 
 Setup runs only while no user exists, and only for the local operator or an
 administrator. Repeating it, retrying after a lost reply, or running it

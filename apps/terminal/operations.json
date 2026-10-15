@@ -194,6 +194,62 @@
       "note": "First run only: creates the enabled Owner when the server has no user; a repeat returns the recorded owner and existing users are never adopted. The owner is given no device."
     },
     {
+      "id": "access.approvals.list",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "ListActionApprovals",
+        "CollectActionApprovals"
+      ],
+      "api": [
+        "ListActionApprovals"
+      ],
+      "cli": "access approvals list",
+      "tui": "Action approvals page",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestActionApprovalNeedsTheRequestersCodeOnce"
+        ],
+        "cli": [
+          "internal/cli:TestCLIApprovesActionRequestsByCode"
+        ],
+        "tui": [
+          "internal/tui:TestTUIApprovesActionRequestsAfterTheCodeIsReviewed"
+        ]
+      }
+    },
+    {
+      "id": "access.approvals.approve",
+      "workflow": "access",
+      "status": "shared",
+      "shared": [
+        "ApproveAction"
+      ],
+      "api": [
+        "ApproveAction"
+      ],
+      "cli": "access approvals approve",
+      "tui": "Action approvals: a, enter the requesting device's code, review",
+      "capabilities": [
+        "system:admin"
+      ],
+      "tests": {
+        "operations": [
+          "internal/operations:TestActionApprovalNeedsTheRequestersCodeOnce"
+        ],
+        "cli": [
+          "internal/cli:TestCLIApprovesActionRequestsByCode"
+        ],
+        "tui": [
+          "internal/tui:TestTUIApprovesActionRequestsAfterTheCodeIsReviewed"
+        ]
+      },
+      "note": "Approves another device's request to make one sensitive change without recent sign-in, after comparing its code; the server binds the approval to that device, action and target. The local operator or another administrator approves; the requester submits its own change."
+    },
+    {
       "id": "access.pairings.list",
       "workflow": "pairing",
       "status": "shared",

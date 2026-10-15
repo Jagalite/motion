@@ -147,3 +147,32 @@ func TestTUIServersWithoutOwnerSetupKeepAccessState(t *testing.T) {
 		t.Fatal("setup offered by a server without it")
 	}
 }
+
+func TestTUIApprovesActionRequestsAfterTheCodeIsReviewed(t *testing.T) {
+	f := opstest.NewServer("fixture", "token")
+	req, code := f.SeedActionApproval("browser", "user.admin", "owner")
+	m := startOn(t, f)
+	m = goTo(t, m, route{page: pageApprovals})
+	m = selectRow(t, m, req.ID)
+	m = press(t, m, "a")
+	if m.access == nil || m.access.kind != "proof" || !strings.Contains(m.access.title, "user.admin") {
+		t.Fatalf("approval dialog: %+v", m.access)
+	}
+	setText(t, m, "code", "WRONG")
+	m, _ = update(t, m, tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl})
+	if !strings.Contains(m.accessView(), "it must match the requesting device") {
+		t.Fatalf("review:\n%s", m.accessView())
+	}
+	m = press(t, m, "y")
+	if m.access == nil || !strings.Contains(m.access.message, "invalid_code") && !strings.Contains(strings.ToLower(m.access.message), "code") {
+		t.Fatalf("wrong code was not refused: %+v", m.access)
+	}
+	m = press(t, m, "esc")
+	m = selectRow(t, m, req.ID)
+	m = press(t, m, "a")
+	setText(t, m, "code", code)
+	m = apply(t, m)
+	if pending, _ := f.ListActionApprovals(context.Background(), "", 10); len(pending.Items) != 0 {
+		t.Fatalf("still pending: %+v", pending.Items)
+	}
+}

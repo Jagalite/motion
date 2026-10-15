@@ -174,7 +174,7 @@ async function withBusy(control, output, run) {
 // An approval is action-bound and single-use. No automatic replay: the user
 // must review the original change and explicitly submit it after approval.
 async function proofFlow(parent, action, target, retry) {
-  const group = panel(parent, 'Approve this sensitive change', 'Use a different authorized administrator device to compare and approve the code. Refreshing this page is not fresh authentication.');
+  const group = panel(parent, 'Approve this sensitive change', 'Use a different authorized administrator device, or Motion terminal → Action approvals on the server computer, to compare and approve the code. Refreshing this page is not fresh authentication.');
   const output = status(group);
   const request = button('Request approval for this change', () => withBusy(request, output, async () => {
     const proof = await api('POST', '/auth/proofs', {action, target});
@@ -618,7 +618,7 @@ async function registrationSection(parent, lookups) {
 function ownerSetup(parent, lookups) {
   if (lookups.setup?.owner_setup !== 'required') return;
   const item = panel(parent, 'First run: create the Owner', 'This server has no users yet. The Owner is one enabled user whose access includes administration of this server.');
-  item.append(node('p', 'Creating the Owner approves no device and does not change existing devices; unassigned devices stay unassigned. Approve each device, including a browser, under Pairing & invitations after comparing its code. Repeating this step returns the same Owner. Like creating a user, it needs recent sign-in or approval from another authorized device; on a new server, Motion terminal with the operator token needs neither.', {class: 'notice'}));
+  item.append(node('p', 'Creating the Owner approves no device and does not change existing devices; unassigned devices stay unassigned. Approve each device, including a browser, under Pairing & invitations after comparing its code. Repeating this step returns the same Owner. Like creating a user, it needs recent sign-in or approval from another authorized device: request approval, then approve its code in Motion terminal → Action approvals on the server computer.', {class: 'notice'}));
   const input = form(item, 'Create the Owner', async () => {
     await mutation(item, 'POST', '/access/setup', {name: name.value.trim() || 'Owner'}, {action: 'user.admin', target: 'owner', done: () => location.reload()});
   });

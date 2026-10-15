@@ -274,6 +274,15 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 		return list(func(ctx context.Context) ([]api.Device, bool, error) {
 			return operations.CollectDevices(ctx, b, listCap)
 		})
+	case keyApprovals:
+		if a, ok := b.(approvalBackend); ok {
+			return list(func(ctx context.Context) ([]api.ActionApproval, bool, error) {
+				return operations.CollectActionApprovals(ctx, a, listCap)
+			})
+		}
+		return func(context.Context) (any, bool, error) {
+			return nil, false, fmt.Errorf("action approvals unavailable")
+		}
 	case keySetup:
 		if a, ok := b.(setupBackend); ok {
 			return whole(func(ctx context.Context) (any, error) {

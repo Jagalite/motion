@@ -405,3 +405,28 @@ func TestOwnerSetupIsRepeatableAndSuggestsOnlyASingleEnabledUser(t *testing.T) {
 		t.Fatalf("existing users: %v", err)
 	}
 }
+
+func TestActionApprovalNeedsTheRequestersCodeOnce(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	req, code := f.SeedActionApproval("browser", "user.admin", "owner")
+	if err := operations.ApproveAction(ctx, f, req.ID, " "); !isInvalid(err) || len(f.Writes()) != 0 {
+		t.Fatalf("empty code: %v", err)
+	}
+	if err := operations.ApproveAction(ctx, f, req.ID, "WRONG"); !api.IsCode(err, "invalid_code") {
+		t.Fatalf("wrong code: %v", err)
+	}
+	pending, _, err := operations.CollectActionApprovals(ctx, f, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending: %v %v", pending, err)
+	}
+	if err := operations.ApproveAction(ctx, f, req.ID, strings.ToLower(code)); err != nil {
+		t.Fatal(err)
+	}
+	if err := operations.ApproveAction(ctx, f, req.ID, code); err == nil {
+		t.Fatal("a request was approved twice")
+	}
+	if pending, _, _ := operations.CollectActionApprovals(ctx, f, 10); len(pending) != 0 {
+		t.Fatalf("still pending: %v", pending)
+	}
+}

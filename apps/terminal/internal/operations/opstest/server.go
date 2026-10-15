@@ -42,6 +42,7 @@ type Server struct {
 	policies    map[string]*api.AccessPolicy
 	users       []*api.User
 	owner       string
+	approvals   []*actionApproval
 	pairings    []*pairing
 	invitations []*api.Invitation
 	redeemed    map[string]api.Credential
@@ -51,6 +52,11 @@ type Server struct {
 	libraries   []*api.Library
 	scans       []*api.Scan
 	items       []api.CatalogItem
+}
+
+type actionApproval struct {
+	api.ActionApproval
+	code string
 }
 
 type pairing struct {
@@ -543,6 +549,51 @@ func (s *Server) CreateUser(_ context.Context, in api.UserInput, key string) (ap
 		s.users = append(s.users, u)
 		return api.Tagged[api.User]{Value: *u, ETag: tag(u.Revision)}, nil
 	})
+}
+
+// SeedActionApproval adds a pending request from device actor; it returns
+// the request and the code that device would show.
+func (s *Server) SeedActionApproval(actor, action, target string) (api.ActionApproval, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := &actionApproval{ActionApproval: api.ActionApproval{ID: s.id("proof"), Actor: actor, Action: action, Target: target, Status: "pending", ExpiresAt: 4102444800, CreatedAt: 1}, code: "CODE" + strconv.Itoa(s.seq)}
+	s.approvals = append(s.approvals, a)
+	return a.ActionApproval, a.code
+}
+
+func (s *Server) ListActionApprovals(_ context.Context, cursor string, limit int) (api.Page[api.ActionApproval], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("listActionApprovals", "", "", "")
+	var pending []api.ActionApproval
+	for _, a := range s.approvals {
+		if a.Status == "pending" {
+			pending = append(pending, a.ActionApproval)
+		}
+	}
+	return page(pending, cursor, limit), nil
+}
+
+// ApproveAction mirrors the server: the exact code, once.
+func (s *Server) ApproveAction(_ context.Context, id, code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("approveAction", id, "", "")
+	for _, a := range s.approvals {
+		if a.ID != id {
+			continue
+		}
+		if a.Status != "pending" {
+			return problem(409, "expired")
+		}
+		if a.code != code {
+			return problem(422, "invalid_code")
+		}
+		a.Status = "approved"
+		_, err := s.deliver(nil)
+		return err
+	}
+	return problem(404, "not_found")
 }
 
 // GetAccessSetup mirrors the server's owner setup state.
@@ -1073,6 +1124,14 @@ func (s *Server) Handler() http.Handler {
 			_ = decode(&in)
 			t, e := s.ReplaceDevicePolicy(ctx, seg[1], in, ifMatch)
 			tagged(t.Value, t.ETag, e)
+		case "GET admin/auth/fresh-approvals":
+			v, err = s.ListActionApprovals(ctx, cursor, limit)
+		case "POST auth/proofs/*/approve":
+			var in struct {
+				Code string `json:"code"`
+			}
+			_ = decode(&in)
+			err = s.ApproveAction(ctx, seg[2], in.Code)
 		case "GET access/setup":
 			v, err = s.GetAccessSetup(ctx)
 		case "POST access/setup":

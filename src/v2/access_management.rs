@@ -262,30 +262,37 @@ async fn recorded_owner(conn: &mut sqlx::SqliteConnection) -> Result<Option<Stri
             .await?,
     )
 }
+/// Bounded: counts plus at most two enabled candidates, never every user.
+/// `disabled=0` prefetches the candidates `admin::pairing_eligible` accepts;
+/// the core still decides the suggestion from them.
 async fn setup_body(conn: &mut sqlx::SqliteConnection) -> Result<SetupBody, Problem> {
     let owner_id = recorded_owner(&mut *conn).await?;
+    let (users, enabled): (i64, i64) =
+        sqlx::query_as("SELECT count(*), coalesce(sum(disabled=0),0) FROM access_users")
+            .fetch_one(&mut *conn)
+            .await?;
     let rows: Vec<UserRow> = sqlx::query_as(
-        "SELECT id,name,revision,disabled,profile_ids,permissions,policy FROM access_users ORDER BY id",
+        "SELECT id,name,revision,disabled,profile_ids,permissions,policy FROM access_users WHERE disabled=0 ORDER BY id LIMIT 2",
     )
     .fetch_all(&mut *conn)
     .await?;
-    let users = rows
+    let candidates = rows
         .into_iter()
         .map(UserRow::decode)
         .collect::<Result<Vec<_>, _>>()?;
-    let owner = owner_id
-        .as_deref()
-        .and_then(|id| users.iter().find(|u| u.id == id))
-        .map(user_body);
-    let pairing_user = match admin::pairing_user(&users) {
+    let owner = match owner_id.as_deref() {
+        Some(id) => load_user(&mut *conn, id).await?.as_ref().map(user_body),
+        None => None,
+    };
+    let pairing_user = match admin::pairing_user(&candidates) {
         admin::PairingUser::Only(user) => Some(user_body(user)),
         _ => None,
     };
     Ok(SetupBody {
-        owner_setup: admin::setup_state(owner_id.is_some(), users.len()),
+        owner_setup: admin::setup_state(owner_id.is_some(), users as usize),
         owner,
         pairing_user,
-        eligible_users: users.iter().filter(|u| admin::pairing_eligible(u)).count(),
+        eligible_users: enabled as usize,
     })
 }
 pub async fn get_setup(State(app): State<App>, caller: Caller) -> Result<Json<SetupBody>, Problem> {

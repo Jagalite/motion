@@ -258,6 +258,8 @@ func (m Model) header(width int) []string {
 		lines = m.titled("Scans", count(keyScans, "scan", "scans"))
 	case pagePairings, pageUsers, pageInvitations:
 		lines = m.titled(m.title(m.route), "n new · a approve · e edit · d deny/revoke")
+	case pageApprovals:
+		lines = m.titled(m.title(m.route), "a approve after comparing the requesting device's code")
 	case pageDevices:
 		lines = m.titled("Devices", count(keyDevices, "device", "devices"))
 	case pageProfiles:

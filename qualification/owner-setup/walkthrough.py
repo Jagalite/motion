@@ -121,6 +121,38 @@ class TUI:
             pass
 
 
+def wait_file(path, seconds=120):
+    for _ in range(int(seconds * 4)):
+        if os.path.exists(path):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def tui_approve(tui, out, n):
+    """Approve the browser's n-th action request on Action approvals."""
+    if not wait_file(os.path.join(out, f"approval-{n}.txt")):
+        return False
+    code = open(os.path.join(out, f"approval-{n}.txt")).read().strip()
+    if not tui.page("Requested by"):
+        return False
+    tui.press(b"\t", 0.8)
+    tui.press(b"r", 1.5)
+    tui.all = b""
+    tui.press(b"a", 1.2)
+    if not tui.seen("Code shown on the requesting device"):
+        return False
+    tui.press(code.encode(), 0.6)
+    tui.press(b"\x13", 0.8)
+    ok = tui.seen("it must match the requesting device")
+    tui.all = b""
+    tui.press(b"y", 2.0)
+    ok = ok and tui.seen("Request approved")
+    open(os.path.join(out, f"approved-{n}"), "w").close()
+    tui.press(b"\t", 0.6)  # back to the sidebar for the next navigation
+    return ok
+
+
 def main(server_bin, motion, out):
     os.makedirs(out, exist_ok=True)
     data, conf = tempfile.mkdtemp(prefix="motion-owner-data-"), tempfile.mkdtemp(prefix="motion-owner-conf-")
@@ -211,8 +243,21 @@ def main(server_bin, motion, out):
         checks["browser_session_survives_restart"] = rc == 0 and check.get("status") == 200 and check.get("settings_access")
         notes["browser_check"] = {k: check.get(k) for k in ("status", "settings_access", "errors", "failure")}
 
-        # 6. Several users: approval needs an explicit choice.
-        rc, sam, _ = cli("access", "users", "create", "Sam")
+        # 6. The paired-only Owner browser makes an admin change (creates Sam);
+        #    it lacks recent sign-in, so the operator approves it in the TUI.
+        tui = TUI(motion, url, conf, token_path)
+        change = subprocess.Popen(["node", os.path.join(HERE, "browser.cjs"), "change", url, out])
+        checks["tui_approves_browser_change"] = tui_approve(tui, out, 1)
+        change.wait(timeout=120)
+        changed = json.load(open(os.path.join(out, "browser-change.json")))
+        notes["browser_change"] = {k: changed.get(k) for k in ("created", "errors", "failure")}
+        checks["browser_admin_change_applied"] = bool(changed.get("created"))
+        tui.close()
+        tui = None
+        rc, users, _ = cli("access", "users", "list")
+        sam = next((u for u in users["items"] if u["name"] == "Sam"), {"id": None})
+
+        # 7. Several users: approval needs an explicit choice.
         status, setup = request(url + "/api/v2/access/setup", token=token)
         checks["two_users_no_suggestion"] = setup["pairing_user"] is None and setup["eligible_users"] == 2 and setup["owner"]["id"] == owner["id"]
         status, pairing = request(url + "/api/v2/auth/pairings", "POST", {"device_name": "Den TV", "client_name": "walkthrough"})
@@ -241,11 +286,127 @@ def main(server_bin, motion, out):
             server.stop()
         except Exception:
             pass
+    desktop_checks, desktop_notes = desktop(server_bin, motion, os.path.join(out, "desktop"))
+    checks.update(desktop_checks)
+    notes["desktop"] = desktop_notes
+    crash_checks, crash_notes = crash(server_bin)
+    checks.update(crash_checks)
+    notes["crash"] = crash_notes
+    audits = []
+    for name in ("browser-pair.json", "desktop/browser-desktop.json"):
+        try:
+            audits += json.load(open(os.path.join(out, name))).get("audits", [])
+        except FileNotFoundError:
+            pass
+    notes["audits"] = audits
+    checks["axe_wcag21aa_no_violations"] = len(audits) >= 3 and all(not a["violations"] and not a["overflow"] for a in audits)
     receipt = {"checks": checks, "notes": notes, "passed": all(checks.values())}
     with open(os.path.join(out, "receipt.json"), "w") as f:
         json.dump(receipt, f, indent=2)
     print(json.dumps(receipt, indent=2))
     return 0 if receipt["passed"] else 1
+
+
+
+def desktop(server_bin, motion, out):
+    """First run from an administrator browser that is not freshly signed in.
+
+    The desktop app's session is the unassigned, all-permission desktop-local
+    device without a sign-in family. An unassigned administrator device
+    approved without a user (as older clients could) has the same authority,
+    so it stands in for it here; the desktop shell itself is not driven.
+    """
+    os.makedirs(out, exist_ok=True)
+    checks, notes = {}, {}
+    data, conf = tempfile.mkdtemp(prefix="motion-owner-desk-"), tempfile.mkdtemp(prefix="motion-owner-desk-conf-")
+    server = Server(server_bin, data, free_port())
+    url = server.start()
+    token_path = os.path.join(data, "admin-token")
+    token = open(token_path).read().strip()
+    tui = browser = None
+    try:
+        _, pairing = request(url + "/api/v2/auth/pairings", "POST", {"device_name": "Desktop stand-in", "client_name": "walkthrough"})
+        everything = ["catalog:read", "catalog:write", "sources:manage", "profiles:manage", "viewing:write", "playback:request",
+                      "processing:request", "downloads:manage", "collections:write", "events:read", "system:admin"]
+        req = urllib.request.Request(url + f"/api/v2/auth/pairings/{pairing['id']}/approve", method="POST",
+                                     data=json.dumps({"user_code": pairing["user_code"], "profile_ids": [], "permissions": everything}).encode(),
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + token, "Idempotency-Key": "desktop-standin-approval"})
+        urllib.request.urlopen(req).read()
+        _, claimed = request(url + f"/api/v2/auth/pairings/{pairing['id']}/claim", "POST", {"device_code": pairing["device_code"]})
+        browser = subprocess.Popen(["node", os.path.join(HERE, "browser.cjs"), "desktop", url, out, claimed["access_token"]])
+        tui = TUI(motion, url, conf, token_path)
+        checks["desktop_tui_approves_owner_setup"] = tui_approve(tui, out, 1)
+        for _ in range(80):
+            _, setup = request(url + "/api/v2/access/setup", token=token)
+            if setup["owner_setup"] == "complete":
+                break
+            time.sleep(0.25)
+        checks["desktop_owner_created_from_browser"] = setup["owner_setup"] == "complete" and setup["owner"]["name"] == "Owner"
+        _, second = request(url + "/api/v2/auth/pairings", "POST", {"device_name": "Living room browser", "client_name": "walkthrough"})
+        with open(os.path.join(out, "second-pairing.json"), "w") as f:
+            json.dump({"id": second["id"], "user_code": second["user_code"]}, f)
+        checks["desktop_tui_approves_pairing_approval"] = tui_approve(tui, out, 2)
+        browser.wait(timeout=180)
+        result = json.load(open(os.path.join(out, "browser-desktop.json")))
+        notes["browser"] = {k: result.get(k) for k in ("session", "owner_setup_offered", "preselected", "admin_refused_without_confirmation", "second_status", "errors", "failure")}
+        checks["desktop_setup_offered"] = result.get("owner_setup_offered") == 1
+        checks["desktop_owner_preselected"] = result.get("preselected") == setup["owner"]["id"]
+        checks["desktop_admin_needs_confirmation"] = bool(result.get("admin_refused_without_confirmation"))
+        checks["desktop_pairing_approved"] = result.get("second_status") == "approved"
+        _, device = request(url + f"/api/v2/auth/pairings/{second['id']}/claim", "POST", {"device_code": second["device_code"]})
+        _, me = request(url + "/api/v2/me", token=device.get("access_token"))
+        checks["desktop_second_device_owner_admin"] = me.get("user_id") == setup["owner"]["id"] and "system:admin" in me.get("permissions", [])
+    finally:
+        if tui:
+            tui.close()
+        if browser and browser.poll() is None:
+            browser.kill()
+        server.stop()
+    return checks, notes
+
+
+def crash(server_bin, rounds=24):
+    """SIGKILL the server at random points around setup, then restart.
+
+    Each round must end in exactly one of two durable states: no user and
+    setup required, or one user recorded as the complete Owner. A retry then
+    converges on exactly one Owner.
+    """
+    import random
+    import signal
+    import threading
+    rng = random.Random(1015)
+    outcomes = {"before_commit": 0, "after_commit": 0}
+    consistent = converges = True
+    for i in range(rounds):
+        data = tempfile.mkdtemp(prefix="motion-owner-crash-")
+        server = Server(server_bin, data, free_port())
+        url = server.start()
+        token = open(os.path.join(data, "admin-token")).read().strip()
+        def attempt():
+            try:
+                request(url + "/api/v2/access/setup", "POST", {}, token)
+            except OSError:
+                pass  # the server was killed mid-request
+
+        threading.Thread(target=attempt, daemon=True).start()
+        time.sleep(rng.uniform(0, 0.03))
+        server.proc.send_signal(signal.SIGKILL)
+        server.proc.wait()
+        server.start()
+        _, state = request(url + "/api/v2/access/setup", token=token)
+        users = state["eligible_users"]
+        if state["owner_setup"] == "required" and users == 0 and state["owner"] is None:
+            outcomes["before_commit"] += 1
+        elif state["owner_setup"] == "complete" and users == 1 and state["owner"] is not None:
+            outcomes["after_commit"] += 1
+        else:
+            consistent = False
+            outcomes.setdefault("inconsistent", []).append(state)
+        status, after = request(url + "/api/v2/access/setup", "POST", {}, token)
+        converges &= status in (200, 201) and after["eligible_users"] == 1 and after["owner"] is not None
+        server.stop()
+    return {"crash_leaves_no_partial_owner": consistent, "crash_retry_converges": converges}, outcomes
 
 
 if __name__ == "__main__":
