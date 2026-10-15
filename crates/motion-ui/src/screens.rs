@@ -184,6 +184,7 @@ pub(crate) async fn pairing_form() -> Result<impl View> {
             <input type="hidden" name="client_name" data-type=(kind(Field::Text)) value="Motion web">
         )
         <p class="muted small">"An administrator can approve the displayed code in Motion terminal → Pairing requests."</p>
+        <p class="muted small">"New server with no users? On the server computer run " <code>"motion --operator-token-file DATA_DIR/admin-token tui"</code> ", press s on Pairing requests to create the Owner, then compare and approve this code. Connecting from the same computer grants nothing by itself."</p>
         command_form(command: "POST /api/v2/auth/invitations/redeem".to_string(), label: "Redeem invitation", class: Some("command invitation"),
             <label>"Invitation code" <input type="password" name="code" data-type=(kind(Field::Text)) autocomplete="off" required=(true) maxlength="128"></label>
             <input type="hidden" name="device_name" data-type=(kind(Field::Text)) value="Web browser">

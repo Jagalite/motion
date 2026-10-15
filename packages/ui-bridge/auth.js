@@ -275,6 +275,12 @@ async function selectionRows(path) {
   } while (cursor);
   return result;
 }
+// The grant an approval starts from: the user's grant without administration,
+// which is only ever granted deliberately.
+function inheritedGrant(user) {
+  if (!user) return {};
+  return {profile_ids: user.profile_ids ?? [], permissions: (user.permissions ?? []).filter(id => id !== 'system:admin'), policy: user.policy ?? {}};
+}
 function grantFields(parent, current = {}, lookups = {}, permissionOptions = permissions) {
   const profile_ids = choices(parent, 'Allowed viewing profiles', (lookups.profiles ?? []).map(v => [v.id, v.name]), current.profile_ids ?? []);
   const permission_ids = choices(parent, 'Permissions', permissionOptions, current.permissions ?? []);
@@ -609,8 +615,18 @@ async function registrationSection(parent, lookups) {
   const grant = grantFields(defaults, current.default_access ?? {}, lookups, permissions.filter(([id]) => id !== 'system:admin'));
   input.fields.append(defaults);
 }
+function ownerSetup(parent, lookups) {
+  if (lookups.setup?.owner_setup !== 'required') return;
+  const item = panel(parent, 'First run: create the Owner', 'This server has no users yet. The Owner is one enabled user whose access includes administration of this server.');
+  item.append(node('p', 'Creating the Owner approves no device and does not change existing devices; unassigned devices stay unassigned. Approve each device, including a browser, under Pairing & invitations after comparing its code. Repeating this step returns the same Owner.', {class: 'notice'}));
+  const input = form(item, 'Create the Owner', async () => {
+    await mutation(item, 'POST', '/access/setup', {name: name.value.trim() || 'Owner'}, {action: 'user.admin', target: 'owner', done: () => location.reload()});
+  });
+  const name = field(input.fields, 'Owner name', 'Owner', 'text', {required: true, maxlength: 100});
+}
 async function usersSection(parent, lookups) {
   const area = section(parent, 'users', 'Users', 'A local user is an access identity. Disabling access does not delete profiles or viewing history.');
+  ownerSetup(area, lookups);
   function userForm(host, user) {
     const editing = Boolean(user);
     const edit = disclosure(host, editing ? 'Edit access and restrictions' : 'Create a local user');
@@ -678,15 +694,33 @@ async function enrollmentSection(parent, lookups) {
     detail(item, 'Expires', when(pairing.expires_at));
     if (pairing.status !== 'pending') return;
     detail(item, 'Requesting device code', pairing.user_code);
+    const eligible = lookups.users.filter(user => !user.disabled);
+    if (!eligible.length) {
+      item.append(node('p', lookups.setup?.owner_setup === 'required' ? 'No user exists yet. Create the Owner under Users first, then approve this device for it.' : 'No enabled user. Create or enable a user before approving this device.', {class: 'notice'}));
+      return;
+    }
     const input = form(item, 'Approve this device', async () => {
       const chosen = lookups.users.find(user => user.id === owner.value);
       if (!chosen) throw Object.assign(new Error('Choose an explicit local user.'), {status: 400});
       if (code.value.trim() !== pairing.user_code) throw Object.assign(new Error('Compare the code on the requesting device and enter it exactly.'), {status: 400});
-      await mutation(item, 'POST', `/auth/pairings/${idPath(pairing.id)}/approve`, {user_code: code.value.trim(), user_id: chosen.id, user_revision: chosen.revision, ...grant()}, {action: 'pairing.approve', target: pairing.id, done: () => location.reload()});
+      const requested = grant();
+      if (requested.permissions.includes('system:admin') && !adminConfirm.checked) throw Object.assign(new Error('Administration is selected. Confirm that this device should administer the server, or clear Administer this server.'), {status: 400});
+      await mutation(item, 'POST', `/auth/pairings/${idPath(pairing.id)}/approve`, {user_code: code.value.trim(), user_id: chosen.id, user_revision: chosen.revision, ...requested}, {action: 'pairing.approve', target: pairing.id, done: () => location.reload()});
     });
-    const owner = select(input.fields, 'Device owner', [['', 'Choose a user'], ...lookups.users.filter(user => !user.disabled).map(user => [user.id, user.name])]);
+    // The only enabled user, as suggested by the server, is preselected.
+    const suggested = eligible.length === 1 && lookups.setup?.pairing_user?.id === eligible[0].id ? eligible[0] : undefined;
+    const owner = select(input.fields, 'Device owner', [['', 'Choose a user'], ...eligible.map(user => [user.id, user.name])], suggested?.id ?? '');
+    if (suggested) input.fields.append(node('p', `Preselected: ${suggested.name} is the only enabled user.`, {class: 'muted small'}));
     const code = field(input.fields, 'Enter the code shown on the requesting device', '', 'text', {required: true, autocomplete: 'off'});
-    const grant = grantFields(input.fields, {}, lookups);
+    const grantArea = node('div');
+    input.fields.append(grantArea);
+    let grant = grantFields(grantArea, inheritedGrant(suggested), lookups);
+    owner.addEventListener('change', () => {
+      grantArea.replaceChildren();
+      grant = grantFields(grantArea, inheritedGrant(lookups.users.find(user => user.id === owner.value)), lookups);
+    });
+    input.fields.append(node('p', 'Administer this server is never preselected. It permits every operation, including managing users and devices.', {class: 'notice'}));
+    const adminConfirm = checkbox(input.fields, 'If Administer this server is selected: I deliberately grant administration to this device.');
     confirmChange(item, 'Deny pairing', `Deny the pending pairing from ${pairing.device_name}.`, async () => mutation(item, 'POST', `/auth/pairings/${idPath(pairing.id)}/deny`, undefined, {done: () => location.reload()}));
   }, 'No pairing requests.');
   const invites = panel(area, 'Single-use invitations', 'Invitation codes appear only when created. Share them only with the intended recipient.');
@@ -779,8 +813,8 @@ async function overviewSection(parent) {
   }, 'No pending sensitive action approvals.');
 }
 async function adminPage(content, output) {
-  const [users, profiles, libraries] = await Promise.all([selectionRows('/users'), selectionRows('/profiles'), selectionRows('/libraries')]);
-  const lookups = {users, profiles, libraries};
+  const [users, profiles, libraries, setup] = await Promise.all([selectionRows('/users'), selectionRows('/profiles'), selectionRows('/libraries'), api('GET', '/access/setup').catch(() => null)]);
+  const lookups = {users, profiles, libraries, setup};
   const sections = [() => overviewSection(content), () => methodsSection(content), () => emailSection(content), () => registrationSection(content, lookups), () => usersSection(content, lookups), () => requestsSection(content, lookups), () => enrollmentSection(content, lookups), async () => {
     const area = section(content, 'identities', 'Linked identities', 'To add a method, the account owner uses My sign-in methods and completes fresh proof. Access requests can be explicitly approved as audited recovery; provider subjects are never reassigned by editing text.');
     area.append(node('a', 'Open My sign-in methods', {href: '/settings/signin', class: 'button'}));

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http/httptest"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -364,5 +366,42 @@ func TestFixtureAssignmentNarrowsRatingsAndRefusesLabelOverflow(t *testing.T) {
 	}
 	if p, _ := operations.InspectDevicePolicy(ctx, f, dup); len(p.Value.BlockedLabels) != 2 {
 		t.Fatalf("labels %v", p.Value.BlockedLabels)
+	}
+}
+
+func TestOwnerSetupIsRepeatableAndSuggestsOnlyASingleEnabledUser(t *testing.T) {
+	ctx := context.Background()
+	f := opstest.NewServer("s", "t")
+	if only, err := operations.SuggestedApprovalUser(ctx, f); err != nil || only != nil {
+		t.Fatalf("no users: %v %v", only, err)
+	}
+	if _, err := operations.SetupOwner(ctx, f, strings.Repeat("a", 101)); !isInvalid(err) || len(f.Writes()) != 0 {
+		t.Fatalf("long name: %v", err)
+	}
+	first, err := operations.SetupOwner(ctx, f, " Ada ")
+	if err != nil || first.Owner == nil || first.Owner.Name != "Ada" || !slices.Contains(first.Owner.Permissions, api.PermSystemAdmin) {
+		t.Fatalf("setup: %+v %v", first, err)
+	}
+	again, err := operations.SetupOwner(ctx, f, "Other")
+	if err != nil || again.Owner == nil || again.Owner.ID != first.Owner.ID || again.Owner.Name != "Ada" {
+		t.Fatalf("repeat: %+v %v", again, err)
+	}
+	if only, err := operations.SuggestedApprovalUser(ctx, f); err != nil || only == nil || only.ID != first.Owner.ID {
+		t.Fatalf("owner suggestion: %v %v", only, err)
+	}
+	f.AddUser("Sam")
+	if only, err := operations.SuggestedApprovalUser(ctx, f); err != nil || only != nil {
+		t.Fatalf("several users: %v %v", only, err)
+	}
+	// Servers without user-based access suggest no one.
+	f.DisableFeature(operations.AccessFeature)
+	if only, err := operations.SuggestedApprovalUser(ctx, f); err != nil || only != nil {
+		t.Fatalf("legacy server: %v %v", only, err)
+	}
+
+	existing := opstest.NewServer("s", "t")
+	opstest.SeedManagement(existing)
+	if _, err := operations.SetupOwner(ctx, existing, ""); !api.IsCode(err, "owner_setup_unavailable") {
+		t.Fatalf("existing users: %v", err)
 	}
 }

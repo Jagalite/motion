@@ -8,6 +8,9 @@ provider or FFmpeg dependency; `boundary_test.go` enforces that.
 go build -o motion ./cmd/motion
 motion --server http://127.0.0.1:8787 server status
 motion auth pair --credential-store file          # device shows a code
+motion access setup --operator-token-file /path/to/data/admin-token   # first run: create the Owner
+motion auth approve PAIRING_ID --code ABCD-EFGH \
+  --operator-token-file /path/to/data/admin-token   # the only enabled user is selected
 motion access users create Sam --operator-token-file /path/to/data/admin-token
 motion auth approve PAIRING_ID --code ABCD-EFGH --user USER_ID \
   --operator-token-file /path/to/data/admin-token   # on the server host; the device joins Sam

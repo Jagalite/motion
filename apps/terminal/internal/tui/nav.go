@@ -53,9 +53,9 @@ func (r route) keys() []string {
 	case pageDevices:
 		return []string{keyDevices, keyUsers}
 	case pagePairings:
-		return []string{keyPairings, keyUsers, keyProfiles, keyLibraries}
+		return []string{keyPairings, keyUsers, keyProfiles, keyLibraries, keySetup}
 	case pageUsers:
-		return []string{keyUsers, keyProfiles, keyLibraries, keyDevices}
+		return []string{keyUsers, keyProfiles, keyLibraries, keyDevices, keySetup}
 	case pageInvitations:
 		return []string{keyInvitations, keyUsers, keyProfiles, keyLibraries}
 	case pageSources:

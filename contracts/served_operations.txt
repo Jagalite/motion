@@ -59,6 +59,7 @@ denySigninRequest
 diagnoseSigninEmail
 finishEmailSignin
 finishOidcSignin
+getAccessSetup
 getAccessUser
 getAssetBytes
 getBrowserSession
@@ -199,6 +200,7 @@ revokeSigninUser
 searchCatalog
 selectArtwork
 setWatchedState
+setupAccessOwner
 startEmailRegistration
 startEmailSignin
 startOidcSignin

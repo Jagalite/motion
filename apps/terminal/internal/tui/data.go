@@ -274,6 +274,11 @@ func (m *Model) fetcher(key string) func(context.Context) (any, bool, error) {
 		return list(func(ctx context.Context) ([]api.Device, bool, error) {
 			return operations.CollectDevices(ctx, b, listCap)
 		})
+	case keySetup:
+		if a, ok := b.(setupBackend); ok {
+			return whole(func(ctx context.Context) (any, error) { return operations.ReadAccessSetup(ctx, a) })
+		}
+		return whole(func(context.Context) (any, error) { return api.AccessSetup{}, nil })
 	case keyUsers, keyPairings, keyInvitations:
 		if a, ok := b.(accessBackend); ok {
 			switch kind {

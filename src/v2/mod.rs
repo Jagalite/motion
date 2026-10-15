@@ -350,6 +350,10 @@ impl From<AccessError> for Problem {
             InvitationUnavailable => (StatusCode::CONFLICT, "The invitation is unavailable"),
             PairingPending => (StatusCode::CONFLICT, "The pairing is awaiting approval"),
             PairingDecided => (StatusCode::CONFLICT, "The pairing already has a decision"),
+            OwnerSetupUnavailable => (
+                StatusCode::CONFLICT,
+                "Users already exist; owner setup never adopts an existing user. Approve devices for an explicit user",
+            ),
             UserCodeMismatch => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "The user code does not match the pairing",
@@ -868,6 +872,10 @@ pub fn router() -> Router<App> {
         .route(
             "/users",
             get(access_management::list_users).post(access_management::create_user),
+        )
+        .route(
+            "/access/setup",
+            get(access_management::get_setup).post(access_management::setup_owner),
         )
         .route(
             "/users/{user_id}",

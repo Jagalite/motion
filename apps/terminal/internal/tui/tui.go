@@ -423,7 +423,7 @@ func (m *Model) update(msg tea.Msg) tea.Cmd {
 			m.signedOut(msg.err)
 			return nil
 		}
-		if (msg.key == keyUsers || msg.key == keyPairings || msg.key == keyInvitations || msg.key == keyDevices) && revoked(msg.err) {
+		if (msg.key == keyUsers || msg.key == keyPairings || msg.key == keyInvitations || msg.key == keyDevices || msg.key == keySetup) && revoked(msg.err) {
 			m.forgetAccess()
 			return m.load(keySession)
 		}

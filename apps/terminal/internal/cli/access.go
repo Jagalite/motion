@@ -154,7 +154,7 @@ func printPolicy(w io.Writer, p api.AccessPolicy) {
 // TUI's access pages do.
 func accessCmd(env *Env) *cobra.Command {
 	cmd := &cobra.Command{Use: "access", Short: "Manage access users, pairing requests and invitations (administrator)"}
-	cmd.AddCommand(pairingsCmd(env), usersCmd(env), invitationsCmd(env))
+	cmd.AddCommand(pairingsCmd(env), usersCmd(env), invitationsCmd(env), setupCmd(env))
 	return cmd
 }
 
@@ -265,6 +265,32 @@ func printUser(w io.Writer, u api.User) {
 		u.Name, u.ID, state, u.Revision, strings.Join(u.ProfileIDs, ", "), strings.Join(u.Policy.LibraryIDs, ", "),
 		strings.Join(u.Permissions, ", "), u.Policy.AllowUnrated, u.Policy.DenyRated,
 		strings.Join(u.Policy.AllowedRatings, ", "), strings.Join(u.Policy.BlockedLabels, ", "))
+}
+
+func setupCmd(env *Env) *cobra.Command {
+	var name string
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Create the enabled Owner on a server without users (first run; administrator or local operator)",
+		Long: "On a server without users, create one enabled Owner whose access includes administration. " +
+			"Repeating it returns the same owner; existing users are never adopted. The owner gets no device: " +
+			"approve each device, including your browser, with its code. Loopback connections grant nothing.",
+		Args: cobra.NoArgs,
+		RunE: run(env, func(ctx context.Context, c *Conn) error {
+			s, err := operations.SetupOwner(ctx, c, name)
+			if err != nil {
+				return err
+			}
+			return env.print(s, func(w io.Writer) {
+				if s.Owner != nil {
+					fmt.Fprintf(w, "Owner %s (%s) is ready.\n", sanitize(s.Owner.Name), s.Owner.ID)
+				}
+				fmt.Fprintln(w, "Next: choose Pair this browser on the sign-in page, then compare its code with `motion access pairings list` and run `motion auth approve PAIRING_ID --code CODE`. Add --permission system:admin only to make that device an administrator.")
+			})
+		}),
+	}
+	cmd.Flags().StringVar(&name, "name", "", "owner name (default: Owner)")
+	return cmd
 }
 
 func usersCmd(env *Env) *cobra.Command {

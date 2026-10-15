@@ -71,6 +71,7 @@ applying any pending migration to an existing database.
 
 | 0063 | `0063_download_subtitle_artifacts.sql` | Required download artifacts | durable subtitle digest, size and failure state |
 | 0064 | `0064_mail_delivery_registration.sql` | Native email and registration | outbox attempt identity/lease/ambiguity and configuration/key/epoch fences; email access requests; email-bound invitations; registration policy; DKIM key; delivery tests |
+| 0065 | `0065_access_owner_setup.sql` | First-run owner setup | singleton record of the owner user created by guided local-operator setup |
 
 The catalog migrations were renumbered when PR #4 merged (they had used 0018–0026 on the unreleased branch). Databases created by pre-merge `catalog-sources` builds are development-only and are not upgradable; recreate them. The released baseline (schema 9) and main's history upgrade normally. 0027 is unassigned.
 
@@ -84,7 +85,8 @@ The completion chain retains 0045–0052. The rewrite repair migrations are
 Only their filenames/numbers changed; their SQL bytes remain unchanged.
 0060 adds preview layout identity, 0061 records issued viewing histories,
 0062 orders manual marker corrections, 0063 records subtitle artifacts, and
-0064 adds native mail delivery state and email registration. 0064 rebuilds
+0064 adds native mail delivery state and email registration, and 0065 records
+first-run owner setup. 0064 rebuilds
 `signin_outbox` and `signin_requests` (both small and transient); legacy
 `pending`/`sent` outbox rows map to `queued`/`accepted`, and an interrupted
 `sending` row is recovered as an attempt whose acceptance is unknown.

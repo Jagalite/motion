@@ -235,6 +235,8 @@ pub enum AccessError {
     /// The acknowledged result was revoked since; a retry cannot restore it.
     ReplayUnavailable,
     InvalidCursor,
+    /// Owner setup only creates the first user; existing users are never adopted.
+    OwnerSetupUnavailable,
 }
 
 impl AccessError {
@@ -264,6 +266,7 @@ impl AccessError {
             Self::IdempotencyMismatch => "idempotency_key_reused",
             Self::ReplayUnavailable => "idempotent_replay_unavailable",
             Self::InvalidCursor => "invalid_cursor",
+            Self::OwnerSetupUnavailable => "owner_setup_unavailable",
         }
     }
 }

@@ -111,6 +111,8 @@ type request struct {
 	idempotencyKey string
 	ifMatch        string
 	header         http.Header
+	// repeatable marks an unkeyed write whose repeat has no further effect.
+	repeatable bool
 }
 
 func (c *Client) url(path string, query url.Values) string {
@@ -129,7 +131,7 @@ func (c *Client) url(path string, query url.Values) string {
 
 // retrySafe: reads, and writes that carry an idempotency key.
 func (r request) retrySafe() bool {
-	return r.method == http.MethodGet || r.method == http.MethodHead || r.idempotencyKey != ""
+	return r.method == http.MethodGet || r.method == http.MethodHead || r.idempotencyKey != "" || r.repeatable
 }
 
 func backoff(attempt int) time.Duration {

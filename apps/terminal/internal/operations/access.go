@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 )
@@ -429,4 +430,57 @@ func ReplaceDevicePolicy(ctx context.Context, a DeviceAPI, id string, in api.Acc
 	}
 	v, err := a.ReplaceDevicePolicy(ctx, id, in, etag)
 	return v, settleConditional("policy replacement for device "+id, etag, err)
+}
+
+// Owner setup ----------------------------------------------------------------
+
+// SetupAPI reads and performs first-run owner setup.
+type SetupAPI interface {
+	GetAccessSetup(context.Context) (api.AccessSetup, error)
+	SetupOwner(context.Context, api.SetupInput) (api.AccessSetup, error)
+}
+
+// ReadAccessSetup reports owner setup and the user suggested for approvals.
+func ReadAccessSetup(ctx context.Context, a SetupAPI) (api.AccessSetup, error) {
+	return a.GetAccessSetup(ctx)
+}
+
+// SetupOwner creates the enabled Owner when the server has no user. A repeat,
+// concurrent or interrupted attempt is resolved by the server, which returns
+// the recorded owner; existing users are never adopted. The owner holds no
+// device: each device, including this one's browser, is approved explicitly.
+func SetupOwner(ctx context.Context, a SetupAPI, name string) (api.AccessSetup, error) {
+	name = strings.TrimSpace(name)
+	if n := utf8.RuneCountInString(name); n > 100 {
+		return api.AccessSetup{}, Invalid("the owner name must be at most 100 characters")
+	}
+	return a.SetupOwner(ctx, api.SetupInput{Name: name})
+}
+
+// SuggestionAPI reads what a pairing approval may be preselected for.
+type SuggestionAPI interface {
+	CapabilityReader
+	SetupAPI
+}
+
+// SuggestedApprovalUser is the user a pairing approval is preselected for:
+// the only enabled user on a server that manages access by user. Nil means
+// the administrator names the user explicitly, as before; servers predating
+// owner setup suggest no one.
+func SuggestedApprovalUser(ctx context.Context, a SuggestionAPI) (*api.User, error) {
+	caps, err := a.Capabilities(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ManagesAccessByUser(caps) {
+		return nil, nil
+	}
+	s, err := a.GetAccessSetup(ctx)
+	if api.IsCode(err, "not_found") {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.PairingUser, nil
 }

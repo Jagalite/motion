@@ -217,6 +217,9 @@ func (m Model) tableEmpty() string {
 	case pageUsers:
 		return "No access users."
 	case pagePairings:
+		if m.setupRequired() {
+			return "No pending pairing requests. First run: choose Pair this browser on Motion's sign-in page, then press s to create the Owner."
+		}
 		return "No pending pairing requests."
 	case pageInvitations:
 		return "No invitations."

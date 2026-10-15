@@ -41,6 +41,7 @@ type Server struct {
 	devices     []*api.Device
 	policies    map[string]*api.AccessPolicy
 	users       []*api.User
+	owner       string
 	pairings    []*pairing
 	invitations []*api.Invitation
 	redeemed    map[string]api.Credential
@@ -544,6 +545,61 @@ func (s *Server) CreateUser(_ context.Context, in api.UserInput, key string) (ap
 	})
 }
 
+// GetAccessSetup mirrors the server's owner setup state.
+func (s *Server) GetAccessSetup(_ context.Context) (api.AccessSetup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("getAccessSetup", "", "", "")
+	return s.setup(), nil
+}
+
+func (s *Server) setup() api.AccessSetup {
+	v := api.AccessSetup{OwnerSetup: api.SetupExistingUsers}
+	switch {
+	case s.owner != "":
+		v.OwnerSetup = api.SetupComplete
+	case len(s.users) == 0:
+		v.OwnerSetup = api.SetupRequired
+	}
+	var eligible []*api.User
+	for _, u := range s.users {
+		if u.ID == s.owner {
+			c := *u
+			v.Owner = &c
+		}
+		if !u.Disabled {
+			eligible = append(eligible, u)
+		}
+	}
+	v.EligibleUsers = len(eligible)
+	if len(eligible) == 1 {
+		c := *eligible[0]
+		v.PairingUser = &c
+	}
+	return v
+}
+
+// SetupOwner creates the owner only when no user exists; a repeat returns it.
+func (s *Server) SetupOwner(_ context.Context, in api.SetupInput) (api.AccessSetup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("setupAccessOwner", "", "", "")
+	if s.owner == "" {
+		if len(s.users) != 0 {
+			return api.AccessSetup{}, problem(409, "owner_setup_unavailable")
+		}
+		name := in.Name
+		if name == "" {
+			name = "Owner"
+		}
+		u := &api.User{ID: s.id("u"), Name: name, Revision: "1", ProfileIDs: []string{}, Permissions: slices.Clone(api.AllPermissions), Policy: api.GrantPolicy{LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}}}
+		s.users = append(s.users, u)
+		s.owner = u.ID
+	}
+	v, err := s.deliver(s.setup())
+	return v.(api.AccessSetup), err
+}
+
 func (s *Server) ReplaceUser(_ context.Context, id string, in api.UserInput, etag string) (api.Tagged[api.User], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1017,6 +1073,12 @@ func (s *Server) Handler() http.Handler {
 			_ = decode(&in)
 			t, e := s.ReplaceDevicePolicy(ctx, seg[1], in, ifMatch)
 			tagged(t.Value, t.ETag, e)
+		case "GET access/setup":
+			v, err = s.GetAccessSetup(ctx)
+		case "POST access/setup":
+			var in api.SetupInput
+			_ = decode(&in)
+			v, err = s.SetupOwner(ctx, in)
 		case "GET users":
 			v, err = s.ListUsers(ctx, cursor, limit)
 		case "POST users":
@@ -1144,7 +1206,7 @@ func pattern(seg []string) []string {
 	case len(out) >= 3 && out[0] == "auth" && out[2] != "redeem",
 		len(out) >= 3 && out[0] == "catalog":
 		out[2] = "*"
-	case out[0] == "auth", out[0] == "system", out[0] == "admin", out[0] == "catalog":
+	case out[0] == "auth", out[0] == "system", out[0] == "admin", out[0] == "catalog", out[0] == "access":
 	case len(out) >= 2:
 		out[1] = "*"
 		if len(out) >= 4 && out[2] == "timelines" {
