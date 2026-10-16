@@ -664,6 +664,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                         class: Some("command viewing-mark"),
                                         viewing_epoch: Some(who.viewing_epoch.clone()),
                                         viewing_manual_epoch: Some(viewing.manual_epoch.clone()),
+                                        viewing_session: Some(viewing.session_id.clone()),
                                         // Unwatched starts the title over; watched keeps the position.
                                         json_body: Some(if viewing.watched {
                                             r#"{"manual_watched":false,"reset_position":true}"#

@@ -212,12 +212,14 @@ const submitting = new WeakSet();
 /**
  * A watched mark rendered before the player's final progress report landed
  * conflicts only with that automatic progress. Retry once at the current
- * revision while no manual watched change happened since the page rendered
- * (same manual epoch); any other conflict stands for the user to see.
+ * revision while neither a manual watched change (same manual epoch) nor a
+ * new viewing session (same session) happened since the page rendered; any
+ * other conflict, such as playback starting elsewhere, stands for the user.
  */
-function markRetryRevision(current, renderedManualEpoch) {
+function markRetryRevision(current, renderedManualEpoch, renderedSession) {
   const valid = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
   if (!valid || typeof renderedManualEpoch !== 'string' || renderedManualEpoch === '') return null;
+  if (typeof renderedSession !== 'string' || (current.session_id ?? '') !== renderedSession) return null;
   return current.manual_epoch === renderedManualEpoch ? current.revision : null;
 }
 
@@ -255,7 +257,8 @@ async function submitCommand(form) {
     } catch (error) {
       // A watched mark may race the player's last progress report.
       const revision = error.status === 412 && form.dataset.viewingManualEpoch !== undefined
-        ? markRetryRevision(await call('GET', path).catch(() => null), form.dataset.viewingManualEpoch) : null;
+        ? markRetryRevision(await call('GET', path).catch(() => null), form.dataset.viewingManualEpoch,
+          form.dataset.viewingSession ?? '') : null;
       if (revision === null) throw error;
       result = await call(method, path, body, {...headers, 'If-Match': `"r-${revision}"`});
     }

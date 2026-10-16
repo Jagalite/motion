@@ -3,7 +3,7 @@
     {
       "id": "startup.announces_household_mode",
       "ok": true,
-      "detail": "Household mode: anyone who can reach http://127.0.0.1:53762 can browse, play and save progress without signing in."
+      "detail": "Household mode: anyone who can reach http://127.0.0.1:57011 can browse, play and save progress without signing in."
     },
     {
       "id": "api.catalog_without_credentials",
@@ -43,7 +43,7 @@
     {
       "id": "player.plays_without_sign_in",
       "ok": true,
-      "detail": "{\"ok\":true,\"from\":0.003215,\"to\":6.112189}"
+      "detail": "{\"ok\":true,\"from\":0.003014,\"to\":6.115414}"
     },
     {
       "id": "player.remembers_volume_and_mute",
@@ -63,7 +63,7 @@
     {
       "id": "player.resume_starts_at_saved_position",
       "ok": true,
-      "detail": "resume_ms=6112"
+      "detail": "resume_ms=6115"
     },
     {
       "id": "player.volume_and_mute_carry_over",
@@ -78,7 +78,7 @@
     {
       "id": "player.start_over_keeps_viewing_snapshot",
       "ok": true,
-      "detail": "resume_ms=6112"
+      "detail": "resume_ms=6115"
     },
     {
       "id": "viewing.mark_watched",
@@ -118,7 +118,7 @@
     {
       "id": "admin.paired",
       "ok": true,
-      "detail": "200/200 {\"client_name\":\"walkthrough\",\"id\":\"ff315e16-31bb-40b8-960d-25477684ea51\",\"name\":\"Walkthrough admin\",\"permissions\":[\"system:admin\"],\"profile_ids\":[\"default\"],\"revision\":\"1\",\"revoked\":false,\"user_id\":nu"
+      "detail": "200/200 {\"client_name\":\"walkthrough\",\"id\":\"f306f7cc-353d-4547-9736-db6a64584790\",\"name\":\"Walkthrough admin\",\"permissions\":[\"system:admin\"],\"profile_ids\":[\"default\"],\"revision\":\"1\",\"revoked\":false,\"user_id\":nu"
     },
     {
       "id": "admin.signed_in_sees_manage",
@@ -133,7 +133,7 @@
     {
       "id": "a11y.household_pages_axe_clean",
       "ok": true,
-      "detail": "{\"/\":[],\"/item/3cd94ea2-57ae-479f-84e2-2a3be4279113\":[]}"
+      "detail": "{\"/\":[],\"/item/54f5db0e-8bd5-4ca0-ad05-ef708ff0a1b8\":[]}"
     },
     {
       "id": "viewing.mark_retries_past_progress_race",
@@ -143,7 +143,7 @@
     {
       "id": "web.no_unexpected_failed_requests",
       "ok": true,
-      "detail": "{\"failedResponses\":[\"412 /api/v2/profiles/default/timelines/97fad4bc-2f34-4c21-b19e-4512b540876a/viewing\",\"403 /settings/access\"]}"
+      "detail": "{\"failedResponses\":[\"412 /api/v2/profiles/default/timelines/d0381976-61bf-4109-9150-b17bfeb08095/viewing\",\"403 /settings/access\"]}"
     },
     {
       "id": "web.no_console_errors_beyond_that_visit",

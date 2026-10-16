@@ -120,6 +120,8 @@ pub struct TimelineViewing {
     pub revision: String,
     /// Count of manual watched changes; a retry is safe only while unchanged.
     pub manual_epoch: String,
+    /// The viewing session that owned the state when rendered ("" for none).
+    pub session_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

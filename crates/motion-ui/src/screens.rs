@@ -147,6 +147,7 @@ pub(crate) async fn command_form(
     #[default] json_body: Option<String>,
     #[default] viewing_epoch: Option<String>,
     #[default] viewing_manual_epoch: Option<String>,
+    #[default] viewing_session: Option<String>,
     #[default] child: Child<'_>,
 ) -> Result<impl View> {
     let body_kind = if file_body {
@@ -162,6 +163,7 @@ pub(crate) async fn command_form(
             data-if-match=(if_match.as_deref())
             data-viewing-epoch=(viewing_epoch.as_deref())
             data-viewing-manual-epoch=(viewing_manual_epoch.as_deref())
+            data-viewing-session=(viewing_session.as_deref())
             data-body=(body_kind)>
             if let Some(body) = &json_body {
                 <input type="hidden" data-json-body="" value=(body.as_str())>

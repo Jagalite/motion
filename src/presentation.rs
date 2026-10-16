@@ -777,6 +777,7 @@ impl UiQueryFacade for Queries {
                     watched: v["watched"].as_bool().unwrap_or(false),
                     revision: text(&v, "revision"),
                     manual_epoch: text(&v, "manual_epoch"),
+                    session_id: text(&v, "session_id"),
                 });
                 // Ready prepared versions, when this caller may save and read
                 // them; each is offered with exactly the selection it kept.
