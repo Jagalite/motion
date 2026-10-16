@@ -1,7 +1,7 @@
 //! Bounded caller-source reauthentication using the production core policy.
 use playscale_core::access::{
     AccessError, AccessMode, Authentication, Credential, CredentialKind, Device, Grant,
-    HouseholdScope, Mode, Permission, Policy, Principal, authenticate_caller,
+    HouseholdScope, Mode, Permission, Policy, Principal, Recheck, authenticate_caller, recheck,
 };
 use sha2::{Digest, Sha256};
 use stateless::{Check, Enumerate, Model, ModelError, ModelMetadata, Transition, TransitionRef};
@@ -168,6 +168,7 @@ fn expected(s: &State, source: Source) -> Result<Principal, AccessError> {
                 library_ids: s.library.then(|| "l".to_string()).into_iter().collect(),
                 ..Policy::default()
             },
+            // A scope digest; compared by `scoped` and the stream property below.
             policy_revision: 0,
         });
     }
@@ -202,6 +203,24 @@ fn expected(s: &State, source: Source) -> Result<Principal, AccessError> {
         policy: Policy::default(),
         policy_revision: if s.downgraded { 2 } else { 1 },
     })
+}
+
+/// Household revisions are scope digests: specified by how they change
+/// (checked per transition), not by value.
+fn scoped(result: Result<Principal, AccessError>) -> Result<Principal, AccessError> {
+    result.map(|mut p| {
+        if p.mode == Mode::Household {
+            p.policy_revision = 0;
+        }
+        p
+    })
+}
+
+fn scope_change(input: &Input) -> bool {
+    matches!(
+        input,
+        Input::AddLibrary | Input::RemoveLibrary | Input::AddProfile | Input::RemoveProfile
+    )
 }
 
 struct Callers;
@@ -271,7 +290,7 @@ impl Model for Callers {
         let mut checks: Vec<Check> = SOURCES
             .into_iter()
             .map(|source| {
-                if observe(state, source) == expected(state, source) {
+                if scoped(observe(state, source)) == expected(state, source) {
                     Check::passed("caller.current_source_facts")
                 } else {
                     Check::failed("caller.current_source_facts", "unexpected authority")
@@ -304,20 +323,46 @@ impl Model for Callers {
     ) -> Result<Vec<Check>, ModelError> {
         let exact = match (input, next.outputs) {
             (Input::Reauthenticate(source), [Effect::Authenticated(result)]) => {
-                next.state == before && *result == expected(before, *source)
+                next.state == before && scoped(result.clone()) == expected(before, *source)
             }
             (Input::Reauthenticate(_), _) => false,
             (_, [Effect::Changed]) => true,
             _ => false,
         };
-        Ok(vec![if exact {
-            Check::passed("caller.exact_current_authority_and_single_outcome")
-        } else {
-            Check::failed(
-                "caller.exact_current_authority_and_single_outcome",
-                "unexpected authority or effect",
-            )
-        }])
+        // An event stream opened by the household viewer before this input
+        // resets exactly when its scope changed (production `recheck`).
+        let stream = match (
+            observe(before, Source::Anonymous),
+            observe(next.state, Source::Anonymous),
+        ) {
+            (Ok(subscribed), current @ Ok(_)) => {
+                let reset = matches!(
+                    recheck(subscribed.policy_revision, &current),
+                    Recheck::Reset { .. }
+                );
+                reset == scope_change(input)
+            }
+            // Restricted on either side: no household stream to keep.
+            _ => true,
+        };
+        Ok(vec![
+            if exact {
+                Check::passed("caller.exact_current_authority_and_single_outcome")
+            } else {
+                Check::failed(
+                    "caller.exact_current_authority_and_single_outcome",
+                    "unexpected authority or effect",
+                )
+            },
+            if stream {
+                Check::passed("caller.household_stream_resets_on_scope_change")
+            } else {
+                Check::failed(
+                    "caller.household_stream_resets_on_scope_change",
+                    "household scope change not reflected in its revision",
+                )
+            },
+        ])
     }
 }
 

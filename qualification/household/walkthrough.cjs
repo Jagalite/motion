@@ -159,14 +159,23 @@ const helpers = `window.__hh = {
   await page.goto(`${origin}/item/${film.id}`);
   await page.getByRole('link', {name: 'Start over'}).click();
   await page.waitForURL(/from=start/);
-  check('player.start_over_starts_at_zero', Number(await page.locator('#motion-player').getAttribute('data-resume-ms')) === 0);
+  const host = page.locator('#motion-player');
+  const snapshot = Number(await host.getAttribute('data-resume-ms'));
+  await page.evaluate(helpers);
+  const overState = await page.evaluate(() => window.__hh.ready());
+  const overAt = await page.evaluate(() => window.__hh.el()?.player?.state?.currentTime);
+  check('player.start_over_starts_at_zero', Number(await host.getAttribute('data-start-ms')) === 0 && overState === 'ready' && overAt < 2,
+    {state: overState, currentTime: overAt});
+  // The rendered viewing snapshot is unchanged, so session handoff still reconciles.
+  check('player.start_over_keeps_viewing_snapshot', snapshot >= 5000, `resume_ms=${snapshot}`);
 
   // 4. Mark watched, then unwatched.
   await page.goto(`${origin}/item/${film.id}`);
   await page.getByRole('button', {name: 'Mark watched'}).click();
   await page.waitForLoadState('load');
   await page.getByText('Watched.').waitFor({timeout: 15000}).catch(() => {});
-  check('viewing.mark_watched', await page.getByText('Watched.').count() === 1 && await page.getByRole('button', {name: 'Mark unwatched'}).count() === 1);
+  check('viewing.mark_watched', await page.getByText('Watched.').count() === 1 && await page.getByRole('button', {name: 'Mark unwatched'}).count() === 1,
+    await page.locator('form.viewing-mark .command-status').textContent().catch(() => ''));
   await page.screenshot({path: path.join(out, '04-item-watched.png')});
   await page.getByRole('button', {name: 'Mark unwatched'}).click();
   await page.getByText('Not started.').waitFor({timeout: 15000}).catch(() => {});
@@ -224,8 +233,12 @@ const helpers = `window.__hh = {
   } catch (error) {
     check('a11y.household_pages_axe_clean', false, String(error));
   }
-  // The only failed load is the deliberate visit to the administration page.
-  const unexpected = failedResponses.filter(r => r !== '403 /settings/access');
+  // Expected failures: the deliberate visit to the administration page, and
+  // at most one 412 when a watched mark raced the player's last progress
+  // report (the bridge then retries at the current revision).
+  const raced = failedResponses.filter(r => /^412 \/api\/v2\/profiles\/default\/timelines\/[^/]+\/viewing$/.test(r));
+  check('viewing.mark_retries_past_progress_race', raced.length <= 1, `${raced.length} stale-revision retries`);
+  const unexpected = failedResponses.filter(r => r !== '403 /settings/access' && !raced.includes(r));
   check('web.no_unexpected_failed_requests', unexpected.length === 0, {failedResponses});
   check('web.no_console_errors_beyond_that_visit', consoleErrors.length === failedResponses.length - unexpected.length, consoleErrors.slice(0, 5));
   await browser.close();

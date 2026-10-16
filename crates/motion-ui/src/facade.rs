@@ -118,6 +118,8 @@ pub struct TimelineViewing {
     pub watched: bool,
     /// The viewing state's revision; a watched override must match it.
     pub revision: String,
+    /// Count of manual watched changes; a retry is safe only while unchanged.
+    pub manual_epoch: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

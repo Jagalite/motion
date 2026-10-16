@@ -663,6 +663,7 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                         if_match: Some(format!("\"r-{}\"", viewing.revision)),
                                         class: Some("command viewing-mark"),
                                         viewing_epoch: Some(who.viewing_epoch.clone()),
+                                        viewing_manual_epoch: Some(viewing.manual_epoch.clone()),
                                         // Unwatched starts the title over; watched keeps the position.
                                         json_body: Some(if viewing.watched {
                                             r#"{"manual_watched":false,"reset_position":true}"#
@@ -814,14 +815,17 @@ async fn manage(cx: &Cx) -> Result<impl View> {
 async fn play(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let id = path_param::<TimelineId>(cx);
-    let mut view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
-    // "Start over" from the title page; progress then saves from the start.
-    if uri(cx)
+    let view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
+    // "Start over" from the title page changes only where playback starts;
+    // `resume_ms` stays the rendered viewing snapshot the player reconciles with.
+    let start_ms = if uri(cx)
         .query()
         .is_some_and(|q| q.split('&').any(|pair| pair == "from=start"))
     {
-        view_model.resume_ms = 0;
-    }
+        0
+    } else {
+        view_model.resume_ms
+    };
     let preferences = facade(cx)
         .0
         .profiles(who)
@@ -860,6 +864,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
             data-max-bitrate=(preferences.max_bitrate_bps.map(|b| b.to_string()).unwrap_or_default())
             data-resume-ms=(view_model.resume_ms)
+            data-start-ms=(start_ms)
             data-duration-ms=(view_model.duration_ms.unwrap_or(0))
             data-demuxe-base=(assets::DEMUXE_BASE)>
             <p class="status-panel" role="status" data-state="loading">"Preparing playback…"</p>
@@ -870,7 +875,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <button type="button" data-player-action="pause">icon(name: "pause") <span>"Pause"</span></button>
                 <button type="button" data-player-action="mute">icon(name: "volume") <span>"Mute / unmute"</span></button>
                 <button type="button" data-player-action="next">icon(name: "next") <span>"Next title"</span></button>
-                <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+                <output id="motion-position" aria-live="off">(clock(start_ms))</output>
             </div>
             // Skip buttons appear while playback is inside their interval
             // (the player shows them); chapters are always listed.
@@ -898,7 +903,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <summary>"Playback options"</summary>
                 <div class="player-options-body">
                     <div class="player-option-row">
-                        <label>"Position in seconds "<input name="position" type="number" inputmode="decimal" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
+                        <label>"Position in seconds "<input name="position" type="number" inputmode="decimal" min="0" step="0.1" required=(true) value=(start_ms / 1000)></label>
                         <button type="submit">"Seek"</button>
                     </div>
                     <label>"Version "<select name="version"><option value="">"Automatic"</option>

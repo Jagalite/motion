@@ -864,7 +864,7 @@ async function start() {
       dispose: opened => disposePlayer(opened.element),
       plan: body => api('POST', '/api/v2/playback/plans', body, undefined, AbortSignal.timeout(10000)),
       admit: plan => retryCommand('/api/v2/playback/delivery-sessions',
-        {plan_token: plan.plan_token, start_ms: Number(data.resumeMs) || 0}, key(), current),
+        {plan_token: plan.plan_token, start_ms: Number(data.startMs ?? data.resumeMs) || 0}, key(), current),
       retire: async id => {
         if (state.deliveryId === id) {
           state.stopLease?.(); state.stopLease = null;
@@ -882,7 +882,7 @@ async function start() {
         }
         state.delivery = readyDelivery;
         renewLease(readyDelivery, generation, current);
-        const element = await preparePlayer(generation, Number(data.resumeMs) || 0, current);
+        const element = await preparePlayer(generation, Number(data.startMs ?? data.resumeMs) || 0, current);
         if (!current()) { await disposePlayer(element); throw new Error('Playback ownership changed.'); }
         return {delivery, generation, element};
       },

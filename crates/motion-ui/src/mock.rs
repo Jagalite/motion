@@ -223,7 +223,7 @@ impl UiQueryFacade for MockUiQueryFacade {
                         id: timeline.into(),
                         edition: "Theatrical".into(),
                         duration_ms: Some(title.duration_ms),
-                        viewing: Some(TimelineViewing { position_ms: position, watched: false, revision: "1".into() }),
+                        viewing: Some(TimelineViewing { position_ms: position, watched: false, revision: "1".into(), manual_epoch: "0".into() }),
                         versions: vec![VersionView {
                             id: format!("ver-{timeline}"),
                             label: "1080p original".into(),

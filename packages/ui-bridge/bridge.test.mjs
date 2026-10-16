@@ -440,3 +440,32 @@ test('an unavailable invitation asks for a new code without saving the secret', 
   assert.equal(f.querySelector('.command-status').textContent, 'This invitation is no longer available. Ask an administrator for a new code.');
   assert.equal(storage.size, 0);
 });
+
+test('watched marks retry a progress-only conflict once and never a manual one', async () => {
+  const {markRetryRevision} = runInNewContext(`${source}\n({markRetryRevision})`, {
+    document: {querySelector: () => null, addEventListener() {}}, crypto: webcrypto});
+  assert.equal(markRetryRevision({revision: '7', manual_epoch: '2'}, '2'), '7');
+  assert.equal(markRetryRevision({revision: '7', manual_epoch: '3'}, '2'), null);
+  assert.equal(markRetryRevision({revision: 'x', manual_epoch: '2'}, '2'), null);
+  assert.equal(markRetryRevision(null, '2'), null);
+  assert.equal(markRetryRevision({revision: '7', manual_epoch: '2'}, ''), null);
+
+  for (const [epoch, expected] of [['2', ['PUT "r-5"', 'GET', 'PUT "r-7"']], ['1', ['PUT "r-5"', 'GET']]]) {
+    const calls = [];
+    const fetch = async (path, options) => {
+      calls.push(options.method === 'GET' ? 'GET' : `PUT ${options.headers['If-Match']}`);
+      if (options.method === 'GET') return {ok: true, status: 200, json: async () => ({revision: '7', manual_epoch: '2'})};
+      return calls.length === 1
+        ? {ok: false, status: 412, json: async () => ({code: 'precondition_failed'})}
+        : {ok: true, status: 200, json: async () => ({})};
+    };
+    const {submitCommand} = harness(new Map(), fetch);
+    const mark = form();
+    mark.dataset = {command: 'PUT /api/v2/profiles/p/timelines/t/viewing', ifMatch: '"r-5"',
+      viewingEpoch: 's:1', viewingManualEpoch: epoch, body: 'json'};
+    mark.querySelector = selector => selector === '[data-json-body]' ? {value: '{"manual_watched":true,"reset_position":false}'}
+      : selector === '.command-status' ? {setAttribute() {}} : {setAttribute() {}, removeAttribute() {}};
+    await submitCommand(mark);
+    assert.deepEqual(calls, expected, `rendered manual epoch ${epoch}`);
+  }
+});

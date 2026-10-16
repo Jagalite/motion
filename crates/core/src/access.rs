@@ -574,6 +574,22 @@ pub fn authenticate_household(
     Ok(household_principal(scope))
 }
 
+/// Revision of the household grant: a digest of its scope, so adding or
+/// removing a library or profile changes it (open event streams reset and
+/// `/me` revalidates) and an unchanged scope keeps it.
+pub fn household_revision(scope: HouseholdScope<'_>) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (tag, ids) in [(b'l', scope.library_ids), (b'p', scope.profile_ids)] {
+        for id in ids {
+            digest.update([tag]);
+            digest.update((id.len() as u64).to_be_bytes());
+            digest.update(id.as_bytes());
+        }
+    }
+    u64::from_be_bytes(digest.finalize()[..8].try_into().expect("8 bytes"))
+}
+
 /// The household viewer's principal for the current scope: every library and
 /// profile, no rating or label restriction, and only `HOUSEHOLD_PERMISSIONS`.
 pub fn household_principal(scope: HouseholdScope<'_>) -> Principal {
@@ -589,7 +605,7 @@ pub fn household_principal(scope: HouseholdScope<'_>) -> Principal {
             library_ids: scope.library_ids.clone(),
             ..Policy::default()
         },
-        policy_revision: 0,
+        policy_revision: household_revision(scope),
     }
 }
 

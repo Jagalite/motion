@@ -562,6 +562,18 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<&str> {
         .map(|(_, value)| value)
 }
 
+/// Whether any Cookie header names the session cookie, judged on raw bytes so
+/// a header that fails to parse still counts as a presented credential.
+fn session_cookie_presented(headers: &HeaderMap) -> bool {
+    headers.get_all(header::COOKIE).iter().any(|value| {
+        value.as_bytes().split(|b| *b == b';').any(|pair| {
+            pair.trim_ascii_start()
+                .strip_prefix(SESSION_COOKIE.as_bytes())
+                .is_some_and(|rest| rest.trim_ascii_start().starts_with(b"="))
+        })
+    })
+}
+
 /// Digest comparison avoids leaking the operator token through timing.
 pub fn is_operator(app: &App, token: &str) -> bool {
     Sha256::digest(token.as_bytes()) == Sha256::digest(app.admin_token.as_bytes())
@@ -653,7 +665,9 @@ pub async fn resolve_with(
     }
     let Some(token) = session_cookie(headers) else {
         let mode = app.access.mode;
-        let presented = headers.contains_key(header::AUTHORIZATION);
+        // Any trace of a credential is enforced: never a household fallback.
+        let presented =
+            headers.contains_key(header::AUTHORIZATION) || session_cookie_presented(headers);
         let principal = authenticate_household(&mut conn, mode, presented, now).await?;
         let csrf = household_csrf(app);
         if !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {

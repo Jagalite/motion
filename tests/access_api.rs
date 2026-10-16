@@ -5215,3 +5215,83 @@ async fn household_scope_follows_current_profiles() {
             .contains(&json!("kids"))
     );
 }
+
+#[tokio::test]
+async fn household_fallback_never_takes_malformed_session_cookies() {
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    // A session cookie in a header that is not valid text is still a
+    // presented credential: refused, not admitted as the household.
+    let mut request = f.request("GET", "/api/v2/me", None, &[]);
+    request.headers_mut().insert(
+        "cookie",
+        axum::http::HeaderValue::from_bytes(b"motion_session=revoked; x=\xff").unwrap(),
+    );
+    assert_eq!(f.raw(request).await.status(), StatusCode::UNAUTHORIZED);
+    for cookie in ["motion_session =stale", " motion_session=stale; other=1"] {
+        let reply = f
+            .call("GET", "/api/v2/me", None, &[("cookie", cookie)])
+            .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{cookie}");
+    }
+    // Unrelated cookies are not credentials.
+    let reply = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("cookie", "motion_profile=default; xmotion_session=1")],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn household_revision_follows_scope() {
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let first = f.call("GET", "/api/v2/me", None, &[]).await.body["policy_revision"].clone();
+    let again = f.call("GET", "/api/v2/me", None, &[]).await.body["policy_revision"].clone();
+    assert_eq!(first, again);
+    let root = f._dir.path().join("more");
+    std::fs::create_dir(&root).unwrap();
+    db::add_library(&f.app.db, "More", &root).await.unwrap();
+    let changed = f.call("GET", "/api/v2/me", None, &[]).await.body["policy_revision"].clone();
+    assert_ne!(
+        first, changed,
+        "an open event stream must reset when the scope grows"
+    );
+}
+
+#[tokio::test]
+async fn household_clients_render_pages_on_their_own_rate_budget() {
+    let mut f = Fixture::new(AccessMode::TrustedHousehold).await;
+    f.app.access = Arc::new(
+        playscale::v2::Runtime::new(AccessMode::TrustedHousehold, [0; 32]).with_settings(
+            playscale::v2::ApiSettings {
+                requests_per_minute: 30,
+                ..Default::default()
+            },
+        ),
+    );
+    let render =
+        |peer: [u8; 4]| {
+            let mut request = f.request("GET", "/", None, &[]);
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                std::net::SocketAddr::from((peer, 50_000)),
+            ));
+            request
+        };
+    // One client exhausts its own budget, page reads included.
+    let mut limited = false;
+    for _ in 0..40 {
+        if f.raw(render([10, 0, 0, 2])).await.status() == StatusCode::TOO_MANY_REQUESTS {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "a client's renders are rate-limited");
+    // Another client on the network still renders a full page.
+    let response = f.raw(render([10, 0, 0, 3])).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains("Server unavailable"));
+}
