@@ -27,6 +27,9 @@ pub struct UiPrincipal {
     pub viewing_epoch: String,
     /// CSRF token for this browser session, embedded for the external command module.
     pub csrf_token: String,
+    /// The no-login household viewer of a trusted-household server: no
+    /// sign-in methods of its own, and a way for an administrator to sign in.
+    pub household: bool,
 }
 
 impl UiPrincipal {
@@ -113,6 +116,8 @@ pub struct VersionView {
 pub struct TimelineViewing {
     pub position_ms: u64,
     pub watched: bool,
+    /// The viewing state's revision; a watched override must match it.
+    pub revision: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

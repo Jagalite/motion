@@ -219,7 +219,7 @@ fn problem(reply: &Reply, status: StatusCode, code: &str) {
 
 #[tokio::test]
 async fn pairing_lifecycle_idempotency_and_claim_replay() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let pairing = f
         .call(
@@ -388,7 +388,7 @@ async fn pairing_lifecycle_idempotency_and_claim_replay() {
 
 #[tokio::test]
 async fn access_tokens_are_bounded_children_and_replay_exactly() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let (_, device) = f.pair(&[], &["catalog:read"]).await;
     let device_auth = bearer(&device);
     let headers = [
@@ -479,7 +479,7 @@ async fn access_tokens_are_bounded_children_and_replay_exactly() {
 
 #[tokio::test]
 async fn revocation_is_conditional_and_denies_every_credential() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let (device_id, token) = f.pair(&[], &["catalog:read"]).await;
     let access = f
@@ -585,7 +585,7 @@ async fn revocation_is_conditional_and_denies_every_credential() {
 
 #[tokio::test]
 async fn browser_sessions_require_origin_cookie_flags_and_csrf() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let (_, token) = f.pair(&["default"], &["catalog:read"]).await;
     let exchange = json!({"kind":"credential","credential":token});
     let no_origin = f
@@ -715,7 +715,7 @@ async fn browser_sessions_require_origin_cookie_flags_and_csrf() {
 
 #[tokio::test]
 async fn profiles_are_scoped_conditional_and_idempotent() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let create = |key: &'static str, name: &'static str| {
         let operator = operator.clone();
@@ -867,7 +867,7 @@ async fn profiles_are_scoped_conditional_and_idempotent() {
 
 #[tokio::test]
 async fn device_policy_is_validated_and_advances_the_principal_revision() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let (device_id, token) = f.pair(&[], &["catalog:read"]).await;
     let path = format!("/api/v2/devices/{device_id}/policy");
@@ -961,7 +961,7 @@ async fn sse(body: &mut Body, count: usize) -> (Vec<(String, Value)>, bool) {
 
 #[tokio::test]
 async fn event_stream_is_scoped_resets_on_policy_and_ends_on_revocation() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let (_, silent) = f.pair(&["default"], &["catalog:read"]).await;
     let denied = f
@@ -1113,7 +1113,7 @@ async fn event_stream_is_scoped_resets_on_policy_and_ends_on_revocation() {
 
 #[tokio::test]
 async fn page_event_cursor_resumes_without_reset() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     let page = f
         .call(
@@ -1381,7 +1381,7 @@ async fn retired_routes_are_absent_in_every_mode_without_state_mutation() {
 
 #[tokio::test]
 async fn problems_contract_and_capabilities() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let operator = bearer(OPERATOR);
     problem(
         &f.call("GET", "/api/v2/nope", None, &[]).await,
@@ -1489,7 +1489,7 @@ async fn problems_contract_and_capabilities() {
 
 #[tokio::test]
 async fn revocation_after_admission_is_enforced_inside_the_transaction() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let (device_id, token) = f.pair(&["default"], &["profiles:manage"]).await;
     let mut headers = HeaderMap::new();
     headers.insert("authorization", bearer(&token).parse().unwrap());
@@ -5025,4 +5025,193 @@ async fn administrator_user_edit_ignores_revoked_device_label_overflow() {
         )
         .await;
     assert_eq!(device_before.body, device_after.body);
+}
+
+#[tokio::test]
+async fn household_viewer_needs_household_mode_and_no_credential() {
+    let restricted = Fixture::new(AccessMode::Restricted).await;
+    let me = restricted.call("GET", "/api/v2/me", None, &[]).await;
+    assert_eq!(me.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(me.body["code"], "authentication_required");
+
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let me = f.call("GET", "/api/v2/me", None, &[]).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.body["id"], "household");
+    assert_eq!(me.body["mode"], "household");
+    assert_eq!(me.body["device_id"], Value::Null);
+    let mut permissions: Vec<String> = me.body["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().into())
+        .collect();
+    permissions.sort();
+    assert_eq!(
+        permissions,
+        [
+            "catalog:read",
+            "events:read",
+            "playback:request",
+            "viewing:write"
+        ]
+    );
+    assert!(
+        me.body["profile_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("default"))
+    );
+    // Every existing library is readable without signing in.
+    let libraries = f.call("GET", "/api/v2/libraries", None, &[]).await;
+    assert_eq!(libraries.status, StatusCode::OK, "{}", libraries.body);
+    assert!(libraries.body.to_string().contains(&f.library));
+
+    // A presented credential is enforced, never downgraded to the household.
+    for headers in [
+        vec![("authorization", "Bearer not-a-real-token")],
+        vec![("authorization", "Basic abc")],
+        vec![("cookie", "motion_session=not-a-real-session")],
+    ] {
+        let me = f.call("GET", "/api/v2/me", None, &headers).await;
+        assert_eq!(me.status, StatusCode::UNAUTHORIZED, "{headers:?}");
+    }
+    // A paired device keeps its own (narrower or wider) identity.
+    let (device, token) = f.pair(&["default"], &["catalog:read"]).await;
+    let me = f
+        .call(
+            "GET",
+            "/api/v2/me",
+            None,
+            &[("authorization", &bearer(&token))],
+        )
+        .await;
+    assert_eq!(
+        (me.body["id"].as_str(), me.body["mode"].as_str()),
+        (Some(device.as_str()), Some("paired"))
+    );
+
+    // Capabilities say which mode is in effect.
+    let household_feature = |reply: &Reply| {
+        reply.body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|feature| feature["id"] == "access.household_viewer")
+            .unwrap()["enabled"]
+            .clone()
+    };
+    let on = f
+        .call("GET", "/api/v2/system/capabilities", None, &[])
+        .await;
+    assert_eq!(household_feature(&on), true);
+    let off = restricted
+        .call(
+            "GET",
+            "/api/v2/system/capabilities",
+            None,
+            &[("authorization", &bearer(OPERATOR))],
+        )
+        .await;
+    assert_eq!(household_feature(&off), false);
+}
+
+#[tokio::test]
+async fn household_viewer_is_never_an_administrator_and_needs_csrf_to_write() {
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let csrf = playscale::v2::auth::household_csrf(&f.app);
+    // Administration is refused, not hidden behind a sign-in prompt.
+    for path in ["/api/v2/users", "/api/v2/devices"] {
+        let reply = f.call("GET", path, None, &[]).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::FORBIDDEN,
+            "{path}: {}",
+            reply.body
+        );
+    }
+    // Unsafe requests without the derived token are cross-site-forgeable: refused.
+    for token in [None, Some("csrf_wrong")] {
+        let mut headers = vec![("idempotency-key", "household-library-attempt-1")];
+        if let Some(token) = token {
+            headers.push(("x-csrf-token", token));
+        }
+        let reply = f
+            .call(
+                "POST",
+                "/api/v2/libraries",
+                Some(json!({"name":"x","kind":"movies","language":"en","source_ids":[]})),
+                &headers,
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(reply.body["code"], "csrf_required");
+    }
+    // With the token, the request reaches authorization, which refuses it.
+    let reply = f
+        .call(
+            "POST",
+            "/api/v2/libraries",
+            Some(json!({"name":"x","kind":"movies","language":"en","source_ids":[]})),
+            &[
+                ("x-csrf-token", &csrf),
+                ("idempotency-key", "household-library-attempt-2"),
+            ],
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.body["code"], "permission_denied");
+    // A pending pairing cannot be approved by the household viewer.
+    let pairing = f
+        .call(
+            "POST",
+            "/api/v2/auth/pairings",
+            Some(json!({"device_name":"Den TV","client_name":"motion-test"})),
+            &[],
+        )
+        .await;
+    assert_eq!(pairing.status, StatusCode::CREATED);
+    let id = pairing.body["id"].as_str().unwrap();
+    let approve = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{id}/approve"),
+            Some(json!({"user_code":pairing.body["user_code"],"profile_ids":["default"],"permissions":["system:admin"]})),
+            &[("x-csrf-token", &csrf), ("idempotency-key", "household-approve-0001")],
+        )
+        .await;
+    assert_eq!(approve.status, StatusCode::FORBIDDEN, "{}", approve.body);
+    let row: (String,) = sqlx::query_as("SELECT phase FROM pairings WHERE id=?")
+        .bind(id)
+        .fetch_one(&f.app.db)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "pending");
+}
+
+#[tokio::test]
+async fn household_scope_follows_current_profiles() {
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    sqlx::query("INSERT INTO profiles(id,name) VALUES ('kids','Kids')")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let me = f.call("GET", "/api/v2/me", None, &[]).await;
+    assert!(
+        me.body["profile_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("kids"))
+    );
+    sqlx::query("DELETE FROM profiles WHERE id='kids'")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let me = f.call("GET", "/api/v2/me", None, &[]).await;
+    assert!(
+        !me.body["profile_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("kids"))
+    );
 }

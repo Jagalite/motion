@@ -572,13 +572,14 @@ async fn render(State(app): State<App>, mut request: Request) -> Response {
                 Err(error) => return error.into_response(),
             };
             request.extensions_mut().insert(UiPrincipal {
-                principal_id: caller.principal.id,
+                principal_id: caller.principal.id.clone(),
                 profile_id: profile.id.clone(),
                 profile_name: profile.name.clone(),
                 profiles,
                 permissions,
                 server_epoch: app.access.server_epoch.clone(),
                 viewing_epoch: format!("{server_id}:{restore_epoch}"),
+                household: caller.is_household(),
                 csrf_token: caller.csrf.unwrap_or_default(),
             });
         }
@@ -765,6 +766,7 @@ impl UiQueryFacade for Queries {
                 let viewing = self.viewing(who, &timeline).await.map(|v| TimelineViewing {
                     position_ms: v["position_ms"].as_u64().unwrap_or(0),
                     watched: v["watched"].as_bool().unwrap_or(false),
+                    revision: text(&v, "revision"),
                 });
                 // Ready prepared versions, when this caller may save and read
                 // them; each is offered with exactly the selection it kept.

@@ -19054,7 +19054,8 @@
             "enum": [
               "paired",
               "trusted_private",
-              "integration"
+              "integration",
+              "household"
             ]
           }
         },

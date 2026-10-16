@@ -42,7 +42,9 @@ pub struct Args {
     /// Compatibility flag: Topcoat is always the production presentation.
     #[arg(long)]
     pub topcoat: bool,
-    /// Access policy for v2 clients. Retired APIs remain unavailable in every mode.
+    /// restricted (default): every request needs a credential. trusted_household:
+    /// requests without one browse, play and save progress as the household
+    /// viewer, never as an administrator. Retired APIs stay unavailable in both.
     #[arg(long, value_parser = parse_access_mode)]
     pub access_mode: Option<playscale_core::access::AccessMode>,
 }

@@ -233,6 +233,8 @@ async function submitCommand(form) {
     const headers = {};
     if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
     if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
+    // Viewing-history writes name the history they were rendered against.
+    if (form.dataset.viewingEpoch) headers['X-Motion-Viewing-Epoch'] = form.dataset.viewingEpoch;
     button?.setAttribute('disabled', '');
     if (status) status.textContent = 'Working…';
     const result = await call(method, path, body, headers);

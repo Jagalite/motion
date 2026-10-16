@@ -356,7 +356,9 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     </ul>
                                 }
                                 <ul class="nav-list nav-foot">
-                                    nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
+                                    if !who.household {
+                                        nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
+                                    }
                                     nav_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profiles".to_string(), icon_name: "profiles", current: path.starts_with("/profiles"))
                                 </ul>
                             </nav>
@@ -395,6 +397,9 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                         <span class="profile">"Profile: " (who.profile_name.as_str())</span>
                                     }
                                     <a class="avatar" href=(href!(crate::screens::profiles)) aria-label=(format!("Profile: {}", who.profile_name))>(initial.as_str())</a>
+                                    if who.household {
+                                        <a class="button" href="/signin">"Sign in"</a>
+                                    }
                                 </div>
                             </header>
                         }
@@ -647,6 +652,24 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                         icon(name: "play")
                                         if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) { "Resume" } else { "Play" }
                                     </a>
+                                    if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) {
+                                        <a class="button" href=(format!("{}?from=start", href!(play, TimelineId(timeline.id.as_str())).resolve(cx)))>"Start over"</a>
+                                    }
+                                }
+                                if let (true, Some(viewing)) = (who.can("viewing:write"), &timeline.viewing) {
+                                    crate::screens::command_form(
+                                        command: format!("PUT /api/v2/profiles/{}/timelines/{}/viewing", who.profile_id, timeline.id),
+                                        label: if viewing.watched { "Mark unwatched" } else { "Mark watched" },
+                                        if_match: Some(format!("\"r-{}\"", viewing.revision)),
+                                        class: Some("command viewing-mark"),
+                                        viewing_epoch: Some(who.viewing_epoch.clone()),
+                                        // Unwatched starts the title over; watched keeps the position.
+                                        json_body: Some(if viewing.watched {
+                                            r#"{"manual_watched":false,"reset_position":true}"#
+                                        } else {
+                                            r#"{"manual_watched":true,"reset_position":false}"#
+                                        }.to_string()),
+                                    )
                                 }
                                 if who.can("downloads:manage") {
                                     download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone(), prepared: timeline.prepared_downloads.clone(), incomplete: timeline.prepared_incomplete, subtitled: timeline.subtitle_downloads.clone())
@@ -791,7 +814,14 @@ async fn manage(cx: &Cx) -> Result<impl View> {
 async fn play(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let id = path_param::<TimelineId>(cx);
-    let view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
+    let mut view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
+    // "Start over" from the title page; progress then saves from the start.
+    if uri(cx)
+        .query()
+        .is_some_and(|q| q.split('&').any(|pair| pair == "from=start"))
+    {
+        view_model.resume_ms = 0;
+    }
     let preferences = facade(cx)
         .0
         .profiles(who)

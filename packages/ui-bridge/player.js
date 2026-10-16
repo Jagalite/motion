@@ -383,11 +383,27 @@ async function recoverViewing(data, current) {
   } finally { owner.active = false; }
 }
 
+// Volume and mute carry over to later titles and visits in this browser.
+const AUDIO_KEY = 'motion:audio';
+function storedAudio() {
+  try {
+    const value = JSON.parse(localStorage.getItem(AUDIO_KEY) ?? 'null');
+    return value && Number.isFinite(value.volume) && value.volume >= 0 && value.volume <= 1
+      && typeof value.muted === 'boolean' ? {volume: value.volume, muted: value.muted} : null;
+  } catch { return null; }
+}
+function rememberAudio(observation) {
+  if (!Number.isFinite(observation?.volume) || typeof observation?.muted !== 'boolean') return;
+  const value = JSON.stringify({volume: observation.volume, muted: observation.muted});
+  try { if (localStorage.getItem(AUDIO_KEY) !== value) localStorage.setItem(AUDIO_KEY, value); } catch { /* not remembered */ }
+}
+
 function observeViewing(element, generation, writer, current) {
   let last = 0;
   let previous;
   return element.player.subscribe(observation => {
     if (!current()) return;
+    rememberAudio(observation);
     const logical = Math.max(0, Math.round(observation.currentTime * 1000 + generation.media_time_origin_ms));
     const output = document.getElementById('motion-position');
     if (output && Number.isSafeInteger(logical)) output.textContent = `${(logical / 1000).toFixed(1)} / ${(Number(host.dataset.durationMs) / 1000).toFixed(1)} seconds`;
@@ -560,7 +576,9 @@ async function attachPreviews(element, base, timeline, source) {
 async function preparePlayer(generation, position, current, savedPreferences = null, {inert = false, source = state.delivery?.source} = {}) {
   const data = host.dataset;
   const previous = state.element?.player.state;
-  const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate} : null);
+  const remembered = storedAudio();
+  const preferences = savedPreferences ?? (previous ? {volume: previous.volume, muted: previous.muted, rate: previous.playbackRate}
+    : remembered ? {...remembered, rate: 1} : null);
   const shared = await loadDemuxe(data.demuxeBase);
   if (!current()) throw new Error('Playback ownership changed.');
   const element = document.createElement('demuxe-player');

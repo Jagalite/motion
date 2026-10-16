@@ -58,7 +58,7 @@ impl Fixture {
                 Default::default(),
             )),
             access: Arc::new(playscale::v2::Runtime::new(
-                AccessMode::TrustedHousehold,
+                AccessMode::Restricted,
                 playscale::v2::auth::random_key(),
             )),
         };

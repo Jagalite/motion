@@ -218,9 +218,14 @@ pub async fn capabilities(
             true,
             app.access.settings.trusted_ingress.is_some(),
         ),
-        // Every live route enforces v2 grants after retirement, including
-        // configurations that retain the historical household mode value.
+        // Every live route enforces v2 grants after retirement; the household
+        // viewer is itself a narrow v2 grant, never a bypass.
         feature("access.restricted_mode", true, true),
+        feature(
+            "access.household_viewer",
+            true,
+            app.access.mode == playscale_core::access::AccessMode::TrustedHousehold,
+        ),
         feature("events.scoped_stream", true, true),
         feature("catalog.v2", true, true),
         playback,

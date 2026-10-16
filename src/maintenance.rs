@@ -427,7 +427,7 @@ mod tests {
                 Default::default(),
             )),
             access: Arc::new(crate::v2::Runtime::new(
-                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale_core::access::AccessMode::Restricted,
                 crate::v2::auth::random_key(),
             )),
         }

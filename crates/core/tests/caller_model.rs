@@ -1,10 +1,11 @@
 //! Bounded caller-source reauthentication using the production core policy.
 use playscale_core::access::{
-    AccessError, Authentication, Credential, CredentialKind, Device, Grant, Mode, Permission,
-    Policy, Principal, authenticate_caller,
+    AccessError, AccessMode, Authentication, Credential, CredentialKind, Device, Grant,
+    HouseholdScope, Mode, Permission, Policy, Principal, authenticate_caller,
 };
 use sha2::{Digest, Sha256};
 use stateless::{Check, Enumerate, Model, ModelError, ModelMetadata, Transition, TransitionRef};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
@@ -15,6 +16,10 @@ struct State {
     rotated: bool,
     downgraded: bool,
     now: i64,
+    /// Deployment mode, as chosen at the last (re)start.
+    household: bool,
+    library: bool,
+    profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,7 +29,21 @@ enum Source {
     Session,
     Ingress,
     WrongIngressDevice,
+    /// No bearer token and no session cookie.
+    Anonymous,
+    /// A credential was presented but did not resolve (malformed, unknown).
+    RejectedCredential,
 }
+
+const SOURCES: [Source; 7] = [
+    Source::Operator,
+    Source::Device,
+    Source::Session,
+    Source::Ingress,
+    Source::WrongIngressDevice,
+    Source::Anonymous,
+    Source::RejectedCredential,
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Input {
@@ -35,6 +54,11 @@ enum Input {
     Rotate,
     Downgrade,
     At(i64),
+    Restart { household: bool },
+    AddLibrary,
+    RemoveLibrary,
+    AddProfile,
+    RemoveProfile,
     Reauthenticate(Source),
 }
 
@@ -80,7 +104,22 @@ fn observe(s: &State, source: Source) -> Result<Principal, AccessError> {
         ..parent.clone()
     };
     let device = s.device.then_some(&device);
+    let library_ids: BTreeSet<String> = s.library.then(|| "l".to_string()).into_iter().collect();
+    let profile_ids: BTreeSet<String> = s.profile.then(|| "p".to_string()).into_iter().collect();
+    let mode = if s.household {
+        AccessMode::TrustedHousehold
+    } else {
+        AccessMode::Restricted
+    };
     let facts = match source {
+        Source::Anonymous | Source::RejectedCredential => Authentication::Household {
+            mode,
+            presented: matches!(source, Source::RejectedCredential),
+            scope: HouseholdScope {
+                library_ids: &library_ids,
+                profile_ids: &profile_ids,
+            },
+        },
         Source::Operator => Authentication::VerifiedLocalOperator,
         Source::Device | Source::Session => Authentication::Credential {
             credential: s.credential.then_some(&credential),
@@ -104,6 +143,33 @@ fn observe(s: &State, source: Source) -> Result<Principal, AccessError> {
 fn expected(s: &State, source: Source) -> Result<Principal, AccessError> {
     if matches!(source, Source::Operator) {
         return Ok(Principal::operator());
+    }
+    if matches!(source, Source::Anonymous | Source::RejectedCredential) {
+        // Only a credential-less request in a household deployment, and then
+        // exactly the viewer grant over what exists now; never administration.
+        if !s.household || matches!(source, Source::RejectedCredential) {
+            return Err(AccessError::Unauthenticated);
+        }
+        return Ok(Principal {
+            id: "household".into(),
+            device_id: None,
+            mode: Mode::Household,
+            grant: Grant {
+                profile_ids: s.profile.then(|| "p".to_string()).into_iter().collect(),
+                permissions: [
+                    Permission::CatalogRead,
+                    Permission::PlaybackRequest,
+                    Permission::ViewingWrite,
+                    Permission::EventsRead,
+                ]
+                .into(),
+            },
+            policy: Policy {
+                library_ids: s.library.then(|| "l".to_string()).into_iter().collect(),
+                ..Policy::default()
+            },
+            policy_revision: 0,
+        });
     }
     let ingress = matches!(source, Source::Ingress | Source::WrongIngressDevice);
     if !s.device
@@ -147,7 +213,7 @@ impl Model for Callers {
     fn metadata(&self) -> ModelMetadata {
         ModelMetadata {
             name: "motion.caller_sources".into(),
-            model_version: 1,
+            model_version: 2,
             properties_version: 1,
             codec_version: 1,
             // Fingerprint the complete source without embedding an unbounded string
@@ -168,6 +234,9 @@ impl Model for Callers {
             rotated: false,
             downgraded: false,
             now: 0,
+            household: false,
+            library: true,
+            profile: true,
         })
     }
 
@@ -184,6 +253,11 @@ impl Model for Callers {
                     Input::Rotate => next.rotated = true,
                     Input::Downgrade => next.downgraded = true,
                     Input::At(now) => next.now = *now,
+                    Input::Restart { household } => next.household = *household,
+                    Input::AddLibrary => next.library = true,
+                    Input::RemoveLibrary => next.library = false,
+                    Input::AddProfile => next.profile = true,
+                    Input::RemoveProfile => next.profile = false,
                     Input::Reauthenticate(_) => unreachable!(),
                 }
                 Effect::Changed
@@ -194,22 +268,32 @@ impl Model for Callers {
 
     fn check_state(&self, state: &State) -> Result<Vec<Check>, ModelError> {
         // Check every source after every mutation, including terminal states.
-        Ok([
-            Source::Operator,
-            Source::Device,
-            Source::Session,
-            Source::Ingress,
-            Source::WrongIngressDevice,
-        ]
-        .into_iter()
-        .map(|source| {
-            if observe(state, source) == expected(state, source) {
-                Check::passed("caller.current_source_facts")
+        let mut checks: Vec<Check> = SOURCES
+            .into_iter()
+            .map(|source| {
+                if observe(state, source) == expected(state, source) {
+                    Check::passed("caller.current_source_facts")
+                } else {
+                    Check::failed("caller.current_source_facts", "unexpected authority")
+                }
+            })
+            .collect();
+        // Stated directly as well: the household viewer is never an
+        // administrator and never outlives a restricted restart.
+        let household = observe(state, Source::Anonymous);
+        checks.push(
+            if household.as_ref().is_ok_and(|p| p.is_admin())
+                || (!state.household && household.is_ok())
+            {
+                Check::failed(
+                    "caller.household_viewer_bounded",
+                    "household authority escaped",
+                )
             } else {
-                Check::failed("caller.current_source_facts", "unexpected authority")
-            }
-        })
-        .collect())
+                Check::passed("caller.household_viewer_bounded")
+            },
+        );
+        Ok(checks)
     }
 
     fn check_transition(
@@ -246,23 +330,26 @@ impl Enumerate for Callers {
             Input::Revoke,
             Input::Rotate,
             Input::Downgrade,
+            Input::Restart {
+                household: !s.household,
+            },
+            if s.library {
+                Input::RemoveLibrary
+            } else {
+                Input::AddLibrary
+            },
+            if s.profile {
+                Input::RemoveProfile
+            } else {
+                Input::AddProfile
+            },
         ];
         for time in [99, 100] {
             if time > s.now {
                 inputs.push(Input::At(time));
             }
         }
-        inputs.extend(
-            [
-                Source::Operator,
-                Source::Device,
-                Source::Session,
-                Source::Ingress,
-                Source::WrongIngressDevice,
-            ]
-            .into_iter()
-            .map(Input::Reauthenticate),
-        );
+        inputs.extend(SOURCES.into_iter().map(Input::Reauthenticate));
         Ok(inputs)
     }
 }
@@ -272,8 +359,8 @@ fn caller_sources_never_infer_operator_from_missing_facts() {
     let report = stateless::explore::enumerate(
         &Callers,
         stateless::explore::SearchConfig {
-            max_states: 1_000,
-            max_transitions: 20_000,
+            max_states: 5_000,
+            max_transitions: 200_000,
             max_depth: 20,
         },
     )
@@ -284,9 +371,9 @@ fn caller_sources_never_infer_operator_from_missing_facts() {
         report.termination,
         stateless::explore::SearchTermination::GraphExhausted
     );
-    assert_eq!(report.states, 192);
+    assert_eq!(report.states, 1_536);
     println!(
-        "Caller model: {} states, {} transitions; one device and parent/session chain, five explicit sources, deletion/revoke/rotation/downgrade interleavings, time 0/99/100",
+        "Caller model: {} states, {} transitions; one device and parent/session chain, seven explicit sources (incl. anonymous and rejected-credential household fallback), deletion/revoke/rotation/downgrade, restricted/household restarts, library/profile add/remove interleavings, time 0/99/100",
         report.states, report.transitions
     );
 }

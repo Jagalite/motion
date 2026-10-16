@@ -230,7 +230,10 @@ async fn presentation_identity(
             .await
         {
             Ok(caller) => {
-                if let Err(error) = app.access.admit_request(&caller.principal.id) {
+                if let Err(error) = app
+                    .access
+                    .admit_request(&caller.rate_key(request.extensions()))
+                {
                     return error.into_response();
                 }
                 Some(caller)
