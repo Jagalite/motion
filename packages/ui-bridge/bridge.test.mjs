@@ -450,7 +450,9 @@ test('watched marks retry a progress-only conflict once and never a manual one',
   // Playback started elsewhere after rendering: a new session, same epoch.
   assert.equal(markRetryRevision({...same, session_id: 's2'}, '2', 's1'), null);
   assert.equal(markRetryRevision(same, '2', ''), null);
-  assert.equal(markRetryRevision({...same, session_id: null}, '2', ''), '7');
+  // Offline progress sync advances revision with no session: never retried.
+  assert.equal(markRetryRevision({...same, session_id: null}, '2', ''), null);
+  assert.equal(markRetryRevision({...same, session_id: null}, '2', 's1'), null);
   assert.equal(markRetryRevision({...same, revision: 'x'}, '2', 's1'), null);
   assert.equal(markRetryRevision(null, '2', 's1'), null);
   assert.equal(markRetryRevision(same, '', 's1'), null);

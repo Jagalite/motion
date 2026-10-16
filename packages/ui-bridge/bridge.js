@@ -214,12 +214,14 @@ const submitting = new WeakSet();
  * conflicts only with that automatic progress. Retry once at the current
  * revision while neither a manual watched change (same manual epoch) nor a
  * new viewing session (same session) happened since the page rendered; any
- * other conflict, such as playback starting elsewhere, stands for the user.
+ * other conflict, such as playback starting elsewhere or offline progress
+ * syncing (which clears the session), stands for the user. Without a rendered
+ * session there is no late report to recover, so there is no retry.
  */
 function markRetryRevision(current, renderedManualEpoch, renderedSession) {
   const valid = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
   if (!valid || typeof renderedManualEpoch !== 'string' || renderedManualEpoch === '') return null;
-  if (typeof renderedSession !== 'string' || (current.session_id ?? '') !== renderedSession) return null;
+  if (typeof renderedSession !== 'string' || renderedSession === '' || current.session_id !== renderedSession) return null;
   return current.manual_epoch === renderedManualEpoch ? current.revision : null;
 }
 
