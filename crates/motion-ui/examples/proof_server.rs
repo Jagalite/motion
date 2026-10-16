@@ -126,6 +126,7 @@ async fn authenticate(State(state): State<AppState>, mut request: Request, next:
             server_epoch: "proof-epoch".into(),
             viewing_epoch: "server:restore".into(),
             csrf_token: csrf,
+            household: false,
         });
     } else if request.uri().path().starts_with("/api/v2/")
         && request.uri().path() != "/api/v2/auth/session"

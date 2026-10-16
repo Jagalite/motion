@@ -13,10 +13,11 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use playscale_core::access::{
-    AccessError, Authentication, Credential, CredentialKind, Device, Grant, Permission, Principal,
-    authenticate_caller,
+    AccessError, AccessMode, Authentication, Credential, CredentialKind, Device, Grant,
+    HouseholdScope, Permission, Principal, authenticate_caller,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io::Write;
 
 pub const SESSION_COOKIE: &str = "motion_session";
@@ -64,6 +65,7 @@ pub enum Purpose {
     Ticket,
     IngressCsrf,
     Invitation,
+    HouseholdCsrf,
 }
 
 impl Purpose {
@@ -76,6 +78,7 @@ impl Purpose {
             Self::Ticket => "mtk",
             Self::IngressCsrf => "csrf",
             Self::Invitation => "min",
+            Self::HouseholdCsrf => "csrf",
         }
     }
 }
@@ -148,6 +151,64 @@ fn decode(row: DeviceTuple) -> Result<DeviceRow, Problem> {
 }
 
 const DEVICE_COLUMNS: &str = "id,name,client_name,revision,profile_ids,permissions,policy,revoked,generation,credential_expires_at,user_id";
+
+/// Every library and profile that exists now: the household viewer's scope.
+pub async fn load_household_scope(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), Problem> {
+    let libraries: Vec<String> = sqlx::query_scalar("SELECT id FROM libraries")
+        .fetch_all(&mut *conn)
+        .await?;
+    let profiles: Vec<String> = sqlx::query_scalar("SELECT id FROM profiles")
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok((
+        libraries.into_iter().collect(),
+        profiles.into_iter().collect(),
+    ))
+}
+
+async fn authenticate_household(
+    conn: &mut sqlx::SqliteConnection,
+    mode: AccessMode,
+    presented: bool,
+    now: i64,
+) -> Result<Principal, AccessError> {
+    // Restricted deployments never read scope for credential-less requests.
+    if mode != AccessMode::TrustedHousehold || presented {
+        return authenticate_caller(
+            Authentication::Household {
+                mode,
+                presented,
+                scope: HouseholdScope {
+                    library_ids: &BTreeSet::new(),
+                    profile_ids: &BTreeSet::new(),
+                },
+            },
+            now,
+        );
+    }
+    let (library_ids, profile_ids) = load_household_scope(conn)
+        .await
+        .map_err(|_| AccessError::Unauthenticated)?;
+    authenticate_caller(
+        Authentication::Household {
+            mode,
+            presented,
+            scope: HouseholdScope {
+                library_ids: &library_ids,
+                profile_ids: &profile_ids,
+            },
+        },
+        now,
+    )
+}
+
+/// The household viewer has no stored session, so its CSRF token is derived
+/// from the server key; cross-site pages cannot read it.
+pub fn household_csrf(app: &App) -> String {
+    derive_secret(&app.access.key, Purpose::HouseholdCsrf, "household")
+}
 
 pub async fn load_device(
     conn: &mut sqlx::SqliteConnection,
@@ -353,8 +414,17 @@ pub struct Caller {
 #[derive(Clone, Debug)]
 enum CallerSource {
     LocalOperator,
-    Credential { hash: String, admitted: Credential },
-    TrustedIngress { device_id: String },
+    Credential {
+        hash: String,
+        admitted: Credential,
+    },
+    TrustedIngress {
+        device_id: String,
+    },
+    /// No credential presented in a trusted-household deployment.
+    Household {
+        mode: AccessMode,
+    },
 }
 
 /// Marks requests that arrived through the trusted private-ingress listener.
@@ -387,6 +457,24 @@ impl Caller {
 
     pub fn is_local_operator(&self) -> bool {
         matches!(self.source, CallerSource::LocalOperator)
+    }
+
+    pub fn is_household(&self) -> bool {
+        matches!(self.source, CallerSource::Household { .. })
+    }
+
+    /// Rate-limit bucket. Household requests share one principal, so each
+    /// client address gets its own bucket and one device cannot starve others.
+    pub(crate) fn rate_key(&self, extensions: &axum::http::Extensions) -> String {
+        match (
+            &self.source,
+            extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>(),
+        ) {
+            (CallerSource::Household { .. }, Some(info)) => {
+                format!("{}@{}", self.principal.id, info.0.ip())
+            }
+            _ => self.principal.id.clone(),
+        }
     }
 
     pub fn require(&self, permission: Permission) -> Result<(), Problem> {
@@ -434,6 +522,9 @@ impl Caller {
                 Authentication::VerifiedLocalOperator,
                 now,
             )?),
+            CallerSource::Household { mode } => {
+                Ok(authenticate_household(conn, *mode, false, now).await?)
+            }
             CallerSource::Credential { hash, admitted } => {
                 let stored = load_credential(conn, hash)
                     .await?
@@ -469,6 +560,18 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<&str> {
         .filter_map(|pair| pair.trim().split_once('='))
         .find(|(name, _)| *name == SESSION_COOKIE)
         .map(|(_, value)| value)
+}
+
+/// Whether any Cookie header names the session cookie, judged on raw bytes so
+/// a header that fails to parse still counts as a presented credential.
+fn session_cookie_presented(headers: &HeaderMap) -> bool {
+    headers.get_all(header::COOKIE).iter().any(|value| {
+        value.as_bytes().split(|b| *b == b';').any(|pair| {
+            pair.trim_ascii_start()
+                .strip_prefix(SESSION_COOKIE.as_bytes())
+                .is_some_and(|rest| rest.trim_ascii_start().starts_with(b"="))
+        })
+    })
 }
 
 /// Digest comparison avoids leaking the operator token through timing.
@@ -560,7 +663,34 @@ pub async fn resolve_with(
             csrf: None,
         });
     }
-    let token = session_cookie(headers).ok_or(AccessError::Unauthenticated)?;
+    let Some(token) = session_cookie(headers) else {
+        let mode = app.access.mode;
+        // Any trace of a credential is enforced: never a household fallback.
+        let presented =
+            headers.contains_key(header::AUTHORIZATION) || session_cookie_presented(headers);
+        let principal = authenticate_household(&mut conn, mode, presented, now).await?;
+        let csrf = household_csrf(app);
+        if !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            // Household identity is ambient, like a cookie: unsafe requests
+            // need the derived CSRF token (the boundary already checks origin).
+            let presented = headers
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if Sha256::digest(presented.as_bytes()) != Sha256::digest(csrf.as_bytes()) {
+                return Err(Problem::new(
+                    StatusCode::FORBIDDEN,
+                    "csrf_required",
+                    "Household unsafe requests require X-CSRF-Token",
+                ));
+            }
+        }
+        return Ok(Caller {
+            principal,
+            source: CallerSource::Household { mode },
+            csrf: Some(csrf),
+        });
+    };
     let hash = token_hash(token);
     let stored = load_credential(&mut conn, &hash)
         .await?
@@ -598,7 +728,8 @@ impl FromRequestParts<App> for Caller {
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Problem> {
         let ingress = parts.extensions.get::<TrustedIngress>().copied();
         let caller = resolve_with(app, &parts.method, &parts.headers, ingress).await?;
-        app.access.admit_request(&caller.principal.id)?;
+        app.access
+            .admit_request(&caller.rate_key(&parts.extensions))?;
         Ok(caller)
     }
 }

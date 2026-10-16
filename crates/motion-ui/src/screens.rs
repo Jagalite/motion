@@ -145,6 +145,9 @@ pub(crate) async fn command_form(
     #[default] class: Option<&'static str>,
     #[default] file_body: bool,
     #[default] json_body: Option<String>,
+    #[default] viewing_epoch: Option<String>,
+    #[default] viewing_manual_epoch: Option<String>,
+    #[default] viewing_session: Option<String>,
     #[default] child: Child<'_>,
 ) -> Result<impl View> {
     let body_kind = if file_body {
@@ -158,6 +161,9 @@ pub(crate) async fn command_form(
         <form class=(class.unwrap_or("command")) data-command=(command.as_str())
             data-idempotent=(if idempotent { "true" } else { "false" })
             data-if-match=(if_match.as_deref())
+            data-viewing-epoch=(viewing_epoch.as_deref())
+            data-viewing-manual-epoch=(viewing_manual_epoch.as_deref())
+            data-viewing-session=(viewing_session.as_deref())
             data-body=(body_kind)>
             if let Some(body) = &json_body {
                 <input type="hidden" data-json-body="" value=(body.as_str())>

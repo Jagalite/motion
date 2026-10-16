@@ -108,7 +108,7 @@ async fn app(dir: &Path) -> App {
             Default::default(),
         )),
         access: Arc::new(v2::Runtime::new(
-            AccessMode::TrustedHousehold,
+            AccessMode::Restricted,
             v2::auth::random_key(),
         )),
     }

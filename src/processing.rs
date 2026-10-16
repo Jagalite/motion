@@ -1593,7 +1593,7 @@ mod publication_tests {
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
             access: Arc::new(crate::v2::Runtime::new(
-                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale_core::access::AccessMode::Restricted,
                 crate::v2::auth::random_key(),
             )),
         };
@@ -1714,7 +1714,7 @@ mod publication_tests {
             )),
             processing: Arc::new(Runtime::new(dir.path().join("cache"), Default::default())),
             access: Arc::new(crate::v2::Runtime::new(
-                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale_core::access::AccessMode::Restricted,
                 crate::v2::auth::random_key(),
             )),
         };

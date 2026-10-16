@@ -579,13 +579,18 @@ pub fn may_control(owner: &Owner, principal: &Principal, file: Option<&FileFacts
 /// Revalidate long-lived delivery work against the owner's current device grant.
 /// Credential expiry is enforced by request admission and the delivery lease;
 /// this policy fences device revocation and scope removal even without requests.
+/// `household` is the current household scope, present only while the
+/// deployment admits the household viewer; a household delivery stops without it.
 pub fn may_continue(
     owner: &Owner,
     device: Option<&crate::access::Device>,
+    household: Option<crate::access::HouseholdScope<'_>>,
     file: Option<&FileFacts>,
 ) -> bool {
     let principal = if owner.principal == "operator" {
         Some(Principal::operator())
+    } else if owner.principal == crate::access::HOUSEHOLD_PRINCIPAL_ID {
+        household.map(crate::access::household_principal)
     } else {
         device
             .filter(|d| !d.revoked && d.id == owner.principal)
@@ -1488,5 +1493,58 @@ mod tests {
         // Both rungs leave room for video under their caps.
         assert!(rate_cap(ADAPTIVE_MAIN_BPS, 3_000).is_some());
         assert!(rate_cap(ADAPTIVE_LOW_BPS, 3_000).is_some());
+    }
+
+    #[test]
+    fn household_delivery_continues_only_while_household_mode_admits_it() {
+        use crate::access::{HOUSEHOLD_PRINCIPAL_ID, HouseholdScope};
+        let owner = Owner {
+            principal: HOUSEHOLD_PRINCIPAL_ID.into(),
+            profile: "p".into(),
+            timeline: "t".into(),
+            file: "f".into(),
+            file_revision: "r".into(),
+        };
+        let libraries: std::collections::BTreeSet<String> = ["lib".to_string()].into();
+        let profiles: std::collections::BTreeSet<String> = ["p".to_string()].into();
+        let none = std::collections::BTreeSet::new();
+        let scope = |library_ids, profile_ids| {
+            Some(HouseholdScope {
+                library_ids,
+                profile_ids,
+            })
+        };
+        let file = facts("r", "lib");
+        assert!(may_continue(
+            &owner,
+            None,
+            scope(&libraries, &profiles),
+            Some(&file)
+        ));
+        // Restricted again (no scope observed), library or profile gone: stop.
+        assert!(!may_continue(&owner, None, None, Some(&file)));
+        assert!(!may_continue(
+            &owner,
+            None,
+            scope(&none, &profiles),
+            Some(&file)
+        ));
+        assert!(!may_continue(
+            &owner,
+            None,
+            scope(&libraries, &none),
+            Some(&file)
+        ));
+        // A device delivery never borrows household authority.
+        let device_owner = Owner {
+            principal: "d".into(),
+            ..owner.clone()
+        };
+        assert!(!may_continue(
+            &device_owner,
+            None,
+            scope(&libraries, &profiles),
+            Some(&file)
+        ));
     }
 }

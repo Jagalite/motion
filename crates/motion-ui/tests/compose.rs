@@ -32,6 +32,7 @@ fn principal(profile: &str, permissions: &[&str]) -> UiPrincipal {
         server_epoch: "epoch1".into(),
         viewing_epoch: "server:restore".into(),
         csrf_token: "csrf-abc".into(),
+        household: false,
     }
 }
 

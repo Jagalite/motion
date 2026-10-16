@@ -69,6 +69,9 @@ computer run `motion --operator-token-file <data-dir>/admin-token tui`: press
 code and approve it (see [First run](ACCESS_MANAGEMENT.md#first-run-single-owner)).
 No email, password or SSO is needed. See [Administrator access](ACCESS_MANAGEMENT.md)
 for users, grants, invitations, device revocation and explicit server-local recovery.
+On a trusted home network, `--access-mode trusted_household` lets everyone browse
+and play without signing in
+(see [Household mode](ACCESS_MANAGEMENT.md#household-mode-no-sign-in)).
 Use the exact configured hostname. Local data defaults to `data/`; put it on a local
 disk outside media roots. One process may own a data directory.
 

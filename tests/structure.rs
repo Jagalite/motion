@@ -14,7 +14,7 @@ async fn fixture() -> (tempfile::TempDir, App) {
     std::fs::create_dir(&state).unwrap();
     let app = App {
         access: Arc::new(playscale::v2::Runtime::new(
-            playscale_core::access::AccessMode::TrustedHousehold,
+            playscale_core::access::AccessMode::Restricted,
             playscale::v2::auth::random_key(),
         )),
         health: Arc::new(playscale::operations::Health::new(false)),

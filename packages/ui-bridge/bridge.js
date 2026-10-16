@@ -209,6 +209,22 @@ function restoreAfterReload() {
 restoreAfterReload();
 
 const submitting = new WeakSet();
+/**
+ * A watched mark rendered before the player's final progress report landed
+ * conflicts only with that automatic progress. Retry once at the current
+ * revision while neither a manual watched change (same manual epoch) nor a
+ * new viewing session (same session) happened since the page rendered; any
+ * other conflict, such as playback starting elsewhere or offline progress
+ * syncing (which clears the session), stands for the user. Without a rendered
+ * session there is no late report to recover, so there is no retry.
+ */
+function markRetryRevision(current, renderedManualEpoch, renderedSession) {
+  const valid = typeof current?.revision === 'string' && /^(0|[1-9][0-9]{0,19})$/.test(current.revision);
+  if (!valid || typeof renderedManualEpoch !== 'string' || renderedManualEpoch === '') return null;
+  if (typeof renderedSession !== 'string' || renderedSession === '' || current.session_id !== renderedSession) return null;
+  return current.manual_epoch === renderedManualEpoch ? current.revision : null;
+}
+
 async function submitCommand(form) {
   if (submitting.has(form)) return;
   if (form.classList.contains('invitation')) return redeemBrowserInvitation(form);
@@ -233,9 +249,21 @@ async function submitCommand(form) {
     const headers = {};
     if (form.dataset.idempotent === 'true') headers['Idempotency-Key'] = keyFor(identity);
     if (form.dataset.ifMatch) headers['If-Match'] = form.dataset.ifMatch;
+    // Viewing-history writes name the history they were rendered against.
+    if (form.dataset.viewingEpoch) headers['X-Motion-Viewing-Epoch'] = form.dataset.viewingEpoch;
     button?.setAttribute('disabled', '');
     if (status) status.textContent = 'Working…';
-    const result = await call(method, path, body, headers);
+    let result;
+    try {
+      result = await call(method, path, body, headers);
+    } catch (error) {
+      // A watched mark may race the player's last progress report.
+      const revision = error.status === 412 && form.dataset.viewingManualEpoch !== undefined
+        ? markRetryRevision(await call('GET', path).catch(() => null), form.dataset.viewingManualEpoch,
+          form.dataset.viewingSession ?? '') : null;
+      if (revision === null) throw error;
+      result = await call(method, path, body, {...headers, 'If-Match': `"r-${revision}"`});
+    }
     settleKey(identity);
     // Pairing keeps the button disabled for the whole flow (one flow at a time).
     if (form.classList.contains('pairing')) return await pair(form, result);

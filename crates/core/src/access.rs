@@ -160,15 +160,43 @@ pub enum Mode {
     Paired,
     TrustedPrivate,
     Integration,
+    /// The no-login household viewer of a trusted-household deployment.
+    Household,
 }
 
-/// Persisted deployment setting retained for configuration compatibility.
-/// Both values enforce v2 grants; neither enables retired HTTP routes.
+/// Deployment access policy, chosen explicitly by the operator. `Restricted`
+/// (the default) requires a credential on every request. `TrustedHousehold`
+/// additionally admits requests that present no credential at all as the
+/// household viewer; credentials, when presented, are still enforced, and
+/// neither mode enables retired HTTP routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
     TrustedHousehold,
     Restricted,
+}
+
+/// Principal ID of the household viewer. Device IDs are generated UUIDs and
+/// the operator is `operator`, so this never names a stored device.
+pub const HOUSEHOLD_PRINCIPAL_ID: &str = "household";
+
+/// Everything the household viewer may do: browse, play, keep viewing state
+/// and follow live updates. Never administration, curation, sources,
+/// processing, downloads, profile management or collections.
+pub const HOUSEHOLD_PERMISSIONS: [Permission; 4] = [
+    Permission::CatalogRead,
+    Permission::PlaybackRequest,
+    Permission::ViewingWrite,
+    Permission::EventsRead,
+];
+
+/// Current server state the household viewer's scope is derived from: every
+/// library and every profile that exists now. Re-observed on each request and
+/// each revalidation, so a removed library or profile leaves the scope at once.
+#[derive(Clone, Copy, Debug)]
+pub struct HouseholdScope<'a> {
+    pub library_ids: &'a BTreeSet<String>,
+    pub profile_ids: &'a BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -500,6 +528,14 @@ pub enum Authentication<'a> {
         device_id: &'a str,
         device: Option<&'a Device>,
     },
+    /// A request with no bearer token and no session cookie. `presented` is
+    /// whether any credential was presented at all, however malformed: a
+    /// rejected credential never falls back to the household viewer.
+    Household {
+        mode: AccessMode,
+        presented: bool,
+        scope: HouseholdScope<'a>,
+    },
 }
 
 pub fn authenticate_caller(source: Authentication<'_>, now: i64) -> Result<Principal, AccessError> {
@@ -518,6 +554,61 @@ pub fn authenticate_caller(source: Authentication<'_>, now: i64) -> Result<Princ
         Authentication::TrustedIngress { device_id, device } => {
             authenticate_ingress(device.filter(|d| d.id == device_id))
         }
+        Authentication::Household {
+            mode,
+            presented,
+            scope,
+        } => authenticate_household(mode, presented, scope),
+    }
+}
+
+/// The household viewer, only in a trusted-household deployment and only for
+/// a request that presented no credential. Restricted deployments, and any
+/// request that presented a credential (valid or not), stay unauthenticated
+/// here. Network position plays no part: loopback is not authority.
+pub fn authenticate_household(
+    mode: AccessMode,
+    presented: bool,
+    scope: HouseholdScope<'_>,
+) -> Result<Principal, AccessError> {
+    if mode != AccessMode::TrustedHousehold || presented {
+        return Err(AccessError::Unauthenticated);
+    }
+    Ok(household_principal(scope))
+}
+
+/// Revision of the household grant: a digest of its scope, so adding or
+/// removing a library or profile changes it (open event streams reset and
+/// `/me` revalidates) and an unchanged scope keeps it.
+pub fn household_revision(scope: HouseholdScope<'_>) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (tag, ids) in [(b'l', scope.library_ids), (b'p', scope.profile_ids)] {
+        for id in ids {
+            digest.update([tag]);
+            digest.update((id.len() as u64).to_be_bytes());
+            digest.update(id.as_bytes());
+        }
+    }
+    u64::from_be_bytes(digest.finalize()[..8].try_into().expect("8 bytes"))
+}
+
+/// The household viewer's principal for the current scope: every library and
+/// profile, no rating or label restriction, and only `HOUSEHOLD_PERMISSIONS`.
+pub fn household_principal(scope: HouseholdScope<'_>) -> Principal {
+    Principal {
+        id: HOUSEHOLD_PRINCIPAL_ID.into(),
+        device_id: None,
+        mode: Mode::Household,
+        grant: Grant {
+            profile_ids: scope.profile_ids.clone(),
+            permissions: HOUSEHOLD_PERMISSIONS.into_iter().collect(),
+        },
+        policy: Policy {
+            library_ids: scope.library_ids.clone(),
+            ..Policy::default()
+        },
+        policy_revision: household_revision(scope),
     }
 }
 
@@ -1786,6 +1877,46 @@ mod tests {
             admit_file_bytes(&narrowed, Some(&facts)),
             Err(TicketError::Forbidden(Permission::PlaybackRequest))
         );
+    }
+
+    #[test]
+    fn household_viewer_only_without_credentials_in_household_mode() {
+        let libraries: BTreeSet<String> = ["l1".to_string(), "l2".to_string()].into();
+        let profiles: BTreeSet<String> = ["default".to_string()].into();
+        let scope = HouseholdScope {
+            library_ids: &libraries,
+            profile_ids: &profiles,
+        };
+        // Restricted deployments and presented credentials never fall back.
+        for (mode, presented) in [
+            (AccessMode::Restricted, false),
+            (AccessMode::Restricted, true),
+            (AccessMode::TrustedHousehold, true),
+        ] {
+            assert_eq!(
+                authenticate_household(mode, presented, scope),
+                Err(AccessError::Unauthenticated)
+            );
+        }
+        let p = authenticate_household(AccessMode::TrustedHousehold, false, scope).unwrap();
+        assert_eq!(p.id, HOUSEHOLD_PRINCIPAL_ID);
+        assert_eq!((p.mode, p.device_id.as_deref()), (Mode::Household, None));
+        assert!(!p.is_admin());
+        for permission in Permission::ALL {
+            assert_eq!(
+                p.allows(permission),
+                HOUSEHOLD_PERMISSIONS.contains(&permission),
+                "{permission:?}"
+            );
+        }
+        assert!(p.may_use_profile("default") && !p.may_use_profile("other"));
+        assert_eq!(
+            catalog_scope(&p),
+            CatalogScope::Libraries(libraries.clone())
+        );
+        // Library administration events and other administrative resources stay hidden.
+        assert!(!visible(&p, &Resource::Source));
+        assert!(!visible(&p, &Resource::Administrative));
     }
 
     #[test]

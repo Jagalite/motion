@@ -45,6 +45,7 @@ async fn serve_for_accessibility_audit() {
         server_epoch: "epoch1".into(),
         viewing_epoch: "server:restore".into(),
         csrf_token: "csrf-abc".into(),
+        household: false,
     };
     let app = motion_ui::mount(Router::new(), Arc::new(MockUiQueryFacade), None).layer(
         axum::middleware::from_fn(move |mut request: Request, next: Next| {

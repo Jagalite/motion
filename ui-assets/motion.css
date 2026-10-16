@@ -370,6 +370,12 @@ form.command.stacked { flex-direction: column; align-items: stretch; max-width: 
 form.command.stacked label { display: flex; flex-direction: column; align-items: stretch; gap: .3rem; }
 form.command.stacked textarea { font: inherit; }
 .plan-result { flex-basis: 100%; }
+/* Watched marks are secondary to Play/Resume beside them. */
+form.viewing-mark button[type="submit"] { background: var(--raised); color: var(--fg); border-color: var(--line-strong); font-weight: 600; padding: .55rem 1.1rem; }
+form.viewing-mark .command-status:empty { display: none; }
+@media (hover: hover) {
+  form.viewing-mark button[type="submit"]:hover { background: var(--raised-2); border-color: rgba(255, 255, 255, .3); }
+}
 .artwork-grid { list-style: none; padding: 0; margin: 0 0 1rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr)); gap: .75rem; }
 .artwork img { display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border-radius: var(--radius); background: var(--raised); outline: 2px solid transparent; }
 .artwork.is-selected img { outline-color: var(--accent); }

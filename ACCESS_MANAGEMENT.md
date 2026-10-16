@@ -131,3 +131,36 @@ can run `motion --operator-token-file /path/to/admin-token tui` using the protec
 never paste its contents into a browser or another device. Use the TUI to create
 an administrator identity and approve a new administrator terminal. Possession of
 that protected file establishes operator authority; loopback alone grants none.
+
+
+## Household mode (no sign-in)
+
+By default (`--access-mode restricted`, or `"access_mode": "restricted"` in the
+JSON configuration) every request needs a paired device, a browser session or
+the operator token. For a home server where everyone on the network is trusted,
+start it with:
+
+```sh
+motion --access-mode trusted_household --library /path/to/media
+```
+
+Then anyone who can reach the server can browse, play and save progress without
+signing in, as the built-in **household** viewer. The server says so on every
+start, and warns again if it listens on anything other than this computer.
+
+- The household viewer can read every library, use every viewing profile, play,
+  keep viewing history (resume positions, watched marks) and follow live updates.
+  It cannot administer, edit the catalog, manage sources, request processing,
+  download for offline use, manage profiles or edit collections.
+- Administration is unchanged: use `motion tui` with the operator token, or pair
+  an administrator browser with **Sign in** in the top bar. A signed-in browser
+  uses its own grant; signing out returns it to the household viewer.
+- A request that presents a credential is always checked. A revoked, expired or
+  unknown credential is refused (sign in again or sign out); it never falls back
+  to the household viewer.
+- The household viewer cannot be restricted: per-user library or rating limits
+  do not apply to anyone who chooses not to sign in. Use restricted mode when any
+  viewer must be limited.
+- Each viewing profile keeps its own progress. Create one per person under
+  **Profiles** with an administrator, then pick it in the top bar.
+- Switching back to restricted mode ends household playback at the next restart.

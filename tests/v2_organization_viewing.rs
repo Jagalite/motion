@@ -299,7 +299,7 @@ fn etag(reply: &Reply) -> String {
 
 #[tokio::test]
 async fn saved_filters_are_profile_scoped_conditional_and_idempotent() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     f.seed().await;
     let operator = bearer(OPERATOR);
     let device = f
@@ -580,7 +580,7 @@ async fn saved_filters_are_profile_scoped_conditional_and_idempotent() {
 
 #[tokio::test]
 async fn collections_validate_and_never_disclose_members_outside_the_scope() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let shows = f.seed().await;
     let operator = bearer(OPERATOR);
     let movies = f
@@ -820,7 +820,7 @@ async fn collections_validate_and_never_disclose_members_outside_the_scope() {
 
 #[tokio::test]
 async fn playlists_keep_entries_outside_the_scope_in_place() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let shows = f.seed().await;
     let operator = bearer(OPERATOR);
     let movies = f
@@ -972,7 +972,7 @@ async fn playlists_keep_entries_outside_the_scope_in_place() {
 
 #[tokio::test]
 async fn queues_round_trip_seeds_and_hide_the_current_entry_outside_the_scope() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     f.seed().await;
     let operator = bearer(OPERATOR);
     let movies = f
@@ -1205,7 +1205,7 @@ async fn queues_round_trip_seeds_and_hide_the_current_entry_outside_the_scope() 
 
 #[tokio::test]
 async fn revocation_after_admission_is_enforced_inside_the_transaction() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let (device, token) = f.pair(&["default"], &["collections:write"]).await;
     let token = bearer(&token);
     // Hold the writer lock, so the request is admitted and then waits.
@@ -1239,7 +1239,7 @@ async fn revocation_after_admission_is_enforced_inside_the_transaction() {
 
 #[tokio::test]
 async fn replays_are_redacted_for_the_current_catalog_scope() {
-    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let f = Fixture::new(AccessMode::Restricted).await;
     let shows = f.seed().await;
     let permissions = ["collections:write", "viewing:write", "catalog:read"];
     let (device, token) = f.pair(&["default"], &permissions).await;
