@@ -86,7 +86,7 @@ func (m *Model) poll() tea.Cmd {
 	var cmds []tea.Cmd
 	if m.admin() && m.accessFeature() {
 		switch m.route.page {
-		case pagePairings, pageUsers, pageInvitations, pageDevices:
+		case pagePairings, pageUsers, pageInvitations, pageApprovals, pageDevices:
 			for _, key := range m.route.keys() {
 				if due(key, 5*time.Second) {
 					cmds = append(cmds, m.load(key))

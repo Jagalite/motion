@@ -241,6 +241,118 @@ pub async fn create_user(
     tx.commit().await?;
     Ok(tagged(StatusCode::CREATED, &response, 1))
 }
+#[derive(Serialize)]
+pub struct SetupBody {
+    owner_setup: admin::SetupState,
+    owner: Option<UserBody>,
+    /// The only enabled user, preselected when approving a pairing.
+    pairing_user: Option<UserBody>,
+    eligible_users: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupInput {
+    #[serde(default)]
+    name: Option<String>,
+}
+async fn recorded_owner(conn: &mut sqlx::SqliteConnection) -> Result<Option<String>, Problem> {
+    Ok(
+        sqlx::query_scalar("SELECT user_id FROM access_owner_setup WHERE singleton=1")
+            .fetch_optional(conn)
+            .await?,
+    )
+}
+/// Bounded: counts plus at most two enabled candidates, never every user.
+/// `disabled=0` prefetches the candidates `admin::pairing_eligible` accepts;
+/// the core still decides the suggestion from them.
+async fn setup_body(conn: &mut sqlx::SqliteConnection) -> Result<SetupBody, Problem> {
+    let owner_id = recorded_owner(&mut *conn).await?;
+    let (users, enabled): (i64, i64) =
+        sqlx::query_as("SELECT count(*), coalesce(sum(disabled=0),0) FROM access_users")
+            .fetch_one(&mut *conn)
+            .await?;
+    let rows: Vec<UserRow> = sqlx::query_as(
+        "SELECT id,name,revision,disabled,profile_ids,permissions,policy FROM access_users WHERE disabled=0 ORDER BY id LIMIT 2",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let candidates = rows
+        .into_iter()
+        .map(UserRow::decode)
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner = match owner_id.as_deref() {
+        Some(id) => load_user(&mut *conn, id).await?.as_ref().map(user_body),
+        None => None,
+    };
+    let pairing_user = match admin::pairing_user(&candidates) {
+        admin::PairingUser::Only(user) => Some(user_body(user)),
+        _ => None,
+    };
+    Ok(SetupBody {
+        owner_setup: admin::setup_state(owner_id.is_some(), users as usize),
+        owner,
+        pairing_user,
+        eligible_users: enabled as usize,
+    })
+}
+pub async fn get_setup(State(app): State<App>, caller: Caller) -> Result<Json<SetupBody>, Problem> {
+    caller.require(Permission::SystemAdmin)?;
+    let mut tx = app.db.begin().await?;
+    caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let body = setup_body(&mut tx).await?;
+    tx.commit().await?;
+    Ok(Json(body))
+}
+/// Guided first-run setup. The writer reservation serializes concurrent and
+/// retried requests; the owner user and its singleton record commit together,
+/// so an interrupted attempt leaves no partial owner and a retry creates it.
+pub async fn setup_owner(
+    State(app): State<App>,
+    caller: Caller,
+    headers: HeaderMap,
+    body: Body<SetupInput>,
+) -> Result<Response, Problem> {
+    if let Some(name) = &body.value.name {
+        identity::bounded("name", name, 1, 100)?;
+    }
+    let mut tx = begin_write(&app.db).await?;
+    let principal = caller
+        .reauthorize(&mut tx, Some(Permission::SystemAdmin))
+        .await?;
+    let recorded = recorded_owner(&mut tx).await?.is_some();
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM access_users")
+        .fetch_one(&mut *tx)
+        .await?;
+    let decision = admin::setup_owner(
+        &principal,
+        recorded,
+        users as usize,
+        new_id(),
+        body.value.name.clone(),
+    )?;
+    let status = match decision {
+        admin::OwnerSetup::Completed => StatusCode::OK,
+        admin::OwnerSetup::Create(user) => {
+            super::signin::require_fresh(&mut tx, &caller, &headers, "user.admin", "owner").await?;
+            insert_user(&mut tx, &user).await?;
+            sqlx::query(
+                "INSERT INTO access_owner_setup(singleton,user_id,created_at) VALUES (1,?,?)",
+            )
+            .bind(&user.id)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+            super::signin::audit(&mut tx, &caller.principal.id, &user.id, "owner.setup", "ok")
+                .await?;
+            StatusCode::CREATED
+        }
+    };
+    let body = setup_body(&mut tx).await?;
+    tx.commit().await?;
+    Ok((status, Json(body)).into_response())
+}
 pub async fn replace_user(
     State(app): State<App>,
     caller: Caller,

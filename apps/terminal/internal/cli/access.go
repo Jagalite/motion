@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 	"github.com/Jagalite/motion/apps/terminal/internal/operations"
@@ -154,7 +155,7 @@ func printPolicy(w io.Writer, p api.AccessPolicy) {
 // TUI's access pages do.
 func accessCmd(env *Env) *cobra.Command {
 	cmd := &cobra.Command{Use: "access", Short: "Manage access users, pairing requests and invitations (administrator)"}
-	cmd.AddCommand(pairingsCmd(env), usersCmd(env), invitationsCmd(env))
+	cmd.AddCommand(pairingsCmd(env), usersCmd(env), invitationsCmd(env), setupCmd(env), approvalsCmd(env))
 	return cmd
 }
 
@@ -265,6 +266,80 @@ func printUser(w io.Writer, u api.User) {
 		u.Name, u.ID, state, u.Revision, strings.Join(u.ProfileIDs, ", "), strings.Join(u.Policy.LibraryIDs, ", "),
 		strings.Join(u.Permissions, ", "), u.Policy.AllowUnrated, u.Policy.DenyRated,
 		strings.Join(u.Policy.AllowedRatings, ", "), strings.Join(u.Policy.BlockedLabels, ", "))
+}
+
+func approvalsCmd(env *Env) *cobra.Command {
+	cmd := &cobra.Command{Use: "approvals", Short: "Other devices' requests to make one sensitive change without recent sign-in"}
+	var cursor string
+	var limit int
+	list := &cobra.Command{Use: "list", Args: cobra.NoArgs, RunE: run(env, func(ctx context.Context, c *Conn) error {
+		page, err := operations.ListActionApprovals(ctx, c, operations.PageRequest{Cursor: cursor, Limit: limit})
+		if err != nil {
+			return err
+		}
+		return env.print(page, func(w io.Writer) {
+			rows := [][]string{}
+			for _, a := range page.Items {
+				rows = append(rows, []string{a.ID, a.Status, a.Action, a.Target, a.Actor, unixTime(a.ExpiresAt)})
+			}
+			table(w, "ID\tSTATUS\tACTION\tTARGET\tREQUESTED BY\tEXPIRES", rows)
+			more(w, page.NextCursor)
+		})
+	})}
+	pageFlags(list, &cursor, &limit)
+	var code string
+	approve := &cobra.Command{
+		Use:   "approve APPROVAL_ID",
+		Short: "Approve one request after comparing the code shown on the requesting device",
+		Long:  "Approves exactly the listed action on the listed target for the requesting device, once. That device then submits its reviewed change. Compare the code; never approve a request you did not expect.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if code == "" {
+				return usage("--code is required: use the code shown on the requesting device")
+			}
+			return run(env, func(ctx context.Context, c *Conn) error {
+				if err := operations.ApproveAction(ctx, c, args[0], code); err != nil {
+					return err
+				}
+				return env.print(map[string]string{"approval_id": args[0], "status": "approved"}, func(w io.Writer) {
+					fmt.Fprintf(w, "Approved request %s. The requesting device can now submit its change.\n", sanitize(args[0]))
+				})
+			})(cmd, args)
+		},
+	}
+	approve.Flags().StringVar(&code, "code", "", "code shown on the requesting device")
+	cmd.AddCommand(list, approve)
+	return cmd
+}
+
+func unixTime(seconds int64) string {
+	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
+}
+
+func setupCmd(env *Env) *cobra.Command {
+	var name string
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Create the enabled Owner on a server without users (first run; administrator or local operator)",
+		Long: "On a server without users, create one enabled Owner whose access includes administration. " +
+			"Repeating it returns the same owner; existing users are never adopted. The owner gets no device: " +
+			"approve each device, including your browser, with its code. Loopback connections grant nothing.",
+		Args: cobra.NoArgs,
+		RunE: run(env, func(ctx context.Context, c *Conn) error {
+			s, err := operations.SetupOwner(ctx, c, name)
+			if err != nil {
+				return err
+			}
+			return env.print(s, func(w io.Writer) {
+				if s.Owner != nil {
+					fmt.Fprintf(w, "Owner %s (%s) is ready.\n", sanitize(s.Owner.Name), s.Owner.ID)
+				}
+				fmt.Fprintln(w, "Next: choose Pair this browser on the sign-in page, then compare its code with `motion access pairings list` and run `motion auth approve PAIRING_ID --code CODE`. Add --permission system:admin only to make that device an administrator.")
+			})
+		}),
+	}
+	cmd.Flags().StringVar(&name, "name", "", "owner name (default: Owner)")
+	return cmd
 }
 
 func usersCmd(env *Env) *cobra.Command {

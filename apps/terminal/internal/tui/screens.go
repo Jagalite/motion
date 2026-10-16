@@ -126,7 +126,7 @@ func (m Model) tableChrome(f frame) (strip, detail []string) {
 func (m Model) tableStrip(width int) []string {
 	cw := (width - 6) / 4
 	switch m.route.page {
-	case pagePairings, pageUsers, pageInvitations:
+	case pagePairings, pageUsers, pageInvitations, pageApprovals:
 		return m.accessDetail(width)
 	case pageNowPlaying, pageHistory:
 		if width < 60 {
@@ -404,6 +404,8 @@ func (m Model) listTitle() string {
 		return "Users and access"
 	case pageInvitations:
 		return "Access invitations"
+	case pageApprovals:
+		return "Pending requests"
 	case pageNowPlaying:
 		return "Sessions"
 	case pageHistory:

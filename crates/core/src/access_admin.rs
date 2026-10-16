@@ -195,6 +195,90 @@ pub fn assign_owner(
     constrain(device, user)
 }
 
+pub const OWNER_DEFAULT_NAME: &str = "Owner";
+
+/// First-run owner setup, observed under the setup writer transaction. The
+/// recorded owner is durable: once set it is never replaced, including after
+/// the owner is renamed, narrowed or disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupState {
+    /// No user exists and no owner was recorded.
+    Required,
+    /// An owner was recorded by an earlier setup.
+    Complete,
+    /// Users were created explicitly. Setup never adopts one as the owner.
+    ExistingUsers,
+}
+
+pub fn setup_state(owner_recorded: bool, users: usize) -> SetupState {
+    match (owner_recorded, users) {
+        (true, _) => SetupState::Complete,
+        (false, 0) => SetupState::Required,
+        (false, _) => SetupState::ExistingUsers,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnerSetup {
+    /// Insert this user and record it as the owner in one transaction.
+    Create(User),
+    /// Retries and concurrent requests return the recorded owner unchanged.
+    Completed,
+}
+
+/// The owner is an enabled user whose ceiling includes administration. It
+/// owns no device: devices, including unassigned ones, keep their owner and
+/// every device approval for it is a separate explicit decision.
+pub fn setup_owner(
+    approver: &Principal,
+    owner_recorded: bool,
+    users: usize,
+    id: String,
+    name: Option<String>,
+) -> Result<OwnerSetup, AccessError> {
+    if !approver.is_admin() {
+        return Err(AccessError::Forbidden(Permission::SystemAdmin));
+    }
+    match setup_state(owner_recorded, users) {
+        SetupState::Complete => Ok(OwnerSetup::Completed),
+        SetupState::ExistingUsers => Err(AccessError::OwnerSetupUnavailable),
+        SetupState::Required => Ok(OwnerSetup::Create(User {
+            id,
+            name: name.unwrap_or_else(|| OWNER_DEFAULT_NAME.into()),
+            revision: 1,
+            disabled: false,
+            grant: Grant {
+                profile_ids: Default::default(),
+                permissions: Permission::ALL.into(),
+            },
+            policy: Policy::default(),
+        })),
+    }
+}
+
+/// Who a new device approval is suggested for. A single eligible user is
+/// preselected; the approver still compares the code and reviews the grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingUser<'a> {
+    NoEligibleUser,
+    Only(&'a User),
+    Choose,
+}
+
+pub fn pairing_eligible(user: &User) -> bool {
+    !user.disabled
+}
+
+pub fn pairing_user(users: &[User]) -> PairingUser<'_> {
+    let mut eligible = users.iter().filter(|u| pairing_eligible(u));
+    match (eligible.next(), eligible.next()) {
+        (None, _) => PairingUser::NoEligibleUser,
+        (Some(only), None) => PairingUser::Only(only),
+        _ => PairingUser::Choose,
+    }
+}
+
 pub fn usable_admin(device: &Device, credential_present: bool, now: i64) -> bool {
     !device.revoked
         && credential_present

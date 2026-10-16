@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/table"
@@ -28,7 +29,36 @@ const (
 	keyUsers       = "access-users"
 	keyPairings    = "pairings"
 	keyInvitations = "invitations"
+	keySetup       = "access-setup"
+	keyApprovals   = "action-approvals"
 )
+
+// approvalBackend is optional: it lists and approves other devices'
+// requests to make one sensitive change without recent sign-in.
+type approvalBackend interface {
+	operations.ApprovalAPI
+}
+
+// setupBackend is optional: without it the TUI never offers owner setup
+// or preselects an approval user.
+type setupBackend interface {
+	operations.SetupAPI
+}
+
+// accessSetup is the server's owner setup state and approval suggestion.
+func (m Model) accessSetup() api.AccessSetup {
+	v, _ := data[api.AccessSetup](m, keySetup)
+	return v
+}
+
+// setupRequired reports a server without users, where an administrator or
+// the local operator may create the Owner.
+func (m Model) setupRequired() bool {
+	_, ok := m.backend.(setupBackend)
+	return ok && m.admin() && m.accessFeature() && m.accessSetup().OwnerSetup == api.SetupRequired
+}
+
+const firstRunHint = "First run: press s to create the Owner, then approve the browser's request with a."
 
 func (m Model) accessFeature() bool {
 	if _, ok := m.backend.(accessBackend); !ok {
@@ -48,6 +78,20 @@ func (m Model) userName(id string) string {
 		}
 	}
 	return "Unassigned"
+}
+
+// deviceName names a requesting device; its name is untrusted display text.
+func (m Model) deviceName(id string) string {
+	devices, _ := data[[]api.Device](m, keyDevices)
+	for _, d := range devices {
+		if d.ID == id {
+			return "“" + clean(d.Name) + "” (" + shortID(id) + ")"
+		}
+	}
+	return shortID(id)
+}
+func unixTime(seconds int64) string {
+	return time.Unix(seconds, 0).UTC().Format("2006-01-02 15:04 UTC")
 }
 func (m Model) grantSummary(profiles, libraries []string) []string {
 	ps, _ := data[[]api.Profile](m, keyProfiles)
@@ -124,6 +168,13 @@ func (m Model) accessRows(width int) ([]table.Column, []table.Row, []string) {
 			rows = append(rows, table.Row{clean(u.Name), state, fmt.Sprintf("%d profiles · %d libraries", len(u.ProfileIDs), len(u.Policy.LibraryIDs)), clean(strings.Join(u.Permissions, ", "))})
 		}
 		return project(width, []column{{"User", 24, false}, {"Status", 10, false}, {"Scope", 26, true}, {"Permissions", 32, true}}, rows, ids)
+	case pageApprovals:
+		values, _ := data[[]api.ActionApproval](m, keyApprovals)
+		for _, a := range values {
+			ids = append(ids, a.ID)
+			rows = append(rows, table.Row{clean(a.Status), clean(a.Action), clean(a.Target), m.deviceName(a.Actor), unixTime(a.ExpiresAt)})
+		}
+		return project(width, []column{{"Status", 10, false}, {"Action", 22, false}, {"Target", 28, true}, {"Requested by", 24, false}, {"Expires", 22, true}}, rows, ids)
 	case pageInvitations:
 		values, _ := data[[]api.Invitation](m, keyInvitations)
 		for _, i := range values {
@@ -145,6 +196,9 @@ func (m Model) accessDetail(width int) []string {
 				lines = []string{"Names are untrusted. Compare the code with the requesting device.", "Created: " + clean(p.CreatedAt) + " · Expires: " + clean(p.ExpiresAt), "a approve · d deny · r refresh"}
 			}
 		}
+		if m.setupRequired() {
+			lines = append([]string{firstRunHint}, lines...)
+		}
 	case pageUsers:
 		values, _ := data[[]api.User](m, keyUsers)
 		for _, u := range values {
@@ -161,11 +215,16 @@ func (m Model) accessDetail(width int) []string {
 				lines = append(lines, m.ownedDevices(u.ID)...)
 			}
 		}
+	case pageApprovals:
+		lines = []string{"a approve the selected pending request after comparing its code · r refresh", "Approving lets that device make exactly this change once. Approve only requests you expect.", "Approved requests stay listed until that device submits its change or the request expires."}
 	case pageInvitations:
 		lines = []string{"n create invitation · d revoke unused invitation · r refresh", "Codes are shown only after issuance. Send them privately.", "Claimed invitations: revoke the device on Devices."}
 	}
 	if len(lines) == 0 {
 		lines = []string{"n new user or invitation · r refresh"}
+		if m.setupRequired() {
+			lines = []string{firstRunHint, "n creates a user manually instead · r refresh"}
+		}
 	}
 	return panel(m.title(m.route), "", colorInfo, lines, width)
 }
@@ -191,7 +250,9 @@ type accessDialog struct {
 type accessDone struct {
 	epoch      int
 	invitation *api.Invitation
-	err        error
+	// owner is the name of the owner that setup created or found.
+	owner string
+	err   error
 	// Form results: a pairing awaiting approval, a credential change and
 	// the confirmation to show.
 	pairing   *operations.PendingPairing
@@ -289,6 +350,13 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 			d.target = ""
 		}
 		m.grantFields(d, u)
+	case "setup":
+		if !m.setupRequired() {
+			return m.say("Owner setup is available only on a server without users.", true)
+		}
+		d.title = "Set up Motion's owner"
+		d.message = "Creates one enabled Owner whose access includes administration of this server. No device gets access yet: approve each device, including your browser, after comparing its code. Existing unassigned devices stay unassigned."
+		d.fields = []accessField{textField("Owner name", "name", "Owner")}
 	case "approve", "invite":
 		d.title = "Choose the intended user"
 		users, _ := data[[]api.User](*m, keyUsers)
@@ -299,6 +367,9 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 			}
 		}
 		if len(d.users) == 0 {
+			if m.setupRequired() {
+				return m.beginAccess("setup")
+			}
 			return m.say("Create an enabled user on Users and access first.", true)
 		}
 		if kind == "approve" {
@@ -314,7 +385,30 @@ func (m *Model) beginAccess(kind string) tea.Cmd {
 			if !found {
 				return m.say("Select a pending request and refresh its status.", true)
 			}
+			// The server's suggestion and this list agree on the only
+			// enabled user: preselect it. The code and grant are still
+			// reviewed and confirmed explicitly.
+			if only := m.accessSetup().PairingUser; only != nil && len(d.users) == 1 && d.users[0].ID == only.ID {
+				d.user, d.fields = 0, nil
+				d.title = "Approve access for “" + clean(d.users[0].Name) + "”"
+				d.message += " Preselected: the only enabled user."
+				m.grantFields(d, d.users[0])
+			}
 		}
+	case "proof":
+		values, _ := data[[]api.ActionApproval](*m, keyApprovals)
+		found := false
+		for _, a := range values {
+			if a.ID == d.target && a.Status == "pending" {
+				found = true
+				d.title = "Approve “" + clean(a.Action) + "” for " + m.deviceName(a.Actor) + "?"
+				d.message = "Target: " + clean(a.Target) + ". Enter the code shown on the requesting device. That device then submits its reviewed change once."
+			}
+		}
+		if !found {
+			return m.say("Select a pending request; approved requests wait for their device. Refresh to see changes.", true)
+		}
+		d.fields = []accessField{textField("Code shown on the requesting device", "code", "")}
 	case "deny":
 		d.title = "Deny pairing request?"
 		d.review = true
@@ -350,6 +444,9 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 	}
 	switch m.route.page {
 	case pagePairings:
+		if msg.String() == "s" {
+			return true, m.beginAccess("setup")
+		}
 		if msg.String() == "a" {
 			return true, m.beginAccess("approve")
 		}
@@ -357,6 +454,9 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			return true, m.beginAccess("deny")
 		}
 	case pageUsers:
+		if msg.String() == "s" {
+			return true, m.beginAccess("setup")
+		}
 		if msg.String() == "e" && m.selectedID() != "" {
 			return true, m.beginAccess("user")
 		}
@@ -371,6 +471,10 @@ func (m *Model) accessAction(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 				cmd = m.access.fields[0].focusInput()
 			}
 			return true, cmd
+		}
+	case pageApprovals:
+		if msg.String() == "a" && m.selectedID() != "" {
+			return true, m.beginAccess("proof")
 		}
 	case pageInvitations:
 		if msg.String() == "n" {
@@ -557,6 +661,14 @@ func (m *Model) submitAccess() tea.Cmd {
 		return nil
 	}
 	b, devices := m.backend.(accessBackend), m.backend
+	setup, _ := m.backend.(setupBackend)
+	approvals, _ := m.backend.(approvalBackend)
+	var code string
+	for _, f := range d.fields {
+		if f.kind == "text" && f.id == "code" {
+			code = f.input.Value()
+		}
+	}
 	ctx := m.ctx
 	// Capture immutable intent and revisions before launching any asynchronous work.
 	kind, id, rev, epoch := d.kind, d.target, d.revision, d.epoch
@@ -570,6 +682,14 @@ func (m *Model) submitAccess() tea.Cmd {
 		defer cancel()
 		result := accessDone{epoch: epoch}
 		switch kind {
+		case "proof":
+			result.err = operations.ApproveAction(ctx, approvals, id, code)
+		case "setup":
+			var s api.AccessSetup
+			s, result.err = operations.SetupOwner(ctx, setup, in.Name)
+			if result.err == nil && s.Owner != nil {
+				result.owner = s.Owner.Name
+			}
 		case "user":
 			if id == "" {
 				_, result.err = operations.CreateUser(ctx, b, in, d.intent("creation of user "+in.Name))
@@ -603,7 +723,7 @@ func (m *Model) submitAccess() tea.Cmd {
 func (m *Model) forgetAccess() {
 	m.access = nil
 	m.accessEpoch++
-	for _, key := range []string{keyUsers, keyPairings, keyInvitations, keyDevices} {
+	for _, key := range []string{keyUsers, keyPairings, keyInvitations, keyDevices, keySetup, keyApprovals} {
 		m.drop(key)
 	}
 }
@@ -625,6 +745,12 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	}
 	var unknown *operations.UncertainError
 	d.resubmit = d.resubmit || errors.As(result.err, &unknown) && unknown.Key != ""
+	if result.err != nil && d.kind == "setup" {
+		// Setup is safe to repeat: the server returns the recorded owner.
+		d.review = false
+		d.message = clean(refusal(result.err)) + " Setup is safe to repeat: review and apply again, or Esc and refresh."
+		return nil
+	}
 	if result.err != nil {
 		d.review = d.resubmit
 		d.message = clean(refusal(result.err))
@@ -639,6 +765,13 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	if formKind(d.kind) {
 		return m.formFinished(result)
 	}
+	done := "Access updated."
+	if d.kind == "proof" {
+		done = "Request approved. The requesting device can now submit its change."
+	}
+	if d.kind == "setup" {
+		done = "Owner “" + clean(result.owner) + "” is ready. On Pairing requests select the browser's request and press a: compare its code, review the grant, then confirm."
+	}
 	if result.invitation != nil {
 		d.secret = result.invitation.Code
 		d.message = "Expires " + result.invitation.ExpiresAt + ". Share privately; Esc hides this code."
@@ -646,7 +779,7 @@ func (m *Model) accessFinished(result accessDone) tea.Cmd {
 	} else {
 		m.access = nil
 	}
-	return tea.Batch(m.reloadAll(), m.load(keyDevices), m.load(keyUsers), m.say("Access updated.", false))
+	return tea.Batch(m.reloadAll(), m.load(keyDevices), m.load(keyUsers), m.load(keySetup), m.say(done, false))
 }
 func (m Model) accessView() string {
 	d := m.access
@@ -665,8 +798,31 @@ func (m Model) accessView() string {
 			lines[len(lines)-1] = "Resubmit the same request? y apply · Esc cancel"
 		}
 		lines = append(lines, m.formSummary(d)...)
+	} else if d.review && d.kind == "proof" {
+		code := ""
+		for _, f := range d.fields {
+			if f.id == "code" {
+				code = f.input.Value()
+			}
+		}
+		lines = append(lines, "", "Approve this request? y apply · n edit · Esc cancel",
+			"Code entered: "+clean(code)+" — it must match the requesting device.",
+			"Only this action on this target, once, for that device.")
+	} else if d.review && d.kind == "setup" {
+		in, _, _ := d.input()
+		name := strings.TrimSpace(in.Name)
+		if name == "" {
+			name = "Owner"
+		}
+		lines = append(lines, "", "Create the Owner? y apply · n edit · Esc cancel",
+			"Owner: "+clean(name)+" · enabled · administrator of this server",
+			"Devices: none approved or assigned by this step.",
+			"Next: compare the browser's code and approve it on Pairing requests.")
 	} else if d.review {
 		lines = append(lines, "", "Confirm this access change? y apply · n edit · Esc cancel")
+		if d.kind == "approve" {
+			lines = append(lines, "Compare code: "+clean(d.revision)+" must match the requesting device.")
+		}
 		if in, _, err := d.input(); err == nil && len(d.fields) > 0 {
 			state := "enabled"
 			if in.Disabled {
@@ -674,6 +830,13 @@ func (m Model) accessView() string {
 			}
 			lines = append(lines, "User: "+clean(in.Name)+" · "+state, "Permissions: "+strings.Join(in.Permissions, ", "))
 			lines = append(lines, m.grantSummary(in.ProfileIDs, in.Policy.LibraryIDs)...)
+			if d.kind == "approve" || d.kind == "invite" {
+				if has(in.Permissions, api.PermSystemAdmin) {
+					lines = append(lines, "Administration: GRANTED. This device can manage users, devices, access and all content.")
+				} else {
+					lines = append(lines, "Administration: not granted. Select Permission: "+api.PermSystemAdmin+" to grant it deliberately.")
+				}
+			}
 			if d.kind == "user" && d.target != "" {
 				lines = append(lines, m.ownedDevices(d.target)...)
 			}

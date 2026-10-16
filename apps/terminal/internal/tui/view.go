@@ -258,6 +258,8 @@ func (m Model) header(width int) []string {
 		lines = m.titled("Scans", count(keyScans, "scan", "scans"))
 	case pagePairings, pageUsers, pageInvitations:
 		lines = m.titled(m.title(m.route), "n new · a approve · e edit · d deny/revoke")
+	case pageApprovals:
+		lines = m.titled(m.title(m.route), "a approve after comparing the requesting device's code")
 	case pageDevices:
 		lines = m.titled("Devices", count(keyDevices, "device", "devices"))
 	case pageProfiles:
@@ -648,6 +650,8 @@ func (m Model) shortHelp() []key.Binding {
 			b = append(b, keyHelp("n", "request scan"))
 		case m.route.page == pageDevices && m.admin():
 			b = append(b, keys.Policy, keys.Assign)
+		case (m.route.page == pagePairings || m.route.page == pageUsers) && m.setupRequired():
+			b = append(b, keys.Setup)
 		case m.route.page == pageNowPlaying:
 			b = append(b, keys.History)
 		case m.route.page == pageHistory && m.historyFilter.DeviceID != "":

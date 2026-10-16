@@ -31,7 +31,7 @@ class Element {
 function harness(fetch = async () => ({ok: true, status: 204}), extra = {}) {
   const document = {createElement: tag => new Element(tag), querySelector: selector => selector === 'meta[name="motion-csrf"]' ? {content: 'csrf-token'} : null};
   const location = {origin: 'https://motion.test', search: '', reload() {}, assign() {}};
-  return runInNewContext(`${source}\n({api, mutation, secretUpdate, secretField, safeRedirect, errorMessage, revision, node, proofFlow, selectionRows, grantFields, confirmChange, signInPage, selfPage, pending, emailFlow, registrationFlow, emailSection, registrationSection})`, {
+  return runInNewContext(`${source}\n({api, mutation, secretUpdate, secretField, safeRedirect, errorMessage, revision, node, proofFlow, selectionRows, grantFields, confirmChange, signInPage, selfPage, pending, emailFlow, registrationFlow, emailSection, registrationSection, enrollmentSection, usersSection, inheritedGrant})`, {
     document, location, fetch, crypto: webcrypto, URL, URLSearchParams, TextEncoder,
     navigator: {}, ...extra,
   });
@@ -385,4 +385,77 @@ test('registration policy editor never offers administrator authority as a defau
   const put = calls.find(call => call.method === 'PUT');
   assert.equal(put.body.policy, 'open');
   assert.deepEqual(put.body.default_access.permissions, ['catalog:read']);
+});
+
+const owner = {id: 'u1', name: 'Owner', revision: '1', disabled: false, profile_ids: [], permissions: ['catalog:read', 'playback:request', 'system:admin'], policy: {library_ids: [], allow_unrated: true}};
+const pendingPairing = {id: 'p1', device_name: 'Web browser', client_name: 'Motion web', status: 'pending', user_code: 'ABCD-EFGH', expires_at: '2026-10-14T00:10:00Z'};
+function enrollmentHarness(calls) {
+  return harness(async (path, options) => {
+    calls.push({path, method: options.method, body: options.body && JSON.parse(options.body)});
+    if (path.startsWith('/api/v2/auth/pairings?')) return response(200, {items: [pendingPairing], next_cursor: null});
+    if (path.startsWith('/api/v2/auth/pairings/')) return response(200, {id: 'd1'});
+    return response(200, {items: [], next_cursor: null});
+  });
+}
+const checkboxFor = (root, label) => root.byText(label).parent.children[0];
+
+test('the only enabled user is preselected without administration, which needs deliberate confirmation', async () => {
+  const calls = [];
+  const client = enrollmentHarness(calls);
+  const content = new Element('div');
+  await client.enrollmentSection(content, {users: [owner], profiles: [], libraries: [], setup: {owner_setup: 'complete', pairing_user: owner}});
+  const form = forms(content)[0];
+  assert.equal(form.ofTag('select')[0].value, 'u1');
+  assert.ok(content.byText('Preselected: Owner is the only enabled user.'));
+  assert.equal(checkboxFor(form, 'Administer this server').checked, false);
+  assert.equal(checkboxFor(form, 'Play media').checked, true);
+  const code = inputs(form).find(input => input.attributes.autocomplete === 'off');
+  code.value = 'ABCD-EFGH';
+  checkboxFor(form, 'Administer this server').checked = true;
+  await submit(form);
+  assert.equal(calls.filter(call => call.method === 'POST').length, 0, 'administration without confirmation is not sent');
+  checkboxFor(form, 'If Administer this server is selected: I deliberately grant administration to this device.').checked = true;
+  await submit(form);
+  const approve = calls.find(call => call.method === 'POST');
+  assert.equal(approve.path, '/api/v2/auth/pairings/p1/approve');
+  assert.equal(approve.body.user_id, 'u1');
+  assert.equal(approve.body.user_code, 'ABCD-EFGH');
+  assert.ok(approve.body.permissions.includes('system:admin'));
+  assert.deepEqual(plain(client.inheritedGrant(owner)).permissions, ['catalog:read', 'playback:request']);
+});
+
+test('several users are chosen explicitly and no users point to owner setup', async () => {
+  const second = {...owner, id: 'u2', name: 'Sam', permissions: ['catalog:read']};
+  const content = new Element('div');
+  await enrollmentHarness([]).enrollmentSection(content, {users: [owner, second], profiles: [], libraries: [], setup: {owner_setup: 'existing_users', pairing_user: null}});
+  assert.equal(forms(content)[0].ofTag('select')[0].value, '');
+  assert.equal(checkboxFor(content, 'Administer this server').checked, false);
+
+  const empty = new Element('div');
+  await enrollmentHarness([]).enrollmentSection(empty, {users: [], profiles: [], libraries: [], setup: {owner_setup: 'required', pairing_user: null}});
+  assert.equal(empty.byText('Approve this device'), undefined);
+  assert.ok(empty.byText('No user exists yet. Create the Owner under Users first, then approve this device for it.'));
+  assert.ok(empty.byText('Deny pairing'), 'denial stays available without an eligible user');
+});
+
+test('owner setup is offered only on a server without users and approves no device', async () => {
+  const calls = [];
+  const client = harness(async (path, options) => {
+    calls.push({path, method: options.method, body: options.body && JSON.parse(options.body)});
+    if (options.method === 'POST') return response(201, {owner_setup: 'complete'});
+    return response(200, {items: [], next_cursor: null});
+  });
+  const content = new Element('div');
+  await client.usersSection(content, {users: [], profiles: [], libraries: [], setup: {owner_setup: 'required'}});
+  assert.ok(content.byText('First run: create the Owner'));
+  const setupForm = forms(content).find(form => form.byText('Create the Owner'));
+  await submit(setupForm);
+  const post = calls.find(call => call.method === 'POST');
+  assert.equal(post.path, '/api/v2/access/setup');
+  assert.deepEqual(post.body, {name: 'Owner'});
+  for (const state of ['complete', 'existing_users']) {
+    const other = new Element('div');
+    await harness(async () => response(200, {items: [], next_cursor: null})).usersSection(other, {users: [], profiles: [], libraries: [], setup: {owner_setup: state}});
+    assert.equal(other.byText('First run: create the Owner'), undefined, state);
+  }
 });

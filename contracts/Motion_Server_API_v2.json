@@ -1327,6 +1327,171 @@
         }
       }
     },
+    "/api/v2/access/setup": {
+      "get": {
+        "operationId": "getAccessSetup",
+        "summary": "Read first-run owner setup and the suggested pairing user",
+        "description": "Reports whether guided owner setup is required, complete, or unavailable because users were already created explicitly, and the only enabled user when exactly one exists. A suggestion never approves a device.",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "200": {
+            "description": "Current setup state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSetup"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin"
+      },
+      "post": {
+        "operationId": "setupAccessOwner",
+        "summary": "Create the first-run Owner user",
+        "description": "Creates one enabled Owner user with an administrator ceiling when no user exists, recording it in the same transaction. Retries and concurrent requests return the recorded owner (200). Existing users are never adopted (409 owner_setup_unavailable), no device is assigned, and the request source (including loopback) grants nothing. Approve each device for the owner separately.",
+        "tags": [
+          "identity"
+        ],
+        "x-owner": "A08",
+        "x-milestone": "M1",
+        "x-status": "implementation_target",
+        "responses": {
+          "201": {
+            "description": "The Owner was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSetup"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Setup was already complete; the recorded owner.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessSetup"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "413": {
+            "$ref": "#/components/responses/E413"
+          },
+          "422": {
+            "$ref": "#/components/responses/E422"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "500": {
+            "$ref": "#/components/responses/E500"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "x-required-permission": "system:admin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                    "description": "Defaults to \"Owner\"."
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v2/users": {
       "get": {
         "operationId": "listAccessUsers",
@@ -19159,6 +19324,51 @@
           "profile_ids",
           "permissions",
           "policy"
+        ]
+      },
+      "AccessSetup": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "owner_setup": {
+            "type": "string",
+            "enum": [
+              "required",
+              "complete",
+              "existing_users"
+            ]
+          },
+          "owner": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessUser"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pairing_user": {
+            "description": "The only enabled user, preselected for approval. Null when none or several users are eligible.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessUser"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "eligible_users": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "owner_setup",
+          "owner",
+          "pairing_user",
+          "eligible_users"
         ]
       },
       "AccessUser": {

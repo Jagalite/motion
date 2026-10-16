@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -305,6 +306,30 @@ func TestSuggestedRetryWordsSurviveTheShell(t *testing.T) {
 func TestCLIApprovalNamesAUser(t *testing.T) {
 	c := newManaged(t)
 	seed := opstest.SeedManagement(c.fixture)
+	// The only enabled user is preselected; administration is never inherited.
+	if _, stderr, code := c.run("auth", "approve", seed.Tablet.ID, "--code", seed.Tablet.UserCode); code != ExitOK || !strings.Contains(stderr, "the only enabled user") {
+		t.Fatalf("single-user approval: exit %d %s", code, stderr)
+	}
+	devices, err := c.fixture.ListDevices(context.Background(), "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range devices.Items {
+		if d.Name == "Tablet" {
+			found = true
+			if d.UserID == nil || *d.UserID != seed.Ana.ID || slices.Contains(d.Permissions, api.PermSystemAdmin) {
+				t.Fatalf("preselected approval: %+v", d)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the preselected approval was not applied")
+	}
+	// With several enabled users the administrator must name one.
+	if _, _, code := c.run("access", "users", "create", "Sam"); code != ExitOK {
+		t.Fatalf("create second user: exit %d", code)
+	}
 	before := len(c.fixture.Writes())
 	if _, stderr, code := c.run("auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode, "--permission", "catalog:read"); code != ExitInvalid || !strings.Contains(stderr, "access user") {
 		t.Fatalf("device-only approval: exit %d %s", code, stderr)
@@ -317,5 +342,87 @@ func TestCLIApprovalNamesAUser(t *testing.T) {
 	}
 	if _, stderr, code := c.run("devices", "assign", seed.TV.ID, "--user", seed.Ana.ID); code != ExitConflict || !strings.Contains(stderr, "precondition_failed") {
 		t.Fatalf("reassignment: exit %d %s", code, stderr)
+	}
+}
+
+func TestCLIOwnerSetupIsRepeatableAndNeverAdoptsUsers(t *testing.T) {
+	c := newManaged(t)
+	stdout, stderr, code := c.run("access", "setup")
+	if code != ExitOK || !strings.Contains(stdout, "Owner Owner") || !strings.Contains(stdout, "system:admin only") {
+		t.Fatalf("setup: exit %d %s %s", code, stdout, stderr)
+	}
+	again, _, code := c.run("access", "setup", "--name", "Someone else")
+	if code != ExitOK || again != stdout {
+		t.Fatalf("repeat: exit %d %q", code, again)
+	}
+	s, _ := c.fixture.GetAccessSetup(context.Background())
+	if s.OwnerSetup != api.SetupComplete || s.Owner == nil || s.Owner.Name != "Owner" || s.PairingUser == nil || s.PairingUser.ID != s.Owner.ID {
+		t.Fatalf("setup state: %+v", s)
+	}
+
+	existing := newManaged(t)
+	opstest.SeedManagement(existing.fixture)
+	if _, stderr, code := existing.run("access", "setup"); code != ExitConflict || !strings.Contains(stderr, "owner_setup_unavailable") {
+		t.Fatalf("existing users: exit %d %s", code, stderr)
+	}
+	if s, _ := existing.fixture.GetAccessSetup(context.Background()); s.Owner != nil || s.OwnerSetup != api.SetupExistingUsers {
+		t.Fatalf("existing users were adopted: %+v", s)
+	}
+}
+
+func TestCLIPreselectedApprovalResubmitsTheRecordedUserAndKeepsJSONClean(t *testing.T) {
+	c := newManaged(t)
+	seed := opstest.SeedManagement(c.fixture)
+	c.fixture.LoseAcks(1 << 20)
+	_, stderr, code := c.run("--json", "auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode)
+	var report struct {
+		Error struct {
+			IdempotencyKey string          `json:"idempotency_key"`
+			Request        json.RawMessage `json:"request"`
+		}
+	}
+	if err := json.Unmarshal([]byte(stderr), &report); err != nil || code != ExitUnavailable || !strings.Contains(string(report.Error.Request), seed.Ana.ID) {
+		t.Fatalf("JSON stderr must be one error document recording the user: exit %d %s", code, stderr)
+	}
+	c.fixture.LoseAcks(0)
+	// The user changes and another enabled user appears; the retry must
+	// still repeat the recorded user, revision and grant.
+	if _, err := c.fixture.ReplaceUser(context.Background(), seed.Ana.ID, api.UserInput{Name: "Ana", ProfileIDs: []string{}, Permissions: []string{api.PermCatalogRead, api.PermEventsRead}}, `"r-1"`); err != nil {
+		t.Fatal(err)
+	}
+	c.fixture.AddUser("Sam")
+	key := report.Error.IdempotencyKey
+	c.ok("auth", "approve", seed.Laptop.ID, "--code", seed.Laptop.UserCode, "--idempotency-key", key, "--resubmit-request", string(report.Error.Request))
+	devices, _ := c.fixture.ListDevices(context.Background(), "", 100)
+	laptops := 0
+	for _, d := range devices.Items {
+		if d.Name == "Laptop" {
+			laptops++
+			if d.UserID == nil || *d.UserID != seed.Ana.ID {
+				t.Fatalf("resubmitted for another user: %+v", d)
+			}
+		}
+	}
+	if laptops != 1 {
+		t.Fatalf("%d laptop devices", laptops)
+	}
+}
+
+func TestCLIApprovesActionRequestsByCode(t *testing.T) {
+	c := newManaged(t)
+	req, code := c.fixture.SeedActionApproval("browser", "pairing.approve", "p1")
+	stdout, _, exit := c.run("access", "approvals", "list")
+	if exit != ExitOK || !strings.Contains(stdout, req.ID) || !strings.Contains(stdout, "pairing.approve") {
+		t.Fatalf("list: exit %d %s", exit, stdout)
+	}
+	if _, stderr, exit := c.run("access", "approvals", "approve", req.ID); exit != ExitInvalid || !strings.Contains(stderr, "--code") {
+		t.Fatalf("missing code: exit %d %s", exit, stderr)
+	}
+	if _, _, exit := c.run("access", "approvals", "approve", req.ID, "--code", "WRONG"); exit == ExitOK {
+		t.Fatal("wrong code approved")
+	}
+	c.ok("access", "approvals", "approve", req.ID, "--code", code)
+	if stdout, _, _ := c.run("access", "approvals", "list"); !strings.Contains(stdout, req.ID) || !strings.Contains(stdout, "approved") {
+		t.Fatalf("approved request must show its status: %s", stdout)
 	}
 }

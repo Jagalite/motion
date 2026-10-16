@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Jagalite/motion/apps/terminal/internal/api"
 )
@@ -34,6 +35,9 @@ func canonicalPermissions(permissions []string) []string {
 // GrantRequest is what a resubmission of a user-bound approval or an
 // invitation must repeat exactly: the user revision and the grant.
 type GrantRequest struct {
+	// UserID is recorded for approvals, so a resubmission repeats the user
+	// even when it was preselected rather than named.
+	UserID       string          `json:"user_id,omitempty"`
 	UserRevision string          `json:"user_revision"`
 	ProfileIDs   []string        `json:"profile_ids"`
 	Permissions  []string        `json:"permissions"`
@@ -169,7 +173,7 @@ func ApprovePairing(ctx context.Context, a PairingAPI, in Approval, i Intent) (a
 	}
 	v, err := a.ApprovePairing(ctx, in.PairingID, approval, i.Key)
 	if in.UserID != "" && approval.Policy != nil {
-		return v, i.settleRequest(&GrantRequest{UserRevision: in.UserRevision, ProfileIDs: approval.ProfileIDs,
+		return v, i.settleRequest(&GrantRequest{UserID: in.UserID, UserRevision: in.UserRevision, ProfileIDs: approval.ProfileIDs,
 			Permissions: approval.Permissions, Policy: *approval.Policy}, err)
 	}
 	return v, i.settle(err)
@@ -429,4 +433,90 @@ func ReplaceDevicePolicy(ctx context.Context, a DeviceAPI, id string, in api.Acc
 	}
 	v, err := a.ReplaceDevicePolicy(ctx, id, in, etag)
 	return v, settleConditional("policy replacement for device "+id, etag, err)
+}
+
+// Owner setup ----------------------------------------------------------------
+
+// SetupAPI reads and performs first-run owner setup.
+type SetupAPI interface {
+	GetAccessSetup(context.Context) (api.AccessSetup, error)
+	SetupOwner(context.Context, api.SetupInput) (api.AccessSetup, error)
+}
+
+// ReadAccessSetup reports owner setup and the user suggested for approvals.
+func ReadAccessSetup(ctx context.Context, a SetupAPI) (api.AccessSetup, error) {
+	return a.GetAccessSetup(ctx)
+}
+
+// SetupOwner creates the enabled Owner when the server has no user. A repeat,
+// concurrent or interrupted attempt is resolved by the server, which returns
+// the recorded owner; existing users are never adopted. The owner holds no
+// device: each device, including this one's browser, is approved explicitly.
+func SetupOwner(ctx context.Context, a SetupAPI, name string) (api.AccessSetup, error) {
+	name = strings.TrimSpace(name)
+	if n := utf8.RuneCountInString(name); n > 100 {
+		return api.AccessSetup{}, Invalid("the owner name must be at most 100 characters")
+	}
+	return a.SetupOwner(ctx, api.SetupInput{Name: name})
+}
+
+// SuggestionAPI reads what a pairing approval may be preselected for.
+type SuggestionAPI interface {
+	CapabilityReader
+	SetupAPI
+}
+
+// SuggestedApprovalUser is the user a pairing approval is preselected for:
+// the only enabled user on a server that manages access by user. Nil means
+// the administrator names the user explicitly, as before; servers predating
+// owner setup suggest no one.
+func SuggestedApprovalUser(ctx context.Context, a SuggestionAPI) (*api.User, error) {
+	caps, err := a.Capabilities(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ManagesAccessByUser(caps) {
+		return nil, nil
+	}
+	s, err := a.GetAccessSetup(ctx)
+	if api.IsCode(err, "not_found") {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.PairingUser, nil
+}
+
+// Action approvals --------------------------------------------------------------
+
+// ApprovalAPI lists and approves other devices' sensitive-change requests.
+type ApprovalAPI interface {
+	ListActionApprovals(context.Context, string, int) (api.Page[api.ActionApproval], error)
+	ApproveAction(context.Context, string, string) error
+}
+
+// ListActionApprovals reads one page of pending requests.
+func ListActionApprovals(ctx context.Context, a ApprovalAPI, page PageRequest) (api.Page[api.ActionApproval], error) {
+	if err := page.validate(); err != nil {
+		return api.Page[api.ActionApproval]{}, err
+	}
+	return a.ListActionApprovals(ctx, page.Cursor, page.Limit)
+}
+
+// CollectActionApprovals reads pending requests until the list ends or max arrive.
+func CollectActionApprovals(ctx context.Context, a ApprovalAPI, max int) ([]api.ActionApproval, bool, error) {
+	return Collect(ctx, a.ListActionApprovals, max)
+}
+
+// ApproveAction approves one request after the administrator compared the
+// code shown on the requesting device. The server binds the approval to that
+// device, action and target, and to this approver; the requester then submits
+// its reviewed change itself.
+func ApproveAction(ctx context.Context, a ApprovalAPI, id, code string) error {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if strings.TrimSpace(id) == "" || code == "" {
+		return Invalid("an approval request and the code shown on the requesting device are required")
+	}
+	return settle("approval of request "+id, "", "", false, a.ApproveAction(ctx, id, code))
 }

@@ -219,17 +219,45 @@ func authCmd(env *Env) *cobra.Command {
 				return err
 			}
 			var original *operations.GrantRequest
-			if approveUser != "" {
+			if approveUser != "" || approveResubmit != "" {
 				if original, err = resubmission(approveKey, approveResubmit); err != nil {
 					return err
 				}
 			}
+			userID := approveUser
+			if original != nil && original.UserID != "" {
+				// A resubmission repeats the recorded user, never a new suggestion.
+				if userID != "" && userID != original.UserID {
+					return usage("--user differs from the user in --resubmit-request")
+				}
+				userID = original.UserID
+			}
 			return run(env, func(ctx context.Context, c *Conn) error {
 				in := operations.Approval{PairingID: args[0], UserCode: code, ProfileIDs: profiles, Permissions: permissions}
-				if approveUser != "" {
+				if userID == "" {
+					// A server with exactly one enabled user preselects it;
+					// otherwise the administrator must name the user.
+					only, err := operations.SuggestedApprovalUser(ctx, c)
+					if err != nil {
+						return err
+					}
+					if only != nil && approveKey != "" {
+						// A keyed retry must repeat its recorded request.
+						return usage("--idempotency-key needs the original request: pass the reported --resubmit-request")
+					}
+					if only != nil {
+						userID = only.ID
+						// JSON stderr stays one decodable error document; the
+						// approved device reports its user_id.
+						if !env.JSON {
+							fmt.Fprintf(env.Err, "Approving for %s (%s), the only enabled user.\n", sanitize(only.Name), only.ID)
+						}
+					}
+				}
+				if userID != "" {
 					// The device joins the user at the revision read now, with
 					// the grant given here.
-					user, err := operations.InspectUser(ctx, c, approveUser)
+					user, err := operations.InspectUser(ctx, c, userID)
 					if err != nil {
 						return err
 					}
@@ -254,7 +282,7 @@ func authCmd(env *Env) *cobra.Command {
 	}
 	approve.Flags().StringVar(&code, "code", "", "user code displayed by the pairing device")
 	grantFlags(approve, &profiles, &permissions, &policy)
-	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to (required by servers that manage access by user); its grant is the default")
+	approve.Flags().StringVar(&approveUser, "user", "", "access user the device belongs to (default: the only enabled user; required when several are enabled); its grant without system:admin is the default")
 	approve.Flags().StringVar(&approveRevision, "user-revision", "", "user revision the approval is decided on (default: read it now)")
 	approve.Flags().StringVar(&approveResubmit, "resubmit-request", "", "with --idempotency-key and --user: the reported request, which replaces the grant flags")
 	keyFlag(approve, &approveKey)

@@ -1,0 +1,122 @@
+{
+  "checks": {
+    "loopback_without_token_refused": true,
+    "fresh_server_requires_setup": true,
+    "tui_pairings_page": true,
+    "tui_first_run_hint": true,
+    "tui_setup_dialog": true,
+    "tui_setup_review": true,
+    "tui_owner_ready": true,
+    "single_owner_created": true,
+    "tui_owner_preselected": true,
+    "tui_review_compare_code": true,
+    "tui_review_states_admin": true,
+    "tui_approved": true,
+    "signin_first_run_hint": true,
+    "browser_was_unauthenticated": true,
+    "browser_signed_in_as_owner_admin": true,
+    "browser_admin_page": true,
+    "retry_returns_same_owner": true,
+    "concurrent_retries_same_owner": true,
+    "exactly_one_user": true,
+    "restart_same_origin": true,
+    "restart_same_owner": true,
+    "browser_session_survives_restart": true,
+    "tui_approves_browser_change": true,
+    "browser_admin_change_applied": true,
+    "two_users_no_suggestion": true,
+    "cli_requires_user_with_two": true,
+    "tui_chooser_with_two": true,
+    "explicit_user_approval": true,
+    "desktop_tui_approves_owner_setup": true,
+    "desktop_owner_created_from_browser": true,
+    "desktop_tui_approves_pairing_approval": true,
+    "desktop_setup_offered": true,
+    "desktop_owner_preselected": true,
+    "desktop_admin_needs_confirmation": true,
+    "desktop_pairing_approved": true,
+    "desktop_second_device_owner_admin": true,
+    "crash_leaves_no_partial_owner": true,
+    "crash_retry_converges": true,
+    "axe_wcag21aa_no_violations": true
+  },
+  "notes": {
+    "browser_code": "SG4E-PGPM",
+    "admin_toggle_screen_has_check": false,
+    "browser_pair": {
+      "before": 401,
+      "settings_access": true,
+      "owner_setup_offered": 0,
+      "signin_first_run_hint": true,
+      "errors": [],
+      "failure": null
+    },
+    "me": {
+      "id": "024bfe05-fe54-4c89-9e93-1e83c54ee8d6",
+      "device_id": "024bfe05-fe54-4c89-9e93-1e83c54ee8d6",
+      "user_id": "b02c1e6d-5dd9-48f3-9461-79e93cf7a0fa",
+      "profile_ids": [
+        "default"
+      ],
+      "permissions": [
+        "catalog:read",
+        "catalog:write",
+        "sources:manage",
+        "profiles:manage",
+        "viewing:write",
+        "playback:request",
+        "processing:request",
+        "downloads:manage",
+        "collections:write",
+        "events:read",
+        "system:admin"
+      ],
+      "policy_revision": "1",
+      "mode": "paired"
+    },
+    "browser_check": {
+      "status": 200,
+      "settings_access": true,
+      "errors": [],
+      "failure": null
+    },
+    "browser_change": {
+      "created": true,
+      "errors": [],
+      "failure": null
+    },
+    "desktop": {
+      "browser": {
+        "session": 200,
+        "owner_setup_offered": 1,
+        "preselected": "76cffc9b-199f-47ce-ba75-b27d238d09fe",
+        "admin_refused_without_confirmation": true,
+        "second_status": "approved",
+        "errors": [],
+        "failure": null
+      }
+    },
+    "crash": {
+      "before_commit": 3,
+      "after_commit": 21
+    },
+    "audits": [
+      {
+        "name": "signin",
+        "violations": [],
+        "overflow": false
+      },
+      {
+        "name": "access-first-run",
+        "violations": [],
+        "overflow": false
+      },
+      {
+        "name": "access-pairing-preselected",
+        "violations": [],
+        "overflow": false
+      }
+    ]
+  },
+  "passed": true
+}

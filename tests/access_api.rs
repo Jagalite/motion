@@ -5295,3 +5295,322 @@ async fn household_clients_render_pages_on_their_own_rate_budget() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(!String::from_utf8_lossy(&body).contains("Server unavailable"));
 }
+
+impl Fixture {
+    async fn setup(&self, body: Value, auth: Option<&str>) -> Reply {
+        let header = auth.map(bearer);
+        let headers: Vec<(&str, &str)> = header
+            .as_deref()
+            .map(|h| vec![("authorization", h)])
+            .unwrap_or_default();
+        self.call("POST", "/api/v2/access/setup", Some(body), &headers)
+            .await
+    }
+
+    async fn setup_state(&self) -> Value {
+        let reply = self
+            .call(
+                "GET",
+                "/api/v2/access/setup",
+                None,
+                &[("authorization", &bearer(OPERATOR))],
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        reply.body
+    }
+
+    async fn user_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM access_users")
+            .fetch_one(&self.app.db)
+            .await
+            .unwrap()
+    }
+
+    async fn create_named_user(&self, name: &str) -> Value {
+        let reply = self.call(
+            "POST", "/api/v2/users",
+            Some(json!({"name":name,"disabled":false,"profile_ids":[],"permissions":["catalog:read"],"policy":{"library_ids":[self.library],"allow_unrated":true,"allowed_ratings":[],"blocked_labels":[]}})),
+            &[("authorization", &bearer(OPERATOR)), ("idempotency-key", &format!("named-user-{}", uuid::Uuid::new_v4()))],
+        ).await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        reply.body
+    }
+}
+
+/// First setup → browser code → explicit approval for the preselected owner
+/// → browser session. Loopback requests without the operator token get nothing.
+#[tokio::test]
+async fn first_run_owner_setup_pairs_a_browser_with_deliberate_administration() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    // A pre-existing unassigned device keeps its owner (none) through setup.
+    let (legacy, _) = f.pair(&[], &["catalog:read"]).await;
+    let initial = f.setup_state().await;
+    assert_eq!(initial["owner_setup"], "required", "{initial}");
+    assert_eq!(initial["pairing_user"], Value::Null);
+    assert_eq!(initial["eligible_users"], 0);
+
+    // Loopback origin alone is not authority.
+    let anonymous = f.setup(json!({}), None).await;
+    problem(
+        &anonymous,
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    );
+    let anonymous_read = f
+        .call("GET", "/api/v2/access/setup", None, &[("origin", ORIGIN)])
+        .await;
+    assert_eq!(anonymous_read.status, StatusCode::UNAUTHORIZED);
+    let (_, viewer) = f.pair(&[], &["catalog:read"]).await;
+    let forbidden = f.setup(json!({}), Some(&viewer)).await;
+    problem(&forbidden, StatusCode::FORBIDDEN, "permission_denied");
+    assert_eq!(f.user_count().await, 0);
+
+    // The browser starts pairing before setup and shows its code.
+    let pairing = f
+        .call(
+            "POST",
+            "/api/v2/auth/pairings",
+            Some(json!({"device_name":"Web browser","client_name":"Motion web"})),
+            &[],
+        )
+        .await;
+    assert_eq!(pairing.status, StatusCode::CREATED);
+    let pairing_id = pairing.body["id"].as_str().unwrap().to_owned();
+
+    let created = f.setup(json!({}), Some(OPERATOR)).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let owner = created.body["owner"].clone();
+    assert_eq!(owner["name"], "Owner");
+    assert_eq!(owner["disabled"], false);
+    assert_eq!(owner["revision"], "1");
+    assert!(
+        owner["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("system:admin"))
+    );
+    assert_eq!(created.body["owner_setup"], "complete");
+    assert_eq!(created.body["pairing_user"], owner);
+
+    // Retries, including with another name, return the recorded owner.
+    for body in [json!({}), json!({"name":"Someone else"})] {
+        let retry = f.setup(body, Some(OPERATOR)).await;
+        assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+        assert_eq!(retry.body["owner"], owner);
+    }
+    assert_eq!(f.user_count().await, 1);
+    let legacy_device = f
+        .call(
+            "GET",
+            &format!("/api/v2/devices/{legacy}"),
+            None,
+            &[("authorization", &bearer(OPERATOR))],
+        )
+        .await;
+    assert_eq!(legacy_device.body["user_id"], Value::Null);
+
+    // The administrator compares the code and approves administration explicitly.
+    let suggested = f.setup_state().await["pairing_user"].clone();
+    assert_eq!(suggested["id"], owner["id"]);
+    let mismatch = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{pairing_id}/approve"),
+            Some(json!({"user_code":"WRONG-CODE","profile_ids":[],"permissions":["system:admin"],"user_id":suggested["id"],"user_revision":suggested["revision"]})),
+            &[("authorization", &bearer(OPERATOR)), ("idempotency-key", "owner-approve-mismatch-0001")],
+        )
+        .await;
+    problem(
+        &mismatch,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "user_code_mismatch",
+    );
+    let approved = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{pairing_id}/approve"),
+            Some(json!({"user_code":pairing.body["user_code"],"profile_ids":[],"permissions":["catalog:read","system:admin"],"user_id":suggested["id"],"user_revision":suggested["revision"]})),
+            &[("authorization", &bearer(OPERATOR)), ("idempotency-key", "owner-approve-explicit-0001")],
+        )
+        .await;
+    assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+    assert_eq!(approved.body["user_id"], owner["id"]);
+    let claimed = f
+        .call(
+            "POST",
+            &format!("/api/v2/auth/pairings/{pairing_id}/claim"),
+            Some(json!({"device_code":pairing.body["device_code"]})),
+            &[],
+        )
+        .await;
+    assert_eq!(claimed.status, StatusCode::OK, "{}", claimed.body);
+    let session = f
+        .call(
+            "POST",
+            "/api/v2/auth/session",
+            Some(json!({"kind":"credential","credential":claimed.body["access_token"]})),
+            &[("origin", ORIGIN)],
+        )
+        .await;
+    assert_eq!(session.status, StatusCode::OK, "{}", session.body);
+    let cookie = session.headers["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let me = f
+        .call("GET", "/api/v2/me", None, &[("cookie", &cookie)])
+        .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert!(me.body.to_string().contains("system:admin"), "{}", me.body);
+    let browser_view = f
+        .call("GET", "/api/v2/access/setup", None, &[("cookie", &cookie)])
+        .await;
+    assert_eq!(browser_view.status, StatusCode::OK, "{}", browser_view.body);
+    assert_eq!(browser_view.body["owner"]["id"], owner["id"]);
+}
+
+/// Setup never adopts existing users; selection stays explicit when several
+/// users are eligible, and a single enabled user is the suggestion.
+#[tokio::test]
+async fn owner_setup_refuses_existing_users_and_keeps_multi_user_selection() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    let first = f.create_named_user("Avery").await;
+    let state = f.setup_state().await;
+    assert_eq!(state["owner_setup"], "existing_users");
+    assert_eq!(state["owner"], Value::Null);
+    assert_eq!(state["pairing_user"]["id"], first["id"]);
+    let refused = f.setup(json!({"name":"Owner"}), Some(OPERATOR)).await;
+    problem(&refused, StatusCode::CONFLICT, "owner_setup_unavailable");
+    assert_eq!(f.user_count().await, 1);
+    assert_eq!(f.setup_state().await["owner_setup"], "existing_users");
+
+    let second = f.create_named_user("Blake").await;
+    let several = f.setup_state().await;
+    assert_eq!(several["pairing_user"], Value::Null);
+    assert_eq!(several["eligible_users"], 2);
+    let mut disabled = second.clone();
+    disabled["disabled"] = json!(true);
+    for field in ["id", "revision"] {
+        disabled.as_object_mut().unwrap().remove(field);
+    }
+    let edited = f
+        .call(
+            "PUT",
+            &format!("/api/v2/users/{}", second["id"].as_str().unwrap()),
+            Some(disabled),
+            &[
+                ("authorization", &bearer(OPERATOR)),
+                (
+                    "if-match",
+                    &format!("\"r-{}\"", second["revision"].as_str().unwrap()),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(edited.status, StatusCode::OK, "{}", edited.body);
+    let single = f.setup_state().await;
+    assert_eq!(single["pairing_user"]["id"], first["id"]);
+    assert_eq!(single["eligible_users"], 1);
+}
+
+/// Concurrent requests create one owner; an interrupted attempt leaves no
+/// partial owner; a restarted server observes the same recorded owner.
+#[tokio::test]
+async fn owner_setup_is_atomic_under_concurrency_interruption_and_restart() {
+    let f = Fixture::new(AccessMode::Restricted).await;
+    // Interrupt the attempt after the user insert, before the record commits.
+    sqlx::query("CREATE TRIGGER interrupt_setup BEFORE INSERT ON access_owner_setup BEGIN SELECT RAISE(ABORT,'interrupted'); END")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+    let interrupted = f.setup(json!({}), Some(OPERATOR)).await;
+    assert_eq!(interrupted.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(f.user_count().await, 0);
+    assert_eq!(f.setup_state().await["owner_setup"], "required");
+    sqlx::query("DROP TRIGGER interrupt_setup")
+        .execute(&f.app.db)
+        .await
+        .unwrap();
+
+    let (a, b, c, d) = tokio::join!(
+        f.setup(json!({}), Some(OPERATOR)),
+        f.setup(json!({"name":"Second"}), Some(OPERATOR)),
+        f.setup(json!({}), Some(OPERATOR)),
+        f.setup(json!({}), Some(OPERATOR)),
+    );
+    let replies = [a, b, c, d];
+    let created = replies
+        .iter()
+        .filter(|r| r.status == StatusCode::CREATED)
+        .count();
+    assert_eq!(
+        created,
+        1,
+        "{:?}",
+        replies.iter().map(|r| &r.body).collect::<Vec<_>>()
+    );
+    let owner = replies[0].body["owner"]["id"].clone();
+    for reply in &replies {
+        assert!(
+            matches!(reply.status, StatusCode::OK | StatusCode::CREATED),
+            "{}",
+            reply.body
+        );
+        assert_eq!(reply.body["owner"]["id"], owner);
+    }
+    assert_eq!(f.user_count().await, 1);
+
+    let mut restarted = f.app.clone();
+    restarted.db = db::connect(&f._dir.path().join("db.sqlite")).await.unwrap();
+    restarted.access = Arc::new(playscale::v2::Runtime::new(AccessMode::Restricted, [1; 32]));
+    let after = api::router(restarted, None)
+        .oneshot(f.request(
+            "POST",
+            "/api/v2/access/setup",
+            Some(&json!({})),
+            &[("authorization", &bearer(OPERATOR))],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&after.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["owner"]["id"], owner);
+    assert_eq!(f.user_count().await, 1);
+}
+
+/// Household mode admits unsigned viewers, but never as the first-run Owner:
+/// setup stays an administrator action, and the operator still performs it.
+#[tokio::test]
+async fn household_viewers_cannot_perform_first_run_owner_setup() {
+    let f = Fixture::new(AccessMode::TrustedHousehold).await;
+    let csrf = playscale::v2::auth::household_csrf(&f.app);
+    let read = f
+        .call("GET", "/api/v2/access/setup", None, &[("origin", ORIGIN)])
+        .await;
+    problem(&read, StatusCode::FORBIDDEN, "permission_denied");
+    let without_csrf = f.setup(json!({}), None).await;
+    problem(&without_csrf, StatusCode::FORBIDDEN, "csrf_required");
+    let with_csrf = f
+        .call(
+            "POST",
+            "/api/v2/access/setup",
+            Some(json!({})),
+            &[("origin", ORIGIN), ("x-csrf-token", &csrf)],
+        )
+        .await;
+    problem(&with_csrf, StatusCode::FORBIDDEN, "permission_denied");
+    assert_eq!(f.user_count().await, 0);
+    assert_eq!(f.setup_state().await["owner_setup"], "required");
+
+    let created = f.setup(json!({"name":"Owner"}), Some(OPERATOR)).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    assert_eq!(f.user_count().await, 1);
+    // The household viewer is still not the Owner.
+    let me = f.call("GET", "/api/v2/me", None, &[]).await;
+    assert_eq!(me.body["id"], "household");
+}

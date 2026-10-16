@@ -114,3 +114,61 @@ func (c *Client) RedeemInvitation(ctx context.Context, input RedemptionInput) (C
 	_, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/auth/invitations/redeem", body: input}, &v)
 	return v, err
 }
+
+// Owner setup states reported by the server.
+const (
+	SetupRequired      = "required"
+	SetupComplete      = "complete"
+	SetupExistingUsers = "existing_users"
+)
+
+// AccessSetup is first-run owner setup and the user suggested for pairing
+// approval: the only enabled user, or nil when none or several are enabled.
+type AccessSetup struct {
+	OwnerSetup    string `json:"owner_setup"`
+	Owner         *User  `json:"owner"`
+	PairingUser   *User  `json:"pairing_user"`
+	EligibleUsers int    `json:"eligible_users"`
+}
+type SetupInput struct {
+	Name string `json:"name,omitempty"`
+}
+
+func (c *Client) GetAccessSetup(ctx context.Context) (AccessSetup, error) {
+	var v AccessSetup
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/access/setup", auth: true}, &v)
+	return v, err
+}
+
+// SetupOwner is naturally idempotent: a repeat returns the recorded owner,
+// so it is retried like a keyed write.
+func (c *Client) SetupOwner(ctx context.Context, in SetupInput) (AccessSetup, error) {
+	var v AccessSetup
+	_, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/access/setup", body: in, auth: true, repeatable: true}, &v)
+	return v, err
+}
+
+// ActionApproval is a pending request from another device to make one
+// sensitive change (for example creating a user or approving a pairing)
+// without recent sign-in. Approving it needs the code that device shows.
+type ActionApproval struct {
+	ID        string `json:"id"`
+	Actor     string `json:"actor"`
+	Action    string `json:"action"`
+	Target    string `json:"target"`
+	Status    string `json:"status"`
+	ExpiresAt int64  `json:"expires_at"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func (c *Client) ListActionApprovals(ctx context.Context, cursor string, limit int) (Page[ActionApproval], error) {
+	var v Page[ActionApproval]
+	_, err := c.do(ctx, request{method: http.MethodGet, path: "/api/v2/admin/auth/fresh-approvals", query: pageQuery(cursor, limit), auth: true}, &v)
+	return v, err
+}
+
+// ApproveAction is not retried: a second approval of the same request is refused.
+func (c *Client) ApproveAction(ctx context.Context, id, code string) error {
+	_, err := c.do(ctx, request{method: http.MethodPost, path: "/api/v2/auth/proofs/" + esc(id) + "/approve", body: map[string]string{"code": code}, auth: true}, nil)
+	return err
+}

@@ -41,6 +41,8 @@ type Server struct {
 	devices     []*api.Device
 	policies    map[string]*api.AccessPolicy
 	users       []*api.User
+	owner       string
+	approvals   []*actionApproval
 	pairings    []*pairing
 	invitations []*api.Invitation
 	redeemed    map[string]api.Credential
@@ -50,6 +52,11 @@ type Server struct {
 	libraries   []*api.Library
 	scans       []*api.Scan
 	items       []api.CatalogItem
+}
+
+type actionApproval struct {
+	api.ActionApproval
+	code string
 }
 
 type pairing struct {
@@ -544,6 +551,118 @@ func (s *Server) CreateUser(_ context.Context, in api.UserInput, key string) (ap
 	})
 }
 
+// SeedActionApproval adds a pending request from device actor; it returns
+// the request and the code that device would show.
+func (s *Server) SeedActionApproval(actor, action, target string) (api.ActionApproval, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := &actionApproval{ActionApproval: api.ActionApproval{ID: s.id("proof"), Actor: actor, Action: action, Target: target, Status: "pending", ExpiresAt: 4102444800, CreatedAt: 1}, code: "CODE" + strconv.Itoa(s.seq)}
+	s.approvals = append(s.approvals, a)
+	return a.ActionApproval, a.code
+}
+
+func (s *Server) ListActionApprovals(_ context.Context, cursor string, limit int) (api.Page[api.ActionApproval], error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("listActionApprovals", "", "", "")
+	// Like the server: approved requests stay listed until consumed.
+	var live []api.ActionApproval
+	for _, a := range s.approvals {
+		if a.Status != "consumed" {
+			live = append(live, a.ActionApproval)
+		}
+	}
+	return page(live, cursor, limit), nil
+}
+
+// ConsumeActionApproval mirrors the requester submitting its approved change.
+func (s *Server) ConsumeActionApproval(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.approvals {
+		if a.ID == id {
+			a.Status = "consumed"
+		}
+	}
+}
+
+// ApproveAction mirrors the server: the exact code, once.
+func (s *Server) ApproveAction(_ context.Context, id, code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("approveAction", id, "", "")
+	for _, a := range s.approvals {
+		if a.ID != id {
+			continue
+		}
+		if a.Status != "pending" {
+			return problem(409, "expired")
+		}
+		if a.code != code {
+			return problem(422, "invalid_code")
+		}
+		a.Status = "approved"
+		_, err := s.deliver(nil)
+		return err
+	}
+	return problem(404, "not_found")
+}
+
+// GetAccessSetup mirrors the server's owner setup state.
+func (s *Server) GetAccessSetup(_ context.Context) (api.AccessSetup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("getAccessSetup", "", "", "")
+	return s.setup(), nil
+}
+
+func (s *Server) setup() api.AccessSetup {
+	v := api.AccessSetup{OwnerSetup: api.SetupExistingUsers}
+	switch {
+	case s.owner != "":
+		v.OwnerSetup = api.SetupComplete
+	case len(s.users) == 0:
+		v.OwnerSetup = api.SetupRequired
+	}
+	var eligible []*api.User
+	for _, u := range s.users {
+		if u.ID == s.owner {
+			c := *u
+			v.Owner = &c
+		}
+		if !u.Disabled {
+			eligible = append(eligible, u)
+		}
+	}
+	v.EligibleUsers = len(eligible)
+	if len(eligible) == 1 {
+		c := *eligible[0]
+		v.PairingUser = &c
+	}
+	return v
+}
+
+// SetupOwner creates the owner only when no user exists; a repeat returns it.
+func (s *Server) SetupOwner(_ context.Context, in api.SetupInput) (api.AccessSetup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.record("setupAccessOwner", "", "", "")
+	if s.owner == "" {
+		if len(s.users) != 0 {
+			return api.AccessSetup{}, problem(409, "owner_setup_unavailable")
+		}
+		name := in.Name
+		if name == "" {
+			name = "Owner"
+		}
+		u := &api.User{ID: s.id("u"), Name: name, Revision: "1", ProfileIDs: []string{}, Permissions: slices.Clone(api.AllPermissions), Policy: api.GrantPolicy{LibraryIDs: []string{}, AllowUnrated: true, AllowedRatings: []string{}, BlockedLabels: []string{}}}
+		s.users = append(s.users, u)
+		s.owner = u.ID
+	}
+	v, err := s.deliver(s.setup())
+	return v.(api.AccessSetup), err
+}
+
 func (s *Server) ReplaceUser(_ context.Context, id string, in api.UserInput, etag string) (api.Tagged[api.User], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1017,6 +1136,20 @@ func (s *Server) Handler() http.Handler {
 			_ = decode(&in)
 			t, e := s.ReplaceDevicePolicy(ctx, seg[1], in, ifMatch)
 			tagged(t.Value, t.ETag, e)
+		case "GET admin/auth/fresh-approvals":
+			v, err = s.ListActionApprovals(ctx, cursor, limit)
+		case "POST auth/proofs/*/approve":
+			var in struct {
+				Code string `json:"code"`
+			}
+			_ = decode(&in)
+			err = s.ApproveAction(ctx, seg[2], in.Code)
+		case "GET access/setup":
+			v, err = s.GetAccessSetup(ctx)
+		case "POST access/setup":
+			var in api.SetupInput
+			_ = decode(&in)
+			v, err = s.SetupOwner(ctx, in)
 		case "GET users":
 			v, err = s.ListUsers(ctx, cursor, limit)
 		case "POST users":
@@ -1144,7 +1277,7 @@ func pattern(seg []string) []string {
 	case len(out) >= 3 && out[0] == "auth" && out[2] != "redeem",
 		len(out) >= 3 && out[0] == "catalog":
 		out[2] = "*"
-	case out[0] == "auth", out[0] == "system", out[0] == "admin", out[0] == "catalog":
+	case out[0] == "auth", out[0] == "system", out[0] == "admin", out[0] == "catalog", out[0] == "access":
 	case len(out) >= 2:
 		out[1] = "*"
 		if len(out) >= 4 && out[2] == "timelines" {
