@@ -104,6 +104,7 @@ mod tests {
                 server_epoch: "epoch-1".into(),
                 viewing_epoch: "server:restore".into(),
                 csrf_token: "session-csrf".into(),
+                household: false,
             })),
         }
     }

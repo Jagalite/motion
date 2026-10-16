@@ -23,6 +23,8 @@ struct Queries {
     app: App,
     headers: HeaderMap,
     ingress: Option<v2::auth::TrustedIngress>,
+    /// The client's address: internal reads are rate-limited as that client.
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
 }
 
 fn error(status: StatusCode) -> UiError {
@@ -244,6 +246,9 @@ impl Queries {
         *request.headers_mut() = self.headers.clone();
         if let Some(ingress) = self.ingress {
             request.extensions_mut().insert(ingress);
+        }
+        if let Some(peer) = self.peer {
+            request.extensions_mut().insert(peer);
         }
         let response = v2::router()
             .with_state(self.app.clone())
@@ -508,6 +513,10 @@ async fn render(State(app): State<App>, mut request: Request) -> Response {
             .extensions()
             .get::<v2::auth::TrustedIngress>()
             .copied(),
+        peer: request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .copied(),
     });
     let render = async {
         if let Some(PresentationIdentity(Some(caller))) = identity {
@@ -572,13 +581,14 @@ async fn render(State(app): State<App>, mut request: Request) -> Response {
                 Err(error) => return error.into_response(),
             };
             request.extensions_mut().insert(UiPrincipal {
-                principal_id: caller.principal.id,
+                principal_id: caller.principal.id.clone(),
                 profile_id: profile.id.clone(),
                 profile_name: profile.name.clone(),
                 profiles,
                 permissions,
                 server_epoch: app.access.server_epoch.clone(),
                 viewing_epoch: format!("{server_id}:{restore_epoch}"),
+                household: caller.is_household(),
                 csrf_token: caller.csrf.unwrap_or_default(),
             });
         }
@@ -765,6 +775,9 @@ impl UiQueryFacade for Queries {
                 let viewing = self.viewing(who, &timeline).await.map(|v| TimelineViewing {
                     position_ms: v["position_ms"].as_u64().unwrap_or(0),
                     watched: v["watched"].as_bool().unwrap_or(false),
+                    revision: text(&v, "revision"),
+                    manual_epoch: text(&v, "manual_epoch"),
+                    session_id: text(&v, "session_id"),
                 });
                 // Ready prepared versions, when this caller may save and read
                 // them; each is offered with exactly the selection it kept.

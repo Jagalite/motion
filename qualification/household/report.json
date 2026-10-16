@@ -1,0 +1,165 @@
+{
+  "checks": [
+    {
+      "id": "startup.announces_household_mode",
+      "ok": true,
+      "detail": "Household mode: anyone who can reach http://127.0.0.1:58646 can browse, play and save progress without signing in."
+    },
+    {
+      "id": "api.catalog_without_credentials",
+      "ok": true,
+      "detail": "[\"Second Feature\",\"Signal Film\"]"
+    },
+    {
+      "id": "web.home_renders_without_sign_in",
+      "ok": true,
+      "detail": "status 200"
+    },
+    {
+      "id": "web.sign_in_link_offered",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "web.no_manage_section",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "web.no_personal_sign_in_methods_link",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "web.item_page",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "player.ready",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "player.plays_without_sign_in",
+      "ok": true,
+      "detail": "{\"ok\":true,\"from\":0.003056,\"to\":6.105356}"
+    },
+    {
+      "id": "player.remembers_volume_and_mute",
+      "ok": true,
+      "detail": "{\"volume\":0.35,\"muted\":true}"
+    },
+    {
+      "id": "viewing.progress_saved",
+      "ok": true,
+      "detail": "Stopped at 0:06."
+    },
+    {
+      "id": "viewing.resume_and_start_over_offered",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "player.resume_starts_at_saved_position",
+      "ok": true,
+      "detail": "resume_ms=6105"
+    },
+    {
+      "id": "player.volume_and_mute_carry_over",
+      "ok": true,
+      "detail": "{\"volume\":0.35,\"muted\":true}"
+    },
+    {
+      "id": "player.start_over_starts_at_zero",
+      "ok": true,
+      "detail": "{\"state\":\"ready\",\"currentTime\":0}"
+    },
+    {
+      "id": "player.start_over_keeps_viewing_snapshot",
+      "ok": true,
+      "detail": "resume_ms=6105"
+    },
+    {
+      "id": "viewing.mark_watched",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "viewing.mark_unwatched_starts_over",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "id": "web.administration_forbidden",
+      "ok": true,
+      "detail": "status 403"
+    },
+    {
+      "id": "api.users_forbidden",
+      "ok": true,
+      "detail": "403"
+    },
+    {
+      "id": "api.write_without_csrf_refused",
+      "ok": true,
+      "detail": "csrf_required"
+    },
+    {
+      "id": "api.cross_origin_write_refused",
+      "ok": true,
+      "detail": "invalid_origin"
+    },
+    {
+      "id": "api.stale_session_not_downgraded",
+      "ok": true,
+      "detail": "authentication_required"
+    },
+    {
+      "id": "admin.paired",
+      "ok": true,
+      "detail": "200/200 {\"client_name\":\"walkthrough\",\"id\":\"246a08ab-5a25-44b8-8a86-c3852e4b759d\",\"name\":\"Walkthrough admin\",\"permissions\":[\"system:admin\"],\"profile_ids\":[\"default\"],\"revision\":\"1\",\"revoked\":false,\"user_id\":nu"
+    },
+    {
+      "id": "admin.signed_in_sees_manage",
+      "ok": true,
+      "detail": "200"
+    },
+    {
+      "id": "admin.sign_out_returns_to_household",
+      "ok": true,
+      "detail": "sign-out 204"
+    },
+    {
+      "id": "a11y.household_pages_axe_clean",
+      "ok": true,
+      "detail": "{\"/\":[],\"/item/5c8376d2-5e00-4f06-9a25-78d9126f6a42\":[]}"
+    },
+    {
+      "id": "viewing.mark_retries_past_progress_race",
+      "ok": true,
+      "detail": "1 stale-revision retries"
+    },
+    {
+      "id": "web.no_unexpected_failed_requests",
+      "ok": true,
+      "detail": "{\"failedResponses\":[\"412 /api/v2/profiles/default/timelines/1bd16fa2-7e95-48e4-98ed-512dadb784de/viewing\",\"403 /settings/access\"]}"
+    },
+    {
+      "id": "web.no_console_errors_beyond_that_visit",
+      "ok": true,
+      "detail": "[\"Failed to load resource: the server responded with a status of 412 (Precondition Failed)\",\"Failed to load resource: the server responded with a status of 403 (Forbidden)\"]"
+    },
+    {
+      "id": "restricted_restart.anonymous_refused",
+      "ok": true,
+      "detail": "401"
+    },
+    {
+      "id": "restricted_restart.home_asks_to_sign_in",
+      "ok": true,
+      "detail": "401"
+    }
+  ],
+  "failed": 0
+}

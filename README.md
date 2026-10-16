@@ -64,7 +64,9 @@ Open **http://127.0.0.1:8787**. Registration and an initial scan run for each
 `--library`; repeat the option for more roots. Pair the browser from a paired
 administrator terminal under **Pairing requests**, or redeem an invitation.
 See [Administrator access](ACCESS_MANAGEMENT.md) for users, grants, invitations,
-device revocation and explicit server-local recovery.
+device revocation and explicit server-local recovery. On a trusted home network,
+`--access-mode trusted_household` lets everyone browse and play without signing in
+(see [Household mode](ACCESS_MANAGEMENT.md#household-mode-no-sign-in)).
 Use the exact configured hostname. Local data defaults to `data/`; put it on a local
 disk outside media roots. One process may own a data directory.
 

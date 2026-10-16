@@ -356,7 +356,9 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     </ul>
                                 }
                                 <ul class="nav-list nav-foot">
-                                    nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
+                                    if !who.household {
+                                        nav_link(href: "/settings/signin".to_string(), label: "My sign-in methods".to_string(), icon_name: "profiles", current: path == "/settings/signin")
+                                    }
                                     nav_link(href: href!(crate::screens::profiles).resolve(cx), label: "Profiles".to_string(), icon_name: "profiles", current: path.starts_with("/profiles"))
                                 </ul>
                             </nav>
@@ -395,6 +397,9 @@ async fn shell(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                         <span class="profile">"Profile: " (who.profile_name.as_str())</span>
                                     }
                                     <a class="avatar" href=(href!(crate::screens::profiles)) aria-label=(format!("Profile: {}", who.profile_name))>(initial.as_str())</a>
+                                    if who.household {
+                                        <a class="button" href="/signin">"Sign in"</a>
+                                    }
                                 </div>
                             </header>
                         }
@@ -647,6 +652,26 @@ async fn item(cx: &Cx) -> Result<impl View> {
                                         icon(name: "play")
                                         if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) { "Resume" } else { "Play" }
                                     </a>
+                                    if timeline.viewing.as_ref().is_some_and(|v| v.position_ms > 0 && !v.watched) {
+                                        <a class="button" href=(format!("{}?from=start", href!(play, TimelineId(timeline.id.as_str())).resolve(cx)))>"Start over"</a>
+                                    }
+                                }
+                                if let (true, Some(viewing)) = (who.can("viewing:write"), &timeline.viewing) {
+                                    crate::screens::command_form(
+                                        command: format!("PUT /api/v2/profiles/{}/timelines/{}/viewing", who.profile_id, timeline.id),
+                                        label: if viewing.watched { "Mark unwatched" } else { "Mark watched" },
+                                        if_match: Some(format!("\"r-{}\"", viewing.revision)),
+                                        class: Some("command viewing-mark"),
+                                        viewing_epoch: Some(who.viewing_epoch.clone()),
+                                        viewing_manual_epoch: Some(viewing.manual_epoch.clone()),
+                                        viewing_session: Some(viewing.session_id.clone()),
+                                        // Unwatched starts the title over; watched keeps the position.
+                                        json_body: Some(if viewing.watched {
+                                            r#"{"manual_watched":false,"reset_position":true}"#
+                                        } else {
+                                            r#"{"manual_watched":true,"reset_position":false}"#
+                                        }.to_string()),
+                                    )
                                 }
                                 if who.can("downloads:manage") {
                                     download_form(device_id: who.principal_id.clone(), profile_id: who.profile_id.clone(), timeline_id: timeline.id.clone(), prepared: timeline.prepared_downloads.clone(), incomplete: timeline.prepared_incomplete, subtitled: timeline.subtitle_downloads.clone())
@@ -792,6 +817,16 @@ async fn play(cx: &Cx) -> Result<impl View> {
     let who = principal(cx)?;
     let id = path_param::<TimelineId>(cx);
     let view_model = facade(cx).0.player(who, id).await.map_err(ui_error)?;
+    // "Start over" from the title page changes only where playback starts;
+    // `resume_ms` stays the rendered viewing snapshot the player reconciles with.
+    let start_ms = if uri(cx)
+        .query()
+        .is_some_and(|q| q.split('&').any(|pair| pair == "from=start"))
+    {
+        0
+    } else {
+        view_model.resume_ms
+    };
     let preferences = facade(cx)
         .0
         .profiles(who)
@@ -830,6 +865,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
             data-software-decode=(if preferences.allow_client_software_decode { "true" } else { "false" })
             data-max-bitrate=(preferences.max_bitrate_bps.map(|b| b.to_string()).unwrap_or_default())
             data-resume-ms=(view_model.resume_ms)
+            data-start-ms=(start_ms)
             data-duration-ms=(view_model.duration_ms.unwrap_or(0))
             data-demuxe-base=(assets::DEMUXE_BASE)>
             <p class="status-panel" role="status" data-state="loading">"Preparing playback…"</p>
@@ -840,7 +876,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <button type="button" data-player-action="pause">icon(name: "pause") <span>"Pause"</span></button>
                 <button type="button" data-player-action="mute">icon(name: "volume") <span>"Mute / unmute"</span></button>
                 <button type="button" data-player-action="next">icon(name: "next") <span>"Next title"</span></button>
-                <output id="motion-position" aria-live="off">(clock(view_model.resume_ms))</output>
+                <output id="motion-position" aria-live="off">(clock(start_ms))</output>
             </div>
             // Skip buttons appear while playback is inside their interval
             // (the player shows them); chapters are always listed.
@@ -868,7 +904,7 @@ async fn play(cx: &Cx) -> Result<impl View> {
                 <summary>"Playback options"</summary>
                 <div class="player-options-body">
                     <div class="player-option-row">
-                        <label>"Position in seconds "<input name="position" type="number" inputmode="decimal" min="0" step="0.1" required=(true) value=(view_model.resume_ms / 1000)></label>
+                        <label>"Position in seconds "<input name="position" type="number" inputmode="decimal" min="0" step="0.1" required=(true) value=(start_ms / 1000)></label>
                         <button type="submit">"Seek"</button>
                     </div>
                     <label>"Version "<select name="version"><option value="">"Automatic"</option>

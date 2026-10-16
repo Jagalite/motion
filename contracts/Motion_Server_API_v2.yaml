@@ -12332,6 +12332,7 @@ components:
           - paired
           - trusted_private
           - integration
+          - household
       required:
       - id
       - device_id

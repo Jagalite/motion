@@ -260,6 +260,18 @@ async fn run() -> anyhow::Result<()> {
         "Motion is running at {origin}\nAdmin token file: {}\nPress Ctrl+C to stop.",
         token_path.display()
     );
+    if app.access.mode == playscale_core::access::AccessMode::TrustedHousehold {
+        // Explicitly chosen; say what it means every start.
+        tracing::warn!(%origin, loopback = address.ip().is_loopback(), "Household access mode: requests without a credential browse and play as the household viewer");
+        println!(
+            "Household mode: anyone who can reach {origin} can browse, play and save progress without signing in.\nAdministration still needs the admin token file or a signed-in administrator.{}",
+            if address.ip().is_loopback() {
+                ""
+            } else {
+                "\nWARNING: this server listens beyond this computer. Use household mode only on a network you trust."
+            }
+        );
+    }
     if cli.open_browser {
         #[cfg(target_os = "macos")]
         if let Err(error) = std::process::Command::new("/usr/bin/open")

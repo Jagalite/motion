@@ -296,12 +296,12 @@ fn revoked_missing_and_narrowed_owners_cannot_continue() {
                         },
                     };
                     assert_eq!(
-                        may_continue(&owner, Some(&device), Some(&file)),
+                        may_continue(&owner, Some(&device), None, Some(&file)),
                         !revoked && permission && profile && library
                     );
                 }
             }
         }
     }
-    assert!(!may_continue(&owner, None, Some(&file)));
+    assert!(!may_continue(&owner, None, None, Some(&file)));
 }

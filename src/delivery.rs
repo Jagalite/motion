@@ -2362,10 +2362,23 @@ async fn revalidate(app: &App, session: &Arc<Session>) {
         let allowed = async {
             let mut tx = app.db.begin().await.map_err(crate::v2::Problem::from)?;
             let device = crate::v2::auth::load_device(&mut tx, &owner.principal).await?;
+            // Observed only while the deployment admits the household viewer.
+            let household =
+                if app.access.mode == playscale_core::access::AccessMode::TrustedHousehold {
+                    Some(crate::v2::auth::load_household_scope(&mut tx).await?)
+                } else {
+                    None
+                };
             let file = crate::v2::content::file_facts(&mut tx, &owner.file).await?;
             Ok::<_, crate::v2::Problem>(playscale_core::playback_session::may_continue(
                 owner,
                 device.as_ref().map(|d| &d.device),
+                household.as_ref().map(|(library_ids, profile_ids)| {
+                    playscale_core::access::HouseholdScope {
+                        library_ids,
+                        profile_ids,
+                    }
+                }),
                 file.as_ref(),
             ))
         }

@@ -107,7 +107,7 @@ impl Fixture {
             storage: Arc::new(playscale::storage::Runtime::new(state, storage)),
             processing: Arc::new(processing),
             access: Arc::new(playscale::v2::Runtime::new(
-                playscale_core::access::AccessMode::TrustedHousehold,
+                playscale_core::access::AccessMode::Restricted,
                 playscale::v2::auth::random_key(),
             )),
         };
