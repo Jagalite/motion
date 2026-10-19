@@ -423,3 +423,97 @@ async fn failed_guard_installation_rolls_back_partial_ddl_and_admission() {
         Some(("retry-install", 1))
     );
 }
+
+#[tokio::test]
+async fn manual_pins_use_native_owner_and_survive_batch_packing_and_restart() {
+    let f = Fixture::new().await;
+    for (id, state) in [
+        ("a", "manual"),
+        ("b", "manual"),
+        ("c", "matched"),
+        ("d", "unmatched"),
+        ("e", "ambiguous"),
+        ("retired", "manual"),
+    ] {
+        sqlx::query("INSERT INTO items(id,title,kind,match_state) VALUES(?,?,'video',?)")
+            .bind(id)
+            .bind(id)
+            .bind(state)
+            .execute(&f.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO item_origins VALUES(?,?)")
+            .bind(id)
+            .bind(id)
+            .execute(&f.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO metadata_documents VALUES(?,'tmdb',7,?, ?,1)")
+            .bind(id)
+            .bind(format!("id-{id}"))
+            .bind(json!({"values":{},"tags":[],"excluded_tags":[]}).to_string())
+            .execute(&f.db)
+            .await
+            .unwrap();
+    }
+    sqlx::raw_sql("INSERT INTO catalog_receipts VALUES('merge','merge',1,'{}'); INSERT INTO item_aliases VALUES('retired','a','merge');")
+        .execute(&f.db).await.unwrap();
+    let backend = f.backend().await;
+    backend.capture_motion_import("pins").await.unwrap();
+    let saved = f.snapshot("pins").await;
+    assert_eq!(saved.manifest.source_namespace, "motion.schema68.export.v2");
+    let pins: Vec<_> = saved
+        .batches
+        .iter()
+        .filter_map(|b| b.typed.as_ref())
+        .flat_map(|t| &t.pins)
+        .collect();
+    assert_eq!(pins.len(), 2);
+    assert_eq!(
+        pins.iter().map(|p| p.item_id.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert!(
+        pins.iter()
+            .all(|p| p.namespace == "tmdb" && p.history[0].source_revision == 7)
+    );
+    // Capture is immutable even if the source subsequently releases a pin.
+    sqlx::query("UPDATE items SET match_state='unmatched' WHERE id='a'")
+        .execute(&f.db)
+        .await
+        .unwrap();
+    backend.stage_import("pins").await.unwrap();
+    drop(backend);
+    let backend = f.backend().await;
+    assert!(backend.validate_import("pins", None).await.is_err());
+    let ImportReceipt::ValidatedStaging {
+        proposed_typed_mappings,
+        activation_supported,
+        ..
+    } = backend.validate_motion_import("pins").await.unwrap()
+    else {
+        panic!("expected validation")
+    };
+    let mapped: Vec<_> = proposed_typed_mappings
+        .iter()
+        .filter(|v| v["owner"] == "pins")
+        .collect();
+    assert_eq!(mapped.len(), 2);
+    assert!(
+        mapped
+            .iter()
+            .all(|v| v["source_revision"] == 7 && v["catalog_revision"] == 1)
+    );
+    assert!(!activation_supported);
+    // A newly captured snapshot observes the release, never a retained set decision.
+    backend.capture_motion_import("released").await.unwrap();
+    let saved = f.snapshot("released").await;
+    let pins: Vec<_> = saved
+        .batches
+        .iter()
+        .filter_map(|b| b.typed.as_ref())
+        .flat_map(|t| &t.pins)
+        .collect();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].item_id, "b");
+}

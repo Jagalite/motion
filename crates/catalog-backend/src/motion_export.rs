@@ -12,15 +12,18 @@ use catabolic_store::{
         UnresolvedEvidence,
     },
     catalog_import_typed::{
-        ImportedContribution, ImportedMetadata, ImportedSourceKind, TypedAuthority, TypedBatch,
+        ImportedContribution, ImportedMetadata, ImportedPin, ImportedPinRevision,
+        ImportedSourceKind, TypedAuthority, TypedBatch,
     },
     catalog_metadata_store::{MetadataAccess, MetadataAuthority},
+    catalog_pins::{PinAuthority, PinDecision},
 };
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-const SOURCE: &str = "motion.schema68.export.v1";
+const SOURCE: &str = "motion.schema68.export.v2";
+const PREVIOUS_SOURCE: &str = "motion.schema68.export.v1";
 // Dedicated catalog facts not yet represented by a qualified typed mapping.
 // Artifact bytes remain Motion-owned; their catalog references are retained here.
 const EVIDENCE_TABLES: &[(&str, EvidenceKind)] = &[
@@ -108,10 +111,17 @@ impl NativeCatalog {
         .bind(import_id)
         .fetch_optional(&self.journal)
         .await?;
+        ensure!(
+            matches!(
+                snapshot.manifest.source_namespace.as_str(),
+                SOURCE | PREVIOUS_SOURCE
+            ),
+            "unsupported Motion export mapper"
+        );
         let admitted = provenance.is_some_and(|(input_digest, format_version)| {
             playscale_core::catalog_backend::ExportProvenance {
                 input_digest,
-                source_namespace: SOURCE.into(),
+                source_namespace: snapshot.manifest.source_namespace.clone(),
                 format_version,
             }
             .admits(&digest, &snapshot.manifest.source_namespace)
@@ -123,6 +133,19 @@ impl NativeCatalog {
         let mut grants = TypedAuthority::default();
         for batch in snapshot.batches {
             if let Some(typed) = batch.typed {
+                for pin in &typed.pins {
+                    grants
+                        .pins
+                        .get_or_insert_with(|| PinAuthority {
+                            host_namespace: HOST_NAMESPACE.into(),
+                            readable: BTreeMap::new(),
+                            mutable: BTreeMap::new(),
+                        })
+                        .mutable
+                        .entry(pin.namespace.clone())
+                        .or_default()
+                        .insert(pin.item_id.clone());
+                }
                 for metadata in typed.metadata {
                     grants.metadata.push(MetadataAuthority {
                         host_namespace: HOST_NAMESPACE.into(),
@@ -167,11 +190,15 @@ fn append(batches: &mut Vec<ImportBatch>, unit: ImportBatch) -> anyhow::Result<(
             .unresolved_evidence
             .extend(unit.unresolved_evidence.clone());
         if let Some(typed) = &unit.typed {
-            joined
-                .typed
-                .get_or_insert_with(TypedBatch::default)
-                .metadata
-                .extend(typed.metadata.clone());
+            let target = joined.typed.get_or_insert_with(TypedBatch::default);
+            target.metadata.extend(typed.metadata.clone());
+            target.pins.extend(typed.pins.clone());
+            if let Some(native) = &typed.native {
+                let target = target.native.get_or_insert_with(Default::default);
+                target.occurrences.extend(native.occurrences.clone());
+                target.associations.extend(native.associations.clone());
+                target.mutations.extend(native.mutations.clone());
+            }
         }
         if catalog_import::describe_batch(&joined).is_ok() {
             *last = joined;
@@ -241,6 +268,13 @@ async fn capture(
         }];
         let mut fields = BTreeSet::from(["title".to_owned()]);
         let mut pending = vec![];
+        let mut pins = vec![];
+        let state = serde_json::from_value(item["match_state"].clone())?;
+        let retired: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM item_aliases WHERE alias_id=?)")
+                .bind(id)
+                .fetch_one(&mut *db)
+                .await?;
         for (source, revision, external_id, document, updated_at) in documents {
             let doc: playscale_core::metadata::Contribution = serde_json::from_str(&document)?;
             ensure!(
@@ -248,6 +282,25 @@ async fn capture(
                 "reserved scan contribution in Motion source"
             );
             fields.extend(doc.values.keys().cloned());
+            let identity = external_id
+                .as_ref()
+                .map(|value| (source.clone(), value.clone()));
+            if playscale_core::catalog_backend::pinned_source_identity(
+                state,
+                retired,
+                identity.as_ref(),
+            ) {
+                pins.push(ImportedPin {
+                    item_id: id.into(),
+                    namespace: source.clone(),
+                    history: vec![ImportedPinRevision {
+                        source_revision: revision,
+                        decision: PinDecision::Set {
+                            value: external_id.clone().expect("pinned identity exists"),
+                        },
+                    }],
+                });
+            }
             if !doc.tags.is_empty() || !doc.excluded_tags.is_empty() || external_id.is_some() {
                 pending.push((source.clone(),json!({"item_id":id,"source":source,"revision":revision,"external_id":external_id,"tags":doc.tags,"excluded_tags":doc.excluded_tags})));
             }
@@ -274,6 +327,7 @@ async fn capture(
                         policies: json!(policies),
                         contributions: sources,
                     }],
+                    pins,
                     ..Default::default()
                 }),
                 ..empty()

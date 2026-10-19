@@ -4,7 +4,7 @@ Worktree branch: `feat/catabolic-main-backend`.
 Pinned upstream: `6969f08c5d9b207afe8eec819555759be136644d` (Catabolic main).
 
 The implementation provides native dependency alignment, operator catalog
-admission, durable commands, consistent Motion source capture and typed metadata
+admission, durable commands, consistent Motion source capture and typed metadata/pin
 staging in `crates/catalog-backend`. The server still uses its existing catalog
 routes/scanner. Binding an operator catalog does not activate it for the
 server. No real catalog migration has been performed.
@@ -74,7 +74,7 @@ that Motion writers are frozen or that application references have been audited.
 There is deliberately no activation command yet.
 
 The source exporter below now supplies Motion observations to this transport.
-Complete typed mappings, reference audit, durable write-freezing, activation and
+Complete typed mappings, reference audit, activation and
 startup reconciliation remain required before server cutover.
 
 ## Motion source capture
@@ -99,7 +99,16 @@ source-capture provenance. Copying a snapshot through `prepare-import` does not
 copy that authority. The production core checks the exact namespace, digest and
 supported exporter version before the adapter constructs any owner grants.
 
-Tags/exclusions, external identities, structural decisions, timelines, physical
+Export namespace `motion.schema68.export.v2` also imports current provider
+identities protected by Motion's manual match state as native pins. The core
+uses the same identity-withdrawal policy as the running application and excludes
+retired aliases. Other identities stay evidence. Only the current source head
+is available: its metadata-document revision maps explicitly to native pin
+revision 1; no earlier decisions or removal history are invented. Existing v1
+snapshots remain immutable and can still be validated. Pin grants are rebuilt
+only from the trusted retained export.
+
+Tags/exclusions, identity evidence, structural decisions, timelines, physical
 occurrences, source bindings and artwork references remain explicit unresolved
 evidence until their native mappings are implemented. Direct relational
 application references retain their key/reference columns; unrelated payloads

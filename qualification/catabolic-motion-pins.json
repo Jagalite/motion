@@ -1,0 +1,104 @@
+{
+  "base_commit": "a6319cf50d3a6bb89a93eadc505c0829dfb64bf9",
+  "catabolic_commit": "6969f08c5d9b207afe8eec819555759be136644d",
+  "source_sha256": {
+    "crates/core/src/catalog_backend.rs": "6687083c886c08b0ee073a5c996f2de99271f178d4ba0de4e0cf5f9601ec47fb",
+    "crates/core/tests/catalog_backend.rs": "dc69111891c20ee86348bacebef3ae0cc2765a7fdf0b03131036852846d9bacd",
+    "crates/catalog-backend/src/motion_export.rs": "de850583c293992a4a56901c774a578aefe26a496c7a5887e4ae331fe14b4fad",
+    "crates/catalog-backend/tests/motion_export.rs": "d69699dbcf25838cf4478c683c46c6f78e15a16e5bd80a7412a686e5023a4cc6"
+  },
+  "kyoto_jobs": [
+    {
+      "id": "c82bd091cfe44e9e8c537de218cfb67e",
+      "status": "succeeded",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "playscale-core",
+        "-p",
+        "motion-catalog-backend",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--no-run"
+      ]
+    },
+    {
+      "id": "74d8070dd9584010a2171a755116130a",
+      "status": "succeeded",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "playscale-core",
+        "-p",
+        "motion-catalog-backend",
+        "--all-targets",
+        "-j",
+        "1",
+        "--config",
+        "profile.dev.debug=0",
+        "--config",
+        "profile.test.debug=0",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    }
+  ],
+  "executions": [
+    {
+      "binary": "target/debug/deps/motion_catalog_backend-881985bb4926479f",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/pins-motion_catalog_backend.log",
+      "binary_sha256": "0ee688e9686fadf3fb37fcc414f10b486cd293c885e496bb575d981e606db209",
+      "log_sha256": "1da816586042ebf102f5afc52d1cc7849a8621d5041604ceed75b7a42b2edcec",
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s"
+    },
+    {
+      "binary": "target/debug/deps/motion_export-e11a138e69012b90",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/pins-motion_export.log",
+      "binary_sha256": "099266203d3964c85a4124381ec22bad413e7d03c5db85bf20c5c6c34126f06a",
+      "log_sha256": "a6ed2b23c0b49e2060aedc01e72429a76ec77cec10bd6c3e6aa09ac559a7bb85",
+      "summary": "test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.49s"
+    },
+    {
+      "binary": "target/debug/deps/native-0b62a5052064d916",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/pins-native.log",
+      "binary_sha256": "bb80a476864fbf3849651e84844758f09013c739342bf5a187bcdaaeb0fc21c9",
+      "log_sha256": "246f51ca4daf156c5f8c49dc4d464c67156a7be28d23f7b98ebd1fe06d209725",
+      "summary": "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.14s"
+    },
+    {
+      "binary": "target/debug/deps/catalog_backend-1198b2543f674085",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/pins-catalog_backend.log",
+      "binary_sha256": "ede3396563c930c10676aea9e9c012dfbf914aed596cb7f71905351b35ddf9b2",
+      "log_sha256": "bc704d89c23093673f3904ce63b4d969a038ec3a73bc9f563565a03ad99fbad3",
+      "summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    },
+    {
+      "binary": "target/debug/deps/catalog_source_model-2cd5e2073a2c754f",
+      "exit_code": 0,
+      "log": "artifacts/catabolic-integration/pins-catalog_source_model.log",
+      "binary_sha256": "818bc297d95dd7014c59af57978e537e67add279a4c37e9338ec43decfad7c78",
+      "log_sha256": "3dc087bc51045a3c2a3d0747e6134e4a19b690217f5dd338eae080520ed175bf",
+      "summary": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    }
+  ],
+  "scope": "Manual identity pins from trusted Motion export v2; native validation rehearsal only",
+  "remaining": [
+    "structural and physical mappings",
+    "tag owner integration",
+    "reference audit",
+    "activation and startup reconciliation",
+    "server routing",
+    "playback and real-library qualification"
+  ]
+}

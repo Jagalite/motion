@@ -86,3 +86,27 @@ fn export_owner_grants_require_exact_supported_source_provenance() {
     }
     assert_eq!(checked, 432);
 }
+
+#[test]
+fn export_pins_preserve_live_manual_identity_protection() {
+    use playscale_core::{catalog_backend::pinned_source_identity, matching::MatchState};
+    let current = ("tmdb".into(), "42".into());
+    let mut checked = 0;
+    for state in [
+        MatchState::Unmatched,
+        MatchState::Ambiguous,
+        MatchState::Matched,
+        MatchState::Manual,
+    ] {
+        for retired in [false, true] {
+            for identity in [None, Some(&current)] {
+                assert_eq!(
+                    pinned_source_identity(state, retired, identity),
+                    state == MatchState::Manual && !retired && identity.is_some()
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 16);
+}

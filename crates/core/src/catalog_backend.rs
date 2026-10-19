@@ -67,3 +67,14 @@ impl ExportProvenance {
             && self.source_namespace == source_namespace
     }
 }
+
+/// Export only identities that the live source actually protects against
+/// withdrawal. Provider evidence and identities on retired aliases are not
+/// accepted native decisions. The adapter supplies facts from one snapshot.
+pub fn pinned_source_identity(
+    state: crate::matching::MatchState,
+    retired: bool,
+    current: Option<&(String, String)>,
+) -> bool {
+    !retired && !crate::matching::provider_identity_allowed(state, current, None)
+}

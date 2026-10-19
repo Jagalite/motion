@@ -219,3 +219,22 @@ vendor archive exposed three upstream trailing-whitespace lines in
 `vendor/sqlx-sqlite-0.8.6/src/connection/serialize.rs`. That complete file was
 recompared byte-for-byte to the verified crate archive; it is intentionally
 unchanged to preserve the recorded one-line dependency patch boundary.
+
+## Manual identity pin mapping
+
+The v2 Motion exporter maps live manual identities to the native pin owner.
+The production core reuses Motion's identity-withdrawal policy; SQLite supplies
+match state, identity, revision and alias status from the same capture transaction.
+The core test exhausts 16 combinations of four match states, retirement and
+identity presence. This is a finite policy check, not a concurrency model.
+Native integration exercises two accepted identities through batch packing,
+retained snapshot replay, restart and typed rehearsal. Matched/unmatched/ambiguous
+identities and retired aliases remain evidence; releasing one manual pin affects
+only a subsequent capture. Source document revision 7 maps to native pin revision
+1 explicitly. Missing original pin history is not reconstructed.
+
+Kyoto compile job: `c82bd091cfe44e9e8c537de218cfb67e` (shared policy: no-run).
+Kyoto Clippy job: `74d8070dd9584010a2171a755116130a` (`-D warnings`).
+Source and executable receipts are in `qualification/catabolic-motion-pins.json`.
+This does not qualify activation, application routing, tags, physical/structural
+mapping, real libraries, or playback with Catabolic as the primary backend.
